@@ -9,6 +9,7 @@ import {
   migrateSupervisionStore,
   type SupervisionMigrationDb,
 } from '../../src/daemon/supervision-store-migrations.js';
+import { resolveMissingSupervisionSessionPresentation } from '../../src/daemon/lifecycle.js';
 import type { SupervisionTaskConsoleDelta } from '../../shared/supervision-task-console.js';
 import type { SupervisionAuditReceipt } from '../../shared/supervision-audit-handoff.js';
 
@@ -39,12 +40,23 @@ let clock: number;
 
 function asDb(): SupervisionMigrationDb { return db as unknown as SupervisionMigrationDb; }
 
-function producer(over: Partial<{ onBoundary: (b: SupervisionCrashBoundary) => void; broadcast: boolean; epoch: string }> = {}) {
+function producer(over: Partial<{
+  onBoundary: (b: SupervisionCrashBoundary) => void;
+  broadcast: boolean;
+  epoch: string;
+  resolveSessionPresentation: (sessionName: string, durableObservedAt: number) => {
+    label?: string;
+    state: 'running' | 'idle' | 'needs_input' | 'offline' | 'unknown';
+    source: 'runtime' | 'supervision' | 'registry';
+    observedAt: number;
+  } | undefined;
+}> = {}) {
   return new SupervisionConsoleProducer(asDb(), {
     projectionEpoch: over.epoch ?? EPOCH,
     now: () => ++clock,
     onBoundary: over.onBoundary,
     broadcast: over.broadcast === false ? undefined : (frame) => { sent.push(frame); },
+    resolveSessionPresentation: over.resolveSessionPresentation,
   });
 }
 
@@ -268,6 +280,42 @@ describe('assignment, pool and validation projections', () => {
     expect(snapshot.assignments).toHaveLength(1);
     expect(snapshot.pools).toHaveLength(2);
     expect(snapshot.tasks).toHaveLength(1);
+  });
+
+  it('projects the canonical objective and daemon-authoritative owner activity', () => {
+    seedTask('implementing');
+    db.prepare("UPDATE supervision_tasks SET payload_json=? WHERE task_id='tsk_console'")
+      .run(JSON.stringify({ objective: 'Build a human-readable activity board' }));
+    const snapshot = producer({
+      resolveSessionPresentation: (sessionName) => sessionName === 'deck_sub_4s48141x'
+        ? { label: 'Cx7', state: 'needs_input', source: 'supervision', observedAt: 444 }
+        : undefined,
+    }).buildSnapshot(SCOPE, 'sub-presentation');
+    expect(snapshot.tasks[0]!.title).toBe('Build a human-readable activity board');
+    expect(snapshot.assignments[0]).toMatchObject({
+      ownerSessionName: 'deck_sub_4s48141x',
+      ownerSessionLabel: 'Cx7',
+      sessionState: 'needs_input',
+      sessionStateSource: 'supervision',
+      sessionStateObservedAt: 444,
+    });
+  });
+
+  it('keeps a missing owner offline at its durable assignment timestamp', () => {
+    seedTask('implementing');
+    db.prepare("UPDATE supervision_task_assignments SET updated_at=731 WHERE assignment_id='asg_console'").run();
+    const snapshot = producer({
+      resolveSessionPresentation: (_sessionName, durableObservedAt) => (
+        resolveMissingSupervisionSessionPresentation(durableObservedAt)
+      ),
+    }).buildSnapshot(SCOPE, 'sub-missing-owner');
+
+    expect(snapshot.assignments[0]).toMatchObject({
+      sessionState: 'offline',
+      sessionStateSource: 'registry',
+      sessionStateObservedAt: 731,
+      updatedAt: 731,
+    });
   });
 
   it('never projects tasks or assignments from another project', () => {

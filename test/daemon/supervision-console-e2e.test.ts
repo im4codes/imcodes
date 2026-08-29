@@ -325,7 +325,10 @@ describe('production registry database composition', () => {
       expect(sent[0]).toMatchObject({
         type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
         subscriptionId: 'sub-nonempty',
-        tasks: [expect.objectContaining({ taskId: 'task-authoritative' })],
+        tasks: [expect.objectContaining({
+          taskId: 'task-authoritative',
+          title: 'authoritative console row',
+        })],
       });
       production.close();
     } finally {

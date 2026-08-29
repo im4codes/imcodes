@@ -116,21 +116,29 @@ function resolveTransportSessionListState(
   return record.state;
 }
 
+/**
+ * The one daemon-side session activity projection used by both session.list and
+ * the supervision console. It observes the live transport runtime and its
+ * structured queue; it never guesses from elapsed heartbeat time.
+ */
+export function resolveAuthoritativeSessionListState(record: SessionRecord): SessionListItem['state'] {
+  const runtime = record.runtimeType === 'transport' ? getTransportRuntime(record.name) : undefined;
+  const runtimeState = resolveTransportSessionListState(record, runtime);
+  if (record.runtimeType === 'transport') expireResendEntries(record.name);
+  const queuePayload = record.runtimeType === 'transport'
+    ? buildTransportQueueSnapshotPayload(record.name, 'session_list')
+    : null;
+  const hasPendingQueue = (queuePayload?.pendingMessageEntries.length ?? 0) > 0;
+  return hasPendingQueue
+    ? (runtime ? (runtimeState === 'idle' ? 'queued' : runtimeState) : 'queued')
+    : runtimeState;
+}
+
 function baseItem(s: SessionRecord): SessionListItem {
-  const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
-  const runtimeState = resolveTransportSessionListState(s, runtime);
-  if (s.runtimeType === 'transport') {
-    expireResendEntries(s.name);
-  }
+  const state = resolveAuthoritativeSessionListState(s);
   const queuePayload = s.runtimeType === 'transport'
     ? buildTransportQueueSnapshotPayload(s.name, 'session_list')
     : null;
-  const hasPendingQueue = (queuePayload?.pendingMessageEntries.length ?? 0) > 0;
-  const state = hasPendingQueue
-    ? runtime
-      ? (runtimeState === 'idle' ? 'queued' : runtimeState)
-      : 'queued'
-    : runtimeState;
   // DAEMON-AUTHORITATIVE template eligibility. Computed from the persisted
   // record (not the resolved transport `state` above) so it stays deterministic
   // and matches the clone-create gate's view of the session.

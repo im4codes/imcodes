@@ -1,10 +1,10 @@
 import type { ComponentChildren, RefObject } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useMemo, useRef, useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
-  SUPERVISION_CONSOLE_STATUS_GROUPS,
   supervisionConsoleStatusGroup,
-  type SupervisionConsoleStatusGroup,
+  supervisionConsoleTabForStatus,
+  type SupervisionConsoleSessionState,
   type SupervisionTaskConsoleAssignmentRow,
   type SupervisionTaskConsoleTaskRow,
 } from '@shared/supervision-task-console.js';
@@ -26,38 +26,36 @@ import {
   type SupervisionTaskConsoleVisibilityInput,
 } from '../supervision-task-console-visibility.js';
 
-export const SUPERVISION_TASK_CONSOLE_STALE_HEARTBEAT_MS = 2 * 60_000;
-const DESKTOP_MIN_WIDTH = 320;
-const DESKTOP_DEFAULT_WIDTH = 420;
-const DESKTOP_MAX_WIDTH = 720;
+const DESKTOP_MIN_WIDTH = 720;
+const DESKTOP_DEFAULT_WIDTH = 720;
+const DESKTOP_MAX_WIDTH = 1440;
+const DESKTOP_VIEWPORT_CAP = 0.92;
+const COMPLETED_PAGE_SIZE = 10;
+const FOCUSABLE_SELECTOR = [
+  'a[href]', 'button:not([disabled])', 'input:not([disabled])',
+  'select:not([disabled])', 'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
 
 export function supervisionConsoleMaxWidth(viewportWidth: number): number {
-  return Math.max(DESKTOP_MIN_WIDTH, Math.min(DESKTOP_MAX_WIDTH, Math.floor(viewportWidth * 0.65)));
+  return Math.max(320, Math.min(DESKTOP_MAX_WIDTH, Math.floor(viewportWidth * DESKTOP_VIEWPORT_CAP)));
 }
 
 export function supervisionTaskConsolePreferenceBounds(
   viewportWidth = Number.POSITIVE_INFINITY,
 ): SupervisionTaskConsoleWidthBounds {
+  const maxWidth = supervisionConsoleMaxWidth(viewportWidth);
   return {
-    minWidth: DESKTOP_MIN_WIDTH,
-    maxWidth: supervisionConsoleMaxWidth(viewportWidth),
-    defaultWidth: DESKTOP_DEFAULT_WIDTH,
+    minWidth: Math.min(DESKTOP_MIN_WIDTH, maxWidth),
+    maxWidth,
+    defaultWidth: Math.min(DESKTOP_DEFAULT_WIDTH, maxWidth),
   };
 }
 
-/** Apply the fixed desktop range and the shared 65vw split cap. */
 export function clampSupervisionConsoleWidth(next: number, viewportWidth: number): number {
-  const max = supervisionConsoleMaxWidth(viewportWidth);
-  return Math.max(DESKTOP_MIN_WIDTH, Math.min(max, Math.round(next)));
+  const bounds = supervisionTaskConsolePreferenceBounds(viewportWidth);
+  return Math.max(bounds.minWidth, Math.min(bounds.maxWidth, Math.round(next)));
 }
-const FOCUSABLE_SELECTOR = [
-  'a[href]',
-  'button:not([disabled])',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
-].join(',');
 
 export function SupervisionTaskConsoleToggle(props: {
   visibility: SupervisionTaskConsoleVisibilityInput;
@@ -88,21 +86,11 @@ function displayStatusKey(status: unknown): string {
     : 'supervision_task_console.unsupported';
 }
 
-function displayGroupKey(group: SupervisionConsoleStatusGroup): string {
-  return `supervision_task_console.group.${group}`;
-}
-
-function staleHeartbeat(timestamp: number | undefined, now: number): boolean {
-  return timestamp === undefined || now - timestamp > SUPERVISION_TASK_CONSOLE_STALE_HEARTBEAT_MS;
-}
-
 function safeTimestamp(timestamp: number | undefined, language: string): string {
   if (timestamp === undefined || !Number.isFinite(timestamp)) return '—';
   try {
     return new Intl.DateTimeFormat(language, {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
     }).format(new Date(timestamp));
   } catch {
     return '—';
@@ -110,68 +98,108 @@ function safeTimestamp(timestamp: number | undefined, language: string): string 
 }
 
 function valueOrDash(value: string | number | null | undefined): string {
-  if (value === null || value === undefined || value === '') return '—';
-  return String(value);
+  return value === null || value === undefined || value === '' ? '—' : String(value);
 }
 
-function Field(props: { label: string; value: string | number | null | undefined; class?: string }) {
-  return (
-    <div class={`supervision-task-console-field${props.class ? ` ${props.class}` : ''}`}>
-      <dt>{props.label}</dt>
-      <dd>{valueOrDash(props.value)}</dd>
-    </div>
-  );
+function Field(props: { label: string; value: string | number | null | undefined }) {
+  return <div class="supervision-task-console-field"><dt>{props.label}</dt><dd>{valueOrDash(props.value)}</dd></div>;
 }
 
-function AssignmentCard(props: {
+function isAuditAssignment(assignment: SupervisionTaskConsoleAssignmentRow): boolean {
+  return assignment.role === 'auditor';
+}
+
+function isImplementerAssignment(assignment: SupervisionTaskConsoleAssignmentRow): boolean {
+  return assignment.role === 'implementer';
+}
+
+function taskRoleAssignments(
+  assignments: readonly SupervisionTaskConsoleAssignmentRow[],
+): SupervisionTaskConsoleAssignmentRow[] {
+  return assignments.filter((assignment) => (
+    isImplementerAssignment(assignment) || isAuditAssignment(assignment)
+  ));
+}
+
+function stateRank(state: SupervisionConsoleSessionState | undefined): number {
+  switch (state) {
+    case 'needs_input': return 0;
+    case 'running': return 1;
+    case 'idle': return 4;
+    case 'offline': return 6;
+    default: return 5;
+  }
+}
+
+function taskPriority(
+  task: SupervisionTaskConsoleTaskRow,
+  assignments: readonly SupervisionTaskConsoleAssignmentRow[],
+): number {
+  const roleAssignments = taskRoleAssignments(assignments);
+  if (task.status === 'blocked' || task.status === 'cancelled' || task.blocker
+    || roleAssignments.some((assignment) => assignment.sessionState === 'needs_input')) return 0;
+  if (roleAssignments.some((assignment) => isImplementerAssignment(assignment) && assignment.sessionState === 'running')) return 1;
+  if (roleAssignments.some((assignment) => isAuditAssignment(assignment) && assignment.sessionState === 'running')) return 2;
+  const group = supervisionConsoleStatusGroup(task.status);
+  if (group === 'audit' || group === 'rework' || group === 'integration') return 3;
+  const bestSession = roleAssignments.reduce((best, assignment) => Math.min(best, stateRank(assignment.sessionState)), 9);
+  if (bestSession === 4) return 4;
+  return 5;
+}
+
+function authoritativeActivityAt(
+  task: SupervisionTaskConsoleTaskRow,
+  assignments: readonly SupervisionTaskConsoleAssignmentRow[],
+): number {
+  const roleAssignments = taskRoleAssignments(assignments);
+  if (roleAssignments.length === 0) return task.updatedAt;
+  return Math.max(...roleAssignments.map((assignment) => (
+    assignment.sessionStateObservedAt ?? assignment.updatedAt
+  )));
+}
+
+/** Stable product sort: authority state first, authoritative activity time second. */
+export function sortSupervisionConsoleTasks(
+  tasks: readonly SupervisionTaskConsoleTaskRow[],
+  assignmentsByTask: ReadonlyMap<string, readonly SupervisionTaskConsoleAssignmentRow[]>,
+): SupervisionTaskConsoleTaskRow[] {
+  return [...tasks].sort((left, right) => {
+    const leftAssignments = assignmentsByTask.get(left.taskId) ?? [];
+    const rightAssignments = assignmentsByTask.get(right.taskId) ?? [];
+    const priority = taskPriority(left, leftAssignments) - taskPriority(right, rightAssignments);
+    return priority
+      || authoritativeActivityAt(right, rightAssignments) - authoritativeActivityAt(left, leftAssignments)
+      || left.taskId.localeCompare(right.taskId);
+  });
+}
+
+function SessionButton(props: {
   assignment: SupervisionTaskConsoleAssignmentRow;
-  now: number;
-  language: string;
+  lane: 'implementer' | 'auditor';
   onNavigateSession: (sessionName: string) => void;
 }) {
   const { t } = useTranslation();
   const { assignment } = props;
-  const ownerName = assignment.ownerSessionName;
-  const heartbeatStale = staleHeartbeat(assignment.heartbeatAt, props.now);
+  const name = assignment.ownerSessionName;
+  const state = assignment.sessionState ?? 'unknown';
+  if (!name) return null;
   return (
-    <article class="supervision-task-console-assignment" data-testid={`task-assignment-${assignment.assignmentId}`}>
-      <header>
-        <span class="supervision-task-console-role">{assignment.role || t('supervision_task_console.unknown')}</span>
-        <span class={`supervision-task-console-heartbeat${heartbeatStale ? ' is-stale' : ''}`}>
-          {heartbeatStale ? t('supervision_task_console.heartbeat_stale') : t('supervision_task_console.heartbeat_live')}
-        </span>
-      </header>
-      {ownerName ? (
-        <button
-          type="button"
-          class="supervision-task-console-owner"
-          onClick={() => props.onNavigateSession(ownerName)}
-        >
-          {assignment.ownerSessionLabel || ownerName}
-          {assignment.ownerSessionLabel && <small>{ownerName}</small>}
-        </button>
-      ) : <span class="supervision-task-console-owner is-missing">{t('supervision_task_console.unassigned')}</span>}
-      <dl class="supervision-task-console-fields">
-        <Field label={t('supervision_task_console.provider')} value={assignment.observedProvider} />
-        <Field label={t('supervision_task_console.model')} value={assignment.observedModel} />
-        <Field label={t('supervision_task_console.pool')} value={assignment.poolKind ? t(`supervision_task_console.pool_kind.${assignment.poolKind}`) : assignment.poolId} />
-        <Field label={t('supervision_task_console.current_action')} value={assignment.currentAction} />
-        <Field label={t('supervision_task_console.next_action')} value={assignment.nextAction} />
-        <Field label={t('supervision_task_console.validation')} value={t(`supervision_task_console.validation_state.${assignment.validationState}`)} />
-        <Field label={t('supervision_task_console.audit_attempt')} value={assignment.auditAttemptId} />
-        <Field label={t('supervision_task_console.audit_round')} value={assignment.auditRound} />
-        <Field label={t('supervision_task_console.audit_verdict')} value={assignment.auditVerdict} />
-        <Field label={t('supervision_task_console.blocker')} value={assignment.blocker} />
-        <Field label={t('supervision_task_console.recovery')} value={assignment.recoveryState} />
-        <Field label={t('supervision_task_console.recovery_reason')} value={assignment.recoveryReason} />
-        <Field label={t('supervision_task_console.workspace')} value={assignment.workspaceId} />
-        <Field label={t('supervision_task_console.snapshot')} value={assignment.snapshotId} />
-        <Field label={t('supervision_task_console.checkpoint')} value={assignment.checkpointId} />
-        <Field label={t('supervision_task_console.heartbeat')} value={safeTimestamp(assignment.heartbeatAt, props.language)} />
-        <Field label={t('supervision_task_console.updated')} value={safeTimestamp(assignment.updatedAt, props.language)} />
-        <Field label={t('supervision_task_console.last_event')} value={assignment.lastEventId} />
-      </dl>
-    </article>
+    <button
+      type="button"
+      class={`supervision-task-console-session session-${state} lane-${props.lane}`}
+      data-session-state={state}
+      aria-label={`${t(`supervision_task_console.${props.lane}`)}: ${assignment.ownerSessionLabel || name}, ${t(`supervision_task_console.session_state.${state}`)}`}
+      onClick={(event) => { event.stopPropagation(); props.onNavigateSession(name); }}
+    >
+      <span class="supervision-task-console-session-icon" aria-hidden="true" />
+      <span class="supervision-task-console-session-copy">
+        <strong>{assignment.ownerSessionLabel || name}</strong>
+        {assignment.ownerSessionLabel && <small>{name}</small>}
+        <small>{assignment.observedProvider || assignment.ownerAgentType || '—'} · {assignment.observedModel || '—'}</small>
+        {props.lane === 'auditor' && (assignment.auditAttemptId || assignment.auditVerdict) && <small>{assignment.auditAttemptId || '—'} · {assignment.auditVerdict || '—'}</small>}
+      </span>
+      <span class="supervision-task-console-session-state">{t(`supervision_task_console.session_state.${state}`)} · {assignment.sessionStateSource ?? 'registry'}</span>
+    </button>
   );
 }
 
@@ -182,108 +210,89 @@ function TaskCard(props: {
   expanded: boolean;
   onToggle: () => void;
   onNavigateSession: (sessionName: string) => void;
-  now: number;
   language: string;
 }) {
   const { t } = useTranslation();
-  const { task } = props;
-  const heartbeatStale = staleHeartbeat(task.heartbeatAt, props.now);
-  const progress = task.progress && task.progress.total > 0
-    ? Math.min(100, Math.max(0, (task.progress.completed / task.progress.total) * 100))
+  const implementer = props.assignments.find(isImplementerAssignment);
+  const auditor = props.assignments.find(isAuditAssignment);
+  const dominantState = props.task.blocker || props.task.status === 'blocked' || props.task.status === 'cancelled'
+    ? 'needs_input'
+    : implementer?.sessionState === 'running'
+      ? 'running'
+      : auditor?.sessionState === 'running'
+        ? 'audit-running'
+        : implementer?.sessionState ?? auditor?.sessionState ?? 'unknown';
+  const activityAt = authoritativeActivityAt(props.task, props.assignments);
+  const activityAssignment = taskRoleAssignments(props.assignments).sort((left, right) =>
+    (right.sessionStateObservedAt ?? right.updatedAt) - (left.sessionStateObservedAt ?? left.updatedAt))[0];
+  const activitySource = activityAssignment?.sessionStateSource ?? 'registry';
+  const progress = props.task.progress && props.task.progress.total > 0
+    ? Math.min(100, Math.max(0, (props.task.progress.completed / props.task.progress.total) * 100))
     : null;
   return (
     <article
-      class="supervision-task-console-task"
-      data-status={task.status}
-      data-event-id={task.lastEventId}
-      data-testid={`task-card-${task.taskId}`}
+      class={`supervision-task-console-task activity-${dominantState}`}
+      data-status={props.task.status}
+      data-activity-state={dominantState}
+      data-event-id={props.task.lastEventId}
+      data-testid={`task-card-${props.task.taskId}`}
     >
-      <span key={task.lastEventId} class="supervision-task-console-transition" aria-hidden="true" />
-      <button
-        type="button"
-        class="supervision-task-console-task-summary"
-        aria-expanded={props.expanded}
-        aria-controls={`task-console-details-${task.taskId}`}
-        onClick={props.onToggle}
-      >
-        <span class="supervision-task-console-task-title">
-          <strong>{task.title}</strong>
-          <small>{task.semanticKey || task.taskId}</small>
-        </span>
-        <span class={`supervision-task-console-status status-${task.status}`}>
-          {t(displayStatusKey(task.status))}
-        </span>
-        <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
-      </button>
-      {progress !== null && task.progress && (
-        <div class="supervision-task-console-progress" aria-label={t('supervision_task_console.progress', { ...task.progress })}>
+      <span key={props.task.lastEventId} class="supervision-task-console-transition" aria-hidden="true" />
+      <div class="supervision-task-console-task-head">
+        <button
+          type="button"
+          class="supervision-task-console-task-summary"
+          aria-expanded={props.expanded}
+          aria-controls={`task-console-details-${props.task.taskId}`}
+          onClick={props.onToggle}
+        >
+          <span class="supervision-task-console-task-title"><strong>{props.task.title}</strong></span>
+          <span class={`supervision-task-console-status status-${props.task.status}`}>{t(displayStatusKey(props.task.status))}</span>
+          <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
+        </button>
+        <div class="supervision-task-console-role-tracks">
+          {implementer && <SessionButton assignment={implementer} lane="implementer" onNavigateSession={props.onNavigateSession} />}
+          {auditor && <SessionButton assignment={auditor} lane="auditor" onNavigateSession={props.onNavigateSession} />}
+        </div>
+      </div>
+      <div class={`supervision-task-console-stage-track phase-${props.task.phase}`} aria-label={t(displayStatusKey(props.task.status))}>
+        <span /><span /><span /><span />
+      </div>
+      {progress !== null && props.task.progress && (
+        <div class="supervision-task-console-progress" aria-label={t('supervision_task_console.progress', { ...props.task.progress })}>
           <span style={{ width: `${progress}%` }} />
         </div>
       )}
       <div class="supervision-task-console-task-meta">
-        <span class={`supervision-task-console-heartbeat${heartbeatStale ? ' is-stale' : ''}`}>
-          {heartbeatStale ? t('supervision_task_console.heartbeat_stale') : t('supervision_task_console.heartbeat_live')}
-        </span>
-        {task.poolKind && <span>{t(`supervision_task_console.pool_kind.${task.poolKind}`)}</span>}
-        {task.currentAction && <span>{task.currentAction}</span>}
+        {props.task.blocker && <span class="is-blocker">{props.task.blocker}</span>}
+        {props.task.currentAction && <span>{t('supervision_task_console.current_action')}: {props.task.currentAction}</span>}
+        {props.task.nextAction && <span>{t('supervision_task_console.next_action')}: {props.task.nextAction}</span>}
+        <span>{t('supervision_task_console.recent_activity')}: {safeTimestamp(activityAt, props.language)} · {activitySource}</span>
       </div>
       {props.expanded && (
-        <div id={`task-console-details-${task.taskId}`} class="supervision-task-console-task-details">
-          <section aria-label={t('supervision_task_console.evidence')}>
-            <h4>{t('supervision_task_console.evidence')}</h4>
-            {task.ownerSessionName && (
-              <button
-                type="button"
-                class="supervision-task-console-owner"
-                onClick={() => props.onNavigateSession(task.ownerSessionName!)}
-              >
-                {task.ownerSessionName}
-              </button>
-            )}
-            <dl class="supervision-task-console-fields">
-              <Field label={t('supervision_task_console.task_id')} value={task.taskId} />
-              <Field label={t('supervision_task_console.top_level_task')} value={task.topLevelTaskId} />
-              <Field label={t('supervision_task_console.current_action')} value={task.currentAction} />
-              <Field label={t('supervision_task_console.next_action')} value={task.nextAction} />
-              <Field label={t('supervision_task_console.validation')} value={t(`supervision_task_console.validation_state.${task.validationState}`)} />
-              <Field label={t('supervision_task_console.audit_attempt')} value={task.auditAttemptId} />
-              <Field label={t('supervision_task_console.audit_round')} value={task.auditRound} />
-              <Field label={t('supervision_task_console.audit_verdict')} value={task.auditVerdict} />
-              <Field label={t('supervision_task_console.blocker')} value={task.blocker} />
-              <Field label={t('supervision_task_console.recovery')} value={task.recoveryState} />
-              <Field label={t('supervision_task_console.recovery_reason')} value={task.recoveryReason} />
-              <Field label={t('supervision_task_console.workspace')} value={task.workspaceId} />
-              <Field label={t('supervision_task_console.snapshot')} value={task.snapshotId} />
-              <Field label={t('supervision_task_console.snapshot_state')} value={task.snapshotState} />
-              <Field label={t('supervision_task_console.checkpoint')} value={task.checkpointId} />
-              <Field label={t('supervision_task_console.updated')} value={safeTimestamp(task.updatedAt, props.language)} />
-              <Field label={t('supervision_task_console.last_event')} value={task.lastEventId} />
-            </dl>
-          </section>
+        <div id={`task-console-details-${props.task.taskId}`} class="supervision-task-console-task-details">
+          <dl class="supervision-task-console-fields">
+            <div class="supervision-task-console-field">
+              <dt>{t('supervision_task_console.task_id')}</dt>
+              <dd><button type="button" class="supervision-task-console-copy-id" onClick={() => { void navigator.clipboard?.writeText(props.task.taskId); }}>{props.task.taskId}<span>{t('supervision_task_console.copy_task_id')}</span></button></dd>
+            </div>
+            <Field label={t('supervision_task_console.top_level_task')} value={props.task.topLevelTaskId} />
+            <Field label={t('supervision_task_console.current_action')} value={props.task.currentAction} />
+            <Field label={t('supervision_task_console.next_action')} value={props.task.nextAction} />
+            <Field label={t('supervision_task_console.validation')} value={t(`supervision_task_console.validation_state.${props.task.validationState}`)} />
+            <Field label={t('supervision_task_console.audit_attempt')} value={props.task.auditAttemptId || auditor?.auditAttemptId} />
+            <Field label={t('supervision_task_console.audit_verdict')} value={props.task.auditVerdict || auditor?.auditVerdict} />
+            <Field label={t('supervision_task_console.blocker')} value={props.task.blocker} />
+            <Field label={t('supervision_task_console.recovery')} value={props.task.recoveryState} />
+            <Field label={t('supervision_task_console.updated')} value={safeTimestamp(props.task.updatedAt, props.language)} />
+          </dl>
           <section aria-label={t('supervision_task_console.events')}>
             <h4>{t('supervision_task_console.events')}</h4>
-            {props.events.length > 0 ? (
-              <ol class="supervision-task-console-events">
-                {props.events.map((event) => (
-                  <li key={`${event.projectionVersion}:${event.eventId}`}>
-                    <span>{t(`supervision_task_console.event_op.${event.op}`)}</span>
-                    <small>{t('supervision_task_console.event', { id: event.eventId })}</small>
-                  </li>
-                ))}
-              </ol>
+            {props.events.length ? (
+              <ol class="supervision-task-console-events">{props.events.map((event) => (
+                <li key={`${event.projectionVersion}:${event.eventId}`}><span>{t(`supervision_task_console.event_op.${event.op}`)}</span><small>{t('supervision_task_console.event', { id: event.eventId })}</small></li>
+              ))}</ol>
             ) : <p class="supervision-task-console-muted">{t('supervision_task_console.no_events')}</p>}
-          </section>
-          <section aria-label={t('supervision_task_console.assignments')}>
-            <h4>{t('supervision_task_console.assignments')}</h4>
-            {props.assignments.length > 0 ? props.assignments.map((assignment) => (
-              <AssignmentCard
-                key={assignment.assignmentId}
-                assignment={assignment}
-                now={props.now}
-                language={props.language}
-                onNavigateSession={props.onNavigateSession}
-              />
-            )) : <p class="supervision-task-console-muted">{t('supervision_task_console.no_assignments')}</p>}
           </section>
         </div>
       )}
@@ -307,12 +316,13 @@ export function SupervisionTaskConsoleView(props: {
 }) {
   const { t, i18n } = useTranslation();
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
-  const [liveNow, setLiveNow] = useState(() => Date.now());
+  const [activeTab, setActiveTab] = useState<'ongoing' | 'completed'>('ongoing');
+  const [completedLimit, setCompletedLimit] = useState(COMPLETED_PAGE_SIZE);
   const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
-  const now = props.now ?? liveNow;
+  const ongoingTabRef = useRef<HTMLButtonElement>(null);
+  const completedTabRef = useRef<HTMLButtonElement>(null);
   const language = i18n.resolvedLanguage || i18n.language || 'en';
-  const tasks = Object.values(props.state.tasks).sort((left, right) => right.updatedAt - left.updatedAt);
   const assignmentsByTask = useMemo(() => {
     const grouped = new Map<string, SupervisionTaskConsoleAssignmentRow[]>();
     for (const assignment of Object.values(props.state.assignments)) {
@@ -323,62 +333,50 @@ export function SupervisionTaskConsoleView(props: {
     for (const values of grouped.values()) values.sort((left, right) => right.updatedAt - left.updatedAt);
     return grouped;
   }, [props.state.assignments]);
+  const allTasks = useMemo(() => Object.values(props.state.tasks).filter((task) => isSupervisionTaskLifecycleStatus(task.status)), [props.state.tasks]);
+  const completedTasks = useMemo(() => allTasks
+    .filter((task) => supervisionConsoleTabForStatus(task.status) === 'completed')
+    .sort((left, right) => right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId)), [allTasks]);
+  const ongoingTasks = useMemo(() => sortSupervisionConsoleTasks(allTasks.filter((task) => {
+    if (supervisionConsoleTabForStatus(task.status) !== 'ongoing') return false;
+    if (task.status !== 'planned') return true;
+    return Boolean(assignmentsByTask.get(task.taskId)?.length || task.currentAction || task.nextAction || task.blocker);
+  }), assignmentsByTask), [allTasks, assignmentsByTask]);
 
-  useEffect(() => {
-    if (props.mobile) closeRef.current?.focus();
-  }, [props.mobile]);
-
-  // Presentation-only clock: projection state remains entirely WebSocket driven.
-  useEffect(() => {
-    if (props.now !== undefined) return undefined;
-    const timer = window.setInterval(() => setLiveNow(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, [props.now]);
+  useEffect(() => { if (props.mobile) closeRef.current?.focus(); }, [props.mobile]);
 
   const closeAndReturnFocus = () => {
     props.onClose();
     if (props.mobile) queueMicrotask(() => props.returnFocusRef?.current?.focus());
   };
-  const onKeyDown = (event: KeyboardEvent) => {
+  const onPanelKeyDown = (event: KeyboardEvent) => {
     if (!props.mobile) return;
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      closeAndReturnFocus();
-      return;
-    }
+    if (event.key === 'Escape') { event.preventDefault(); closeAndReturnFocus(); return; }
     if (event.key !== 'Tab') return;
     const panel = panelRef.current;
     if (!panel) return;
     const focusable = [...panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)]
       .filter((element) => element.tabIndex >= 0 && element.getAttribute('aria-hidden') !== 'true');
-    if (focusable.length === 0) {
-      event.preventDefault();
-      panel.focus();
-      return;
-    }
-    const first = focusable[0];
+    if (!focusable.length) { event.preventDefault(); panel.focus(); return; }
+    const [first] = focusable;
     const last = focusable[focusable.length - 1];
     const active = document.activeElement;
-    if (event.shiftKey && (active === first || !panel.contains(active))) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && (active === last || !panel.contains(active))) {
-      event.preventDefault();
-      first.focus();
-    }
+    if (event.shiftKey && (active === first || !panel.contains(active))) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && (active === last || !panel.contains(active))) { event.preventDefault(); first.focus(); }
   };
-  const bodyState = props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR
-    ? 'error'
-    : props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING
-        && props.state.resyncReason === 'status_contract_mismatch'
-      ? 'unsupported'
-    : props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING
-      ? 'recovery'
-      : props.state.phase !== SUPERVISION_TASK_CONSOLE_PHASE.READY
-        ? 'loading'
-        : tasks.length === 0
-          ? 'empty'
-          : 'ready';
+  const onTabKeyDown = (event: KeyboardEvent) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === 'ArrowLeft' || event.key === 'Home' ? 'ongoing' : 'completed';
+    setActiveTab(next);
+    (next === 'ongoing' ? ongoingTabRef : completedTabRef).current?.focus();
+  };
+  const bodyState = props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR ? 'error'
+    : props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING && props.state.resyncReason === 'status_contract_mismatch' ? 'unsupported'
+      : props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING ? 'recovery'
+        : props.state.phase !== SUPERVISION_TASK_CONSOLE_PHASE.READY ? 'loading'
+          : allTasks.length === 0 ? 'empty' : 'ready';
+  const visibleTasks = activeTab === 'ongoing' ? ongoingTasks : completedTasks.slice(0, completedLimit);
 
   return (
     <aside
@@ -388,76 +386,46 @@ export function SupervisionTaskConsoleView(props: {
       aria-modal={props.mobile ? 'true' : undefined}
       aria-label={t('supervision_task_console.title')}
       data-read-only={props.readOnly ? 'true' : 'false'}
-      onKeyDown={onKeyDown}
+      onKeyDown={onPanelKeyDown}
       style={!props.mobile && props.width ? { width: `${props.width}px` } : undefined}
     >
-      {!props.mobile && (
-        <div
-          class="supervision-task-console-resize"
-          role="separator"
-          tabIndex={0}
-          aria-orientation="vertical"
-          aria-label={t('supervision_task_console.resize')}
-          aria-valuemin={DESKTOP_MIN_WIDTH}
-          aria-valuemax={props.maxWidth ?? DESKTOP_MAX_WIDTH}
-          aria-valuenow={props.width}
-          onPointerDown={props.onResizeStart}
-          onKeyDown={props.onResizeKeyDown}
-        />
-      )}
+      {!props.mobile && <div
+        class="supervision-task-console-resize" role="separator" tabIndex={0} aria-orientation="vertical"
+        aria-label={t('supervision_task_console.resize')}
+        aria-valuemin={Math.min(DESKTOP_MIN_WIDTH, props.maxWidth ?? DESKTOP_MAX_WIDTH)}
+        aria-valuemax={props.maxWidth ?? DESKTOP_MAX_WIDTH} aria-valuenow={props.width}
+        onPointerDown={props.onResizeStart} onKeyDown={props.onResizeKeyDown}
+      />}
       <header class="supervision-task-console-header">
-        <div>
-          <span class="supervision-task-console-kicker">{t('supervision_task_console.kicker')}</span>
-          <h2>{t('supervision_task_console.title')}</h2>
-        </div>
+        <div><span class="supervision-task-console-kicker">{t('supervision_task_console.kicker')}</span><h2>{t('supervision_task_console.title')}</h2></div>
         <button ref={closeRef} type="button" class="supervision-task-console-close" onClick={closeAndReturnFocus} aria-label={t('common.close')}>×</button>
       </header>
       {!props.readOnly && props.mutationControls}
-      <div class="supervision-task-console-cursor" aria-live="polite">
-        <span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span>
-        <span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span>
-      </div>
-
+      <div class="supervision-task-console-cursor" aria-live="polite"><span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span><span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span></div>
+      {bodyState === 'ready' && <div class="supervision-task-console-tabs" role="tablist" aria-label={t('supervision_task_console.tabs_label')}>
+        <button ref={ongoingTabRef} type="button" role="tab" id="task-console-tab-ongoing" aria-selected={activeTab === 'ongoing'} aria-controls="task-console-panel-ongoing" tabIndex={activeTab === 'ongoing' ? 0 : -1} onKeyDown={onTabKeyDown} onClick={() => setActiveTab('ongoing')}>{t('supervision_task_console.tab_ongoing')} <span>{ongoingTasks.length}</span></button>
+        <button ref={completedTabRef} type="button" role="tab" id="task-console-tab-completed" aria-selected={activeTab === 'completed'} aria-controls="task-console-panel-completed" tabIndex={activeTab === 'completed' ? 0 : -1} onKeyDown={onTabKeyDown} onClick={() => setActiveTab('completed')}>{t('supervision_task_console.tab_completed')} <span>{completedTasks.length}</span></button>
+      </div>}
       <div class="supervision-task-console-body" data-state={bodyState}>
         {bodyState === 'loading' && <div class="supervision-task-console-state"><span class="spinner" />{t('supervision_task_console.loading')}</div>}
         {bodyState === 'recovery' && <div class="supervision-task-console-state is-recovery" role="status">{t('supervision_task_console.recovering')}</div>}
         {bodyState === 'unsupported' && <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.unsupported')}</div>}
         {bodyState === 'error' && <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.error')}</div>}
         {bodyState === 'empty' && <div class="supervision-task-console-state">{t('supervision_task_console.empty')}</div>}
-        {bodyState === 'ready' && SUPERVISION_CONSOLE_STATUS_GROUPS.map((group) => {
-          const groupTasks = tasks.filter((task) => (
-            isSupervisionTaskLifecycleStatus(task.status)
-              ? supervisionConsoleStatusGroup(task.status) === group
-              : false
-          ));
-          if (groupTasks.length === 0) return null;
-          return (
-            <section key={group} class={`supervision-task-console-group group-${group}`} aria-label={t(displayGroupKey(group))}>
-              <header><h3>{t(displayGroupKey(group))}</h3><span>{groupTasks.length}</span></header>
-              {groupTasks.map((task) => (
-                <TaskCard
-                  key={task.taskId}
-                  task={task}
-                  assignments={assignmentsByTask.get(task.taskId) ?? []}
-                  events={props.state.eventsByTask[task.taskId] ?? []}
-                  expanded={expanded.has(task.taskId)}
-                  onToggle={() => setExpanded((previous) => {
-                    const next = new Set(previous);
-                    if (next.has(task.taskId)) next.delete(task.taskId);
-                    else next.add(task.taskId);
-                    return next;
-                  })}
-                  onNavigateSession={props.onNavigateSession}
-                  now={now}
-                  language={language}
-                />
-              ))}
-            </section>
-          );
-        })}
-        {bodyState === 'ready' && tasks.some((task) => !isSupervisionTaskLifecycleStatus(task.status)) && (
-          <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.unsupported')}</div>
-        )}
+        {bodyState === 'ready' && <section
+          id={`task-console-panel-${activeTab}`} role="tabpanel" aria-labelledby={`task-console-tab-${activeTab}`}
+          class="supervision-task-console-grid"
+        >
+          {visibleTasks.map((task) => <TaskCard
+            key={task.taskId} task={task} assignments={assignmentsByTask.get(task.taskId) ?? []}
+            events={props.state.eventsByTask[task.taskId] ?? []} expanded={expanded.has(task.taskId)}
+            onToggle={() => setExpanded((previous) => { const next = new Set(previous); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })}
+            onNavigateSession={props.onNavigateSession} language={language}
+          />)}
+          {!visibleTasks.length && <div class="supervision-task-console-state">{t(activeTab === 'ongoing' ? 'supervision_task_console.no_ongoing' : 'supervision_task_console.no_completed')}</div>}
+          {activeTab === 'completed' && completedLimit < completedTasks.length && <button type="button" class="supervision-task-console-show-more" onClick={() => setCompletedLimit((value) => value + COMPLETED_PAGE_SIZE)}>{t('supervision_task_console.show_more')}</button>}
+        </section>}
+        {bodyState === 'ready' && allTasks.length !== Object.keys(props.state.tasks).length && <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.unsupported')}</div>}
       </div>
     </aside>
   );
@@ -475,27 +443,13 @@ export function SupervisionTaskConsole(props: {
   returnFocusRef?: RefObject<HTMLButtonElement>;
 }) {
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
-  const [width, setWidth] = useState(() => loadSupervisionTaskConsolePreferences(
-    supervisionTaskConsolePreferenceBounds(window.innerWidth),
-  ).width);
-  const state = useSupervisionTaskConsole({
-    ws: props.ws,
-    connected: props.connected,
-    scope: {
-      projectName: props.projectName,
-      coordinatorSessionName: props.coordinatorSessionName,
-    },
-  });
-
+  const [width, setWidth] = useState(() => loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds(window.innerWidth)).width);
+  const state = useSupervisionTaskConsole({ ws: props.ws, connected: props.connected, scope: { projectName: props.projectName, coordinatorSessionName: props.coordinatorSessionName } });
   useEffect(() => {
-    const handleViewportResize = () => {
-      setViewportWidth(window.innerWidth);
-      setWidth((current) => clampSupervisionConsoleWidth(current, window.innerWidth));
-    };
+    const handleViewportResize = () => { setViewportWidth(window.innerWidth); setWidth((current) => clampSupervisionConsoleWidth(current, window.innerWidth)); };
     window.addEventListener('resize', handleViewportResize);
     return () => window.removeEventListener('resize', handleViewportResize);
   }, []);
-
   const persistWidth = (next: number) => {
     const bounds = supervisionTaskConsolePreferenceBounds(window.innerWidth);
     const clamped = clampSupervisionConsoleWidth(next, window.innerWidth);
@@ -503,48 +457,22 @@ export function SupervisionTaskConsole(props: {
     saveSupervisionTaskConsolePreferences({ ...current, width: clamped }, bounds);
     setWidth(clamped);
   };
-
   const startResize = (event: PointerEvent) => {
     if (props.mobile || event.button !== 0) return;
-    const startX = event.clientX;
-    const startWidth = width;
-    const target = event.currentTarget as HTMLElement;
+    const startX = event.clientX; const startWidth = width; const target = event.currentTarget as HTMLElement;
     target.setPointerCapture?.(event.pointerId);
-    const move = (moveEvent: PointerEvent) => {
-      if (moveEvent.pointerId !== event.pointerId) return;
-      persistWidth(startWidth + startX - moveEvent.clientX);
-    };
-    const stop = (stopEvent: PointerEvent) => {
-      if (stopEvent.pointerId !== event.pointerId) return;
-      target.releasePointerCapture?.(event.pointerId);
-      document.removeEventListener('pointermove', move);
-      document.removeEventListener('pointerup', stop);
-      document.removeEventListener('pointercancel', stop);
-    };
-    document.addEventListener('pointermove', move);
-    document.addEventListener('pointerup', stop);
-    document.addEventListener('pointercancel', stop);
+    const move = (moveEvent: PointerEvent) => { if (moveEvent.pointerId === event.pointerId) persistWidth(startWidth + startX - moveEvent.clientX); };
+    const stop = (stopEvent: PointerEvent) => { if (stopEvent.pointerId !== event.pointerId) return; target.releasePointerCapture?.(event.pointerId); document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', stop); document.removeEventListener('pointercancel', stop); };
+    document.addEventListener('pointermove', move); document.addEventListener('pointerup', stop); document.addEventListener('pointercancel', stop);
   };
-
   const resizeWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-    event.preventDefault();
-    const delta = event.key === 'ArrowLeft' ? 24 : -24;
-    persistWidth(width + delta);
+    event.preventDefault(); persistWidth(width + (event.key === 'ArrowLeft' ? 24 : -24));
   };
-
-  return (
-    <SupervisionTaskConsoleView
-      state={state}
-      mobile={props.mobile}
-      readOnly={props.readOnly}
-      width={width}
-      maxWidth={supervisionConsoleMaxWidth(viewportWidth)}
-      onResizeStart={startResize}
-      onResizeKeyDown={resizeWithKeyboard}
-      onClose={props.onClose}
-      onNavigateSession={props.onNavigateSession}
-      returnFocusRef={props.returnFocusRef}
-    />
-  );
+  return <SupervisionTaskConsoleView
+    state={state} mobile={props.mobile} readOnly={props.readOnly} width={width}
+    maxWidth={supervisionConsoleMaxWidth(viewportWidth)} onResizeStart={startResize}
+    onResizeKeyDown={resizeWithKeyboard} onClose={props.onClose}
+    onNavigateSession={props.onNavigateSession} returnFocusRef={props.returnFocusRef}
+  />;
 }

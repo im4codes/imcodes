@@ -3261,7 +3261,18 @@
       "ready_for_audit": "감사 준비 완료", "auditing": "감사 중", "rework": "재작업", "passed": "통과", "ready_for_integration": "통합 준비 완료",
       "integrating": "통합 중", "final_audit": "최종 감사", "finalizing": "최종 처리 중", "committed": "커밋됨", "pushed": "푸시됨",
       "recovered": "복구됨", "finalized": "완료됨", "blocked": "차단됨", "cancelled": "취소됨"
-    }
+    },
+    "tabs_label": "작업 보기",
+    "tab_ongoing": "진행 중",
+    "tab_completed": "완료",
+    "no_ongoing": "진행 중인 작업이 없습니다.",
+    "no_completed": "완료된 작업이 없습니다.",
+    "show_more": "더 보기",
+    "recent_activity": "최근 활동",
+    "implementer": "구현자",
+    "auditor": "감사자",
+    "copy_task_id": "복사",
+    "session_state": {"running": "실행 중","idle": "유휴","needs_input": "입력 필요","offline": "오프라인","unknown": "알 수 없음"}
   },
   "remote_desktop": {
     "open": "aiDesk.to 원격 데스크톱",

@@ -8,9 +8,9 @@ import {
 } from '../src/supervision-task-console-preferences.js';
 
 const BOUNDS: SupervisionTaskConsoleWidthBounds = {
-  minWidth: 320,
-  maxWidth: 720,
-  defaultWidth: 420,
+  minWidth: 720,
+  maxWidth: 1440,
+  defaultWidth: 720,
 };
 
 describe('supervision task console preferences', () => {
@@ -19,17 +19,17 @@ describe('supervision task console preferences', () => {
   });
 
   it('round-trips the local open state and dragged width', () => {
-    expect(saveSupervisionTaskConsolePreferences({ open: true, width: 584 }, BOUNDS)).toBe(true);
+    expect(saveSupervisionTaskConsolePreferences({ open: true, width: 984 }, BOUNDS)).toBe(true);
 
     expect(loadSupervisionTaskConsolePreferences(BOUNDS)).toEqual({
       open: true,
-      width: 584,
+      width: 984,
     });
   });
 
   it('clamps restored and saved widths to the caller supplied desktop range', () => {
-    expect(clampSupervisionTaskConsolePreferenceWidth(100, BOUNDS)).toBe(320);
-    expect(clampSupervisionTaskConsolePreferenceWidth(900, BOUNDS)).toBe(720);
+    expect(clampSupervisionTaskConsolePreferenceWidth(100, BOUNDS)).toBe(720);
+    expect(clampSupervisionTaskConsolePreferenceWidth(1900, BOUNDS)).toBe(1440);
 
     localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({
       version: 1,
@@ -40,21 +40,28 @@ describe('supervision task console preferences', () => {
 
     expect(saveSupervisionTaskConsolePreferences({ open: true, width: 40 }, BOUNDS)).toBe(true);
     expect(JSON.parse(localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!)).toEqual({
-      version: 1,
+      version: 2,
       open: true,
-      width: 320,
+      width: 720,
     });
+  });
+
+  it('migrates v1 by preserving open state while resetting the obsolete narrow width', () => {
+    localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      version: 1, open: true, width: 420,
+    }));
+    expect(loadSupervisionTaskConsolePreferences(BOUNDS)).toEqual({ open: true, width: 720 });
   });
 
   it.each([
     'not-json',
-    JSON.stringify({ version: 2, open: true, width: 500 }),
+    JSON.stringify({ version: 3, open: true, width: 900 }),
     JSON.stringify({ version: 1, open: 'yes', width: 500 }),
     JSON.stringify({ version: 1, open: true, width: '500' }),
     JSON.stringify({ version: 1, open: true, width: null }),
   ])('fails safely for malformed persisted state: %s', (raw) => {
     localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, raw);
-    expect(loadSupervisionTaskConsolePreferences(BOUNDS)).toEqual({ open: false, width: 420 });
+    expect(loadSupervisionTaskConsolePreferences(BOUNDS)).toEqual({ open: false, width: 720 });
   });
 
   it('fails safely when browser storage cannot be read or written', () => {
@@ -69,7 +76,7 @@ describe('supervision task console preferences', () => {
       },
     };
 
-    expect(loadSupervisionTaskConsolePreferences(BOUNDS, unreadable)).toEqual({ open: false, width: 420 });
+    expect(loadSupervisionTaskConsolePreferences(BOUNDS, unreadable)).toEqual({ open: false, width: 720 });
     expect(saveSupervisionTaskConsolePreferences({ open: true, width: 500 }, BOUNDS, unwritable)).toBe(false);
   });
 });

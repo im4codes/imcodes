@@ -3261,7 +3261,18 @@
       "ready_for_audit": "Готово к аудиту", "auditing": "Аудит", "rework": "Доработка", "passed": "Пройдено", "ready_for_integration": "Готово к интеграции",
       "integrating": "Интеграция", "final_audit": "Финальный аудит", "finalizing": "Завершение", "committed": "Зафиксировано", "pushed": "Отправлено",
       "recovered": "Восстановлено", "finalized": "Завершено", "blocked": "Заблокировано", "cancelled": "Отменено"
-    }
+    },
+    "tabs_label": "Представления задач",
+    "tab_ongoing": "В работе",
+    "tab_completed": "Завершено",
+    "no_ongoing": "Нет активных задач.",
+    "no_completed": "Нет завершённых задач.",
+    "show_more": "Показать ещё",
+    "recent_activity": "Последняя активность",
+    "implementer": "Исполнитель",
+    "auditor": "Аудитор",
+    "copy_task_id": "Копировать",
+    "session_state": {"running": "Выполняется","idle": "Ожидание","needs_input": "Нужен ответ","offline": "Не в сети","unknown": "Неизвестно"}
   },
   "remote_desktop": {
     "open": "Удалённый рабочий стол aiDesk.to",

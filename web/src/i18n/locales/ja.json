@@ -3261,7 +3261,18 @@
       "ready_for_audit": "監査準備完了", "auditing": "監査中", "rework": "再作業", "passed": "合格", "ready_for_integration": "統合準備完了",
       "integrating": "統合中", "final_audit": "最終監査", "finalizing": "最終処理中", "committed": "コミット済み", "pushed": "プッシュ済み",
       "recovered": "復旧済み", "finalized": "完了", "blocked": "ブロック中", "cancelled": "キャンセル済み"
-    }
+    },
+    "tabs_label": "タスク表示",
+    "tab_ongoing": "進行中",
+    "tab_completed": "完了",
+    "no_ongoing": "進行中のタスクはありません。",
+    "no_completed": "完了したタスクはありません。",
+    "show_more": "さらに表示",
+    "recent_activity": "最近のアクティビティ",
+    "implementer": "実装担当",
+    "auditor": "監査担当",
+    "copy_task_id": "コピー",
+    "session_state": {"running": "実行中","idle": "待機中","needs_input": "入力待ち","offline": "オフライン","unknown": "不明"}
   },
   "remote_desktop": {
     "open": "aiDesk.to リモートデスクトップ",

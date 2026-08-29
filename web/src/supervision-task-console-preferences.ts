@@ -12,7 +12,7 @@ export interface SupervisionTaskConsoleWidthBounds {
 }
 
 interface StoredSupervisionTaskConsolePreferences {
-  version: 1;
+  version: 1 | 2;
   open: boolean;
   width: number;
 }
@@ -57,7 +57,7 @@ export function loadSupervisionTaskConsolePreferences(
     const parsed = JSON.parse(raw) as Partial<StoredSupervisionTaskConsolePreferences> | null;
     if (
       !parsed
-      || parsed.version !== 1
+      || (parsed.version !== 1 && parsed.version !== 2)
       || typeof parsed.open !== 'boolean'
       || typeof parsed.width !== 'number'
     ) {
@@ -65,7 +65,12 @@ export function loadSupervisionTaskConsolePreferences(
     }
     return {
       open: parsed.open,
-      width: clampSupervisionTaskConsolePreferenceWidth(parsed.width, bounds),
+      // V1 used a 320-720 layout. Preserve visibility but reset its narrow
+      // width so the upgraded task cards are not permanently pinned small.
+      width: clampSupervisionTaskConsolePreferenceWidth(
+        parsed.version === 1 ? bounds.defaultWidth : parsed.width,
+        bounds,
+      ),
     };
   } catch {
     return defaultPreferences(bounds);
@@ -79,7 +84,7 @@ export function saveSupervisionTaskConsolePreferences(
 ): boolean {
   if (!storage) return false;
   const stored: StoredSupervisionTaskConsolePreferences = {
-    version: 1,
+    version: 2,
     open: preferences.open,
     width: clampSupervisionTaskConsolePreferenceWidth(preferences.width, bounds),
   };

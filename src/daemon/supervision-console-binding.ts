@@ -11,7 +11,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { SupervisionConsoleProducer } from './supervision-console-producer.js';
+import { SupervisionConsoleProducer, type SupervisionProducerOptions } from './supervision-console-producer.js';
 import { SupervisionConsoleSessionRegistry } from './supervision-console-session.js';
 import { migrateSupervisionStore, type SupervisionMigrationDb } from './supervision-store-migrations.js';
 import {
@@ -35,6 +35,7 @@ export interface SupervisionConsoleBindingDeps {
   now?: () => number;
   newEpoch?: () => string;
   onError?: (error: unknown) => void;
+  resolveSessionPresentation?: SupervisionProducerOptions['resolveSessionPresentation'];
 }
 
 export interface SupervisionConsoleBinding {
@@ -92,6 +93,7 @@ export function createSupervisionConsoleBinding(
     projectionEpoch,
     now: deps.now,
     broadcast: (frame) => { sessions?.broadcast(frame); },
+    resolveSessionPresentation: deps.resolveSessionPresentation,
   });
 
   sessions = new SupervisionConsoleSessionRegistry({

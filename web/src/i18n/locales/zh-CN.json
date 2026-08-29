@@ -3295,7 +3295,18 @@
       "ready_for_audit": "可审计", "auditing": "审计中", "rework": "返工", "passed": "已通过",
       "ready_for_integration": "可集成", "integrating": "集成中", "final_audit": "最终审计", "finalizing": "最终化中", "committed": "已提交",
       "pushed": "已推送", "recovered": "已恢复", "finalized": "已完成", "blocked": "已阻塞", "cancelled": "已取消"
-    }
+    },
+    "tabs_label": "任务视图",
+    "tab_ongoing": "进行中",
+    "tab_completed": "已完成",
+    "no_ongoing": "暂无进行中的任务",
+    "no_completed": "暂无已完成任务",
+    "show_more": "显示更多",
+    "recent_activity": "最近活动",
+    "implementer": "实现者",
+    "auditor": "审计者",
+    "copy_task_id": "复制",
+    "session_state": {"running": "运行中","idle": "空闲","needs_input": "等待输入","offline": "离线","unknown": "未知"}
   },
   "remote_desktop": {
     "open": "aiDesk.to 远程桌面",

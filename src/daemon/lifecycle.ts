@@ -14,7 +14,7 @@ import { loadMemoryShortRefsFromStore } from '../context/memory-short-ref.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
-import { buildSessionList } from './session-list.js';
+import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
@@ -89,6 +89,15 @@ let supervisionConsole: SupervisionConsoleBinding | undefined;
 /** Exposed for diagnostics/tests; undefined until the link is bound. */
 export function getSupervisionConsoleBinding(): SupervisionConsoleBinding | undefined {
   return supervisionConsole;
+}
+
+/** Preserve durable registry time when an assignment owner has no live session record. */
+export function resolveMissingSupervisionSessionPresentation(durableObservedAt: number): {
+  state: 'offline';
+  source: 'registry';
+  observedAt: number;
+} {
+  return { state: 'offline', source: 'registry', observedAt: durableObservedAt };
 }
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
@@ -1331,6 +1340,35 @@ export async function startup(): Promise<DaemonContext> {
       serverLink,
       // Only the coordinator that owns a project scope may subscribe to it.
       authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
+      resolveSessionPresentation: (sessionName, durableObservedAt) => {
+        const record = getSession(sessionName);
+        if (!record) {
+          return resolveMissingSupervisionSessionPresentation(durableObservedAt);
+        }
+        if (supervisionAutomation.isWaitingForUserInput(sessionName)) {
+          return {
+            label: record.label,
+            state: 'needs_input',
+            source: 'supervision',
+            observedAt: record.updatedAt,
+          };
+        }
+        const observed = resolveAuthoritativeSessionListState(record);
+        return {
+          label: record.label,
+          state: observed === 'running' || observed === 'queued'
+            ? 'running'
+            : observed === 'idle'
+              ? 'idle'
+              : observed === 'error' || observed === 'stopped'
+                ? 'offline'
+                : 'unknown',
+          source: observed === 'running' || observed === 'queued' || observed === 'idle'
+            ? 'runtime'
+            : 'registry',
+          observedAt: record.updatedAt,
+        };
+      },
       onError: (error) => logger.warn({ error }, 'supervision console projection unavailable'),
     });
     logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');

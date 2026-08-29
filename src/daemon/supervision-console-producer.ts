@@ -23,6 +23,8 @@ import {
   type SupervisionTaskConsoleAssignmentRow,
   type SupervisionTaskConsolePoolRow,
   type SupervisionConsoleValidationState,
+  type SupervisionConsoleSessionState,
+  type SupervisionConsoleSessionStateSource,
   SUPERVISION_CONSOLE_VALIDATION_STATES,
 } from '../../shared/supervision-task-console.js';
 import {
@@ -60,6 +62,13 @@ export interface SupervisionProducerOptions {
   onBoundary?: (boundary: SupervisionCrashBoundary) => void;
   /** Delivery sink. Absent means "durable only", which restart will redeliver. */
   broadcast?: (frame: SupervisionTaskConsoleDelta) => void;
+  /** Live daemon authority for assignment owner presentation. */
+  resolveSessionPresentation?: (sessionName: string, durableObservedAt: number) => {
+    label?: string;
+    state: SupervisionConsoleSessionState;
+    source: SupervisionConsoleSessionStateSource;
+    observedAt: number;
+  } | undefined;
 }
 
 export interface SupervisionOutboxRow {
@@ -104,6 +113,7 @@ export class SupervisionConsoleProducer {
   readonly #now: () => number;
   readonly #onBoundary: (boundary: SupervisionCrashBoundary) => void;
   readonly #broadcast?: (frame: SupervisionTaskConsoleDelta) => void;
+  readonly #resolveSessionPresentation?: SupervisionProducerOptions['resolveSessionPresentation'];
 
   constructor(db: SupervisionMigrationDb, options: SupervisionProducerOptions) {
     this.#db = db;
@@ -111,6 +121,7 @@ export class SupervisionConsoleProducer {
     this.#now = options.now ?? (() => 0);
     this.#onBoundary = options.onBoundary ?? (() => {});
     this.#broadcast = options.broadcast;
+    this.#resolveSessionPresentation = options.resolveSessionPresentation;
   }
 
   #transaction<T>(fn: () => T): T {
@@ -222,18 +233,24 @@ export class SupervisionConsoleProducer {
     const row = this.#db.prepare(
       `SELECT task_id, top_level_task_id, status, semantic_key, integration_owner, next_action,
               blocked_reason, recovery_state, recovery_reason, last_durable_event_id, updated_at,
-              validation_state, heartbeat_at
+              validation_state, heartbeat_at, payload_json
        FROM supervision_tasks WHERE task_id = ? AND project_name = ?`,
     ).get(taskId, projectName) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     const status = String(row.status ?? '');
     // Fail closed: never project a status the contract does not know.
     if (!isSupervisionTaskLifecycleStatus(status)) return undefined;
+    let objective: string | undefined;
+    try {
+      const payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>;
+      objective = typeof payload.objective === 'string' && payload.objective.trim()
+        ? payload.objective.trim() : undefined;
+    } catch { /* malformed legacy payload: task id remains the fail-safe title */ }
     return {
       taskId: String(row.task_id),
       topLevelTaskId: row.top_level_task_id ? String(row.top_level_task_id) : undefined,
       semanticKey: row.semantic_key ? String(row.semantic_key) : undefined,
-      title: String(row.task_id),
+      title: objective ?? String(row.task_id),
       status,
       phase: supervisionConsoleStatusGroup(status),
       validationState: readValidationState(row.validation_state),
@@ -265,17 +282,26 @@ export class SupervisionConsoleProducer {
       // Same fail-closed rule as tasks: never project an unknown status.
       if (!isSupervisionTaskLifecycleStatus(status)) continue;
       const verdict = row.verdict === 'PASS' || row.verdict === 'REWORK' ? row.verdict : undefined;
+      const ownerSessionName = row.session_name ? String(row.session_name) : undefined;
+      const durableObservedAt = Number(row.updated_at ?? 0);
+      const presentation = ownerSessionName
+        ? this.#resolveSessionPresentation?.(ownerSessionName, durableObservedAt)
+        : undefined;
       out.push({
         assignmentId: String(row.assignment_id),
         taskId: String(row.task_id),
         status,
         phase: supervisionConsoleStatusGroup(status),
         role: row.role ? String(row.role) : undefined,
-        ownerSessionName: row.session_name ? String(row.session_name) : undefined,
+        ownerSessionName,
+        ownerSessionLabel: presentation?.label,
         ownerAgentType: row.agent_type ? String(row.agent_type) : undefined,
         observedModel: row.observed_model ? String(row.observed_model) : undefined,
         observedProvider: row.observed_provider ? String(row.observed_provider)
           : (row.provider_family ? String(row.provider_family) : undefined),
+        sessionState: presentation?.state ?? 'unknown',
+        sessionStateSource: presentation?.source ?? 'registry',
+        sessionStateObservedAt: presentation?.observedAt ?? durableObservedAt,
         poolKind: readPoolKind(row.pool_kind),
         validationState: readValidationState(row.validation_state),
         auditAttemptId: row.audit_attempt_id ? String(row.audit_attempt_id) : undefined,

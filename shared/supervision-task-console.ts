@@ -221,6 +221,30 @@ export function supervisionConsoleStatusGroup(
   return SUPERVISION_CONSOLE_STATUS_GROUP[status];
 }
 
+/** Product-level tabs. Only genuinely shipped terminal states are completed. */
+export const SUPERVISION_CONSOLE_TABS = ['ongoing', 'completed'] as const;
+export type SupervisionConsoleTab = typeof SUPERVISION_CONSOLE_TABS[number];
+export const SUPERVISION_CONSOLE_COMPLETED_STATUSES = Object.freeze([
+  'committed', 'pushed', 'finalized',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[]);
+const COMPLETED_STATUS_SET = new Set<SupervisionTaskLifecycleStatus>(SUPERVISION_CONSOLE_COMPLETED_STATUSES);
+
+export function supervisionConsoleTabForStatus(
+  status: SupervisionTaskLifecycleStatus,
+): SupervisionConsoleTab {
+  return COMPLETED_STATUS_SET.has(status) ? 'completed' : 'ongoing';
+}
+
+/** Authoritative session activity presented by the daemon; never heartbeat-derived. */
+export const SUPERVISION_CONSOLE_SESSION_STATES = [
+  'running', 'idle', 'needs_input', 'offline', 'unknown',
+] as const;
+export type SupervisionConsoleSessionState = typeof SUPERVISION_CONSOLE_SESSION_STATES[number];
+export const SUPERVISION_CONSOLE_SESSION_STATE_SOURCES = [
+  'runtime', 'supervision', 'registry',
+] as const;
+export type SupervisionConsoleSessionStateSource = typeof SUPERVISION_CONSOLE_SESSION_STATE_SOURCES[number];
+
 /** Validation outcome the UI renders next to a task/assignment. */
 export const SUPERVISION_CONSOLE_VALIDATION_STATES = ['unknown', 'pending', 'passed', 'failed', 'unavailable'] as const;
 export type SupervisionConsoleValidationState = typeof SUPERVISION_CONSOLE_VALIDATION_STATES[number];
@@ -283,6 +307,10 @@ export interface SupervisionTaskConsoleAssignmentRow {
   /** Daemon-OBSERVED, not self-reported. */
   observedModel?: string;
   observedProvider?: string;
+  /** Current daemon-authoritative state of the canonical owner session. */
+  sessionState?: SupervisionConsoleSessionState;
+  sessionStateSource?: SupervisionConsoleSessionStateSource;
+  sessionStateObservedAt?: number;
   poolId?: string;
   poolKind?: SupervisionExecutionPoolKind;
   currentAction?: string;
@@ -518,6 +546,9 @@ function isAssignmentRow(value: unknown): boolean {
     && hasDerivedPhase(value)
     && (value.auditVerdict === undefined || isPeerAuditVerdict(value.auditVerdict))
     && (value.poolKind === undefined || (SUPERVISION_EXECUTION_POOL_KINDS as readonly string[]).includes(value.poolKind as string))
+    && (value.sessionState === undefined || (SUPERVISION_CONSOLE_SESSION_STATES as readonly string[]).includes(value.sessionState as string))
+    && (value.sessionStateSource === undefined || (SUPERVISION_CONSOLE_SESSION_STATE_SOURCES as readonly string[]).includes(value.sessionStateSource as string))
+    && (value.sessionStateObservedAt === undefined || isFiniteNumber(value.sessionStateObservedAt))
     && typeof value.validationState === 'string'
     && (SUPERVISION_CONSOLE_VALIDATION_STATES as readonly string[]).includes(value.validationState)
     && isFiniteNumber(value.updatedAt)

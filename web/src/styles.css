@@ -67,8 +67,6 @@ html { position: fixed; }
 .supervision-task-console-progress { height: 2px; overflow: hidden; background: rgba(148,163,184,.09); }
 .supervision-task-console-progress > span { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); transition: width .2s ease; }
 .supervision-task-console-task-meta { padding: 0 10px 9px; display: flex; flex-wrap: wrap; gap: 5px 9px; color: #64748b; font-size: 9px; }
-.supervision-task-console-heartbeat { color: #4ade80; }
-.supervision-task-console-heartbeat.is-stale { color: #f59e0b; }
 .supervision-task-console-task-details { padding: 10px; border-top: 1px solid rgba(148,163,184,.1); background: rgba(2,6,23,.3); }
 .supervision-task-console-task-details h4 { margin: 2px 0 7px; color: #94a3b8; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .supervision-task-console-fields { margin: 0 0 10px; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 5px 8px; }
@@ -11932,8 +11930,6 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-progress { height: 2px; overflow: hidden; background: rgba(148,163,184,.09); }
 .supervision-task-console-progress > span { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); transition: width .2s ease; }
 .supervision-task-console-task-meta { padding: 0 10px 9px; display: flex; flex-wrap: wrap; gap: 5px 9px; color: #64748b; font-size: 9px; }
-.supervision-task-console-heartbeat { color: #4ade80; }
-.supervision-task-console-heartbeat.is-stale { color: #f59e0b; }
 .supervision-task-console-task-details { padding: 10px; border-top: 1px solid rgba(148,163,184,.1); background: rgba(2,6,23,.3); }
 .supervision-task-console-task-details h4 { margin: 2px 0 7px; color: #94a3b8; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .supervision-task-console-fields { margin: 0 0 10px; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 5px 8px; }
@@ -11962,4 +11958,72 @@ button.quick-agent-delegation-preset.active {
 @media (prefers-reduced-motion: reduce) {
   .supervision-task-console-transition { animation: none; }
   .supervision-task-console-progress > span { transition: none; }
+}
+
+/* Supervision task console V2 — compact activity board. Kept as a final override
+   because the legacy console rules also exist in the generated compatibility
+   portion of this stylesheet. */
+.supervision-task-console.is-desktop { max-width: 92vw; container-type: inline-size; container-name: supervision-console; }
+.supervision-task-console-tabs { padding: 7px 10px 0; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; border-bottom: 1px solid rgba(148,163,184,.1); }
+.supervision-task-console-tabs button { padding: 7px 9px; color: #64748b; background: transparent; border: 0; border-bottom: 2px solid transparent; font: inherit; font-size: 11px; cursor: pointer; }
+.supervision-task-console-tabs button[aria-selected="true"] { color: #dbeafe; border-color: #22d3ee; background: linear-gradient(180deg,transparent,rgba(34,211,238,.07)); }
+.supervision-task-console-tabs button span { margin-left: 5px; padding: 1px 5px; border: 1px solid rgba(148,163,184,.18); border-radius: 999px; font-size: 9px; }
+.supervision-task-console-grid { display: grid; grid-template-columns: minmax(0,1fr); gap: 7px; align-items: start; }
+.supervision-task-console-grid > .supervision-task-console-state { grid-column: 1/-1; }
+.supervision-task-console-task { margin: 0; overflow: visible; border-color: rgba(148,163,184,.13); border-radius: 8px; }
+.supervision-task-console-task-head { display: grid; grid-template-columns: minmax(0,1fr) minmax(210px,.72fr); align-items: start; }
+.supervision-task-console-task-summary { min-height: 54px; padding: 8px 9px; }
+.supervision-task-console-task-title strong { display: -webkit-box; overflow: hidden; font-size: 12px; line-height: 1.35; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.supervision-task-console-role-tracks { padding: 7px 7px 7px 0; display: grid; gap: 4px; }
+.supervision-task-console-session { position: relative; min-width: 0; padding: 5px 6px; display: grid; grid-template-columns: 7px minmax(0,1fr) auto; align-items: center; gap: 5px; color: #94a3b8; background: rgba(2,6,23,.36); border: 1px solid rgba(148,163,184,.12); border-radius: 6px; font: inherit; text-align: left; cursor: pointer; }
+.supervision-task-console-session:hover, .supervision-task-console-session:focus-visible { color: #e2e8f0; border-color: rgba(34,211,238,.38); outline: none; }
+.supervision-task-console-session-icon { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 7px currentColor; }
+.supervision-task-console-session-copy { min-width: 0; display: flex; flex-direction: column; }
+.supervision-task-console-session-copy strong, .supervision-task-console-session-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.supervision-task-console-session-copy strong { color: inherit; font-size: 9px; }
+.supervision-task-console-session-copy small { color: #64748b; font-size: 7px; }
+.supervision-task-console-session-state { font-size: 7px; text-transform: uppercase; }
+.supervision-task-console-session.session-running { color: #22d3ee; }
+.supervision-task-console-session.lane-auditor.session-running { color: #a78bfa; }
+.supervision-task-console-session.session-idle { color: #64748b; }
+.supervision-task-console-session.session-needs_input { color: #fb923c; }
+.supervision-task-console-session.session-offline, .supervision-task-console-session.session-unknown { color: #475569; }
+.supervision-task-console-task-meta { padding: 0 9px 7px; line-height: 1.35; }
+.supervision-task-console-stage-track { height: 3px; margin: 0 9px 6px; display: grid; grid-template-columns: repeat(4,1fr); gap: 3px; }
+.supervision-task-console-stage-track span { border-radius: 99px; background: rgba(71,85,105,.42); }
+.supervision-task-console-stage-track.phase-active span:first-child,
+.supervision-task-console-stage-track.phase-rework span:first-child { background: #22d3ee; }
+.supervision-task-console-stage-track.phase-audit span:nth-child(-n+2) { background: #a78bfa; }
+.supervision-task-console-stage-track.phase-integration span:nth-child(-n+3) { background: #a78bfa; }
+.supervision-task-console-stage-track.phase-final span { background: #4ade80; }
+.supervision-task-console-task-meta .is-blocker { width: 100%; color: #fb923c; font-weight: 700; }
+.supervision-task-console-task-details { padding: 8px 9px; }
+.supervision-task-console-fields { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.supervision-task-console-show-more { grid-column: 1/-1; padding: 8px; color: #67e8f9; background: rgba(8,145,178,.08); border: 1px solid rgba(34,211,238,.18); border-radius: 7px; cursor: pointer; }
+.supervision-task-console-copy-id { max-width: 100%; padding: 0; display: flex; gap: 5px; color: #94a3b8; background: none; border: 0; font: inherit; cursor: copy; }
+.supervision-task-console-copy-id span { color: #22d3ee; font-size: 7px; }
+@keyframes supervision-console-flow { to { background-position: 200% 0; } }
+@keyframes supervision-console-pulse { 50% { border-color: rgba(100,116,139,.35); } }
+@keyframes supervision-console-breathe { 50% { border-color: rgba(251,146,60,.7); box-shadow: 0 0 11px rgba(251,146,60,.12); } }
+.supervision-task-console-task.activity-running { border-color: rgba(34,211,238,.42); background-image: linear-gradient(110deg,rgba(34,211,238,.04),rgba(15,23,42,.68),rgba(34,211,238,.1)); background-size: 200% 100%; animation: supervision-console-flow 2.4s linear infinite; }
+.supervision-task-console-task.activity-audit-running { border-color: rgba(167,139,250,.45); background-image: linear-gradient(110deg,rgba(167,139,250,.04),rgba(15,23,42,.68),rgba(167,139,250,.1)); background-size: 200% 100%; animation: supervision-console-flow 2.9s linear infinite; }
+.supervision-task-console-task.activity-idle { animation: supervision-console-pulse 4s ease-in-out infinite; }
+.supervision-task-console-task.activity-needs_input { border-color: rgba(251,146,60,.48); animation: supervision-console-breathe 2.1s ease-in-out infinite; }
+.supervision-task-console-task.activity-offline, .supervision-task-console-task.activity-unknown { border-color: rgba(71,85,105,.32); }
+.supervision-task-console-status.status-committed { color: #86efac; border-color: rgba(74,222,128,.3); background: rgba(34,197,94,.08); }
+@container supervision-console (min-width: 1080px) {
+  .supervision-task-console-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .supervision-task-console-task-head { grid-template-columns: minmax(0,1fr) minmax(190px,.62fr); }
+}
+@media (max-width: 640px) {
+  .supervision-task-console-grid { grid-template-columns: minmax(0,1fr) !important; }
+  .supervision-task-console-task-head { grid-template-columns: minmax(0,1fr); }
+  .supervision-task-console-role-tracks { padding: 0 8px 7px; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .supervision-task-console-fields { grid-template-columns: minmax(0,1fr); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .supervision-task-console-task.activity-running,
+  .supervision-task-console-task.activity-audit-running,
+  .supervision-task-console-task.activity-idle,
+  .supervision-task-console-task.activity-needs_input { animation: none; }
 }

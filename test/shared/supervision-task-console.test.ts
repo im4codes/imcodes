@@ -4,6 +4,7 @@ import {
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
   SUPERVISION_CONSOLE_STATUS_GROUP,
   SUPERVISION_CONSOLE_STATUS_GROUPS,
+  SUPERVISION_CONSOLE_COMPLETED_STATUSES,
   SUPERVISION_CONSOLE_RESYNC_REASONS,
   SUPERVISION_CONSOLE_TRANSITION_FIELDS,
   canCoalesceSupervisionTaskRows,
@@ -13,6 +14,7 @@ import {
   isSupervisionConsoleAudienceMember,
   isValidSupervisionTaskConsoleEvent,
   supervisionConsoleStatusGroup,
+  supervisionConsoleTabForStatus,
   type SupervisionTaskConsoleCursorState,
   type SupervisionTaskConsoleTaskRow,
 } from '../../shared/supervision-task-console.js';
@@ -55,6 +57,17 @@ describe('supervision task console status grouping', () => {
       if ((SUPERVISION_TASK_LIFECYCLE_STATUSES as readonly string[]).includes(eventOnly)) continue;
       expect(mapped).not.toContain(eventOnly);
     }
+  });
+
+  it('puts only committed, pushed and finalized in completed history', () => {
+    expect(SUPERVISION_CONSOLE_COMPLETED_STATUSES).toEqual(['committed', 'pushed', 'finalized']);
+    for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES) {
+      expect(supervisionConsoleTabForStatus(status), status).toBe(
+        ['committed', 'pushed', 'finalized'].includes(status) ? 'completed' : 'ongoing',
+      );
+    }
+    expect(supervisionConsoleTabForStatus('blocked')).toBe('ongoing');
+    expect(supervisionConsoleTabForStatus('cancelled')).toBe('ongoing');
   });
 });
 
@@ -178,8 +191,15 @@ describe('supervision console wire validation', () => {
     expect(isValidSupervisionTaskConsoleEvent({
       ...base, op: 'assignment_upsert',
       assignment: { assignmentId: 'asg-1', taskId: 'tsk-1', status: 'auditing',
-        phase: 'audit', validationState: 'pending', updatedAt: 1, lastEventId: 2 },
+        phase: 'audit', validationState: 'pending', sessionState: 'running',
+        sessionStateSource: 'runtime', sessionStateObservedAt: 1, updatedAt: 1, lastEventId: 2 },
     })).toBe(true);
+    expect(isValidSupervisionTaskConsoleEvent({
+      ...base, op: 'assignment_upsert',
+      assignment: { assignmentId: 'asg-1', taskId: 'tsk-1', status: 'auditing',
+        phase: 'audit', validationState: 'pending', sessionState: 'stale',
+        sessionStateSource: 'model', sessionStateObservedAt: Number.NaN, updatedAt: 1, lastEventId: 2 },
+    })).toBe(false);
   });
 
   it('rejects a frame missing subscription identity or authority epoch', () => {

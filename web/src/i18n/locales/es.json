@@ -3262,7 +3262,18 @@
       "ready_for_audit": "Lista para auditoría", "auditing": "Auditando", "rework": "Revisión", "passed": "Aprobada", "ready_for_integration": "Lista para integración",
       "integrating": "Integrando", "final_audit": "Auditoría final", "finalizing": "Finalizando", "committed": "Confirmada", "pushed": "Enviada",
       "recovered": "Recuperada", "finalized": "Finalizada", "blocked": "Bloqueada", "cancelled": "Cancelada"
-    }
+    },
+    "tabs_label": "Vistas de tareas",
+    "tab_ongoing": "En curso",
+    "tab_completed": "Completadas",
+    "no_ongoing": "No hay tareas activas.",
+    "no_completed": "No hay tareas completadas.",
+    "show_more": "Mostrar más",
+    "recent_activity": "Actividad reciente",
+    "implementer": "Implementador",
+    "auditor": "Auditor",
+    "copy_task_id": "Copiar",
+    "session_state": {"running": "En ejecución","idle": "Inactivo","needs_input": "Requiere atención","offline": "Sin conexión","unknown": "Desconocido"}
   },
   "remote_desktop": {
     "open": "Escritorio remoto de aiDesk.to",

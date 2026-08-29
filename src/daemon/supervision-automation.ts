@@ -880,6 +880,11 @@ class SupervisionAutomation {
     this.automaticPeerAuditCompatibilityForTests = enabled;
   }
 
+  /** Presentation seam for the console; this is authoritative run state. */
+  isWaitingForUserInput(sessionName: string): boolean {
+    return this.heartbeatPausedForNeedsInput.has(sessionName);
+  }
+
   private emitWarning(sessionName: string, text: string): void {
     timelineEmitter.emit(
       sessionName,

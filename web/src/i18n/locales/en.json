@@ -3295,7 +3295,18 @@
       "ready_for_audit": "Ready for audit", "auditing": "Auditing", "rework": "Rework", "passed": "Passed",
       "ready_for_integration": "Ready for integration", "integrating": "Integrating", "final_audit": "Final audit", "finalizing": "Finalizing", "committed": "Committed",
       "pushed": "Pushed", "recovered": "Recovered", "finalized": "Finalized", "blocked": "Blocked", "cancelled": "Cancelled"
-    }
+    },
+    "tabs_label": "Task views",
+    "tab_ongoing": "Ongoing",
+    "tab_completed": "Completed",
+    "no_ongoing": "No active tasks.",
+    "no_completed": "No completed tasks.",
+    "show_more": "Show more",
+    "recent_activity": "Recent activity",
+    "implementer": "Implementer",
+    "auditor": "Auditor",
+    "copy_task_id": "Copy",
+    "session_state": {"running": "Running","idle": "Idle","needs_input": "Needs input","offline": "Offline","unknown": "Unknown"}
   },
   "remote_desktop": {
     "open": "aiDesk.to Remote Desktop",

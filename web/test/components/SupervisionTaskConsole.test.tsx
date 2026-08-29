@@ -12,6 +12,7 @@ import {
   SupervisionTaskConsoleToggle,
   SupervisionTaskConsoleView,
   clampSupervisionConsoleWidth,
+  sortSupervisionConsoleTasks,
   supervisionConsoleMaxWidth,
 } from '../../src/components/SupervisionTaskConsole.js';
 import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../../src/supervision-task-console-preferences.js';
@@ -120,6 +121,9 @@ function state(
         observedModel: 'gpt-5.6-sol',
         poolKind: 'primary',
         validationState: 'pending',
+        sessionState: 'running',
+        sessionStateSource: 'runtime',
+        sessionStateObservedAt: NOW,
         heartbeatAt: NOW - 100,
         updatedAt: NOW,
         lastEventId: 20,
@@ -136,6 +140,9 @@ function state(
         poolKind: 'economy',
         validationState: 'passed',
         auditVerdict: 'PASS',
+        sessionState: 'running',
+        sessionStateSource: 'runtime',
+        sessionStateObservedAt: NOW,
         updatedAt: NOW,
         lastEventId: 21,
       },
@@ -189,12 +196,12 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
   });
 
-  it('bounds the desktop split to 320-720px and never past 65% of the viewport', () => {
-    expect(clampSupervisionConsoleWidth(500, 4000)).toBe(500);
-    expect(clampSupervisionConsoleWidth(10, 4000)).toBe(320);
-    expect(clampSupervisionConsoleWidth(99_999, 4000)).toBe(720);
-    expect(clampSupervisionConsoleWidth(720, 1000)).toBe(650);
-    expect(clampSupervisionConsoleWidth(400, 400)).toBe(320);
+  it('bounds the desktop split to 720-1440px and never past 92% of the viewport', () => {
+    expect(clampSupervisionConsoleWidth(1000, 4000)).toBe(1000);
+    expect(clampSupervisionConsoleWidth(10, 4000)).toBe(720);
+    expect(clampSupervisionConsoleWidth(99_999, 4000)).toBe(1440);
+    expect(clampSupervisionConsoleWidth(1200, 1000)).toBe(920);
+    expect(clampSupervisionConsoleWidth(400, 400)).toBe(368);
   });
 
   it('publishes the split bounds to assistive tech', () => {
@@ -203,17 +210,17 @@ describe('SupervisionTaskConsole', () => {
         state={state()}
         mobile={false}
         now={NOW}
-        width={420}
-        maxWidth={650}
+        width={720}
+        maxWidth={920}
         onResizeKeyDown={() => {}}
         onClose={() => {}}
         onNavigateSession={() => {}}
       />,
     );
     const handle = screen.getByRole('separator', { name: 'supervision_task_console.resize' });
-    expect(handle.getAttribute('aria-valuemin')).toBe('320');
-    expect(handle.getAttribute('aria-valuemax')).toBe('650');
-    expect(handle.getAttribute('aria-valuenow')).toBe('420');
+    expect(handle.getAttribute('aria-valuemin')).toBe('720');
+    expect(handle.getAttribute('aria-valuemax')).toBe('920');
+    expect(handle.getAttribute('aria-valuenow')).toBe('720');
   });
 
   it.each([1, 2, 3])('clamps connected drag and keyboard paths without leaking viewport state (repeat %i)', () => {
@@ -237,21 +244,21 @@ describe('SupervisionTaskConsole', () => {
     dispatchPointerEvent(handle, 'pointerdown', { button: 0, pointerId: 7, clientX: 500 });
     expect(addListenerSpy).toHaveBeenCalledWith('pointermove', expect.any(Function));
     dispatchPointerEvent(document, 'pointermove', { pointerId: 99, clientX: -10_000 });
-    expect(handle.getAttribute('aria-valuenow')).toBe('420');
+    expect(handle.getAttribute('aria-valuenow')).toBe('720');
     const acceptedMove = dispatchPointerEvent(document, 'pointermove', { pointerId: 7, clientX: -10_000 });
     expect(acceptedMove.clientX).toBe(-10_000);
-    expect(handle.getAttribute('aria-valuenow')).toBe('650');
+    expect(handle.getAttribute('aria-valuenow')).toBe('920');
     dispatchPointerEvent(document, 'pointerup', { pointerId: 7 });
     addListenerSpy.mockRestore();
 
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800, writable: true });
     fireEvent(window, new Event('resize'));
-    expect(handle.getAttribute('aria-valuemax')).toBe('520');
-    expect(handle.getAttribute('aria-valuenow')).toBe('520');
+    expect(handle.getAttribute('aria-valuemax')).toBe('736');
+    expect(handle.getAttribute('aria-valuenow')).toBe('736');
     for (let index = 0; index < 30; index += 1) fireEvent.keyDown(handle, { key: 'ArrowRight' });
-    expect(handle.getAttribute('aria-valuenow')).toBe('320');
+    expect(handle.getAttribute('aria-valuenow')).toBe('720');
     for (let index = 0; index < 30; index += 1) fireEvent.keyDown(handle, { key: 'ArrowLeft' });
-    expect(handle.getAttribute('aria-valuenow')).toBe('520');
+    expect(handle.getAttribute('aria-valuenow')).toBe('736');
     view.unmount();
   });
 
@@ -275,23 +282,23 @@ describe('SupervisionTaskConsole', () => {
     dispatchPointerEvent(handle, 'pointerdown', { button: 0, pointerId: 11, clientX: 500 });
     dispatchPointerEvent(document, 'pointermove', { pointerId: 11, clientX: 340 });
     dispatchPointerEvent(document, 'pointerup', { pointerId: 11 });
-    expect(handle.getAttribute('aria-valuenow')).toBe('580');
-    expect(JSON.parse(window.localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).width).toBe(580);
+    expect(handle.getAttribute('aria-valuenow')).toBe('880');
+    expect(JSON.parse(window.localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).width).toBe(880);
 
     view.unmount();
     view = renderConsole();
     handle = screen.getByRole('separator', { name: 'supervision_task_console.resize' });
-    expect(handle.getAttribute('aria-valuenow')).toBe('580');
+    expect(handle.getAttribute('aria-valuenow')).toBe('880');
     fireEvent.keyDown(handle, { key: 'ArrowLeft' });
-    expect(handle.getAttribute('aria-valuenow')).toBe('604');
-    expect(JSON.parse(window.localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).width).toBe(604);
+    expect(handle.getAttribute('aria-valuenow')).toBe('904');
+    expect(JSON.parse(window.localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).width).toBe(904);
 
     view.unmount();
     renderConsole();
-    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('604');
+    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('904');
   });
 
-  it('falls back for malformed width storage and clamps restored width to the current 65vw cap', () => {
+  it('falls back for malformed storage and migrates the old narrow v1 width to 720', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1000, writable: true });
     window.localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, '{bad json');
     const props = {
@@ -305,12 +312,12 @@ describe('SupervisionTaskConsole', () => {
       onNavigateSession: () => {},
     };
     const view = render(<SupervisionTaskConsole {...props} />);
-    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('420');
+    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('720');
 
     view.unmount();
     window.localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({ version: 1, open: true, width: 700 }));
     render(<SupervisionTaskConsole {...props} />);
-    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('650');
+    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('720');
   });
 
   it('keeps the mobile panel full-screen regardless of a persisted desktop width', () => {
@@ -361,7 +368,161 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.getByRole('button', { name: 'mutate-task' })).toBeTruthy();
   });
 
-  it('renders grouped real-time evidence, two pools, stale heartbeat, and canonical owner navigation', () => {
+  it('sorts by authoritative attention/runtime state, never by heartbeat age', () => {
+    const row = (taskId: string, status: 'implementing' | 'auditing' | 'blocked', updatedAt: number) => ({
+      taskId, title: taskId, status, phase: supervisionConsoleStatusGroup(status),
+      validationState: 'unknown' as const, heartbeatAt: taskId === 'idle' ? NOW : 1,
+      updatedAt, lastEventId: updatedAt,
+    });
+    const tasks = [row('idle', 'implementing', 50), row('audit', 'auditing', 40), row('running', 'implementing', 30), row('blocked', 'blocked', 20)];
+    const assignments = new Map([
+      ['idle', [{ assignmentId: 'a-idle', taskId: 'idle', status: 'implementing' as const, phase: 'active' as const, role: 'implementer', validationState: 'unknown' as const, sessionState: 'idle' as const, updatedAt: 50, lastEventId: 1 }]],
+      ['audit', [{ assignmentId: 'a-audit', taskId: 'audit', status: 'auditing' as const, phase: 'audit' as const, role: 'auditor', validationState: 'unknown' as const, sessionState: 'running' as const, updatedAt: 40, lastEventId: 2 }]],
+      ['running', [{ assignmentId: 'a-running', taskId: 'running', status: 'implementing' as const, phase: 'active' as const, role: 'implementer', validationState: 'unknown' as const, sessionState: 'running' as const, updatedAt: 30, lastEventId: 3 }]],
+    ]);
+    expect(sortSupervisionConsoleTasks(tasks, assignments).map((task) => task.taskId))
+      .toEqual(['blocked', 'running', 'audit', 'idle']);
+  });
+
+  it('sorts equal-priority idle tasks by authoritative session activity over contradictory task updates', () => {
+    const tasks = [
+      {
+        taskId: 'session-1000', title: 'Session 1000', status: 'implementing' as const,
+        phase: 'active' as const, validationState: 'unknown' as const,
+        updatedAt: 10, lastEventId: 1,
+      },
+      {
+        taskId: 'session-50', title: 'Session 50', status: 'implementing' as const,
+        phase: 'active' as const, validationState: 'unknown' as const,
+        updatedAt: 10_000, lastEventId: 2,
+      },
+    ];
+    const assignments = new Map([
+      ['session-1000', [{
+        assignmentId: 'assignment-1000', taskId: 'session-1000', status: 'implementing' as const,
+        phase: 'active' as const, role: 'implementer', validationState: 'unknown' as const, sessionState: 'idle' as const,
+        sessionStateObservedAt: 1_000, updatedAt: 20, lastEventId: 3,
+      }]],
+      ['session-50', [{
+        assignmentId: 'assignment-50', taskId: 'session-50', status: 'implementing' as const,
+        phase: 'active' as const, role: 'implementer', validationState: 'unknown' as const, sessionState: 'idle' as const,
+        sessionStateObservedAt: 50, updatedAt: 9_000, lastEventId: 4,
+      }]],
+    ]);
+
+    expect(sortSupervisionConsoleTasks(tasks, assignments).map((task) => task.taskId))
+      .toEqual(['session-1000', 'session-50']);
+  });
+
+  it('uses exact production roles for implementer navigation and runtime priority', () => {
+    const task = {
+      taskId: 'production-shape', title: 'Production role shape', status: 'implementing' as const,
+      phase: 'active' as const, validationState: 'pending' as const,
+      updatedAt: 10, lastEventId: 30,
+    };
+    const auditRunningTask = {
+      taskId: 'audit-running', title: 'Audit running', status: 'auditing' as const,
+      phase: 'audit' as const, validationState: 'pending' as const,
+      updatedAt: 9, lastEventId: 31,
+    };
+    const productionAssignments = [{
+      assignmentId: 'coordinator', taskId: task.taskId, status: 'implementing' as const,
+      phase: 'active' as const, role: 'coordinator', ownerSessionName: 'deck_alpha_brain',
+      ownerSessionLabel: 'Coordinator', validationState: 'unknown' as const,
+      sessionState: 'running' as const, sessionStateObservedAt: 1_001, updatedAt: 1_001, lastEventId: 40,
+    }, {
+      assignmentId: 'integration-owner', taskId: task.taskId, status: 'ready_for_integration' as const,
+      phase: 'integration' as const, role: 'integration_owner', ownerSessionName: 'deck_alpha_integrator',
+      ownerSessionLabel: 'Integrator', validationState: 'passed' as const,
+      sessionState: 'running' as const, sessionStateObservedAt: 1_000, updatedAt: 1_000, lastEventId: 41,
+    }, {
+      assignmentId: 'malformed-role', taskId: task.taskId, status: 'implementing' as const,
+      phase: 'active' as const, role: 'Implementer', ownerSessionName: 'deck_alpha_impostor',
+      ownerSessionLabel: 'Malformed Role', validationState: 'unknown' as const,
+      sessionState: 'running' as const, sessionStateObservedAt: 999, updatedAt: 999, lastEventId: 42,
+    }, {
+      assignmentId: 'implementer', taskId: task.taskId, status: 'implementing' as const,
+      phase: 'active' as const, role: 'implementer', ownerSessionName: 'deck_alpha_worker',
+      ownerSessionLabel: 'True Worker', validationState: 'pending' as const,
+      sessionState: 'idle' as const, sessionStateObservedAt: 100, updatedAt: 100, lastEventId: 43,
+    }, {
+      assignmentId: 'auditor', taskId: task.taskId, status: 'auditing' as const,
+      phase: 'audit' as const, role: 'auditor', ownerSessionName: 'deck_alpha_auditor',
+      ownerSessionLabel: 'True Auditor', validationState: 'pending' as const,
+      sessionState: 'idle' as const, sessionStateObservedAt: 200, updatedAt: 200, lastEventId: 44,
+    }];
+    const auditRunningAssignments = [{
+      assignmentId: 'other-auditor', taskId: auditRunningTask.taskId, status: 'auditing' as const,
+      phase: 'audit' as const, role: 'auditor', validationState: 'pending' as const,
+      sessionState: 'running' as const, sessionStateObservedAt: 50, updatedAt: 50, lastEventId: 45,
+    }];
+
+    expect(sortSupervisionConsoleTasks(
+      [task, auditRunningTask],
+      new Map([[task.taskId, productionAssignments], [auditRunningTask.taskId, auditRunningAssignments]]),
+    ).map((row) => row.taskId)).toEqual(['audit-running', 'production-shape']);
+
+    const onNavigateSession = vi.fn();
+    render(<SupervisionTaskConsoleView
+      state={state({
+        tasks: { [task.taskId]: task },
+        assignments: Object.fromEntries(productionAssignments.map((assignment) => [assignment.assignmentId, assignment])),
+      })}
+      mobile={false}
+      onClose={() => {}}
+      onNavigateSession={onNavigateSession}
+    />);
+
+    expect(screen.getByTestId(`task-card-${task.taskId}`).getAttribute('data-activity-state')).toBe('idle');
+    expect(screen.queryByText('Coordinator')).toBeNull();
+    expect(screen.queryByText('Integrator')).toBeNull();
+    expect(screen.queryByText('Malformed Role')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /True Worker/ }));
+    fireEvent.click(screen.getByRole('button', { name: /True Auditor/ }));
+    expect(onNavigateSession.mock.calls).toEqual([
+      ['deck_alpha_worker'],
+      ['deck_alpha_auditor'],
+    ]);
+  });
+
+  it('provides keyboard tabs, keeps cancelled ongoing, and preserves expanded details across tabs', () => {
+    const initial = state();
+    const completed = {
+      taskId: 'task-complete', title: 'Released task', status: 'finalized' as const, phase: 'final' as const,
+      validationState: 'passed' as const, updatedAt: NOW + 1, lastEventId: 22,
+    };
+    const cancelled = {
+      taskId: 'task-cancelled', title: 'Cancelled task', status: 'cancelled' as const, phase: 'final' as const,
+      validationState: 'failed' as const, updatedAt: NOW + 2, lastEventId: 23,
+    };
+    render(<SupervisionTaskConsoleView state={state({ tasks: { ...initial.tasks, [completed.taskId]: completed, [cancelled.taskId]: cancelled } })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
+    const ongoing = screen.getByRole('tab', { name: /supervision_task_console.tab_ongoing/ });
+    fireEvent.click(screen.getByText('Build live task console'));
+    expect(screen.getByText('Cancelled task')).toBeTruthy();
+    expect(screen.queryByText('Released task')).toBeNull();
+    fireEvent.keyDown(ongoing, { key: 'ArrowRight' });
+    const completedTab = screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ });
+    expect(document.activeElement).toBe(completedTab);
+    expect(completedTab.getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByText('Released task')).toBeTruthy();
+    expect(screen.queryByText('Cancelled task')).toBeNull();
+    fireEvent.keyDown(completedTab, { key: 'Home' });
+    expect(screen.getByText('supervision_task_console.event_op.assignment_upsert')).toBeTruthy();
+  });
+
+  it('limits completed history to ten rows until show-more is requested', () => {
+    const tasks = Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`done-${index}`, {
+      taskId: `done-${index}`, title: `Done ${index}`, status: 'pushed' as const, phase: 'final' as const,
+      validationState: 'passed' as const, updatedAt: NOW - index, lastEventId: index + 1,
+    }]));
+    render(<SupervisionTaskConsoleView state={state({ tasks, assignments: {} })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ }));
+    expect(screen.getAllByTestId(/task-card-/)).toHaveLength(10);
+    fireEvent.click(screen.getByRole('button', { name: 'supervision_task_console.show_more' }));
+    expect(screen.getAllByTestId(/task-card-/)).toHaveLength(12);
+  });
+
+  it('renders compact tabs and authoritative role states without heartbeat inference', () => {
     const onNavigateSession = vi.fn();
     const onResizeKeyDown = vi.fn();
     const view = render(
@@ -369,7 +530,7 @@ describe('SupervisionTaskConsole', () => {
         state={state()}
         mobile={false}
         now={NOW}
-        width={420}
+        width={720}
         onResizeKeyDown={onResizeKeyDown}
         onClose={() => {}}
         onNavigateSession={onNavigateSession}
@@ -377,22 +538,24 @@ describe('SupervisionTaskConsole', () => {
     );
     expect(screen.getByRole('complementary', { name: 'supervision_task_console.title' })).toBeTruthy();
     const separator = screen.getByRole('separator', { name: 'supervision_task_console.resize' });
-    expect(separator.getAttribute('aria-valuenow')).toBe('420');
+    expect(separator.getAttribute('aria-valuenow')).toBe('720');
     fireEvent.keyDown(separator, { key: 'ArrowLeft' });
     expect(onResizeKeyDown).toHaveBeenCalledTimes(1);
-    expect(screen.getByText('supervision_task_console.group.active')).toBeTruthy();
-    expect(screen.getByText('supervision_task_console.group.audit')).toBeTruthy();
-    expect(screen.getByText('supervision_task_console.heartbeat_stale')).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console.tab_ongoing/ }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ })).toBeTruthy();
+    expect(screen.queryByText('supervision_task_console.heartbeat_stale')).toBeNull();
+    expect(readFileSync(resolve(import.meta.dirname, '../../src/components/SupervisionTaskConsole.tsx'), 'utf8')).not.toMatch(/heartbeat/i);
+    expect(screen.getAllByText(/supervision_task_console\.session_state\.running/)).toHaveLength(2);
     expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeTruthy();
     expect(view.container.querySelector('img')).toBeNull();
 
     fireEvent.click(screen.getByText('Build live task console'));
-    expect(screen.getAllByText('supervision_task_console.pool_kind.primary').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('supervision_task_console.pool_kind.economy').length).toBeGreaterThan(0);
-    expect(screen.getAllByTestId(/task-assignment-/)).toHaveLength(2);
     expect(screen.getByText('supervision_task_console.event_op.assignment_upsert')).toBeTruthy();
+    const taskSummary = screen.getByText('Build live task console').closest('button')!;
+    expect(taskSummary.getAttribute('aria-expanded')).toBe('true');
     fireEvent.click(screen.getByRole('button', { name: /Worker One/ }));
     expect(onNavigateSession).toHaveBeenCalledWith('deck_alpha_worker');
+    expect(taskSummary.getAttribute('aria-expanded')).toBe('true');
   });
 
   it('uses an accessible mobile dialog and closes on Escape', async () => {
@@ -414,8 +577,8 @@ describe('SupervisionTaskConsole', () => {
     expect(dialog.getAttribute('aria-modal')).toBe('true');
     const close = screen.getByRole('button', { name: 'common.close' });
     await waitFor(() => expect(document.activeElement).toBe(close));
-    const summaries = [...view.container.querySelectorAll<HTMLButtonElement>('button[aria-expanded]')];
-    const last = summaries[summaries.length - 1];
+    const focusable = [...view.container.querySelectorAll<HTMLButtonElement>('button:not([disabled])')];
+    const last = focusable[focusable.length - 1];
     last.focus();
     fireEvent.keyDown(last, { key: 'Tab' });
     expect(document.activeElement).toBe(close);
@@ -476,6 +639,7 @@ describe('SupervisionTaskConsole', () => {
       status,
       phase: supervisionConsoleStatusGroup(status),
       validationState: 'unknown' as const,
+      currentAction: 'Contract row',
       updatedAt: NOW - index,
       lastEventId: index + 1,
     }]));
@@ -488,11 +652,17 @@ describe('SupervisionTaskConsole', () => {
         onNavigateSession={() => {}}
       />,
     );
-    for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES) {
+    for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES.filter((value) => !['committed', 'pushed', 'finalized'].includes(value))) {
+      expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
+    }
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ }));
+    for (const status of ['committed', 'pushed', 'finalized']) {
       expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
     }
     const css = readFileSync(resolve(import.meta.dirname, '../../src/styles.css'), 'utf8');
-    expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.supervision-task-console-transition\s*\{\s*animation:\s*none/);
+    expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?activity-running[\s\S]*?animation:\s*none/);
+    expect(css).toMatch(/container-name:\s*supervision-console/);
+    expect(css).toMatch(/@container supervision-console \(min-width: 1080px\)[\s\S]*?grid-template-columns:\s*repeat\(2/);
     const app = readFileSync(resolve(import.meta.dirname, '../../src/app.tsx'), 'utf8');
     expect(app).toMatch(/onNavigateSession=\{\(sessionName\) => \{\s*navigateToSession\(sessionName\);/);
     expect(app).toMatch(/<SupervisionTaskConsole[\s\S]*?connected=\{connected && daemonOnline\}/);

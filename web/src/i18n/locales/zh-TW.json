@@ -3295,7 +3295,18 @@
       "ready_for_audit": "可稽核", "auditing": "稽核中", "rework": "返工", "passed": "已通過",
       "ready_for_integration": "可整合", "integrating": "整合中", "final_audit": "最終稽核", "finalizing": "最終化中", "committed": "已提交",
       "pushed": "已推送", "recovered": "已復原", "finalized": "已完成", "blocked": "已阻塞", "cancelled": "已取消"
-    }
+    },
+    "tabs_label": "任務檢視",
+    "tab_ongoing": "進行中",
+    "tab_completed": "已完成",
+    "no_ongoing": "暫無進行中的任務",
+    "no_completed": "暫無已完成任務",
+    "show_more": "顯示更多",
+    "recent_activity": "最近活動",
+    "implementer": "實作者",
+    "auditor": "稽核者",
+    "copy_task_id": "複製",
+    "session_state": {"running": "執行中","idle": "閒置","needs_input": "等待輸入","offline": "離線","unknown": "未知"}
   },
   "remote_desktop": {
     "open": "aiDesk.to 遠端桌面",
