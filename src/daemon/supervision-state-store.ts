@@ -524,6 +524,41 @@ function validRepoPath(path: string): boolean {
   return Boolean(path) && !path.startsWith('/') && !path.split('/').includes('..') && !/[\u0000-\u001f\u007f]/.test(path);
 }
 
+/**
+ * Lifecycle paths by which an exact audit receipt may advance its target.
+ * Keeping selection and transition on this same table prevents a stale
+ * same-session assignment from becoming eligible merely because it was
+ * returned first by SQLite.
+ */
+const AUDIT_RECEIPT_TO_AUDITING: Partial<Record<SupervisionTaskLifecycleStatus, readonly SupervisionTaskLifecycleStatus[]>> = {
+  delegated: ['auditing'],
+  implementing: ['validated', 'ready_for_audit', 'auditing'],
+  retrying_external_ci: ['validated', 'ready_for_audit', 'auditing'],
+  validated: ['ready_for_audit', 'auditing'],
+  ready_for_audit: ['auditing'],
+  rework: ['auditing'],
+  auditing: [],
+};
+
+const AUDIT_RECEIPT_PENDING_TARGET_STATUSES = new Set<SupervisionTaskLifecycleStatus>([
+  'ready_for_audit',
+  'auditing',
+  'rework',
+]);
+
+function isExactAuditReceiptTarget(
+  assignment: PersistedSupervisionTaskAssignment,
+  attemptId: string,
+  revision: string,
+): boolean {
+  const exactReceiptBinding = assignment.auditAttemptId === attemptId
+    && assignment.auditRevision === revision;
+  if (!exactReceiptBinding) return false;
+  return assignment.status in AUDIT_RECEIPT_TO_AUDITING
+    || assignment.status === 'passed'
+    || assignment.status === 'ready_for_integration';
+}
+
 function safeJsonParseObject(text: string | undefined): Record<string, unknown> | undefined {
   if (!text) return undefined;
   try {
@@ -1156,18 +1191,35 @@ export class SupervisionTaskRegistry {
     }
     const task = this.getTaskRecord(auditAssignment.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
-    const candidates = this.listAssignments(task.taskId).filter((assignment) => (
+    const sameSessionAssignments = this.listAssignments(task.taskId).filter((assignment) => (
       assignment.role !== 'auditor'
       && assignment.identity.sessionName === auditedSessionName
     ));
+    const pendingCandidates = sameSessionAssignments.filter((assignment) => (
+      AUDIT_RECEIPT_PENDING_TARGET_STATUSES.has(assignment.status)
+    ));
+    const exactCandidates = sameSessionAssignments.filter((assignment) => (
+      isExactAuditReceiptTarget(assignment, attemptId, revision)
+    ));
+    const legacyTransitionCandidates = sameSessionAssignments.filter((assignment) => (
+      assignment.status in AUDIT_RECEIPT_TO_AUDITING
+    ));
+    // Prefer assignments already in the audit phase. If none exists, an exact
+    // receipt-bound replay wins. The final fallback preserves the historic
+    // single-delegated Quick Audit path, but multiple such rows remain
+    // ambiguous rather than being selected by creation order.
+    const candidates = pendingCandidates.length > 0
+      ? pendingCandidates
+      : exactCandidates.length > 0
+        ? exactCandidates
+        : legacyTransitionCandidates;
     if (candidates.length === 0) return { ok: false, reason: 'not_found' };
     if (candidates.length !== 1) return { ok: false, reason: 'ambiguous_assignment' };
     const target = candidates[0]!;
-    const expectedRevision = auditAssignment.auditRevision ?? target.auditRevision ?? task.currentRevision;
-    if (!expectedRevision || expectedRevision !== revision
-      || (auditAssignment.auditRevision !== undefined && auditAssignment.auditRevision !== revision)
+    const taskRevision = normalizeTaskString(task.currentRevision);
+    if (auditAssignment.auditRevision !== revision
       || (target.auditRevision !== undefined && target.auditRevision !== revision)
-      || (task.currentRevision !== undefined && task.currentRevision !== revision)) {
+      || (taskRevision !== undefined && taskRevision !== revision)) {
       return { ok: false, reason: 'old_revision' };
     }
     if (target.executionBinding?.pool === 'economy' && target.primaryReviewPassed !== true) {
@@ -1187,21 +1239,12 @@ export class SupervisionTaskRegistry {
     }
 
     const now = input.now ?? Date.now();
-    const toAuditing: Partial<Record<SupervisionTaskLifecycleStatus, SupervisionTaskLifecycleStatus[]>> = {
-      delegated: ['auditing'],
-      implementing: ['validated', 'ready_for_audit', 'auditing'],
-      retrying_external_ci: ['validated', 'ready_for_audit', 'auditing'],
-      validated: ['ready_for_audit', 'auditing'],
-      ready_for_audit: ['auditing'],
-      rework: ['auditing'],
-      auditing: [],
-    };
     const transition = (
       assignment: PersistedSupervisionTaskAssignment,
       terminal: 'passed' | 'ready_for_integration' | 'rework',
     ): PersistedSupervisionTaskAssignment | undefined => {
       let current = assignment;
-      const steps = [...(toAuditing[current.status] ?? [])];
+      const steps = [...(AUDIT_RECEIPT_TO_AUDITING[current.status] ?? [])];
       if (terminal === 'ready_for_integration') {
         if (current.status === 'passed') steps.push('ready_for_integration');
         else if (current.status !== 'ready_for_integration') steps.push('passed', 'ready_for_integration');
@@ -1232,6 +1275,13 @@ export class SupervisionTaskRegistry {
 
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      if (taskRevision === undefined) {
+        this.#writeTask({ ...task, currentRevision: revision, updatedAt: now }, this.#taskEventFor(task.status), {
+          source: 'matching_audit_receipt',
+          attemptId,
+          revisionBound: true,
+        });
+      }
       const audited = transition(target, input.verdict === 'PASS' ? 'ready_for_integration' : 'rework');
       const audit = transition(auditAssignment, input.verdict === 'PASS' ? 'passed' : 'rework');
       if (!audited || !audit) {
