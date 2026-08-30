@@ -11,6 +11,7 @@
 import {
   isSupervisionTaskLifecycleStatus,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import {
@@ -175,7 +176,7 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
     type: 'object', additionalProperties: false,
     properties: {
       taskId: { type: 'string' },
-      toStatus: { type: 'string', enum: ['recovered', 'blocked', 'cancelled'] },
+      toStatus: { type: 'string', enum: [...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES] },
       assignmentId: { type: 'string' },
       rebindSessionName: { type: 'string' },
       reason: { type: 'string' },

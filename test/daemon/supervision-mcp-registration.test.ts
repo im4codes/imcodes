@@ -12,13 +12,13 @@ import {
 import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import {
-  SUPERVISION_RECOVERY_TARGET_STATUSES,
   createSupervisionMcpToolHandlers,
   type SupervisionRegistryPort,
 } from '../../src/daemon/supervision-mcp-tools.js';
 import { SUPERVISION_INTENTS } from '../../src/daemon/supervision-intent-ops.js';
 import {
-  SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
+  SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
+  SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
@@ -487,8 +487,10 @@ describe('administrative recover', () => {
     expect(registry.recovered).toEqual([]);
   });
 
-  it('cannot fabricate a shipped state', async () => {
-    for (const bad of ['finalized', 'pushed', 'passed', 'implementing']) {
+  it('rejects every lifecycle status outside the shared recovery contract on the real server', async () => {
+    for (const bad of SUPERVISION_TASK_LIFECYCLE_STATUSES.filter(
+      (status) => !(SUPERVISION_TASK_RECOVERY_TARGET_STATUSES as readonly string[]).includes(status),
+    )) {
       const res: any = await client.callTool({
         name: SUPERVISION_MCP_TOOLS.RECOVER, arguments: { taskId: 'tsk_a', toStatus: bad, reason: 'x' },
       });
@@ -533,13 +535,13 @@ describe('published schema enums match the fixed constants exactly', () => {
     expect(intent.properties.intent.enum).toEqual([...SUPERVISION_INTENTS]);
     expect(intent.properties.validationState.enum).toEqual([...SUPERVISION_CONSOLE_VALIDATION_STATES]);
     expect(byName.get(SUPERVISION_MCP_TOOLS.RECOVER).properties.toStatus.enum)
-      .toEqual([...SUPERVISION_RECOVERY_TARGET_STATUSES]);
+      .toEqual([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]);
     expect(byName.get(SUPERVISION_MCP_TOOLS.HOUSEKEEPING).properties.mode.enum)
       .toEqual(['dryRun', 'apply']);
     expect(byName.get(SUPERVISION_MCP_TOOLS.LIST).properties.limit.maximum).toBe(100);
     // The recovery enum must never include a shipped terminal.
     for (const shipped of ['finalized', 'pushed']) {
-      expect(SUPERVISION_RECOVERY_TARGET_STATUSES as readonly string[], shipped).not.toContain(shipped);
+      expect(SUPERVISION_TASK_RECOVERY_TARGET_STATUSES as readonly string[], shipped).not.toContain(shipped);
     }
   });
 

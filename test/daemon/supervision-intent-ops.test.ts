@@ -4,7 +4,8 @@ import {
   resolveSupervisionIntent, supervisionSchemaStatusEnums,
 } from '../../src/daemon/supervision-intent-ops.js';
 import {
-  SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
+  SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
+  SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
 
@@ -115,6 +116,7 @@ describe('published MCP schemas', () => {
     const known = [
       JSON.stringify([...SUPERVISION_INTENTS]),
       JSON.stringify([...SUPERVISION_TASK_LIFECYCLE_STATUSES]),
+      JSON.stringify([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]),
       JSON.stringify([...SUPERVISION_CONSOLE_VALIDATION_STATES]),
     ];
     const found = supervisionSchemaStatusEnums();

@@ -23,8 +23,10 @@ import {
   type SupervisionIntent,
 } from './supervision-intent-ops.js';
 import {
+  SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   isSupervisionTaskLifecycleStatus,
+  type SupervisionTaskRecoveryTargetStatus,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
@@ -32,15 +34,8 @@ import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 
 type ToolResult = Record<string, unknown>;
 
-/**
- * Statuses an administrative recovery may target.
- *
- * Narrow on purpose: recovery exists to un-wedge a task, not to hand an
- * operator a way to declare arbitrary completion. `finalized`/`pushed` are
- * absent so recovery can never fabricate a shipped state.
- */
-export const SUPERVISION_RECOVERY_TARGET_STATUSES = ['recovered', 'blocked', 'cancelled'] as const;
-export type SupervisionRecoveryTargetStatus = typeof SUPERVISION_RECOVERY_TARGET_STATUSES[number];
+/** @deprecated Import SupervisionTaskRecoveryTargetStatus from the shared contract. */
+export type SupervisionRecoveryTargetStatus = SupervisionTaskRecoveryTargetStatus;
 
 /** Recovery may not move a shipped terminal. Cancelled recovery is evidence-derived below. */
 const RECOVERY_FORBIDDEN_SOURCES: readonly SupervisionTaskLifecycleStatus[] =
@@ -196,7 +191,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
   },
   [SUPERVISION_MCP_TOOLS.RECOVER]: {
     taskId: z.string().min(1),
-    toStatus: z.enum([...SUPERVISION_RECOVERY_TARGET_STATUSES] as [string, ...string[]]).optional(),
+    toStatus: z.enum([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]).optional(),
     assignmentId: z.string().min(1).optional(),
     rebindSessionName: z.string().min(1).optional(),
     reason: z.string().min(1).max(2000),
@@ -430,7 +425,7 @@ export function createSupervisionMcpToolHandlers(
         return ok({ taskId, assignmentId, rebindSessionName, replay: rebound.replay === true });
       }
       const target = String(input.toStatus ?? '');
-      if (!(SUPERVISION_RECOVERY_TARGET_STATUSES as readonly string[]).includes(target)) {
+      if (!(SUPERVISION_TASK_RECOVERY_TARGET_STATUSES as readonly string[]).includes(target)) {
         return err('invalid_target_status', 'recovery target must be a restricted enum member');
       }
       const current = reg.getStatus(taskId);

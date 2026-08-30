@@ -696,6 +696,10 @@ export const SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE = 25 as const;
 export const SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE = 100 as const;
 export const SUPERVISION_TASK_ARCHIVE_GRACE_MS = 24 * 60 * 60_000;
 export const SUPERVISION_TASK_ABANDONED_AFTER_MS = 7 * 24 * 60 * 60_000;
+export const SUPERVISION_TASK_RECOVERY_TARGET_STATUSES = [
+  'recovered', 'blocked', 'cancelled',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[];
+export type SupervisionTaskRecoveryTargetStatus = typeof SUPERVISION_TASK_RECOVERY_TARGET_STATUSES[number];
 
 export type SupervisionTaskArchiveReason =
   | 'terminal_retention'
