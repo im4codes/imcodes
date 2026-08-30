@@ -143,6 +143,57 @@ describe('capability MCP tools', () => {
     }
   });
 
+  it('refreshes capability_status on the same connection and retains an exact fallback for hosts that ignore list_changed', async () => {
+    const capabilityService = service();
+    let resolveChanged: ((names: string[]) => void) | undefined;
+    const changed = new Promise<string[]>((resolve) => { resolveChanged = resolve; });
+    const server = createMemoryMcpServer(caller(), { capabilityService });
+    const client = new Client({ name: 'capability-self-refresh-test', version: '1' }, {
+      listChanged: {
+        tools: {
+          debounceMs: 0,
+          onChanged: (error, tools) => {
+            if (!error && tools?.some((tool) => tool.name === 'capability_status')) {
+              resolveChanged?.(tools.map((tool) => tool.name));
+            }
+          },
+        },
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const bootstrap = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(bootstrap).not.toContain('capability_status');
+      await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'capability_status' },
+      });
+      await expect(changed).resolves.toContain('capability_status');
+      await expect(client.callTool({
+        name: 'capability_status', arguments: { capabilityId: 'skill-1', activate: true },
+      })).resolves.toMatchObject({ structuredContent: { status: 'ok' } });
+
+      // A host that ignored the notification can still use the unchanged
+      // bootstrap schema on this same connection; no second listTools call is
+      // needed for this exact validated invocation.
+      await expect(client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: {
+          query: 'capability_status',
+          fallbackCall: {
+            name: 'capability_status',
+            arguments: { capabilityId: 'skill-1', activate: true },
+          },
+        },
+      })).resolves.toMatchObject({ structuredContent: { status: 'ok' } });
+      expect(capabilityService.status).toHaveBeenCalledTimes(2);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it('carries provider context for Skill resolution without making it a tool authorization gate', async () => {
     const config = getDefaultMcpServers({
       sessionKey: 'route-fallback',

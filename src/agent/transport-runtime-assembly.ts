@@ -24,6 +24,7 @@ import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { buildFilePathReportingPrompt, buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
 import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
+import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
@@ -350,6 +351,9 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
   const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
   const capabilityGuidance = input.suppressMcpMemorySearchGuidance ? undefined : CAPABILITY_AI_SYSTEM_INSTRUCTIONS;
+  const mcpToolRefreshGuidance = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS;
   const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
   const filePathReportingGuidance = input.suppressFilePathReportingGuidance ? undefined : buildFilePathReportingPrompt();
   // Daemon-injected, session-stable identity block. NOT subject to
@@ -372,6 +376,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     : undefined;
   const sessionSystemText = [
     capabilityGuidance,
+    mcpToolRefreshGuidance,
     input.description?.trim(),
     input.systemPrompt?.trim(),
     identityPart,

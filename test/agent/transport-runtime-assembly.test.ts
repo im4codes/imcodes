@@ -7,6 +7,7 @@ import {
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
+import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 function makeProvider(
@@ -75,6 +76,9 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('Be concise');
     expect(payload.systemText).toContain('Never edit generated files');
     expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    expect(payload.systemText).toContain(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS);
+    expect(payload.systemText).toContain('tools/list_changed');
+    expect(payload.systemText).toContain('fallbackCall');
     expect(payload.systemText).toContain('exact tool identifier shown in the current tool list');
     expect(payload.systemText).toContain('available memory source-expansion tool');
     expect(payload.systemText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);

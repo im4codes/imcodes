@@ -15,7 +15,21 @@ export const MCP_TOOL_DISCOVERY_NAME = 'mcp_tool_search' as const;
  * by the bootstrap tool count on every request.
  */
 export const MCP_TOOL_DISCOVERY_DESCRIPTION =
-  'Use mcp_tool_search to inspect or activate hidden tool groups; inactive tools fail closed and publish when enabled.';
+  'Use mcp_tool_search to activate hidden MCP tools; activation publishes tools/list_changed.';
+
+/**
+ * Runtime guidance for hosts that do not implement MCP tools/list_changed.
+ *
+ * The normal path remains activation followed by the host's bounded re-list.
+ * `fallbackCall` is deliberately carried by the one bootstrap tool so an old
+ * host can execute one exact activated tool without publishing every long-tail
+ * schema or requiring a new MCP connection.
+ */
+export const MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS = [
+  'After mcp_tool_search activates a tool, MCP hosts that support tools/list_changed must refresh the callable tool list on the same connection.',
+  'If the exact activated tool is still absent from the callable schema, call mcp_tool_search again with the exact tool name and fallbackCall { name, arguments }; this fail-safe invokes only that registered tool through its original validation and authority handler.',
+  'Never claim a discovered tool is callable merely because active=true, and never expose or preload the complete long-tail schema as a fallback.',
+].join(' ');
 
 export const MCP_TOOL_GROUP_QUERY_PREFIX = 'group:' as const;
 

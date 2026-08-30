@@ -31,6 +31,7 @@ import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 import { CAPABILITY_MCP_TOOL_NAMES } from '../../shared/capability-management.js';
 import { SUPERVISION_MCP_REGISTERED_TOOLS } from '../../shared/supervision-mcp-tools.js';
+import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { AGENT_DELEGATION_REPLY_ERRORS } from '../../shared/agent-delegation.js';
 import {
   createMemoryMcpServerFromEnv,
@@ -703,6 +704,78 @@ describe('memory MCP stdio server', () => {
       ]));
     } finally {
       await client.close();
+    }
+  });
+
+  it('refreshes supervision_task_recover on the same connection and fail-safely invokes it without a host relist', async () => {
+    const recover = vi.fn(() => ({ ok: true as const, value: { status: 'recovered' } }));
+    const registry = {
+      getStatus: vi.fn(() => 'cancelled'),
+      applyIntent: vi.fn(),
+      list: vi.fn(() => []),
+      get: vi.fn(() => ({ taskId: 'task-1', projectName: 'proj', assignments: [] })),
+      recover,
+      housekeeping: vi.fn(() => ({})),
+    };
+    let resolveChanged: ((names: string[]) => void) | undefined;
+    const changed = new Promise<string[]>((resolve) => { resolveChanged = resolve; });
+    const client = new Client({ name: 'supervision-self-refresh-test', version: '0.1.0' }, {
+      listChanged: {
+        tools: {
+          debounceMs: 0,
+          onChanged: (error, tools) => {
+            if (!error && tools?.some((tool) => tool.name === SUPERVISION_MCP_TOOLS.RECOVER)) {
+              resolveChanged?.(tools.map((tool) => tool.name));
+            }
+          },
+        },
+      },
+    });
+    const server = createMemoryMcpServer({
+      transport: 'in_process', userId: 'user-1', namespace,
+      sessionName: 'deck_proj_brain', projectName: 'proj', projectRoot: '/tmp/proj',
+    }, {}, {}, { registry, isAdmin: () => true });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain(SUPERVISION_MCP_TOOLS.RECOVER);
+      await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: SUPERVISION_MCP_TOOLS.RECOVER },
+      });
+      await expect(changed).resolves.toContain(SUPERVISION_MCP_TOOLS.RECOVER);
+
+      const fallback = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: {
+          query: SUPERVISION_MCP_TOOLS.RECOVER,
+          fallbackCall: {
+            name: SUPERVISION_MCP_TOOLS.RECOVER,
+            arguments: { taskId: 'task-1', toStatus: 'recovered', reason: 'repair stale projection' },
+          },
+        },
+      });
+      expect(fallback).toMatchObject({
+        isError: false,
+        structuredContent: { status: 'ok', taskId: 'task-1', fromStatus: 'cancelled', toStatus: 'recovered' },
+      });
+      expect(recover).toHaveBeenCalledTimes(1);
+
+      const mismatched = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: {
+          query: SUPERVISION_MCP_TOOLS.RECOVER,
+          fallbackCall: { name: 'capability_status', arguments: {} },
+        },
+      });
+      expect(mismatched).toMatchObject({
+        isError: true,
+        structuredContent: { status: 'error', reason: 'validation_failed' },
+      });
+      expect(recover).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.close();
+      await server.close();
     }
   });
 

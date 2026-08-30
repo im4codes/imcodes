@@ -1,4 +1,5 @@
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import {
   MCP_TOOL_DISCOVERY_LIMITS,
@@ -15,10 +16,52 @@ export type RegisteredMcpToolCatalog = ReadonlyMap<string, RegisteredTool>;
 
 const searchInput = z.strictObject({
   query: z.string().trim().min(1).max(MCP_TOOL_DISCOVERY_LIMITS.QUERY_CHARS)
-    .describe('Tool name, task phrase, group:<id>, or * for the complete catalog.'),
+    .describe('Tool name, task phrase, group:<id>, or *.'),
   activate: z.boolean().optional()
-    .describe('Defaults to true. Activating replaces the previously exposed result set.'),
+    .describe('Defaults true; replaces the discovered set.'),
+  // Kept as one compact map so the always-visible bootstrap schema remains
+  // inside its hard byte budget. Runtime validation below still requires the
+  // exact { name, arguments } shape before invoking an authoritative handler.
+  fallbackCall: z.record(z.string(), z.unknown()).optional(),
 });
+
+type CallableRegisteredTool = (
+  args: unknown,
+  extra: unknown,
+) => CallToolResult | Promise<CallToolResult>;
+
+function discoveryError(error: string) {
+  const result = {
+    status: MCP_TOOL_DISCOVERY_STATUS.ERROR,
+    reason: MCP_TOOL_DISCOVERY_REASON.VALIDATION_FAILED,
+    error,
+  };
+  return { structuredContent: result, content: [{ type: 'text' as const, text: JSON.stringify(result) }], isError: true };
+}
+
+async function invokeFallbackTool(
+  tool: RegisteredTool,
+  argumentsValue: Record<string, unknown>,
+  extra: unknown,
+): Promise<CallToolResult> {
+  if (!tool.enabled || typeof tool.handler !== 'function') {
+    return discoveryError('fallback tool is not callable');
+  }
+  if (tool.outputSchema) {
+    return discoveryError('fallback tool requires direct host schema support');
+  }
+  const schema = tool.inputSchema as {
+    safeParseAsync?: (input: unknown) => Promise<{ success: boolean; data?: unknown }>;
+  } | undefined;
+  if (!schema?.safeParseAsync) {
+    return discoveryError('fallback tool input schema is unavailable');
+  }
+  const parsed = await schema.safeParseAsync(argumentsValue);
+  if (!parsed.success) {
+    return discoveryError('fallback tool arguments failed validation');
+  }
+  return (tool.handler as CallableRegisteredTool)(parsed.data, extra);
+}
 
 function compactDescription(value: string | undefined): string {
   if (!value) return '';
@@ -57,7 +100,7 @@ export function registerMcpToolDiscovery(
     // it as server instructions makes some hosts repeat it on every tool.
     description: MCP_TOOL_DISCOVERY_DESCRIPTION,
     inputSchema: searchInput,
-  }, async ({ query, activate }) => {
+  }, async ({ query, activate, fallbackCall }, extra) => {
     const normalizedQuery = query.trim().toLowerCase();
     if (!normalizedQuery) {
       const result = {
@@ -127,6 +170,24 @@ export function registerMcpToolDiscovery(
         }
       }
       if (changed) server.sendToolListChanged();
+    }
+
+    if (fallbackCall) {
+      const fallbackName = typeof fallbackCall.name === 'string' ? fallbackCall.name.trim() : '';
+      const fallbackArguments = fallbackCall.arguments === undefined
+        ? {}
+        : fallbackCall.arguments;
+      const exactTool = tools.get(fallbackName);
+      if (!shouldActivate
+        || normalizedQuery !== fallbackName.toLowerCase()
+        || !exactTool
+        || !activatedNames.includes(fallbackName)
+        || typeof fallbackArguments !== 'object'
+        || fallbackArguments === null
+        || Array.isArray(fallbackArguments)) {
+        return discoveryError('fallbackCall requires one exact registered tool query with activation enabled');
+      }
+      return invokeFallbackTool(exactTool, fallbackArguments as Record<string, unknown>, extra);
     }
 
     const result = {
