@@ -153,6 +153,10 @@ export interface SupervisionMcpToolDeps {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
     agentType: string; providerFamily: string;
   } | undefined;
+  /** Physical worktree cleanup shares the already-authorized housekeeping ingress. */
+  worktreeGc?: (input: {
+    mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number;
+  }) => Promise<unknown>;
 }
 
 function ok(value: ToolResult): ToolResult { return { status: 'ok', ...value }; }
@@ -466,7 +470,33 @@ export function createSupervisionMcpToolHandlers(
         ...(input.cursor === undefined ? {} : { cursor: String(input.cursor) }),
         ...(input.limit === undefined ? {} : { limit: Number(input.limit) }),
       });
-      return ok({ result });
+      let worktrees: unknown = {
+        mode,
+        registryAvailable: false,
+        entries: [],
+        diagnostics: [{ code: 'worktree_gc_not_bound' }],
+      };
+      if (deps.worktreeGc) {
+        try {
+          worktrees = await deps.worktreeGc({
+            mode,
+            projectName,
+            ...(input.cursor === undefined ? {} : { cursor: String(input.cursor) }),
+            ...(input.limit === undefined ? {} : { limit: Number(input.limit) }),
+          });
+        } catch {
+          // Registry housekeeping remains authoritative even when the optional
+          // filesystem census fails. Apply must fail closed inside the GC and
+          // this diagnostic deliberately carries no local path/error text.
+          worktrees = {
+            mode,
+            registryAvailable: false,
+            entries: [],
+            diagnostics: [{ code: 'worktree_gc_failed' }],
+          };
+        }
+      }
+      return ok({ result, worktrees });
     },
   };
 }

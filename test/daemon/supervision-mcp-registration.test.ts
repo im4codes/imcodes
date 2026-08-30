@@ -84,10 +84,26 @@ class FakeRegistry implements SupervisionRegistryPort {
 
 let registry: FakeRegistry;
 let client: Client;
+let worktreeGcCalls: Array<Record<string, unknown>>;
 
 async function connect(isAdmin = true) {
   registry = new FakeRegistry();
-  const server = createMemoryMcpServer(CALLER, {}, {}, { registry, isAdmin: () => isAdmin });
+  worktreeGcCalls = [];
+  const server = createMemoryMcpServer(CALLER, {}, {}, {
+    registry,
+    isAdmin: () => isAdmin,
+    worktreeGc: async (input) => {
+      worktreeGcCalls.push(input);
+      return {
+        mode: input.mode,
+        scanned: 1,
+        deleted: 0,
+        retained: 1,
+        registryAvailable: true,
+        entries: [{ assignmentId: 'assignment-a', action: 'retain', reason: 'unique_evidence' }],
+      };
+    },
+  });
   client = new Client({ name: 'supervision-reg-test', version: '0.1.0' });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await Promise.all([client.connect(clientT), server.connect(serverT)]);
@@ -515,8 +531,14 @@ describe('bounded housekeeping administration', () => {
     expect(out).toMatchObject({
       status: 'ok',
       result: { mode: 'dryRun', scanned: 2, activeCount: 1, archivedCount: 1 },
+      worktrees: {
+        mode: 'dryRun', scanned: 1, deleted: 0, retained: 1, registryAvailable: true,
+      },
     });
     expect(registry.housekeepingCalls).toEqual([{
+      mode: 'dryRun', projectName: 'codedeck', cursor: 'tsk_0', limit: 25,
+    }]);
+    expect(worktreeGcCalls).toEqual([{
       mode: 'dryRun', projectName: 'codedeck', cursor: 'tsk_0', limit: 25,
     }]);
 
@@ -524,6 +546,24 @@ describe('bounded housekeeping administration', () => {
     expect(await call(SUPERVISION_MCP_TOOLS.HOUSEKEEPING, { mode: 'apply' }))
       .toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.housekeepingCalls).toEqual([]);
+    expect(worktreeGcCalls).toEqual([]);
+  });
+
+  it('keeps registry housekeeping authoritative when physical GC is not bound', async () => {
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isAdmin: () => true,
+      isProjectBrain: () => true,
+    });
+    const out = await handlers[SUPERVISION_MCP_TOOLS.HOUSEKEEPING]({ mode: 'dryRun' });
+    expect(out).toMatchObject({
+      status: 'ok',
+      result: { mode: 'dryRun', scanned: 2 },
+      worktrees: {
+        mode: 'dryRun', registryAvailable: false,
+        diagnostics: [{ code: 'worktree_gc_not_bound' }],
+      },
+    });
   });
 });
 

@@ -16,6 +16,7 @@ import type {
   SupervisionRegistryPort,
 } from './supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
+import { runSupervisionWorktreeGc } from './supervision-worktree-gc.js';
 
 /**
  * One live-session authority check shared by the MCP project list and the Web
@@ -94,5 +95,48 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         providerFamily: resolvePeerAuditProviderFamily(session),
       };
     },
+    worktreeGc: async (input) => runSupervisionWorktreeGc(input, {
+      // Every lookup resolves the live singleton at call time. A closed or
+      // replaced SQLite handle therefore fails closed rather than authorizing
+      // deletion from a captured, stale snapshot.
+      resolveRegistryReference: (metadata) => {
+        try {
+          const registry = getSupervisionTaskRegistry();
+          const assignment = registry.getAssignment(metadata.assignmentId);
+          const task = registry.get(metadata.taskId);
+          if (!assignment || !task) return { available: true };
+          return {
+            available: true,
+            assignment: {
+              assignmentId: assignment.assignmentId,
+              taskId: assignment.taskId,
+              status: assignment.status,
+              leaseId: assignment.leaseId,
+            },
+            task: {
+              taskId: task.taskId,
+              projectName: task.projectName,
+              status: task.status,
+              ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
+              assignments: task.assignments.map((candidate) => ({
+                assignmentId: candidate.assignmentId,
+                status: candidate.status,
+                leaseId: candidate.leaseId,
+              })),
+            },
+            claims: task.fileClaims.map((claim) => ({
+              assignmentId: claim.assignmentId,
+              path: claim.path,
+            })),
+          };
+        } catch {
+          return { available: false };
+        }
+      },
+      // A live session cwd is a second, independent authority signal. Even a
+      // corrupt terminal registry row cannot make the directory currently in
+      // use by an agent eligible for deletion.
+      protectedPaths: [process.cwd(), ...listSessions().map((session) => session.projectDir)],
+    }),
   };
 }
