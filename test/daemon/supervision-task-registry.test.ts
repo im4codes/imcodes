@@ -1444,8 +1444,10 @@ describe('SupervisionTaskRegistry', () => {
         assignmentId: auditor.value.assignmentId, identity: reboundAuditorIdentity, revision,
       })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
       expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
-        status: 'rework', verdict: 'REWORK', blocker: 'correction before finish',
+        status: 'rework', auditAttemptId: attemptId, auditRevision: revision,
+        verdict: 'REWORK', blocker: 'correction before finish',
       });
+      expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('crossVendorAuditPassed');
       expect(registry.appendMatchingAuditReceipt({
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
         receiptKind: 'final', verdict: 'PASS', auditorSessionName: reboundAuditorIdentity.sessionName,
@@ -1457,7 +1459,131 @@ describe('SupervisionTaskRegistry', () => {
       registry = new SupervisionTaskRegistry({ dbPath });
       expect(registry.listAuditReceipts(taskId).map((receipt) => receipt.sequence)).toEqual([1, 2, 3, 4]);
       expect(registry.getAssignment(auditor.value.assignmentId)?.status).toBe('finalized');
-      expect(registry.getAssignment(implementer.value.assignmentId)?.status).toBe('rework');
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'rework', auditAttemptId: attemptId, auditRevision: revision, verdict: 'REWORK',
+      });
+      expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('crossVendorAuditPassed');
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('atomically propagates receipted PASS authority to structured finalization and replays after reopen', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-audit-finish-finalization-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'audit-finish-structured-finalization';
+    const revision = 'audit-finish-structured-r1';
+    const attemptId = 'audit-finish-structured-attempt';
+    const path = 'src/audited-production.ts';
+    const ownerIdentity = identity('deck_audit_finish_structured_brain');
+    const implementerIdentity = identity('deck_audit_finish_structured_worker');
+    const auditorIdentity = identity('deck_audit_finish_structured_auditor', 'claude-code-sdk');
+    const commitSha = 'a'.repeat(40);
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'carry accepted receipt authority into structured finalization', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const owner = registry.createAssignment({
+        assignmentId: `${taskId}-owner`, taskId, role: 'integration_owner', identity: ownerIdentity,
+        scopeFiles: [path], auditAttemptId: attemptId, auditRevision: revision,
+      });
+      const implementer = registry.createAssignment({
+        assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: implementerIdentity,
+        scopeFiles: [path], auditRevision: revision,
+      });
+      const auditor = registry.createAssignment({
+        assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', identity: auditorIdentity,
+        required: false, scopeFiles: [path], auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!owner.ok || !implementer.ok || !auditor.ok) throw new Error('expected finalization assignments');
+      expect(registry.recordFileEvent({
+        assignmentId: implementer.value.assignmentId, identity: implementerIdentity,
+        path, operation: 'modify', idempotencyKey: `${taskId}-file`,
+      })).toMatchObject({ ok: true });
+      for (const status of [
+        'implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration',
+      ] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: owner.value.assignmentId, identity: ownerIdentity, status,
+          revision, auditAttemptId: attemptId, auditRevision: revision,
+          ...(status === 'passed' || status === 'ready_for_integration'
+            ? { verdict: 'PASS', crossVendorAuditPassed: true }
+            : {}),
+          externalRunId: '33287386936', externalHeadSha: commitSha, externalTaskId: 'ci-node24',
+        }), `owner:${status}`).toMatchObject({ ok: true });
+      }
+      for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
+        }), `implementer:${status}`).toMatchObject({ ok: true });
+      }
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'ready_for_audit', auditRevision: revision,
+      });
+      expect(registry.getAssignment(implementer.value.assignmentId)?.auditAttemptId).toBeUndefined();
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'exact matching PASS',
+        validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'passed' }], now: 100,
+      })).toMatchObject({ ok: true, value: { verdict: 'PASS' } });
+
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision, now: 110,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'ready_for_integration', auditAttemptId: attemptId, auditRevision: revision,
+        verdict: 'PASS', crossVendorAuditPassed: true,
+      });
+      expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
+
+      const finalization = {
+        assignmentId: owner.value.assignmentId,
+        identity: ownerIdentity,
+        revision,
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        verdict: 'PASS' as const,
+        ownedFiles: [path],
+        integrationManifest: [{ path, sha256: '1'.repeat(64) }],
+        integrationOwner: ownerIdentity.sessionName,
+        commitSha,
+        pushResult: 'pushed' as const,
+        pushRemoteRef: 'refs/heads/dev',
+        stagedPaths: [path],
+        conflictedPaths: [] as string[],
+        untrackedOtherOwnerPaths: [] as string[],
+        externalRunId: '33287386936',
+        externalHeadSha: commitSha,
+        externalTaskId: 'ci-node24',
+        ciResult: 'success' as const,
+        now: 120,
+      };
+      expect(registry.finalizeIntegration(finalization)).toMatchObject({
+        ok: true,
+        value: {
+          status: 'finalized',
+          finalization: { auditAttemptId: attemptId, auditRevision: revision, verdict: 'PASS' },
+        },
+      });
+      const eventsAfterFinalization = registry.listEvents(taskId);
+      const receiptsAfterFinalization = registry.listAuditReceipts(taskId);
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        auditAttemptId: attemptId, auditRevision: revision, verdict: 'PASS', crossVendorAuditPassed: true,
+      });
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision, now: 130,
+      })).toMatchObject({ ok: true, replay: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.finalizeIntegration({ ...finalization, now: 140 }))
+        .toMatchObject({ ok: true, replay: true, value: { status: 'finalized' } });
+      expect(registry.listEvents(taskId)).toEqual(eventsAfterFinalization);
+      expect(registry.listAuditReceipts(taskId)).toEqual(receiptsAfterFinalization);
       registry.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

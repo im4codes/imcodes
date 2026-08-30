@@ -1902,7 +1902,10 @@ export class SupervisionTaskRegistry {
           current = {
             ...current,
             status,
+            auditAttemptId: existing.auditAttemptId,
+            auditRevision: existing.auditRevision,
             verdict: authenticatedAuditVerdict,
+            crossVendorAuditPassed: authenticatedAuditVerdict === 'PASS' ? true : undefined,
             blocker: status === 'rework' ? existing.blocker : undefined,
             updatedAt: now,
           };
