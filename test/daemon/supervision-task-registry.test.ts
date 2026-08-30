@@ -119,11 +119,19 @@ function makeRegistry(): SupervisionTaskRegistry {
 function prepareStructuredFinalizationShape(
   registry: SupervisionTaskRegistry,
   taskId: string,
-  options: { selfAudit?: boolean; leaveOwnerLeaseActive?: boolean } = {},
+  options: {
+    selfAudit?: boolean;
+    leaveOwnerLeaseActive?: boolean;
+    leaveAuditorUnfinalized?: boolean;
+    files?: string[];
+    authorizedUntouchedFiles?: string[];
+    ownerFileCount?: number;
+  } = {},
 ) {
   const revision = `${taskId}-r1`;
   const attemptId = `${taskId}-overall-audit`;
-  const files = ['src/final-a.ts', 'src/final-b.ts'];
+  const files = [...(options.files ?? ['src/final-a.ts', 'src/final-b.ts'])].sort();
+  const scopeFiles = [...files, ...(options.authorizedUntouchedFiles ?? [])].sort();
   const ownerIdentity = identity(`${taskId}-owner`);
   const implementerIdentity = identity(`${taskId}-worker`);
   const auditorIdentity = options.selfAudit ? ownerIdentity : identity(`${taskId}-auditor`, 'claude-code-sdk');
@@ -135,11 +143,11 @@ function prepareStructuredFinalizationShape(
     taskId, role: 'coordinator', identity: identity(`${taskId}-brain`), required: false,
   });
   const owner = registry.createAssignment({
-    taskId, role: 'integration_owner', identity: ownerIdentity, scopeFiles: files,
+    taskId, role: 'integration_owner', identity: ownerIdentity, scopeFiles,
     auditAttemptId: attemptId, auditRevision: revision,
   });
   const implementer = registry.createAssignment({
-    taskId, role: 'implementer', identity: implementerIdentity, scopeFiles: files,
+    taskId, role: 'implementer', identity: implementerIdentity, scopeFiles,
     auditAttemptId: attemptId, auditRevision: revision,
   });
   const auditor = registry.createAssignment({
@@ -147,6 +155,16 @@ function prepareStructuredFinalizationShape(
     auditAttemptId: attemptId, auditRevision: revision,
   });
   if (!coordinator.ok || !owner.ok || !implementer.ok || !auditor.ok) throw new Error('shape setup failed');
+  for (const [index, path] of files.entries()) {
+    const fileOwner = index < (options.ownerFileCount ?? 0) ? owner.value : implementer.value;
+    expect(registry.recordFileEvent({
+      assignmentId: fileOwner.assignmentId,
+      identity: fileOwner.identity,
+      path,
+      operation: 'modify',
+      idempotencyKey: `${taskId}-authoritative-file-${index}`,
+    })).toMatchObject({ ok: true });
+  }
   for (const target of [owner.value, implementer.value]) {
     for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
       expect(registry.updateAssignment({
@@ -177,9 +195,11 @@ function prepareStructuredFinalizationShape(
       ...(status === 'passed' ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
     })).toMatchObject({ ok: true });
   }
-  expect(registry.finishAssignment({
-    assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision,
-  })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+  if (!options.leaveAuditorUnfinalized) {
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision,
+    })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+  }
   expect(registry.finishAssignment({
     assignmentId: implementer.value.assignmentId, identity: implementer.value.identity, revision,
   })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
@@ -199,7 +219,10 @@ function prepareStructuredFinalizationShape(
     auditRevision: revision,
     verdict: 'PASS' as const,
     ownedFiles: files,
-    integrationManifest: files.map((path, index) => ({ path, sha256: String(index + 1).repeat(64) })),
+    integrationManifest: files.map((path, index) => ({
+      path,
+      sha256: ((index + 1) % 10).toString().repeat(64),
+    })),
     integrationOwner: ownerIdentity.sessionName,
     commitSha: 'a'.repeat(40),
     pushResult: 'pushed' as const,
@@ -213,7 +236,11 @@ function prepareStructuredFinalizationShape(
     ciResult: 'success' as const,
   };
   expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
-  return { taskId, revision, attemptId, files, owner: owner.value, coordinator: coordinator.value, auditor: auditor.value, finalization };
+  return {
+    taskId, revision, attemptId, files, scopeFiles,
+    owner: owner.value, implementer: implementer.value,
+    coordinator: coordinator.value, auditor: auditor.value, finalization,
+  };
 }
 
 function prepareStaleRuntimeIntegrationOwnerShape(
@@ -443,6 +470,97 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
   });
 
+  it('uses authoritative file events as evidence while keeping larger scopes authorization-only', () => {
+    const cases = [
+      { taskId: 'structured-finalization-scope-13-owned-12', scopeCount: 13, ownedCount: 12 },
+      { taskId: 'structured-finalization-scope-31-owned-26', scopeCount: 31, ownedCount: 26 },
+    ];
+    for (const testCase of cases) {
+      const registry = makeRegistry();
+      const files = Array.from(
+        { length: testCase.ownedCount },
+        (_, index) => `src/actual-${String(index).padStart(2, '0')}.ts`,
+      );
+      const authorizedUntouchedFiles = Array.from(
+        { length: testCase.scopeCount - testCase.ownedCount },
+        (_, index) => `test/authorized-untouched-${String(index).padStart(2, '0')}.test.ts`,
+      );
+      const shape = prepareStructuredFinalizationShape(registry, testCase.taskId, {
+        files,
+        authorizedUntouchedFiles,
+        ownerFileCount: 1,
+      });
+      expect(shape.scopeFiles).toHaveLength(testCase.scopeCount);
+      expect(registry.recordFileEvent({
+        assignmentId: shape.implementer.assignmentId,
+        identity: shape.implementer.identity,
+        path: files[1]!,
+        operation: 'modify',
+        idempotencyKey: `${testCase.taskId}-authoritative-file-1`,
+      })).toMatchObject({ ok: true, replay: true });
+      expect(registry.listFileEvents(shape.taskId).map((event) => event.path).sort()).toEqual(files);
+      expect(registry.finalizeIntegration({
+        ...shape.finalization,
+        identity: shape.owner.identity,
+      })).toMatchObject({
+        ok: true,
+        value: {
+          status: 'finalized',
+          finalization: { ownedFiles: files, stagedPaths: files },
+        },
+      });
+      registry.close();
+    }
+  });
+
+  it('fails closed without lifecycle mutation on out-of-scope or other-assignment file events', () => {
+    const outsideRegistry = makeRegistry();
+    const outside = prepareStructuredFinalizationShape(outsideRegistry, 'structured-finalization-outside-event');
+    expect(outsideRegistry.recordFileEvent({
+      assignmentId: outside.implementer.assignmentId,
+      identity: outside.implementer.identity,
+      path: 'src/authorized-scope-miss.ts',
+      operation: 'modify',
+      idempotencyKey: 'outside-scope-event',
+    })).toMatchObject({ ok: true });
+    const outsideBefore = outsideRegistry.get(outside.taskId);
+    const outsideEventCount = outsideRegistry.listEvents(outside.taskId).length;
+    expect(outsideRegistry.finalizeIntegration({
+      ...outside.finalization,
+      identity: outside.owner.identity,
+    })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+    expect(outsideRegistry.get(outside.taskId)).toEqual(outsideBefore);
+    expect(outsideRegistry.listEvents(outside.taskId)).toHaveLength(outsideEventCount);
+    outsideRegistry.close();
+
+    const otherRegistry = makeRegistry();
+    const other = prepareStructuredFinalizationShape(otherRegistry, 'structured-finalization-other-assignment-event');
+    const observer = otherRegistry.createAssignment({
+      taskId: other.taskId,
+      role: 'coordinator',
+      identity: identity('structured-finalization-observer'),
+      scopeFiles: ['src/other-assignment.ts'],
+      required: false,
+    });
+    if (!observer.ok) throw new Error(observer.reason);
+    expect(otherRegistry.recordFileEvent({
+      assignmentId: observer.value.assignmentId,
+      identity: observer.value.identity,
+      path: 'src/other-assignment.ts',
+      operation: 'modify',
+      idempotencyKey: 'other-assignment-event',
+    })).toMatchObject({ ok: true });
+    const otherBefore = otherRegistry.get(other.taskId);
+    const otherEventCount = otherRegistry.listEvents(other.taskId).length;
+    expect(otherRegistry.finalizeIntegration({
+      ...other.finalization,
+      identity: other.owner.identity,
+    })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+    expect(otherRegistry.get(other.taskId)).toEqual(otherBefore);
+    expect(otherRegistry.listEvents(other.taskId)).toHaveLength(otherEventCount);
+    otherRegistry.close();
+  });
+
   it('fails closed on stale audit, dirty staged sets, conflicts, foreign owners, and self-audit without mutation', () => {
     const registry = makeRegistry();
     const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-refusals');
@@ -462,6 +580,17 @@ describe('SupervisionTaskRegistry', () => {
       .toEqual({ ok: false, reason: 'invalid' });
     expect(call({ untrackedOtherOwnerPaths: ['src/foreign.ts'] }))
       .toEqual({ ok: false, reason: 'invalid' });
+    expect(call({ ownedFiles: [...shape.files, shape.files[0]!] }))
+      .toEqual({ ok: false, reason: 'invalid' });
+    expect(call({ ciResult: 'failure' as never }))
+      .toEqual({ ok: false, reason: 'invalid' });
+    expect(call({ pushRemoteRef: 'heads/dev' }))
+      .toEqual({ ok: false, reason: 'invalid' });
+    expect(call({ externalHeadSha: 'b'.repeat(40) }))
+      .toEqual({ ok: false, reason: 'manifest_mismatch' });
+    expect(call({
+      integrationManifest: shape.files.map((path) => ({ path, sha256: 'not-a-hash' })),
+    })).toEqual({ ok: false, reason: 'invalid' });
     expect(call({}, identity('foreign-integration-owner')))
       .toEqual({ ok: false, reason: 'owner_mismatch' });
     expect(registry.get(shape.taskId)).toEqual(initial);
@@ -472,6 +601,54 @@ describe('SupervisionTaskRegistry', () => {
       ...selfAudit.finalization, identity: selfAudit.owner.identity,
     })).toEqual({ ok: false, reason: 'owner_mismatch' });
     expect(registry.get(selfAudit.taskId)).toMatchObject({ status: 'ready_for_integration' });
+
+    const unfinishedAudit = prepareStructuredFinalizationShape(
+      registry,
+      'structured-finalization-unfinished-auditor',
+      { leaveAuditorUnfinalized: true },
+    );
+    expect(registry.finalizeIntegration({
+      ...unfinishedAudit.finalization,
+      identity: unfinishedAudit.owner.identity,
+    })).toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(registry.get(unfinishedAudit.taskId)).toMatchObject({ status: 'ready_for_integration' });
+    registry.close();
+  });
+
+  it('fails closed without mutation when a required lineage assignment carries a stale revision', () => {
+    const registry = makeRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-stale-lineage');
+    const staleIdentity = identity('structured-finalization-stale-lineage-worker');
+    const stale = registry.createAssignment({
+      taskId: shape.taskId,
+      role: 'implementer',
+      identity: staleIdentity,
+      scopeFiles: ['src/stale-lineage.ts'],
+      auditAttemptId: 'stale-lineage-attempt',
+      auditRevision: 'stale-lineage-revision',
+    });
+    if (!stale.ok) throw new Error(stale.reason);
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: stale.value.assignmentId,
+        identity: staleIdentity,
+        status,
+        revision: 'stale-lineage-revision',
+        auditAttemptId: 'stale-lineage-attempt',
+        auditRevision: 'stale-lineage-revision',
+        ...(status === 'passed' || status === 'ready_for_integration'
+          ? { verdict: 'PASS', crossVendorAuditPassed: true }
+          : {}),
+      })).toMatchObject({ ok: true });
+    }
+    const before = registry.get(shape.taskId);
+    const eventCount = registry.listEvents(shape.taskId).length;
+    expect(registry.finalizeIntegration({
+      ...shape.finalization,
+      identity: shape.owner.identity,
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
     registry.close();
   });
 

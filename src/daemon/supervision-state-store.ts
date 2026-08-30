@@ -2156,9 +2156,27 @@ export class SupervisionTaskRegistry {
       .sort((left, right) => left.path.localeCompare(right.path));
     const manifestPaths = manifest.map((entry) => entry.path);
     const assignments = this.listAssignments(task.taskId);
-    const expectedOwnedFiles = normalizeTaskArray(assignments
-      .filter((assignment) => assignment.role === 'implementer' || assignment.role === 'integration_owner')
-      .flatMap((assignment) => assignment.scopeFiles));
+    const requiredLineage = assignments.filter((assignment) => (
+      assignment.required
+      && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+      && assignment.status !== 'cancelled'
+      && assignment.status !== 'recovered'
+    ));
+    const requiredLineageById = new Map(requiredLineage.map((assignment) => (
+      [assignment.assignmentId, assignment] as const
+    )));
+    // scopeFiles authorizes a reported path; it is not evidence that the path
+    // changed. Only authenticated file events from the required audited
+    // implementation/integration lineage define the committed file set.
+    const taskFileEvents = this.listFileEvents(task.taskId);
+    const authoritativeFileEvents = taskFileEvents
+      .filter((event) => requiredLineageById.has(event.assignmentId));
+    const authoritativeFileEventsValid = authoritativeFileEvents.length === taskFileEvents.length
+      && authoritativeFileEvents.every((event) => {
+        const assignment = requiredLineageById.get(event.assignmentId);
+        return Boolean(assignment && validRepoPath(event.path) && assignment.scopeFiles.includes(event.path));
+      });
+    const expectedOwnedFiles = normalizeTaskArray(authoritativeFileEvents.map((event) => event.path));
     const structurallyValid = Boolean(
       revision && auditAttemptId && auditRevision && integrationOwner && commitSha
       && pushRemoteRef && externalRunId && externalHeadSha
@@ -2215,7 +2233,8 @@ export class SupervisionTaskRegistry {
     if (owner.externalRunId !== externalRunId || owner.externalHeadSha?.toLowerCase() !== externalHeadSha
       || (externalTaskId && owner.externalTaskId !== externalTaskId)
       || externalHeadSha !== commitSha) return { ok: false, reason: 'manifest_mismatch' };
-    if (!sameStringArray(ownedFiles, expectedOwnedFiles)
+    if (!authoritativeFileEventsValid
+      || !sameStringArray(ownedFiles, expectedOwnedFiles)
       || !sameStringArray(stagedPaths, ownedFiles)
       || !sameStringArray(manifestPaths, ownedFiles)) return { ok: false, reason: 'manifest_mismatch' };
 
@@ -2264,6 +2283,15 @@ export class SupervisionTaskRegistry {
       if (!exactStaleRuntimeOwner) return { ok: false, reason: 'owner_mismatch' };
       integrationOwnerReboundFromAssignmentId = staleOwner!.assignmentId;
     }
+
+    if (requiredLineage.some((assignment) => assignment.auditRevision !== revision)) {
+      return { ok: false, reason: 'old_revision' };
+    }
+    if (requiredLineage.length === 0 || requiredLineage.some((assignment) => (
+      !assignment.auditAttemptId
+      || assignment.verdict?.trim().toUpperCase() !== 'PASS'
+      || assignment.crossVendorAuditPassed !== true
+    ))) return { ok: false, reason: 'old_audit_attempt' };
 
     const exactAuditors = assignments.filter((assignment) => (
       assignment.role === 'auditor'
