@@ -3906,14 +3906,32 @@ html.native-ios-mac .chat-dl-btn {
   }
   .controlled-nodes-machine-actions { justify-content: stretch; }
   .controlled-nodes-machine-actions button { min-height: 36px; }
-  .controlled-nodes-machine-actions.is-mobile {
+  .controlled-nodes-machine-actions.is-mobile.is-owner {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 42px;
     align-items: stretch;
     gap: 8px;
   }
-  .controlled-nodes-machine-actions.is-mobile > .controlled-nodes-remote-desktop {
+  .controlled-nodes-machine-actions.is-mobile.is-owner > .controlled-nodes-remote-desktop {
     width: 100%;
+  }
+  .controlled-nodes-machine-actions.is-mobile.is-participant,
+  .controlled-nodes-machine-actions.is-mobile.is-viewer {
+    display: flex;
+    flex-flow: row wrap;
+    align-items: center;
+    justify-content: flex-start;
+  }
+  .controlled-nodes-machine-actions.is-mobile.is-participant > .controlled-nodes-remote-desktop {
+    flex: 0 0 auto;
+    width: auto;
+  }
+  .controlled-nodes-machine-actions.is-mobile.is-participant > .controlled-nodes-muted,
+  .controlled-nodes-machine-actions.is-mobile.is-viewer > .controlled-nodes-muted {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 7px 9px;
+    white-space: nowrap;
   }
   .controlled-nodes-mobile-menu-trigger {
     display: inline-grid;
@@ -3983,11 +4001,18 @@ html.native-ios-mac .chat-dl-btn {
   .controlled-nodes-machine-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
   .controlled-nodes-machine-actions { flex-direction: column; }
   .controlled-nodes-machine-actions button { width: 100%; }
-  .controlled-nodes-machine-actions.is-mobile {
+  .controlled-nodes-machine-actions.is-mobile.is-owner {
     grid-template-columns: minmax(0, 1fr) 42px;
   }
-  .controlled-nodes-machine-actions.is-mobile > .controlled-nodes-mobile-menu-trigger {
+  .controlled-nodes-machine-actions.is-mobile.is-owner > .controlled-nodes-mobile-menu-trigger {
     width: 42px;
+  }
+  .controlled-nodes-machine-actions.is-mobile.is-participant,
+  .controlled-nodes-machine-actions.is-mobile.is-viewer {
+    flex-direction: row;
+  }
+  .controlled-nodes-machine-actions.is-mobile.is-participant > .controlled-nodes-remote-desktop {
+    width: auto;
   }
   .controlled-nodes-mobile-menu-panel > .controlled-nodes-auto-unlock-form {
     grid-template-columns: minmax(0, 1fr) auto;

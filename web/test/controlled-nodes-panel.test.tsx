@@ -125,10 +125,16 @@ import {
  *  properties defined directly on `document`. */
 let restoreExecCommand: (() => void) | null = null;
 const originalViewportWidth = window.innerWidth;
+const originalViewportHeight = window.innerHeight;
 
 function setViewportWidth(width: number): void {
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
   window.dispatchEvent(new Event('resize'));
+}
+
+function setViewportSize(width: number, height: number): void {
+  Object.defineProperty(window, 'innerHeight', { configurable: true, value: height });
+  setViewportWidth(width);
 }
 
 afterEach(() => {
@@ -140,6 +146,7 @@ afterEach(() => {
   machinesLoaded = true;
   machinesLoading = false;
   refetch.mockResolvedValue(null);
+  Object.defineProperty(window, 'innerHeight', { configurable: true, value: originalViewportHeight });
   setViewportWidth(originalViewportWidth);
 });
 
@@ -595,7 +602,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('keeps only Remote Desktop and one menu trigger visible on a mobile owner card', async () => {
-    setViewportWidth(390);
+    setViewportSize(390, 944);
     machines = [machine({
       serverId: 'mobile-owner',
       displayName: 'Pocket Mac',
@@ -612,6 +619,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     });
 
     expect(card.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(card.querySelector('.controlled-nodes-machine-actions')?.classList.contains('is-owner')).toBe(true);
     const trigger = card.querySelector('.controlled-nodes-mobile-menu-trigger') as HTMLButtonElement;
     expect(trigger).not.toBeNull();
     expect(trigger.getAttribute('aria-label')).toBe('controlled_nodes.more_actions');
@@ -640,6 +648,55 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).not.toBeNull();
     fireEvent(document.body, new Event('pointerdown', { bubbles: true }));
     expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).toBeNull();
+  });
+
+  it('uses a compact role-aware action row for a Participant at a 390x944 CSS-pixel viewport', async () => {
+    setViewportSize(390, 944);
+    machines = [machine({
+      serverId: 'mobile-participant',
+      displayName: 'Shared Windows Node',
+      os: 'win',
+      accessRole: 'participant',
+      execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={vi.fn()} />);
+    const card = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-machine-row');
+      if (!(candidate instanceof HTMLLIElement)) throw new Error('mobile participant card not found');
+      return candidate;
+    });
+
+    expect(window.innerWidth).toBe(390);
+    expect(window.innerHeight).toBe(944);
+    const actions = card.querySelector('.controlled-nodes-machine-actions') as HTMLElement;
+    expect(actions.classList.contains('is-mobile')).toBe(true);
+    expect(actions.classList.contains('is-participant')).toBe(true);
+    expect(actions.classList.contains('is-owner')).toBe(false);
+    expect(actions.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(actions.querySelector('.controlled-nodes-muted')?.textContent).toBe('controlled_nodes.exec_on');
+    expect(actions.querySelector('.controlled-nodes-mobile-menu-trigger')).toBeNull();
+
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+    const css = readFileSync(resolve(webRoot, 'src/styles.css'), 'utf8');
+    const participantRuleStart = css.indexOf('.controlled-nodes-machine-actions.is-mobile.is-participant,');
+    expect(participantRuleStart).toBeGreaterThanOrEqual(0);
+    const participantRule = css.slice(participantRuleStart, css.indexOf('}', participantRuleStart));
+    expect(participantRule).toContain('display: flex');
+    expect(participantRule).toContain('flex-flow: row wrap');
+    expect(participantRule).toContain('align-items: center');
+    expect(css).toContain('.controlled-nodes-machine-actions.is-mobile.is-owner {');
+    expect(css).not.toMatch(/\.controlled-nodes-machine-actions\.is-mobile\s*\{[^}]*grid-template-columns/);
+
+    const remoteRuleStart = css.indexOf('.controlled-nodes-machine-actions.is-mobile.is-participant > .controlled-nodes-remote-desktop {');
+    const remoteRule = css.slice(remoteRuleStart, css.indexOf('}', remoteRuleStart));
+    expect(remoteRule).toContain('width: auto');
+    expect(remoteRule).toContain('flex: 0 0 auto');
+
+    const statusRuleStart = css.indexOf('.controlled-nodes-machine-actions.is-mobile.is-participant > .controlled-nodes-muted,');
+    const statusRule = css.slice(statusRuleStart, css.indexOf('}', statusRuleStart));
+    expect(statusRule).toContain('margin: 0');
+    expect(statusRule).toContain('white-space: nowrap');
   });
 
   it('puts worker installation inside the mobile menu instead of adding another card button', async () => {

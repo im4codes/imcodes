@@ -735,7 +735,7 @@ export function ControlledNodesPanel({
                 </div>
                 <RemoteDesktopReadiness capabilities={m.capabilities} compact />
               </div>
-              <div class={`controlled-nodes-machine-actions ${mobileActions ? 'is-mobile' : 'is-desktop'}`}>
+              <div class={`controlled-nodes-machine-actions ${mobileActions ? `is-mobile is-${machineAccessRole(m)}` : 'is-desktop'}`}>
                 {!mobileActions && renderInstallAction(m, false)}
                 {canOpenRemoteDesktopMachine(m) && (
                   <button
