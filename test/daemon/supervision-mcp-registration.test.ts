@@ -45,6 +45,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   applied: any[] = [];
   recovered: any[] = [];
   rebound: any[] = [];
+  revisionRebound: any[] = [];
   housekeepingCalls: any[] = [];
   listCalls: any[] = [];
   item(taskId: string) {
@@ -75,6 +76,10 @@ class FakeRegistry implements SupervisionRegistryPort {
   rebindAuditAssignment(input: any) {
     this.rebound.push(input);
     return { ok: true as const, value: { assignmentId: input.assignmentId } };
+  }
+  rebindTaskAssignmentRevision(input: any) {
+    this.revisionRebound.push(input);
+    return { ok: true as const, value: { taskId: input.taskId } };
   }
   housekeeping(input: any) {
     this.housekeepingCalls.push(input);
@@ -408,6 +413,47 @@ describe('list/get visibility guards', () => {
 });
 
 describe('administrative recover', () => {
+  it('rebinds one same-object revision only through Brain/admin authority and the strict production schema', async () => {
+    const request = {
+      taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+      fromRevision: 'gc-r1', toRevision: 'gc-r3',
+      ownedFiles: ['src/daemon/supervision-worktree-gc.ts'],
+      evidenceManifestSha256: 'a'.repeat(64),
+      reason: 'bind the frozen R3 evidence to the original assignment',
+    };
+    const participant = createSupervisionMcpToolHandlers(CALLER, { registry });
+    expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER](request))
+      .toMatchObject({ status: 'error', reason: 'forbidden' });
+    expect(registry.revisionRebound).toEqual([]);
+
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toEqual({
+      status: 'ok', taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+      fromRevision: 'gc-r1', toRevision: 'gc-r3', replay: false,
+    });
+    expect(registry.revisionRebound).toEqual([request]);
+
+    registry.revisionRebound = [];
+    expect(await call(SUPERVISION_MCP_TOOLS.RECOVER, request)).toEqual({
+      status: 'ok', taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+      fromRevision: 'gc-r1', toRevision: 'gc-r3', replay: false,
+    });
+    expect(registry.revisionRebound).toEqual([request]);
+
+    registry.revisionRebound = [];
+    for (const missing of ['assignmentId', 'fromRevision', 'toRevision', 'ownedFiles', 'evidenceManifestSha256'] as const) {
+      const malformed = { ...request } as Record<string, unknown>;
+      delete malformed[missing];
+      const result: any = await client.callTool({
+        name: SUPERVISION_MCP_TOOLS.RECOVER, arguments: malformed,
+      });
+      expect(result.isError, missing).toBe(true);
+    }
+    expect(registry.revisionRebound).toEqual([]);
+  });
+
   it('rebinds an existing auditor only through project-Brain authority and live daemon identity', async () => {
     const liveIdentity = {
       sessionName: 'deck_sub_rebound', sessionInstanceId: 'instance-rebound', runtimeEpoch: 'epoch-rebound',
@@ -576,6 +622,12 @@ describe('published schema enums match the fixed constants exactly', () => {
     expect(intent.properties.validationState.enum).toEqual([...SUPERVISION_CONSOLE_VALIDATION_STATES]);
     expect(byName.get(SUPERVISION_MCP_TOOLS.RECOVER).properties.toStatus.enum)
       .toEqual([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]);
+    expect(byName.get(SUPERVISION_MCP_TOOLS.RECOVER).properties).toEqual(expect.objectContaining({
+      fromRevision: expect.any(Object),
+      toRevision: expect.any(Object),
+      ownedFiles: expect.any(Object),
+      evidenceManifestSha256: expect.objectContaining({ pattern: '^[a-f0-9]{64}$' }),
+    }));
     expect(byName.get(SUPERVISION_MCP_TOOLS.HOUSEKEEPING).properties.mode.enum)
       .toEqual(['dryRun', 'apply']);
     expect(byName.get(SUPERVISION_MCP_TOOLS.LIST).properties.limit.maximum).toBe(100);

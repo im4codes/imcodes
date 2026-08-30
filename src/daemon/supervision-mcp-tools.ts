@@ -139,6 +139,15 @@ export interface SupervisionRegistryPort {
     };
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
+  rebindTaskAssignmentRevision?(input: {
+    taskId: string;
+    assignmentId: string;
+    fromRevision: string;
+    toRevision: string;
+    ownedFiles: string[];
+    evidenceManifestSha256: string;
+    reason: string;
+  }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   housekeeping(input: { mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number }): unknown;
 }
 
@@ -198,6 +207,10 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     toStatus: z.enum([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]).optional(),
     assignmentId: z.string().min(1).optional(),
     rebindSessionName: z.string().min(1).optional(),
+    fromRevision: z.string().min(1).optional(),
+    toRevision: z.string().min(1).optional(),
+    ownedFiles: z.array(z.string().min(1)).min(1).optional(),
+    evidenceManifestSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     reason: z.string().min(1).max(2000),
   },
   [SUPERVISION_MCP_TOOLS.HOUSEKEEPING]: {
@@ -411,8 +424,38 @@ export function createSupervisionMcpToolHandlers(
       if (!reg) return err('unavailable', 'supervision registry not bound');
       const assignmentId = String(input.assignmentId ?? '').trim();
       const rebindSessionName = String(input.rebindSessionName ?? '').trim();
+      const fromRevision = String(input.fromRevision ?? '').trim();
+      const toRevision = String(input.toRevision ?? '').trim();
+      const ownedFiles = Array.isArray(input.ownedFiles)
+        ? input.ownedFiles.map((path) => String(path))
+        : [];
+      const evidenceManifestSha256 = String(input.evidenceManifestSha256 ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
+      const revisionRecoveryRequested = Boolean(
+        fromRevision || toRevision || ownedFiles.length > 0 || evidenceManifestSha256,
+      );
+      if (revisionRecoveryRequested) {
+        if (!assignmentId || !fromRevision || !toRevision || ownedFiles.length === 0
+          || !evidenceManifestSha256 || rebindSessionName || input.toStatus !== undefined) {
+          return err('validation_failed', 'revision recovery requires assignmentId, fromRevision, toRevision, ownedFiles, evidenceManifestSha256 and reason only');
+        }
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        const authorized = isAdmin(caller) || Boolean(
+          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
+        );
+        if (!task || !authorized) {
+          return err('forbidden', 'revision recovery requires the authoritative project Brain or administrator');
+        }
+        const rebound = reg.rebindTaskAssignmentRevision?.({
+          taskId, assignmentId, fromRevision, toRevision, ownedFiles,
+          evidenceManifestSha256, reason,
+        });
+        if (!rebound) return err('unavailable', 'revision recovery is not bound');
+        if (!rebound.ok) return err(rebound.reason, `revision recovery rejected: ${rebound.reason}`);
+        return ok({ taskId, assignmentId, fromRevision, toRevision, replay: rebound.replay === true });
+      }
       if (assignmentId || rebindSessionName) {
         if (!assignmentId || !rebindSessionName || !reason) return err('validation_failed', 'audit rebind requires assignmentId, rebindSessionName and reason');
         const task = reg.get(taskId);

@@ -67,6 +67,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       return getSupervisionTaskRegistry().recoverTask(input);
     },
     rebindAuditAssignment: (input) => getSupervisionTaskRegistry().rebindAuditAssignment(input),
+    rebindTaskAssignmentRevision: (input) => getSupervisionTaskRegistry().rebindTaskAssignmentRevision(input),
     housekeeping: (input) => getSupervisionTaskRegistry().reconcileHousekeeping(input),
   };
 }

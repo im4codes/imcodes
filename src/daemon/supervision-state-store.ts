@@ -2160,6 +2160,164 @@ export class SupervisionTaskRegistry {
   }
 
   /**
+   * Brain/admin-authorized recovery for one frozen revision on the SAME task
+   * and required implementer assignment. Historical audit rows and events are
+   * append-only; only the live revision binding is cleared and rebound.
+   */
+  rebindTaskAssignmentRevision(input: {
+    taskId: string;
+    assignmentId: string;
+    fromRevision: string;
+    toRevision: string;
+    ownedFiles: readonly string[];
+    evidenceManifestSha256: string;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const fromRevision = normalizeTaskString(input.fromRevision);
+    const toRevision = normalizeTaskString(input.toRevision);
+    const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
+    const reason = normalizeTaskString(input.reason);
+    const ownedFiles = normalizeTaskArray(input.ownedFiles);
+    if (!taskId || !assignmentId || !fromRevision || !toRevision || fromRevision === toRevision
+      || !evidenceManifestSha256 || !FINALIZATION_SHA256_RE.test(evidenceManifestSha256)
+      || !reason || ownedFiles.length === 0 || ownedFiles.length !== input.ownedFiles.length
+      || !ownedFiles.every(validRepoPath)) return { ok: false, reason: 'invalid' };
+
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(taskId);
+      const assignment = this.getAssignment(assignmentId);
+      if (!task || !assignment || assignment.taskId !== taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+
+      const exactReplay = task.currentRevision === toRevision && assignment.auditRevision === toRevision;
+      if (exactReplay) {
+        const prior = this.listEvents(taskId).find((event) => (
+          event.assignmentId === assignmentId
+          && event.eventType === 'recovered'
+          && event.payload?.source === 'brain_authorized_revision_rebind'
+          && event.payload?.fromRevision === fromRevision
+          && event.payload?.toRevision === toRevision
+          && event.payload?.evidenceManifestSha256 === evidenceManifestSha256
+          && sameStringArray(
+            Array.isArray(event.payload?.ownedFiles)
+              ? event.payload.ownedFiles.map((path) => String(path))
+              : [],
+            ownedFiles,
+          )
+        ));
+        this.#db.exec('ROLLBACK');
+        return prior
+          ? { ok: true, value: task, replay: true }
+          : { ok: false, reason: 'conflicting_replay' };
+      }
+
+      const assignments = this.listAssignments(taskId);
+      const activeImplementers = assignments.filter((candidate) => (
+        candidate.required
+        && candidate.role === 'implementer'
+        && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+      ));
+      const activeAuditor = assignments.some((candidate) => (
+        candidate.role === 'auditor'
+        && !['cancelled', 'finalized'].includes(candidate.status)
+      ));
+      const conflictingPassAssignment = assignments.some((candidate) => (
+        candidate.verdict?.trim().toUpperCase() === 'PASS'
+        && (candidate.auditRevision === fromRevision || candidate.auditRevision === toRevision)
+      ));
+      const conflictingPassAttestation = this.#db.prepare(
+        `SELECT 1 AS ok FROM supervision_audit_attestations
+         WHERE task_id = ? AND revision IN (?, ?) AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
+      ).get(taskId, fromRevision, toRevision) as { ok?: number } | undefined;
+      const conflictingPassReceipt = this.#db.prepare(
+        `SELECT 1 AS ok FROM supervision_audit_receipts
+         WHERE task_id = ? AND revision IN (?, ?) AND receipt_kind = 'final'
+           AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
+      ).get(taskId, fromRevision, toRevision) as { ok?: number } | undefined;
+      const exactStaleShape = Boolean(
+        task.classification !== 'integration_slice'
+        && ['implementing', 'rework'].includes(task.status)
+        && ['implementing', 'rework'].includes(assignment.status)
+        && task.currentRevision === fromRevision
+        && assignment.auditRevision === fromRevision
+        && assignment.role === 'implementer'
+        && assignment.required
+        && Boolean(assignment.leaseId)
+        && activeImplementers.length === 1
+        && activeImplementers[0]?.assignmentId === assignmentId
+        && !activeAuditor
+        && !conflictingPassAssignment
+        && conflictingPassAttestation?.ok !== 1
+        && conflictingPassReceipt?.ok !== 1
+        && sameStringArray(assignment.scopeFiles, ownedFiles)
+        && !task.commitSha
+        && !task.pushRemoteRef
+        && !task.finalization
+        && !task.archivedAt
+        && this.listFileClaims(taskId).length === 0
+      );
+      if (!exactStaleShape) {
+        this.#db.exec('ROLLBACK');
+        return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
+          : activeAuditor ? { ok: false, reason: 'invalid_transition' }
+            : !sameStringArray(assignment.scopeFiles, ownedFiles) ? { ok: false, reason: 'manifest_mismatch' }
+              : task.currentRevision !== fromRevision || assignment.auditRevision !== fromRevision
+                ? { ok: false, reason: 'old_revision' }
+                : { ok: false, reason: 'invalid_transition' };
+      }
+
+      const payload = {
+        source: 'brain_authorized_revision_rebind',
+        reason,
+        fromRevision,
+        toRevision,
+        ownedFiles,
+        evidenceManifestSha256,
+        ...(assignment.auditAttemptId ? { previousAuditAttemptId: assignment.auditAttemptId } : {}),
+        ...(assignment.verdict ? { previousVerdict: assignment.verdict } : {}),
+      };
+      const reboundAssignment: PersistedSupervisionTaskAssignment = {
+        ...assignment,
+        status: 'implementing',
+        generation: assignment.generation + 1,
+        auditAttemptId: undefined,
+        auditRevision: toRevision,
+        verdict: undefined,
+        blocker: undefined,
+        externalRunId: undefined,
+        externalHeadSha: undefined,
+        externalTaskId: undefined,
+        primaryReviewPassed: undefined,
+        crossVendorAuditPassed: undefined,
+        auditRoutingReason: undefined,
+        auditDegradedReason: undefined,
+        updatedAt: now,
+      };
+      const reboundTask: PersistedSupervisionTaskRecord = {
+        ...task,
+        currentRevision: toRevision,
+        status: 'implementing',
+        blocker: undefined,
+        updatedAt: now,
+      };
+      this.#writeAssignment(reboundAssignment, 'recovered', payload);
+      this.#writeTask(reboundTask, 'recovered', { ...payload, assignmentId });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: reboundTask };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
    * Append a daemon-authenticated audit receipt without bearer authority.
    *
    * Validation and identity binding happen before BEGIN IMMEDIATE, so a schema
