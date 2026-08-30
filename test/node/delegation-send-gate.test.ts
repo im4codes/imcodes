@@ -646,9 +646,9 @@ describe('delegation send gate', () => {
   });
 
   it.each([
-    ['blocked', 'blocked'],
-    ['FINISHED', 'ready_for_audit'],
-  ] as const)('fails closed before every side effect when the only historical implementer is %s', async (_label, terminalStatus) => {
+    ['blocked', 'blocked', false],
+    ['FINISHED with reply:true', 'ready_for_audit', true],
+  ] as const)('keeps blocked fail-closed but reuses the exact historical implementer after %s', async (_label, terminalStatus, explicitReply) => {
     const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
     const brain = supervisedBrain([config]);
     const worker = supervisedChild({
@@ -696,17 +696,33 @@ describe('delegation send gate', () => {
     const createReplyAuthority = vi.spyOn(getDelegationReplyStore(), 'create');
     dispatched.mockClear();
     const result = await dispatchSendMessage(caller, {
-      target: worker.name, message: 'must not replace a terminal implementer', deliveryMode: 'append',
+      target: worker.name, message: 'append without replacing the historical implementer', deliveryMode: 'append',
+      reply: explicitReply,
       task: { taskId: created.taskId, executionPool: 'primary' },
     }, deps(sessions, dispatched));
-    expect(result).toMatchObject({
-      status: 'error', reason: 'identity_rejected',
-      error: expect.stringContaining('no unique reusable implementer assignment'),
-    });
+    if (terminalStatus === 'blocked') {
+      expect(result).toMatchObject({
+        status: 'error', reason: 'identity_rejected',
+        error: expect.stringContaining('no unique reusable implementer assignment'),
+      });
+      expect(dispatched).not.toHaveBeenCalled();
+    } else {
+      expect(result).toMatchObject({
+        status: 'accepted', taskId: created.taskId, assignmentId: created.assignmentId,
+        deliveries: [expect.objectContaining({ target: worker.name, status: 'delivered' })],
+      });
+      expect(dispatched).toHaveBeenCalledWith(worker, expect.any(String), expect.objectContaining({
+        deliveryMode: 'append',
+      }));
+      if (result.status !== 'accepted') throw new Error('expected accepted continuation');
+      expect(result.deliveries[0]).not.toHaveProperty('delegationId');
+      expect(registry.getAssignment(created.assignmentId)).toMatchObject({
+        assignmentId: created.assignmentId, status: 'ready_for_audit',
+      });
+    }
     expect(createTask).not.toHaveBeenCalled();
     expect(createAssignment).not.toHaveBeenCalled();
     expect(createReplyAuthority).not.toHaveBeenCalled();
-    expect(dispatched).not.toHaveBeenCalled();
     expect(registry.list()).toHaveLength(taskCount);
     expect(registry.get(created.taskId)!.assignments).toHaveLength(assignmentCount);
   });

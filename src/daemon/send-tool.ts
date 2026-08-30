@@ -1128,12 +1128,19 @@ export async function dispatchSendMessage(
 
   for (const target of dispatchable) {
     const messageId = createSendMessageId();
-    // A registered task must always have an authenticated return path. Without
-    // this, a worker that hits illegal_transition or a contract contradiction
-    // can only print NEEDS_INPUT in its own transcript and silently strand the
-    // coordinating Brain. Ordinary untracked messages keep their opt-in reply
-    // behavior.
-    const replyRequired = input.reply === true || Boolean(supervisedTaskId && supervisedAssignmentId);
+    // A newly registered assignment must always have an authenticated return
+    // path. Without this, a worker that hits illegal_transition or a contract
+    // contradiction can only print NEEDS_INPUT in its own transcript and
+    // silently strand the coordinating Brain. Existing continuations retain
+    // that assignment's original channel; ordinary untracked messages keep
+    // their opt-in reply behavior.
+    // A continuation appends to an already-authorized assignment and must not
+    // mint a second reply authority/card merely to deliver an addendum. The
+    // original assignment's append-only reply channel remains authoritative;
+    // callers can still explicitly request a fresh ordinary reply channel.
+    const replyRequired = !reusedContinuationAssignment && (
+      input.reply === true || Boolean(supervisedTaskId && supervisedAssignmentId)
+    );
     const replyAuthority = replyRequired
       ? createDelegationReplyAuthority({
           origin: callerRecord,
