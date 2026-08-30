@@ -87,6 +87,8 @@ export interface TransportMemoryRecallItem {
   id: string;
   type?: 'raw' | 'processed' | 'observation';
   projectId: string;
+  /** Session whose timeline produced this projection, when provenance is known. */
+  sourceSessionName?: string;
   scope?: string;
   enterpriseId?: string;
   workspaceId?: string;

@@ -53,6 +53,7 @@ function toTransportItem(
     id: item.id,
     type: 'processed',
     projectId: item.projectId,
+    ...(item.sourceSessionName ? { sourceSessionName: item.sourceSessionName } : {}),
     scope: item.scope,
     ...(item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
     ...(item.workspaceId ? { workspaceId: item.workspaceId } : {}),
@@ -63,6 +64,14 @@ function toTransportItem(
     ...(typeof item.updatedAt === 'number' ? { updatedAt: item.updatedAt } : {}),
     sourceKind,
   };
+}
+
+function normalizeSummarySourceSessionName(
+  item: MemorySearchResultItem,
+): MemorySearchResultItem {
+  const { sourceSessionName: rawSourceSessionName, ...rest } = item;
+  const sourceSessionName = rawSourceSessionName?.trim();
+  return sourceSessionName ? { ...rest, sourceSessionName } : rest;
 }
 
 async function selectLocalRecent(
@@ -112,10 +121,12 @@ export async function collectRecentSummarySyncCandidates(
   const rows = [
     ...remote
       .filter((item) => item.type === 'processed' && item.projectionClass === 'recent_summary')
+      .map(normalizeSummarySourceSessionName)
       .filter((item) => !currentSessionName || item.sourceSessionName !== currentSessionName)
       .map((item) => ({ item, sourceKind: 'remote_processed' as const })),
     ...local
       .filter((item) => item.type === 'processed' && item.projectionClass === 'recent_summary')
+      .map(normalizeSummarySourceSessionName)
       .filter((item) => !currentSessionName || item.sourceSessionName !== currentSessionName)
       .map((item) => ({ item, sourceKind: 'local_processed' as const })),
   ].sort((a, b) => (

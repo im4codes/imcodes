@@ -43,6 +43,7 @@ vi.mock('../../src/store/context-store-worker-client.js', () => ({
 }));
 
 import { attachMemoryShortRefs } from '../../src/context/memory-recall-refs.js';
+import { collectRecentSummarySyncCandidates } from '../../src/context/summary-sync.js';
 import { buildMemoryContextTimelinePayload } from '../../src/daemon/memory-context-timeline.js';
 import {
   loadMemoryShortRefsFromStore,
@@ -127,6 +128,80 @@ describe('injected memory handles resolve for the agent they were injected into'
     expect(item?.ref).toMatch(/^obs:[a-z2-7]{13}$/);
     expect(payload?.injectedText).toContain(`(${item?.ref})`);
     expect(payload?.injectedText).not.toContain('(proj:');
+  });
+
+  it('preserves recent-summary source session metadata through transport and timeline projection', async () => {
+    const [candidate] = await collectRecentSummarySyncCandidates(RESOLVER_NAMESPACE, {
+      selectLocal: async () => [{
+        id: 'recent-session-source',
+        type: 'processed',
+        projectId: PROJECT,
+        scope: 'personal',
+        sourceSessionName: 'deck_sub_source',
+        projectionClass: 'recent_summary',
+        summary: 'Summary produced by the source sub-session',
+        createdAt: 100,
+      }],
+      fetchRemote: async () => [],
+    });
+
+    expect(candidate?.item.sourceSessionName).toBe('deck_sub_source');
+    const payload = buildMemoryContextTimelinePayload('continue the source task', [candidate!.item]);
+    expect(payload?.items[0]?.sourceSessionName).toBe('deck_sub_source');
+  });
+
+  it('omits whitespace-only source session metadata at sync and timeline trust boundaries', async () => {
+    const [candidate] = await collectRecentSummarySyncCandidates(RESOLVER_NAMESPACE, {
+      selectLocal: async () => [{
+        id: 'recent-blank-source',
+        type: 'processed',
+        projectId: PROJECT,
+        scope: 'personal',
+        sourceSessionName: ' \t ',
+        projectionClass: 'recent_summary',
+        summary: 'Legacy summary with no trustworthy source session',
+        createdAt: 100,
+      }],
+      fetchRemote: async () => [],
+    });
+
+    expect(candidate?.item).not.toHaveProperty('sourceSessionName');
+    const payload = buildMemoryContextTimelinePayload('continue safely', [{
+      ...candidate!.item,
+      sourceSessionName: ' \t ',
+    }]);
+    expect(payload?.items[0]).not.toHaveProperty('sourceSessionName');
+  });
+
+  it('excludes padded current-session summaries and projects trimmed sibling provenance', async () => {
+    const candidates = await collectRecentSummarySyncCandidates(RESOLVER_NAMESPACE, {
+      currentSessionName: 'deck_current_brain',
+      selectLocal: async () => [{
+        id: 'recent-padded-self',
+        type: 'processed',
+        projectId: PROJECT,
+        scope: 'personal',
+        sourceSessionName: '  deck_current_brain  ',
+        projectionClass: 'recent_summary',
+        summary: 'Current conversation must not be supplemental context',
+        createdAt: 200,
+      }, {
+        id: 'recent-padded-sibling',
+        type: 'processed',
+        projectId: PROJECT,
+        scope: 'personal',
+        sourceSessionName: '  deck_sub_sibling  ',
+        projectionClass: 'recent_summary',
+        summary: 'Sibling summary remains eligible',
+        createdAt: 100,
+      }],
+      fetchRemote: async () => [],
+    });
+
+    expect(candidates.map(({ item }) => item.id)).toEqual(['recent-padded-sibling']);
+    expect(candidates[0]?.item.sourceSessionName).toBe('deck_sub_sibling');
+    const payload = buildMemoryContextTimelinePayload('continue sibling work', [candidates[0]!.item]);
+    expect(payload?.items[0]?.sourceSessionName).toBe('deck_sub_sibling');
   });
 
   it('still redeems after a daemon restart, via the row that actually reached the store', async () => {

@@ -182,6 +182,8 @@ export interface MemoryContextTimelineItem {
   /** Redeemable projection/observation handle shown to users and agents. */
   ref?: string;
   projectId: string;
+  /** Session whose timeline produced this projection, when provenance is known. */
+  sourceSessionName?: string;
   scope?: string;
   enterpriseId?: string;
   workspaceId?: string;

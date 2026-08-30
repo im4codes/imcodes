@@ -349,14 +349,21 @@ function extractMemoryProblemPreview(summary: string): string | null {
   );
 }
 
-function getLatestRecentMemoryProblemPreview(events: TimelineEvent[]): string | null {
+function getLatestRecentMemoryProblemPreview(
+  events: TimelineEvent[],
+  sessionId: string | null | undefined,
+  relatedToEventId: string | null | undefined,
+): string | null {
+  if (!sessionId || !relatedToEventId) return null;
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
     if (event.type !== 'memory.context') continue;
     const payload = event.payload as unknown as Partial<MemoryContextTimelinePayload>;
+    if (payload.relatedToEventId !== relatedToEventId) continue;
     if (!Array.isArray(payload.items)) continue;
     for (const item of payload.items) {
       if (item?.projectionClass !== 'recent_summary') continue;
+      if (item.sourceSessionName !== sessionId) continue;
       const preview = extractMemoryProblemPreview(String(item.summary ?? ''));
       if (preview) return preview;
     }
@@ -1885,7 +1892,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     }
     return null;
   }, [events, t]);
-  const recentMemoryProblemPreview = useMemo(() => getLatestRecentMemoryProblemPreview(events), [events]);
+  const recentMemoryProblemPreview = useMemo(
+    () => getLatestRecentMemoryProblemPreview(events, sessionId, lastSentUserMessage?.eventId),
+    [events, sessionId, lastSentUserMessage?.eventId],
+  );
   const pinnedPreviewText = recentMemoryProblemPreview ?? lastSentUserMessage?.text ?? '';
   const pinnedPreviewUsesMemory = !!recentMemoryProblemPreview;
   // Reset the expand state whenever the pinned target/summary changes so a new

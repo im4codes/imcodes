@@ -4030,6 +4030,7 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
     id: item.id,
     type: item.type,
     projectId: item.projectId,
+    ...(item.sourceSessionName?.trim() ? { sourceSessionName: item.sourceSessionName.trim() } : {}),
     scope: item.scope,
     ...(item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
     ...(item.workspaceId ? { workspaceId: item.workspaceId } : {}),
