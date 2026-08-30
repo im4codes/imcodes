@@ -4,6 +4,7 @@
  */
 import { useState, useEffect, useMemo, useRef, useCallback } from 'preact/hooks';
 import type { JSX } from 'preact';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { SubSessionCard } from './SubSessionCard.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -39,6 +40,10 @@ import {
 } from '../subsession-accent-colors.js';
 import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
 import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
+import {
+  SUBSESSION_DESKTOP_LAYOUT,
+  type SubSessionDesktopLayout,
+} from '../subsession-desktop-layout-preference.js';
 import {
   DIRECT_CONNECTIVITY_ENDPOINT_KIND,
   DIRECT_CONNECTIVITY_PROBE_STAGE,
@@ -87,6 +92,7 @@ interface CollapsedSubSessionButtonProps {
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
+  orientation?: 'horizontal' | 'vertical';
   sharedState?: SharedStateSummary | null;
   inP2p: boolean;
   draggable?: boolean;
@@ -105,6 +111,9 @@ interface Props {
   openIds: Set<string>;
   maximizedIds?: ReadonlySet<string>;
   desktopLayoutCapable?: boolean;
+  desktopLayout?: SubSessionDesktopLayout;
+  onDesktopLayoutChange?: (layout: SubSessionDesktopLayout) => void;
+  verticalRailHost?: HTMLElement | null;
   idleFlashTokens?: Map<string, number>;
   sharedSubSessionStates?: ReadonlyMap<string, SharedStateSummary>;
   onOpen: (id: string) => void;
@@ -325,7 +334,7 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -347,7 +356,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -694,9 +703,10 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, verticalRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
+  const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
   const collapsed = controlledCollapsed ?? internalCollapsed;
@@ -1175,7 +1185,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('touchcancel', onCancel);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, getEntryGestureController, moveSubSessionInDragOrder, syncOrderToServer]);
+  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
@@ -1222,7 +1232,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       cleanupCollapsed();
       cleanupExpanded();
     };
-  }, [collapsed, layout, orderedSessions.length]);
+  }, [collapsed, isVerticalRail, layout, orderedSessions.length]);
 
   useEffect(() => {
     if (!ws) return;
@@ -1281,13 +1291,73 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const repoButtonLabel = t('repo.info_title', { defaultValue: t('subsessionBar.repository') });
   const cronButtonLabel = t('subsessionBar.scheduled_tasks');
 
+  const renderQuickSubWindowControl = () => showQuickSubWindowControl ? (
+    <button
+      type="button"
+      class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
+      title={quickSubWindowLabel}
+      aria-label={quickSubWindowLabel}
+      disabled={quickSubWindowDisabled}
+      onClick={handleQuickSubWindowControl}
+    >
+      <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
+    </button>
+  ) : null;
+
+  const renderCompactSubSessionButtons = (orientation: 'horizontal' | 'vertical') => orderedSessions.map((sub) => (
+    <CollapsedSubSessionButton
+      key={sub.id}
+      sub={sub}
+      orientation={orientation}
+      accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+      isOpen={openIds.has(sub.id)}
+      isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
+      idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
+      usage={subUsages?.get(`deck_sub_${sub.id}`)}
+      detectedModel={detectedModels?.get(sub.sessionName)}
+      sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
+      inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+      draggable={desktopLayoutCapable}
+      onEntryPointerDown={handleEntryPointerDown}
+      onEntryTouchStart={handleEntryTouchStart}
+      onEntryClick={handleEntryClick}
+      onEntryDoubleClick={handleEntryDoubleClick}
+      onEntryDragStart={handleCollapsedEntryDragStart}
+      onEntryDragOver={handleCollapsedEntryDragOver}
+      onEntryDragEnd={handleCollapsedEntryDragEnd}
+      t={t}
+    />
+  ));
+
+  const verticalRail = isVerticalRail && verticalRailHost
+    ? createPortal(
+      <div class="subsession-vertical-rail" data-testid="subsession-vertical-rail">
+        <div class="subsession-vertical-rail-header">
+          <span>{t('subsessionBar.vertical_rail')}</span>
+          <span class="subsession-vertical-rail-count">{subSessions.length}</span>
+          {renderQuickSubWindowControl()}
+        </div>
+        <div
+          class="subsession-vertical-rail-scroll"
+          data-testid="subsession-vertical-rail-scroll"
+          ref={collapsedBarRef}
+        >
+          {renderCompactSubSessionButtons('vertical')}
+        </div>
+      </div>,
+      verticalRailHost,
+    )
+    : null;
+
   return (
-    <div class="subcard-bar">
+    <>
+    {verticalRail}
+    <div class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}`}>
       {/* Toolbar */}
       <div class="subcard-toolbar">
-        <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
+        {!isVerticalRail && <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
           {collapsed ? '▲' : '▼'}
-        </button>
+        </button>}
         {isMobile && discussions.length > 0 && (
           <button
             class={`subcard-toolbar-btn${p2pHidden ? ' subcard-toolbar-btn-active' : ''}`}
@@ -1312,17 +1382,33 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         )}
         {!collapsed && (
           <>
-            <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
+            {!isVerticalRail && <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
               {layout === 'single' ? '⊞' : '☰'}
-            </button>
-            <button
+            </button>}
+            {!isVerticalRail && <button
               class={`subcard-toolbar-btn${showSizePanel ? ' subcard-toolbar-btn-active' : ''}`}
               onClick={() => { setShowSizePanel(!showSizePanel); setDraftW(String(cardSize.w)); setDraftH(String(cardSize.h)); }}
               title={t('subsessionBar.card_size')}
             >
               ⚙
-            </button>
-            <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
+            </button>}
+            {!isVerticalRail && <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>}
+            {desktopLayoutCapable && onDesktopLayoutChange && (
+              <button
+                type="button"
+                class="subcard-toolbar-btn subsession-desktop-layout-toggle"
+                data-testid="subsession-desktop-layout-toggle"
+                data-layout={desktopLayout}
+                aria-pressed={isVerticalRail}
+                aria-label={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+                title={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+                onClick={() => onDesktopLayoutChange(
+                  isVerticalRail ? SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL : SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+                )}
+              >
+                <span aria-hidden="true">{isVerticalRail ? '⇆' : '⇅'}</span>
+              </button>
+            )}
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
               <button
@@ -1385,6 +1471,22 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               </button>
             )}
           </>
+        )}
+        {collapsed && desktopLayoutCapable && onDesktopLayoutChange && (
+          <button
+            type="button"
+            class="subcard-toolbar-btn subsession-desktop-layout-toggle"
+            data-testid="subsession-desktop-layout-toggle"
+            data-layout={desktopLayout}
+            aria-pressed={isVerticalRail}
+            aria-label={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+            title={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+            onClick={() => onDesktopLayoutChange(
+              isVerticalRail ? SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL : SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+            )}
+          >
+            <span aria-hidden="true">{isVerticalRail ? '⇆' : '⇅'}</span>
+          </button>
         )}
         {/* Collapsed toolbar: compact stats strip. */}
         {collapsed && stats && (() => {
@@ -1543,7 +1645,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       </div>
 
       {/* Size settings panel */}
-      {!collapsed && showSizePanel && (
+      {!isVerticalRail && !collapsed && showSizePanel && (
         <div class="subcard-size-panel">
           <span class="subcard-size-label">{t('subsessionBar.card_size')}</span>
           <label class="subcard-size-field">
@@ -1614,67 +1716,19 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       )}
 
       {/* Collapsed: compact buttons (all platforms) — drag on desktop, long-press on touch */}
-      {collapsed && subSessions.length > 0 && (
+      {!isVerticalRail && collapsed && subSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showQuickSubWindowControl && (
-            <button
-              type="button"
-              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
-              title={quickSubWindowLabel}
-              aria-label={quickSubWindowLabel}
-              disabled={quickSubWindowDisabled}
-              onClick={handleQuickSubWindowControl}
-            >
-              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
-            </button>
-          )}
+          {renderQuickSubWindowControl()}
           <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
-            {orderedSessions.map((sub) => (
-              <CollapsedSubSessionButton
-                key={sub.id}
-                sub={sub}
-                accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
-                isOpen={openIds.has(sub.id)}
-                // Desktop: focusedSubId marks the single active card. Mobile only
-                // ever opens ONE sub-session, so that open card IS the active one
-                // (focusedSubId is null on mobile) — treat open as active there so
-                // it gets the SOLID bottom accent, not the dashed open-only one.
-                isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
-                idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
-                usage={subUsages?.get(`deck_sub_${sub.id}`)}
-                detectedModel={detectedModels?.get(sub.sessionName)}
-                sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
-                inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
-                draggable={desktopLayoutCapable}
-                onEntryPointerDown={handleEntryPointerDown}
-                onEntryTouchStart={handleEntryTouchStart}
-                onEntryClick={handleEntryClick}
-                onEntryDoubleClick={handleEntryDoubleClick}
-                onEntryDragStart={handleCollapsedEntryDragStart}
-                onEntryDragOver={handleCollapsedEntryDragOver}
-                onEntryDragEnd={handleCollapsedEntryDragEnd}
-                t={t}
-              />
-            ))}
+            {renderCompactSubSessionButtons('horizontal')}
           </div>
         </div>
       )}
 
       {/* Expanded: preview cards (all platforms) */}
-      {!collapsed && orderedSessions.length > 0 && (
+      {!isVerticalRail && !collapsed && orderedSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showQuickSubWindowControl && (
-            <button
-              type="button"
-              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
-              title={quickSubWindowLabel}
-              aria-label={quickSubWindowLabel}
-              disabled={quickSubWindowDisabled}
-              onClick={handleQuickSubWindowControl}
-            >
-              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
-            </button>
-          )}
+          {renderQuickSubWindowControl()}
           <div
             ref={expandedScrollRef}
             class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
@@ -1773,5 +1827,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         />
       )}
     </div>
+    </>
   );
 }

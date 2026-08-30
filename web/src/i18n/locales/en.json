@@ -2066,6 +2066,9 @@
     "drag_to_resize": "Drag to resize"
   },
   "subsessionBar": {
+    "switch_to_vertical": "Switch sub-sessions to vertical rail",
+    "switch_to_horizontal": "Switch sub-sessions to horizontal bar",
+    "vertical_rail": "Sub-sessions",
     "show": "Show",
     "hide": "Hide",
     "layout_double": "Double row",

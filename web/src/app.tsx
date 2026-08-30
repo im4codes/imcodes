@@ -52,6 +52,12 @@ import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './compone
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
+import {
+  loadSubSessionDesktopLayout,
+  saveSubSessionDesktopLayout,
+  SUBSESSION_DESKTOP_LAYOUT,
+  type SubSessionDesktopLayout,
+} from './subsession-desktop-layout-preference.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
 import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
@@ -845,6 +851,15 @@ export function App() {
       localStorage.setItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, JSON.stringify(subSessionBarCollapsed));
     } catch { /* ignore */ }
   }, [subSessionBarCollapsed]);
+  const [subSessionDesktopLayout, setSubSessionDesktopLayout] = useState<SubSessionDesktopLayout>(
+    () => loadSubSessionDesktopLayout(),
+  );
+  const [subSessionVerticalRailHost, setSubSessionVerticalRailHost] = useState<HTMLElement | null>(null);
+  const handleSubSessionDesktopLayoutChange = useCallback((layout: SubSessionDesktopLayout) => {
+    setSubSessionDesktopLayout(layout);
+    // Persist only from the desktop-only control. Mobile rendering never writes or resets this preference.
+    saveSubSessionDesktopLayout(layout);
+  }, []);
   const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
   const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
     const el = desktopWorkspaceBoundsRef.current;
@@ -5614,7 +5629,7 @@ export function App() {
           </div>
         </aside>
       )}
-      {/* Desktop 3-column: [ServerIconBar][SidebarPanel][MainContent] */}
+      {/* Desktop flow: [ServerIconBar][SidebarPanel][optional SubSessionRail][MainContent] */}
       {!isMobile && (
         <>
           <ServerIconBar
@@ -5852,6 +5867,17 @@ export function App() {
           </button>
         </div>
       </aside>
+
+      {!isMobile
+        && selectedServerId
+        && subSessionDesktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && (
+        <aside
+          ref={setSubSessionVerticalRailHost}
+          class="subsession-vertical-rail-host"
+          data-testid="subsession-vertical-rail-host"
+          aria-label={trans('subsessionBar.vertical_rail')}
+        />
+      )}
 
       {/* Main */}
       <main class="main">
@@ -6301,6 +6327,9 @@ export function App() {
                 openIds={openSubIds}
                 maximizedIds={maximizedSubIds}
                 desktopLayoutCapable={desktopLayoutCapable}
+                desktopLayout={subSessionDesktopLayout}
+                onDesktopLayoutChange={handleSubSessionDesktopLayoutChange}
+                verticalRailHost={subSessionVerticalRailHost}
                 collapsed={subSessionBarCollapsed}
                 onCollapsedChange={setSubSessionBarCollapsed}
                 onVisualOrderChange={handleSubSessionVisualOrderChange}

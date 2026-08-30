@@ -2065,6 +2065,9 @@
     "drag_to_resize": "ドラッグしてサイズ変更"
   },
   "subsessionBar": {
+    "switch_to_vertical": "サブセッションを縦レールに切り替え",
+    "switch_to_horizontal": "サブセッションを横バーに切り替え",
+    "vertical_rail": "サブセッション",
     "show": "表示",
     "hide": "非表示",
     "layout_double": "2段表示",

@@ -110,6 +110,7 @@ import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
 import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
+import { SUBSESSION_DESKTOP_LAYOUT } from '../../src/subsession-desktop-layout-preference.js';
 
 const LOCALE_DIR = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/i18n/locales');
 
@@ -1537,6 +1538,107 @@ describe('SubSessionBar', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
       for (const key of keys) {
+        expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
+      }
+    }
+  });
+
+  it('renders one ordered compact button set in the desktop vertical rail and keeps its gestures', async () => {
+    const host = document.createElement('aside');
+    document.body.append(host);
+    const onOpen = vi.fn();
+    const onOpenMaximized = vi.fn();
+    const onDesktopLayoutChange = vi.fn();
+    const sessions = [
+      makeSubSession({ id: 'sub-1', sessionName: 'deck_sub_sub-1', label: 'first' }),
+      makeSubSession({ id: 'sub-2', sessionName: 'deck_sub_sub-2', label: 'second' }),
+    ];
+
+    try {
+      const view = render(
+        <SubSessionBar
+          subSessions={sessions}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          onDesktopLayoutChange={onDesktopLayoutChange}
+          verticalRailHost={host}
+          onOpen={onOpen}
+          onOpenMaximized={onOpenMaximized}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+
+      expect(view.container.querySelector('.subcard-scroll')).toBeNull();
+      expect(view.container.querySelector('.subsession-bar')).toBeNull();
+      expect(view.container.querySelectorAll('[data-sub-id]')).toHaveLength(0);
+      expect(Array.from(host.querySelectorAll<HTMLElement>('[data-sub-id]')).map((node) => node.dataset.subId))
+        .toEqual(['sub-1', 'sub-2']);
+      expect(host.querySelectorAll('.subsession-card-rail')).toHaveLength(2);
+
+      const toggle = view.getByTestId('subsession-desktop-layout-toggle');
+      expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      expect(toggle.getAttribute('aria-label')).toBe('subsessionBar.switch_to_horizontal');
+      expect(toggle.textContent).toBe('⇆');
+      fireEvent.click(toggle);
+      expect(onDesktopLayoutChange).toHaveBeenCalledWith(SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL);
+
+      fireEvent.dblClick(host.querySelector('[data-sub-id="sub-1"]')!);
+      expect(onOpenMaximized).toHaveBeenCalledWith('sub-1');
+
+      const first = host.querySelector('[data-sub-id="sub-1"]')!;
+      const second = host.querySelector('[data-sub-id="sub-2"]')!;
+      fireEvent.dragStart(first);
+      fireEvent.dragOver(second);
+      fireEvent.dragEnd(first);
+      await waitFor(() => expect(reorderSubSessions).toHaveBeenCalledWith('srv-1', ['sub-2', 'sub-1']));
+    } finally {
+      host.remove();
+    }
+  });
+
+  it('keeps mobile on the existing horizontal compact bar without rendering or toggling a desktop rail', () => {
+    const host = document.createElement('aside');
+    document.body.append(host);
+    try {
+      const view = render(
+        <SubSessionBar
+          subSessions={[makeSubSession()]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          onDesktopLayoutChange={vi.fn()}
+          verticalRailHost={host}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+
+      expect(view.queryByTestId('subsession-desktop-layout-toggle')).toBeNull();
+      expect(host.querySelector('[data-testid="subsession-vertical-rail"]')).toBeNull();
+      expect(view.container.querySelector('.subsession-bar [data-sub-id="sub-1"]')).toBeTruthy();
+    } finally {
+      host.remove();
+    }
+  });
+
+  it('ships desktop layout labels in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
+      for (const key of ['switch_to_vertical', 'switch_to_horizontal', 'vertical_rail']) {
         expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
       }
     }

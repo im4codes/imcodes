@@ -2066,6 +2066,9 @@
     "drag_to_resize": "Arrastra para cambiar el tamaño"
   },
   "subsessionBar": {
+    "switch_to_vertical": "Cambiar subsesiones a la barra vertical",
+    "switch_to_horizontal": "Cambiar subsesiones a la barra horizontal",
+    "vertical_rail": "Subsesiones",
     "show": "Mostrar",
     "hide": "Ocultar",
     "layout_double": "Doble fila",

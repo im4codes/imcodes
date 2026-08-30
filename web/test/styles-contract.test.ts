@@ -14,6 +14,22 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps the desktop sub-session rail in flex flow with bounded width and vertical scrolling', () => {
+    const hostRule = cssWithoutComments.match(/\.subsession-vertical-rail-host\s*\{[^}]*\}/)?.[0];
+    expect(hostRule).toBeTruthy();
+    expect(hostRule).toMatch(/display:\s*flex/);
+    expect(hostRule).toMatch(/flex:\s*0\s+0\s+200px/);
+    expect(hostRule).toMatch(/min-width:\s*180px/);
+    expect(hostRule).toMatch(/max-width:\s*220px/);
+    expect(hostRule).not.toMatch(/position:\s*(fixed|absolute)/);
+
+    const scrollRule = cssWithoutComments.match(/\.subsession-vertical-rail-scroll\s*\{[^}]*\}/)?.[0];
+    expect(scrollRule).toBeTruthy();
+    expect(scrollRule).toMatch(/overflow-y:\s*auto/);
+    expect(scrollRule).toMatch(/overflow-x:\s*hidden/);
+    expect(scrollRule).toMatch(/flex-direction:\s*column/);
+  });
+
   it('shows the fast-audit label on desktop and keeps the mobile control icon-only', () => {
     const desktopRule = css.match(/\.shortcut-btn-peer-audit-label\s*\{[^}]*\}/)?.[0];
     expect(desktopRule).toBeTruthy();

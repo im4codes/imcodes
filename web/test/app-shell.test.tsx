@@ -4,8 +4,13 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { createPortal } from 'preact/compat';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
+import {
+  SUBSESSION_DESKTOP_LAYOUT,
+  SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY,
+} from '../src/subsession-desktop-layout-preference.js';
 
 const {
   apiFetchMock,
@@ -428,7 +433,7 @@ vi.mock('../src/components/ServerIconBar.js', () => ({
 }));
 vi.mock('../src/components/Sidebar.js', () => ({
   Sidebar: ({ children, onDropPanel }: any) => (
-    <div>
+    <div data-testid="sidebar-panel">
       sidebar
       <button onClick={() => onDropPanel?.('subsession', 'sub-1')}>sidebar-drop</button>
       <button onClick={() => onDropPanel?.('subsession', 'sub-2')}>sidebar-drop-sub-2</button>
@@ -539,9 +544,32 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     onOpenSpecAutoStop,
     onOpenSpecAutoToggleCompact,
     onOpenSpecAutoHide,
+    desktopLayoutCapable,
+    desktopLayout,
+    onDesktopLayoutChange,
+    verticalRailHost,
   }: any) => (
-    <div data-testid="app-shell-subsession-bar" data-running-discussions={String(totalRunningDiscussions)}>
+    <div
+      data-testid="app-shell-subsession-bar"
+      data-running-discussions={String(totalRunningDiscussions)}
+      data-desktop-layout={desktopLayout}
+    >
+      {verticalRailHost && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && createPortal(
+        <div data-testid="app-shell-subsession-vertical-rail">mock vertical rail</div>,
+        verticalRailHost,
+      )}
       sub-session-bar
+      {desktopLayoutCapable && onDesktopLayoutChange && (
+        <button
+          data-testid="app-shell-subsession-layout-toggle"
+          aria-label={desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL ? 'switch horizontal' : 'switch vertical'}
+          onClick={() => onDesktopLayoutChange(
+            desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+              ? SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL
+              : SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+          )}
+        >layout-toggle</button>
+      )}
       {openSpecAutoProjection && (
         <div
           data-testid="app-shell-auto-deliver-runbar"
@@ -1673,6 +1701,58 @@ describe('App shell', () => {
     expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
     fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
     await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
+  }, 20_000);
+
+  it('persists the desktop sub-session layout and mounts the vertical rail between sidebar and main', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    const view = render(<App />);
+    const toggle = await screen.findByTestId('app-shell-subsession-layout-toggle');
+    expect(screen.getByTestId('app-shell-subsession-bar').dataset.desktopLayout).toBe('horizontal');
+
+    fireEvent.click(toggle);
+
+    const host = await screen.findByTestId('subsession-vertical-rail-host');
+    expect(await screen.findByTestId('app-shell-subsession-vertical-rail')).toBeTruthy();
+    const layout = host.parentElement!;
+    const children = Array.from(layout.children);
+    expect(children.indexOf(screen.getByTestId('sidebar-panel'))).toBeLessThan(children.indexOf(host));
+    expect(children.indexOf(host)).toBeLessThan(children.indexOf(layout.querySelector('.main')!));
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+    });
+
+    view.unmount();
+    render(<App />);
+    expect(await screen.findByTestId('subsession-vertical-rail-host')).toBeTruthy();
+    expect(screen.getByTestId('app-shell-subsession-bar').dataset.desktopLayout).toBe('vertical');
+  }, 20_000);
+
+  it('keeps the saved desktop rail preference untouched while mobile uses its original layout', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const saved = JSON.stringify({ version: 1, layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL });
+    localStorage.setItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY, saved);
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+      await screen.findByTestId('app-shell-subsession-bar');
+
+      expect(screen.queryByTestId('app-shell-subsession-layout-toggle')).toBeNull();
+      expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
+      expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
+      expect(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)).toBe(saved);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   }, 20_000);
 
   it('restores the task panel open state and persists close and toggle changes across refreshes', async () => {

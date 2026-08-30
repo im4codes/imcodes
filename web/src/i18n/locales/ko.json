@@ -2065,6 +2065,9 @@
     "drag_to_resize": "드래그하여 크기 조절"
   },
   "subsessionBar": {
+    "switch_to_vertical": "하위 세션을 세로 레일로 전환",
+    "switch_to_horizontal": "하위 세션을 가로 막대로 전환",
+    "vertical_rail": "하위 세션",
     "show": "표시",
     "hide": "숨기기",
     "layout_double": "2줄",

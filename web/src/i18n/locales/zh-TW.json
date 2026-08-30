@@ -2066,6 +2066,9 @@
     "drag_to_resize": "拖動調整寬度"
   },
   "subsessionBar": {
+    "switch_to_vertical": "將子工作階段切換為直向欄",
+    "switch_to_horizontal": "將子工作階段切換為橫向欄",
+    "vertical_rail": "子工作階段",
     "show": "顯示",
     "hide": "隱藏",
     "layout_double": "雙行",

@@ -5034,6 +5034,8 @@ html.native-ios-mac .chat-dl-btn {
 .subcard-toolbar-btn-discussions { color: #bfdbfe; border-color: rgba(96,165,250,0.30); }
 .subcard-toolbar-btn-discussions:hover { border-color: rgba(96,165,250,0.58); color: #eff6ff; background: linear-gradient(180deg, rgba(37,99,235,0.24), rgba(15,23,42,0.88)); box-shadow: 0 0 16px rgba(96,165,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
 .subcard-toolbar-btn-active { border-color: rgba(34,211,238,0.6) !important; color: var(--chrome-accent) !important; background: rgba(8,145,178,0.22); box-shadow: 0 0 14px rgba(34,211,238,0.18), inset 0 1px 0 rgba(255,255,255,0.06); }
+.subsession-desktop-layout-toggle { min-width: 32px; color: #67e8f9; border-color: rgba(34,211,238,0.34); font-size: 15px; font-weight: 700; line-height: 1; }
+.subsession-desktop-layout-toggle[aria-pressed='true'] { color: #a7f3d0; border-color: rgba(52,211,153,0.48); background: linear-gradient(180deg, rgba(6,95,70,0.26), rgba(8,47,73,0.30)); }
 .subcard-size-panel { display: flex; align-items: center; gap: 8px; padding: 4px 8px 4px; flex-wrap: wrap; }
 .subcard-size-label { font-size: 11px; color: #475569; }
 .subcard-size-field { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #64748b; }
@@ -5601,6 +5603,31 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-card-custom-api { font-size: 9px; color: #f59e0b; margin-left: 2px; }
 .subsession-card-ctx { display: block; height: 3px; background: rgba(15,23,42,0.92); border-radius: 999px; overflow: hidden; margin-top: 2px; box-shadow: inset 0 0 5px rgba(0,0,0,0.42); }
 .subsession-card-ctx-fill { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); border-radius: 999px; transition: width 0.3s; box-shadow: 0 0 8px rgba(34,211,238,0.5); }
+
+/* Desktop vertical sub-session rail. It is an ordinary flex child between the
+   sidebar and main content: never fixed/absolute and never overlays chat. */
+.subsession-vertical-rail-host { position: relative; display: flex; flex: 0 0 200px; width: 200px; min-width: 180px; max-width: 220px; min-height: 0; overflow: hidden; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.025) 22px 23px), linear-gradient(180deg, #0b1422 0%, #070c15 100%); border-right: 1px solid rgba(34,211,238,0.20); box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 8px 0 24px rgba(0,0,0,0.22); z-index: 1; }
+.subsession-vertical-rail { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
+.subsession-vertical-rail-header { display: flex; flex: 0 0 auto; min-height: 34px; align-items: center; gap: 7px; padding: 6px 8px; color: #a5f3fc; border-bottom: 1px solid rgba(34,211,238,0.18); background: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(15,23,42,0.16)); font-size: 10px; font-weight: 700; letter-spacing: 0.045em; text-transform: uppercase; }
+.subsession-vertical-rail-count { display: inline-flex; min-width: 18px; height: 18px; align-items: center; justify-content: center; margin-left: auto; padding: 0 4px; border: 1px solid rgba(34,211,238,0.22); border-radius: 999px; color: #67e8f9; background: rgba(8,145,178,0.12); font-variant-numeric: tabular-nums; }
+.subsession-vertical-rail-header .subsession-close-all-strip { flex: 0 0 24px; width: 24px; min-height: 22px; height: 22px; margin: 0; border-radius: 6px; }
+.subsession-vertical-rail-scroll { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 8px; padding: 9px 8px 12px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(34,211,238,0.38) transparent; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: pan-y; }
+.subsession-vertical-rail-scroll::-webkit-scrollbar { width: 5px; }
+.subsession-vertical-rail-scroll::-webkit-scrollbar-track { background: transparent; }
+.subsession-vertical-rail-scroll::-webkit-scrollbar-thumb { background: rgba(34,211,238,0.34); border-radius: 3px; }
+.subsession-card-rail { width: 100%; min-width: 0; min-height: 56px; box-sizing: border-box; flex-direction: row; justify-content: flex-start; gap: 6px; padding: 8px 7px; text-align: left; }
+.subsession-card-rail.open { transform: scale(1.02); }
+.subsession-card-rail .subsession-card-icon { flex: 0 0 auto; }
+.subsession-card-rail .subsession-card-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subsession-card-rail .subsession-card-model { margin-left: auto; max-width: 62px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subsession-card-rail .subsession-card-ctx { position: absolute; left: 7px; right: 7px; bottom: 4px; width: auto !important; }
+.subcard-bar-vertical-mode .subcard-toolbar { min-height: 29px; }
+
+@media (max-width: 1280px) {
+  .subsession-vertical-rail-host { flex-basis: 184px; width: 184px; }
+  .subcard-bar-vertical-mode .subcard-toolbar-btn-labeled { min-width: 30px; margin-left: 0; padding-left: 7px; padding-right: 7px; }
+  .subcard-bar-vertical-mode .subcard-toolbar-btn-label { display: none; }
+}
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
 .subsession-window { display: flex; flex-direction: column; background: linear-gradient(180deg, #0f1724, #090d15); border: 1px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; box-shadow: 0 12px 38px rgba(0,0,0,0.62), 0 0 0 1px rgba(255,255,255,0.025), 0 0 24px rgba(34,211,238,0.12); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }

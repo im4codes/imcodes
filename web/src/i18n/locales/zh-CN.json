@@ -2066,6 +2066,9 @@
     "drag_to_resize": "拖动调整宽度"
   },
   "subsessionBar": {
+    "switch_to_vertical": "将子会话切换为竖排栏",
+    "switch_to_horizontal": "将子会话切换为横排栏",
+    "vertical_rail": "子会话",
     "show": "显示",
     "hide": "隐藏",
     "layout_double": "双行",
