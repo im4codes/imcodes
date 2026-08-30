@@ -1930,6 +1930,213 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('atomically recovers an exact retired-REWORK aggregate split and fails closed on ambiguous evidence', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-rework-aggregate-recovery-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    const rewriteTask = (taskId: string, patch: Record<string, unknown>) => {
+      const row = db.prepare('SELECT payload_json AS payload FROM supervision_tasks WHERE task_id = ?')
+        .get(taskId) as { payload: string };
+      const payload = { ...JSON.parse(row.payload), ...patch };
+      db.prepare(`UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ?
+                  WHERE task_id = ?`)
+        .run(payload.status, payload.currentRevision ?? null, JSON.stringify(payload), payload.updatedAt, taskId);
+    };
+    const rewriteAssignment = (assignmentId: string, patch: Record<string, unknown>) => {
+      const row = db.prepare('SELECT payload_json AS payload FROM supervision_task_assignments WHERE assignment_id = ?')
+        .get(assignmentId) as { payload: string };
+      const payload = { ...JSON.parse(row.payload), ...patch };
+      db.prepare(`UPDATE supervision_task_assignments SET status = ?, lease_id = ?, audit_attempt_id = ?,
+                    audit_revision = ?, verdict = ?, blocker = ?, payload_json = ?, updated_at = ?
+                  WHERE assignment_id = ?`)
+        .run(payload.status, payload.leaseId ?? '', payload.auditAttemptId ?? null,
+          payload.auditRevision ?? null, payload.verdict ?? null, payload.blocker ?? null,
+          JSON.stringify(payload), payload.updatedAt, assignmentId);
+    };
+    const seedSplit = (input: {
+      taskId: string;
+      taskRevision: string;
+      auditRevision?: string;
+      activeAuditor?: boolean;
+      auditorVerdict?: 'REWORK' | 'PASS';
+      implementerRequired?: boolean;
+      ambiguousImplementer?: boolean;
+    }) => {
+      const auditRevision = input.auditRevision ?? input.taskRevision;
+      const attemptId = `${input.taskId}-attempt`;
+      expect(registry.createOrGet({
+        taskId: input.taskId, projectName: 'alpha', objective: input.taskId,
+        classification: 'independent_top_level', currentRevision: input.taskRevision, now: 10,
+      })).toMatchObject({ ok: true });
+      const implementer = registry.createAssignment({
+        taskId: input.taskId, role: 'implementer', identity: identity(`deck_${input.taskId}_worker`), now: 20,
+      });
+      if (!implementer.ok) throw new Error(implementer.reason);
+      const auditor = registry.createAssignment({
+        taskId: input.taskId, role: 'auditor', identity: identity(`deck_${input.taskId}_auditor`),
+        auditAttemptId: attemptId, auditRevision, now: 30,
+      });
+      if (!auditor.ok) throw new Error(auditor.reason);
+      rewriteAssignment(implementer.value.assignmentId, {
+        status: 'rework', leaseId: implementer.value.leaseId,
+        required: input.implementerRequired ?? true,
+        auditAttemptId: attemptId, auditRevision, verdict: 'REWORK',
+        blocker: `${input.taskId} retained finding`, updatedAt: 40,
+      });
+      rewriteAssignment(auditor.value.assignmentId, {
+        status: 'cancelled', leaseId: '',
+        auditAttemptId: attemptId, auditRevision,
+        verdict: input.auditorVerdict ?? 'REWORK',
+        blocker: `${input.taskId} auditor provenance`, updatedAt: 50,
+      });
+      if (input.activeAuditor) {
+        const activeAuditor = registry.createAssignment({
+          taskId: input.taskId, role: 'auditor', identity: identity(`deck_${input.taskId}_active_auditor`),
+          auditAttemptId: `${input.taskId}-active-attempt`, auditRevision, now: 55,
+        });
+        if (!activeAuditor.ok) throw new Error(activeAuditor.reason);
+      }
+      if (input.ambiguousImplementer) {
+        const other = registry.createAssignment({
+          taskId: input.taskId, role: 'implementer', identity: identity(`deck_${input.taskId}_other`), now: 35,
+        });
+        if (!other.ok) throw new Error(other.reason);
+        rewriteAssignment(other.value.assignmentId, {
+          status: 'rework', leaseId: other.value.leaseId, required: true,
+          auditAttemptId: attemptId, auditRevision, verdict: 'REWORK', updatedAt: 45,
+        });
+      }
+      rewriteTask(input.taskId, {
+        status: 'ready_for_audit', currentRevision: input.taskRevision, updatedAt: 60,
+      });
+      return { implementer: implementer.value, auditor: auditor.value, attemptId, auditRevision };
+    };
+
+    try {
+      const exact = seedSplit({ taskId: 'same-revision-split', taskRevision: 'revision-r1' });
+      const beforeImplementer = registry.getAssignment(exact.implementer.assignmentId)!;
+      const beforeAuditor = registry.getAssignment(exact.auditor.assignmentId)!;
+      expect(registry.applyTaskIntent({
+        taskId: 'same-revision-split', assignmentId: exact.implementer.assignmentId,
+        intent: 'checkpoint', toStatus: null, note: 'resume after retired audit',
+      })).toMatchObject({ ok: true, value: { status: 'rework', currentRevision: 'revision-r1' } });
+      expect(registry.getAssignment(exact.implementer.assignmentId)).toMatchObject({
+        leaseId: beforeImplementer.leaseId, auditAttemptId: exact.attemptId,
+        auditRevision: 'revision-r1', verdict: 'REWORK', blocker: 'same-revision-split retained finding',
+      });
+      expect(registry.getAssignment(exact.auditor.assignmentId)).toEqual(beforeAuditor);
+      expect(registry.get('same-revision-split')?.assignments).toHaveLength(2);
+      const reworkEvents = () => registry.listEvents('same-revision-split')
+        .filter((event) => event.eventType === 'rework' && !event.assignmentId);
+      expect(reworkEvents()).toHaveLength(1);
+      expect(registry.applyTaskIntent({
+        taskId: 'same-revision-split', assignmentId: exact.implementer.assignmentId,
+        intent: 'checkpoint', toStatus: null,
+      })).toMatchObject({ ok: true, value: { status: 'rework', currentRevision: 'revision-r1' } });
+      expect(reworkEvents()).toHaveLength(1);
+
+      const changed = seedSplit({
+        taskId: 'changed-revision-split', taskRevision: 'revision-r1', auditRevision: 'revision-r2',
+      });
+      const planned = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 50, now: 1_000 });
+      expect(planned.actions).toEqual(expect.arrayContaining([expect.objectContaining({
+        taskId: 'changed-revision-split', kind: 'repair_revision',
+        assignmentId: changed.implementer.assignmentId,
+        fromRevision: 'revision-r1', toRevision: 'revision-r2', toStatus: 'rework',
+      })]));
+      registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 50, now: 1_000 });
+      expect(registry.get('changed-revision-split')).toMatchObject({
+        status: 'rework', currentRevision: 'revision-r2',
+      });
+      expect(registry.getAssignment(changed.implementer.assignmentId)).toMatchObject({
+        leaseId: changed.implementer.leaseId, auditAttemptId: changed.attemptId,
+        auditRevision: 'revision-r2', verdict: 'REWORK',
+      });
+      const replay = registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 50, now: 2_000 });
+      expect(replay.actions.filter((action) => (
+        action.taskId === 'changed-revision-split'
+        && (action.kind === 'repair_revision' || action.kind === 'repair_aggregate')
+      ))).toEqual([]);
+
+      const viaUpdate = seedSplit({ taskId: 'assignment-update-split', taskRevision: 'revision-r1' });
+      expect(registry.updateAssignment({
+        assignmentId: viaUpdate.implementer.assignmentId,
+        identity: viaUpdate.implementer.identity,
+        status: 'rework', revision: 'revision-r1',
+        auditAttemptId: viaUpdate.attemptId, auditRevision: 'revision-r1', verdict: 'REWORK',
+      })).toMatchObject({ ok: true });
+      expect(registry.get('assignment-update-split')).toMatchObject({
+        status: 'rework', currentRevision: 'revision-r1',
+      });
+
+      const attestedPass = seedSplit({ taskId: 'attested-pass-split', taskRevision: 'revision-r1' });
+      db.prepare(`INSERT INTO supervision_audit_attestations
+        (attempt_id, task_id, assignment_id, revision, verdict, auditor_session_name, findings, created_at)
+        VALUES (?, ?, ?, 'revision-r1', 'PASS', 'deck_pass_auditor', 'retained PASS', 70)`)
+        .run('attested-pass-attempt', attestedPass.implementer.taskId, attestedPass.implementer.assignmentId);
+      const receiptedPass = seedSplit({ taskId: 'receipted-pass-split', taskRevision: 'revision-r1' });
+      db.prepare(`INSERT INTO supervision_audit_receipts
+        (receipt_id, task_id, assignment_id, attempt_id, revision, sequence, receipt_kind, verdict,
+         findings, validations_json, receipt_digest, sender_identity_json, created_at)
+        VALUES (?, ?, ?, ?, 'revision-r1', 1, 'final', 'PASS', 'retained PASS', '[]', ?, ?, 70)`)
+        .run('receipted-pass-id', receiptedPass.implementer.taskId, receiptedPass.auditor.assignmentId,
+          'receipted-pass-attempt', 'receipted-pass-digest', JSON.stringify(receiptedPass.auditor.identity));
+      const refused = [
+        seedSplit({ taskId: 'active-auditor-split', taskRevision: 'revision-r1', activeAuditor: true }),
+        seedSplit({ taskId: 'pass-evidence-split', taskRevision: 'revision-r1', auditorVerdict: 'PASS' }),
+        attestedPass,
+        receiptedPass,
+        seedSplit({ taskId: 'no-required-worker-split', taskRevision: 'revision-r1', implementerRequired: false }),
+        seedSplit({ taskId: 'ambiguous-worker-split', taskRevision: 'revision-r1', ambiguousImplementer: true }),
+      ];
+      for (const shape of refused) {
+        expect(registry.applyTaskIntent({
+          taskId: shape.implementer.taskId, assignmentId: shape.implementer.assignmentId,
+          intent: 'checkpoint', toStatus: null,
+        })).toMatchObject({ ok: true, value: { status: 'ready_for_audit' } });
+        expect(registry.get(shape.implementer.taskId)).toMatchObject({
+          status: 'ready_for_audit', currentRevision: 'revision-r1',
+        });
+      }
+
+      db.close();
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.get('same-revision-split')).toMatchObject({
+        status: 'rework', currentRevision: 'revision-r1',
+        assignments: expect.arrayContaining([
+          expect.objectContaining({
+            assignmentId: exact.implementer.assignmentId, status: 'rework',
+            leaseId: beforeImplementer.leaseId, auditAttemptId: exact.attemptId,
+            auditRevision: 'revision-r1', verdict: 'REWORK',
+          }),
+          expect.objectContaining({
+            assignmentId: exact.auditor.assignmentId, status: 'cancelled', leaseId: '',
+            auditAttemptId: exact.attemptId, auditRevision: 'revision-r1', verdict: 'REWORK',
+          }),
+        ]),
+      });
+      const handlers = createSupervisionMcpToolHandlers(
+        { sessionName: exact.implementer.identity.sessionName, projectName: 'alpha' } as never,
+        { registry: supervisionRegistryPort(registry) },
+      );
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+        intent: 'start', taskId: 'same-revision-split', assignmentId: exact.implementer.assignmentId,
+      })).toMatchObject({ status: 'ok', fromStatus: 'rework', toStatus: 'implementing' });
+      expect(registry.get('same-revision-split')).toMatchObject({
+        status: 'implementing',
+        assignments: expect.arrayContaining([expect.objectContaining({
+          assignmentId: exact.implementer.assignmentId, status: 'implementing',
+        })]),
+      });
+    } finally {
+      try { db.close(); } catch { /* already closed before SQLite reopen */ }
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('dry-runs and applies bounded housekeeping without deleting provenance or touching active exceptions', () => {
     const dir = mkdtempSync(join(tmpdir(), 'supervision-housekeeping-'));
     const dbPath = join(dir, 'registry.sqlite');
@@ -1995,8 +2202,19 @@ describe('SupervisionTaskRegistry', () => {
 
       task('d-rework-split', 'legitimate R2 rework recovery');
       assignment('d-rework-split', 'd-rework-worker');
+      const reworkAuditor = registry.createAssignment({
+        taskId: 'd-rework-split', assignmentId: 'd-rework-auditor', role: 'auditor',
+        identity: identity('deck_d-rework-auditor'), auditAttemptId: 'd-rework-attempt',
+        auditRevision: 'revision-r2', now: 2_000,
+      });
+      if (!reworkAuditor.ok) throw new Error(reworkAuditor.reason);
       rewriteAssignment('d-rework-worker', {
-        status: 'rework', leaseId: 'rework-lease', auditRevision: 'revision-r2', verdict: 'REWORK', updatedAt: now - 500,
+        status: 'rework', leaseId: 'rework-lease', auditAttemptId: 'd-rework-attempt',
+        auditRevision: 'revision-r2', verdict: 'REWORK', updatedAt: now - 500,
+      });
+      rewriteAssignment('d-rework-auditor', {
+        status: 'cancelled', leaseId: '', auditAttemptId: 'd-rework-attempt',
+        auditRevision: 'revision-r2', verdict: 'REWORK', updatedAt: now - 500,
       });
       rewriteTask('d-rework-split', { status: 'ready_for_audit', currentRevision: 'revision-r1', updatedAt: now - 500 });
 

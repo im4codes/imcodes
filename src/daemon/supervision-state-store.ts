@@ -1147,27 +1147,8 @@ export class SupervisionTaskRegistry {
         }
       }
 
-      const activeImplementers = assignments.filter((assignment) => (
-        assignment.required
-        && assignment.role === 'implementer'
-        && assignment.status !== 'cancelled'
-        && assignment.status !== 'finalized'
-      ));
-      const revisionOwner = activeImplementers.length === 1 ? activeImplementers[0] : undefined;
-      if (revisionOwner?.status === 'rework'
-        && revisionOwner.auditRevision
-        && revisionOwner.auditRevision !== task.currentRevision
-        && ['validated', 'ready_for_audit', 'rework'].includes(task.status)) {
-        actions.push({
-          taskId: task.taskId,
-          kind: 'repair_revision',
-          fromRevision: task.currentRevision,
-          toRevision: revisionOwner.auditRevision,
-          fromStatus: task.status,
-          toStatus: 'rework',
-          assignmentId: revisionOwner.assignmentId,
-        });
-      }
+      const reworkProjectionRepair = this.#planReworkProjectionRepair(task, assignments);
+      if (reworkProjectionRepair) actions.push(reworkProjectionRepair);
 
       const terminalAggregate = deterministicTerminalAggregate(assignments);
       if (terminalAggregate && terminalAggregate !== task.status) {
@@ -1317,6 +1298,33 @@ export class SupervisionTaskRegistry {
     }
     const task = this.getTaskRecord(action.taskId);
     if (!task) return;
+    if ((action.kind === 'repair_revision' || action.kind === 'repair_aggregate')
+      && action.assignmentId) {
+      // The planner ran before BEGIN IMMEDIATE. Re-evaluate the complete
+      // evidence shape while holding the write transaction so an auditor or a
+      // competing implementer appearing between plan and apply fails closed.
+      const repair = this.#planReworkProjectionRepair(task, this.listAssignments(task.taskId));
+      if (!repair
+        || repair.kind !== action.kind
+        || repair.assignmentId !== action.assignmentId
+        || repair.fromStatus !== action.fromStatus
+        || repair.fromRevision !== action.fromRevision
+        || repair.toRevision !== action.toRevision) return;
+      this.#writeTask({
+        ...task,
+        currentRevision: repair.toRevision,
+        status: 'rework',
+        cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
+        updatedAt: now,
+      }, 'rework', {
+        source: 'housekeeping_rework_projection_repair',
+        fromRevision: repair.fromRevision,
+        toRevision: repair.toRevision,
+        fromStatus: repair.fromStatus,
+        assignmentId: repair.assignmentId,
+      });
+      return;
+    }
     if (action.kind === 'repair_revision' && action.toRevision) {
       this.#writeTask({
         ...task,
@@ -1607,12 +1615,19 @@ export class SupervisionTaskRegistry {
     const eventType = nextStatus === 'auditing' ? 'audit_requested'
       : nextStatus === 'passed' || nextStatus === 'rework' ? 'audit_replied'
       : nextStatus;
-    this.#writeAssignment(record, eventType as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, {
-      source: 'assignment_update',
-      ...(record.auditRoutingReason ? { auditRoutingReason: record.auditRoutingReason } : {}),
-    });
-    this.#deriveTaskStatus(record.taskId, now);
-    return { ok: true, value: record };
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#writeAssignment(record, eventType as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, {
+        source: 'assignment_update',
+        ...(record.auditRoutingReason ? { auditRoutingReason: record.auditRoutingReason } : {}),
+      });
+      this.#deriveTaskStatus(record.taskId, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: record };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /**
@@ -2128,7 +2143,13 @@ export class SupervisionTaskRegistry {
   #deriveTaskStatus(taskId: string, now: number): void {
     const task = this.getTaskRecord(taskId);
     if (!task) return;
-    const required = this.listAssignments(taskId).filter((assignment) => (
+    const assignments = this.listAssignments(taskId);
+    const reworkProjectionRepair = this.#planReworkProjectionRepair(task, assignments);
+    if (reworkProjectionRepair) {
+      this.#applyHousekeepingAction(reworkProjectionRepair, now);
+      return;
+    }
+    const required = assignments.filter((assignment) => (
       assignment.required && assignment.role !== 'auditor' && assignment.status !== 'cancelled'
     ));
     if (required.length === 0) return;
@@ -2155,6 +2176,76 @@ export class SupervisionTaskRegistry {
                   : 'validated';
       this.#writeTask({ ...task, status: next, updatedAt: now }, aggregateEvent, { source: 'aggregate_status' });
     }
+  }
+
+  /**
+   * Recognise only the exact durable split left after a REWORK auditor is
+   * assignment-scoped cancelled. This is intentionally narrower than generic
+   * aggregate derivation: ready_for_audit -> rework is a recovery edge, not a
+   * normal lifecycle transition.
+   */
+  #planReworkProjectionRepair(
+    task: PersistedSupervisionTaskRecord,
+    assignments: readonly PersistedSupervisionTaskAssignment[],
+  ): SupervisionHousekeepingAction | undefined {
+    if (!['validated', 'ready_for_audit', 'rework'].includes(task.status)) return undefined;
+    const activeImplementers = assignments.filter((assignment) => (
+      assignment.required
+      && assignment.role === 'implementer'
+      && assignment.status !== 'cancelled'
+      && assignment.status !== 'finalized'
+    ));
+    if (activeImplementers.length !== 1) return undefined;
+    const owner = activeImplementers[0]!;
+    const revision = normalizeTaskString(owner.auditRevision);
+    const attemptId = normalizeTaskString(owner.auditAttemptId);
+    if (owner.status !== 'rework'
+      || owner.verdict?.trim().toUpperCase() !== 'REWORK'
+      || !revision
+      || !attemptId) return undefined;
+
+    const activeAuditor = assignments.some((assignment) => (
+      assignment.role === 'auditor'
+      && assignment.status !== 'cancelled'
+      && assignment.status !== 'finalized'
+    ));
+    if (activeAuditor) return undefined;
+    const retiredMatches = assignments.filter((assignment) => (
+      assignment.role === 'auditor'
+      && assignment.status === 'cancelled'
+      && !assignment.leaseId
+      && assignment.auditAttemptId === attemptId
+      && assignment.auditRevision === revision
+      && assignment.verdict?.trim().toUpperCase() === 'REWORK'
+    ));
+    if (retiredMatches.length !== 1) return undefined;
+
+    const assignmentPass = assignments.some((assignment) => (
+      assignment.auditRevision === revision
+      && assignment.verdict?.trim().toUpperCase() === 'PASS'
+    ));
+    const attestedPass = this.#db.prepare(
+      `SELECT 1 AS ok FROM supervision_audit_attestations
+       WHERE task_id = ? AND revision = ? AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
+    ).get(task.taskId, revision) as { ok?: number } | undefined;
+    const receiptPass = this.#db.prepare(
+      `SELECT 1 AS ok FROM supervision_audit_receipts
+       WHERE task_id = ? AND revision = ? AND receipt_kind = 'final'
+         AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
+    ).get(task.taskId, revision) as { ok?: number } | undefined;
+    if (assignmentPass || attestedPass?.ok === 1 || receiptPass?.ok === 1) return undefined;
+
+    const fromRevision = normalizeTaskString(task.currentRevision);
+    if (task.status === 'rework' && fromRevision === revision) return undefined;
+    return {
+      taskId: task.taskId,
+      kind: fromRevision === revision ? 'repair_aggregate' : 'repair_revision',
+      assignmentId: owner.assignmentId,
+      fromStatus: task.status,
+      toStatus: 'rework',
+      ...(fromRevision ? { fromRevision } : {}),
+      toRevision: revision,
+    };
   }
 
   /**
@@ -2326,11 +2417,21 @@ export class SupervisionTaskRegistry {
         ? 'implementation_progress'
         : 'implementation_heartbeat';
       if (input.intent === 'checkpoint') {
-        this.#writeAssignment({ ...assignment, updatedAt: now }, eventType, {
-          source: 'task_intent_assignment_sync',
-          substantiveProgress: true,
-          ...(input.note ? { note: input.note } : {}),
-        });
+        this.#db.exec('BEGIN IMMEDIATE');
+        try {
+          this.#writeAssignment({ ...assignment, updatedAt: now }, eventType, {
+            source: 'task_intent_assignment_sync',
+            substantiveProgress: true,
+            ...(input.note ? { note: input.note } : {}),
+          });
+          this.#deriveTaskStatus(task.taskId, now);
+          const repaired = this.getTaskRecord(task.taskId) ?? task;
+          this.#db.exec('COMMIT');
+          return { ok: true, value: repaired };
+        } catch (error) {
+          this.#db.exec('ROLLBACK');
+          throw error;
+        }
       } else {
         this.#appendEvent(task.taskId, assignment.assignmentId, eventType, assignment.status, {
           source: 'task_intent',
