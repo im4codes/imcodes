@@ -54,9 +54,13 @@ import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
 import {
+  loadSubSessionDesktopDockSide,
   loadSubSessionDesktopLayout,
+  saveSubSessionDesktopDockSide,
   saveSubSessionDesktopLayout,
+  SUBSESSION_DESKTOP_DOCK_SIDE,
   SUBSESSION_DESKTOP_LAYOUT,
+  type SubSessionDesktopDockSide,
   type SubSessionDesktopLayout,
 } from './subsession-desktop-layout-preference.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
@@ -855,11 +859,19 @@ export function App() {
   const [subSessionDesktopLayout, setSubSessionDesktopLayout] = useState<SubSessionDesktopLayout>(
     () => loadSubSessionDesktopLayout(),
   );
+  const [subSessionDesktopDockSide, setSubSessionDesktopDockSide] = useState<SubSessionDesktopDockSide>(
+    () => loadSubSessionDesktopDockSide(),
+  );
   const [subSessionVerticalRailHost, setSubSessionVerticalRailHost] = useState<HTMLElement | null>(null);
   const handleSubSessionDesktopLayoutChange = useCallback((layout: SubSessionDesktopLayout) => {
     setSubSessionDesktopLayout(layout);
     // Persist only from the desktop-only control. Mobile rendering never writes or resets this preference.
     saveSubSessionDesktopLayout(layout);
+  }, []);
+  const handleSubSessionDesktopDockSideChange = useCallback((side: SubSessionDesktopDockSide) => {
+    setSubSessionDesktopDockSide(side);
+    // Like the layout choice, docking is a desktop-only local preference.
+    saveSubSessionDesktopDockSide(side);
   }, []);
   const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
   const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
@@ -5603,6 +5615,24 @@ export function App() {
     );
   }
 
+  const renderSubSessionVerticalRailHost = (side: SubSessionDesktopDockSide) => (
+    !isMobile
+      && selectedServerId
+      && subSessionDesktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+      && subSessionDesktopDockSide === side
+      ? (
+        <aside
+          key={side}
+          ref={setSubSessionVerticalRailHost}
+          class={`subsession-vertical-rail-host subsession-vertical-rail-host-${side}`}
+          data-testid="subsession-vertical-rail-host"
+          data-dock-side={side}
+          aria-label={trans('subsessionBar.vertical_rail')}
+        />
+      )
+      : null
+  );
+
   return (
     <div
       class={`layout${isMobile ? ' layout-mobile' : ''}${mobileRemoteSurfaceActive ? ' layout-mobile-remote-surface-active' : ''}`}
@@ -5634,7 +5664,7 @@ export function App() {
           </div>
         </aside>
       )}
-      {/* Desktop flow: [ServerIconBar][SidebarPanel][optional SubSessionRail][MainContent] */}
+      {/* Desktop flow: the vertical rail is a real root flex child, docked on either side of MainContent. */}
       {!isMobile && (
         <>
           <ServerIconBar
@@ -5873,16 +5903,7 @@ export function App() {
         </div>
       </aside>
 
-      {!isMobile
-        && selectedServerId
-        && subSessionDesktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && (
-        <aside
-          ref={setSubSessionVerticalRailHost}
-          class="subsession-vertical-rail-host"
-          data-testid="subsession-vertical-rail-host"
-          aria-label={trans('subsessionBar.vertical_rail')}
-        />
-      )}
+      {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT)}
 
       {/* Main */}
       <main class="main">
@@ -6334,6 +6355,8 @@ export function App() {
                 desktopLayoutCapable={desktopLayoutCapable}
                 desktopLayout={subSessionDesktopLayout}
                 onDesktopLayoutChange={handleSubSessionDesktopLayoutChange}
+                desktopDockSide={subSessionDesktopDockSide}
+                onDesktopDockSideChange={handleSubSessionDesktopDockSideChange}
                 verticalRailHost={subSessionVerticalRailHost}
                 collapsed={subSessionBarCollapsed}
                 onCollapsedChange={setSubSessionBarCollapsed}
@@ -6413,6 +6436,8 @@ export function App() {
           </>
         )}
       </main>
+
+      {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
 
       {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
       {isMobile && selectedServerId && (

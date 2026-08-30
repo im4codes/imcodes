@@ -41,7 +41,9 @@ import {
 import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
 import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
 import {
+  SUBSESSION_DESKTOP_DOCK_SIDE,
   SUBSESSION_DESKTOP_LAYOUT,
+  type SubSessionDesktopDockSide,
   type SubSessionDesktopLayout,
 } from '../subsession-desktop-layout-preference.js';
 import {
@@ -113,6 +115,8 @@ interface Props {
   desktopLayoutCapable?: boolean;
   desktopLayout?: SubSessionDesktopLayout;
   onDesktopLayoutChange?: (layout: SubSessionDesktopLayout) => void;
+  desktopDockSide?: SubSessionDesktopDockSide;
+  onDesktopDockSideChange?: (side: SubSessionDesktopDockSide) => void;
   verticalRailHost?: HTMLElement | null;
   idleFlashTokens?: Map<string, number>;
   sharedSubSessionStates?: ReadonlyMap<string, SharedStateSummary>;
@@ -703,7 +707,7 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, verticalRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
@@ -1333,9 +1337,41 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     ? createPortal(
       <div class="subsession-vertical-rail" data-testid="subsession-vertical-rail">
         <div class="subsession-vertical-rail-header">
-          <span>{t('subsessionBar.vertical_rail')}</span>
+          <span class="subsession-vertical-rail-title">{t('subsessionBar.vertical_rail')}</span>
           <span class="subsession-vertical-rail-count">{subSessions.length}</span>
-          {renderQuickSubWindowControl()}
+          <div class="subsession-vertical-rail-actions">
+            {onDesktopDockSideChange && (
+              <div
+                class="subsession-vertical-rail-dock-controls"
+                role="group"
+                aria-label={t('subsessionBar.dock_side')}
+              >
+                <button
+                  type="button"
+                  class="subsession-vertical-rail-dock-button"
+                  data-testid="subsession-vertical-rail-dock-left"
+                  aria-label={t('subsessionBar.dock_left')}
+                  title={t('subsessionBar.dock_left')}
+                  aria-pressed={desktopDockSide === SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+                  onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT)}
+                >
+                  <span aria-hidden="true">←</span>
+                </button>
+                <button
+                  type="button"
+                  class="subsession-vertical-rail-dock-button"
+                  data-testid="subsession-vertical-rail-dock-right"
+                  aria-label={t('subsessionBar.dock_right')}
+                  title={t('subsessionBar.dock_right')}
+                  aria-pressed={desktopDockSide === SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT}
+                  onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
+                >
+                  <span aria-hidden="true">→</span>
+                </button>
+              </div>
+            )}
+            {renderQuickSubWindowControl()}
+          </div>
         </div>
         <div
           class="subsession-vertical-rail-scroll"

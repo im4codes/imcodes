@@ -15,6 +15,8 @@ html { position: fixed; }
   --chrome-accent-2: #34d399;
   --chrome-accent-3: #a78bfa;
   --chrome-warm: #f59e0b;
+  /* The desktop vertical rail is one compact bottom sub-session card wide. */
+  --subsession-compact-card-width: 54px;
   /* Mobile layer contract: persistent navigation stays above session windows,
      while full-screen work surfaces must cover the navigation instead of
      rendering their headers underneath it. */
@@ -5583,7 +5585,7 @@ html.native-ios-mac .chat-dl-btn {
 /* Quick input trigger in shortcuts row: hidden by default, shown when shell input is hidden */
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
-.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 54px; min-height: 54px; padding: 6px 1px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
+.subsession-card { display: flex; width: var(--subsession-compact-card-width); min-width: var(--subsession-compact-card-width); flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-height: 54px; padding: 6px 1px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
 .subsession-card > .share-state-indicator { position: absolute; top: 2px; right: 2px; z-index: 2; margin-left: 0; }
 .subsession-card::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(34,211,238,0.12), transparent 38%, rgba(52,211,153,0.08)); opacity: 0; transition: opacity 0.15s; pointer-events: none; }
 .subsession-card:hover, .subsession-card.open { border-color: rgba(34,211,238,0.44); background: linear-gradient(180deg, rgba(15,40,62,0.92), rgba(10,20,34,0.94)); color: #dbeafe; }
@@ -5604,27 +5606,39 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-card-ctx { display: block; height: 3px; background: rgba(15,23,42,0.92); border-radius: 999px; overflow: hidden; margin-top: 2px; box-shadow: inset 0 0 5px rgba(0,0,0,0.42); }
 .subsession-card-ctx-fill { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); border-radius: 999px; transition: width 0.3s; box-shadow: 0 0 8px rgba(34,211,238,0.5); }
 
+@media (max-width: 640px) {
+  .subsession-card:not(.subsession-card-rail) { min-height: 50px; gap: 1px; padding: 3px 1px; }
+}
+
 /* Desktop vertical sub-session rail. It is an ordinary flex child between the
-   sidebar and main content: never fixed/absolute and never overlays chat. */
-.subsession-vertical-rail-host { position: relative; display: flex; flex: 0 0 200px; width: 200px; min-width: 180px; max-width: 220px; min-height: 0; overflow: hidden; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.025) 22px 23px), linear-gradient(180deg, #0b1422 0%, #070c15 100%); border-right: 1px solid rgba(34,211,238,0.20); box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 8px 0 24px rgba(0,0,0,0.22); z-index: 1; }
+   sidebar and main content or after main: never fixed/absolute and never overlays chat. */
+.subsession-vertical-rail-host { position: relative; display: flex; flex: 0 0 var(--subsession-compact-card-width); width: var(--subsession-compact-card-width); min-width: var(--subsession-compact-card-width); max-width: var(--subsession-compact-card-width); min-height: 0; overflow: hidden; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.025) 22px 23px), linear-gradient(180deg, #0b1422 0%, #070c15 100%); z-index: 1; }
+.subsession-vertical-rail-host-left { border-right: 1px solid rgba(34,211,238,0.20); box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 8px 0 24px rgba(0,0,0,0.22); }
+.subsession-vertical-rail-host-right { border-left: 1px solid rgba(34,211,238,0.20); box-shadow: inset 1px 0 0 rgba(255,255,255,0.035), -8px 0 24px rgba(0,0,0,0.22); }
 .subsession-vertical-rail { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
-.subsession-vertical-rail-header { display: flex; flex: 0 0 auto; min-height: 34px; align-items: center; gap: 7px; padding: 6px 8px; color: #a5f3fc; border-bottom: 1px solid rgba(34,211,238,0.18); background: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(15,23,42,0.16)); font-size: 10px; font-weight: 700; letter-spacing: 0.045em; text-transform: uppercase; }
-.subsession-vertical-rail-count { display: inline-flex; min-width: 18px; height: 18px; align-items: center; justify-content: center; margin-left: auto; padding: 0 4px; border: 1px solid rgba(34,211,238,0.22); border-radius: 999px; color: #67e8f9; background: rgba(8,145,178,0.12); font-variant-numeric: tabular-nums; }
-.subsession-vertical-rail-header .subsession-close-all-strip { flex: 0 0 24px; width: 24px; min-height: 22px; height: 22px; margin: 0; border-radius: 6px; }
-.subsession-vertical-rail-scroll { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 8px; padding: 9px 8px 12px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(34,211,238,0.38) transparent; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: pan-y; }
+.subsession-vertical-rail-header { display: grid; flex: 0 0 auto; min-height: 34px; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 3px; padding: 4px; color: #a5f3fc; border-bottom: 1px solid rgba(34,211,238,0.18); background: linear-gradient(180deg, rgba(34,211,238,0.10), rgba(15,23,42,0.16)); font-size: 9px; font-weight: 700; letter-spacing: 0.025em; text-transform: uppercase; }
+.subsession-vertical-rail-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subsession-vertical-rail-count { display: inline-flex; min-width: 18px; height: 18px; align-items: center; justify-content: center; padding: 0 4px; border: 1px solid rgba(34,211,238,0.22); border-radius: 999px; color: #67e8f9; background: rgba(8,145,178,0.12); font-variant-numeric: tabular-nums; }
+.subsession-vertical-rail-actions { display: flex; grid-column: 1 / -1; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: center; gap: 3px; }
+.subsession-vertical-rail-dock-controls { display: inline-flex; gap: 2px; }
+.subsession-vertical-rail-dock-button { display: inline-flex; width: 20px; height: 20px; align-items: center; justify-content: center; padding: 0; border: 1px solid rgba(34,211,238,0.24); border-radius: 5px; color: #7dd3fc; background: rgba(15,23,42,0.72); cursor: pointer; font: inherit; line-height: 1; }
+.subsession-vertical-rail-dock-button:hover { color: #ecfeff; border-color: rgba(34,211,238,0.58); background: rgba(8,145,178,0.22); }
+.subsession-vertical-rail-dock-button:focus-visible { outline: 2px solid #67e8f9; outline-offset: 1px; }
+.subsession-vertical-rail-dock-button[aria-pressed='true'] { color: #a7f3d0; border-color: rgba(52,211,153,0.55); background: rgba(6,95,70,0.32); }
+.subsession-vertical-rail-header .subsession-close-all-strip { flex: 0 0 20px; width: 20px; min-height: 20px; height: 20px; margin: 0; border-radius: 5px; }
+.subsession-vertical-rail-scroll { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 4px; padding: 5px 2px 8px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(34,211,238,0.38) transparent; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: pan-y; }
 .subsession-vertical-rail-scroll::-webkit-scrollbar { width: 5px; }
 .subsession-vertical-rail-scroll::-webkit-scrollbar-track { background: transparent; }
 .subsession-vertical-rail-scroll::-webkit-scrollbar-thumb { background: rgba(34,211,238,0.34); border-radius: 3px; }
-.subsession-card-rail { width: 100%; min-width: 0; min-height: 56px; box-sizing: border-box; flex-direction: row; justify-content: flex-start; gap: 6px; padding: 8px 7px; text-align: left; }
+.subsession-card-rail { width: 100%; min-width: 0; min-height: 48px; box-sizing: border-box; flex-direction: column; justify-content: center; gap: 1px; padding: 4px 1px 5px; text-align: center; }
 .subsession-card-rail.open { transform: scale(1.02); }
 .subsession-card-rail .subsession-card-icon { flex: 0 0 auto; }
 .subsession-card-rail .subsession-card-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.subsession-card-rail .subsession-card-model { margin-left: auto; max-width: 62px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.subsession-card-rail .subsession-card-ctx { position: absolute; left: 7px; right: 7px; bottom: 4px; width: auto !important; }
+.subsession-card-rail .subsession-card-model { margin-left: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subsession-card-rail .subsession-card-ctx { position: absolute; left: 3px; right: 3px; bottom: 2px; width: auto !important; }
 .subcard-bar-vertical-mode .subcard-toolbar { min-height: 29px; }
 
 @media (max-width: 1280px) {
-  .subsession-vertical-rail-host { flex-basis: 184px; width: 184px; }
   .subcard-bar-vertical-mode .subcard-toolbar-btn-labeled { min-width: 30px; margin-left: 0; padding-left: 7px; padding-right: 7px; }
   .subcard-bar-vertical-mode .subcard-toolbar-btn-label { display: none; }
 }

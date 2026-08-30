@@ -8,6 +8,8 @@ import { createPortal } from 'preact/compat';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
 import {
+  SUBSESSION_DESKTOP_DOCK_SIDE,
+  SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY,
   SUBSESSION_DESKTOP_LAYOUT,
   SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY,
 } from '../src/subsession-desktop-layout-preference.js';
@@ -547,12 +549,15 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     desktopLayoutCapable,
     desktopLayout,
     onDesktopLayoutChange,
+    desktopDockSide,
+    onDesktopDockSideChange,
     verticalRailHost,
   }: any) => (
     <div
       data-testid="app-shell-subsession-bar"
       data-running-discussions={String(totalRunningDiscussions)}
       data-desktop-layout={desktopLayout}
+      data-desktop-dock-side={desktopDockSide}
     >
       {verticalRailHost && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && createPortal(
         <div data-testid="app-shell-subsession-vertical-rail">mock vertical rail</div>,
@@ -569,6 +574,20 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
               : SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
           )}
         >layout-toggle</button>
+      )}
+      {desktopLayoutCapable
+        && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+        && onDesktopDockSideChange && (
+        <>
+          <button
+            data-testid="app-shell-subsession-dock-left"
+            onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT)}
+          >dock-left</button>
+          <button
+            data-testid="app-shell-subsession-dock-right"
+            onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
+          >dock-right</button>
+        </>
       )}
       {openSpecAutoProjection && (
         <div
@@ -1703,7 +1722,7 @@ describe('App shell', () => {
     await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
   }, 20_000);
 
-  it('persists the desktop sub-session layout and mounts the vertical rail between sidebar and main', async () => {
+  it('defaults the vertical rail right, persists both dock sides, and keeps each as a root flex child', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -1715,28 +1734,57 @@ describe('App shell', () => {
 
     fireEvent.click(toggle);
 
-    const host = await screen.findByTestId('subsession-vertical-rail-host');
+    let host = await screen.findByTestId('subsession-vertical-rail-host');
     expect(await screen.findByTestId('app-shell-subsession-vertical-rail')).toBeTruthy();
-    const layout = host.parentElement!;
-    const children = Array.from(layout.children);
-    expect(children.indexOf(screen.getByTestId('sidebar-panel'))).toBeLessThan(children.indexOf(host));
-    expect(children.indexOf(host)).toBeLessThan(children.indexOf(layout.querySelector('.main')!));
+    let layout = host.parentElement!;
+    let children = Array.from(layout.children);
+    expect(host.dataset.dockSide).toBe(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT);
+    expect(children.indexOf(layout.querySelector('.main')!)).toBeLessThan(children.indexOf(host));
     expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)!)).toEqual({
       version: 1,
       layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
     });
+    expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBeNull();
+
+    fireEvent.click(screen.getByTestId('app-shell-subsession-dock-left'));
+    await waitFor(() => expect(screen.getByTestId('subsession-vertical-rail-host').dataset.dockSide)
+      .toBe(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT));
+    host = screen.getByTestId('subsession-vertical-rail-host');
+    layout = host.parentElement!;
+    children = Array.from(layout.children);
+    expect(children.indexOf(screen.getByTestId('sidebar-panel'))).toBeLessThan(children.indexOf(host));
+    expect(children.indexOf(host)).toBeLessThan(children.indexOf(layout.querySelector('.main')!));
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      side: SUBSESSION_DESKTOP_DOCK_SIDE.LEFT,
+    });
 
     view.unmount();
     render(<App />);
-    expect(await screen.findByTestId('subsession-vertical-rail-host')).toBeTruthy();
+    host = await screen.findByTestId('subsession-vertical-rail-host');
+    expect(host.dataset.dockSide).toBe(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT);
     expect(screen.getByTestId('app-shell-subsession-bar').dataset.desktopLayout).toBe('vertical');
+
+    fireEvent.click(screen.getByTestId('app-shell-subsession-dock-right'));
+    await waitFor(() => expect(screen.getByTestId('subsession-vertical-rail-host').dataset.dockSide)
+      .toBe(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT));
+    host = screen.getByTestId('subsession-vertical-rail-host');
+    layout = host.parentElement!;
+    children = Array.from(layout.children);
+    expect(children.indexOf(layout.querySelector('.main')!)).toBeLessThan(children.indexOf(host));
+    expect(JSON.parse(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT,
+    });
   }, 20_000);
 
   it('keeps the saved desktop rail preference untouched while mobile uses its original layout', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
     const saved = JSON.stringify({ version: 1, layout: SUBSESSION_DESKTOP_LAYOUT.VERTICAL });
+    const savedDockSide = JSON.stringify({ version: 1, side: SUBSESSION_DESKTOP_DOCK_SIDE.LEFT });
     localStorage.setItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY, saved);
+    localStorage.setItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY, savedDockSide);
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -1750,6 +1798,7 @@ describe('App shell', () => {
       expect(screen.queryByTestId('subsession-vertical-rail-host')).toBeNull();
       expect(screen.queryByTestId('app-shell-subsession-vertical-rail')).toBeNull();
       expect(localStorage.getItem(SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY)).toBe(saved);
+      expect(localStorage.getItem(SUBSESSION_DESKTOP_DOCK_SIDE_STORAGE_KEY)).toBe(savedDockSide);
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }

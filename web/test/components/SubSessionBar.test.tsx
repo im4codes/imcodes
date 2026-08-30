@@ -110,7 +110,10 @@ import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
 import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
-import { SUBSESSION_DESKTOP_LAYOUT } from '../../src/subsession-desktop-layout-preference.js';
+import {
+  SUBSESSION_DESKTOP_DOCK_SIDE,
+  SUBSESSION_DESKTOP_LAYOUT,
+} from '../../src/subsession-desktop-layout-preference.js';
 
 const LOCALE_DIR = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/i18n/locales');
 
@@ -1549,6 +1552,7 @@ describe('SubSessionBar', () => {
     const onOpen = vi.fn();
     const onOpenMaximized = vi.fn();
     const onDesktopLayoutChange = vi.fn();
+    const onDesktopDockSideChange = vi.fn();
     const sessions = [
       makeSubSession({ id: 'sub-1', sessionName: 'deck_sub_sub-1', label: 'first' }),
       makeSubSession({ id: 'sub-2', sessionName: 'deck_sub_sub-2', label: 'second' }),
@@ -1563,6 +1567,8 @@ describe('SubSessionBar', () => {
           desktopLayoutCapable
           desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
           onDesktopLayoutChange={onDesktopLayoutChange}
+          desktopDockSide={SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+          onDesktopDockSideChange={onDesktopDockSideChange}
           verticalRailHost={host}
           onOpen={onOpen}
           onOpenMaximized={onOpenMaximized}
@@ -1582,6 +1588,17 @@ describe('SubSessionBar', () => {
       expect(Array.from(host.querySelectorAll<HTMLElement>('[data-sub-id]')).map((node) => node.dataset.subId))
         .toEqual(['sub-1', 'sub-2']);
       expect(host.querySelectorAll('.subsession-card-rail')).toHaveLength(2);
+
+      const dockGroup = host.querySelector('[role="group"]');
+      expect(dockGroup?.getAttribute('aria-label')).toBe('subsessionBar.dock_side');
+      const dockLeft = host.querySelector<HTMLButtonElement>('[data-testid="subsession-vertical-rail-dock-left"]')!;
+      const dockRight = host.querySelector<HTMLButtonElement>('[data-testid="subsession-vertical-rail-dock-right"]')!;
+      expect(dockLeft.getAttribute('aria-label')).toBe('subsessionBar.dock_left');
+      expect(dockRight.getAttribute('aria-label')).toBe('subsessionBar.dock_right');
+      expect(dockLeft.getAttribute('aria-pressed')).toBe('true');
+      expect(dockRight.getAttribute('aria-pressed')).toBe('false');
+      fireEvent.click(dockRight);
+      expect(onDesktopDockSideChange).toHaveBeenCalledWith(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT);
 
       const toggle = view.getByTestId('subsession-desktop-layout-toggle');
       expect(toggle.getAttribute('aria-pressed')).toBe('true');
@@ -1616,6 +1633,8 @@ describe('SubSessionBar', () => {
           desktopLayoutCapable={false}
           desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
           onDesktopLayoutChange={vi.fn()}
+          desktopDockSide={SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+          onDesktopDockSideChange={vi.fn()}
           verticalRailHost={host}
           onOpen={vi.fn()}
           onClose={vi.fn()}
@@ -1629,6 +1648,7 @@ describe('SubSessionBar', () => {
 
       expect(view.queryByTestId('subsession-desktop-layout-toggle')).toBeNull();
       expect(host.querySelector('[data-testid="subsession-vertical-rail"]')).toBeNull();
+      expect(view.queryByTestId('subsession-vertical-rail-dock-left')).toBeNull();
       expect(view.container.querySelector('.subsession-bar [data-sub-id="sub-1"]')).toBeTruthy();
     } finally {
       host.remove();
@@ -1638,7 +1658,7 @@ describe('SubSessionBar', () => {
   it('ships desktop layout labels in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
-      for (const key of ['switch_to_vertical', 'switch_to_horizontal', 'vertical_rail']) {
+      for (const key of ['switch_to_vertical', 'switch_to_horizontal', 'vertical_rail', 'dock_side', 'dock_left', 'dock_right']) {
         expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
       }
     }

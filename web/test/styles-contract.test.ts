@@ -14,20 +14,52 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
-  it('keeps the desktop sub-session rail in flex flow with bounded width and vertical scrolling', () => {
+  it('keeps the desktop rail exactly one bottom card wide and its vertical cards compact and scrollable', () => {
+    const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
+    expect(rootRule).toMatch(/--subsession-compact-card-width:\s*54px/);
+
+    const bottomCardRule = cssWithoutComments.match(/\.subsession-card\s*\{[^}]*\}/)?.[0];
+    expect(bottomCardRule).toMatch(/width:\s*var\(--subsession-compact-card-width\)/);
+    expect(bottomCardRule).toMatch(/min-width:\s*var\(--subsession-compact-card-width\)/);
+
     const hostRule = cssWithoutComments.match(/\.subsession-vertical-rail-host\s*\{[^}]*\}/)?.[0];
     expect(hostRule).toBeTruthy();
     expect(hostRule).toMatch(/display:\s*flex/);
-    expect(hostRule).toMatch(/flex:\s*0\s+0\s+200px/);
-    expect(hostRule).toMatch(/min-width:\s*180px/);
-    expect(hostRule).toMatch(/max-width:\s*220px/);
+    expect(hostRule).toMatch(/flex:\s*0\s+0\s+var\(--subsession-compact-card-width\)/);
+    for (const property of ['width', 'min-width', 'max-width']) {
+      expect(hostRule).toMatch(new RegExp(`${property}:\\s*var\\(--subsession-compact-card-width\\)`));
+    }
     expect(hostRule).not.toMatch(/position:\s*(fixed|absolute)/);
+
+    const leftRule = cssWithoutComments.match(/\.subsession-vertical-rail-host-left\s*\{[^}]*\}/)?.[0];
+    const rightRule = cssWithoutComments.match(/\.subsession-vertical-rail-host-right\s*\{[^}]*\}/)?.[0];
+    expect(leftRule).toMatch(/border-right:/);
+    expect(rightRule).toMatch(/border-left:/);
+    expect(leftRule).not.toMatch(/position:\s*(fixed|absolute)/);
+    expect(rightRule).not.toMatch(/position:\s*(fixed|absolute)/);
 
     const scrollRule = cssWithoutComments.match(/\.subsession-vertical-rail-scroll\s*\{[^}]*\}/)?.[0];
     expect(scrollRule).toBeTruthy();
     expect(scrollRule).toMatch(/overflow-y:\s*auto/);
     expect(scrollRule).toMatch(/overflow-x:\s*hidden/);
     expect(scrollRule).toMatch(/flex-direction:\s*column/);
+    expect(scrollRule).toMatch(/gap:\s*4px/);
+    expect(scrollRule).toMatch(/padding:\s*5px\s+2px\s+8px/);
+
+    const railCardRule = cssWithoutComments.match(/\.subsession-card-rail\s*\{[^}]*\}/)?.[0];
+    expect(railCardRule).toMatch(/min-height:\s*48px/);
+    expect(railCardRule).toMatch(/flex-direction:\s*column/);
+    expect(railCardRule).toMatch(/gap:\s*1px/);
+    expect(railCardRule).toMatch(/padding:\s*4px\s+1px\s+5px/);
+
+    const mobileBottomCardRule = cssWithoutComments.match(
+      /@media\s*\(max-width:\s*640px\)\s*\{\s*\.subsession-card:not\(\.subsession-card-rail\)\s*\{[^}]*\}/,
+    )?.[0];
+    expect(mobileBottomCardRule).toMatch(/min-height:\s*50px/);
+    expect(mobileBottomCardRule).toMatch(/gap:\s*1px/);
+    expect(mobileBottomCardRule).toMatch(/padding:\s*3px\s+1px/);
+
+    expect(cssWithoutComments).not.toMatch(/\.subsession-vertical-rail-host\s*\{[^}]*(?:136px|148px)/);
   });
 
   it('shows the fast-audit label on desktop and keeps the mobile control icon-only', () => {
