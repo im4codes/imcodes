@@ -5,7 +5,10 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/pr
 import type { ComponentChildren } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
-import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_STOP_ORIGIN,
+} from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
@@ -144,7 +147,10 @@ describe('RemoteDesktopWall', () => {
     })));
 
     fireEvent.click(screen.getByText('remove:A'));
-    await waitFor(() => expect(manager.stop).toHaveBeenCalledWith('a'));
+    await waitFor(() => expect(manager.stop).toHaveBeenCalledWith(
+      'a',
+      REMOTE_DESKTOP_STOP_ORIGIN.WALL_REMOVE,
+    ));
   });
 
   it('uses the real capability gate: complete macOS opens and incomplete macOS stays absent', async () => {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <thread>
@@ -574,6 +575,10 @@ void PeerSession::HandleMediaStats(uint64_t generation,
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
   const uint64_t source_frames = source_->captured_frames();
+  if (outbound_bytes > 0 && !media_started_) {
+    media_started_ = true;
+    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+  }
   if (!media_stats_initialized_ ||
       outbound_bytes != last_outbound_video_bytes_) {
     media_stats_initialized_ = true;
@@ -800,6 +805,7 @@ void PeerSession::OnConnectionChange(
     return;
   }
   if (state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnected) {
+    peer_connected_ = true;
     // Start the bounded wait for the input channels here: a viewer that never
     // opens all three must still end up with a picture.
     if (video_gate_deadline_ms_ == 0) {
@@ -811,9 +817,16 @@ void PeerSession::OnConnectionChange(
     ActivateVideoIfReady();
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
   } else if (state ==
+                 webrtc::PeerConnectionInterface::PeerConnectionState::kNew ||
+             state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnecting ||
+             state == webrtc::PeerConnectionInterface::PeerConnectionState::kDisconnected) {
+    peer_connected_ = false;
+    SendStatus("connecting", false);
+  } else if (state ==
                  webrtc::PeerConnectionInterface::PeerConnectionState::kFailed ||
              state ==
                  webrtc::PeerConnectionInterface::PeerConnectionState::kClosed) {
+    peer_connected_ = false;
     Close("peer_failed");
   }
 }
@@ -827,6 +840,7 @@ void PeerSession::OnIceSelectedCandidatePairChanged(
     std::weak_ptr<PeerSession> weak = weak_from_this();
     signaling_thread_->PostTask([weak, relayed] {
       if (auto session = weak.lock()) {
+        session->candidate_pair_selected_ = true;
         session->relayed_ = relayed;
         session->ApplyTransportBitratePolicy(!relayed);
         session->SendStatus(relayed ? "relayed" : "direct",
@@ -835,6 +849,7 @@ void PeerSession::OnIceSelectedCandidatePairChanged(
     });
     return;
   }
+  candidate_pair_selected_ = true;
   relayed_ = relayed;
   ApplyTransportBitratePolicy(!relayed);
   SendStatus(relayed ? "relayed" : "direct", InputReady());
@@ -1327,8 +1342,19 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
   Json::Value root = BaseEnvelope(kStatusType, authority_);
   root["mode"] = authority_.mode;
   root["inputEpoch"] = authority_.input_epoch;
-  root["state"] = state;
-  root["route"] = relayed_ ? "relay" : "direct";
+  const bool route_state = std::strcmp(state, "direct") == 0 ||
+                           std::strcmp(state, "relayed") == 0;
+  // A selected direct pair is transport diagnostics, not PeerConnection
+  // readiness. Until libwebrtc reports kConnected, keep the lifecycle state
+  // truthful so the Server cannot clear its negotiation timeout early.
+  root["state"] = route_state && !peer_connected_ ? "connecting" : state;
+  if (candidate_pair_selected_) {
+    root["route"] = relayed_ ? "relay" : "direct";
+  }
+  root["peerConnected"] = peer_connected_;
+  root["dataChannelsReady"] = ChannelsReady();
+  root["mediaStarted"] = media_started_;
+  root["firstFramePresented"] = layout_acknowledged_;
   if (!selection_required_ && selected_display_ < displays_.size()) {
     root["selectedDisplayId"] = displays_[selected_display_].id;
     root["layoutRevision"] = layout_revision_;

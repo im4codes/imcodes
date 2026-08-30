@@ -20,6 +20,7 @@ import {
   REMOTE_DESKTOP_PROTOCOL_VERSION,
   REMOTE_DESKTOP_QUALITY_PRESET,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopSequenceAccepted,
   hasRemoteDesktopIndependentRouteGeneration,
@@ -180,8 +181,15 @@ describe('remote desktop production contract', () => {
       requestId,
       sessionId,
       capability,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
       aggregateBytesReceived: 12_345,
     })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopBrowserMessage({
       type: REMOTE_DESKTOP_MSG.START,
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,

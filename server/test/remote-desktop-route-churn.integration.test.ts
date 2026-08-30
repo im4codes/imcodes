@@ -17,6 +17,7 @@ import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_STOP_ORIGIN,
 } from '../../shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_PRESENTATION_SOURCE,
@@ -165,6 +166,7 @@ describe('remote desktop route-generation churn under privacy', () => {
       requestId,
       sessionId,
       capability: String(replacementPrepare!.capability),
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
     });
   });
 });

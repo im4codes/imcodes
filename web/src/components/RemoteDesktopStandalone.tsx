@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 import { listControllableMachines, type MachineListItem } from '../api/machines.js';
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
@@ -36,7 +37,9 @@ export function RemoteDesktopStandalone({ serverId }: { serverId: string }) {
     return () => { active = false; };
   }, [serverId, t]);
 
-  useEffect(() => () => managerRef.current?.stopAll(), []);
+  useEffect(() => () => managerRef.current?.stopAll(
+    REMOTE_DESKTOP_STOP_ORIGIN.STANDALONE_UNMOUNT,
+  ), []);
 
   if (failed) {
     return <div class="remote-desktop-standalone-status" role="alert">{t('controlled_nodes.error_generic')}</div>;

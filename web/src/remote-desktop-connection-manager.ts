@@ -2,8 +2,10 @@ import {
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   type RemoteDesktopAccessMode,
+  type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
 import {
   RemoteDesktopClient,
@@ -53,7 +55,7 @@ interface RemoteDesktopConnectionClient {
   text(value: string): boolean;
   releaseAll(): void;
   releasePointerButtons(): void;
-  stop(): void;
+  stop(origin: RemoteDesktopStopOrigin): void;
 }
 
 export interface RemoteDesktopManagedConnection extends RemoteDesktopConnectionClient {
@@ -149,7 +151,7 @@ export class RemoteDesktopConnectionManager {
     return scoped;
   }
 
-  stop(target: RemoteDesktopHostTarget | string): void {
+  stop(target: RemoteDesktopHostTarget | string, origin: RemoteDesktopStopOrigin): void {
     const hostKey = typeof target === 'string' ? target : remoteDesktopHostKey(target);
     const entry = this.entries.get(hostKey);
     if (!entry || entry.stopped) return;
@@ -157,7 +159,7 @@ export class RemoteDesktopConnectionManager {
     this.clearReconnectTimers(entry);
     this.entries.delete(hostKey);
     // RemoteDesktopClient.stop owns the exact release_all -> Stop ordering.
-    entry.client.stop();
+    entry.client.stop(origin);
     entry.presentations.clear();
   }
 
@@ -169,8 +171,8 @@ export class RemoteDesktopConnectionManager {
     entry.inputPresentation = null;
   }
 
-  stopAll(): void {
-    for (const hostKey of [...this.entries.keys()]) this.stop(hostKey);
+  stopAll(origin: RemoteDesktopStopOrigin): void {
+    for (const hostKey of [...this.entries.keys()]) this.stop(hostKey, origin);
   }
 
   private createEntry(hostKey: string, serverId: string): ManagedEntry {
@@ -263,7 +265,7 @@ export class RemoteDesktopConnectionManager {
       text: (value) => canControl() && entry.client.text(value),
       releaseAll: () => entry.client.releaseAll(),
       releasePointerButtons: () => entry.client.releasePointerButtons(),
-      stop: () => this.stop(entry.hostKey),
+      stop: (origin) => this.stop(entry.hostKey, origin),
     };
   }
 
@@ -351,7 +353,7 @@ export class RemoteDesktopConnectionManager {
   private replaceClient(entry: ManagedEntry, reconnectAttempt: number): void {
     const previous = entry.client;
     entry.clientGeneration += 1;
-    previous.stop();
+    previous.stop(REMOTE_DESKTOP_STOP_ORIGIN.MANAGER_RECONNECT);
     entry.client = this.newClient(entry, entry.clientGeneration);
     if (entry.started) void this.startCurrentClient(entry, reconnectAttempt);
   }
@@ -362,7 +364,7 @@ export class RemoteDesktopConnectionManager {
     const previous = entry.client;
     entry.clientGeneration += 1;
     entry.serverId = serverId;
-    previous.stop();
+    previous.stop(REMOTE_DESKTOP_STOP_ORIGIN.EXECUTION_ENDPOINT_CHANGE);
     entry.client = this.newClient(entry, entry.clientGeneration);
     entry.snapshot = entry.client.current() as RemoteDesktopSnapshot;
     this.publish(entry, entry.snapshot);

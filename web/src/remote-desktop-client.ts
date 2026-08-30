@@ -31,6 +31,7 @@ import {
   type RemoteDesktopRoute,
   type RemoteDesktopServerMessage,
   type RemoteDesktopState,
+  type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
 import { PendingWebRtcCandidates, toWebRtcIceServers } from '@shared/webrtc-connectivity.js';
 import type { RemoteDesktopBootstrapProof } from '@shared/remote-desktop-access.js';
@@ -808,7 +809,7 @@ export class RemoteDesktopClient {
     }
   }
 
-  stop(): void {
+  stop(stopOrigin: RemoteDesktopStopOrigin): void {
     if (this.stopped) return;
     this.releaseAll();
     if (this.requestId && this.sessionId && this.capability) {
@@ -817,6 +818,7 @@ export class RemoteDesktopClient {
         requestId: this.requestId,
         sessionId: this.sessionId,
         capability: this.capability,
+        stopOrigin,
         ...(this.aggregateBytesReceived > 0
           ? { aggregateBytesReceived: this.aggregateBytesReceived }
           : {}),

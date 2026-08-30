@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -32,6 +33,7 @@ vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
 }));
 
 import { RemoteDesktopWallStandalone } from '../src/components/RemoteDesktopWallStandalone.js';
+import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 import {
   buildRemoteDesktopWallWindowUrl,
   isRemoteDesktopWallWindow,
@@ -58,17 +60,22 @@ describe('remote desktop wall standalone window', () => {
 
   it('keeps the wall independent and opens a reusable manager only after selecting a tile', () => {
     const close = vi.spyOn(window, 'close').mockImplementation(() => undefined);
+    const stopAll = vi.spyOn(RemoteDesktopConnectionManager.prototype, 'stopAll');
     render(<RemoteDesktopWallStandalone />);
     expect(screen.getByTestId('standalone-wall').textContent).toContain('true');
     expect(screen.queryByTestId('standalone-wall-manager')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'open-host' }));
+    // The state update rerenders and the translation mock returns a fresh `t`.
+    // That must not rerun a title-effect cleanup that owns the transport.
+    expect(stopAll).not.toHaveBeenCalled();
     expect(screen.getByTestId('standalone-wall-manager').textContent).toContain('host-a');
     fireEvent.click(screen.getByRole('button', { name: 'close-manager' }));
     expect(screen.queryByTestId('standalone-wall-manager')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'close-wall' }));
     expect(close).toHaveBeenCalledTimes(1);
+    expect(stopAll).toHaveBeenCalledWith(REMOTE_DESKTOP_STOP_ORIGIN.WALL_CLOSE);
   });
 
   it('uses a bounded dedicated query and severs the popup opener', () => {

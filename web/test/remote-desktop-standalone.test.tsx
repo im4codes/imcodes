@@ -2,7 +2,10 @@
 import { act, cleanup, render, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
-import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_STOP_ORIGIN,
+} from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
@@ -34,6 +37,7 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
 }));
 
 import { RemoteDesktopStandalone } from '../src/components/RemoteDesktopStandalone.js';
+import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 import {
   buildRemoteDesktopWindowUrl,
   isRemoteDesktopWallWindow,
@@ -78,6 +82,7 @@ describe('remote desktop standalone window', () => {
       capabilities: [REMOTE_DESKTOP_CAPABILITY],
     }]);
     const close = vi.spyOn(window, 'close').mockImplementation(() => undefined);
+    const stopAll = vi.spyOn(RemoteDesktopConnectionManager.prototype, 'stopAll');
     const result = render(<RemoteDesktopStandalone serverId="desktop-1" />);
 
     expect(result.getByRole('status').textContent).toBe('controlled_nodes.loading');
@@ -85,6 +90,8 @@ describe('remote desktop standalone window', () => {
 
     act(() => result.getByText('stop-standalone').click());
     expect(close).toHaveBeenCalledTimes(1);
+    result.unmount();
+    expect(stopAll).toHaveBeenCalledWith(REMOTE_DESKTOP_STOP_ORIGIN.STANDALONE_UNMOUNT);
   });
 
   it('uses the real capability gate for complete and incomplete macOS profiles', async () => {

@@ -4,7 +4,9 @@ import {
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   type RemoteDesktopAccessMode,
+  type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
 import {
   RemoteDesktopConnectionManager,
@@ -36,6 +38,7 @@ class FakeConnectionClient {
   readonly startAttempts: number[] = [];
   readonly lifecycle: string[] = [];
   readonly input: string[] = [];
+  readonly stopOrigins: RemoteDesktopStopOrigin[] = [];
   private value = snapshot();
 
   constructor(private readonly hooks: RemoteDesktopClientHooks) {}
@@ -76,7 +79,8 @@ class FakeConnectionClient {
   text(_value: string): boolean { this.input.push('text'); return true; }
   releaseAll(): void { this.lifecycle.push('release_all'); }
   releasePointerButtons(): void {}
-  stop(): void {
+  stop(origin: RemoteDesktopStopOrigin): void {
+    this.stopOrigins.push(origin);
     this.lifecycle.push('release_all', 'stop');
   }
 }
@@ -137,6 +141,9 @@ describe('RemoteDesktopConnectionManager', () => {
     expect(clients).toHaveLength(2);
     expect(clients[0].startAttempts).toEqual([0]);
     expect(clients[0].lifecycle).toEqual(['release_all', 'stop']);
+    expect(clients[0].stopOrigins).toEqual([
+      REMOTE_DESKTOP_STOP_ORIGIN.EXECUTION_ENDPOINT_CHANGE,
+    ]);
     expect(clients[1].startAttempts).toEqual([0]);
     expect(clients[1].lifecycle).toEqual([]);
     expect(remoteDesktopHostKey({ serverId: 'fallback' })).toBe('fallback');
@@ -198,6 +205,7 @@ describe('RemoteDesktopConnectionManager', () => {
 
     expect(clients).toHaveLength(3);
     expect(clients[0].lifecycle).toEqual(['release_all', 'stop']);
+    expect(clients[0].stopOrigins).toEqual([REMOTE_DESKTOP_STOP_ORIGIN.MANAGER_RECONNECT]);
     expect(clients[1].lifecycle).toEqual([]);
     expect(clients[1].startAttempts).toEqual([0]);
     expect(clients[2].startAttempts).toEqual([1]);
@@ -220,6 +228,8 @@ describe('RemoteDesktopConnectionManager', () => {
     expect(clients).toHaveLength(3);
     expect(clients[0].lifecycle).toEqual(['release_all', 'stop']);
     expect(clients[1].lifecycle).toEqual(['release_all', 'stop']);
+    expect(clients[0].stopOrigins).toEqual([REMOTE_DESKTOP_STOP_ORIGIN.MANAGER_RECONNECT]);
+    expect(clients[1].stopOrigins).toEqual([REMOTE_DESKTOP_STOP_ORIGIN.MANAGER_RECONNECT]);
     expect(clients[2].startAttempts).toEqual([1]);
     clients[1].emit({ state: REMOTE_DESKTOP_STATE.DIRECT });
     expect(observed.at(-1)?.state).toBe(REMOTE_DESKTOP_STATE.RECONNECTING);
@@ -285,11 +295,12 @@ describe('RemoteDesktopConnectionManager', () => {
     const connection = manager.connection({ serverId: 'server-a' });
     await connection.start();
 
-    connection.stop();
-    connection.stop();
-    manager.stop({ serverId: 'server-a' });
+    connection.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    connection.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    manager.stop({ serverId: 'server-a' }, REMOTE_DESKTOP_STOP_ORIGIN.WALL_CLOSE);
 
     expect(clients[0].lifecycle).toEqual(['release_all', 'stop']);
+    expect(clients[0].stopOrigins).toEqual([REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE]);
     expect(manager.connection({ serverId: 'server-a' })).not.toBe(connection);
     expect(clients).toHaveLength(2);
   });

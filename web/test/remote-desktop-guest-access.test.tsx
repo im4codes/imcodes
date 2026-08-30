@@ -3,7 +3,10 @@ import 'fake-indexeddb/auto';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { IDBFactory } from 'fake-indexeddb';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_ACCESS_MODE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
+} from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_ACTOR_SOURCE } from '../../shared/remote-desktop-access.js';
 import { RemoteDesktopGuestAccess } from '../src/components/RemoteDesktopGuestAccess.js';
 import { generateRemoteDesktopBrowserKeyPair } from '../src/remote-desktop-access-crypto.js';
@@ -32,8 +35,9 @@ describe('RemoteDesktopGuestAccess', () => {
   });
 
   it('moves a resolved scrubbed invite into attended waiting without rendering serverId or desktop controls', async () => {
-    const starter: RemoteDesktopGuestSessionStarter = { start: vi.fn(async () => ({ stop: vi.fn() })) };
-    render(<RemoteDesktopGuestAccess bootstrap={Promise.resolve({ status: 'invite', token: 'A'.repeat(43) })} api={{
+    const stop = vi.fn();
+    const starter: RemoteDesktopGuestSessionStarter = { start: vi.fn(async () => ({ stop })) };
+    const result = render(<RemoteDesktopGuestAccess bootstrap={Promise.resolve({ status: 'invite', token: 'A'.repeat(43) })} api={{
       resolveInvite: vi.fn(async () => ready()),
     } as unknown as RemoteDesktopAccessApi} sessionStarter={starter} />);
     expect(await screen.findByText(/waiting_for_consent/)).toBeTruthy();
@@ -44,6 +48,8 @@ describe('RemoteDesktopGuestAccess', () => {
     expect(document.body.textContent).not.toContain('server-internal-1');
     expect(document.body.textContent).not.toContain('remote_desktop.workspace_wall');
     expect(document.body.textContent).not.toContain('settings');
+    result.unmount();
+    expect(stop).toHaveBeenCalledWith(REMOTE_DESKTOP_STOP_ORIGIN.GUEST_UNMOUNT);
   });
 
   it('uses generic unavailable/cooldown states and clears password input after proof', async () => {

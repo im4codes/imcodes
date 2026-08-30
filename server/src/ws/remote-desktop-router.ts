@@ -482,7 +482,19 @@ export class RemoteDesktopRouter {
         return true;
       }
       const previousState = route.state;
-      route.state = parsed.value.state;
+      const transportState = parsed.value.state === REMOTE_DESKTOP_STATE.DIRECT
+        || parsed.value.state === REMOTE_DESKTOP_STATE.RELAYED;
+      const connectionReady = transportState
+        && parsed.value.peerConnected === true
+        && parsed.value.dataChannelsReady === true
+        && parsed.value.mediaStarted === true
+        && parsed.value.firstFramePresented === true;
+      // Candidate-pair selection is useful route diagnostics, but it is not a
+      // connected session. Keep the timeout armed until native PC, all data
+      // channels, outbound media, and browser frame presentation agree.
+      route.state = transportState && !connectionReady
+        ? REMOTE_DESKTOP_STATE.CONNECTING
+        : parsed.value.state;
       route.statusReceived = true;
       route.workerInputEnabled = parsed.value.inputEnabled;
       route.connectionRoute = parsed.value.route;
@@ -514,15 +526,24 @@ export class RemoteDesktopRouter {
       // than a potentially compromised worker. They remain metadata-only.
       outbound = {
         ...parsed.value,
+        state: route.state,
         viewerCount: stats.active,
         controllerCount: stats.controlling,
       };
-      if (parsed.value.state === REMOTE_DESKTOP_STATE.DIRECT
-        || parsed.value.state === REMOTE_DESKTOP_STATE.RELAYED) {
+      if (connectionReady) {
         clearTimeout(route.negotiationTimer);
-        if (previousState !== parsed.value.state) {
+        if (previousState !== route.state) {
           this.audit(REMOTE_DESKTOP_AUDIT_EVENT.CONNECTED, route, {
-            relayed: parsed.value.state === REMOTE_DESKTOP_STATE.RELAYED,
+            relayed: route.state === REMOTE_DESKTOP_STATE.RELAYED,
+            route: parsed.value.route ?? (
+              route.state === REMOTE_DESKTOP_STATE.RELAYED ? 'relay' : 'direct'
+            ),
+            browserIceCandidates: route.browserIceCandidates,
+            daemonIceCandidates: route.daemonIceCandidates,
+            peerConnected: true,
+            dataChannelsReady: true,
+            mediaStarted: true,
+            firstFramePresented: true,
           });
         }
       }
@@ -1350,6 +1371,9 @@ export class RemoteDesktopRouter {
       });
       this.audit(REMOTE_DESKTOP_AUDIT_EVENT.STOPPED, route, {
         controllerRequested: true,
+        ...(message.type === REMOTE_DESKTOP_MSG.STOP
+          ? { stopOrigin: message.stopOrigin }
+          : { cancelBeforeConnect: true }),
         ...(message.type === REMOTE_DESKTOP_MSG.STOP
           && message.aggregateBytesReceived !== undefined
           ? { aggregateBytesReceived: message.aggregateBytesReceived }

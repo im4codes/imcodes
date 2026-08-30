@@ -18,6 +18,7 @@ import { FloatingPanel } from './FloatingPanel.js';
 import { RemoteDesktopWallTile } from './RemoteDesktopWallTile.js';
 import './remote-desktop-workspace.css';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 
 export const REMOTE_DESKTOP_WALL_WINDOW_ID = 'remote-desktop-wall';
 const REMOTE_DESKTOP_WALL_MOBILE_COLUMNS_KEY = 'imcodes.remoteDesktopWall.mobileColumns';
@@ -145,7 +146,9 @@ export function RemoteDesktopWall({
     const remaining = new Set(result.snapshot.hostIds);
     for (const host of previous.hosts) {
       const hostKey = remoteDesktopHostKey(host);
-      if (!remaining.has(host.hostId) && !retainedHostKeys.has(hostKey)) manager.stop(hostKey);
+      if (!remaining.has(host.hostId) && !retainedHostKeys.has(hostKey)) {
+        manager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WALL_REMOVE);
+      }
     }
     return result;
   }, [applySnapshot, manager, retainedHostKeys, snapshot]);

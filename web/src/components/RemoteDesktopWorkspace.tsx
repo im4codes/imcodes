@@ -19,6 +19,7 @@ import { FloatingPanel } from './FloatingPanel.js';
 import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
 import './remote-desktop-workspace.css';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 
 export interface RemoteDesktopWorkspaceProps {
   state: RemoteDesktopWorkspaceState;
@@ -79,7 +80,9 @@ export function RemoteDesktopWorkspace({
   }, [manager, onActivateTab, state.activeTabId]);
 
   const closeHost = useCallback((hostKey: string) => {
-    if (!wallHostKeys.has(hostKey)) manager.stop(hostKey);
+    if (!wallHostKeys.has(hostKey)) {
+      manager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_HOST_CLOSE);
+    }
     onCloseHost(hostKey);
   }, [manager, onCloseHost, wallHostKeys]);
 
@@ -89,7 +92,9 @@ export function RemoteDesktopWorkspace({
       { count: state.orderedHostKeys.length },
     ))) return;
     for (const hostKey of state.orderedHostKeys) {
-      if (!wallHostKeys.has(hostKey)) manager.stop(hostKey);
+      if (!wallHostKeys.has(hostKey)) {
+        manager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
+      }
     }
     onCloseWorkspace();
   }, [manager, onCloseWorkspace, state.orderedHostKeys, t, wallHostKeys]);

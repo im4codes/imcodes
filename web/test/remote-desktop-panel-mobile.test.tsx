@@ -6,6 +6,7 @@ import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '@shared/remote-desktop.js';
 import {
@@ -405,7 +406,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(directoryAdapters.map((adapter) => adapter.serverId)).toEqual(['endpoint-a', 'endpoint-b']);
     expect(directoryAdapters[0].destroy).toHaveBeenCalledTimes(1);
     expect(clientHooks).toHaveLength(2);
-    connectionManager.stopAll();
+    connectionManager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.APP_UNMOUNT);
   });
 
   it('remounts its presentation without replacing the workspace connection', async () => {
@@ -427,7 +428,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(clientStarts).toEqual([0]);
 
     remounted.unmount();
-    connectionManager.stopAll();
+    connectionManager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.APP_UNMOUNT);
     expect(stop).toHaveBeenCalledTimes(1);
   });
 

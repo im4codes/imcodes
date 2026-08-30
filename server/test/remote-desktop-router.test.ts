@@ -18,6 +18,7 @@ import {
   REMOTE_DESKTOP_MODE_REASON,
   REMOTE_DESKTOP_PROTOCOL_VERSION,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '../../shared/remote-desktop.js';
 import {
@@ -339,6 +340,7 @@ describe('RemoteDesktopRouter', () => {
     await f.router.handleBrowser(f.browserA, 'owner-user', {
       type: REMOTE_DESKTOP_MSG.STOP,
       ...authority,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
     });
     await vi.waitFor(() => expect(f.registryEvents).toContain(`close:${authority.sessionId}:7`));
     expect(f.registryEvents.filter((event) => event === `close:${authority.sessionId}:7`)).toHaveLength(1);
@@ -362,6 +364,7 @@ describe('RemoteDesktopRouter', () => {
     await f.router.handleBrowser(f.browserA, 'owner-user', {
       type: REMOTE_DESKTOP_MSG.STOP,
       ...authority,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
     });
   });
 
@@ -460,12 +463,66 @@ describe('RemoteDesktopRouter', () => {
         inputEpoch: 1,
         state: REMOTE_DESKTOP_STATE.DIRECT,
         route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
         selectedDisplayId: index % 2 === 0 ? 'display_12345678' : 'display_87654321',
         layoutRevision: index + 1,
         inputEnabled: false,
       }, 7);
     }
     expect(f.audits).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_AUDITS_PER_MACHINE_PER_MINUTE);
+  });
+
+  it('does not treat a selected direct pair as connected before PC, channels, media, and first frame', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    const baseStatus = {
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      selectedDisplayId: 'display-primary',
+      layoutRevision: 1,
+      inputEnabled: false,
+    } as const;
+
+    expect(f.router.handleDaemon(baseStatus, 7)).toBe(true);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      state: REMOTE_DESKTOP_STATE.CONNECTING,
+      route: 'direct',
+    });
+    expect(f.audits).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: REMOTE_DESKTOP_AUDIT_EVENT.CONNECTED }),
+    ]));
+
+    expect(f.router.handleDaemon({
+      ...baseStatus,
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
+    }, 7)).toBe(true);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+    });
+    expect(f.audits).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: REMOTE_DESKTOP_AUDIT_EVENT.CONNECTED,
+        fields: expect.objectContaining({
+          route: 'direct',
+          peerConnected: true,
+          dataChannelsReady: true,
+          mediaStarted: true,
+          firstFramePresented: true,
+        }),
+      }),
+    ]));
   });
 
   it('forwards bounded reconnect intent only to the worker and audits aggregate bytes', async () => {
@@ -499,6 +556,7 @@ describe('RemoteDesktopRouter', () => {
       requestId: authority.requestId,
       sessionId: authority.sessionId,
       capability: authority.capability,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
       aggregateBytesReceived: 98_765,
     });
     expect(f.daemonMessages.at(-1)).toEqual({
@@ -511,6 +569,7 @@ describe('RemoteDesktopRouter', () => {
       event: REMOTE_DESKTOP_AUDIT_EVENT.STOPPED,
       fields: expect.objectContaining({
         controllerRequested: true,
+        stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
         aggregateBytesReceived: 98_765,
       }),
     });
@@ -641,6 +700,10 @@ describe('RemoteDesktopRouter', () => {
       inputEpoch: 1,
       state: REMOTE_DESKTOP_STATE.DIRECT,
       route: 'direct',
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
       selectedDisplayId: 'display-primary',
       layoutRevision: 1,
       inputEnabled: false,
@@ -653,6 +716,10 @@ describe('RemoteDesktopRouter', () => {
       inputEpoch: 1,
       state: REMOTE_DESKTOP_STATE.DIRECT,
       route: 'direct',
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
       selectedDisplayId: 'display-primary',
       layoutRevision: 1,
       inputEnabled: false,
@@ -666,6 +733,10 @@ describe('RemoteDesktopRouter', () => {
       inputEpoch: 1,
       state: REMOTE_DESKTOP_STATE.SWITCHING_DISPLAY,
       route: 'direct',
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
       selectedDisplayId: 'display-secondary',
       layoutRevision: 2,
       inputEnabled: false,
@@ -920,6 +991,10 @@ describe('RemoteDesktopRouter', () => {
         inputEpoch: 1,
         state: REMOTE_DESKTOP_STATE.DIRECT,
         route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
         inputEnabled: true,
       }, 7)).toBe(true);
     }
@@ -1122,6 +1197,10 @@ describe('RemoteDesktopRouter', () => {
         inputEpoch: 1,
         state: REMOTE_DESKTOP_STATE.DIRECT,
         route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
         inputEnabled: false,
       }, 7);
 
@@ -1243,6 +1322,7 @@ describe('RemoteDesktopRouter', () => {
     await f.router.handleBrowser(f.browserA, 'owner-user', {
       type: REMOTE_DESKTOP_MSG.STOP,
       ...authority,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
     });
     expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.STOP)).toHaveLength(stoppedCount);
   });

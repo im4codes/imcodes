@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
 import {
@@ -32,8 +33,14 @@ export function RemoteDesktopWallStandalone() {
 
   useEffect(() => {
     document.title = t('remote_desktop.workspace_wall');
-    return () => manager.stopAll();
-  }, [manager, t]);
+  }, [t]);
+
+  // Transport lifetime belongs to the window, not to the translated title
+  // effect. i18n refreshes may replace `t`; coupling cleanup to that dependency
+  // previously sent STOP while the standalone window was still mounted.
+  useEffect(() => () => manager.stopAll(
+    REMOTE_DESKTOP_STOP_ORIGIN.STANDALONE_UNMOUNT,
+  ), [manager]);
 
   return (
     <>
@@ -46,7 +53,7 @@ export function RemoteDesktopWallStandalone() {
         ))}
         onHostKeysChange={setWallHostKeys}
         onClose={() => {
-          manager.stopAll();
+          manager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.WALL_CLOSE);
           window.close();
         }}
       />

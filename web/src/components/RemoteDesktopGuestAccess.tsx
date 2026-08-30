@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { REMOTE_DESKTOP_ACTOR_SOURCE } from '@shared/remote-desktop-access.js';
 import {
+  REMOTE_DESKTOP_STOP_ORIGIN,
+  type RemoteDesktopStopOrigin,
+} from '@shared/remote-desktop.js';
+import {
   createRemoteDesktopAccessApi,
   createRemoteDesktopBootstrapProof,
   mapRemoteDesktopApiError,
@@ -48,7 +52,7 @@ export function RemoteDesktopGuestAccess({
   const [target, setTarget] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
-  const session = useRef<{ stop(): void } | null>(null);
+  const session = useRef<{ stop(origin: RemoteDesktopStopOrigin): void } | null>(null);
   const invite = useRef<PersistedRemoteDesktopInviteBinding | null>(null);
   const video = useRef<HTMLVideoElement | null>(null);
   const alive = useRef(true);
@@ -126,7 +130,7 @@ export function RemoteDesktopGuestAccess({
     });
     return () => {
       alive.current = false;
-      session.current?.stop();
+      session.current?.stop(REMOTE_DESKTOP_STOP_ORIGIN.GUEST_UNMOUNT);
       session.current = null;
       invite.current = null;
       setStream(null);
@@ -158,7 +162,7 @@ export function RemoteDesktopGuestAccess({
   };
 
   const retryOrReset = () => {
-    session.current?.stop();
+    session.current?.stop(REMOTE_DESKTOP_STOP_ORIGIN.GUEST_RETRY);
     session.current = null;
     setStream(null);
     setTarget(null);

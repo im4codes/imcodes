@@ -139,6 +139,35 @@ export type RemoteDesktopModeReason = typeof REMOTE_DESKTOP_MODE_REASON[
 
 export type RemoteDesktopTerminalReason = typeof REMOTE_DESKTOP_TERMINAL_REASON[keyof typeof REMOTE_DESKTOP_TERMINAL_REASON];
 
+/**
+ * Browser-owned reason for ending an otherwise authorized route.
+ *
+ * This is deliberately more precise than `stopped_by_controller`: an
+ * automatic presentation cleanup must never be indistinguishable from the
+ * operator pressing Close, and a reconnect replacement must not look like a
+ * user decision in the durable audit row.
+ */
+export const REMOTE_DESKTOP_STOP_ORIGIN = {
+  USER_CLOSE: 'user_close',
+  PANEL_UNMOUNT: 'panel_unmount',
+  WALL_REMOVE: 'wall_remove',
+  WALL_CLOSE: 'wall_close',
+  WORKSPACE_HOST_CLOSE: 'workspace_host_close',
+  WORKSPACE_CLOSE: 'workspace_close',
+  APP_SIGN_OUT: 'app_sign_out',
+  APP_UNMOUNT: 'app_unmount',
+  STANDALONE_UNMOUNT: 'standalone_unmount',
+  MANAGER_RECONNECT: 'manager_reconnect',
+  EXECUTION_ENDPOINT_CHANGE: 'execution_endpoint_change',
+  GUEST_UNMOUNT: 'guest_unmount',
+  GUEST_RETRY: 'guest_retry',
+  START_FAILURE: 'start_failure',
+} as const;
+
+export type RemoteDesktopStopOrigin = typeof REMOTE_DESKTOP_STOP_ORIGIN[
+  keyof typeof REMOTE_DESKTOP_STOP_ORIGIN
+];
+
 export const REMOTE_DESKTOP_POINTER_KIND = {
   MOVE: 'move',
   BUTTON_DOWN: 'button_down',
@@ -513,6 +542,7 @@ export interface RemoteDesktopStop {
   requestId: string;
   sessionId: string;
   capability: string;
+  stopOrigin: RemoteDesktopStopOrigin;
   aggregateBytesReceived?: number;
 }
 
@@ -522,6 +552,9 @@ export interface RemoteDesktopCancel {
   sessionId: string;
   capability: string;
 }
+
+/** Server → daemon STOP deliberately omits browser diagnostics metadata. */
+export type RemoteDesktopDaemonStop = Omit<RemoteDesktopStop, 'stopOrigin' | 'aggregateBytesReceived'>;
 
 export interface RemoteDesktopStatus {
   type: typeof REMOTE_DESKTOP_MSG.STATUS;
@@ -535,6 +568,14 @@ export interface RemoteDesktopStatus {
   selectedDisplayId?: string;
   layoutRevision?: number;
   inputEnabled: boolean;
+  /** Native PeerConnection reached kConnected; route selection alone is insufficient. */
+  peerConnected?: boolean;
+  /** All three authenticated input/control data channels are open. */
+  dataChannelsReady?: boolean;
+  /** Native outbound RTP stats observed non-zero video bytes. */
+  mediaStarted?: boolean;
+  /** Browser acknowledged presentation of a frame for the current layout. */
+  firstFramePresented?: boolean;
   /** This worker can atomically inject the second click of a desktop double-click. */
   atomicButtonClick?: boolean;
   viewerCount?: number;
@@ -705,7 +746,7 @@ export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
 }
 
 export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopModeSet | RemoteDesktopCancel | RemoteDesktopStop;
-export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopStop;
+export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopDaemonStop;
 export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
 export type RemoteDesktopServerMessage = RemoteDesktopBootstrapRedeemed | RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
 export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopControlRejected;
@@ -866,8 +907,10 @@ export function validateRemoteDesktopBrowserMessage(value: unknown): RemoteDeskt
     return { ok: true, value: value as unknown as RemoteDesktopCancel };
   }
   if (value.type === REMOTE_DESKTOP_MSG.STOP) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability'], ['aggregateBytesReceived'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'stopOrigin'], ['aggregateBytesReceived'])
       || !hasSessionCorrelation(value)
+      || typeof value.stopOrigin !== 'string'
+      || !(Object.values(REMOTE_DESKTOP_STOP_ORIGIN) as string[]).includes(value.stopOrigin)
       || (value.aggregateBytesReceived !== undefined
         && !isSafeNonNegative(value.aggregateBytesReceived))) return invalid();
     return { ok: true, value: value as unknown as RemoteDesktopStop };
@@ -907,6 +950,11 @@ export function validateRemoteDesktopDaemonCommand(value: unknown): RemoteDeskto
       || !MODE_REASONS.has(value.reason)) return invalid();
     return { ok: true, value: value as unknown as RemoteDesktopModeState };
   }
+  if (value.type === REMOTE_DESKTOP_MSG.STOP) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability'])
+      || !hasSessionCorrelation(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopDaemonStop };
+  }
   const browser = validateRemoteDesktopBrowserMessage(value);
   if (browser.ok
     && browser.value.type !== REMOTE_DESKTOP_MSG.START
@@ -933,10 +981,14 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
       : invalid();
   }
   if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'inputBlocked', 'atomicButtonClick'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'inputBlocked', 'atomicButtonClick', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
       || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
       || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
       || (value.atomicButtonClick !== undefined && typeof value.atomicButtonClick !== 'boolean')
+      || (value.peerConnected !== undefined && typeof value.peerConnected !== 'boolean')
+      || (value.dataChannelsReady !== undefined && typeof value.dataChannelsReady !== 'boolean')
+      || (value.mediaStarted !== undefined && typeof value.mediaStarted !== 'boolean')
+      || (value.firstFramePresented !== undefined && typeof value.firstFramePresented !== 'boolean')
       || (value.inputBlocked !== undefined
         && !(Object.values(REMOTE_DESKTOP_INPUT_BLOCKED) as string[]).includes(value.inputBlocked as string))
       || (value.inputBlocked !== undefined && value.inputEnabled === true)

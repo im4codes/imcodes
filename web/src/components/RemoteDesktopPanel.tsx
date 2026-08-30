@@ -7,6 +7,7 @@ import {
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   mapRemoteDesktopVideoPoint,
   type RemoteDesktopNormalizedPoint,
@@ -421,7 +422,7 @@ export function RemoteDesktopPanel({
   }, [hostKey, inputActive, machine.serverId, manager]);
 
   useEffect(() => () => {
-    if (!connectionManager) manager.stopAll();
+    if (!connectionManager) manager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.PANEL_UNMOUNT);
   }, [connectionManager, manager]);
 
   useEffect(() => {
@@ -1494,7 +1495,7 @@ export function RemoteDesktopPanel({
   };
 
   const stopAndClose = () => {
-    clientRef.current?.stop();
+    clientRef.current?.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
     onClose();
   };
 

@@ -225,6 +225,9 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool layout_acknowledged_ = false;
   std::atomic<bool> closed_{false};
   std::atomic<bool> relayed_{false};
+  bool candidate_pair_selected_ = false;
+  bool peer_connected_ = false;
+  bool media_started_ = false;
   std::optional<bool> direct_bitrate_policy_;
   uint64_t media_stats_generation_ = 0;
   uint64_t last_outbound_video_bytes_ = 0;

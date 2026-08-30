@@ -20,6 +20,7 @@ import {
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
@@ -2067,7 +2068,9 @@ export function App() {
   const closeRemoteDesktopWall = useCallback((hostKeys: readonly string[]) => {
     const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
     for (const hostKey of hostKeys) {
-      if (!retained.has(hostKey)) remoteDesktopConnectionManager.stop(hostKey);
+      if (!retained.has(hostKey)) {
+        remoteDesktopConnectionManager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WALL_CLOSE);
+      }
     }
     setRemoteDesktopWallOpen(false);
     setRemoteDesktopWallMinimized(false);
@@ -2081,7 +2084,7 @@ export function App() {
 
   useEffect(() => {
     if (auth) return;
-    remoteDesktopConnectionManager.stopAll();
+    remoteDesktopConnectionManager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.APP_SIGN_OUT);
     setRemoteDesktopWorkspace(createRemoteDesktopWorkspaceState());
     setRemoteDesktopWorkspaceMinimized(false);
     setRemoteDesktopWallOpen(false);
@@ -2090,7 +2093,9 @@ export function App() {
     removeDesktopWindow(REMOTE_DESKTOP_WALL_WINDOW_ID);
   }, [auth, remoteDesktopConnectionManager, removeDesktopWindow]);
 
-  useEffect(() => () => remoteDesktopConnectionManager.stopAll(), [remoteDesktopConnectionManager]);
+  useEffect(() => () => remoteDesktopConnectionManager.stopAll(
+    REMOTE_DESKTOP_STOP_ORIGIN.APP_UNMOUNT,
+  ), [remoteDesktopConnectionManager]);
 
   // Fetch current user info on auth
   useEffect(() => {

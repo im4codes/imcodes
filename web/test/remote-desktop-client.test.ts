@@ -12,6 +12,7 @@ import {
   REMOTE_DESKTOP_POINTER_KIND,
   REMOTE_DESKTOP_PROTOCOL_VERSION,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '@shared/remote-desktop.js';
 import {
@@ -211,7 +212,7 @@ describe('RemoteDesktopClient', () => {
     await starting;
     expect(JSON.parse(socket.sent[1]!).type).toBe(REMOTE_DESKTOP_MSG.START);
     expect(dependencies.guestBootstrapProof).toBeUndefined();
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('defaults to independent Control but enables input only after every channel and worker acknowledgement', async () => {
@@ -702,9 +703,10 @@ describe('RemoteDesktopClient', () => {
       inputEnabled: false,
       reconnectCount: 1,
     });
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
     expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({
       type: REMOTE_DESKTOP_MSG.STOP,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
       aggregateBytesReceived: 54_321,
     });
   });
@@ -823,7 +825,7 @@ describe('RemoteDesktopClient', () => {
     }]));
     expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.FAILED)).toBe(false);
     expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING)).toBe(false);
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('surfaces a refused layout command instead of letting the click vanish', async () => {
@@ -898,7 +900,7 @@ describe('RemoteDesktopClient', () => {
       reason: REMOTE_DESKTOP_CONTROL_REJECTION.MODE_CHANGE_FAILED,
     });
     expect(client.current().controlRejection?.id).toBe(2);
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('offers unlock only when the node says it can answer its own sign-in screen', async () => {
@@ -961,7 +963,7 @@ describe('RemoteDesktopClient', () => {
       kind: REMOTE_DESKTOP_CONTROL_KIND.UNLOCK,
       reason: REMOTE_DESKTOP_CONTROL_REJECTION.NOT_PERMITTED,
     });
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('marks retry starts with a bounded reconnect attempt', async () => {
@@ -979,7 +981,7 @@ describe('RemoteDesktopClient', () => {
       type: REMOTE_DESKTOP_MSG.START,
       reconnectAttempt: 2,
     });
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('fails a foreground media stall but pauses the watchdog while the page is hidden', async () => {
@@ -1297,7 +1299,7 @@ describe('RemoteDesktopClient', () => {
       kind: REMOTE_DESKTOP_CONTROL_KIND.FRAME_PRESENTED,
       displayId: 'display_rearm001',
     });
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('keeps the remote cursor following when frame callbacks never fire', async () => {
@@ -1408,7 +1410,7 @@ describe('RemoteDesktopClient', () => {
     }, { timeout: 3_000 });
     expect(client.current().pointerMovesSent).toBe(movesOn(pointer));
     expect(client.current().pointerMovesMirrored).toBe(movesOn(control));
-    client.stop();
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('denies unknown keys and secure-attention input before the DataChannel', () => {

@@ -2,7 +2,9 @@ import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   type RemoteDesktopAccessMode,
+  type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_BROWSER_CLAIM,
@@ -198,7 +200,9 @@ export interface RemoteDesktopGuestSessionStarter {
     bootstrapProof: { ticket: string; browserKeyThumbprint: string; signature: string };
     expiresAt: number;
     onSnapshot?: (snapshot: Readonly<RemoteDesktopSnapshot>) => void;
-  }, onState: (state: RemoteDesktopGuestSessionState) => void): Promise<{ stop(): void }>;
+  }, onState: (state: RemoteDesktopGuestSessionState) => void): Promise<{
+    stop(origin: RemoteDesktopStopOrigin): void;
+  }>;
 }
 
 export const unavailableRemoteDesktopGuestSessionStarter: RemoteDesktopGuestSessionStarter = {
@@ -245,11 +249,11 @@ export const remoteDesktopGuestSessionStarter: RemoteDesktopGuestSessionStarter 
     try {
       await client.start();
     } catch (error) {
-      client.stop();
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.START_FAILURE);
       publishState('cancelled');
       throw error;
     }
-    return { stop: () => client.stop() };
+    return { stop: (origin) => client.stop(origin) };
   },
 };
 

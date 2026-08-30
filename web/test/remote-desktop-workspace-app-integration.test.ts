@@ -16,7 +16,7 @@ describe('remote desktop workspace App integration', () => {
   });
 
   it('clears protected tabs and all manager owners when authentication disappears', () => {
-    expect(appSource).toMatch(/if \(auth\) return;[\s\S]*remoteDesktopConnectionManager\.stopAll\(\);[\s\S]*setRemoteDesktopWorkspace\(createRemoteDesktopWorkspaceState\(\)\);/);
+    expect(appSource).toMatch(/if \(auth\) return;[\s\S]*remoteDesktopConnectionManager\.stopAll\(REMOTE_DESKTOP_STOP_ORIGIN\.APP_SIGN_OUT\);[\s\S]*setRemoteDesktopWorkspace\(createRemoteDesktopWorkspaceState\(\)\);/);
     expect(appSource).toContain('removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);');
   });
 });

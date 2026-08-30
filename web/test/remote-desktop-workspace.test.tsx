@@ -5,7 +5,10 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/pr
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ComponentChildren } from 'preact';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
-import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_STOP_ORIGIN,
+} from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
@@ -170,6 +173,10 @@ describe('RemoteDesktopWorkspace', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:B' }));
     expect(events).toEqual(['stop:b']);
+    expect(manager.stop).toHaveBeenCalledWith(
+      'b',
+      REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_HOST_CLOSE,
+    );
     expect(closeHost).toHaveBeenCalledWith('b');
     const closeIcon = screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:A' })
       .querySelector('svg');
@@ -212,6 +219,8 @@ describe('RemoteDesktopWorkspace', () => {
     confirm.mockReturnValue(true);
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
     expect(manager.stop).toHaveBeenCalledTimes(2);
+    expect(manager.stop).toHaveBeenCalledWith('a', REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
+    expect(manager.stop).toHaveBeenCalledWith('b', REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
     expect(closeWorkspace).toHaveBeenCalledTimes(1);
 
     result.rerender(<RemoteDesktopWorkspace {...props} minimized />);
@@ -239,6 +248,7 @@ describe('RemoteDesktopWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
     expect(confirm).not.toHaveBeenCalled();
     expect(manager.stop).toHaveBeenCalledTimes(1);
+    expect(manager.stop).toHaveBeenCalledWith('a', REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
     expect(closeWorkspace).toHaveBeenCalledTimes(1);
   });
 
