@@ -3093,6 +3093,7 @@
     "usage_mac_run": "On first launch, bypass Gatekeeper: right-click the app → Open, or run: xattr -cr <path> then open normally.",
     "usage_linux_run": "Make it executable (chmod +x <file>) and run once as root (sudo).",
     "machines_title": "aiDesk.to Devices",
+    "more_actions": "More actions",
     "refresh": "Refresh",
     "error_generic": "Something went wrong. Please try again.",
     "refresh_error": "Could not refresh node status. Showing the last known data.",
@@ -3311,7 +3312,7 @@
     "session_state": {"running": "Running","idle": "Idle","needs_input": "Needs input","offline": "Offline","unknown": "Unknown"}
   },
   "remote_desktop": {
-    "open": "aiDesk.to Remote Desktop",
+    "open": "Remote Desktop",
     "workspace_title": "aiDesk.to Remote Desktop Workspace",
     "workspace_wall": "aiDesk.to Desktop Wall",
     "wall_add": "Add to wall",

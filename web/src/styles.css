@@ -3542,6 +3542,7 @@ html.native-ios-mac .chat-dl-btn {
   transition: border-color 0.16s, background 0.16s, color 0.16s, box-shadow 0.16s;
 }
 .controlled-nodes-machine-actions button:disabled { cursor: wait; opacity: 0.48; }
+.controlled-nodes-mobile-action-label { display: none; }
 .controlled-nodes-exec-toggle {
   display: inline-flex;
   align-items: center;
@@ -3905,6 +3906,67 @@ html.native-ios-mac .chat-dl-btn {
   }
   .controlled-nodes-machine-actions { justify-content: stretch; }
   .controlled-nodes-machine-actions button { min-height: 36px; }
+  .controlled-nodes-machine-actions.is-mobile {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 42px;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .controlled-nodes-machine-actions.is-mobile > .controlled-nodes-remote-desktop {
+    width: 100%;
+  }
+  .controlled-nodes-mobile-menu-trigger {
+    display: inline-grid;
+    place-items: center;
+    width: 42px;
+    min-width: 42px;
+    padding: 0;
+    border: 1px solid rgba(94, 165, 214, 0.32);
+    background: linear-gradient(180deg, rgba(20, 41, 62, 0.92), rgba(12, 27, 44, 0.92));
+    color: #cfeaff;
+    font-size: 22px;
+    line-height: 1;
+  }
+  .controlled-nodes-mobile-menu-trigger[aria-expanded="true"] {
+    border-color: rgba(103, 232, 249, 0.72);
+    background: rgba(8, 145, 178, 0.24);
+    color: #ecfeff;
+    box-shadow: 0 0 15px rgba(34, 211, 238, 0.12);
+  }
+  .controlled-nodes-mobile-menu-panel {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+    padding: 9px;
+    border: 1px solid rgba(94, 165, 214, 0.22);
+    border-radius: 9px;
+    background: rgba(4, 13, 24, 0.94);
+    box-shadow: inset 0 1px 0 rgba(214, 240, 255, 0.04);
+  }
+  .controlled-nodes-mobile-menu-panel > button {
+    width: 100%;
+    min-height: 40px;
+    justify-content: flex-start;
+    padding-inline: 11px;
+    text-align: left;
+  }
+  .controlled-nodes-mobile-menu-panel > .controlled-nodes-rename {
+    display: flex;
+    gap: 8px;
+  }
+  .controlled-nodes-mobile-menu-panel .controlled-nodes-mobile-action-label { display: inline; }
+  .controlled-nodes-mobile-menu-panel > .controlled-nodes-exec-toggle {
+    justify-content: space-between;
+  }
+  .controlled-nodes-mobile-menu-panel > .controlled-nodes-auto-unlock-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+  .controlled-nodes-mobile-menu-panel > .controlled-nodes-auto-unlock-form input {
+    width: 100%;
+    min-width: 0;
+  }
   .controlled-nodes-exec-toggle { flex: 1 1 auto; justify-content: center; }
   .controlled-nodes-revoke { flex: 0 0 auto; }
   .controlled-nodes-downloads { grid-template-columns: minmax(0, 1fr); }
@@ -3921,6 +3983,18 @@ html.native-ios-mac .chat-dl-btn {
   .controlled-nodes-machine-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
   .controlled-nodes-machine-actions { flex-direction: column; }
   .controlled-nodes-machine-actions button { width: 100%; }
+  .controlled-nodes-machine-actions.is-mobile {
+    grid-template-columns: minmax(0, 1fr) 42px;
+  }
+  .controlled-nodes-machine-actions.is-mobile > .controlled-nodes-mobile-menu-trigger {
+    width: 42px;
+  }
+  .controlled-nodes-mobile-menu-panel > .controlled-nodes-auto-unlock-form {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .controlled-nodes-mobile-menu-panel > .controlled-nodes-auto-unlock-form button:last-child {
+    grid-column: 1 / -1;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

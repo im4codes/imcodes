@@ -3092,6 +3092,7 @@
     "usage_mac_run": "첫 실행 시 Gatekeeper 우회: 앱을 우클릭 → 열기, 또는 xattr -cr <경로> 실행 후 일반적으로 엽니다.",
     "usage_linux_run": "실행 권한 부여(chmod +x <파일>) 후 root로 한 번 실행하세요(sudo).",
     "machines_title": "aiDesk.to 디바이스",
+    "more_actions": "추가 작업",
     "refresh": "새로고침",
     "error_generic": "문제가 발생했습니다. 다시 시도하세요.",
     "refresh_error": "노드 상태를 새로 고칠 수 없습니다. 마지막으로 확인된 데이터를 표시합니다.",
@@ -3277,7 +3278,7 @@
     "session_state": {"running": "실행 중","idle": "유휴","needs_input": "입력 필요","offline": "오프라인","unknown": "알 수 없음"}
   },
   "remote_desktop": {
-    "open": "aiDesk.to 원격 데스크톱",
+    "open": "원격 데스크톱",
     "workspace_title": "aiDesk.to 원격 데스크톱 작업 공간",
     "workspace_wall": "aiDesk.to 데스크톱 월",
     "wall_add": "월에 추가",

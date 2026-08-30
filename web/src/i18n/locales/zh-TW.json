@@ -3093,6 +3093,7 @@
     "usage_mac_run": "首次啟動需繞過 Gatekeeper:右鍵應用程式→打開,或執行 xattr -cr <路徑> 後正常打開。",
     "usage_linux_run": "新增可執行權限(chmod +x <檔案>)並以 root 執行一次(sudo)。",
     "machines_title": "aiDesk.to 裝置",
+    "more_actions": "更多操作",
     "refresh": "重新整理",
     "error_generic": "發生錯誤,請重試。",
     "refresh_error": "無法重新整理節點狀態，正在顯示上次資料。",
@@ -3311,7 +3312,7 @@
     "session_state": {"running": "執行中","idle": "閒置","needs_input": "等待輸入","offline": "離線","unknown": "未知"}
   },
   "remote_desktop": {
-    "open": "aiDesk.to 遠端桌面",
+    "open": "遠端桌面",
     "workspace_title": "aiDesk.to 遠端桌面工作區",
     "workspace_wall": "aiDesk.to 桌面牆",
     "wall_add": "加入桌面牆",

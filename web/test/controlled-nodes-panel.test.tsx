@@ -124,6 +124,12 @@ import {
 /** Set by the clipboard-denied test; `vi.unstubAllGlobals` does not cover
  *  properties defined directly on `document`. */
 let restoreExecCommand: (() => void) | null = null;
+const originalViewportWidth = window.innerWidth;
+
+function setViewportWidth(width: number): void {
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
+  window.dispatchEvent(new Event('resize'));
+}
 
 afterEach(() => {
   restoreExecCommand?.();
@@ -134,6 +140,7 @@ afterEach(() => {
   machinesLoaded = true;
   machinesLoading = false;
   refetch.mockResolvedValue(null);
+  setViewportWidth(originalViewportWidth);
 });
 
 const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
@@ -585,6 +592,112 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(toggle!);
     await waitFor(() => expect(setMachineExecEnabled).toHaveBeenCalledWith('srv1', true));
     expect(refetch).toHaveBeenCalled();
+  });
+
+  it('keeps only Remote Desktop and one menu trigger visible on a mobile owner card', async () => {
+    setViewportWidth(390);
+    machines = [machine({
+      serverId: 'mobile-owner',
+      displayName: 'Pocket Mac',
+      os: 'mac',
+      accessRole: 'owner',
+      execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={vi.fn()} />);
+    const card = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-machine-row');
+      if (!(candidate instanceof HTMLLIElement)) throw new Error('mobile machine card not found');
+      return candidate;
+    });
+
+    expect(card.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    const trigger = card.querySelector('.controlled-nodes-mobile-menu-trigger') as HTMLButtonElement;
+    expect(trigger).not.toBeNull();
+    expect(trigger.getAttribute('aria-label')).toBe('controlled_nodes.more_actions');
+    expect(card.querySelectorAll('.controlled-nodes-machine-actions > button')).toHaveLength(2);
+    expect(card.querySelector('.share-revoke-btn')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-rename')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-exec-toggle')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-auto-unlock')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-revoke')).toBeNull();
+
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    const menu = card.querySelector('.controlled-nodes-mobile-menu-panel');
+    expect(menu?.getAttribute('role')).toBe('dialog');
+    expect(menu?.querySelector('.share-revoke-btn')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-rename')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-exec-toggle')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-auto-unlock')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-revoke')).not.toBeNull();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+
+    fireEvent.click(trigger);
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).not.toBeNull();
+    fireEvent(document.body, new Event('pointerdown', { bubbles: true }));
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).toBeNull();
+  });
+
+  it('puts worker installation inside the mobile menu instead of adding another card button', async () => {
+    setViewportWidth(390);
+    machines = [machine({
+      serverId: 'mobile-install',
+      displayName: 'Install Worker',
+      os: 'win',
+      accessRole: 'owner',
+      capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel />);
+    const card = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-machine-row');
+      if (!(candidate instanceof HTMLLIElement)) throw new Error('mobile install card not found');
+      return candidate;
+    });
+
+    expect(card.querySelector('.controlled-nodes-install-worker')).toBeNull();
+    const trigger = card.querySelector('.controlled-nodes-mobile-menu-trigger')!;
+    expect(card.querySelectorAll('.controlled-nodes-machine-actions > button')).toHaveLength(1);
+    fireEvent.click(trigger);
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel .controlled-nodes-install-worker')).not.toBeNull();
+  });
+
+  it('keeps the full machine action row directly visible on desktop', async () => {
+    setViewportWidth(1024);
+    machines = [machine({
+      serverId: 'desktop-owner',
+      displayName: 'Desktop Owner',
+      os: 'win',
+      accessRole: 'owner',
+      execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Desktop Owner'));
+
+    expect(container.querySelector('.controlled-nodes-mobile-menu-trigger')).toBeNull();
+    expect(container.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(container.querySelector('.share-revoke-btn')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-rename')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-exec-toggle')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-auto-unlock')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-revoke')).not.toBeNull();
+  });
+
+  it('removes aiDesk.to branding from the Remote Desktop button in every locale', () => {
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+    for (const locale of ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW']) {
+      const messages = JSON.parse(readFileSync(
+        resolve(webRoot, `src/i18n/locales/${locale}.json`),
+        'utf8',
+      )) as { remote_desktop?: { open?: string }; controlled_nodes?: { more_actions?: string } };
+      expect(messages.remote_desktop?.open).toBeTruthy();
+      expect(messages.remote_desktop?.open?.toLowerCase()).not.toContain('aidesk.to');
+      expect(messages.controlled_nodes?.more_actions).toBeTruthy();
+    }
   });
 
   it('does not report a successful exec toggle as failed when its refresh fails', async () => {

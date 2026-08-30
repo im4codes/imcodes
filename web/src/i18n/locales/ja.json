@@ -3092,6 +3092,7 @@
     "usage_mac_run": "初回起動時は Gatekeeper を回避: アプリを右クリック→開く、または xattr -cr <パス> を実行してから通常に開きます。",
     "usage_linux_run": "実行権限を付与(chmod +x <ファイル>)し、root で一度実行します(sudo)。",
     "machines_title": "aiDesk.to デバイス",
+    "more_actions": "その他の操作",
     "refresh": "更新",
     "error_generic": "問題が発生しました。もう一度お試しください。",
     "refresh_error": "ノードの状態を更新できませんでした。前回のデータを表示しています。",
@@ -3277,7 +3278,7 @@
     "session_state": {"running": "実行中","idle": "待機中","needs_input": "入力待ち","offline": "オフライン","unknown": "不明"}
   },
   "remote_desktop": {
-    "open": "aiDesk.to リモートデスクトップ",
+    "open": "リモートデスクトップ",
     "workspace_title": "aiDesk.to リモートデスクトップ ワークスペース",
     "workspace_wall": "aiDesk.to デスクトップウォール",
     "wall_add": "ウォールに追加",

@@ -113,6 +113,8 @@ export interface ControlledNodesPanelProps {
   onOpenRemoteDesktopWall?(): void;
 }
 
+const CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH = 640;
+
 export function ControlledNodesPanel({
   onOpenRemoteDesktop,
   onOpenRemoteDesktopWall,
@@ -145,6 +147,12 @@ export function ControlledNodesPanel({
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
+  const [mobileActions, setMobileActions] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH,
+  );
+  const [mobileActionMenuServerId, setMobileActionMenuServerId] = useState<string | null>(null);
+  const mobileActionMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const mobileActionMenuPanelRef = useRef<HTMLDivElement | null>(null);
   const presenceMountedRef = useRef(true);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
@@ -166,6 +174,44 @@ export function ControlledNodesPanel({
   }, [t]);
 
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
+
+  useEffect(() => {
+    const updateMobileActions = (): void => {
+      const nextMobileActions = window.innerWidth <= CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH;
+      setMobileActions(nextMobileActions);
+      if (!nextMobileActions) setMobileActionMenuServerId(null);
+    };
+    window.addEventListener('resize', updateMobileActions);
+    return () => window.removeEventListener('resize', updateMobileActions);
+  }, []);
+
+  const closeMobileActionMenu = useCallback((restoreFocus = false): void => {
+    setMobileActionMenuServerId(null);
+    if (restoreFocus) mobileActionMenuTriggerRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!mobileActionMenuServerId) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      const target = event.target as Node | null;
+      if (target
+        && !mobileActionMenuPanelRef.current?.contains(target)
+        && !mobileActionMenuTriggerRef.current?.contains(target)) {
+        closeMobileActionMenu();
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeMobileActionMenu(true);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer, true);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer, true);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [closeMobileActionMenu, mobileActionMenuServerId]);
 
   useEffect(() => {
     presenceMountedRef.current = true;
@@ -436,6 +482,130 @@ export function ControlledNodesPanel({
   const onlineMachineCount = machines.filter((machine) => machine.online).length;
   const execEnabledMachineCount = machines.filter((machine) => machine.execEnabled).length;
 
+  const renderInstallAction = (machine: MachineListItem, inMobileMenu: boolean) => (
+    canInstallRemoteDesktopWorker(machine) && (
+      <button
+        type="button"
+        class="controlled-nodes-install-worker"
+        disabled={busyServerId === machine.serverId}
+        onClick={() => {
+          if (inMobileMenu) closeMobileActionMenu();
+          void onInstallRemoteDesktopWorker(machine.serverId);
+        }}
+      >
+        {busyServerId === machine.serverId
+          ? t('remote_desktop.installing')
+          : t('remote_desktop.install_worker')}
+      </button>
+    )
+  );
+
+  const renderManagementActions = (machine: MachineListItem, inMobileMenu: boolean) => {
+    const closeAfterAction = (): void => {
+      if (inMobileMenu) closeMobileActionMenu();
+    };
+    return (
+      <>
+        {machineAccessRole(machine) === 'owner' ? (
+          <>
+            <button
+              type="button"
+              class="share-revoke-btn"
+              disabled={busyServerId === machine.serverId}
+              onClick={() => {
+                closeAfterAction();
+                setSharingMachine(machine);
+              }}
+            >
+              {t('share.menu.shareTab')}
+            </button>
+            <button
+              type="button"
+              class="controlled-nodes-rename"
+              disabled={busyServerId === machine.serverId || editingServerId === machine.serverId}
+              title={t('common.rename')}
+              onClick={() => {
+                closeAfterAction();
+                startRename(machine.serverId, machine.displayName);
+              }}
+            ><span aria-hidden="true">✎</span><span class="controlled-nodes-mobile-action-label">{t('common.rename')}</span></button>
+            <button
+              type="button"
+              class={`controlled-nodes-exec-toggle ${machine.execEnabled ? 'is-enabled' : 'is-disabled'}`}
+              disabled={busyServerId === machine.serverId}
+              aria-pressed={machine.execEnabled}
+              onClick={() => {
+                closeAfterAction();
+                void onToggleExec(machine.serverId, !machine.execEnabled);
+              }}
+            >
+              <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
+              <span>{machine.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
+            </button>
+            {canConfigureAutoUnlock(machine) && (autoUnlockServerId === machine.serverId ? (
+              <form
+                class="controlled-nodes-auto-unlock-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (autoUnlockValue) void submitAutoUnlock(machine.serverId, autoUnlockValue);
+                }}
+              >
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={autoUnlockValue}
+                  placeholder={t('controlled_nodes.auto_unlock_placeholder')}
+                  aria-label={t('controlled_nodes.auto_unlock_placeholder')}
+                  onInput={(event) => setAutoUnlockValue((event.target as HTMLInputElement).value)}
+                />
+                <button type="submit" disabled={!autoUnlockValue || busyServerId === machine.serverId}>
+                  {t('common.save')}
+                </button>
+                <button type="button" onClick={cancelAutoUnlock}>{t('common.cancel')}</button>
+              </form>
+            ) : (
+              <button
+                type="button"
+                class="controlled-nodes-auto-unlock"
+                disabled={busyServerId === machine.serverId}
+                title={t('controlled_nodes.auto_unlock_hint')}
+                onClick={() => {
+                  if (machine.autoUnlockConfigured) {
+                    closeAfterAction();
+                    void submitAutoUnlock(machine.serverId, null);
+                  } else {
+                    startAutoUnlock(machine.serverId);
+                  }
+                }}
+              >
+                {machine.autoUnlockConfigured
+                  ? t('controlled_nodes.auto_unlock_clear')
+                  : t('controlled_nodes.auto_unlock_set')}
+              </button>
+            ))}
+            <button
+              type="button"
+              class="controlled-nodes-revoke"
+              disabled={busyServerId === machine.serverId}
+              onClick={() => {
+                closeAfterAction();
+                void onRevoke(machine.serverId);
+              }}
+            >
+              <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
+            </button>
+          </>
+        ) : (
+          <span class="controlled-nodes-muted">
+            {machineAccessRole(machine) === 'participant'
+              ? (machine.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off'))
+              : t('controlled_nodes.share.view_only')}
+          </span>
+        )}
+      </>
+    );
+  };
+
   return (
     <div class="controlled-nodes-panel">
       <div class="controlled-nodes-grid" aria-hidden="true" />
@@ -565,19 +735,8 @@ export function ControlledNodesPanel({
                 </div>
                 <RemoteDesktopReadiness capabilities={m.capabilities} compact />
               </div>
-              <div class="controlled-nodes-machine-actions">
-                {canInstallRemoteDesktopWorker(m) && (
-                  <button
-                    type="button"
-                    class="controlled-nodes-install-worker"
-                    disabled={busyServerId === m.serverId}
-                    onClick={() => { void onInstallRemoteDesktopWorker(m.serverId); }}
-                  >
-                    {busyServerId === m.serverId
-                      ? t('remote_desktop.installing')
-                      : t('remote_desktop.install_worker')}
-                  </button>
-                )}
+              <div class={`controlled-nodes-machine-actions ${mobileActions ? 'is-mobile' : 'is-desktop'}`}>
+                {!mobileActions && renderInstallAction(m, false)}
                 {canOpenRemoteDesktopMachine(m) && (
                   <button
                     type="button"
@@ -587,85 +746,35 @@ export function ControlledNodesPanel({
                     {t('remote_desktop.open')}
                   </button>
                 )}
-                {machineAccessRole(m) === 'owner' ? (
+                {mobileActions && machineAccessRole(m) === 'owner' ? (
                   <>
                     <button
+                      ref={mobileActionMenuServerId === m.serverId ? mobileActionMenuTriggerRef : undefined}
                       type="button"
-                      class="share-revoke-btn"
-                      disabled={busyServerId === m.serverId}
-                      onClick={() => setSharingMachine(m)}
-                    >
-                      {t('share.menu.shareTab')}
-                    </button>
-                    <button
-                      type="button"
-                      class="controlled-nodes-rename"
-                      disabled={busyServerId === m.serverId || editingServerId === m.serverId}
-                      title={t('common.rename')}
-                      onClick={() => startRename(m.serverId, m.displayName)}
-                    >✎</button>
-                    <button
-                      type="button"
-                      class={`controlled-nodes-exec-toggle ${m.execEnabled ? 'is-enabled' : 'is-disabled'}`}
-                      disabled={busyServerId === m.serverId}
-                      aria-pressed={m.execEnabled}
-                      onClick={() => onToggleExec(m.serverId, !m.execEnabled)}
-                    >
-                      <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
-                      <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
-                    </button>
-                    {canConfigureAutoUnlock(m) && (autoUnlockServerId === m.serverId ? (
-                      <form
-                        class="controlled-nodes-auto-unlock-form"
-                        onSubmit={(event) => {
-                          event.preventDefault();
-                          if (autoUnlockValue) void submitAutoUnlock(m.serverId, autoUnlockValue);
-                        }}
+                      class="controlled-nodes-mobile-menu-trigger"
+                      aria-haspopup="dialog"
+                      aria-expanded={mobileActionMenuServerId === m.serverId}
+                      aria-controls={`controlled-node-actions-${m.serverId}`}
+                      aria-label={t('controlled_nodes.more_actions')}
+                      title={t('controlled_nodes.more_actions')}
+                      onClick={() => setMobileActionMenuServerId((current) => (
+                        current === m.serverId ? null : m.serverId
+                      ))}
+                    ><span aria-hidden="true">⋯</span></button>
+                    {mobileActionMenuServerId === m.serverId && (
+                      <div
+                        ref={mobileActionMenuPanelRef}
+                        id={`controlled-node-actions-${m.serverId}`}
+                        class="controlled-nodes-mobile-menu-panel"
+                        role="dialog"
+                        aria-label={t('controlled_nodes.more_actions')}
                       >
-                        <input
-                          type="password"
-                          autoComplete="new-password"
-                          value={autoUnlockValue}
-                          placeholder={t('controlled_nodes.auto_unlock_placeholder')}
-                          aria-label={t('controlled_nodes.auto_unlock_placeholder')}
-                          onInput={(event) => setAutoUnlockValue((event.target as HTMLInputElement).value)}
-                        />
-                        <button type="submit" disabled={!autoUnlockValue || busyServerId === m.serverId}>
-                          {t('common.save')}
-                        </button>
-                        <button type="button" onClick={cancelAutoUnlock}>{t('common.cancel')}</button>
-                      </form>
-                    ) : (
-                      <button
-                        type="button"
-                        class="controlled-nodes-auto-unlock"
-                        disabled={busyServerId === m.serverId}
-                        title={t('controlled_nodes.auto_unlock_hint')}
-                        onClick={() => (m.autoUnlockConfigured
-                          ? void submitAutoUnlock(m.serverId, null)
-                          : startAutoUnlock(m.serverId))}
-                      >
-                        {m.autoUnlockConfigured
-                          ? t('controlled_nodes.auto_unlock_clear')
-                          : t('controlled_nodes.auto_unlock_set')}
-                      </button>
-                    ))}
-                    <button
-                      type="button"
-                      class="controlled-nodes-revoke"
-                      disabled={busyServerId === m.serverId}
-                      onClick={() => onRevoke(m.serverId)}
-                    >
-                      <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
-                    </button>
+                        {renderInstallAction(m, true)}
+                        {renderManagementActions(m, true)}
+                      </div>
+                    )}
                   </>
-                ) : (
-                  <span class="controlled-nodes-muted">
-                    {machineAccessRole(m) === 'participant'
-                      ? (m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off'))
-                      : t('controlled_nodes.share.view_only')}
-                  </span>
-                )}
+                ) : renderManagementActions(m, false)}
               </div>
             </li>
           ))}

@@ -3093,6 +3093,7 @@
     "usage_mac_run": "En el primer arranque, evita Gatekeeper: clic derecho en la app → Abrir, o ejecuta: xattr -cr <ruta> y ábrela normalmente.",
     "usage_linux_run": "Hazlo ejecutable (chmod +x <archivo>) y ejecútalo una vez como root (sudo).",
     "machines_title": "Dispositivos de aiDesk.to",
+    "more_actions": "Más acciones",
     "refresh": "Actualizar",
     "error_generic": "Algo salió mal. Inténtalo de nuevo.",
     "refresh_error": "No se pudo actualizar el estado del nodo. Se muestran los últimos datos conocidos.",
@@ -3278,7 +3279,7 @@
     "session_state": {"running": "En ejecución","idle": "Inactivo","needs_input": "Requiere atención","offline": "Sin conexión","unknown": "Desconocido"}
   },
   "remote_desktop": {
-    "open": "Escritorio remoto de aiDesk.to",
+    "open": "Escritorio remoto",
     "workspace_title": "Espacio de escritorios remotos de aiDesk.to",
     "workspace_wall": "Muro de escritorios de aiDesk.to",
     "wall_add": "Añadir al muro",

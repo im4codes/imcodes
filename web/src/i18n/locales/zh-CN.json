@@ -3093,6 +3093,7 @@
     "usage_mac_run": "首次启动需绕过 Gatekeeper:右键应用→打开,或执行 xattr -cr <路径> 后正常打开。",
     "usage_linux_run": "添加可执行权限(chmod +x <文件>)并以 root 运行一次(sudo)。",
     "machines_title": "aiDesk.to 设备",
+    "more_actions": "更多操作",
     "refresh": "刷新",
     "error_generic": "出错了,请重试。",
     "refresh_error": "无法刷新节点状态，正在显示上次数据。",
@@ -3311,7 +3312,7 @@
     "session_state": {"running": "运行中","idle": "空闲","needs_input": "等待输入","offline": "离线","unknown": "未知"}
   },
   "remote_desktop": {
-    "open": "aiDesk.to 远程桌面",
+    "open": "远程桌面",
     "workspace_title": "aiDesk.to 远程桌面工作区",
     "workspace_wall": "aiDesk.to 桌面墙",
     "wall_add": "添加到桌面墙",
