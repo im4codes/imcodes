@@ -18,6 +18,7 @@ import {
 import { SUPERVISION_INTENTS } from '../../src/daemon/supervision-intent-ops.js';
 import {
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
 } from '../../shared/supervision-config.js';
@@ -459,7 +460,7 @@ describe('administrative recover', () => {
     const request = {
       taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
       taskStatus: 'rework', assignmentStatus: 'rework',
-      scopeFiles: ['src/one.ts', 'src/two.ts'], clearLease: true,
+      scopeFiles: ['src/one.ts', 'src/two.ts'], leaseAction: 'clear',
       rebindSessionName: liveIdentity.sessionName,
       idempotencyKey: 'repair-tsk-a-r1', reason: 'repair misprojected REWORK owner',
     } as const;
@@ -478,7 +479,7 @@ describe('administrative recover', () => {
     expect(registry.coordinated).toEqual([{
       taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
       taskStatus: 'rework', assignmentStatus: 'rework',
-      scopeFiles: ['src/one.ts', 'src/two.ts'], clearLease: true,
+      scopeFiles: ['src/one.ts', 'src/two.ts'], leaseAction: 'clear',
       identity: {
         sessionName: liveIdentity.sessionName,
         sessionInstanceId: liveIdentity.sessionInstanceId,
@@ -522,6 +523,7 @@ describe('administrative recover', () => {
     expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
       taskStatus: 'rework', assignmentStatus: 'rework',
+      leaseAction: 'preserve',
       idempotencyKey: 'cross-project-refused', reason: 'must stay project-scoped',
     })).toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.coordinated).toEqual([]);
@@ -532,6 +534,8 @@ describe('administrative recover', () => {
       taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
       fromRevision: 'gc-r1', toRevision: 'gc-r3',
       ownedFiles: ['src/daemon/supervision-worktree-gc.ts'],
+      scopeFiles: ['src/daemon/supervision-worktree-gc.ts', 'test/daemon/authorized-extra.test.ts'],
+      leaseAction: 'renew', idempotencyKey: 'bind-gc-r3-same-object',
       evidenceManifestSha256: 'a'.repeat(64),
       reason: 'bind the frozen R3 evidence to the original assignment',
     };
@@ -557,7 +561,7 @@ describe('administrative recover', () => {
     expect(registry.revisionRebound).toEqual([request]);
 
     registry.revisionRebound = [];
-    for (const missing of ['assignmentId', 'fromRevision', 'toRevision', 'ownedFiles', 'evidenceManifestSha256'] as const) {
+    for (const missing of ['assignmentId', 'toRevision', 'ownedFiles', 'leaseAction', 'idempotencyKey', 'evidenceManifestSha256'] as const) {
       const malformed = { ...request } as Record<string, unknown>;
       delete malformed[missing];
       const result: any = await client.callTool({
@@ -566,6 +570,72 @@ describe('administrative recover', () => {
       expect(result.isError, missing).toBe(true);
     }
     expect(registry.revisionRebound).toEqual([]);
+  });
+
+  it('runs the production recovery handler atomically from cleared lease and scope superset to exact owned evidence', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-recovery-handler-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const realRegistry = new SupervisionTaskRegistry({ dbPath });
+    const taskId = 'production-recovery-handler';
+    const assignmentId = `${taskId}-implementer`;
+    const fromRevision = 'production-recovery-r1';
+    const toRevision = 'production-recovery-r2';
+    const ownedFiles = ['src/one.ts', 'test/one.test.ts'];
+    const scopeFiles = [...ownedFiles, 'test/authorized-extra.test.ts'].sort();
+    const worker = {
+      sessionName: 'deck_production_recovery_worker',
+      sessionInstanceId: 'instance-production-recovery-worker',
+      runtimeEpoch: 'epoch-production-recovery-worker',
+      agentType: 'codex-sdk', providerFamily: 'openai',
+    };
+    try {
+      expect(realRegistry.createOrGet({
+        taskId, projectName: 'codedeck', classification: 'independent_top_level',
+        objective: 'exercise the real recovery handler', currentRevision: fromRevision,
+      })).toMatchObject({ ok: true });
+      expect(realRegistry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: worker, scopeFiles,
+        auditRevision: fromRevision,
+      })).toMatchObject({ ok: true });
+      expect(realRegistry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+      expect(realRegistry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(realRegistry.updateAssignment({
+        assignmentId, identity: worker, status: 'implementing', revision: fromRevision,
+        auditRevision: fromRevision,
+      })).toMatchObject({ ok: true });
+      for (const [index, path] of ownedFiles.entries()) {
+        expect(realRegistry.recordFileEvent({
+          assignmentId, identity: worker, path, operation: 'modify',
+          idempotencyKey: `${taskId}-file-${index}`,
+        })).toMatchObject({ ok: true });
+      }
+      const production = createSupervisionMcpToolHandlers(CALLER, {
+        registry: realRegistry, isProjectBrain: () => true,
+      });
+      expect(await production[SUPERVISION_MCP_TOOLS.RECOVER]({
+        taskId, assignmentId, leaseAction: 'clear',
+        idempotencyKey: 'production-handler-clear-lease',
+        reason: 'reproduce the stale empty-lease state',
+      })).toMatchObject({ status: 'ok', replay: false });
+      expect(realRegistry.getAssignment(assignmentId)?.leaseId).toBe('');
+
+      const recovery = {
+        taskId, assignmentId, fromRevision, toRevision, ownedFiles, scopeFiles,
+        leaseAction: 'renew', idempotencyKey: 'production-handler-bind-r2',
+        evidenceManifestSha256: 'f'.repeat(64),
+        reason: 'bind exact frozen evidence and renew the lease atomically',
+      };
+      expect(await production[SUPERVISION_MCP_TOOLS.RECOVER](recovery)).toMatchObject({
+        status: 'ok', taskId, assignmentId, fromRevision, toRevision, replay: false,
+      });
+      expect(realRegistry.getTaskRecord(taskId)).toMatchObject({ currentRevision: toRevision });
+      expect(realRegistry.getAssignment(assignmentId)).toMatchObject({
+        auditRevision: toRevision, scopeFiles, leaseId: expect.stringMatching(/^supervision_lease_/),
+      });
+    } finally {
+      realRegistry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('rebinds an existing auditor only through project-Brain authority and live daemon identity', async () => {
@@ -752,9 +822,10 @@ describe('published schema enums match the fixed constants exactly', () => {
       ownedFiles: expect.any(Object),
       evidenceManifestSha256: expect.objectContaining({ pattern: '^[a-f0-9]{64}$' }),
       scopeFiles: expect.any(Object),
-      clearLease: expect.any(Object),
+      leaseAction: expect.objectContaining({ enum: [...SUPERVISION_RECOVERY_LEASE_ACTIONS] }),
       idempotencyKey: expect.any(Object),
     }));
+    expect(byName.get(SUPERVISION_MCP_TOOLS.RECOVER).properties).not.toHaveProperty('clearLease');
     expect(byName.get(SUPERVISION_MCP_TOOLS.HOUSEKEEPING).properties.mode.enum)
       .toEqual(['dryRun', 'apply']);
     expect(byName.get(SUPERVISION_MCP_TOOLS.LIST).properties.limit.maximum).toBe(100);

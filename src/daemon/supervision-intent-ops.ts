@@ -13,6 +13,7 @@ import {
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_RECOVERY_LEASE_ACTIONS,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import {
@@ -185,15 +186,20 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
   },
   supervision_task_recover: {
     type: 'object', additionalProperties: false,
+    required: ['taskId', 'reason'],
     properties: {
       taskId: { type: 'string' },
       toStatus: { type: 'string', enum: [...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES] },
       assignmentId: { type: 'string' },
       rebindSessionName: { type: 'string' },
+      fromRevision: { type: 'string' },
+      toRevision: { type: 'string' },
+      ownedFiles: { type: 'array', minItems: 1, items: { type: 'string' } },
+      evidenceManifestSha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
       taskStatus: { type: 'string', enum: [...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES] },
       assignmentStatus: { type: 'string', enum: [...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES] },
       scopeFiles: { type: 'array', minItems: 1, items: { type: 'string' } },
-      clearLease: { type: 'boolean' },
+      leaseAction: { type: 'string', enum: [...SUPERVISION_RECOVERY_LEASE_ACTIONS] },
       idempotencyKey: { type: 'string' },
       reason: { type: 'string' },
     },
@@ -214,7 +220,10 @@ export function supervisionSchemaStatusEnums(): string[][] {
   const visit = (node: unknown, key?: string): void => {
     if (!node || typeof node !== 'object') return;
     const record = node as Record<string, unknown>;
-    if (Array.isArray(record.enum) && ['intent', 'status', 'validationState', 'toStatus'].includes(key ?? '')) {
+    if (Array.isArray(record.enum) && [
+      'intent', 'status', 'validationState', 'toStatus',
+      'taskStatus', 'assignmentStatus', 'leaseAction',
+    ].includes(key ?? '')) {
       found.push(record.enum.map(String));
     }
     for (const [childKey, value] of Object.entries(record)) visit(value, childKey);

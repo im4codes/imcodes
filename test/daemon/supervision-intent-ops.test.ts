@@ -6,6 +6,8 @@ import {
 } from '../../src/daemon/supervision-intent-ops.js';
 import {
   canTransitionSupervisionTaskStatus,
+  SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
 } from '../../shared/supervision-config.js';
@@ -130,11 +132,32 @@ describe('published MCP schemas', () => {
       .toEqual([...SUPERVISION_TASK_LIFECYCLE_STATUSES]);
   });
 
+  it('publishes the complete same-object recovery evidence and lease contract without clearLease', () => {
+    const recovery = SUPERVISION_MCP_TOOL_SCHEMAS.supervision_task_recover;
+    expect(recovery.required).toEqual(['taskId', 'reason']);
+    expect(recovery.additionalProperties).toBe(false);
+    expect(recovery.properties).toEqual(expect.objectContaining({
+      taskId: expect.any(Object),
+      assignmentId: expect.any(Object),
+      fromRevision: expect.any(Object),
+      toRevision: expect.any(Object),
+      ownedFiles: expect.objectContaining({ type: 'array', minItems: 1 }),
+      scopeFiles: expect.objectContaining({ type: 'array', minItems: 1 }),
+      evidenceManifestSha256: expect.objectContaining({ pattern: '^[a-f0-9]{64}$' }),
+      leaseAction: expect.objectContaining({ enum: [...SUPERVISION_RECOVERY_LEASE_ACTIONS] }),
+      idempotencyKey: expect.any(Object),
+      reason: expect.any(Object),
+    }));
+    expect(recovery.properties).not.toHaveProperty('clearLease');
+  });
+
   it('every enum in every schema matches a contract constant exactly', () => {
     const known = [
       JSON.stringify([...SUPERVISION_INTENTS]),
       JSON.stringify([...SUPERVISION_TASK_LIFECYCLE_STATUSES]),
       JSON.stringify([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]),
+      JSON.stringify([...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES]),
+      JSON.stringify([...SUPERVISION_RECOVERY_LEASE_ACTIONS]),
       JSON.stringify([...SUPERVISION_CONSOLE_VALIDATION_STATES]),
     ];
     const found = supervisionSchemaStatusEnums();

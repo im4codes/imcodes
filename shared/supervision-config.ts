@@ -333,6 +333,13 @@ export const SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES = [
 export type SupervisionBrainCoordinationRecoveryStatus =
   typeof SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES[number];
 
+/** Explicit lease handling for Brain/admin same-object recovery. */
+export const SUPERVISION_RECOVERY_LEASE_ACTIONS = [
+  'preserve', 'renew', 'clear',
+] as const;
+export type SupervisionRecoveryLeaseAction =
+  typeof SUPERVISION_RECOVERY_LEASE_ACTIONS[number];
+
 /** Bump only alongside a schema migration that maps every prior status forward. */
 export const SUPERVISION_TASK_STATUS_CONTRACT_VERSION = 1;
 

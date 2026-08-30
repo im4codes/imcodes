@@ -25,10 +25,12 @@ import {
 import {
   SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   isSupervisionTaskLifecycleStatus,
   type SupervisionTaskRecoveryTargetStatus,
   type SupervisionBrainCoordinationRecoveryStatus,
+  type SupervisionRecoveryLeaseAction,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
@@ -144,9 +146,12 @@ export interface SupervisionRegistryPort {
   rebindTaskAssignmentRevision?(input: {
     taskId: string;
     assignmentId: string;
-    fromRevision: string;
+    fromRevision?: string;
     toRevision: string;
     ownedFiles: string[];
+    scopeFiles?: string[];
+    leaseAction: SupervisionRecoveryLeaseAction;
+    idempotencyKey: string;
     evidenceManifestSha256: string;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
@@ -156,7 +161,7 @@ export interface SupervisionRegistryPort {
     taskStatus?: SupervisionBrainCoordinationRecoveryStatus;
     assignmentStatus?: SupervisionBrainCoordinationRecoveryStatus;
     scopeFiles?: string[];
-    clearLease?: boolean;
+    leaseAction: SupervisionRecoveryLeaseAction;
     identity?: {
       sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
       agentType: string; providerFamily: string;
@@ -230,7 +235,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     taskStatus: z.enum([...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES]).optional(),
     assignmentStatus: z.enum([...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES]).optional(),
     scopeFiles: z.array(z.string().min(1)).min(1).optional(),
-    clearLease: z.boolean().optional(),
+    leaseAction: z.enum([...SUPERVISION_RECOVERY_LEASE_ACTIONS]).optional(),
     idempotencyKey: z.string().min(1).max(200).optional(),
     reason: z.string().min(1).max(2000),
   },
@@ -459,19 +464,50 @@ export function createSupervisionMcpToolHandlers(
       const scopeFiles = Array.isArray(input.scopeFiles)
         ? input.scopeFiles.map((path) => String(path))
         : [];
-      const clearLease = input.clearLease === true;
+      const leaseAction = String(input.leaseAction ?? '').trim();
       const idempotencyKey = String(input.idempotencyKey ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
+      const revisionRecoveryRequested = Boolean(
+        fromRevision || toRevision || ownedFiles.length > 0 || evidenceManifestSha256,
+      );
+      if (revisionRecoveryRequested) {
+        if (!assignmentId || !toRevision || ownedFiles.length === 0
+          || !evidenceManifestSha256 || !reason || !idempotencyKey
+          || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(leaseAction as SupervisionRecoveryLeaseAction)
+          || rebindSessionName || taskStatus || assignmentStatus || input.toStatus !== undefined) {
+          return err('validation_failed', 'revision recovery requires assignmentId, toRevision, ownedFiles, evidenceManifestSha256, leaseAction, idempotencyKey and reason; fromRevision/scopeFiles are optional');
+        }
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        const authorized = isAdmin(caller) || Boolean(
+          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
+        );
+        if (!task || !authorized) {
+          return err('forbidden', 'revision recovery requires the authoritative project Brain or administrator');
+        }
+        const rebound = reg.rebindTaskAssignmentRevision?.({
+          taskId, assignmentId,
+          ...(fromRevision ? { fromRevision } : {}),
+          toRevision, ownedFiles,
+          ...(scopeFiles.length > 0 ? { scopeFiles } : {}),
+          leaseAction: leaseAction as SupervisionRecoveryLeaseAction,
+          idempotencyKey, evidenceManifestSha256, reason,
+        });
+        if (!rebound) return err('unavailable', 'revision recovery is not bound');
+        if (!rebound.ok) return err(rebound.reason, `revision recovery rejected: ${rebound.reason}`);
+        return ok({ taskId, assignmentId, ...(fromRevision ? { fromRevision } : {}), toRevision, replay: rebound.replay === true });
+      }
       const coordinationOverrideRequested = Boolean(
-        taskStatus || assignmentStatus || scopeFiles.length > 0 || clearLease || idempotencyKey,
+        taskStatus || assignmentStatus || scopeFiles.length > 0 || leaseAction || idempotencyKey,
       );
       if (coordinationOverrideRequested) {
         if (!assignmentId || !reason || !idempotencyKey
-          || (!taskStatus && !assignmentStatus && scopeFiles.length === 0 && !clearLease && !rebindSessionName)
-          || fromRevision || toRevision || ownedFiles.length > 0
+          || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(leaseAction as SupervisionRecoveryLeaseAction)
+          || (!taskStatus && !assignmentStatus && scopeFiles.length === 0
+            && leaseAction === 'preserve' && !rebindSessionName)
           || evidenceManifestSha256 || input.toStatus !== undefined) {
-          return err('validation_failed', 'coordination override requires assignmentId, idempotencyKey, reason, and at least one taskStatus/assignmentStatus/scopeFiles/clearLease/rebindSessionName field only');
+          return err('validation_failed', 'coordination override requires assignmentId, leaseAction, idempotencyKey, reason, and at least one taskStatus/assignmentStatus/scopeFiles/lease mutation/rebindSessionName field only');
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
@@ -503,7 +539,7 @@ export function createSupervisionMcpToolHandlers(
           ...(taskStatus ? { taskStatus: taskStatus as SupervisionBrainCoordinationRecoveryStatus } : {}),
           ...(assignmentStatus ? { assignmentStatus: assignmentStatus as SupervisionBrainCoordinationRecoveryStatus } : {}),
           ...(scopeFiles.length > 0 ? { scopeFiles } : {}),
-          ...(clearLease ? { clearLease: true } : {}),
+          leaseAction: leaseAction as SupervisionRecoveryLeaseAction,
           ...(reboundIdentity ? { identity: reboundIdentity } : {}),
           idempotencyKey,
           reason,
@@ -511,30 +547,6 @@ export function createSupervisionMcpToolHandlers(
         if (!coordinated) return err('unavailable', 'coordination override is not bound');
         if (!coordinated.ok) return err(coordinated.reason, `coordination override rejected: ${coordinated.reason}`);
         return ok({ taskId, assignmentId, replay: coordinated.replay === true });
-      }
-      const revisionRecoveryRequested = Boolean(
-        fromRevision || toRevision || ownedFiles.length > 0 || evidenceManifestSha256,
-      );
-      if (revisionRecoveryRequested) {
-        if (!assignmentId || !fromRevision || !toRevision || ownedFiles.length === 0
-          || !evidenceManifestSha256 || rebindSessionName || input.toStatus !== undefined) {
-          return err('validation_failed', 'revision recovery requires assignmentId, fromRevision, toRevision, ownedFiles, evidenceManifestSha256 and reason only');
-        }
-        const task = reg.get(taskId);
-        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        const authorized = isAdmin(caller) || Boolean(
-          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
-        );
-        if (!task || !authorized) {
-          return err('forbidden', 'revision recovery requires the authoritative project Brain or administrator');
-        }
-        const rebound = reg.rebindTaskAssignmentRevision?.({
-          taskId, assignmentId, fromRevision, toRevision, ownedFiles,
-          evidenceManifestSha256, reason,
-        });
-        if (!rebound) return err('unavailable', 'revision recovery is not bound');
-        if (!rebound.ok) return err(rebound.reason, `revision recovery rejected: ${rebound.reason}`);
-        return ok({ taskId, assignmentId, fromRevision, toRevision, replay: rebound.replay === true });
       }
       if (assignmentId || rebindSessionName) {
         if (!assignmentId || !rebindSessionName || !reason) return err('validation_failed', 'audit rebind requires assignmentId, rebindSessionName and reason');

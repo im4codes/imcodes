@@ -16,8 +16,10 @@ import {
   SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE,
   SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_RECOVERY_LEASE_ACTIONS,
   type SupervisionTaskArchiveReason,
   type SupervisionBrainCoordinationRecoveryStatus,
+  type SupervisionRecoveryLeaseAction,
   type SessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
 import type { SupervisionAuditDepth } from './supervision-broker.js';
@@ -2183,9 +2185,12 @@ export class SupervisionTaskRegistry {
   rebindTaskAssignmentRevision(input: {
     taskId: string;
     assignmentId: string;
-    fromRevision: string;
+    fromRevision?: string;
     toRevision: string;
     ownedFiles: readonly string[];
+    scopeFiles?: readonly string[];
+    leaseAction: SupervisionRecoveryLeaseAction;
+    idempotencyKey: string;
     evidenceManifestSha256: string;
     reason: string;
     now?: number;
@@ -2196,11 +2201,18 @@ export class SupervisionTaskRegistry {
     const toRevision = normalizeTaskString(input.toRevision);
     const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
     const reason = normalizeTaskString(input.reason);
+    const idempotencyKey = normalizeTaskString(input.idempotencyKey);
     const ownedFiles = normalizeTaskArray(input.ownedFiles);
-    if (!taskId || !assignmentId || !fromRevision || !toRevision || fromRevision === toRevision
+    const scopeFiles = input.scopeFiles === undefined ? undefined : normalizeTaskArray(input.scopeFiles);
+    if (!taskId || !assignmentId || !toRevision || fromRevision === toRevision
       || !evidenceManifestSha256 || !FINALIZATION_SHA256_RE.test(evidenceManifestSha256)
-      || !reason || ownedFiles.length === 0 || ownedFiles.length !== input.ownedFiles.length
-      || !ownedFiles.every(validRepoPath)) return { ok: false, reason: 'invalid' };
+      || !reason || !idempotencyKey
+      || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)
+      || ownedFiles.length === 0 || ownedFiles.length !== input.ownedFiles.length
+      || !ownedFiles.every(validRepoPath)
+      || (scopeFiles !== undefined && (scopeFiles.length === 0
+        || scopeFiles.length !== input.scopeFiles?.length
+        || !scopeFiles.every(validRepoPath)))) return { ok: false, reason: 'invalid' };
 
     const now = input.now ?? Date.now();
     this.#db.exec('BEGIN IMMEDIATE');
@@ -2212,14 +2224,27 @@ export class SupervisionTaskRegistry {
         return { ok: false, reason: 'not_found' };
       }
 
+      const authoritativeOwnedFiles = normalizeTaskArray(this.listFileEvents(taskId)
+        .filter((event) => event.assignmentId === assignmentId)
+        .map((event) => event.path));
+      const targetScopeFiles = scopeFiles ?? assignment.scopeFiles;
       const exactReplay = task.currentRevision === toRevision && assignment.auditRevision === toRevision;
       if (exactReplay) {
-        const prior = this.listEvents(taskId).find((event) => (
+        if (!sameStringArray(authoritativeOwnedFiles, ownedFiles)
+          || !ownedFiles.every((path) => targetScopeFiles.includes(path))) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'manifest_mismatch' };
+        }
+        const priorEvents = this.listEvents(taskId).filter((event) => (
           event.assignmentId === assignmentId
           && event.eventType === 'recovered'
           && event.payload?.source === 'brain_authorized_revision_rebind'
-          && event.payload?.fromRevision === fromRevision
+          && event.payload?.idempotencyKey === idempotencyKey
+        ));
+        const prior = priorEvents.find((event) => (
+          event.payload?.fromRevision === (fromRevision ?? null)
           && event.payload?.toRevision === toRevision
+          && event.payload?.leaseAction === input.leaseAction
           && event.payload?.evidenceManifestSha256 === evidenceManifestSha256
           && sameStringArray(
             Array.isArray(event.payload?.ownedFiles)
@@ -2227,9 +2252,16 @@ export class SupervisionTaskRegistry {
               : [],
             ownedFiles,
           )
+          && sameStringArray(
+            Array.isArray(event.payload?.scopeFiles)
+              ? event.payload.scopeFiles.map((path) => String(path))
+              : [],
+            scopeFiles ?? assignment.scopeFiles,
+          )
         ));
         this.#db.exec('ROLLBACK');
-        return prior
+        return priorEvents.length === 0 ? { ok: false, reason: 'conflicting_replay' }
+          : prior
           ? { ok: true, value: task, replay: true }
           : { ok: false, reason: 'conflicting_replay' };
       }
@@ -2244,35 +2276,45 @@ export class SupervisionTaskRegistry {
         candidate.role === 'auditor'
         && !['cancelled', 'finalized'].includes(candidate.status)
       ));
+      const protectedRevisions = new Set([
+        fromRevision, task.currentRevision, assignment.auditRevision, toRevision,
+      ].filter((value): value is string => Boolean(value)));
       const conflictingPassAssignment = assignments.some((candidate) => (
         candidate.verdict?.trim().toUpperCase() === 'PASS'
-        && (candidate.auditRevision === fromRevision || candidate.auditRevision === toRevision)
+        && Boolean(candidate.auditRevision && protectedRevisions.has(candidate.auditRevision))
       ));
+      const placeholders = [...protectedRevisions].map(() => '?').join(', ');
       const conflictingPassAttestation = this.#db.prepare(
         `SELECT 1 AS ok FROM supervision_audit_attestations
-         WHERE task_id = ? AND revision IN (?, ?) AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
-      ).get(taskId, fromRevision, toRevision) as { ok?: number } | undefined;
+         WHERE task_id = ? AND revision IN (${placeholders}) AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
+      ).get(taskId, ...protectedRevisions) as { ok?: number } | undefined;
       const conflictingPassReceipt = this.#db.prepare(
         `SELECT 1 AS ok FROM supervision_audit_receipts
-         WHERE task_id = ? AND revision IN (?, ?) AND receipt_kind = 'final'
+         WHERE task_id = ? AND revision IN (${placeholders}) AND receipt_kind = 'final'
            AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
-      ).get(taskId, fromRevision, toRevision) as { ok?: number } | undefined;
+      ).get(taskId, ...protectedRevisions) as { ok?: number } | undefined;
+      const sourceBindingMatches = (revision: string | undefined) => (
+        !revision || Boolean(fromRevision && revision === fromRevision)
+      );
+      const leaseCanContinue = input.leaseAction === 'renew'
+        || (input.leaseAction === 'preserve' && Boolean(assignment.leaseId));
       const exactStaleShape = Boolean(
         task.classification !== 'integration_slice'
         && ['implementing', 'rework'].includes(task.status)
         && ['implementing', 'rework'].includes(assignment.status)
-        && task.currentRevision === fromRevision
-        && assignment.auditRevision === fromRevision
+        && sourceBindingMatches(task.currentRevision)
+        && sourceBindingMatches(assignment.auditRevision)
         && assignment.role === 'implementer'
         && assignment.required
-        && Boolean(assignment.leaseId)
+        && leaseCanContinue
         && activeImplementers.length === 1
         && activeImplementers[0]?.assignmentId === assignmentId
         && !activeAuditor
         && !conflictingPassAssignment
         && conflictingPassAttestation?.ok !== 1
         && conflictingPassReceipt?.ok !== 1
-        && sameStringArray(assignment.scopeFiles, ownedFiles)
+        && sameStringArray(authoritativeOwnedFiles, ownedFiles)
+        && ownedFiles.every((path) => targetScopeFiles.includes(path))
         && !task.commitSha
         && !task.pushRemoteRef
         && !task.finalization
@@ -2283,24 +2325,31 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
           : activeAuditor ? { ok: false, reason: 'invalid_transition' }
-            : !sameStringArray(assignment.scopeFiles, ownedFiles) ? { ok: false, reason: 'manifest_mismatch' }
-              : task.currentRevision !== fromRevision || assignment.auditRevision !== fromRevision
+            : !sameStringArray(authoritativeOwnedFiles, ownedFiles)
+              || !ownedFiles.every((path) => targetScopeFiles.includes(path))
+              ? { ok: false, reason: 'manifest_mismatch' }
+              : !sourceBindingMatches(task.currentRevision) || !sourceBindingMatches(assignment.auditRevision)
                 ? { ok: false, reason: 'old_revision' }
                 : { ok: false, reason: 'invalid_transition' };
       }
 
       const payload = {
         source: 'brain_authorized_revision_rebind',
+        idempotencyKey,
         reason,
-        fromRevision,
+        fromRevision: fromRevision ?? null,
         toRevision,
         ownedFiles,
+        scopeFiles: targetScopeFiles,
+        leaseAction: input.leaseAction,
         evidenceManifestSha256,
         ...(assignment.auditAttemptId ? { previousAuditAttemptId: assignment.auditAttemptId } : {}),
         ...(assignment.verdict ? { previousVerdict: assignment.verdict } : {}),
       };
       const reboundAssignment: PersistedSupervisionTaskAssignment = {
         ...assignment,
+        scopeFiles: targetScopeFiles,
+        leaseId: input.leaseAction === 'renew' ? stableLeaseId() : assignment.leaseId,
         status: 'implementing',
         generation: assignment.generation + 1,
         auditAttemptId: undefined,
@@ -2347,7 +2396,7 @@ export class SupervisionTaskRegistry {
     taskStatus?: SupervisionBrainCoordinationRecoveryStatus;
     assignmentStatus?: SupervisionBrainCoordinationRecoveryStatus;
     scopeFiles?: readonly string[];
-    clearLease?: boolean;
+    leaseAction: SupervisionRecoveryLeaseAction;
     identity?: PersistedSupervisionTaskAssignmentIdentity;
     idempotencyKey: string;
     reason: string;
@@ -2370,9 +2419,10 @@ export class SupervisionTaskRegistry {
     ].every((value) => Boolean(normalizeTaskString(value)));
     if (!taskId || !assignmentId || !idempotencyKey || !reason
       || (!taskStatus && !assignmentStatus && scopeFiles === undefined
-        && input.clearLease !== true && input.identity === undefined)
+        && input.leaseAction === 'preserve' && input.identity === undefined)
       || (taskStatus !== undefined && !allowedStatuses.includes(taskStatus))
       || (assignmentStatus !== undefined && !allowedStatuses.includes(assignmentStatus))
+      || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)
       || !validIdentity
       || (scopeFiles !== undefined && (scopeFiles.length === 0
         || scopeFiles.length !== input.scopeFiles?.length
@@ -2406,7 +2456,11 @@ export class SupervisionTaskRegistry {
       }
 
       const nextAssignmentStatus = assignmentStatus ?? assignment.status;
-      const resetsAudit = nextAssignmentStatus === 'implementing' || nextAssignmentStatus === 'rework';
+      // A lease-only recovery must never erase revision/audit provenance just
+      // because the assignment is already implementing or rework. Clearing is
+      // tied to an explicit lifecycle reset, not the assignment's current row.
+      const resetsAudit = assignmentStatus !== undefined
+        && (assignmentStatus === 'implementing' || assignmentStatus === 'rework');
       const resetsTaskAudit = taskStatus === 'implementing' || taskStatus === 'rework';
       const scopeChanged = scopeFiles !== undefined && !sameStringArray(scopeFiles, assignment.scopeFiles);
       const hasValidationOrAuditProvenance = Boolean(
@@ -2433,7 +2487,7 @@ export class SupervisionTaskRegistry {
         event.assignmentId === assignmentId
         && event.payload?.requestedTaskStatus === (taskStatus ?? null)
         && event.payload?.requestedAssignmentStatus === (assignmentStatus ?? null)
-        && event.payload?.requestedClearLease === (input.clearLease === true)
+        && event.payload?.requestedLeaseAction === input.leaseAction
         && event.payload?.reason === reason
         && JSON.stringify(event.payload?.requestedIdentity ?? null) === JSON.stringify(input.identity ?? null)
         && JSON.stringify(event.payload?.requestedScopeFiles ?? null) === JSON.stringify(scopeFiles ?? null)
@@ -2450,7 +2504,8 @@ export class SupervisionTaskRegistry {
         identity: input.identity ?? assignment.identity,
         status: nextAssignmentStatus,
         scopeFiles: scopeFiles ?? assignment.scopeFiles,
-        leaseId: input.clearLease === true ? '' : assignment.leaseId,
+        leaseId: input.leaseAction === 'renew' ? stableLeaseId()
+          : input.leaseAction === 'clear' ? '' : assignment.leaseId,
         generation: assignment.generation + 1,
         ...(resetsAudit ? {
           auditAttemptId: undefined,
@@ -2477,12 +2532,12 @@ export class SupervisionTaskRegistry {
         requestedTaskStatus: taskStatus ?? null,
         requestedAssignmentStatus: assignmentStatus ?? null,
         requestedScopeFiles: scopeFiles ?? null,
-        requestedClearLease: input.clearLease === true,
+        requestedLeaseAction: input.leaseAction,
         requestedIdentity: input.identity ?? null,
         taskStatus: nextTask.status,
         assignmentStatus: nextAssignment.status,
         scopeFiles: nextAssignment.scopeFiles,
-        clearLease: input.clearLease === true,
+        leaseAction: input.leaseAction,
         ...(input.identity ? { identity: input.identity, priorIdentity: assignment.identity } : {}),
         priorTaskStatus: task.status,
         priorAssignmentStatus: assignment.status,

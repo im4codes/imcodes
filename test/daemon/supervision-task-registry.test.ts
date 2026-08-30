@@ -283,6 +283,7 @@ function prepareSameObjectRevisionRecoveryShape(
   const fromRevision = 'supervision-worktree-gc-layout-r1';
   const toRevision = 'supervision-worktree-gc-layout-r3';
   const files = ['src/daemon/supervision-worktree-gc.ts', 'test/daemon/supervision-worktree-gc.test.ts'];
+  const scopeFiles = [...files, 'test/daemon/supervision-worktree-gc-layout.integration.test.ts'].sort();
   const implementerIdentity = identity(`deck_${taskId}_worker`);
   const auditorIdentity = identity(`deck_${taskId}_auditor`, 'claude-code-sdk');
   expect(registry.createOrGet({
@@ -291,7 +292,7 @@ function prepareSameObjectRevisionRecoveryShape(
   })).toMatchObject({ ok: true });
   const implementer = registry.createAssignment({
     assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
-    identity: implementerIdentity, scopeFiles: files,
+    identity: implementerIdentity, scopeFiles,
     auditAttemptId: `${taskId}-r1-attempt`, auditRevision: fromRevision,
   });
   const auditor = registry.createAssignment({
@@ -307,6 +308,15 @@ function prepareSameObjectRevisionRecoveryShape(
     auditAttemptId: `${taskId}-r1-attempt`, auditRevision: fromRevision,
     verdict: 'REWORK', blocker: 'R1 finding retained until frozen R3 rebind',
   })).toMatchObject({ ok: true });
+  for (const [index, path] of files.entries()) {
+    expect(registry.recordFileEvent({
+      assignmentId: implementer.value.assignmentId,
+      identity: implementerIdentity,
+      path,
+      operation: 'modify',
+      idempotencyKey: `${taskId}-authoritative-file-${index}`,
+    })).toMatchObject({ ok: true });
+  }
   expect(registry.updateAssignment({
     assignmentId: auditor.value.assignmentId, identity: auditorIdentity,
     status: 'auditing', auditAttemptId: `${taskId}-r2-attempt`,
@@ -330,12 +340,12 @@ function prepareSameObjectRevisionRecoveryShape(
   if (options.addAmbiguousImplementer) {
     expect(registry.createAssignment({
       assignmentId: `${taskId}-other-implementer`, taskId, role: 'implementer',
-      identity: identity(`deck_${taskId}_other`), scopeFiles: files,
+      identity: identity(`deck_${taskId}_other`), scopeFiles,
       auditRevision: fromRevision,
     })).toMatchObject({ ok: true });
   }
   return {
-    taskId, fromRevision, toRevision, files,
+    taskId, fromRevision, toRevision, files, scopeFiles,
     evidenceManifestSha256: 'd'.repeat(64),
     implementer: implementer.value,
     implementerIdentity,
@@ -610,19 +620,48 @@ describe('SupervisionTaskRegistry', () => {
     try {
       const shape = prepareSameObjectRevisionRecoveryShape(registry, 'same-object-revision-recovery');
       const assignmentCount = registry.listAssignments(shape.taskId).length;
-      const eventCount = registry.listEvents(shape.taskId).length;
-      const leaseId = registry.getAssignment(shape.implementer.assignmentId)!.leaseId;
+      const originalLeaseId = registry.getAssignment(shape.implementer.assignmentId)!.leaseId;
       const historicalAuditor = registry.getAssignment(shape.auditor.assignmentId);
+      expect(registry.coordinateTaskAssignment({
+        taskId: shape.taskId,
+        assignmentId: shape.implementer.assignmentId,
+        leaseAction: 'clear',
+        idempotencyKey: 'same-object-revision-clear-stale-lease',
+        reason: 'reproduce the pre-recovery empty lease blocker',
+        now: 450,
+      })).toMatchObject({ ok: true });
+      expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+        status: 'implementing', leaseId: '',
+        auditAttemptId: `${shape.taskId}-r1-attempt`,
+        auditRevision: shape.fromRevision,
+        verdict: 'REWORK',
+      });
+      const eventCount = registry.listEvents(shape.taskId).length;
       const request = {
         taskId: shape.taskId,
         assignmentId: shape.implementer.assignmentId,
         fromRevision: shape.fromRevision,
         toRevision: shape.toRevision,
         ownedFiles: shape.files,
+        scopeFiles: shape.scopeFiles,
+        leaseAction: 'renew' as const,
+        idempotencyKey: 'same-object-revision-recovery-r3',
         evidenceManifestSha256: shape.evidenceManifestSha256,
         reason: 'bind validated frozen R3 without replacing the GC objects',
         now: 500,
       };
+
+      const emptyLeaseState = registry.get(shape.taskId);
+      const emptyLeaseEvents = registry.listEvents(shape.taskId).length;
+      for (const leaseAction of ['preserve', 'clear'] as const) {
+        expect(registry.rebindTaskAssignmentRevision({
+          ...request,
+          leaseAction,
+          idempotencyKey: `same-object-revision-${leaseAction}-empty-lease-refused`,
+        }), leaseAction).toEqual({ ok: false, reason: 'invalid_transition' });
+        expect(registry.get(shape.taskId)).toEqual(emptyLeaseState);
+        expect(registry.listEvents(shape.taskId)).toHaveLength(emptyLeaseEvents);
+      }
 
       expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
         ok: true,
@@ -630,9 +669,13 @@ describe('SupervisionTaskRegistry', () => {
       });
       expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
         assignmentId: shape.implementer.assignmentId,
-        status: 'implementing', leaseId, generation: 2,
+        status: 'implementing', leaseId: expect.any(String), generation: 3,
+        scopeFiles: shape.scopeFiles,
         auditRevision: shape.toRevision,
       });
+      const renewedLeaseId = registry.getAssignment(shape.implementer.assignmentId)!.leaseId;
+      expect(renewedLeaseId).not.toBe('');
+      expect(renewedLeaseId).not.toBe(originalLeaseId);
       expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('auditAttemptId');
       expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('verdict');
       expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('blocker');
@@ -646,6 +689,8 @@ describe('SupervisionTaskRegistry', () => {
             source: 'brain_authorized_revision_rebind',
             fromRevision: shape.fromRevision, toRevision: shape.toRevision,
             ownedFiles: shape.files,
+            scopeFiles: shape.scopeFiles,
+            leaseAction: 'renew',
             evidenceManifestSha256: shape.evidenceManifestSha256,
             previousAuditAttemptId: `${shape.taskId}-r1-attempt`, previousVerdict: 'REWORK',
           }),
@@ -666,6 +711,7 @@ describe('SupervisionTaskRegistry', () => {
       });
       expect(registry.listEvents(shape.taskId)).toHaveLength(persistedEvents);
       expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
+      expect(registry.getAssignment(shape.implementer.assignmentId)?.leaseId).toBe(renewedLeaseId);
       expect(registry.updateAssignment({
         assignmentId: shape.implementer.assignmentId, identity: shape.implementerIdentity,
         status: 'validated', revision: shape.toRevision, auditRevision: shape.toRevision,
@@ -674,6 +720,74 @@ describe('SupervisionTaskRegistry', () => {
         assignmentId: shape.implementer.assignmentId, identity: shape.implementerIdentity,
         status: 'ready_for_audit', revision: shape.toRevision, auditRevision: shape.toRevision,
       })).toMatchObject({ ok: true, value: { status: 'ready_for_audit', auditRevision: shape.toRevision } });
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('atomically binds null task/audit revisions from exact file events and replays after SQLite reopen', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-null-revision-recovery-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'null-revision-recovery';
+    const assignmentId = `${taskId}-implementer`;
+    const owner = identity('deck_null_revision_worker');
+    const ownedFiles = ['src/one.ts', 'test/one.test.ts'];
+    const scopeFiles = [...ownedFiles, 'test/authorized-but-untouched.test.ts'].sort();
+    const toRevision = 'null-revision-frozen-r1';
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'bind frozen evidence after a legacy null revision',
+      })).toMatchObject({ ok: true });
+      const assignment = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: owner, scopeFiles,
+      });
+      expect(assignment).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId, identity: owner, status: 'implementing',
+      })).toMatchObject({ ok: true });
+      for (const [index, path] of ownedFiles.entries()) {
+        expect(registry.recordFileEvent({
+          assignmentId, identity: owner, path, operation: 'modify',
+          idempotencyKey: `${taskId}-file-${index}`,
+        })).toMatchObject({ ok: true });
+      }
+      expect(registry.getTaskRecord(taskId)).not.toHaveProperty('currentRevision');
+      expect(registry.getAssignment(assignmentId)).not.toHaveProperty('auditRevision');
+
+      const request = {
+        taskId, assignmentId, toRevision, ownedFiles, scopeFiles,
+        leaseAction: 'renew' as const,
+        idempotencyKey: 'null-revision-bind-frozen-r1',
+        evidenceManifestSha256: 'e'.repeat(64),
+        reason: 'atomically bind exact frozen evidence without replacement objects',
+        now: 500,
+      };
+      expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
+        ok: true, value: { currentRevision: toRevision, status: 'implementing' },
+      });
+      const persistedLease = registry.getAssignment(assignmentId)?.leaseId;
+      expect(persistedLease).toMatch(/^supervision_lease_/);
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        auditRevision: toRevision, scopeFiles,
+      });
+      expect(registry.listEvents(taskId)).toContainEqual(expect.objectContaining({
+        assignmentId, eventType: 'recovered',
+        payload: expect.objectContaining({ fromRevision: null, toRevision, ownedFiles, scopeFiles }),
+      }));
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const eventCount = registry.listEvents(taskId).length;
+      expect(registry.rebindTaskAssignmentRevision({ ...request, now: 900 })).toMatchObject({
+        ok: true, replay: true, value: { currentRevision: toRevision },
+      });
+      expect(registry.getAssignment(assignmentId)?.leaseId).toBe(persistedLease);
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
     } finally {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
@@ -742,7 +856,7 @@ describe('SupervisionTaskRegistry', () => {
       const request = {
         taskId, assignmentId: implementer.value.assignmentId,
         taskStatus: 'rework' as const, assignmentStatus: 'rework' as const,
-        scopeFiles: ['src/one.ts', 'src/two.ts'], clearLease: true,
+        scopeFiles: ['src/one.ts', 'src/two.ts'], leaseAction: 'clear' as const,
         identity: reboundIdentity,
         idempotencyKey: 'brain-repair-rework-owner-r1',
         reason: 'move REWORK from coordinator to the original implementer', now: 100,
@@ -846,11 +960,13 @@ describe('SupervisionTaskRegistry', () => {
     };
     assertNoMutation(() => registry.coordinateTaskAssignment({
       taskId, assignmentId: auditor.value.assignmentId, assignmentStatus: 'rework',
+      leaseAction: 'preserve',
       idempotencyKey: 'auditor-status-refused', reason: 'must not rewrite an auditor',
     }), { ok: false, reason: 'role_forbidden' });
     assertNoMutation(() => registry.coordinateTaskAssignment({
       taskId, assignmentId: implementer.value.assignmentId,
       assignmentStatus: 'passed' as never,
+      leaseAction: 'preserve',
       idempotencyKey: 'success-target-refused', reason: 'must not invent PASS',
     }), { ok: false, reason: 'invalid' });
 
@@ -860,6 +976,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.coordinateTaskAssignment({
       taskId, assignmentId: implementer.value.assignmentId,
       taskStatus: 'rework', assignmentStatus: 'rework',
+      leaseAction: 'preserve',
       idempotencyKey: 'finalization-evidence-refused', reason: 'must preserve commit evidence',
     })).toEqual({ ok: false, reason: 'receipt_closed' });
     expect(registry.get(taskId)).toEqual(closed);
@@ -904,6 +1021,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.coordinateTaskAssignment({
       taskId, assignmentId: worker.value.assignmentId,
       scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+      leaseAction: 'preserve',
       idempotencyKey: 'scope-only-after-pass-refused',
       reason: 'must not let a new file inherit PASS',
     })).toEqual({ ok: false, reason: 'invalid_transition' });
@@ -914,6 +1032,7 @@ describe('SupervisionTaskRegistry', () => {
       taskId, assignmentId: worker.value.assignmentId,
       taskStatus: 'rework', assignmentStatus: 'rework',
       scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+      leaseAction: 'preserve',
       idempotencyKey: 'scope-after-pass-requires-rework',
       reason: 'invalidate old audit before expanding scope',
     })).toMatchObject({ ok: true, value: { status: 'rework' } });
@@ -957,6 +1076,7 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.coordinateTaskAssignment({
         taskId, assignmentId: worker.value.assignmentId,
         scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+        leaseAction: 'preserve',
         idempotencyKey: `scope-only-${status}-refused`,
         reason: 'must invalidate old validation and audit provenance before expanding scope',
       }), status).toEqual({ ok: false, reason: 'invalid_transition' });
@@ -980,6 +1100,7 @@ describe('SupervisionTaskRegistry', () => {
         taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
         fromRevision: shape.fromRevision, toRevision: shape.toRevision,
         ownedFiles: shape.files, evidenceManifestSha256: shape.evidenceManifestSha256,
+        leaseAction: 'preserve', idempotencyKey: `${testCase.taskId}-refusal`,
         reason: 'must fail closed',
       })).toEqual({ ok: false, reason: testCase.expected });
       expect(registry.get(shape.taskId)).toEqual(before);
@@ -993,12 +1114,14 @@ describe('SupervisionTaskRegistry', () => {
       taskId: scope.taskId, assignmentId: scope.implementer.assignmentId,
       fromRevision: scope.fromRevision, toRevision: scope.toRevision,
       ownedFiles: [scope.files[0]!], evidenceManifestSha256: scope.evidenceManifestSha256,
+      leaseAction: 'preserve', idempotencyKey: 'scope-owned-mismatch',
       reason: 'scope mismatch',
     })).toEqual({ ok: false, reason: 'manifest_mismatch' });
     expect(scopeRegistry.rebindTaskAssignmentRevision({
       taskId: scope.taskId, assignmentId: scope.implementer.assignmentId,
       fromRevision: scope.fromRevision, toRevision: scope.toRevision,
-      ownedFiles: scope.files, evidenceManifestSha256: '', reason: 'empty evidence',
+      ownedFiles: scope.files, leaseAction: 'preserve', idempotencyKey: 'scope-empty-evidence',
+      evidenceManifestSha256: '', reason: 'empty evidence',
     })).toEqual({ ok: false, reason: 'invalid' });
     scopeRegistry.close();
 
@@ -1009,6 +1132,7 @@ describe('SupervisionTaskRegistry', () => {
       taskId: lifecycle.taskId, assignmentId: lifecycle.implementer.assignmentId,
       fromRevision: lifecycle.fromRevision, toRevision: lifecycle.toRevision,
       ownedFiles: lifecycle.files, evidenceManifestSha256: lifecycle.evidenceManifestSha256,
+      leaseAction: 'preserve', idempotencyKey: 'lifecycle-refusal',
       reason: 'illegal lifecycle',
     })).toEqual({ ok: false, reason: 'invalid_transition' });
     lifecycleRegistry.close();
@@ -1025,6 +1149,7 @@ describe('SupervisionTaskRegistry', () => {
       taskId: pass.taskId, assignmentId: pass.implementer.assignmentId,
       fromRevision: pass.fromRevision, toRevision: pass.toRevision,
       ownedFiles: pass.files, evidenceManifestSha256: pass.evidenceManifestSha256,
+      leaseAction: 'preserve', idempotencyKey: 'pass-conflict-refusal',
       reason: 'PASS conflict',
     })).toEqual({ ok: false, reason: 'invalid_transition' });
     expect(passRegistry.listEvents(pass.taskId)).toHaveLength(passEvents);

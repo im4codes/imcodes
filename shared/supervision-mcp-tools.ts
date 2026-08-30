@@ -11,7 +11,7 @@ export const SUPERVISION_MCP_TOOLS = Object.freeze({
   INTENT: 'supervision_task_intent',
   LIST: 'supervision_task_list',
   GET: 'supervision_task_get',
-  /** Administrative recovery; enum-restricted and transition-checked. */
+  /** Administrative same-object recovery; evidence-, lease-, and transition-checked. */
   RECOVER: 'supervision_task_recover',
   /** Bounded retention census/apply; apply is administrative and provenance-preserving. */
   HOUSEKEEPING: 'supervision_task_housekeeping',
