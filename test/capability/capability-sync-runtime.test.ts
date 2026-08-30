@@ -487,4 +487,124 @@ describe('production capability synchronization runtime', () => {
     ]);
     expect(requestFullSnapshot).toHaveBeenCalledTimes(1);
   });
+
+  it('coalesces a stale-authority feedback loop with bounded backoff without blocking other owners', async () => {
+    vi.useFakeTimers();
+    try {
+      const apply = vi.fn(async (frame: { ownerId: string; revision: number }) => {
+        if (frame.ownerId === 'owner-stale' && frame.revision === 1) {
+          throw new CapabilitySyncError(CAPABILITY_SYNC_ERROR.STALE_REVISION);
+        }
+      });
+      const requestFullSnapshot = vi.fn();
+      const onError = vi.fn();
+      const handler = new CapabilitySyncFrameHandler({
+        serviceForOwner: () => ({ apply } as unknown as CapabilitySyncService),
+        requestFullSnapshot,
+        onError,
+      });
+      const stale = {
+        type: CAPABILITY_SYNC_MSG.AUTHORITY,
+        ownerId: 'owner-stale',
+        revision: 1,
+        digest: 'a'.repeat(64),
+      };
+
+      // Reproduce the exact incident volume. The old handler performed one
+      // apply, error emission, and full-snapshot request for every frame; the
+      // repaired path admits the first frame and coalesces all 20,353 repeats.
+      const handled = await Promise.all(Array.from({ length: 20_354 }, () => handler.handle(stale)));
+      expect(handled).toEqual(Array.from({ length: 20_354 }, () => true));
+      expect(apply).toHaveBeenCalledTimes(1);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+
+      await handler.handle({
+        type: CAPABILITY_SYNC_MSG.SNAPSHOT,
+        ownerId: 'owner-responsive',
+        revision: 1,
+        digest: 'b'.repeat(64),
+      });
+      expect(apply).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(3);
+
+      await handler.handle({
+        type: CAPABILITY_SYNC_MSG.AUTHORITY,
+        ownerId: 'owner-stale',
+        revision: 2,
+        digest: 'c'.repeat(64),
+      });
+      expect(apply).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps stale authority repair backoff across the server SNAPSHOT then AUTHORITY response order', async () => {
+    vi.useFakeTimers();
+    try {
+      const apply = vi.fn(async (frame: { type: string; ownerId: string; revision: number }) => {
+        if (frame.type === CAPABILITY_SYNC_MSG.AUTHORITY && frame.revision === 1) {
+          throw new CapabilitySyncError(CAPABILITY_SYNC_ERROR.STALE_REVISION);
+        }
+      });
+      const requestFullSnapshot = vi.fn();
+      const handler = new CapabilitySyncFrameHandler({
+        serviceForOwner: () => ({ apply } as unknown as CapabilitySyncService),
+        requestFullSnapshot,
+      });
+      const staleAuthority = {
+        type: CAPABILITY_SYNC_MSG.AUTHORITY,
+        ownerId: 'owner-stale',
+        revision: 1,
+        digest: 'a'.repeat(64),
+      };
+      const snapshot = (revision: number) => ({
+        type: CAPABILITY_SYNC_MSG.SNAPSHOT,
+        ownerId: 'owner-stale',
+        revision,
+        digest: 'b'.repeat(64),
+      });
+
+      await handler.handle(staleAuthority);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(1);
+
+      // Production server/src/ws/bridge.ts answers each request with a
+      // SNAPSHOT followed by AUTHORITY. The successful state snapshot must
+      // not clear the still-failing authority dimension.
+      await handler.handle(snapshot(2));
+      await handler.handle(staleAuthority);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(2);
+
+      await handler.handle(snapshot(3));
+      await handler.handle(staleAuthority);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(3);
+
+      await handler.handle({ ...staleAuthority, revision: 2, digest: 'c'.repeat(64) });
+      expect(apply).toHaveBeenCalledTimes(4);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(requestFullSnapshot).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
