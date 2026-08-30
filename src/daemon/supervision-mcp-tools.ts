@@ -124,6 +124,13 @@ export interface SupervisionRegistryPort {
   finishAssignment?(input: {
     assignmentId: string;
     callerSessionName: string;
+    callerProjectName?: string;
+    projectBrain?: boolean;
+    rebindIdentity?: {
+      sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
+      agentType: string; providerFamily: string;
+    };
+    rebindProjectName?: string;
   }): { ok: true; value: unknown; replay?: boolean } | { ok: false; reason: string };
   list(filter: {
     projectName?: string; status?: string; topLevelTaskId?: string; ownerSessionName?: string;
@@ -206,6 +213,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     intent: z.enum([...SUPERVISION_INTENTS] as [string, ...string[]]),
     taskId: z.string().min(1),
     assignmentId: z.string().min(1).optional(),
+    rebindSessionName: z.string().min(1).optional(),
     validationState: z.enum([...SUPERVISION_CONSOLE_VALIDATION_STATES] as [string, ...string[]]).optional(),
     note: z.string().max(2000).optional(),
   },
@@ -277,18 +285,28 @@ export function createSupervisionMcpToolHandlers(
       const taskId = String(input.taskId ?? '');
       const task = reg.get(taskId);
       const requestedAssignmentId = input.assignmentId === undefined ? undefined : String(input.assignmentId);
+      const intent = String(input.intent ?? '');
       const callerAssignments = (task?.assignments ?? []).filter(
         (assignment) => assignment.identity?.sessionName === callerSession && assignment.assignmentId,
       );
-      const boundAssignmentId = requestedAssignmentId
+      const callerBoundAssignmentId = requestedAssignmentId
         ? callerAssignments.find((assignment) => assignment.assignmentId === requestedAssignmentId)?.assignmentId
         : callerAssignments.length === 1 ? callerAssignments[0]?.assignmentId : undefined;
+      const projectBrainMayFinish = Boolean(
+        requestedAssignmentId
+        && intent === 'finish'
+        && task?.projectName
+        && caller.projectName === task.projectName
+        && isProjectBrain(caller)
+        && task.assignments?.some((assignment) => assignment.assignmentId === requestedAssignmentId),
+      );
+      const boundAssignmentId = callerBoundAssignmentId
+        ?? (projectBrainMayFinish ? requestedAssignmentId : undefined);
       if (requestedAssignmentId && !boundAssignmentId) {
         return err('identity_rejected', 'assignment is not visible to this caller');
       }
-      const intent = String(input.intent ?? '');
       const boundAssignment = boundAssignmentId
-        ? callerAssignments.find((assignment) => assignment.assignmentId === boundAssignmentId)
+        ? task?.assignments?.find((assignment) => assignment.assignmentId === boundAssignmentId)
         : undefined;
       if (intent === 'open_audit' && task?.classification === 'integration_slice') {
         const historicalAudit = (task.assignments ?? []).some((assignment) => (
@@ -316,7 +334,31 @@ export function createSupervisionMcpToolHandlers(
         if (input.status !== undefined) {
           return err('model_supplied_status', 'Lifecycle status is daemon-owned; send an intent instead.');
         }
-        const finished = reg.finishAssignment({ assignmentId: boundAssignmentId, callerSessionName: callerSession });
+        const rebindSessionName = input.rebindSessionName === undefined
+          ? undefined : String(input.rebindSessionName).trim();
+        if (rebindSessionName && !projectBrainMayFinish) {
+          return err('identity_rejected', 'only the same-project Brain may rebind a drifted implementation assignment');
+        }
+        const rebind = rebindSessionName ? deps.resolveSessionIdentity?.(rebindSessionName) : undefined;
+        if (rebindSessionName && (!rebind || rebind.projectName !== task?.projectName)) {
+          return err('identity_rejected', 'rebind target is not a live same-project session');
+        }
+        const finished = reg.finishAssignment({
+          assignmentId: boundAssignmentId,
+          callerSessionName: callerSession,
+          ...(caller.projectName ? { callerProjectName: caller.projectName } : {}),
+          ...(projectBrainMayFinish ? { projectBrain: true } : {}),
+          ...(rebind ? {
+            rebindIdentity: {
+              sessionName: rebind.sessionName,
+              sessionInstanceId: rebind.sessionInstanceId,
+              runtimeEpoch: rebind.runtimeEpoch,
+              agentType: rebind.agentType,
+              providerFamily: rebind.providerFamily,
+            },
+            rebindProjectName: rebind.projectName,
+          } : {}),
+        });
         return finished.ok
           ? ok({ intent: 'finish', fromStatus: task?.status ?? reg.getStatus(taskId), toStatus: (finished.value as { status?: unknown }).status ?? null, item: finished.value, idempotentReplay: finished.replay === true })
           : err(finished.reason, `task finish rejected: ${finished.reason}`);

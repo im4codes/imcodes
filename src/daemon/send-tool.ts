@@ -687,6 +687,20 @@ export async function dispatchSendMessage(
       error: 'an existing task continuation must use deliveryMode=append; queue would fork the logical task',
     };
   }
+  if (input.task?.assignmentId?.trim() && !input.task.taskId?.trim()) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'task.assignmentId requires an existing taskId',
+    };
+  }
+  if (input.audit && input.task?.assignmentId?.trim()) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'audit registration cannot reuse an implementer assignmentId',
+    };
+  }
   if (Buffer.byteLength(input.message, 'utf8') > MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES) {
     return { status: 'error', reason: MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED, error: `message exceeds ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} bytes` };
   }
@@ -780,8 +794,12 @@ export async function dispatchSendMessage(
   // can never disagree about one target. Refusing here rather than queueing is
   // the whole point: a message dropped into a limited session's FIFO looks
   // accepted and then sits there, so the orchestrator learns nothing and waits.
+  const existingTaskContinuation = Boolean(input.task?.taskId?.trim());
   const gate = evaluateDelegationAdmission(allSessions, targets.targets, now, {
-    newWorkload: input.newWorkload === true || Boolean(input.task) || Boolean(input.audit) || autoProvision,
+    newWorkload: input.newWorkload === true
+      || Boolean(input.task && !existingTaskContinuation)
+      || Boolean(input.audit)
+      || autoProvision,
   });
   const blockedTargets = gate.blocked;
   const dispatchable = gate.dispatchable;
@@ -808,7 +826,7 @@ export async function dispatchSendMessage(
   // but it is not evidence that a new supervised workload can start. The
   // shared admission service already removes limited/offline targets; close
   // the final unknown-state gap here before any registry or reply side effect.
-  if (input.task && dispatchable.some((target) => (
+  if (input.task && !existingTaskContinuation && dispatchable.some((target) => (
     gate.availability.get(target.name)?.availability === DELEGATION_AVAILABILITY.UNKNOWN
   ))) {
     return {
@@ -960,18 +978,30 @@ export async function dispatchSendMessage(
       }
       if (!input.audit) {
         const implementers = existing.assignments.filter((assignment) => assignment.role === 'implementer');
+        if (input.task.assignmentId?.trim() && implementers.length === 0) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+            error: 'task continuation assignmentId is not an exact reusable implementer assignment',
+          };
+        }
         if (implementers.length > 0) {
+          const requestedAssignmentId = input.task.assignmentId?.trim();
           const reusableImplementers = implementers.filter((assignment) => (
-            ['delegated', 'implementing', 'retrying_external_ci', 'rework'] as const
-          ).includes(assignment.status as 'delegated' | 'implementing' | 'retrying_external_ci' | 'rework'));
-          if (reusableImplementers.length !== 1) {
+            ['delegated', 'implementing', 'retrying_external_ci', 'rework', 'validated', 'ready_for_audit', 'recovered'] as const
+          ).includes(assignment.status as 'delegated' | 'implementing' | 'retrying_external_ci' | 'rework' | 'validated' | 'ready_for_audit' | 'recovered'));
+          const continuation = requestedAssignmentId
+            ? reusableImplementers.find((assignment) => assignment.assignmentId === requestedAssignmentId)
+            : reusableImplementers.length === 1 ? reusableImplementers[0] : undefined;
+          if (!continuation) {
             return {
               status: 'error',
               reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
-              error: 'task continuation has no unique reusable implementer assignment; use authoritative task_start/recovery for replacement work',
+              error: requestedAssignmentId
+                ? 'task continuation assignmentId is not an exact reusable implementer assignment'
+                : 'task continuation has no unique reusable implementer assignment; provide the exact assignmentId or use authoritative recovery',
             };
           }
-          const continuation = reusableImplementers[0]!;
           const sameTarget = continuation.identity.sessionName === targetIdentity.sessionName
             && continuation.identity.sessionInstanceId === targetIdentity.sessionInstanceId
             && continuation.identity.runtimeEpoch === targetIdentity.runtimeEpoch

@@ -554,7 +554,7 @@ function parseCloneArg(value: unknown): SendMessageCloneRequest | undefined | 'i
 
 
 const TASK_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set([
-  'taskId', 'topLevelTaskId', 'sliceId', 'classification', 'objective', 'acceptance',
+  'taskId', 'assignmentId', 'topLevelTaskId', 'sliceId', 'classification', 'objective', 'acceptance',
   'ownedFiles', 'sharedFiles', 'dependencies', 'integrationOwner', 'baseRevision',
   'currentRevision', 'auditAttemptId', 'auditRevision', 'executionPool',
   'autoProvision', 'requestedExecutionType', 'economyPolicy',
@@ -575,6 +575,7 @@ function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'in
   if (record.autoProvision !== undefined && record.autoProvision !== true) return 'invalid';
   return {
     taskId: stringField('taskId'),
+    assignmentId: stringField('assignmentId'),
     topLevelTaskId: stringField('topLevelTaskId'),
     sliceId: stringField('sliceId'),
     classification: typeof record.classification === 'string' ? record.classification as never : undefined,
@@ -2109,12 +2110,11 @@ const schemas = {
     target: z.string().optional().describe('Exact target; omit only for autoProvision.'),
     message: z.string().describe('Request and expected output.'),
     deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
-      .optional()
-      .describe('append or queue.'),
-    files: z.array(z.string()).optional().describe('Project paths.'),
+      .optional(),
+    files: z.array(z.string()).optional(),
     reply: z.boolean().optional(),
     task: z.object({
-      taskId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
+      taskId: z.string().optional(), assignmentId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
       integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
       executionPool: z.enum(['primary', 'economy']).optional(), autoProvision: z.literal(true).optional(),
@@ -2126,7 +2126,7 @@ const schemas = {
         model: z.string(),
         ccPresetId: z.string().min(1).optional(),
       }).strict().optional(),
-    }).strict().optional().describe('Supervision metadata.'),
+    }).strict().optional(),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),

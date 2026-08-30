@@ -297,6 +297,10 @@ describe('memory MCP stdio server', () => {
         'externalTaskId',
         'evidence',
       ].sort());
+      const sendSchema = listed.tools.find(
+        (tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+      )?.inputSchema as { properties?: { task?: { properties?: Record<string, unknown> } } } | undefined;
+      expect(sendSchema?.properties?.task?.properties).toHaveProperty('assignmentId');
       for (const tool of listed.tools) {
         expect(tool.description).toBeTruthy();
         // The protocol name already identifies the tool; repeating it as title

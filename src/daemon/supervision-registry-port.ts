@@ -49,10 +49,21 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
   return {
     getStatus: (taskId) => getSupervisionTaskRegistry().get(taskId)?.status,
     applyIntent: (input) => getSupervisionTaskRegistry().applyTaskIntent(input),
-    finishAssignment: ({ assignmentId, callerSessionName }) => {
+    finishAssignment: ({
+      assignmentId, callerSessionName, callerProjectName, projectBrain,
+      rebindIdentity, rebindProjectName,
+    }) => {
       const registry = getSupervisionTaskRegistry();
       const assignment = registry.getAssignment(assignmentId);
       if (!assignment) return { ok: false, reason: 'not_found' };
+      if (projectBrain && callerProjectName) {
+        return registry.finishAssignmentAsProjectBrain({
+          assignmentId,
+          callerProjectName,
+          ...(rebindIdentity ? { rebindIdentity } : {}),
+          ...(rebindProjectName ? { rebindProjectName } : {}),
+        });
+      }
       if (assignment.identity.sessionName !== callerSessionName) {
         return { ok: false, reason: 'owner_mismatch' };
       }

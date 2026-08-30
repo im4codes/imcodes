@@ -521,7 +521,8 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id, while the daemon authenticates its current session identity and accepts bounded append-only replies. Each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
       task: {
         ...objectSchema({
-          taskId: stringSchema('Optional existing visible task id to append. It reuses the exact active assignment and never mints another task/assignment; omitted creates genuinely new work. Missing or inaccessible ids fail and are never silently reminted.'),
+          taskId: stringSchema('Existing visible task to append; missing or inaccessible ids never create work.'),
+          assignmentId: stringSchema('Exact existing implementer assignment for an unambiguous append.'),
           topLevelTaskId: stringSchema('Optional top-level task id.'),
           sliceId: stringSchema('Optional slice id.'),
           classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },

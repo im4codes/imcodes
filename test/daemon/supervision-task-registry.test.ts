@@ -29,12 +29,23 @@ function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
   return {
     getStatus: (taskId: string) => registry().get(taskId)?.status,
     applyIntent: (input: Parameters<SupervisionTaskRegistry['applyTaskIntent']>[0]) => registry().applyTaskIntent(input),
-    finishAssignment: ({ assignmentId, callerSessionName }: { assignmentId: string; callerSessionName: string }) => {
+    finishAssignment: (input: {
+      assignmentId: string; callerSessionName: string; callerProjectName?: string; projectBrain?: boolean;
+      rebindIdentity?: PersistedSupervisionTaskAssignmentIdentity; rebindProjectName?: string;
+    }) => {
       const current = registry();
-      const assignment = current.getAssignment(assignmentId);
+      const assignment = current.getAssignment(input.assignmentId);
       if (!assignment) return { ok: false as const, reason: 'not_found' };
-      if (assignment.identity.sessionName !== callerSessionName) return { ok: false as const, reason: 'owner_mismatch' };
-      return current.finishAssignment({ assignmentId, identity: assignment.identity });
+      if (input.projectBrain && input.callerProjectName) {
+        return current.finishAssignmentAsProjectBrain({
+          assignmentId: input.assignmentId,
+          callerProjectName: input.callerProjectName,
+          ...(input.rebindIdentity ? { rebindIdentity: input.rebindIdentity } : {}),
+          ...(input.rebindProjectName ? { rebindProjectName: input.rebindProjectName } : {}),
+        });
+      }
+      if (assignment.identity.sessionName !== input.callerSessionName) return { ok: false as const, reason: 'owner_mismatch' };
+      return current.finishAssignment({ assignmentId: input.assignmentId, identity: assignment.identity });
     },
     list: (filter: never) => registry().list(filter) as never,
     get: (taskId: string) => registry().get(taskId) as never,
@@ -1276,7 +1287,7 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
-  it('finishes a receipted auditor against the unique implementer without treating the coordinator as an audit target', () => {
+  it('finishes a receipted auditor against the sole revision-only pending implementer without targeting the coordinator', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-audit-finish-target-'));
     const dbPath = join(dir, 'supervision-state.sqlite');
     const taskId = 'audit-finish-production-shape';
@@ -1297,14 +1308,14 @@ describe('SupervisionTaskRegistry', () => {
       });
       const implementer = registry.createAssignment({
         assignmentId: 'audit-finish-implementer', taskId, role: 'implementer', identity: implementerIdentity,
-        auditAttemptId: attemptId, auditRevision: revision,
+        auditRevision: revision,
       });
       const auditor = registry.createAssignment({
         assignmentId: 'audit-finish-auditor', taskId, role: 'auditor', identity: auditorIdentity,
         auditAttemptId: attemptId, auditRevision: revision,
       });
       if (!coordinator.ok || !implementer.ok || !auditor.ok) throw new Error('expected production assignments');
-      for (const status of ['implementing', 'validated'] as const) {
+      for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
         expect(registry.updateAssignment({
           assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
         })).toMatchObject({ ok: true });
@@ -1314,6 +1325,8 @@ describe('SupervisionTaskRegistry', () => {
         receiptKind: 'final', verdict: 'REWORK', auditorSessionName: auditorIdentity.sessionName,
         auditorIdentity, findings: 'production-shaped correction', validations: [], now: 100,
       })).toMatchObject({ ok: true, value: { sequence: 1, verdict: 'REWORK' } });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({ auditRevision: revision });
+      expect(registry.getAssignment(implementer.value.assignmentId)?.auditAttemptId).toBeUndefined();
 
       const coordinatorBefore = registry.getAssignment(coordinator.value.assignmentId);
       const assignmentCount = registry.get(taskId)?.assignments.length;
@@ -1341,7 +1354,175 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
-  it('fails closed without mutation when a receipt has multiple true implementer targets', () => {
+  it('lets only the same-project Brain clean a revision-only implementer receipt and preserves it across reopen', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-brain-auditor-cleanup-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'brain-auditor-cleanup';
+    const revision = 'brain-auditor-cleanup-r1';
+    const attemptId = 'brain-auditor-cleanup-attempt';
+    const worker = identity('deck_brain_cleanup_worker');
+    const auditorIdentity = identity('deck_brain_cleanup_auditor');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'cleanup accepted audit', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const implementer = registry.createAssignment({
+        assignmentId: 'brain-cleanup-implementer', taskId, role: 'implementer', identity: worker,
+        auditRevision: revision,
+      });
+      const auditor = registry.createAssignment({
+        assignmentId: 'brain-cleanup-auditor', taskId, role: 'auditor', identity: auditorIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!implementer.ok || !auditor.ok) throw new Error('expected assignments');
+      for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+        expect(registry.updateAssignment({ assignmentId: implementer.value.assignmentId, identity: worker, status }))
+          .toMatchObject({ ok: true });
+      }
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'accepted exact receipt',
+        validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'passed' }], now: 100,
+      })).toMatchObject({ ok: true });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({ auditRevision: revision });
+      expect(registry.getAssignment(implementer.value.assignmentId)?.auditAttemptId).toBeUndefined();
+      const receiptBefore = registry.listAuditReceipts(taskId);
+      const snapshotBeforeWrongProject = registry.get(taskId);
+      expect(registry.finishAssignmentAsProjectBrain({
+        assignmentId: auditor.value.assignmentId, callerProjectName: 'beta', now: 105,
+      })).toEqual({ ok: false, reason: 'owner_mismatch' });
+      expect(registry.get(taskId)).toEqual(snapshotBeforeWrongProject);
+
+      expect(registry.finishAssignmentAsProjectBrain({
+        assignmentId: auditor.value.assignmentId, callerProjectName: 'alpha', now: 110,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'ready_for_integration', verdict: 'PASS',
+      });
+      expect(registry.listAuditReceipts(taskId)).toEqual(receiptBefore);
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const beforeReplay = registry.get(taskId);
+      const receiptsAfterReopen = registry.listAuditReceipts(taskId);
+      expect(registry.finishAssignmentAsProjectBrain({
+        assignmentId: auditor.value.assignmentId, callerProjectName: 'alpha', now: 120,
+      })).toMatchObject({ ok: true, replay: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.get(taskId)).toEqual(beforeReplay);
+      expect(registry.listAuditReceipts(taskId)).toEqual(receiptsAfterReopen);
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('atomically rebinds only the same logical validated implementer and refuses audited or cross-user takeover', () => {
+    const registry = makeRegistry();
+    const taskId = 'brain-owner-mismatch-rebind';
+    const revision = 'brain-owner-mismatch-r1';
+    const stale = identity('deck_owner_mismatch_worker');
+    const live = {
+      ...stale,
+      sessionInstanceId: 'new-instance',
+      runtimeEpoch: 'new-epoch',
+    };
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'recover drifted validated identity', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const assignment = registry.createAssignment({
+      assignmentId: 'brain-owner-mismatch-implementer', taskId, role: 'implementer',
+      identity: stale, auditRevision: revision,
+    });
+    if (!assignment.ok) throw new Error(assignment.reason);
+    for (const status of ['implementing', 'validated'] as const) {
+      expect(registry.updateAssignment({ assignmentId: assignment.value.assignmentId, identity: stale, status }))
+        .toMatchObject({ ok: true });
+    }
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'validated' })).toMatchObject({ ok: true });
+
+    const beforeWrongUser = registry.get(taskId);
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId: assignment.value.assignmentId,
+      callerProjectName: 'alpha',
+      rebindProjectName: 'alpha',
+      rebindIdentity: identity('deck_different_user_worker'),
+    })).toEqual({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.get(taskId)).toEqual(beforeWrongUser);
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId: assignment.value.assignmentId,
+      callerProjectName: 'beta',
+      rebindProjectName: 'beta',
+      rebindIdentity: live,
+    })).toEqual({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.get(taskId)).toEqual(beforeWrongUser);
+
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId: assignment.value.assignmentId,
+      callerProjectName: 'alpha',
+      rebindProjectName: 'alpha',
+      rebindIdentity: live,
+      now: 100,
+    })).toMatchObject({
+      ok: true,
+      value: { status: 'ready_for_audit', leaseId: '', identity: live },
+    });
+    expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_audit', currentRevision: revision });
+    const beforeReplay = registry.get(taskId);
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId: assignment.value.assignmentId,
+      callerProjectName: 'alpha',
+      rebindProjectName: 'alpha',
+      rebindIdentity: live,
+      now: 110,
+    })).toMatchObject({ ok: true, replay: true });
+    expect(registry.get(taskId)).toEqual(beforeReplay);
+
+    const auditedTaskId = 'brain-owner-mismatch-audited';
+    const auditedRevision = 'brain-owner-mismatch-audited-r1';
+    const auditedAttempt = 'brain-owner-mismatch-audited-attempt';
+    expect(registry.createOrGet({
+      taskId: auditedTaskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'do not override accepted audit', currentRevision: auditedRevision,
+    })).toMatchObject({ ok: true });
+    const auditedWorker = registry.createAssignment({
+      assignmentId: 'brain-owner-mismatch-audited-worker', taskId: auditedTaskId,
+      role: 'implementer', identity: stale, auditRevision: auditedRevision,
+    });
+    const auditedAuditorIdentity = identity('deck_owner_mismatch_auditor');
+    const auditedAuditor = registry.createAssignment({
+      assignmentId: 'brain-owner-mismatch-auditor', taskId: auditedTaskId,
+      role: 'auditor', identity: auditedAuditorIdentity,
+      auditAttemptId: auditedAttempt, auditRevision: auditedRevision,
+    });
+    if (!auditedWorker.ok || !auditedAuditor.ok) throw new Error('expected audited fixture');
+    for (const status of ['implementing', 'validated'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: auditedWorker.value.assignmentId, identity: stale, status,
+      })).toMatchObject({ ok: true });
+    }
+    expect(registry.appendMatchingAuditReceipt({
+      taskId: auditedTaskId, auditorAssignmentId: auditedAuditor.value.assignmentId,
+      attemptId: auditedAttempt, revision: auditedRevision, receiptKind: 'final', verdict: 'PASS',
+      auditorSessionName: auditedAuditorIdentity.sessionName, auditorIdentity: auditedAuditorIdentity,
+      findings: 'accepted already', validations: [{
+        kind: 'test', label: 'accepted', outcome: 'passed', summary: 'accepted',
+      }],
+    })).toMatchObject({ ok: true });
+    const auditedBefore = registry.get(auditedTaskId);
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId: auditedWorker.value.assignmentId,
+      callerProjectName: 'alpha', rebindProjectName: 'alpha', rebindIdentity: live,
+    })).toEqual({ ok: false, reason: 'receipt_closed' });
+    expect(registry.get(auditedTaskId)).toEqual(auditedBefore);
+    registry.close();
+  });
+
+  it('fails closed without mutation when a receipt has multiple revision-only pending implementers', () => {
     const registry = makeRegistry();
     const taskId = 'audit-finish-ambiguous-implementers';
     const revision = 'audit-finish-ambiguous-r1';
@@ -1360,7 +1541,7 @@ describe('SupervisionTaskRegistry', () => {
       const owner = identity(sessionName);
       const implementer = registry.createAssignment({
         assignmentId: `audit-finish-ambiguous-implementer-${index}`, taskId, role: 'implementer', identity: owner,
-        auditAttemptId: attemptId, auditRevision: revision,
+        auditRevision: revision,
       });
       if (!implementer.ok) throw new Error(implementer.reason);
       for (const status of ['implementing', 'validated'] as const) {
@@ -1397,7 +1578,7 @@ describe('SupervisionTaskRegistry', () => {
     },
     {
       label: 'revision mismatch',
-      implementerAttemptId: 'audit-finish-mismatch-attempt',
+      implementerAttemptId: undefined,
       implementerRevision: 'different-revision',
       reason: 'old_revision',
     },
@@ -1417,7 +1598,8 @@ describe('SupervisionTaskRegistry', () => {
     })).toMatchObject({ ok: true });
     const implementer = registry.createAssignment({
       assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: implementerIdentity,
-      auditAttemptId: implementerAttemptId, auditRevision: implementerRevision,
+      ...(implementerAttemptId ? { auditAttemptId: implementerAttemptId } : {}),
+      auditRevision: implementerRevision,
     });
     const auditor = registry.createAssignment({
       assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', identity: auditorIdentity,
@@ -1505,6 +1687,70 @@ describe('SupervisionTaskRegistry', () => {
         }),
       }),
     ]));
+  });
+
+  it('records an independent validated implementer FINISHED handoff without fabricating PASS', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-top-level-finish-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'validated-top-level-finish';
+    const revision = 'validated-top-level-r1';
+    const owner = identity('deck_validated_top_level_worker');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'finish implementation before audit', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const assignment = registry.createAssignment({
+        assignmentId: 'validated-top-level-implementer', taskId, role: 'implementer',
+        identity: owner, auditRevision: revision, scopeFiles: ['src/top-level.ts'],
+      });
+      if (!assignment.ok) throw new Error(assignment.reason);
+      for (const status of ['implementing', 'validated'] as const) {
+        expect(registry.updateAssignment({ assignmentId: assignment.value.assignmentId, identity: owner, status }))
+          .toMatchObject({ ok: true });
+      }
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'validated' })).toMatchObject({ ok: true });
+
+      expect(registry.finishAssignment({
+        assignmentId: assignment.value.assignmentId, identity: owner, revision, now: 100,
+      })).toMatchObject({ ok: true, value: { status: 'ready_for_audit', leaseId: '' } });
+      expect(registry.get(taskId)).toMatchObject({
+        status: 'ready_for_audit', currentRevision: revision,
+        assignments: [expect.objectContaining({
+          assignmentId: assignment.value.assignmentId,
+          status: 'ready_for_audit', leaseId: '',
+        })],
+      });
+      expect(registry.getAssignment(assignment.value.assignmentId)?.verdict).toBeUndefined();
+      expect(registry.listAuditReceipts(taskId)).toEqual([]);
+      expect(registry.listEvents(taskId)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          assignmentId: assignment.value.assignmentId,
+          eventType: 'implementation_finished',
+          payload: expect.objectContaining({
+            validatedTopLevelHandoff: true,
+            implementationHandoff: 'FINISHED',
+            auditVerdict: null,
+            revision,
+          }),
+        }),
+      ]));
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const before = registry.get(taskId);
+      const events = registry.listEvents(taskId);
+      expect(registry.finishAssignment({
+        assignmentId: assignment.value.assignmentId, identity: owner, revision, now: 200,
+      })).toMatchObject({ ok: true, replay: true });
+      expect(registry.get(taskId)).toEqual(before);
+      expect(registry.listEvents(taskId)).toEqual(events);
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('persists implementation heartbeat cooldown receipts without advancing progress or fabricating PASS', () => {
@@ -2868,6 +3114,63 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.list()).toHaveLength(1);
     expect(registry.get('existing-visible-task')?.assignments.map((item) => item.identity.sessionName).sort())
       .toEqual(['deck_alpha_brain', 'deck_alpha_w1']);
+  });
+
+  it('send_message appends to the exact existing assignment with busy FIFO fallback and never mints a replacement', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'existing-task-exact-continuation';
+    const revision = 'existing-task-exact-r1';
+    expect(registry.createOrGet({
+      projectName: 'alpha', taskId, objective: 'exact append', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', identity: identity('deck_alpha_brain'), required: false,
+    })).toMatchObject({ ok: true });
+    const exact = registry.createAssignment({
+      assignmentId: 'exact-continuation-assignment', taskId, role: 'implementer',
+      identity: identity('deck_alpha_w1'), auditRevision: revision,
+    });
+    const historical = registry.createAssignment({
+      assignmentId: 'other-continuation-assignment', taskId, role: 'implementer',
+      identity: identity('deck_alpha_w2'), auditRevision: revision,
+    });
+    if (!exact.ok || !historical.ok) throw new Error('expected implementers');
+    for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+      expect(registry.updateAssignment({ assignmentId: exact.value.assignmentId, identity: exact.value.identity, status }))
+        .toMatchObject({ ok: true });
+    }
+    const assignmentCount = registry.listAssignments(taskId).length;
+    const sessions = [session('deck_alpha_brain'), session('deck_alpha_w1'), session('deck_alpha_w2')];
+    sessions[1]!.state = 'busy';
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true };
+    const caller = { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' };
+
+    const sent = await dispatchSendMessage(caller, {
+      target: 'deck_alpha_w1', message: 'append exact recovered work',
+      task: { taskId, assignmentId: exact.value.assignmentId, currentRevision: revision },
+    }, deps);
+    expect(sent).toMatchObject({
+      status: 'accepted', taskId, assignmentId: exact.value.assignmentId,
+      deliveries: [expect.objectContaining({ target: 'deck_alpha_w1', status: 'queued' })],
+    });
+    expect(dispatchMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'deck_alpha_w1' }),
+      expect.stringContaining('append exact recovered work'),
+      expect.objectContaining({ deliveryMode: 'append' }),
+    );
+    expect(registry.listAssignments(taskId)).toHaveLength(assignmentCount);
+
+    const ambiguous = await dispatchSendMessage(caller, {
+      target: 'deck_alpha_w1', message: 'must not guess', task: { taskId, currentRevision: revision },
+    }, deps);
+    expect(ambiguous).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    const wrong = await dispatchSendMessage(caller, {
+      target: 'deck_alpha_w1', message: 'must not replace',
+      task: { taskId, assignmentId: 'missing-assignment', currentRevision: revision },
+    }, deps);
+    expect(wrong).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(registry.listAssignments(taskId)).toHaveLength(assignmentCount);
   });
 
   it('send_message rejects missing and inaccessible explicit task ids without minting or dispatching', async () => {

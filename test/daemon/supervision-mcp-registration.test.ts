@@ -49,6 +49,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   rebound: any[] = [];
   revisionRebound: any[] = [];
   coordinated: any[] = [];
+  finished: any[] = [];
   housekeepingCalls: any[] = [];
   listCalls: any[] = [];
   item(taskId: string) {
@@ -67,6 +68,10 @@ class FakeRegistry implements SupervisionRegistryPort {
   }
   getStatus(taskId: string) { return this.statuses.get(taskId); }
   applyIntent(input: any) { this.applied.push(input); this.statuses.set(input.taskId, input.toStatus ?? this.statuses.get(input.taskId)!); }
+  finishAssignment(input: any) {
+    this.finished.push(input);
+    return { ok: true as const, value: { assignmentId: input.assignmentId, status: 'ready_for_audit', leaseId: '' } };
+  }
   list(filter: any) {
     this.listCalls.push(filter);
     // Mirrors the registry: an owner filter NARROWS, it does not authorize.
@@ -136,6 +141,10 @@ describe('production MCP registration', () => {
     for (const tool of SUPERVISION_MCP_REGISTERED_TOOLS) {
       expect(names, tool).toContain(tool);
     }
+    const intent = listed.tools.find((tool) => tool.name === SUPERVISION_MCP_TOOLS.INTENT);
+    expect(intent?.inputSchema).toMatchObject({
+      properties: { rebindSessionName: { type: 'string' } },
+    });
   });
 
   it('CONSOLIDATED: the legacy family no longer publishes list/get', async () => {
@@ -276,6 +285,65 @@ describe('production MCP registration', () => {
     expect(out).toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
     expect(registry.applied).toHaveLength(1);
     expect(registry.assignmentStates.get('tsk_a')).toHaveLength(2);
+  });
+
+  it('routes only a same-project Brain exact finish to auditor cleanup or same-session identity rebind', async () => {
+    registry.statuses.set('tsk_a', 'validated');
+    registry.assignmentStates.set('tsk_a', [
+      {
+        assignmentId: 'brain-coordinator', role: 'coordinator', status: 'delegated', leaseId: 'brain-lease',
+        identity: { sessionName: 'deck_cd_brain' },
+      },
+      {
+        assignmentId: 'drifted-worker', role: 'implementer', status: 'validated', leaseId: 'worker-lease',
+        identity: { sessionName: 'deck_same_worker' },
+      },
+      {
+        assignmentId: 'accepted-auditor', role: 'auditor', status: 'passed', leaseId: 'audit-lease',
+        auditAttemptId: 'accepted-attempt', identity: { sessionName: 'deck_auditor' },
+      },
+    ]);
+    const live = {
+      sessionName: 'deck_same_worker', sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch',
+      agentType: 'codex-sdk', providerFamily: 'openai', projectName: 'codedeck',
+    };
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === live.sessionName ? live : undefined,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId: 'tsk_a', assignmentId: 'drifted-worker',
+      rebindSessionName: live.sessionName,
+    })).toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
+    expect(registry.finished.at(-1)).toEqual({
+      assignmentId: 'drifted-worker', callerSessionName: 'deck_cd_brain', callerProjectName: 'codedeck',
+      projectBrain: true,
+      rebindIdentity: {
+        sessionName: live.sessionName, sessionInstanceId: live.sessionInstanceId,
+        runtimeEpoch: live.runtimeEpoch, agentType: live.agentType, providerFamily: live.providerFamily,
+      },
+      rebindProjectName: 'codedeck',
+    });
+
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId: 'tsk_a', assignmentId: 'accepted-auditor',
+    })).toMatchObject({ status: 'ok' });
+    expect(registry.finished.at(-1)).toEqual({
+      assignmentId: 'accepted-auditor', callerSessionName: 'deck_cd_brain',
+      callerProjectName: 'codedeck', projectBrain: true,
+    });
+
+    const before = registry.finished.length;
+    registry.item = (taskId: string) => ({
+      taskId, projectName: 'other-project', classification: 'integration_task', status: 'validated',
+      assignments: registry.assignmentStates.get(taskId) ?? [],
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId: 'tsk_a', assignmentId: 'drifted-worker',
+      rebindSessionName: live.sessionName,
+    })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(registry.finished).toHaveLength(before);
   });
 });
 

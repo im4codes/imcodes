@@ -658,6 +658,8 @@ export interface SupervisionTaskScopeReconciliation {
 export interface SupervisionTaskMetadata {
   topLevelTaskId?: string | null;
   taskId?: string | null;
+  /** Exact existing assignment for an append-only task continuation. */
+  assignmentId?: string | null;
   sliceId?: string | null;
   classification?: SupervisionTaskClassification | null;
   objective?: string | null;
