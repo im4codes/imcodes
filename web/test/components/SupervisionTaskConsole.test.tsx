@@ -485,9 +485,9 @@ describe('SupervisionTaskConsole', () => {
     ]);
   });
 
-  it('provides keyboard tabs, keeps cancelled ongoing, and preserves expanded details across tabs', () => {
+  it('provides keyboard tabs, moves terminal tasks to history, and preserves expanded details', () => {
     const initial = state();
-    const completed = {
+    const finalized = {
       taskId: 'task-complete', title: 'Released task', status: 'finalized' as const, phase: 'final' as const,
       validationState: 'passed' as const, updatedAt: NOW + 1, lastEventId: 22,
     };
@@ -495,31 +495,107 @@ describe('SupervisionTaskConsole', () => {
       taskId: 'task-cancelled', title: 'Cancelled task', status: 'cancelled' as const, phase: 'final' as const,
       validationState: 'failed' as const, updatedAt: NOW + 2, lastEventId: 23,
     };
-    render(<SupervisionTaskConsoleView state={state({ tasks: { ...initial.tasks, [completed.taskId]: completed, [cancelled.taskId]: cancelled } })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
-    const ongoing = screen.getByRole('tab', { name: /supervision_task_console.tab_ongoing/ });
+    const staleRunningAssignment = {
+      assignmentId: 'cancelled-running', taskId: cancelled.taskId, status: 'implementing' as const,
+      phase: 'active' as const, role: 'implementer', ownerSessionName: 'deck_alpha_old_worker',
+      ownerSessionLabel: 'Stale Running Worker', validationState: 'pending' as const,
+      sessionState: 'running' as const, sessionStateSource: 'runtime' as const,
+      sessionStateObservedAt: NOW + 3, updatedAt: NOW + 3, lastEventId: 24,
+    };
+    render(<SupervisionTaskConsoleView state={state({
+      tasks: { ...initial.tasks, [finalized.taskId]: finalized, [cancelled.taskId]: cancelled },
+      assignments: { ...initial.assignments, [staleRunningAssignment.assignmentId]: staleRunningAssignment },
+    })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
+    const active = screen.getByRole('tab', { name: /supervision_task_console.tab_active/ });
     fireEvent.click(screen.getByText('Build live task console'));
-    expect(screen.getByText('Cancelled task')).toBeTruthy();
-    expect(screen.queryByText('Released task')).toBeNull();
-    fireEvent.keyDown(ongoing, { key: 'ArrowRight' });
-    const completedTab = screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ });
-    expect(document.activeElement).toBe(completedTab);
-    expect(completedTab.getAttribute('aria-selected')).toBe('true');
-    expect(screen.getByText('Released task')).toBeTruthy();
     expect(screen.queryByText('Cancelled task')).toBeNull();
-    fireEvent.keyDown(completedTab, { key: 'Home' });
+    expect(screen.queryByText('Released task')).toBeNull();
+    fireEvent.keyDown(active, { key: 'ArrowRight' });
+    const historyTab = screen.getByRole('tab', { name: /supervision_task_console.tab_history/ });
+    expect(document.activeElement).toBe(historyTab);
+    expect(historyTab.getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByText('Released task')).toBeTruthy();
+    expect(screen.getByText('Cancelled task')).toBeTruthy();
+    expect(screen.getByTestId('task-card-task-cancelled').getAttribute('data-activity-state')).toBe('terminal');
+    expect(screen.getByText('Stale Running Worker')).toBeTruthy();
+    fireEvent.keyDown(historyTab, { key: 'Home' });
+    expect(document.activeElement).toBe(active);
     expect(screen.getByText('supervision_task_console.event_op.assignment_upsert')).toBeTruthy();
   });
 
-  it('limits completed history to ten rows until show-more is requested', () => {
+  it('limits history to ten rows until show-more is requested', () => {
     const tasks = Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`done-${index}`, {
       taskId: `done-${index}`, title: `Done ${index}`, status: 'pushed' as const, phase: 'final' as const,
       validationState: 'passed' as const, updatedAt: NOW - index, lastEventId: index + 1,
     }]));
     render(<SupervisionTaskConsoleView state={state({ tasks, assignments: {} })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
-    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ }));
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_history/ }));
     expect(screen.getAllByTestId(/task-card-/)).toHaveLength(10);
     fireEvent.click(screen.getByRole('button', { name: 'supervision_task_console.show_more' }));
     expect(screen.getAllByTestId(/task-card-/)).toHaveLength(12);
+  });
+
+  it('keeps a cancelled-heavy production projection out of the default active tab', () => {
+    const cancelledTasks = Object.fromEntries(Array.from({ length: 36 }, (_, index) => [`cancelled-${index}`, {
+      taskId: `cancelled-${index}`, title: `Cancelled load ${index}`, status: 'cancelled' as const,
+      phase: 'final' as const, validationState: 'failed' as const,
+      updatedAt: NOW - index, lastEventId: 100 + index,
+    }]));
+    const cancelledAssignments = Object.fromEntries(Array.from({ length: 36 }, (_, index) => [`cancelled-assignment-${index}`, {
+      assignmentId: `cancelled-assignment-${index}`, taskId: `cancelled-${index}`,
+      status: 'implementing' as const, phase: 'active' as const, role: 'implementer',
+      ownerSessionName: `deck_alpha_cancelled_${index}`, validationState: 'pending' as const,
+      sessionState: 'running' as const, sessionStateSource: 'runtime' as const,
+      sessionStateObservedAt: NOW, updatedAt: NOW, lastEventId: 200 + index,
+    }]));
+    const activeTasks = {
+      implementing: {
+        taskId: 'implementing', title: 'Still implementing', status: 'implementing' as const,
+        phase: 'active' as const, validationState: 'pending' as const, updatedAt: NOW + 1, lastEventId: 301,
+      },
+      auditing: {
+        taskId: 'auditing', title: 'Still auditing', status: 'auditing' as const,
+        phase: 'audit' as const, validationState: 'pending' as const, updatedAt: NOW + 2, lastEventId: 302,
+      },
+    };
+    render(<SupervisionTaskConsoleView state={state({
+      tasks: { ...cancelledTasks, ...activeTasks },
+      assignments: cancelledAssignments,
+    })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
+
+    expect(screen.getAllByTestId(/task-card-/)).toHaveLength(2);
+    expect(screen.getByText('Still implementing')).toBeTruthy();
+    expect(screen.getByText('Still auditing')).toBeTruthy();
+    expect(screen.queryByText('Cancelled load 0')).toBeNull();
+    const historyTab = screen.getByRole('tab', { name: /supervision_task_console\.tab_history 36/ });
+    fireEvent.click(historyTab);
+    for (let page = 10; page < 36; page += 10) {
+      fireEvent.click(screen.getByRole('button', { name: 'supervision_task_console.show_more' }));
+    }
+    const historyCards = screen.getAllByTestId(/task-card-/);
+    expect(historyCards).toHaveLength(36);
+    expect(historyCards.every((card) => card.getAttribute('data-status') === 'cancelled')).toBe(true);
+    expect(historyCards.every((card) => card.getAttribute('data-activity-state') === 'terminal')).toBe(true);
+    expect(screen.queryByText('Still implementing')).toBeNull();
+    expect(screen.queryByText('Still auditing')).toBeNull();
+  });
+
+  it('renders distinct localized empty states for active and history tabs', () => {
+    const ended = {
+      taskId: 'ended-only', title: 'Ended only', status: 'finalized' as const,
+      phase: 'final' as const, validationState: 'passed' as const, updatedAt: NOW, lastEventId: 1,
+    };
+    const view = render(<SupervisionTaskConsoleView state={state({ tasks: { [ended.taskId]: ended }, assignments: {} })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
+    expect(screen.getByText('supervision_task_console.no_active')).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_history/ }));
+    expect(screen.getByText('Ended only')).toBeTruthy();
+
+    const active = {
+      taskId: 'active-only', title: 'Active only', status: 'implementing' as const,
+      phase: 'active' as const, validationState: 'pending' as const, updatedAt: NOW, lastEventId: 2,
+    };
+    view.rerender(<SupervisionTaskConsoleView state={state({ tasks: { [active.taskId]: active }, assignments: {} })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
+    expect(screen.getByText('supervision_task_console.no_history')).toBeTruthy();
   });
 
   it('renders compact tabs and authoritative role states without heartbeat inference', () => {
@@ -541,8 +617,8 @@ describe('SupervisionTaskConsole', () => {
     expect(separator.getAttribute('aria-valuenow')).toBe('720');
     fireEvent.keyDown(separator, { key: 'ArrowLeft' });
     expect(onResizeKeyDown).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('tab', { name: /supervision_task_console.tab_ongoing/ }).getAttribute('aria-selected')).toBe('true');
-    expect(screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console.tab_active/ }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: /supervision_task_console.tab_history/ })).toBeTruthy();
     expect(screen.queryByText('supervision_task_console.heartbeat_stale')).toBeNull();
     expect(readFileSync(resolve(import.meta.dirname, '../../src/components/SupervisionTaskConsole.tsx'), 'utf8')).not.toMatch(/heartbeat/i);
     expect(screen.getAllByText(/supervision_task_console\.session_state\.running/)).toHaveLength(2);
@@ -652,17 +728,19 @@ describe('SupervisionTaskConsole', () => {
         onNavigateSession={() => {}}
       />,
     );
-    for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES.filter((value) => !['committed', 'pushed', 'finalized'].includes(value))) {
+    const historyStatuses = ['committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled'];
+    for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES.filter((value) => !historyStatuses.includes(value))) {
       expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
     }
-    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_completed/ }));
-    for (const status of ['committed', 'pushed', 'finalized']) {
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_history/ }));
+    for (const status of historyStatuses) {
       expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
     }
     const css = readFileSync(resolve(import.meta.dirname, '../../src/styles.css'), 'utf8');
     expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?activity-running[\s\S]*?animation:\s*none/);
     expect(css).toMatch(/container-name:\s*supervision-console/);
     expect(css).toMatch(/@container supervision-console \(min-width: 1080px\)[\s\S]*?grid-template-columns:\s*repeat\(2/);
+    expect(css).toMatch(/activity-terminal[\s\S]*?animation:\s*none/);
     const app = readFileSync(resolve(import.meta.dirname, '../../src/app.tsx'), 'utf8');
     expect(app).toMatch(/onNavigateSession=\{\(sessionName\) => \{\s*navigateToSession\(sessionName\);/);
     expect(app).toMatch(/<SupervisionTaskConsole[\s\S]*?connected=\{connected && daemonOnline\}/);

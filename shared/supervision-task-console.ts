@@ -32,6 +32,7 @@
  * values and only `import type` may ever reference that module.
  */
 import {
+  isTerminalSupervisionTaskStatus,
   isSupervisionTaskLifecycleStatus,
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
   type SupervisionTaskLifecycleStatus,
@@ -221,18 +222,34 @@ export function supervisionConsoleStatusGroup(
   return SUPERVISION_CONSOLE_STATUS_GROUP[status];
 }
 
-/** Product-level tabs. Only genuinely shipped terminal states are completed. */
-export const SUPERVISION_CONSOLE_TABS = ['ongoing', 'completed'] as const;
+/** Product-level tabs. Task status, never nested runtime appearance, owns this partition. */
+export const SUPERVISION_CONSOLE_TABS = ['active', 'history'] as const;
 export type SupervisionConsoleTab = typeof SUPERVISION_CONSOLE_TABS[number];
-export const SUPERVISION_CONSOLE_COMPLETED_STATUSES = Object.freeze([
-  'committed', 'pushed', 'finalized',
+
+/**
+ * History includes every canonical terminal task status plus two settled
+ * boundary states that must leave the action queue. `committed` awaits only
+ * publication and `recovered` is retained as evidence; neither represents an
+ * implementer/auditor action for the console. The canonical terminal predicate
+ * remains authoritative for pushed/finalized/blocked/cancelled.
+ */
+export const SUPERVISION_CONSOLE_HISTORY_STATUSES = Object.freeze([
+  'committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled',
 ] as const satisfies readonly SupervisionTaskLifecycleStatus[]);
-const COMPLETED_STATUS_SET = new Set<SupervisionTaskLifecycleStatus>(SUPERVISION_CONSOLE_COMPLETED_STATUSES);
+const HISTORY_BOUNDARY_STATUS_SET = new Set<SupervisionTaskLifecycleStatus>([
+  'committed', 'recovered',
+]);
+
+export function isSupervisionConsoleHistoryStatus(
+  status: SupervisionTaskLifecycleStatus,
+): boolean {
+  return isTerminalSupervisionTaskStatus(status) || HISTORY_BOUNDARY_STATUS_SET.has(status);
+}
 
 export function supervisionConsoleTabForStatus(
   status: SupervisionTaskLifecycleStatus,
 ): SupervisionConsoleTab {
-  return COMPLETED_STATUS_SET.has(status) ? 'completed' : 'ongoing';
+  return isSupervisionConsoleHistoryStatus(status) ? 'history' : 'active';
 }
 
 /** Authoritative session activity presented by the daemon; never heartbeat-derived. */

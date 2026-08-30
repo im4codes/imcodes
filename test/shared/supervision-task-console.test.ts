@@ -4,13 +4,14 @@ import {
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
   SUPERVISION_CONSOLE_STATUS_GROUP,
   SUPERVISION_CONSOLE_STATUS_GROUPS,
-  SUPERVISION_CONSOLE_COMPLETED_STATUSES,
+  SUPERVISION_CONSOLE_HISTORY_STATUSES,
   SUPERVISION_CONSOLE_RESYNC_REASONS,
   SUPERVISION_CONSOLE_TRANSITION_FIELDS,
   canCoalesceSupervisionTaskRows,
   evaluateSupervisionConsoleCursor,
   initialSupervisionConsoleCursor,
   isStaleSupervisionConsoleResponse,
+  isSupervisionConsoleHistoryStatus,
   isSupervisionConsoleAudienceMember,
   isValidSupervisionTaskConsoleEvent,
   supervisionConsoleStatusGroup,
@@ -22,6 +23,7 @@ import {
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+  isTerminalSupervisionTaskStatus,
 } from '../../shared/supervision-config.js';
 
 const SCOPE = { projectName: 'codedeck', coordinatorSessionName: 'deck_cd_brain' };
@@ -59,15 +61,23 @@ describe('supervision task console status grouping', () => {
     }
   });
 
-  it('puts only committed, pushed and finalized in completed history', () => {
-    expect(SUPERVISION_CONSOLE_COMPLETED_STATUSES).toEqual(['committed', 'pushed', 'finalized']);
+  it('partitions every task status into active or history with canonical terminal precedence', () => {
+    expect(SUPERVISION_CONSOLE_HISTORY_STATUSES).toEqual([
+      'committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled',
+    ]);
     for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES) {
+      const history = (SUPERVISION_CONSOLE_HISTORY_STATUSES as readonly string[]).includes(status);
       expect(supervisionConsoleTabForStatus(status), status).toBe(
-        ['committed', 'pushed', 'finalized'].includes(status) ? 'completed' : 'ongoing',
+        history ? 'history' : 'active',
       );
+      expect(isSupervisionConsoleHistoryStatus(status), status).toBe(history);
+      if (isTerminalSupervisionTaskStatus(status)) {
+        expect(supervisionConsoleTabForStatus(status), status).toBe('history');
+      }
     }
-    expect(supervisionConsoleTabForStatus('blocked')).toBe('ongoing');
-    expect(supervisionConsoleTabForStatus('cancelled')).toBe('ongoing');
+    expect(supervisionConsoleTabForStatus('implementing')).toBe('active');
+    expect(supervisionConsoleTabForStatus('auditing')).toBe('active');
+    expect(supervisionConsoleTabForStatus('ready_for_integration')).toBe('active');
   });
 });
 
