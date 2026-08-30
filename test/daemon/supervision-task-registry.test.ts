@@ -105,7 +105,7 @@ function makeRegistry(): SupervisionTaskRegistry {
 function prepareStructuredFinalizationShape(
   registry: SupervisionTaskRegistry,
   taskId: string,
-  options: { selfAudit?: boolean } = {},
+  options: { selfAudit?: boolean; leaveOwnerLeaseActive?: boolean } = {},
 ) {
   const revision = `${taskId}-r1`;
   const attemptId = `${taskId}-overall-audit`;
@@ -169,9 +169,15 @@ function prepareStructuredFinalizationShape(
   expect(registry.finishAssignment({
     assignmentId: implementer.value.assignmentId, identity: implementer.value.identity, revision,
   })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
-  expect(registry.finishAssignment({
-    assignmentId: owner.value.assignmentId, identity: owner.value.identity, revision,
-  })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
+  if (!options.leaveOwnerLeaseActive) {
+    expect(registry.finishAssignment({
+      assignmentId: owner.value.assignmentId, identity: owner.value.identity, revision,
+    })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
+  } else {
+    expect(registry.getAssignment(owner.value.assignmentId)).toMatchObject({
+      status: 'ready_for_integration', leaseId: expect.stringMatching(/^supervision_lease_/),
+    });
+  }
   const finalization = {
     assignmentId: owner.value.assignmentId,
     revision,
@@ -194,6 +200,76 @@ function prepareStructuredFinalizationShape(
   };
   expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
   return { taskId, revision, attemptId, files, owner: owner.value, coordinator: coordinator.value, auditor: auditor.value, finalization };
+}
+
+function prepareStaleRuntimeIntegrationOwnerShape(
+  registry: SupervisionTaskRegistry,
+  taskId: string,
+  options: {
+    oldOwnerLeaseActive?: boolean;
+    replacementSessionName?: string;
+    replacementScopeFiles?: string[];
+    addBrainCoordinator?: boolean;
+    addConcurrentOwner?: boolean;
+  } = {},
+) {
+  const shape = prepareStructuredFinalizationShape(registry, taskId, {
+    leaveOwnerLeaseActive: options.oldOwnerLeaseActive,
+  });
+  const replacementIdentity = {
+    ...shape.owner.identity,
+    sessionName: options.replacementSessionName ?? shape.owner.identity.sessionName,
+    sessionInstanceId: `${taskId}-replacement-instance`,
+    runtimeEpoch: `${taskId}-replacement-epoch`,
+  };
+  if (options.addBrainCoordinator !== false) {
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', identity: replacementIdentity, required: false,
+    })).toMatchObject({ ok: true });
+  }
+  const replacement = registry.createAssignment({
+    assignmentId: `${taskId}-replacement-owner`, taskId, role: 'integration_owner',
+    identity: replacementIdentity,
+    scopeFiles: options.replacementScopeFiles ?? shape.files,
+  });
+  if (!replacement.ok) throw new Error(replacement.reason);
+  for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
+    expect(registry.updateAssignment({
+      assignmentId: replacement.value.assignmentId,
+      identity: replacementIdentity,
+      status,
+      revision: shape.revision,
+      auditAttemptId: shape.attemptId,
+      auditRevision: shape.revision,
+      ...(status === 'passed' || status === 'ready_for_integration' ? {
+        verdict: 'PASS', crossVendorAuditPassed: true,
+      } : {}),
+      externalRunId: shape.finalization.externalRunId,
+      externalHeadSha: shape.finalization.externalHeadSha,
+      externalTaskId: shape.finalization.externalTaskId,
+    }), `replacement:${status}`).toMatchObject({ ok: true });
+  }
+  expect(registry.finishAssignment({
+    assignmentId: replacement.value.assignmentId,
+    identity: replacementIdentity,
+    revision: shape.revision,
+  })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
+  if (options.addConcurrentOwner) {
+    expect(registry.createAssignment({
+      assignmentId: `${taskId}-concurrent-owner`, taskId, role: 'integration_owner',
+      identity: identity(`${taskId}-concurrent-owner`), scopeFiles: shape.files,
+    })).toMatchObject({ ok: true, value: { status: 'delegated', leaseId: expect.any(String) } });
+  }
+  return {
+    ...shape,
+    replacement: replacement.value,
+    replacementIdentity,
+    finalization: {
+      ...shape.finalization,
+      assignmentId: replacement.value.assignmentId,
+      integrationOwner: replacementIdentity.sessionName,
+    },
+  };
 }
 
 beforeEach(() => {
@@ -341,6 +417,118 @@ describe('SupervisionTaskRegistry', () => {
     } finally {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('atomically rebinds a stale same-session integration owner after restart and replays idempotently', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-stale-integration-owner-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      const shape = prepareStaleRuntimeIntegrationOwnerShape(registry, 'stale-runtime-owner-restart');
+      expect(registry.get(shape.taskId)).toMatchObject({
+        status: 'ready_for_integration',
+        currentRevision: shape.revision,
+        integrationOwnerAssignmentId: shape.owner.assignmentId,
+        assignments: expect.arrayContaining([
+          expect.objectContaining({
+            assignmentId: shape.owner.assignmentId,
+            role: 'integration_owner', status: 'ready_for_integration', leaseId: '',
+          }),
+          expect.objectContaining({
+            assignmentId: shape.replacement.assignmentId,
+            role: 'integration_owner', status: 'ready_for_integration', leaseId: '',
+          }),
+        ]),
+      });
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+
+      const eventCount = registry.listEvents(shape.taskId).length;
+      expect(registry.finalizeIntegration({
+        ...shape.finalization, identity: shape.replacementIdentity, now: 500,
+      })).toMatchObject({
+        ok: true,
+        value: {
+          status: 'finalized',
+          integrationOwnerAssignmentId: shape.replacement.assignmentId,
+          archivedAt: 500,
+        },
+      });
+      expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
+        status: 'ready_for_integration', leaseId: '',
+      });
+      const firstFinalizationTaskEvent = registry.listEvents(shape.taskId)
+        .slice(eventCount)
+        .find((event) => !event.assignmentId);
+      expect(firstFinalizationTaskEvent).toMatchObject({
+        status: 'integrating',
+        payload: {
+          integrationOwnerReboundFromAssignmentId: shape.owner.assignmentId,
+          integrationOwnerReboundToAssignmentId: shape.replacement.assignmentId,
+        },
+      });
+
+      const finalizedEventCount = registry.listEvents(shape.taskId).length;
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.finalizeIntegration({
+        ...shape.finalization, identity: shape.replacementIdentity, now: 900,
+      })).toMatchObject({
+        ok: true, replay: true,
+        value: {
+          status: 'finalized',
+          integrationOwnerAssignmentId: shape.replacement.assignmentId,
+          archivedAt: 500,
+        },
+      });
+      expect(registry.listEvents(shape.taskId)).toHaveLength(finalizedEventCount);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when stale integration-owner replacement evidence or authority is not exact', () => {
+    const cases = [
+      {
+        taskId: 'stale-owner-different-session',
+        options: { replacementSessionName: 'deck_other_brain' },
+        reason: 'owner_mismatch',
+      },
+      {
+        taskId: 'stale-owner-live-lease',
+        options: { oldOwnerLeaseActive: true },
+        reason: 'owner_mismatch',
+      },
+      {
+        taskId: 'stale-owner-scope-mismatch',
+        options: { replacementScopeFiles: ['src/final-a.ts'] },
+        reason: 'owner_mismatch',
+      },
+      {
+        taskId: 'stale-owner-not-project-brain',
+        options: { addBrainCoordinator: false },
+        reason: 'owner_mismatch',
+      },
+      {
+        taskId: 'stale-owner-ambiguous-active-owner',
+        options: { addConcurrentOwner: true },
+        reason: 'ambiguous_assignment',
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const registry = makeRegistry();
+      const shape = prepareStaleRuntimeIntegrationOwnerShape(registry, testCase.taskId, testCase.options);
+      const before = registry.get(shape.taskId);
+      const eventCount = registry.listEvents(shape.taskId).length;
+      expect(registry.finalizeIntegration({
+        ...shape.finalization, identity: shape.replacementIdentity,
+      }), testCase.taskId).toEqual({ ok: false, reason: testCase.reason });
+      expect(registry.get(shape.taskId), testCase.taskId).toEqual(before);
+      expect(registry.listEvents(shape.taskId), testCase.taskId).toHaveLength(eventCount);
+      registry.close();
     }
   });
 

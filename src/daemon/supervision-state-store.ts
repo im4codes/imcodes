@@ -1968,8 +1968,7 @@ export class SupervisionTaskRegistry {
     if (task.status !== 'ready_for_integration' || owner.status !== 'ready_for_integration') {
       return { ok: false, reason: 'invalid_transition' };
     }
-    if (task.integrationOwnerAssignmentId !== owner.assignmentId
-      || integrationOwner !== owner.identity.sessionName) return { ok: false, reason: 'owner_mismatch' };
+    if (integrationOwner !== owner.identity.sessionName) return { ok: false, reason: 'owner_mismatch' };
     if (task.currentRevision !== revision || auditRevision !== revision
       || owner.auditRevision !== revision) return { ok: false, reason: 'old_revision' };
     if (owner.auditAttemptId !== auditAttemptId || owner.verdict?.trim().toUpperCase() !== 'PASS') {
@@ -1981,6 +1980,52 @@ export class SupervisionTaskRegistry {
     if (!sameStringArray(ownedFiles, expectedOwnedFiles)
       || !sameStringArray(stagedPaths, ownedFiles)
       || !sameStringArray(manifestPaths, ownedFiles)) return { ok: false, reason: 'manifest_mismatch' };
+
+    // A daemon restart changes the runtime identity tuple while preserving the
+    // durable Brain session name. task_start therefore creates a fresh owner
+    // assignment, but older registries leave the task pointer on the previous
+    // runtime. Repair only that exact, evidence-equivalent shape. The pointer
+    // update is written below in the same transaction as finalization; this is
+    // not a general owner-selection or recovery mechanism.
+    let integrationOwnerReboundFromAssignmentId: string | undefined;
+    if (task.integrationOwnerAssignmentId !== owner.assignmentId) {
+      const staleOwner = task.integrationOwnerAssignmentId
+        ? assignments.find((assignment) => assignment.assignmentId === task.integrationOwnerAssignmentId)
+        : undefined;
+      const concurrentOwners = assignments.filter((assignment) => (
+        assignment.role === 'integration_owner'
+        && assignment.assignmentId !== owner.assignmentId
+        && assignment.assignmentId !== staleOwner?.assignmentId
+        && (assignment.leaseId !== '' || !['cancelled', 'finalized'].includes(assignment.status))
+      ));
+      if (concurrentOwners.length > 0) return { ok: false, reason: 'ambiguous_assignment' };
+      const callerIsProjectBrain = assignments.some((assignment) => (
+        assignment.role === 'coordinator'
+        && assignment.identity.sessionName === owner.identity.sessionName
+      ));
+      const staleOwnerHasClaims = staleOwner
+        ? this.listFileClaims(task.taskId).some((claim) => claim.assignmentId === staleOwner.assignmentId)
+        : false;
+      const exactStaleRuntimeOwner = Boolean(
+        staleOwner
+        && staleOwner.role === 'integration_owner'
+        && staleOwner.taskId === task.taskId
+        && staleOwner.identity.sessionName === owner.identity.sessionName
+        && !identityMatches(staleOwner.identity, owner.identity)
+        && staleOwner.status === 'ready_for_integration'
+        && staleOwner.leaseId === ''
+        && !staleOwnerHasClaims
+        && staleOwner.auditRevision === revision
+        && staleOwner.auditAttemptId === auditAttemptId
+        && staleOwner.verdict?.trim().toUpperCase() === 'PASS'
+        && staleOwner.crossVendorAuditPassed === true
+        && owner.crossVendorAuditPassed === true
+        && sameStringArray(staleOwner.scopeFiles, owner.scopeFiles)
+        && callerIsProjectBrain
+      );
+      if (!exactStaleRuntimeOwner) return { ok: false, reason: 'owner_mismatch' };
+      integrationOwnerReboundFromAssignmentId = staleOwner!.assignmentId;
+    }
 
     const exactAuditors = assignments.filter((assignment) => (
       assignment.role === 'auditor'
@@ -2016,7 +2061,9 @@ export class SupervisionTaskRegistry {
     const now = input.now ?? Date.now();
     this.#db.exec('BEGIN IMMEDIATE');
     try {
-      taskRecord = task;
+      taskRecord = integrationOwnerReboundFromAssignmentId
+        ? { ...task, integrationOwnerAssignmentId: owner.assignmentId }
+        : task;
       ownerRecord = owner;
       for (const status of chain) {
         ownerRecord = {
@@ -2048,6 +2095,10 @@ export class SupervisionTaskRegistry {
           auditRevision,
           revision,
           integrationOwner,
+          ...(integrationOwnerReboundFromAssignmentId ? {
+            integrationOwnerReboundFromAssignmentId,
+            integrationOwnerReboundToAssignmentId: owner.assignmentId,
+          } : {}),
           ...(status === 'committed' ? { commitSha } : {}),
           ...(status === 'pushed' ? { pushResult: input.pushResult, pushRemoteRef } : {}),
           ...(status === 'finalized' ? { externalRunId, externalHeadSha, ciResult: 'success' } : {}),
