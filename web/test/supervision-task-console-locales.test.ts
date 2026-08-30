@@ -27,7 +27,7 @@ describe('supervision task console locales', () => {
       expect(Object.keys(messages.supervision_task_console.status).sort(), locale)
         .toEqual([...SUPERVISION_TASK_LIFECYCLE_STATUSES].sort());
       expect(messages.supervision_task_console.title.trim().length, locale).toBeGreaterThan(0);
-      for (const key of ['tab_active', 'tab_history', 'no_active', 'no_history'] as const) {
+      for (const key of ['tab_active', 'tab_pending', 'tab_history', 'no_active', 'no_pending', 'no_history'] as const) {
         expect(messages.supervision_task_console[key].trim().length, `${locale}:${key}`).toBeGreaterThan(0);
       }
     }
@@ -38,7 +38,9 @@ describe('supervision task console locales', () => {
       if (locale === 'en') continue;
       expect(messages.supervision_task_console.title, locale).not.toBe(en.supervision_task_console.title);
       expect(messages.supervision_task_console.loading, locale).not.toBe(en.supervision_task_console.loading);
+      expect(messages.supervision_task_console.tab_pending, locale).not.toBe(en.supervision_task_console.tab_pending);
       expect(messages.supervision_task_console.tab_history, locale).not.toBe(en.supervision_task_console.tab_history);
+      expect(messages.supervision_task_console.no_pending, locale).not.toBe(en.supervision_task_console.no_pending);
       expect(messages.supervision_task_console.no_history, locale).not.toBe(en.supervision_task_console.no_history);
     }
   });

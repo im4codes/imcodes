@@ -32,7 +32,6 @@
  * values and only `import type` may ever reference that module.
  */
 import {
-  isTerminalSupervisionTaskStatus,
   isSupervisionTaskLifecycleStatus,
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
   type SupervisionTaskLifecycleStatus,
@@ -223,33 +222,65 @@ export function supervisionConsoleStatusGroup(
 }
 
 /** Product-level tabs. Task status, never nested runtime appearance, owns this partition. */
-export const SUPERVISION_CONSOLE_TABS = ['active', 'history'] as const;
+export const SUPERVISION_CONSOLE_TABS = ['active', 'pending', 'history'] as const;
 export type SupervisionConsoleTab = typeof SUPERVISION_CONSOLE_TABS[number];
 
 /**
- * History includes every canonical terminal task status plus two settled
- * boundary states that must leave the action queue. `committed` awaits only
- * publication and `recovered` is retained as evidence; neither represents an
- * implementer/auditor action for the console. The canonical terminal predicate
- * remains authoritative for pushed/finalized/blocked/cancelled.
+ * Console presence is task-lifecycle authority, not a projection of whether a
+ * session happens to be running somewhere. Keep these sets explicit and
+ * exhaustive so a new status cannot silently inflate the Active count.
+ *
+ * `blocked` deliberately stays pending: it still needs operator action. The
+ * History tab is the settled product history, so it also retains `committed`
+ * and `recovered` even though they are not canonical registry terminal states.
  */
-export const SUPERVISION_CONSOLE_HISTORY_STATUSES = Object.freeze([
-  'committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled',
-] as const satisfies readonly SupervisionTaskLifecycleStatus[]);
-const HISTORY_BOUNDARY_STATUS_SET = new Set<SupervisionTaskLifecycleStatus>([
-  'committed', 'recovered',
-]);
+export const SUPERVISION_CONSOLE_TAB_BY_STATUS: Readonly<Record<
+  SupervisionTaskLifecycleStatus,
+  SupervisionConsoleTab
+>> = Object.freeze({
+  planned: 'pending',
+  delegated: 'pending',
+  implementing: 'active',
+  retrying_external_ci: 'active',
+  validated: 'pending',
+  ready_for_audit: 'pending',
+  auditing: 'active',
+  rework: 'pending',
+  passed: 'pending',
+  ready_for_integration: 'pending',
+  integrating: 'active',
+  final_audit: 'active',
+  finalizing: 'active',
+  committed: 'history',
+  pushed: 'history',
+  recovered: 'history',
+  finalized: 'history',
+  blocked: 'pending',
+  cancelled: 'history',
+});
+
+function supervisionConsoleStatusesForTab(
+  tab: SupervisionConsoleTab,
+): readonly SupervisionTaskLifecycleStatus[] {
+  return Object.freeze((Object.entries(SUPERVISION_CONSOLE_TAB_BY_STATUS) as Array<
+    [SupervisionTaskLifecycleStatus, SupervisionConsoleTab]
+  >).filter(([, statusTab]) => statusTab === tab).map(([status]) => status));
+}
+
+export const SUPERVISION_CONSOLE_ACTIVE_STATUSES = supervisionConsoleStatusesForTab('active');
+export const SUPERVISION_CONSOLE_PENDING_STATUSES = supervisionConsoleStatusesForTab('pending');
+export const SUPERVISION_CONSOLE_HISTORY_STATUSES = supervisionConsoleStatusesForTab('history');
 
 export function isSupervisionConsoleHistoryStatus(
   status: SupervisionTaskLifecycleStatus,
 ): boolean {
-  return isTerminalSupervisionTaskStatus(status) || HISTORY_BOUNDARY_STATUS_SET.has(status);
+  return SUPERVISION_CONSOLE_TAB_BY_STATUS[status] === 'history';
 }
 
 export function supervisionConsoleTabForStatus(
   status: SupervisionTaskLifecycleStatus,
 ): SupervisionConsoleTab {
-  return isSupervisionConsoleHistoryStatus(status) ? 'history' : 'active';
+  return SUPERVISION_CONSOLE_TAB_BY_STATUS[status];
 }
 
 /** Authoritative session activity presented by the daemon; never heartbeat-derived. */

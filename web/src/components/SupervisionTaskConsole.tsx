@@ -2,6 +2,7 @@ import type { ComponentChildren, RefObject } from 'preact';
 import { useMemo, useRef, useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
+  SUPERVISION_CONSOLE_TABS,
   supervisionConsoleStatusGroup,
   supervisionConsoleTabForStatus,
   type SupervisionConsoleTab,
@@ -137,8 +138,13 @@ function taskPriority(
   assignments: readonly SupervisionTaskConsoleAssignmentRow[],
 ): number {
   const roleAssignments = taskRoleAssignments(assignments);
-  if (task.status === 'blocked' || task.status === 'cancelled' || task.blocker
-    || roleAssignments.some((assignment) => assignment.sessionState === 'needs_input')) return 0;
+  const tab = supervisionConsoleTabForStatus(task.status);
+  if (task.status === 'blocked' || task.blocker) return 0;
+  if (tab !== 'active') {
+    const group = supervisionConsoleStatusGroup(task.status);
+    return group === 'audit' || group === 'rework' || group === 'integration' ? 3 : 5;
+  }
+  if (roleAssignments.some((assignment) => assignment.sessionState === 'needs_input')) return 0;
   if (roleAssignments.some((assignment) => isImplementerAssignment(assignment) && assignment.sessionState === 'running')) return 1;
   if (roleAssignments.some((assignment) => isAuditAssignment(assignment) && assignment.sessionState === 'running')) return 2;
   const group = supervisionConsoleStatusGroup(task.status);
@@ -152,6 +158,7 @@ function authoritativeActivityAt(
   task: SupervisionTaskConsoleTaskRow,
   assignments: readonly SupervisionTaskConsoleAssignmentRow[],
 ): number {
+  if (supervisionConsoleTabForStatus(task.status) !== 'active') return task.updatedAt;
   const roleAssignments = taskRoleAssignments(assignments);
   if (roleAssignments.length === 0) return task.updatedAt;
   return Math.max(...roleAssignments.map((assignment) => (
@@ -176,6 +183,8 @@ export function sortSupervisionConsoleTasks(
 
 function SessionButton(props: {
   assignment: SupervisionTaskConsoleAssignmentRow;
+  taskStatus: SupervisionTaskConsoleTaskRow['status'];
+  taskTab: SupervisionConsoleTab;
   lane: 'implementer' | 'auditor';
   onNavigateSession: (sessionName: string) => void;
 }) {
@@ -183,13 +192,18 @@ function SessionButton(props: {
   const { assignment } = props;
   const name = assignment.ownerSessionName;
   const state = assignment.sessionState ?? 'unknown';
+  const showRuntimeState = props.taskTab === 'active';
+  const stateLabel = showRuntimeState
+    ? t(`supervision_task_console.session_state.${state}`)
+    : t(displayStatusKey(props.taskStatus));
   if (!name) return null;
   return (
     <button
       type="button"
-      class={`supervision-task-console-session session-${state} lane-${props.lane}`}
-      data-session-state={state}
-      aria-label={`${t(`supervision_task_console.${props.lane}`)}: ${assignment.ownerSessionLabel || name}, ${t(`supervision_task_console.session_state.${state}`)}`}
+      class={`supervision-task-console-session ${showRuntimeState ? `session-${state}` : `task-${props.taskTab}`} lane-${props.lane}`}
+      data-session-state={showRuntimeState ? state : undefined}
+      data-task-tab={props.taskTab}
+      aria-label={`${t(`supervision_task_console.${props.lane}`)}: ${assignment.ownerSessionLabel || name}, ${stateLabel}`}
       onClick={(event) => { event.stopPropagation(); props.onNavigateSession(name); }}
     >
       <span class="supervision-task-console-session-icon" aria-hidden="true" />
@@ -199,7 +213,7 @@ function SessionButton(props: {
         <small>{assignment.observedProvider || assignment.ownerAgentType || '—'} · {assignment.observedModel || '—'}</small>
         {props.lane === 'auditor' && (assignment.auditAttemptId || assignment.auditVerdict) && <small>{assignment.auditAttemptId || '—'} · {assignment.auditVerdict || '—'}</small>}
       </span>
-      <span class="supervision-task-console-session-state">{t(`supervision_task_console.session_state.${state}`)} · {assignment.sessionStateSource ?? 'registry'}</span>
+      <span class="supervision-task-console-session-state">{stateLabel}{showRuntimeState ? ` · ${assignment.sessionStateSource ?? 'registry'}` : ''}</span>
     </button>
   );
 }
@@ -216,9 +230,12 @@ function TaskCard(props: {
   const { t } = useTranslation();
   const implementer = props.assignments.find(isImplementerAssignment);
   const auditor = props.assignments.find(isAuditAssignment);
-  const dominantState = supervisionConsoleTabForStatus(props.task.status) === 'history'
+  const taskTab = supervisionConsoleTabForStatus(props.task.status);
+  const dominantState = taskTab === 'history'
     ? 'terminal'
-    : props.task.blocker
+    : taskTab === 'pending'
+      ? (props.task.status === 'blocked' || props.task.blocker ? 'needs_input' : 'pending')
+      : props.task.blocker
       ? 'needs_input'
       : implementer?.sessionState === 'running'
         ? 'running'
@@ -226,8 +243,10 @@ function TaskCard(props: {
           ? 'audit-running'
           : implementer?.sessionState ?? auditor?.sessionState ?? 'unknown';
   const activityAt = authoritativeActivityAt(props.task, props.assignments);
-  const activityAssignment = taskRoleAssignments(props.assignments).sort((left, right) =>
-    (right.sessionStateObservedAt ?? right.updatedAt) - (left.sessionStateObservedAt ?? left.updatedAt))[0];
+  const activityAssignment = taskTab === 'active'
+    ? taskRoleAssignments(props.assignments).sort((left, right) =>
+      (right.sessionStateObservedAt ?? right.updatedAt) - (left.sessionStateObservedAt ?? left.updatedAt))[0]
+    : undefined;
   const activitySource = activityAssignment?.sessionStateSource ?? 'registry';
   const progress = props.task.progress && props.task.progress.total > 0
     ? Math.min(100, Math.max(0, (props.task.progress.completed / props.task.progress.total) * 100))
@@ -254,8 +273,8 @@ function TaskCard(props: {
           <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
         </button>
         <div class="supervision-task-console-role-tracks">
-          {implementer && <SessionButton assignment={implementer} lane="implementer" onNavigateSession={props.onNavigateSession} />}
-          {auditor && <SessionButton assignment={auditor} lane="auditor" onNavigateSession={props.onNavigateSession} />}
+          {implementer && <SessionButton assignment={implementer} taskStatus={props.task.status} taskTab={taskTab} lane="implementer" onNavigateSession={props.onNavigateSession} />}
+          {auditor && <SessionButton assignment={auditor} taskStatus={props.task.status} taskTab={taskTab} lane="auditor" onNavigateSession={props.onNavigateSession} />}
         </div>
       </div>
       <div class={`supervision-task-console-stage-track phase-${props.task.phase}`} aria-label={t(displayStatusKey(props.task.status))}>
@@ -324,6 +343,7 @@ export function SupervisionTaskConsoleView(props: {
   const closeRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   const activeTabRef = useRef<HTMLButtonElement>(null);
+  const pendingTabRef = useRef<HTMLButtonElement>(null);
   const historyTabRef = useRef<HTMLButtonElement>(null);
   const language = i18n.resolvedLanguage || i18n.language || 'en';
   const assignmentsByTask = useMemo(() => {
@@ -342,6 +362,10 @@ export function SupervisionTaskConsoleView(props: {
     .sort((left, right) => right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId)), [allTasks]);
   const activeTasks = useMemo(() => sortSupervisionConsoleTasks(
     allTasks.filter((task) => supervisionConsoleTabForStatus(task.status) === 'active'),
+    assignmentsByTask,
+  ), [allTasks, assignmentsByTask]);
+  const pendingTasks = useMemo(() => sortSupervisionConsoleTasks(
+    allTasks.filter((task) => supervisionConsoleTabForStatus(task.status) === 'pending'),
     assignmentsByTask,
   ), [allTasks, assignmentsByTask]);
 
@@ -366,19 +390,34 @@ export function SupervisionTaskConsoleView(props: {
     if (event.shiftKey && (active === first || !panel.contains(active))) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && (active === last || !panel.contains(active))) { event.preventDefault(); first.focus(); }
   };
-  const onTabKeyDown = (event: KeyboardEvent) => {
+  const tabRef = (tab: SupervisionConsoleTab) => (
+    tab === 'active' ? activeTabRef : tab === 'pending' ? pendingTabRef : historyTabRef
+  );
+  const onTabKeyDown = (event: KeyboardEvent, current: SupervisionConsoleTab) => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
-    const next: SupervisionConsoleTab = event.key === 'ArrowLeft' || event.key === 'Home' ? 'active' : 'history';
+    const currentIndex = SUPERVISION_CONSOLE_TABS.indexOf(current);
+    const next = event.key === 'Home'
+      ? SUPERVISION_CONSOLE_TABS[0]
+      : event.key === 'End'
+        ? SUPERVISION_CONSOLE_TABS[SUPERVISION_CONSOLE_TABS.length - 1]
+        : SUPERVISION_CONSOLE_TABS[
+          (currentIndex + (event.key === 'ArrowLeft' ? -1 : 1) + SUPERVISION_CONSOLE_TABS.length)
+          % SUPERVISION_CONSOLE_TABS.length
+        ];
     setActiveTab(next);
-    (next === 'active' ? activeTabRef : historyTabRef).current?.focus();
+    tabRef(next).current?.focus();
   };
   const bodyState = props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR ? 'error'
     : props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING && props.state.resyncReason === 'status_contract_mismatch' ? 'unsupported'
       : props.state.phase === SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING ? 'recovery'
         : props.state.phase !== SUPERVISION_TASK_CONSOLE_PHASE.READY ? 'loading'
           : allTasks.length === 0 ? 'empty' : 'ready';
-  const visibleTasks = activeTab === 'active' ? activeTasks : historyTasks.slice(0, historyLimit);
+  const visibleTasks = activeTab === 'active'
+    ? activeTasks
+    : activeTab === 'pending'
+      ? pendingTasks
+      : historyTasks.slice(0, historyLimit);
 
   return (
     <aside
@@ -405,8 +444,9 @@ export function SupervisionTaskConsoleView(props: {
       {!props.readOnly && props.mutationControls}
       <div class="supervision-task-console-cursor" aria-live="polite"><span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span><span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span></div>
       {bodyState === 'ready' && <div class="supervision-task-console-tabs" role="tablist" aria-label={t('supervision_task_console.tabs_label')}>
-        <button ref={activeTabRef} type="button" role="tab" id="task-console-tab-active" aria-selected={activeTab === 'active'} aria-controls="task-console-panel-active" tabIndex={activeTab === 'active' ? 0 : -1} onKeyDown={onTabKeyDown} onClick={() => setActiveTab('active')}>{t('supervision_task_console.tab_active')} <span>{activeTasks.length}</span></button>
-        <button ref={historyTabRef} type="button" role="tab" id="task-console-tab-history" aria-selected={activeTab === 'history'} aria-controls="task-console-panel-history" tabIndex={activeTab === 'history' ? 0 : -1} onKeyDown={onTabKeyDown} onClick={() => setActiveTab('history')}>{t('supervision_task_console.tab_history')} <span>{historyTasks.length}</span></button>
+        <button ref={activeTabRef} type="button" role="tab" id="task-console-tab-active" aria-selected={activeTab === 'active'} aria-controls="task-console-panel-active" tabIndex={activeTab === 'active' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'active')} onClick={() => setActiveTab('active')}>{t('supervision_task_console.tab_active')} <span>{activeTasks.length}</span></button>
+        <button ref={pendingTabRef} type="button" role="tab" id="task-console-tab-pending" aria-selected={activeTab === 'pending'} aria-controls="task-console-panel-pending" tabIndex={activeTab === 'pending' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'pending')} onClick={() => setActiveTab('pending')}>{t('supervision_task_console.tab_pending')} <span>{pendingTasks.length}</span></button>
+        <button ref={historyTabRef} type="button" role="tab" id="task-console-tab-history" aria-selected={activeTab === 'history'} aria-controls="task-console-panel-history" tabIndex={activeTab === 'history' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'history')} onClick={() => setActiveTab('history')}>{t('supervision_task_console.tab_history')} <span>{historyTasks.length}</span></button>
       </div>}
       <div class="supervision-task-console-body" data-state={bodyState}>
         {bodyState === 'loading' && <div class="supervision-task-console-state"><span class="spinner" />{t('supervision_task_console.loading')}</div>}
@@ -424,7 +464,11 @@ export function SupervisionTaskConsoleView(props: {
             onToggle={() => setExpanded((previous) => { const next = new Set(previous); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })}
             onNavigateSession={props.onNavigateSession} language={language}
           />)}
-          {!visibleTasks.length && <div class="supervision-task-console-state">{t(activeTab === 'active' ? 'supervision_task_console.no_active' : 'supervision_task_console.no_history')}</div>}
+          {!visibleTasks.length && <div class="supervision-task-console-state">{t(activeTab === 'active'
+            ? 'supervision_task_console.no_active'
+            : activeTab === 'pending'
+              ? 'supervision_task_console.no_pending'
+              : 'supervision_task_console.no_history')}</div>}
           {activeTab === 'history' && historyLimit < historyTasks.length && <button type="button" class="supervision-task-console-show-more" onClick={() => setHistoryLimit((value) => value + HISTORY_PAGE_SIZE)}>{t('supervision_task_console.show_more')}</button>}
         </section>}
         {bodyState === 'ready' && allTasks.length !== Object.keys(props.state.tasks).length && <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.unsupported')}</div>}

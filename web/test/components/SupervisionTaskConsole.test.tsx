@@ -414,6 +414,36 @@ describe('SupervisionTaskConsole', () => {
       .toEqual(['session-1000', 'session-50']);
   });
 
+  it('sorts pending tasks by task activity rather than a shared session running elsewhere', () => {
+    const tasks = [
+      {
+        taskId: 'older-pending', title: 'Older pending', status: 'ready_for_audit' as const,
+        phase: 'audit' as const, validationState: 'pending' as const,
+        updatedAt: 10, lastEventId: 1,
+      },
+      {
+        taskId: 'newer-pending', title: 'Newer pending', status: 'ready_for_audit' as const,
+        phase: 'audit' as const, validationState: 'pending' as const,
+        updatedAt: 20, lastEventId: 2,
+      },
+    ];
+    const assignments = new Map([
+      ['older-pending', [{
+        assignmentId: 'older-worker', taskId: 'older-pending', status: 'implementing' as const,
+        phase: 'active' as const, role: 'implementer', validationState: 'pending' as const,
+        sessionState: 'running' as const, sessionStateObservedAt: 10_000, updatedAt: 10_000, lastEventId: 3,
+      }]],
+      ['newer-pending', [{
+        assignmentId: 'newer-worker', taskId: 'newer-pending', status: 'implementing' as const,
+        phase: 'active' as const, role: 'implementer', validationState: 'pending' as const,
+        sessionState: 'idle' as const, sessionStateObservedAt: 1, updatedAt: 1, lastEventId: 4,
+      }]],
+    ]);
+
+    expect(sortSupervisionConsoleTasks(tasks, assignments).map((task) => task.taskId))
+      .toEqual(['newer-pending', 'older-pending']);
+  });
+
   it('uses exact production roles for implementer navigation and runtime priority', () => {
     const task = {
       taskId: 'production-shape', title: 'Production role shape', status: 'implementing' as const,
@@ -511,12 +541,19 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.queryByText('Cancelled task')).toBeNull();
     expect(screen.queryByText('Released task')).toBeNull();
     fireEvent.keyDown(active, { key: 'ArrowRight' });
+    const pendingTab = screen.getByRole('tab', { name: /supervision_task_console.tab_pending/ });
+    expect(document.activeElement).toBe(pendingTab);
+    expect(pendingTab.getAttribute('aria-selected')).toBe('true');
+    fireEvent.keyDown(pendingTab, { key: 'ArrowRight' });
     const historyTab = screen.getByRole('tab', { name: /supervision_task_console.tab_history/ });
     expect(document.activeElement).toBe(historyTab);
     expect(historyTab.getAttribute('aria-selected')).toBe('true');
     expect(screen.getByText('Released task')).toBeTruthy();
     expect(screen.getByText('Cancelled task')).toBeTruthy();
-    expect(screen.getByTestId('task-card-task-cancelled').getAttribute('data-activity-state')).toBe('terminal');
+    const cancelledCard = screen.getByTestId('task-card-task-cancelled');
+    expect(cancelledCard.getAttribute('data-activity-state')).toBe('terminal');
+    expect(cancelledCard.textContent).not.toContain('supervision_task_console.session_state.running');
+    expect(cancelledCard.textContent).toContain('supervision_task_console.status.cancelled');
     expect(screen.getByText('Stale Running Worker')).toBeTruthy();
     fireEvent.keyDown(historyTab, { key: 'Home' });
     expect(document.activeElement).toBe(active);
@@ -580,13 +617,80 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.queryByText('Still auditing')).toBeNull();
   });
 
-  it('renders distinct localized empty states for active and history tabs', () => {
+  it('reduces the production-shaped 126 active count to ten and isolates pending runtime appearance', () => {
+    const statusCounts = [
+      ['planned', 48],
+      ['delegated', 19],
+      ['implementing', 10],
+      ['validated', 2],
+      ['ready_for_audit', 17],
+      ['auditing', 0],
+      ['rework', 5],
+      ['ready_for_integration', 25],
+      ['blocked', 2],
+    ] as const;
+    const rows = statusCounts.flatMap(([status, count]) => Array.from({ length: count }, (_, index) => {
+      const taskId = `${status}-${index}`;
+      return [taskId, {
+        taskId,
+        title: `${status} ${index}`,
+        status,
+        phase: supervisionConsoleStatusGroup(status),
+        validationState: 'pending' as const,
+        updatedAt: NOW - index,
+        lastEventId: index + 1,
+      }] as const;
+    }));
+    expect(rows.filter(([, task]) => task.status !== 'blocked')).toHaveLength(126);
+    const tasks = Object.fromEntries(rows);
+    const assignments = Object.fromEntries(rows.map(([taskId, task], index) => [`assignment-${taskId}`, {
+      assignmentId: `assignment-${taskId}`,
+      taskId,
+      status: task.status,
+      phase: task.phase,
+      role: 'implementer',
+      ownerSessionName: 'deck_alpha_shared_worker',
+      ownerSessionLabel: 'Shared current worker',
+      validationState: 'pending' as const,
+      sessionState: 'running' as const,
+      sessionStateSource: 'runtime' as const,
+      sessionStateObservedAt: NOW + index,
+      updatedAt: NOW + index,
+      lastEventId: 500 + index,
+    }]));
+
+    render(<SupervisionTaskConsoleView
+      state={state({ tasks, assignments })}
+      mobile={false}
+      onClose={() => {}}
+      onNavigateSession={() => {}}
+    />);
+
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 10/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 118/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_history 0/ })).toBeTruthy();
+    expect(screen.getAllByTestId(/task-card-/)).toHaveLength(10);
+    expect(screen.getAllByTestId(/task-card-/).every((card) => card.getAttribute('data-status') === 'implementing')).toBe(true);
+
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 118/ }));
+    const pendingCards = screen.getAllByTestId(/task-card-/);
+    expect(pendingCards).toHaveLength(118);
+    expect(pendingCards.every((card) => !['running', 'audit-running'].includes(card.getAttribute('data-activity-state') ?? ''))).toBe(true);
+    expect(pendingCards.every((card) => !card.textContent?.includes('supervision_task_console.session_state.running'))).toBe(true);
+    expect(Array.from(document.querySelectorAll('.supervision-task-console-session')).every((row) => (
+      row.getAttribute('data-task-tab') === 'pending' && row.getAttribute('data-session-state') === null
+    ))).toBe(true);
+  });
+
+  it('renders distinct localized empty states for active, pending, and history tabs', () => {
     const ended = {
       taskId: 'ended-only', title: 'Ended only', status: 'finalized' as const,
       phase: 'final' as const, validationState: 'passed' as const, updatedAt: NOW, lastEventId: 1,
     };
     const view = render(<SupervisionTaskConsoleView state={state({ tasks: { [ended.taskId]: ended }, assignments: {} })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
     expect(screen.getByText('supervision_task_console.no_active')).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_pending/ }));
+    expect(screen.getByText('supervision_task_console.no_pending')).toBeTruthy();
     fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_history/ }));
     expect(screen.getByText('Ended only')).toBeTruthy();
 
@@ -618,6 +722,7 @@ describe('SupervisionTaskConsole', () => {
     fireEvent.keyDown(separator, { key: 'ArrowLeft' });
     expect(onResizeKeyDown).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('tab', { name: /supervision_task_console.tab_active/ }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: /supervision_task_console.tab_pending/ })).toBeTruthy();
     expect(screen.getByRole('tab', { name: /supervision_task_console.tab_history/ })).toBeTruthy();
     expect(screen.queryByText('supervision_task_console.heartbeat_stale')).toBeNull();
     expect(readFileSync(resolve(import.meta.dirname, '../../src/components/SupervisionTaskConsole.tsx'), 'utf8')).not.toMatch(/heartbeat/i);
@@ -728,8 +833,15 @@ describe('SupervisionTaskConsole', () => {
         onNavigateSession={() => {}}
       />,
     );
-    const historyStatuses = ['committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled'];
-    for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES.filter((value) => !historyStatuses.includes(value))) {
+    const activeStatuses = ['implementing', 'retrying_external_ci', 'auditing', 'integrating', 'final_audit', 'finalizing'];
+    const pendingStatuses = ['planned', 'delegated', 'validated', 'ready_for_audit', 'rework', 'passed', 'ready_for_integration', 'blocked'];
+    const historyStatuses = ['committed', 'pushed', 'recovered', 'finalized', 'cancelled'];
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 6/ })).toBeTruthy();
+    for (const status of activeStatuses) {
+      expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
+    }
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 8/ }));
+    for (const status of pendingStatuses) {
       expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
     }
     fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console.tab_history/ }));
@@ -740,6 +852,8 @@ describe('SupervisionTaskConsole', () => {
     expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?activity-running[\s\S]*?animation:\s*none/);
     expect(css).toMatch(/container-name:\s*supervision-console/);
     expect(css).toMatch(/@container supervision-console \(min-width: 1080px\)[\s\S]*?grid-template-columns:\s*repeat\(2/);
+    expect(css).toMatch(/supervision-task-console-tabs[\s\S]*?grid-template-columns:\s*repeat\(3/);
+    expect(css).toMatch(/activity-pending[\s\S]*?animation:\s*none/);
     expect(css).toMatch(/activity-terminal[\s\S]*?animation:\s*none/);
     const app = readFileSync(resolve(import.meta.dirname, '../../src/app.tsx'), 'utf8');
     expect(app).toMatch(/onNavigateSession=\{\(sessionName\) => \{\s*navigateToSession\(sessionName\);/);

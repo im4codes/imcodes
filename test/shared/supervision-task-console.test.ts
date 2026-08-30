@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   SUPERVISION_TASK_CONSOLE_MSG,
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+  SUPERVISION_CONSOLE_ACTIVE_STATUSES,
   SUPERVISION_CONSOLE_STATUS_GROUP,
   SUPERVISION_CONSOLE_STATUS_GROUPS,
   SUPERVISION_CONSOLE_HISTORY_STATUSES,
+  SUPERVISION_CONSOLE_PENDING_STATUSES,
   SUPERVISION_CONSOLE_RESYNC_REASONS,
+  SUPERVISION_CONSOLE_TAB_BY_STATUS,
+  SUPERVISION_CONSOLE_TABS,
   SUPERVISION_CONSOLE_TRANSITION_FIELDS,
   canCoalesceSupervisionTaskRows,
   evaluateSupervisionConsoleCursor,
@@ -23,7 +27,6 @@ import {
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
-  isTerminalSupervisionTaskStatus,
 } from '../../shared/supervision-config.js';
 
 const SCOPE = { projectName: 'codedeck', coordinatorSessionName: 'deck_cd_brain' };
@@ -61,23 +64,37 @@ describe('supervision task console status grouping', () => {
     }
   });
 
-  it('partitions every task status into active or history with canonical terminal precedence', () => {
-    expect(SUPERVISION_CONSOLE_HISTORY_STATUSES).toEqual([
-      'committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled',
+  it('partitions every task status exactly once into active, pending, or history', () => {
+    expect(SUPERVISION_CONSOLE_TABS).toEqual(['active', 'pending', 'history']);
+    expect(SUPERVISION_CONSOLE_ACTIVE_STATUSES).toEqual([
+      'implementing', 'retrying_external_ci', 'auditing', 'integrating',
+      'final_audit', 'finalizing',
     ]);
+    expect(SUPERVISION_CONSOLE_PENDING_STATUSES).toEqual([
+      'planned', 'delegated', 'validated', 'ready_for_audit', 'rework', 'passed',
+      'ready_for_integration', 'blocked',
+    ]);
+    expect(SUPERVISION_CONSOLE_HISTORY_STATUSES).toEqual([
+      'committed', 'pushed', 'recovered', 'finalized', 'cancelled',
+    ]);
+    expect(Object.keys(SUPERVISION_CONSOLE_TAB_BY_STATUS).sort())
+      .toEqual([...SUPERVISION_TASK_LIFECYCLE_STATUSES].sort());
+    const partitioned = [
+      ...SUPERVISION_CONSOLE_ACTIVE_STATUSES,
+      ...SUPERVISION_CONSOLE_PENDING_STATUSES,
+      ...SUPERVISION_CONSOLE_HISTORY_STATUSES,
+    ];
+    expect(new Set(partitioned).size).toBe(SUPERVISION_TASK_LIFECYCLE_STATUSES.length);
     for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES) {
-      const history = (SUPERVISION_CONSOLE_HISTORY_STATUSES as readonly string[]).includes(status);
-      expect(supervisionConsoleTabForStatus(status), status).toBe(
-        history ? 'history' : 'active',
-      );
-      expect(isSupervisionConsoleHistoryStatus(status), status).toBe(history);
-      if (isTerminalSupervisionTaskStatus(status)) {
-        expect(supervisionConsoleTabForStatus(status), status).toBe('history');
-      }
+      const tab = SUPERVISION_CONSOLE_TAB_BY_STATUS[status];
+      expect(supervisionConsoleTabForStatus(status), status).toBe(tab);
+      expect(isSupervisionConsoleHistoryStatus(status), status).toBe(tab === 'history');
     }
     expect(supervisionConsoleTabForStatus('implementing')).toBe('active');
     expect(supervisionConsoleTabForStatus('auditing')).toBe('active');
-    expect(supervisionConsoleTabForStatus('ready_for_integration')).toBe('active');
+    expect(supervisionConsoleTabForStatus('ready_for_integration')).toBe('pending');
+    expect(supervisionConsoleTabForStatus('blocked')).toBe('pending');
+    expect(supervisionConsoleTabForStatus('cancelled')).toBe('history');
   });
 });
 

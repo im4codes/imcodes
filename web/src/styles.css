@@ -11964,11 +11964,12 @@ button.quick-agent-delegation-preset.active {
    because the legacy console rules also exist in the generated compatibility
    portion of this stylesheet. */
 .supervision-task-console.is-desktop { max-width: 92vw; container-type: inline-size; container-name: supervision-console; }
-.supervision-task-console-tabs { padding: 7px 10px 0; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; border-bottom: 1px solid rgba(148,163,184,.1); }
+.supervision-task-console-tabs { padding: 7px 10px 0; display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; border-bottom: 1px solid rgba(148,163,184,.1); }
 .supervision-task-console-tabs button { padding: 7px 9px; color: #64748b; background: transparent; border: 0; border-bottom: 2px solid transparent; font: inherit; font-size: 11px; cursor: pointer; }
 .supervision-task-console-tabs button[aria-selected="true"] { color: #dbeafe; border-color: #22d3ee; background: linear-gradient(180deg,transparent,rgba(34,211,238,.07)); }
 .supervision-task-console-tabs button span { margin-left: 5px; padding: 1px 5px; border: 1px solid rgba(148,163,184,.18); border-radius: 999px; font-size: 9px; }
 .supervision-task-console-grid { display: grid; grid-template-columns: minmax(0,1fr); gap: 7px; align-items: start; }
+.supervision-task-console-grid[data-tab="pending"] { --supervision-console-pending-color: #94a3b8; }
 .supervision-task-console-grid[data-tab="history"] { --supervision-console-history-color: #64748b; }
 .supervision-task-console-grid > .supervision-task-console-state { grid-column: 1/-1; }
 .supervision-task-console-task { margin: 0; overflow: visible; border-color: rgba(148,163,184,.13); border-radius: 8px; }
@@ -12010,6 +12011,9 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-task.activity-audit-running { border-color: rgba(167,139,250,.45); background-image: linear-gradient(110deg,rgba(167,139,250,.04),rgba(15,23,42,.68),rgba(167,139,250,.1)); background-size: 200% 100%; animation: supervision-console-flow 2.9s linear infinite; }
 .supervision-task-console-task.activity-idle { animation: supervision-console-pulse 4s ease-in-out infinite; }
 .supervision-task-console-task.activity-needs_input { border-color: rgba(251,146,60,.48); animation: supervision-console-breathe 2.1s ease-in-out infinite; }
+.supervision-task-console-task.activity-pending { border-color: rgba(148,163,184,.25); background: rgba(15,23,42,.62); animation: none; }
+.supervision-task-console-task.activity-pending .supervision-task-console-session { color: var(--supervision-console-pending-color,#94a3b8); border-color: rgba(148,163,184,.2); box-shadow: none; }
+.supervision-task-console-task.activity-pending .supervision-task-console-session-icon { background: var(--supervision-console-pending-color,#94a3b8); box-shadow: none; }
 .supervision-task-console-task.activity-offline, .supervision-task-console-task.activity-unknown { border-color: rgba(71,85,105,.32); }
 .supervision-task-console-task.activity-terminal { border-color: rgba(100,116,139,.3); background: rgba(15,23,42,.52); animation: none; }
 .supervision-task-console-task.activity-terminal .supervision-task-console-session { color: var(--supervision-console-history-color,#64748b); border-color: rgba(100,116,139,.2); box-shadow: none; }
