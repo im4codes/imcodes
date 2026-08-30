@@ -5,6 +5,7 @@ import {
   MEMORY_MCP_TOOL_CONTRACTS,
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
+  SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
   buildMcpDisabledResult,
   pickAllowedMcpArgs,
   stripForbiddenMcpArgs,
@@ -26,6 +27,21 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 // semantics, candidateCount/truncated, list_machines avoidance, timeouts --
 // is kept, so the contract is shorter but not weaker.
 describe('memory MCP shared contracts', () => {
+  it('publishes a strict structured integration-finalization branch without removing legacy assignment finish', () => {
+    const finish = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH].inputSchema;
+    expect(finish).toMatchObject({ additionalProperties: false, required: ['assignmentId'] });
+    const finalization = MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE
+    ].inputSchema;
+    expect(finalization).toMatchObject({
+      additionalProperties: false,
+      required: [...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS],
+    });
+    expect(finalization.properties?.verdict?.enum).toEqual(['PASS']);
+    expect(finalization.properties?.ciResult?.enum).toEqual(['success']);
+    expect(finalization.properties?.pushResult?.enum).toEqual(['pushed', 'already_present']);
+  });
+
   it('exposes the registered MCP tool names including the execution-clone destroy + machine tools', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
@@ -46,6 +62,7 @@ describe('memory MCP shared contracts', () => {
       'supervision_task_start',
       'supervision_task_update',
       'supervision_task_finish',
+      'supervision_integration_finalize',
       'supervision_task_file_event',
       'send_stop',
       'destroy_execution_clone',

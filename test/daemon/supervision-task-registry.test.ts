@@ -102,12 +102,248 @@ function makeRegistry(): SupervisionTaskRegistry {
   return new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
 }
 
+function prepareStructuredFinalizationShape(
+  registry: SupervisionTaskRegistry,
+  taskId: string,
+  options: { selfAudit?: boolean } = {},
+) {
+  const revision = `${taskId}-r1`;
+  const attemptId = `${taskId}-overall-audit`;
+  const files = ['src/final-a.ts', 'src/final-b.ts'];
+  const ownerIdentity = identity(`${taskId}-owner`);
+  const implementerIdentity = identity(`${taskId}-worker`);
+  const auditorIdentity = options.selfAudit ? ownerIdentity : identity(`${taskId}-auditor`, 'claude-code-sdk');
+  expect(registry.createOrGet({
+    taskId, projectName: 'alpha', classification: 'integration_task',
+    objective: 'finalize exact matching PASS', currentRevision: revision,
+  })).toMatchObject({ ok: true });
+  const coordinator = registry.createAssignment({
+    taskId, role: 'coordinator', identity: identity(`${taskId}-brain`), required: false,
+  });
+  const owner = registry.createAssignment({
+    taskId, role: 'integration_owner', identity: ownerIdentity, scopeFiles: files,
+    auditAttemptId: attemptId, auditRevision: revision,
+  });
+  const implementer = registry.createAssignment({
+    taskId, role: 'implementer', identity: implementerIdentity, scopeFiles: files,
+    auditAttemptId: attemptId, auditRevision: revision,
+  });
+  const auditor = registry.createAssignment({
+    taskId, role: 'auditor', identity: auditorIdentity, required: false,
+    auditAttemptId: attemptId, auditRevision: revision,
+  });
+  if (!coordinator.ok || !owner.ok || !implementer.ok || !auditor.ok) throw new Error('shape setup failed');
+  for (const target of [owner.value, implementer.value]) {
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: target.assignmentId,
+        identity: target.identity,
+        status,
+        revision,
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        ...(status === 'passed' || status === 'ready_for_integration' ? {
+          verdict: 'PASS', crossVendorAuditPassed: true,
+        } : {}),
+        ...(target.role === 'integration_owner' ? {
+          externalRunId: '33287386936',
+          externalHeadSha: 'a'.repeat(40),
+          externalTaskId: 'ci-node24',
+        } : {}),
+      }), `${target.role}:${status}`).toMatchObject({ ok: true });
+    }
+  }
+  for (const status of ['auditing', 'passed'] as const) {
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditor.value.identity,
+      status,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      ...(status === 'passed' ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+    })).toMatchObject({ ok: true });
+  }
+  expect(registry.finishAssignment({
+    assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision,
+  })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+  expect(registry.finishAssignment({
+    assignmentId: implementer.value.assignmentId, identity: implementer.value.identity, revision,
+  })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
+  expect(registry.finishAssignment({
+    assignmentId: owner.value.assignmentId, identity: owner.value.identity, revision,
+  })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
+  const finalization = {
+    assignmentId: owner.value.assignmentId,
+    revision,
+    auditAttemptId: attemptId,
+    auditRevision: revision,
+    verdict: 'PASS' as const,
+    ownedFiles: files,
+    integrationManifest: files.map((path, index) => ({ path, sha256: String(index + 1).repeat(64) })),
+    integrationOwner: ownerIdentity.sessionName,
+    commitSha: 'a'.repeat(40),
+    pushResult: 'pushed' as const,
+    pushRemoteRef: 'refs/heads/dev',
+    stagedPaths: files,
+    conflictedPaths: [] as string[],
+    untrackedOtherOwnerPaths: [] as string[],
+    externalRunId: '33287386936',
+    externalHeadSha: 'a'.repeat(40),
+    externalTaskId: 'ci-node24',
+    ciResult: 'success' as const,
+  };
+  expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
+  return { taskId, revision, attemptId, files, owner: owner.value, coordinator: coordinator.value, auditor: auditor.value, finalization };
+}
+
 beforeEach(() => {
   resetSupervisionTaskRegistryForTests();
   clearSendIdempotencyCacheForTests();
 });
 
 describe('SupervisionTaskRegistry', () => {
+  it('atomically finalizes one exact integration through the production MCP and keeps legacy history queryable', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-production');
+    const assignmentCount = registry.listAssignments(shape.taskId).length;
+    const eventCount = registry.listEvents(shape.taskId).length;
+    expect(registry.createAssignment({
+      taskId: shape.taskId,
+      role: 'integration_owner',
+      identity: shape.owner.identity,
+      scopeFiles: shape.files,
+    })).toMatchObject({
+      ok: true, replay: true,
+      value: { assignmentId: shape.owner.assignmentId },
+    });
+    expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
+    const handlers = createMemoryMcpToolHandlers(
+      {
+        userId: 'u', sessionName: shape.owner.identity.sessionName,
+        projectName: 'alpha', projectRoot: '/work/alpha',
+      },
+      {
+        sendDeps: {
+          listSessions: () => [
+            session(shape.owner.identity.sessionName),
+            session(shape.auditor.identity.sessionName, 'alpha', 'claude-code-sdk'),
+            session(shape.coordinator.identity.sessionName),
+          ],
+        },
+      },
+    );
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](shape.finalization))
+      .resolves.toMatchObject({
+        status: 'ok', idempotentReplay: false,
+        item: {
+          taskId: shape.taskId, status: 'finalized', currentRevision: shape.revision,
+          commitSha: shape.finalization.commitSha,
+          pushRemoteRef: shape.finalization.pushRemoteRef,
+          archivedAt: expect.any(Number),
+          finalization: {
+            revision: shape.revision,
+            auditAttemptId: shape.attemptId,
+            auditRevision: shape.revision,
+            verdict: 'PASS',
+            ciResult: 'success',
+          },
+        },
+      });
+
+    expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
+    expect(registry.listAssignments(shape.taskId).every((assignment) => assignment.leaseId === '')).toBe(true);
+    expect(registry.listFileClaims(shape.taskId)).toEqual([]);
+    expect(registry.list({ projectName: 'alpha' }).map((task) => task.taskId)).not.toContain(shape.taskId);
+    expect(registry.list({ projectName: 'alpha', history: true })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: shape.taskId, status: 'finalized' }),
+    ]));
+    const lifecycleTail = registry.listEvents(shape.taskId).slice(eventCount, eventCount + 14);
+    expect(lifecycleTail.map((event) => `${event.assignmentId ? 'assignment' : 'task'}:${event.status}`)).toEqual([
+      'assignment:integrating', 'task:integrating',
+      'assignment:final_audit', 'task:final_audit',
+      'assignment:passed', 'task:passed',
+      'assignment:finalizing', 'task:finalizing',
+      'assignment:committed', 'task:committed',
+      'assignment:pushed', 'task:pushed',
+      'assignment:finalized', 'task:finalized',
+    ]);
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](shape.finalization))
+      .resolves.toMatchObject({ status: 'ok', idempotentReplay: true, item: { status: 'finalized' } });
+    expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount + 15);
+    expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
+  });
+
+  it('fails closed on stale audit, dirty staged sets, conflicts, foreign owners, and self-audit without mutation', () => {
+    const registry = makeRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-refusals');
+    const initial = registry.get(shape.taskId);
+    const initialEvents = registry.listEvents(shape.taskId).length;
+    const call = (overrides: Partial<typeof shape.finalization> = {}, ownerIdentity = shape.owner.identity) => (
+      registry.finalizeIntegration({ ...shape.finalization, ...overrides, identity: ownerIdentity })
+    );
+
+    expect(call({ revision: `${shape.revision}-stale`, auditRevision: `${shape.revision}-stale` }))
+      .toEqual({ ok: false, reason: 'old_revision' });
+    expect(call({ auditAttemptId: `${shape.attemptId}-stale` }))
+      .toEqual({ ok: false, reason: 'old_audit_attempt' });
+    expect(call({ stagedPaths: [shape.files[0]] }))
+      .toEqual({ ok: false, reason: 'manifest_mismatch' });
+    expect(call({ conflictedPaths: [shape.files[0]] }))
+      .toEqual({ ok: false, reason: 'invalid' });
+    expect(call({ untrackedOtherOwnerPaths: ['src/foreign.ts'] }))
+      .toEqual({ ok: false, reason: 'invalid' });
+    expect(call({}, identity('foreign-integration-owner')))
+      .toEqual({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.get(shape.taskId)).toEqual(initial);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(initialEvents);
+
+    const selfAudit = prepareStructuredFinalizationShape(registry, 'structured-finalization-self-audit', { selfAudit: true });
+    expect(registry.finalizeIntegration({
+      ...selfAudit.finalization, identity: selfAudit.owner.identity,
+    })).toEqual({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.get(selfAudit.taskId)).toMatchObject({ status: 'ready_for_integration' });
+    registry.close();
+  });
+
+  it('persists structured finalization across SQLite reopen and makes exact replay idempotent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-structured-finalization-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-restart');
+      expect(registry.finalizeIntegration({
+        ...shape.finalization, identity: shape.owner.identity, now: 500,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', archivedAt: 500 } });
+      const eventCount = registry.listEvents(shape.taskId).length;
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+
+      expect(registry.get(shape.taskId)).toMatchObject({
+        status: 'finalized', archivedAt: 500,
+        finalization: {
+          revision: shape.revision,
+          commitSha: shape.finalization.commitSha,
+          finalizedAt: 500,
+        },
+      });
+      expect(registry.finalizeIntegration({
+        ...shape.finalization, identity: shape.owner.identity, now: 900,
+      })).toMatchObject({ ok: true, replay: true, value: { status: 'finalized', archivedAt: 500 } });
+      expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
+      expect(registry.finalizeIntegration({
+        ...shape.finalization,
+        commitSha: 'b'.repeat(40), externalHeadSha: 'b'.repeat(40),
+        identity: shape.owner.identity,
+      })).toEqual({ ok: false, reason: 'conflicting_replay' });
+      expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('persists tokenless append-only audit receipts across restart and gates integration on auditor FINISHED', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-audit-receipts-'));
     const dbPath = join(dir, 'supervision-state.sqlite');

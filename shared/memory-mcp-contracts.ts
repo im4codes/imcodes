@@ -82,6 +82,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SUPERVISION_TASK_START: 'supervision_task_start',
   SUPERVISION_TASK_UPDATE: 'supervision_task_update',
   SUPERVISION_TASK_FINISH: 'supervision_task_finish',
+  SUPERVISION_INTEGRATION_FINALIZE: 'supervision_integration_finalize',
   SUPERVISION_TASK_FILE_EVENT: 'supervision_task_file_event',
   SEND_STOP: 'send_stop',
   DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
@@ -122,6 +123,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
@@ -139,6 +141,13 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
 ] as const satisfies readonly MemoryMcpToolName[];
+
+export const SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS = [
+  'assignmentId', 'revision', 'auditAttemptId', 'auditRevision', 'verdict',
+  'ownedFiles', 'integrationManifest', 'integrationOwner', 'commitSha',
+  'pushResult', 'pushRemoteRef', 'stagedPaths', 'conflictedPaths',
+  'untrackedOtherOwnerPaths', 'externalRunId', 'externalHeadSha', 'ciResult',
+] as const;
 
 /**
  * Tools available ONLY to FULL nodes. A controlled node never advertises these
@@ -432,7 +441,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-    description: 'List scoped sendable siblings; current caller session and stopped sessions are excluded. Omit executionPool for ordinary discovery; primary/economy filters by caller pool/live identity; if this returns no items, no matching sibling exists. Returned availability/limitGroup/replyCapable/eligiblePools/dispatchMode are evidence; send_message revalidates authority.',
+    description: 'List siblings; current caller session and stopped sessions are excluded; if this returns no items, none match. Omit executionPool for all; primary/economy filter canonical live pool members.',
     inputSchema: objectSchema({
       query: stringSchema('Optional case-insensitive text filter over target display labels, names, agent types, and model metadata, such as "cc", "codex", "gpt-5", "reviewer", or a session label mentioned by the user.'),
       limit: numberSchema('Optional maximum number of targets to return; implementations may clamp it.'),
@@ -488,13 +497,13 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
-    description: 'Runtime identity of the bound MCP caller only. No arguments, cannot enumerate peers. Model metadata is evidence, not authorization; schedulers revalidate the live SessionRecord before assigning.',
+    description: 'Return only the bound caller runtime identity; model metadata is evidence, not authority.',
     inputSchema: objectSchema({}),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send to an exact send_list_targets target. Callers and labels are invalid targets. Existing-task continuations MUST append (default) with durable FIFO fallback; queue always uses FIFO for new work. Returns delivered/queued/failed status.',
+    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Existing-task continuations MUST append (default), with durable FIFO fallback; queue always uses FIFO for new work. Returns delivered/queued/failed status.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from the configured pool.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
@@ -569,7 +578,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
 
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
-    description: 'Start genuinely new daemon-authoritative supervision work or a replacement after prior implementers are terminal. Existing active-task addenda use send_message deliveryMode=append and MUST NOT mint another assignment. Creates durable SQLite task/assignment state; free text is not a completion signal.',
+    description: 'Start new supervised work or an authorized replacement. Active-task addenda must append and cannot mint an assignment.',
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. Omit to let daemon generate one.'),
       topLevelTaskId: stringSchema('Optional top-level task id. Defaults to taskId.'),
@@ -585,7 +594,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
-    description: 'Heartbeat or update the caller bound assignment. The daemon derives lifecycle status from a semantic intent; callers cannot name a target status. Gates, revision and audit-attempt checks are enforced by the registry.',
+    description: 'Update the caller assignment; daemon lifecycle, revision, and audit gates remain authoritative.',
     inputSchema: objectSchema({
       assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
       revision: stringSchema('Current/audit revision for stale-update rejection.'),
@@ -601,17 +610,48 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
-    description: 'Finish only the caller’s assignment (validated/ready_for_audit/ready_for_integration/blocked/cancelled/etc.); it never closes the whole task by prose and does not automatically scan files or Git state.',
+    description: 'Finish only the caller assignment; prose evidence never finalizes an integration task.',
     inputSchema: objectSchema({
-      assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
+      assignmentId: stringSchema('Caller-bound assignment.'),
       revision: stringSchema('Current revision.'),
-      evidence: stringSchema('Bounded evidence summary.'),
+      evidence: stringSchema('Bounded legacy assignment evidence.'),
     }, ['assignmentId']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
+    description: 'Atomically finalize one exact audited integration from integration-owner Git, push, and successful CI evidence.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Caller-bound integration owner assignment.'),
+      revision: stringSchema('Exact combined revision.'),
+      auditAttemptId: stringSchema('Exact overall matching audit attempt.'),
+      auditRevision: stringSchema('Exact overall audited revision.'),
+      verdict: { type: 'string', enum: ['PASS'] },
+      ownedFiles: { type: 'array', items: stringSchema('Owned path.') },
+      integrationManifest: {
+        type: 'array', items: objectSchema({
+          path: stringSchema('Owned path.'),
+          sha256: stringSchema('Exact file SHA-256.', { pattern: '^[0-9a-f]{64}$' }),
+        }, ['path', 'sha256']),
+      },
+      integrationOwner: stringSchema('Canonical integration owner session.'),
+      commitSha: stringSchema('Exact pushed commit.', { pattern: '^[0-9a-f]{40}$' }),
+      pushResult: { type: 'string', enum: ['pushed', 'already_present'] },
+      pushRemoteRef: stringSchema('Exact pushed remote ref.'),
+      stagedPaths: { type: 'array', items: stringSchema('Path staged for the exact commit.') },
+      conflictedPaths: { type: 'array', items: stringSchema('Unresolved conflict path; must be empty.') },
+      untrackedOtherOwnerPaths: { type: 'array', items: stringSchema('Untracked path owned elsewhere; must be empty.') },
+      externalRunId: stringSchema('Successful CI run id.'),
+      externalHeadSha: stringSchema('CI head SHA.', { pattern: '^[0-9a-f]{40}$' }),
+      externalTaskId: stringSchema('Optional external workflow id.'),
+      ciResult: { type: 'string', enum: ['success'] },
+      evidence: stringSchema('Bounded structured-finalization note.'),
+    }, SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
-    description: 'Record a caller-reported file event for the caller assignment. Nothing is auto-detected: no editor hook, no filesystem or Git scanner. The path must already be in the claim scope; outside-scope reports block the task. Unreported writes stay invisible.',
+    description: 'Record a caller-reported in-scope file event; no filesystem or Git scan is implied.',
     inputSchema: objectSchema({
       assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
       filePath: stringSchema('Normalized repo-relative path.'),
@@ -626,7 +666,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_STOP,
-    description: 'Immediately stop a sibling\'s active turn using its exact target. Use for stuck or wrong work. The caller is invalid. Existing queued user messages remain; only the active turn is interrupted.',
+    description: 'Stop an exact sibling active turn; queued messages remain and the caller is invalid.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session value. Required unless broadcast is true. For an ordinary peer, use the exact send_list_targets.target value. To stop an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may stop them. Always use the exact target name; never a label or agentType value.'),
       broadcast: booleanSchema('Optional project-scoped request to stop every sendable sibling session; unavailable for unscoped callers.'),
@@ -645,7 +685,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
-    description: `Preferred self-wakeup method: schedule a message for the current session. New jobs default to recurring and stay scheduled after each run; choose until_complete only for a bounded goal. Identity is automatic; runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`,
+    description: `Preferred self-wakeup for the current session; Identity is automatic. Recurring is default, until_complete is bounded; minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`,
     inputSchema: objectSchema({
       cronExpr: stringSchema(`Cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
       message: stringSchema('Message delivered to the current session.'),
@@ -660,7 +700,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
-    description: 'Update the current session\'s self-wakeup job using its returned or injected id.',
+    description: 'Update current-session self-wakeup by id.',
     inputSchema: objectSchema({
       id: stringSchema('Current-session cron job id.'),
       cronExpr: stringSchema(`Optional cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
@@ -677,7 +717,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
-    description: 'Cancel a current session self-wakeup job by id or unique name, or all=true for every one. Recurring jobs need force=true, only on explicit user request. until_complete jobs may self-cancel when done.',
+    description: 'Cancel self-wakeup; recurring needs force=true, while until_complete may self-cancel.',
     inputSchema: objectSchema({
       id: stringSchema('Exact job id; exclusive with name and all.'),
       name: stringSchema('Unique exact job name; exclusive with id and all.'),
@@ -688,7 +728,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
-    description: `Schedule a cross-session send. Use cron_create_self to wake this session. Minimum interval: ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`,
+    description: `Schedule cross-session send; use cron_create_self for this session. Minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`,
     inputSchema: objectSchema({
       name: stringSchema('Job name.'),
       cronExpr: stringSchema(`Cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
@@ -706,7 +746,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_LIST]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_LIST,
-    description: 'List cron jobs for the current user, server, and project.',
+    description: 'List scoped cron jobs.',
     inputSchema: objectSchema({
       projectName: stringSchema('Optional caller-project filter.'),
       limit: numberSchema(`Optional limit, up to ${MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }),
@@ -715,7 +755,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
-    description: `Update a cross-session cron job. Use cron_update_self for this session. Minimum interval: ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`,
+    description: `Update cross-session cron; minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`,
     inputSchema: objectSchema({
       id: stringSchema('Job id.'),
       name: stringSchema('Optional replacement name.'),
@@ -735,7 +775,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
-    description: 'Delete a cron job by id. Agent deletion of recurring jobs requires force=true. Use cron_cancel_self for current-session jobs.',
+    description: 'Delete cron by id; recurring jobs require force.',
     inputSchema: objectSchema({
       id: stringSchema('Job id.'),
       force: booleanSchema('Required for agent deletion of a recurring job.'),

@@ -23,7 +23,10 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
-import { MEMORY_MCP_TOOL_NAME_LIST, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import {
+  MEMORY_MCP_TOOL_NAME_LIST, MEMORY_MCP_TOOL_NAMES,
+  SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
+} from '../../shared/memory-mcp-contracts.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 import { CAPABILITY_MCP_TOOL_NAMES } from '../../shared/capability-management.js';
@@ -277,6 +280,22 @@ describe('memory MCP stdio server', () => {
         ALIAS_MCP_TOOLS.SAVE,
         ALIAS_MCP_TOOLS.DELETE,
       ]));
+      const finishSchema = listed.tools.find(
+        (tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
+      )?.inputSchema as {
+        required?: string[];
+        additionalProperties?: boolean;
+        properties?: Record<string, unknown>;
+      } | undefined;
+      expect(finishSchema).toMatchObject({
+        required: [...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS],
+        additionalProperties: false,
+      });
+      expect(Object.keys(finishSchema?.properties ?? {}).sort()).toEqual([
+        ...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
+        'externalTaskId',
+        'evidence',
+      ].sort());
       for (const tool of listed.tools) {
         expect(tool.description).toBeTruthy();
         // The protocol name already identifies the tool; repeating it as title

@@ -37,6 +37,7 @@ import type {
 // Type-only: supervision-mcp-tools does not import this module, and the import
 // is erased at runtime, so this cannot create a cycle.
 import type { SupervisionRecoveryTargetStatus } from './supervision-mcp-tools.js';
+import { SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH } from './supervision-intent-ops.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -313,6 +314,30 @@ export interface PersistedSupervisionTaskAssignmentIdentity {
   providerFamily: string;
 }
 
+export interface SupervisionIntegrationManifestEntry {
+  path: string;
+  sha256: string;
+}
+
+export interface PersistedSupervisionIntegrationFinalization {
+  revision: string;
+  auditAttemptId: string;
+  auditRevision: string;
+  verdict: 'PASS';
+  ownedFiles: string[];
+  integrationManifest: SupervisionIntegrationManifestEntry[];
+  integrationOwner: string;
+  commitSha: string;
+  pushResult: 'pushed' | 'already_present';
+  pushRemoteRef: string;
+  stagedPaths: string[];
+  externalRunId: string;
+  externalHeadSha: string;
+  externalTaskId?: string;
+  ciResult: 'success';
+  finalizedAt: number;
+}
+
 export interface PersistedSupervisionTaskRecord {
   version: typeof SUPERVISION_TASK_REGISTRY_DB_VERSION;
   taskId: string;
@@ -328,6 +353,7 @@ export interface PersistedSupervisionTaskRecord {
   status: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus;
   commitSha?: string;
   pushRemoteRef?: string;
+  finalization?: PersistedSupervisionIntegrationFinalization;
   blocker?: string;
   archivedAt?: number;
   archiveReason?: SupervisionTaskArchiveReason;
@@ -509,6 +535,30 @@ export interface SupervisionTaskAssignmentFinishInput {
   now?: number;
 }
 
+export interface SupervisionIntegrationFinalizationInput {
+  assignmentId: string;
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  revision: string;
+  auditAttemptId: string;
+  auditRevision: string;
+  verdict: 'PASS';
+  ownedFiles: readonly string[];
+  integrationManifest: readonly SupervisionIntegrationManifestEntry[];
+  integrationOwner: string;
+  commitSha: string;
+  pushResult: 'pushed' | 'already_present';
+  pushRemoteRef: string;
+  stagedPaths: readonly string[];
+  conflictedPaths: readonly string[];
+  untrackedOtherOwnerPaths: readonly string[];
+  externalRunId: string;
+  externalHeadSha: string;
+  externalTaskId?: string;
+  ciResult: 'success';
+  evidence?: string;
+  now?: number;
+}
+
 export interface SupervisionTaskFileEventInput {
   assignmentId: string;
   path: string;
@@ -605,6 +655,13 @@ function auditReceiptDigest(input: {
 
 function validRepoPath(path: string): boolean {
   return Boolean(path) && !path.startsWith('/') && !path.split('/').includes('..') && !/[\u0000-\u001f\u007f]/.test(path);
+}
+
+const FINALIZATION_SHA256_RE = /^[0-9a-f]{64}$/;
+const FINALIZATION_COMMIT_RE = /^[0-9a-f]{40}$/;
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 /**
@@ -1508,6 +1565,13 @@ export class SupervisionTaskRegistry {
     }
     if (this.getAssignment(assignmentId)) return { ok: false, reason: 'duplicate_assignment' };
     if (!['coordinator','integration_owner','implementer','auditor'].includes(input.role)) return { ok: false, reason: 'invalid' };
+    if (input.role === 'integration_owner') {
+      const exactOwners = this.listAssignments(task.taskId).filter((assignment) => (
+        assignment.role === 'integration_owner' && identityMatches(assignment.identity, input.identity)
+      ));
+      if (exactOwners.length > 1) return { ok: false, reason: 'ambiguous_assignment' };
+      if (exactOwners.length === 1) return { ok: true, value: exactOwners[0], replay: true };
+    }
     // New integration slices hand validated bytes to their integration owner;
     // they never mint an auditor assignment or consume an audit attempt. The
     // idempotency replay above deliberately remains first so rows created by
@@ -1810,6 +1874,196 @@ export class SupervisionTaskRegistry {
       this.#deriveTaskStatus(existing.taskId, now);
       this.#db.exec('COMMIT');
       return { ok: true, value: record, ...(alreadyApplied ? { replay: true } : {}) };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Finalize one exact audited integration from structured Git/CI evidence.
+   *
+   * This is intentionally separate from finishAssignment: a normal worker or
+   * auditor may close only its own assignment, while the canonical
+   * integration owner may advance the whole task only after every independent
+   * evidence source agrees. All checks run before BEGIN IMMEDIATE; the status
+   * chain, provenance, lease cleanup, claim cleanup and archive projection are
+   * then one idempotent transaction.
+   */
+  finalizeIntegration(
+    input: SupervisionIntegrationFinalizationInput,
+  ): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const owner = this.getAssignment(input.assignmentId);
+    if (!owner) return { ok: false, reason: 'not_found' };
+    if (!identityMatches(owner.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
+    if (owner.role !== 'integration_owner') return { ok: false, reason: 'role_forbidden' };
+    const task = this.getTaskRecord(owner.taskId);
+    if (!task) return { ok: false, reason: 'not_found' };
+
+    const revision = normalizeTaskString(input.revision);
+    const auditAttemptId = normalizeTaskString(input.auditAttemptId);
+    const auditRevision = normalizeTaskString(input.auditRevision);
+    const integrationOwner = normalizeTaskString(input.integrationOwner);
+    const commitSha = normalizeTaskString(input.commitSha)?.toLowerCase();
+    const pushRemoteRef = normalizeTaskString(input.pushRemoteRef);
+    const externalRunId = normalizeTaskString(input.externalRunId);
+    const externalHeadSha = normalizeTaskString(input.externalHeadSha)?.toLowerCase();
+    const externalTaskId = normalizeTaskString(input.externalTaskId);
+    const ownedFiles = normalizeTaskArray(input.ownedFiles);
+    const stagedPaths = normalizeTaskArray(input.stagedPaths);
+    const conflictedPaths = normalizeTaskArray(input.conflictedPaths);
+    const untrackedOtherOwnerPaths = normalizeTaskArray(input.untrackedOtherOwnerPaths);
+    const manifest = [...input.integrationManifest]
+      .map((entry) => ({ path: entry.path.trim(), sha256: entry.sha256.trim().toLowerCase() }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    const manifestPaths = manifest.map((entry) => entry.path);
+    const assignments = this.listAssignments(task.taskId);
+    const expectedOwnedFiles = normalizeTaskArray(assignments
+      .filter((assignment) => assignment.role === 'implementer' || assignment.role === 'integration_owner')
+      .flatMap((assignment) => assignment.scopeFiles));
+    const structurallyValid = Boolean(
+      revision && auditAttemptId && auditRevision && integrationOwner && commitSha
+      && pushRemoteRef && externalRunId && externalHeadSha
+      && input.verdict === 'PASS' && input.ciResult === 'success'
+      && (input.pushResult === 'pushed' || input.pushResult === 'already_present')
+      && FINALIZATION_COMMIT_RE.test(commitSha)
+      && FINALIZATION_COMMIT_RE.test(externalHeadSha)
+      && pushRemoteRef.startsWith('refs/')
+      && ownedFiles.length > 0
+      && input.ownedFiles.length === ownedFiles.length
+      && input.stagedPaths.length === stagedPaths.length
+      && input.integrationManifest.length === manifest.length
+      && manifest.every((entry) => validRepoPath(entry.path) && FINALIZATION_SHA256_RE.test(entry.sha256))
+      && new Set(manifestPaths).size === manifestPaths.length
+      && conflictedPaths.length === 0
+      && untrackedOtherOwnerPaths.length === 0
+    );
+    if (!structurallyValid) return { ok: false, reason: 'invalid' };
+
+    const finalizedAt = task.finalization?.finalizedAt ?? input.now ?? Date.now();
+    const finalization: PersistedSupervisionIntegrationFinalization = {
+      revision: revision!,
+      auditAttemptId: auditAttemptId!,
+      auditRevision: auditRevision!,
+      verdict: 'PASS',
+      ownedFiles,
+      integrationManifest: manifest,
+      integrationOwner: integrationOwner!,
+      commitSha: commitSha!,
+      pushResult: input.pushResult,
+      pushRemoteRef: pushRemoteRef!,
+      stagedPaths,
+      externalRunId: externalRunId!,
+      externalHeadSha: externalHeadSha!,
+      ...(externalTaskId ? { externalTaskId } : {}),
+      ciResult: 'success',
+      finalizedAt,
+    };
+    if (task.status === 'finalized') {
+      return task.finalization && JSON.stringify(task.finalization) === JSON.stringify(finalization)
+        ? { ok: true, value: task, replay: true }
+        : { ok: false, reason: 'conflicting_replay' };
+    }
+
+    if (task.status !== 'ready_for_integration' || owner.status !== 'ready_for_integration') {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    if (task.integrationOwnerAssignmentId !== owner.assignmentId
+      || integrationOwner !== owner.identity.sessionName) return { ok: false, reason: 'owner_mismatch' };
+    if (task.currentRevision !== revision || auditRevision !== revision
+      || owner.auditRevision !== revision) return { ok: false, reason: 'old_revision' };
+    if (owner.auditAttemptId !== auditAttemptId || owner.verdict?.trim().toUpperCase() !== 'PASS') {
+      return { ok: false, reason: 'old_audit_attempt' };
+    }
+    if (owner.externalRunId !== externalRunId || owner.externalHeadSha?.toLowerCase() !== externalHeadSha
+      || (externalTaskId && owner.externalTaskId !== externalTaskId)
+      || externalHeadSha !== commitSha) return { ok: false, reason: 'manifest_mismatch' };
+    if (!sameStringArray(ownedFiles, expectedOwnedFiles)
+      || !sameStringArray(stagedPaths, ownedFiles)
+      || !sameStringArray(manifestPaths, ownedFiles)) return { ok: false, reason: 'manifest_mismatch' };
+
+    const exactAuditors = assignments.filter((assignment) => (
+      assignment.role === 'auditor'
+      && assignment.auditAttemptId === auditAttemptId
+      && assignment.auditRevision === revision
+      && assignment.verdict?.trim().toUpperCase() === 'PASS'
+    ));
+    if (exactAuditors.length !== 1) return { ok: false, reason: 'ambiguous_assignment' };
+    const auditor = exactAuditors[0];
+    if (auditor.status !== 'finalized') return { ok: false, reason: 'invalid_transition' };
+    if (auditor.identity.sessionName === owner.identity.sessionName) return { ok: false, reason: 'owner_mismatch' };
+    const auditReceipts = this.listAuditReceipts(task.taskId)
+      .filter((receipt) => receipt.assignmentId === auditor.assignmentId
+        && receipt.attemptId === auditAttemptId && receipt.revision === revision);
+    if (auditReceipts.length > 0) {
+      const latestFinal = auditReceipts.filter((receipt) => receipt.receiptKind === 'final').at(-1);
+      if (!latestFinal || latestFinal.verdict !== 'PASS') return { ok: false, reason: 'old_audit_attempt' };
+    }
+
+    const chain: readonly SupervisionTaskLifecycleStatus[] =
+      SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH.slice(1);
+    let taskRecord = task;
+    let ownerRecord = owner;
+    for (const status of chain) {
+      if (!canTransitionSupervisionTaskStatus(taskRecord.status, status)
+        || !canTransitionSupervisionTaskStatus(ownerRecord.status, status)) {
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      taskRecord = { ...taskRecord, status };
+      ownerRecord = { ...ownerRecord, status };
+    }
+
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      taskRecord = task;
+      ownerRecord = owner;
+      for (const status of chain) {
+        ownerRecord = {
+          ...ownerRecord,
+          status,
+          leaseId: status === 'finalized' ? '' : ownerRecord.leaseId,
+          blocker: undefined,
+          updatedAt: now,
+        };
+        taskRecord = {
+          ...taskRecord,
+          status,
+          blocker: undefined,
+          ...(status === 'committed' ? { commitSha } : {}),
+          ...(status === 'pushed' ? { pushRemoteRef } : {}),
+          ...(status === 'finalized' ? {
+            commitSha,
+            pushRemoteRef,
+            finalization,
+            archivedAt: now,
+            archiveReason: 'terminal_retention' as const,
+            cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
+          } : {}),
+          updatedAt: now,
+        };
+        const payload = {
+          source: 'structured_integration_finalization',
+          auditAttemptId,
+          auditRevision,
+          revision,
+          integrationOwner,
+          ...(status === 'committed' ? { commitSha } : {}),
+          ...(status === 'pushed' ? { pushResult: input.pushResult, pushRemoteRef } : {}),
+          ...(status === 'finalized' ? { externalRunId, externalHeadSha, ciResult: 'success' } : {}),
+        };
+        this.#writeAssignment(ownerRecord, this.#taskEventFor(status), payload);
+        this.#writeTask(taskRecord, this.#taskEventFor(status), payload);
+      }
+      for (const assignment of assignments) {
+        if (assignment.assignmentId === owner.assignmentId || !assignment.leaseId) continue;
+        this.#writeAssignment({ ...assignment, leaseId: '', updatedAt: now }, this.#taskEventFor(assignment.status), {
+          source: 'structured_integration_finalization', leaseRevoked: true,
+        });
+      }
+      this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ?').run(task.taskId);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: taskRecord };
     } catch (error) {
       this.#db.exec('ROLLBACK');
       throw error;

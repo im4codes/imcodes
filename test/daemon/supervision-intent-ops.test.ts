@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH,
   SUPERVISION_INTENTS, SUPERVISION_INTENT_TRANSITIONS, SUPERVISION_MCP_TOOL_SCHEMAS,
   resolveSupervisionIntent, supervisionSchemaStatusEnums,
 } from '../../src/daemon/supervision-intent-ops.js';
 import {
+  canTransitionSupervisionTaskStatus,
   SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
 } from '../../shared/supervision-config.js';
@@ -82,6 +84,22 @@ describe('intent resolution', () => {
 });
 
 describe('transition table integrity', () => {
+  it('keeps the structured integration finalization path explicit and legal', () => {
+    expect(SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH).toEqual([
+      'ready_for_integration', 'integrating', 'final_audit', 'passed',
+      'finalizing', 'committed', 'pushed', 'finalized',
+    ]);
+    for (let index = 1; index < SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH.length; index += 1) {
+      expect(canTransitionSupervisionTaskStatus(
+        SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH[index - 1],
+        SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH[index],
+      )).toBe(true);
+    }
+    expect(resolveSupervisionIntent({
+      request: { intent: 'finish', taskId: 't' }, currentStatus: 'ready_for_integration',
+    })).toMatchObject({ ok: false, refusal: 'illegal_transition' });
+  });
+
   it('names only real lifecycle statuses, never event types', () => {
     for (const intent of SUPERVISION_INTENTS) {
       const rule = SUPERVISION_INTENT_TRANSITIONS[intent];

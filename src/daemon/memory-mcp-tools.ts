@@ -154,6 +154,38 @@ import {
 } from './alias-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
+
+const integrationManifestEntrySchema = z.object({
+  path: z.string().min(1),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
+const integrationFinalizationSchema = z.object({
+  assignmentId: z.string().min(1),
+  revision: z.string().min(1),
+  auditAttemptId: z.string().min(1),
+  auditRevision: z.string().min(1),
+  verdict: z.literal('PASS'),
+  ownedFiles: z.array(z.string().min(1)).min(1),
+  integrationManifest: z.array(integrationManifestEntrySchema).min(1),
+  integrationOwner: z.string().min(1),
+  commitSha: z.string().regex(/^[0-9a-f]{40}$/),
+  pushResult: z.enum(['pushed', 'already_present']),
+  pushRemoteRef: z.string().min(1),
+  stagedPaths: z.array(z.string().min(1)).min(1),
+  conflictedPaths: z.array(z.string()),
+  untrackedOtherOwnerPaths: z.array(z.string()),
+  externalRunId: z.string().min(1),
+  externalHeadSha: z.string().regex(/^[0-9a-f]{40}$/),
+  externalTaskId: z.string().min(1).optional(),
+  ciResult: z.literal('success'),
+  evidence: z.string().optional(),
+}).strict();
+
+const legacySupervisionFinishSchema = z.object({
+  assignmentId: z.string(), revision: z.string().optional(), evidence: z.string().optional(),
+}).strict();
+
 export interface MemoryMcpToolContext {
   signal?: AbortSignal;
   onProgress?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
@@ -1534,8 +1566,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_update rejected: ${updated.reason}`);
     },
     [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: async (input) => {
-      // Maps to the fixed `finish` intent; the destination comes from the
-      // transition table, never from the payload.
+      // Legacy assignment-only finish remains compatible; it can never close
+      // a whole integration task from evidence prose.
       const mapped = mapLegacySupervisionFinish(input);
       if (!mapped.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, mapped.detail);
       const identity = await supervisionTaskIdentity();
@@ -1550,6 +1582,18 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         evidence: mapped.metadata.evidence,
       });
       return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: async (input) => {
+      const parsed = integrationFinalizationSchema.safeParse(input);
+      if (!parsed.success) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'integration_finalize rejected: invalid structured finalization');
+      }
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const finalized = getSupervisionTaskRegistry().finalizeIntegration({ ...parsed.data, identity });
+      return finalized.ok
+        ? { status: 'ok', item: finalized.value, idempotentReplay: finalized.replay === true }
+        : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `integration_finalize rejected: ${finalized.reason}`);
     },
     [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['assignmentId', 'filePath', 'operation', 'beforeHash', 'afterHash', 'tool', 'source', 'idempotencyKey']);
@@ -2055,19 +2099,19 @@ const schemas = {
     result: z.string(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
-    query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
-    limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
+    query: z.string().optional().describe('Name/label filter.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Max targets.'),
     executionPool: z.enum(SUPERVISION_EXECUTION_POOL_KINDS).optional()
-      .describe('Optional configured supervision pool filter; omitted lists every scoped sibling for ordinary messaging.'),
+      .describe('Optional primary/economy filter; omit for all siblings.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
-    target: z.string().optional().describe('Exact send_list_targets target. May be omitted only with task.autoProvision=true.'),
-    message: z.string().describe('The task and the expected output.'),
+    target: z.string().optional().describe('Exact target; omit only for autoProvision.'),
+    message: z.string().describe('Request and expected output.'),
     deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
       .optional()
-      .describe('append (default) or durable queue.'),
-    files: z.array(z.string()).optional().describe('Project-root paths, not bytes.'),
+      .describe('append or queue.'),
+    files: z.array(z.string()).optional().describe('Project paths.'),
     reply: z.boolean().optional(),
     task: z.object({
       taskId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
@@ -2082,21 +2126,21 @@ const schemas = {
         model: z.string(),
         ccPresetId: z.string().min(1).optional(),
       }).strict().optional(),
-    }).strict().optional().describe('Optional supervision task metadata; result returns taskId/assignmentId.'),
+    }).strict().optional().describe('Supervision metadata.'),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),
-      auditedSessionName: z.string().min(1).describe('Session under audit; not the caller or target.'),
-      strictCrossVendor: z.literal(true).optional().describe('Set only when the user explicitly forbids same-family degradation.'),
-    }).strict().optional().describe('Supervision audit metadata; needs reply=true and one exact target.'),
-    broadcast: z.boolean().optional().describe('Only when the user says all sessions.'),
-    idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),
+      auditedSessionName: z.string().min(1).describe('Audited session.'),
+      strictCrossVendor: z.literal(true).optional().describe('Forbid same-family degradation.'),
+    }).strict().optional().describe('Audit metadata; requires reply and exact target.'),
+    broadcast: z.boolean().optional().describe('All sessions only.'),
+    idempotencyKey: z.string().optional().describe('Replay key.'),
     clone: z.object({
       kind: z.literal(EXECUTION_CLONE_KIND),
-      ephemeral: z.literal(true).describe('Always true.'),
+      ephemeral: z.literal(true),
       parentRunId: z.string().min(1),
       parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES),
-    }).strict().optional().describe('Route to a fresh ephemeral clone; returns clone.target; no broadcast.'),
+    }).strict().optional().describe('Fresh ephemeral clone; no broadcast.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: z.object({
     target: z.string().describe('Exact result.clone.target.'),
@@ -2109,42 +2153,43 @@ const schemas = {
     scopeFiles: z.array(z.string()).optional(), claimMode: z.enum(['exclusive', 'shared', 'read_only']).optional(), idempotencyKey: z.string().optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: z.object({ assignmentId: z.string(), revision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(), verdict: z.string().optional(), blocker: z.string().optional(), externalRunId: z.string().optional(), externalHeadSha: z.string().optional(), externalTaskId: z.string().optional() }),
-  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: z.object({ assignmentId: z.string(), revision: z.string().optional(), evidence: z.string().optional() }),
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: legacySupervisionFinishSchema,
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: integrationFinalizationSchema,
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: z.object({ assignmentId: z.string(), filePath: z.string(), operation: z.enum(SUPERVISION_TASK_FILE_OPERATIONS), beforeHash: z.string().optional(), afterHash: z.string().optional(), tool: z.string().optional(), source: z.string().optional(), idempotencyKey: z.string().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({
-    target: z.string().optional().describe('Exact sibling target; required unless broadcast.'),
-    broadcast: z.boolean().optional().describe('Stop all sendable siblings.'),
-    idempotencyKey: z.string().optional().describe('Accepted-stop replay key.'),
+    target: z.string().optional().describe('Exact target unless broadcast.'),
+    broadcast: z.boolean().optional().describe('Stop all siblings.'),
+    idempotencyKey: z.string().optional().describe('Replay key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: z.object({
     cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum interval.`),
     message: z.string(),
-    name: z.string().optional().describe('Job name; derived from message by default.'),
+    name: z.string().optional().describe('Optional job name.'),
     timezone: z.string().optional(),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms or explicit-offset ISO expiration.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/ISO expiry.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
       CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
-    ]).optional().describe('Defaults to recurring; use until_complete only for a bounded overall goal.'),
+    ]).optional().describe('recurring or bounded until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: z.object({
     id: z.string().describe('Current-session job id.'),
-    cronExpr: z.string().optional().describe(`Replacement schedule; ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum.`),
-    message: z.string().optional().describe('Replacement wake-up message.'),
+    cronExpr: z.string().optional().describe(`Schedule; ≥${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} min.`),
+    message: z.string().optional().describe('Wakeup message.'),
     name: z.string().optional(),
     timezone: z.string().optional(),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO expiration.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/ISO expiry.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
       CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
-    ]).optional().describe('Replacement lifecycle policy.'),
-    force: z.boolean().optional().describe('Required to change recurring to until_complete.'),
+    ]).optional().describe('Lifecycle policy.'),
+    force: z.boolean().optional().describe('Required for recurring→until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: z.object({
-    id: z.string().optional().describe('Exact current-session job id.'),
-    name: z.string().optional().describe('Exact unique current-session job name.'),
-    all: z.boolean().optional().describe('Cancel every current-session job.'),
-    force: z.boolean().optional().describe('Required for recurring jobs; use only after an explicit user request.'),
+    id: z.string().optional().describe('Exact job id.'),
+    name: z.string().optional().describe('Exact unique job name.'),
+    all: z.boolean().optional().describe('Cancel all self jobs.'),
+    force: z.boolean().optional().describe('Required for recurring jobs.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
     name: z.string(),

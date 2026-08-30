@@ -102,6 +102,20 @@ describe('memory MCP tool schema firewall', () => {
     rmSync(shortRefDir, { recursive: true, force: true });
   });
 
+  it('rejects partial structured integration finalization instead of falling back to legacy prose finish', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller());
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
+      assignmentId: 'supervision_assignment_owner',
+      revision: 'combined-r1',
+      auditAttemptId: 'overall-audit-r1',
+      evidence: 'must not select the legacy branch',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: expect.stringContaining('invalid structured finalization'),
+    });
+  });
+
   it('submits peer audit replies only through the strict structured dependency', async () => {
     const peerAuditReply = vi.fn(async () => ({ ok: true }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });

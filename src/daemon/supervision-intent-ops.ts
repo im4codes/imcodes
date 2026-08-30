@@ -26,6 +26,16 @@ export const SUPERVISION_INTENTS = [
 export type SupervisionIntent = typeof SUPERVISION_INTENTS[number];
 
 /**
+ * Daemon-owned structured integration finalization path. A generic `finish`
+ * intent cannot traverse this chain; supervision_task_finish must first pass
+ * the exact audit/manifest/Git/CI gate and then persists every edge atomically.
+ */
+export const SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH = [
+  'ready_for_integration', 'integrating', 'final_audit', 'passed',
+  'finalizing', 'committed', 'pushed', 'finalized',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[];
+
+/**
  * Allowed source statuses and the resulting status per intent.
  *
  * `to: null` means the intent records information without moving the lifecycle
