@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   },
   store: {
     matchPendingAuditAuthority: vi.fn(),
+    rebindAssignmentTarget: vi.fn(),
     receive: vi.fn(),
     markDelivered: vi.fn(),
     expire: vi.fn(),
@@ -26,7 +27,8 @@ const mocks = vi.hoisted(() => ({
     listReceived: vi.fn(() => []),
   },
   timelineEmit: vi.fn(),
-  applyMatchingAuditReceipt: vi.fn(),
+  appendMatchingAuditReceipt: vi.fn(),
+  getAssignment: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -49,7 +51,8 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 
 vi.mock('../../src/daemon/supervision-state-store.js', () => ({
   getSupervisionTaskRegistry: () => ({
-    applyMatchingAuditReceipt: mocks.applyMatchingAuditReceipt,
+    appendMatchingAuditReceipt: mocks.appendMatchingAuditReceipt,
+    getAssignment: mocks.getAssignment,
   }),
 }));
 
@@ -92,7 +95,6 @@ const record = {
 const envelope = {
   version: AGENT_DELEGATION_REPLY_VERSION,
   delegationId: record.delegationId,
-  replyCapability: 'reply_capability_1234567890_ABCDEFG',
   result: record.result,
 };
 
@@ -119,6 +121,7 @@ describe('delegation reply ingress', () => {
     mocks.restoredRuntime = undefined;
     mocks.store.receive.mockReset().mockReturnValue({ ok: true, record, replay: false });
     mocks.store.matchPendingAuditAuthority.mockReset();
+    mocks.store.rebindAssignmentTarget.mockReset();
     mocks.store.markDelivered.mockReset().mockReturnValue(true);
     mocks.store.expire.mockReset();
     mocks.store.get.mockReset();
@@ -129,7 +132,8 @@ describe('delegation reply ingress', () => {
     }));
     mocks.store.listReceived.mockReset().mockReturnValue([]);
     mocks.timelineEmit.mockReset();
-    mocks.applyMatchingAuditReceipt.mockReset().mockReturnValue({ ok: true, value: {} });
+    mocks.appendMatchingAuditReceipt.mockReset().mockReturnValue({ ok: true, value: {} });
+    mocks.getAssignment.mockReset();
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
   });
 
@@ -137,7 +141,7 @@ describe('delegation reply ingress', () => {
     clearDelegationReplyIngressForTests();
   });
 
-  it('binds the sender and delivers one trusted notification before consuming the capability', async () => {
+  it('binds the sender and delivers one trusted tokenless notification', async () => {
     const delivered = vi.fn();
     const unsubscribe = onDelegationReplyDelivered(delivered);
     await expect(submitDelegationReply({
@@ -152,8 +156,8 @@ describe('delegation reply ingress', () => {
 
     expect(mocks.store.receive).toHaveBeenCalledWith(expect.objectContaining({
       delegationId: record.delegationId,
-      replyCapability: envelope.replyCapability,
       sender: target,
+      result: record.result,
     }));
     expect(mocks.runtime?.deliverDelegationNotification).toHaveBeenCalledWith({
       notificationId: record.notificationId,
@@ -193,13 +197,15 @@ describe('delegation reply ingress', () => {
     unsubscribe();
   });
 
-  it('accepts the structured peer-audit envelope through the capability minted by send_message', async () => {
+  it('accepts the structured peer-audit envelope through daemon-authenticated assignment authority', async () => {
     const auditRecord = {
       ...record,
       purpose: 'supervision_audit' as const,
       auditAttemptId: 'attempt_manual_audit_1',
       auditRevision: 'revision-manual-1',
       auditedSessionName: origin.sessionName,
+      taskId: 'supervision_task_manual_1',
+      assignmentId: 'supervision_assignment_auditor_1',
     };
     mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
     mocks.store.receive.mockImplementation((input: { result: string }) => ({
@@ -207,13 +213,24 @@ describe('delegation reply ingress', () => {
       record: { ...auditRecord, result: input.result },
       replay: false,
     }));
-    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'invalid_capability' }));
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: auditRecord.assignmentId,
+      taskId: auditRecord.taskId,
+      role: 'auditor',
+      auditAttemptId: auditRecord.auditAttemptId,
+      auditRevision: auditRecord.auditRevision,
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
 
     await expect(submitPeerAuditReply({
       rawBody: JSON.stringify({
         version: PEER_AUDIT_REPLY_VERSION,
+        taskId: auditRecord.taskId,
+        assignmentId: auditRecord.assignmentId,
         attemptId: auditRecord.auditAttemptId,
-        replyCapability: envelope.replyCapability,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'final',
         verdict: 'PASS',
         findings: 'Exact revision and focused validation pass.',
         validations: [{
@@ -226,23 +243,27 @@ describe('delegation reply ingress', () => {
 
     expect(mocks.store.matchPendingAuditAuthority).toHaveBeenCalledWith({
       auditAttemptId: auditRecord.auditAttemptId,
-      replyCapability: envelope.replyCapability,
       sender: target,
       now: 100,
     });
     expect(mocks.store.receive).toHaveBeenCalledWith(expect.objectContaining({
       delegationId: auditRecord.delegationId,
-      replyCapability: envelope.replyCapability,
       sender: target,
+      authorizedSender: target,
       result: expect.stringContaining('"verdict":"PASS"'),
     }));
-    expect(mocks.applyMatchingAuditReceipt).toHaveBeenCalledWith({
+    expect(mocks.appendMatchingAuditReceipt).toHaveBeenCalledWith({
+      taskId: auditRecord.taskId,
+      auditorAssignmentId: auditRecord.assignmentId,
       attemptId: auditRecord.auditAttemptId,
       revision: auditRecord.auditRevision,
+      receiptKind: 'final',
       verdict: 'PASS',
       auditedSessionName: origin.sessionName,
       auditorSessionName: target.sessionName,
+      auditorIdentity: expect.objectContaining(target),
       findings: 'Exact revision and focused validation pass.',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '29 passed' }],
       now: 100,
     });
     expect(mocks.timelineEmit).toHaveBeenCalledWith(
@@ -260,16 +281,29 @@ describe('delegation reply ingress', () => {
       auditAttemptId: 'attempt_manual_audit_stale',
       auditRevision: 'revision-current',
       auditedSessionName: origin.sessionName,
+      taskId: 'supervision_task_stale',
+      assignmentId: 'supervision_assignment_stale',
     };
     mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
-    mocks.applyMatchingAuditReceipt.mockReturnValue({ ok: false, reason: 'old_revision' });
-    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'invalid_capability' }));
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: auditRecord.assignmentId,
+      taskId: auditRecord.taskId,
+      role: 'auditor',
+      auditAttemptId: auditRecord.auditAttemptId,
+      auditRevision: auditRecord.auditRevision,
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
+    mocks.appendMatchingAuditReceipt.mockReturnValue({ ok: false, reason: 'old_revision' });
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
 
     await expect(submitPeerAuditReply({
       rawBody: JSON.stringify({
         version: PEER_AUDIT_REPLY_VERSION,
+        taskId: auditRecord.taskId,
+        assignmentId: auditRecord.assignmentId,
         attemptId: auditRecord.auditAttemptId,
-        replyCapability: envelope.replyCapability,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'final',
         verdict: 'PASS',
         findings: 'Stale evidence must not be delivered.',
         validations: [{
@@ -278,7 +312,7 @@ describe('delegation reply ingress', () => {
       }),
       senderSessionName: target.sessionName,
       now: 100,
-    })).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    })).resolves.toEqual({ ok: false, error: 'revision_mismatch' });
 
     expect(mocks.store.receive).not.toHaveBeenCalled();
     expect(mocks.timelineEmit).not.toHaveBeenCalled();
@@ -415,7 +449,7 @@ describe('delegation reply ingress', () => {
     );
   });
 
-  it('keeps the capability unconsumed when native notification admission throws', async () => {
+  it('keeps the durable receipt pending when native notification admission throws', async () => {
     mocks.runtime = {
       deliverDelegationNotification: vi.fn(async () => {
         throw new Error('active turn changed');
@@ -454,7 +488,7 @@ describe('delegation reply ingress', () => {
     expect(mocks.store.markDelivered).not.toHaveBeenCalled();
   });
 
-  it('rejects a sender whose live logical identity does not match the capability target', async () => {
+  it('rejects a sender whose live logical identity does not match the authority target', async () => {
     mocks.store.receive.mockReturnValue({ ok: false, reason: 'identity' });
 
     await expect(submitDelegationReply({

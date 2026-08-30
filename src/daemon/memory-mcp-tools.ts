@@ -1311,7 +1311,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: async (input) => {
       if (!deps.peerAuditReply) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit reply ingress is unavailable');
       // This is deliberately structure-only. Evidence policy runs only after
-      // the daemon ingress has bound capability and live sender/destination.
+      // the daemon ingress has bound the exact assignment and live sender/destination.
       const decoded = decodePeerAuditReplyCommandStructure(input);
       if (!decoded.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, decoded.error);
       const result = await deps.peerAuditReply(decoded.value);
@@ -1455,6 +1455,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       )) {
         return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
       }
+      const requestedRole = typeof args.role === 'string' ? args.role : 'implementer';
       const task = existing
         ? { ok: true as const, value: existing, replay: true as const }
         : registry.createOrGet({
@@ -1466,9 +1467,35 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             idempotencyKey: stringArg(args, 'idempotencyKey'),
           });
       if (!task.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_start rejected: ${task.reason}`);
+      if (existing && requestedRole === 'implementer') {
+        const active = existing.assignments.filter((assignment) => (
+          assignment.role === 'implementer'
+          && !['cancelled', 'blocked', 'ready_for_audit', 'ready_for_integration', 'committed', 'pushed', 'finalized']
+            .includes(assignment.status)
+        ));
+        if (active.length > 0) {
+          const requestedScope = [...new Set(stringArrayArg(args, 'scopeFiles'))].sort();
+          const same = active.length === 1
+            && active[0]!.identity.sessionName === identity.sessionName
+            && active[0]!.identity.sessionInstanceId === identity.sessionInstanceId
+            && active[0]!.identity.runtimeEpoch === identity.runtimeEpoch
+            && active[0]!.identity.agentType === identity.agentType
+            && active[0]!.identity.providerFamily === identity.providerFamily
+            && JSON.stringify([...active[0]!.scopeFiles].sort()) === JSON.stringify(requestedScope);
+          return same
+            ? {
+                status: 'ok', taskId: task.value.taskId,
+                assignmentId: active[0]!.assignmentId, idempotentReplay: true,
+              }
+            : error(
+                MCP_ERROR_REASONS.VALIDATION_FAILED,
+                'existing task continuation must use send_message deliveryMode=append; task_start cannot mint another implementer assignment',
+              );
+        }
+      }
       const assignment = registry.createAssignment({
         taskId: task.value.taskId,
-        role: typeof args.role === 'string' ? args.role as never : 'implementer',
+        role: requestedRole as never,
         identity,
         scopeFiles: stringArrayArg(args, 'scopeFiles'),
         claimMode: typeof args.claimMode === 'string' ? args.claimMode as never : undefined,
@@ -2009,9 +2036,12 @@ const schemas = {
     idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: z.object({
+    taskId: z.string(),
+    assignmentId: z.string(),
     attemptId: z.string(),
-    replyCapability: z.string(),
-    verdict: z.enum(['PASS', 'REWORK']),
+    revision: z.string(),
+    receiptKind: z.enum(['progress', 'final']),
+    verdict: z.enum(['PASS', 'REWORK']).optional(),
     findings: z.string(),
     validations: z.array(z.object({
       kind: z.enum(PEER_AUDIT_VALIDATION_KINDS),
@@ -2022,7 +2052,6 @@ const schemas = {
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: z.object({
     delegationId: z.string(),
-    replyCapability: z.string(),
     result: z.string(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({

@@ -37,7 +37,6 @@ import {
   type PeerAuditTerminalRecord,
 } from './peer-audit-controller.js';
 import {
-  peerAuditCapabilityMatches,
   processPeerAuditReplyAuthority,
   registerPeerAuditReplyIngressHandler,
 } from './peer-audit-reply-ingress.js';
@@ -429,9 +428,8 @@ export class PeerAuditService {
     persistSessionRecord(nextRecord, nextRecord.name);
 
     const attemptId = opaqueId();
-    const capability = randomBytes(32).toString('base64url');
     const configRevision = targetConfigRevision(nextRecord);
-    const brief = this.#buildBrief(baseline, attemptId, capability, nextRecord);
+    const brief = this.#buildBrief(baseline, attemptId, nextRecord);
     this.#contexts.set(attemptId, {
       brief,
       auditorSessionName: candidate.name,
@@ -459,7 +457,6 @@ export class PeerAuditService {
       auditorSessionInstanceId: candidate.sessionInstanceId,
       auditorRuntimeEpoch: candidate.runtimeEpoch,
       selectionIntent: command.selectionIntent,
-      capabilityHash: hash(capability),
     });
     if (requested.status !== 'started') {
       this.#contexts.delete(attemptId);
@@ -512,10 +509,9 @@ export class PeerAuditService {
       ...(input.supervisorRationale ? { supervisorRationale: input.supervisorRationale } : {}),
     };
     const attemptId = opaqueId();
-    const capability = randomBytes(32).toString('base64url');
     const configRevision = targetConfigRevision(audited);
     const context: AttemptContext = {
-      brief: this.#buildBrief(baseline, attemptId, capability, audited, {
+      brief: this.#buildBrief(baseline, attemptId, audited, {
         changePath: input.changePath,
         changedPaths: input.changedPaths,
         validations: input.validations,
@@ -544,7 +540,6 @@ export class PeerAuditService {
       auditorSessionInstanceId: candidate.sessionInstanceId,
       auditorRuntimeEpoch: candidate.runtimeEpoch,
       selectionIntent: 'remembered_fast_path' as const,
-      capabilityHash: hash(capability),
     };
     const requested = this.#controller(audited.name).request(request, {
       // A repeated automatic evaluation for the same completed baseline is
@@ -626,7 +621,7 @@ export class PeerAuditService {
     const controller = sessionName ? this.#controllers.get(sessionName) : undefined;
     const pending = controller?.pending;
     if (!pending || pending.attemptId !== envelope.attemptId) {
-      return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+      return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
     }
     const audited = getSession(pending.auditedSessionName);
     const context = this.#contexts.get(pending.attemptId);
@@ -668,10 +663,6 @@ export class PeerAuditService {
         configRevision: audited ? targetConfigRevision(audited) : undefined,
         controllerRevision: controller.pending?.revision,
       },
-      capabilityMatches: (provided) => peerAuditCapabilityMatches(
-        pending.capabilityHash,
-        hash(provided),
-      ),
       onInvalidReply: () => { controller.invalidReply({ attemptId: envelope.attemptId }); },
       onDeadline: () => { controller.timeout({ attemptId: pending.attemptId, occurredAt: receivedAt }); },
       reduce: (reply) => {
@@ -715,7 +706,6 @@ export class PeerAuditService {
   #buildBrief(
     baseline: CompletedAuditBaseline,
     attemptId: string,
-    capability: string,
     record: SessionRecord,
     context: {
       changePath?: string;
@@ -726,7 +716,6 @@ export class PeerAuditService {
   ): string {
     return buildPeerAuditBriefV1({
       attemptId,
-      replyCapability: capability,
       taskRequest: baseline.userText,
       completedResult: baseline.assistantText,
       acceptanceCriteria: [

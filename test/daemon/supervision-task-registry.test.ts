@@ -108,6 +108,274 @@ beforeEach(() => {
 });
 
 describe('SupervisionTaskRegistry', () => {
+  it('persists tokenless append-only audit receipts across restart and gates integration on auditor FINISHED', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-audit-receipts-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'tokenless-audit-task';
+    const revision = 'tokenless-audit-r1';
+    const attemptId = 'tokenless-audit-attempt-1';
+    const implementerIdentity = identity('deck_tokenless_worker');
+    const auditorIdentity = identity('deck_tokenless_auditor');
+    const reboundAuditorIdentity = {
+      ...auditorIdentity, sessionInstanceId: 'instance-rebound-auditor', runtimeEpoch: 'epoch-rebound-auditor',
+    };
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'append-only audit receipt', currentRevision: revision,
+      }).ok).toBe(true);
+      const implementer = registry.createAssignment({
+        assignmentId: 'tokenless-implementer', taskId, role: 'implementer', identity: implementerIdentity,
+      });
+      const auditor = registry.createAssignment({
+        assignmentId: 'tokenless-auditor', taskId, role: 'auditor', identity: auditorIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!implementer.ok || !auditor.ok) throw new Error('expected tokenless audit assignments');
+      for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
+        }).ok).toBe(true);
+      }
+
+      const progress = registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'progress', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'review in progress', validations: [], now: 100,
+      });
+      expect(progress).toMatchObject({ ok: true, value: { sequence: 1, receiptKind: 'progress' } });
+      expect(registry.getAssignment(implementer.value.assignmentId)?.status).toBe('ready_for_audit');
+      expect(registry.getAssignment(auditor.value.assignmentId)?.status).toBe('auditing');
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.listAuditReceipts(taskId)).toEqual([
+        expect.objectContaining({ sequence: 1, receiptKind: 'progress', findings: 'review in progress' }),
+      ]);
+      expect(registry.rebindAuditAssignment({
+        taskId, assignmentId: auditor.value.assignmentId, identity: reboundAuditorIdentity,
+        reason: 'Brain-authorized device replacement', now: 105,
+      })).toMatchObject({ ok: true, value: { identity: reboundAuditorIdentity, generation: 2 } });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'progress', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'stale device', validations: [], now: 106,
+      })).toEqual({ ok: false, reason: 'owner_mismatch' });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'progress', auditorSessionName: reboundAuditorIdentity.sessionName,
+        auditorIdentity: reboundAuditorIdentity, findings: 'second progress', validations: [], now: 110,
+      })).toMatchObject({ ok: true, value: { sequence: 2 } });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId: 'wrong-attempt', revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: reboundAuditorIdentity.sessionName,
+        auditorIdentity: reboundAuditorIdentity, findings: 'wrong attempt', validations: [], now: 111,
+      })).toEqual({ ok: false, reason: 'old_audit_attempt' });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity: { ...reboundAuditorIdentity, runtimeEpoch: 'wrong-epoch' },
+        findings: 'wrong identity', validations: [], now: 112,
+      })).toEqual({ ok: false, reason: 'owner_mismatch' });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+
+      const pass = registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: reboundAuditorIdentity.sessionName,
+        auditorIdentity: reboundAuditorIdentity, findings: 'pass before correction',
+        validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '1 passed' }], now: 120,
+      });
+      expect(pass).toMatchObject({ ok: true, value: { sequence: 3, verdict: 'PASS' } });
+      expect(registry.getAssignment(implementer.value.assignmentId)?.status).toBe('ready_for_audit');
+      const corrected = registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'REWORK', auditorSessionName: reboundAuditorIdentity.sessionName,
+        auditorIdentity: reboundAuditorIdentity, findings: 'correction before finish', validations: [], now: 130,
+      });
+      expect(corrected).toMatchObject({
+        ok: true,
+        value: { sequence: 4, verdict: 'REWORK', supersedesReceiptId: pass.ok ? pass.value.receiptId : undefined },
+      });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'REWORK', auditorSessionName: reboundAuditorIdentity.sessionName,
+        auditorIdentity: reboundAuditorIdentity, findings: 'correction before finish', validations: [], now: 131,
+      })).toMatchObject({ ok: true, replay: true, value: { sequence: 4 } });
+
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId, identity: reboundAuditorIdentity, revision,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'rework', verdict: 'REWORK', blocker: 'correction before finish',
+      });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: reboundAuditorIdentity.sessionName,
+        auditorIdentity: reboundAuditorIdentity, findings: 'conflict after finish', validations: [], now: 140,
+      })).toEqual({ ok: false, reason: 'receipt_closed' });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(4);
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.listAuditReceipts(taskId).map((receipt) => receipt.sequence)).toEqual([1, 2, 3, 4]);
+      expect(registry.getAssignment(auditor.value.assignmentId)?.status).toBe('finalized');
+      expect(registry.getAssignment(implementer.value.assignmentId)?.status).toBe('rework');
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('hands off a validated integration slice without registering or consuming an audit', () => {
+    const registry = makeRegistry();
+    const taskId = 'validated-slice-no-audit';
+    const revision = 'slice-r1';
+    expect(registry.createOrGet({
+      taskId, topLevelTaskId: 'top-feature', classification: 'integration_slice',
+      objective: 'validated slice handoff',
+    }).ok).toBe(true);
+    const workerIdentity = identity('deck_slice_worker');
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: workerIdentity, scopeFiles: ['src/slice.ts'],
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'record_validation',
+      validationState: 'passed', toStatus: 'validated',
+    })).toMatchObject({ ok: true, value: { status: 'validated' } });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'open_audit', toStatus: 'ready_for_audit',
+    })).toEqual({ ok: false, reason: 'role_forbidden' });
+    expect(registry.createAssignment({
+      taskId, role: 'auditor', identity: identity('deck_slice_auditor'),
+      scopeFiles: ['src/slice.ts'], auditAttemptId: 'must-not-exist', auditRevision: revision,
+    })).toEqual({ ok: false, reason: 'role_forbidden' });
+
+    const finished = registry.finishAssignment({
+      assignmentId: worker.value.assignmentId, identity: workerIdentity,
+      revision, evidence: 'focused tests passed',
+    });
+    expect(finished).toMatchObject({
+      ok: true,
+      value: {
+        status: 'ready_for_integration', leaseId: '',
+      },
+    });
+    if (!finished.ok) throw new Error(finished.reason);
+    expect(finished.value.auditAttemptId).toBeUndefined();
+    expect(finished.value.verdict).toBeUndefined();
+    expect(registry.get(taskId)).toMatchObject({
+      classification: 'integration_slice', currentRevision: revision,
+      status: 'ready_for_integration',
+      assignments: [expect.objectContaining({
+        assignmentId: worker.value.assignmentId,
+        status: 'ready_for_integration', leaseId: '',
+      })],
+    });
+    expect(registry.listEvents(taskId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        assignmentId: worker.value.assignmentId,
+        eventType: 'implementation_finished',
+        payload: expect.objectContaining({
+          validatedSliceHandoff: true, implementationHandoff: 'FINISHED', auditVerdict: null, revision,
+        }),
+      }),
+    ]));
+  });
+
+  it('persists implementation heartbeat cooldown receipts without advancing progress or fabricating PASS', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-implementation-heartbeat-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const identityValue = identity('deck_alpha_worker');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId: 'heartbeat-task', projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'durable watchdog', now: 1_000,
+      }).ok).toBe(true);
+      const assignment = registry.createAssignment({
+        assignmentId: 'heartbeat-assignment', taskId: 'heartbeat-task', role: 'implementer',
+        identity: identityValue, scopeFiles: ['src/a.ts'], now: 2_000,
+      });
+      if (!assignment.ok) throw new Error(assignment.reason);
+      expect(registry.updateTask({ taskId: 'heartbeat-task', status: 'implementing', now: 3_000 }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId: assignment.value.assignmentId, identity: identityValue,
+        status: 'implementing', now: 3_000,
+      }).ok).toBe(true);
+      const progressClock = registry.getAssignment(assignment.value.assignmentId)!.updatedAt;
+      expect(registry.recordImplementationHeartbeat({
+        assignmentId: assignment.value.assignmentId,
+        reminderNumber: 1,
+        clientMessageId: 'implementation-heartbeat:1',
+        now: 10_000,
+      })).toMatchObject({
+        ok: true,
+        value: {
+          eventType: 'implementation_heartbeat', status: 'implementing', createdAt: 10_000,
+          payload: expect.objectContaining({ substantiveProgress: false, reminderNumber: 1 }),
+        },
+      });
+      expect(registry.getAssignment(assignment.value.assignmentId)).toMatchObject({
+        updatedAt: progressClock, status: 'implementing',
+      });
+      expect(registry.getAssignment(assignment.value.assignmentId)?.verdict).toBeUndefined();
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.listEvents('heartbeat-task')).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          assignmentId: assignment.value.assignmentId,
+          eventType: 'implementation_heartbeat', createdAt: 10_000,
+        }),
+      ]));
+      expect(registry.get('heartbeat-task')).toMatchObject({
+        status: 'implementing', assignments: [expect.objectContaining({
+          assignmentId: assignment.value.assignmentId, status: 'implementing',
+        })],
+      });
+      expect(registry.getAssignment(assignment.value.assignmentId)?.verdict).toBeUndefined();
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('admits exactly one active overall auditor and makes REWORK belong to the combined revision', () => {
+    const registry = makeRegistry();
+    expect(registry.createOrGet({
+      taskId: 'one-overall-audit', projectName: 'alpha', classification: 'integration_task',
+      objective: 'audit once', currentRevision: 'combined-r1',
+    }).ok).toBe(true);
+    const firstIdentity = identity('deck_alpha_auditor_1', 'claude-code-sdk');
+    const first = registry.createAssignment({
+      assignmentId: 'overall-auditor-1', taskId: 'one-overall-audit', role: 'auditor',
+      identity: firstIdentity, auditAttemptId: 'overall-attempt-1', auditRevision: 'combined-r1',
+    });
+    if (!first.ok) throw new Error(first.reason);
+    expect(registry.createAssignment({
+      assignmentId: 'overall-auditor-duplicate', taskId: 'one-overall-audit', role: 'auditor',
+      identity: identity('deck_alpha_auditor_2', 'claude-code-sdk'),
+      auditAttemptId: 'overall-attempt-duplicate', auditRevision: 'combined-r1',
+    })).toEqual({ ok: false, reason: 'duplicate_assignment' });
+    expect(registry.updateAssignment({
+      assignmentId: first.value.assignmentId, identity: firstIdentity,
+      status: 'rework', auditAttemptId: 'overall-attempt-1', auditRevision: 'combined-r1', verdict: 'REWORK',
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      assignmentId: 'overall-auditor-r2', taskId: 'one-overall-audit', role: 'auditor',
+      identity: identity('deck_alpha_auditor_2', 'claude-code-sdk'),
+      auditAttemptId: 'overall-attempt-2', auditRevision: 'combined-r2',
+    })).toMatchObject({ ok: true });
+    expect(registry.listAssignments('one-overall-audit')).toHaveLength(2);
+    registry.close();
+  });
+
   function createReplacementOwnerPassShape(registry: SupervisionTaskRegistry, taskId: string) {
     const revision = 'overall-pass-r1';
     const attemptId = 'overall-pass-attempt-r1';
@@ -120,7 +388,8 @@ describe('SupervisionTaskRegistry', () => {
     };
     const auditorIdentity = identity('deck_alpha_auditor');
     expect(registry.createOrGet({
-      taskId, projectName: 'alpha', objective: 'replacement owner recovery', currentRevision: revision, now: 1,
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'replacement owner recovery', currentRevision: revision, now: 1,
     }).ok).toBe(true);
     const oldOwner = registry.createAssignment({
       assignmentId: `${taskId}-old-owner`, taskId, role: 'integration_owner', identity: oldOwnerIdentity,
@@ -377,7 +646,8 @@ describe('SupervisionTaskRegistry', () => {
     try {
       let registry = new SupervisionTaskRegistry({ dbPath });
       expect(registry.createOrGet({
-        taskId: 'task-matching-pass', projectName: 'alpha', objective: 'receipt projection',
+        taskId: 'task-matching-pass', projectName: 'alpha', classification: 'integration_task',
+        objective: 'receipt projection',
       }).ok).toBe(true);
       registry.close();
 
@@ -475,7 +745,8 @@ describe('SupervisionTaskRegistry', () => {
   it('fails closed when two same-session assignments are equally audit eligible', () => {
     const registry = makeRegistry();
     expect(registry.createOrGet({
-      taskId: 'task-ambiguous-audit', projectName: 'alpha', objective: 'ambiguous receipt', currentRevision: 'rev-1',
+      taskId: 'task-ambiguous-audit', projectName: 'alpha', classification: 'integration_task',
+      objective: 'ambiguous receipt', currentRevision: 'rev-1',
     }).ok).toBe(true);
     for (const assignmentId of ['assignment-eligible-a', 'assignment-eligible-b']) {
       const assignment = registry.createAssignment({
@@ -506,7 +777,8 @@ describe('SupervisionTaskRegistry', () => {
   it('does not bind a missing task revision without an exact auditor revision', () => {
     const registry = makeRegistry();
     expect(registry.createOrGet({
-      taskId: 'task-unbound-revision', projectName: 'alpha', objective: 'missing auditor revision',
+      taskId: 'task-unbound-revision', projectName: 'alpha', classification: 'integration_task',
+      objective: 'missing auditor revision',
     }).ok).toBe(true);
     const implementer = registry.createAssignment({
       assignmentId: 'assignment-unbound-target', taskId: 'task-unbound-revision', role: 'implementer',
@@ -535,7 +807,8 @@ describe('SupervisionTaskRegistry', () => {
   it('rejects an old audit revision without advancing the registry projection', () => {
     const registry = makeRegistry();
     registry.createOrGet({
-      taskId: 'task-old-audit', projectName: 'alpha', objective: 'old receipt', currentRevision: 'rev-current',
+      taskId: 'task-old-audit', projectName: 'alpha', classification: 'integration_task',
+      objective: 'old receipt', currentRevision: 'rev-current',
     });
     const current = registry.createAssignment({
       assignmentId: 'assignment-current', taskId: 'task-old-audit', role: 'implementer',
@@ -648,7 +921,7 @@ describe('SupervisionTaskRegistry', () => {
 
   it('binds file events to assignment runtime without using scope claims as a write gate', () => {
     const registry = makeRegistry();
-    registry.createOrGet({ taskId: 'task-files', objective: 'file hooks' });
+    registry.createOrGet({ taskId: 'task-files', objective: 'file hooks', classification: 'integration_task' });
     const implementer = identity('deck_sub_impl');
     const auditor = identity('deck_sub_audit', 'claude-code-sdk');
     const impl = registry.createAssignment({ taskId: 'task-files', role: 'implementer', identity: implementer, scopeFiles: ['src/ok.ts'], claimMode: 'read_only' });
@@ -968,7 +1241,7 @@ describe('SupervisionTaskRegistry', () => {
           attemptId: 'attempt-degraded-12345678',
           auditedSessionName: audited.name,
         },
-        task: { autoProvision: true, objective: 'audit the implementation' },
+        task: { autoProvision: true, objective: 'audit the implementation', classification: 'integration_task' },
       },
       {
         listSessions: () => sessions,
@@ -1092,7 +1365,8 @@ describe('SupervisionTaskRegistry', () => {
     const registry = getSupervisionTaskRegistry();
     const revision = 'task-worktree-core-r2';
     expect(registry.createOrGet({
-      projectName: 'alpha', taskId: 'matching-pass-close', objective: 'close reachable lifecycle', currentRevision: revision,
+      projectName: 'alpha', taskId: 'matching-pass-close', classification: 'integration_task',
+      objective: 'close reachable lifecycle', currentRevision: revision,
     }).ok).toBe(true);
     const implementerIdentity = identity('deck_alpha_w1');
     const auditorIdentity = identity('deck_alpha_w2', 'claude-code-sdk');
@@ -1204,19 +1478,31 @@ describe('SupervisionTaskRegistry', () => {
         const owner = identity(`deck_alpha_${role}`);
         const auditorIdentity = identity(`deck_alpha_${role}_auditor`, 'claude-code-sdk');
         expect(registry.createOrGet({
-          taskId, projectName: 'alpha', objective: `finish ${role}`, currentRevision: revision,
+          taskId, projectName: 'alpha', classification: 'integration_task',
+          objective: `finish ${role}`, currentRevision: revision,
         }).ok).toBe(true);
         const target = registry.createAssignment({ taskId, role, identity: owner });
-        const auditor = registry.createAssignment({
-          taskId, role: 'auditor', identity: auditorIdentity,
-          auditAttemptId: `attempt-${role}`, auditRevision: revision,
-        });
         const staleAuditorIdentity = identity(`deck_alpha_${role}_stale_auditor`, 'claude-code-sdk');
         const staleAuditor = registry.createAssignment({
           taskId, role: 'auditor', identity: staleAuditorIdentity,
           auditAttemptId: `stale-attempt-${role}`, auditRevision: 'older-revision',
         });
-        if (!target.ok || !auditor.ok || !staleAuditor.ok) throw new Error('expected finalization assignments');
+        if (!target.ok || !staleAuditor.ok) throw new Error('expected initial finalization assignments');
+        for (const status of ['auditing', 'rework'] as const) {
+          expect(registry.updateAssignment({
+            assignmentId: staleAuditor.value.assignmentId,
+            identity: staleAuditorIdentity,
+            status,
+            auditAttemptId: `stale-attempt-${role}`,
+            auditRevision: 'older-revision',
+            ...(status === 'rework' ? { verdict: 'REWORK' } : {}),
+          }).ok, `${role}:stale-auditor:prepare:${status}`).toBe(true);
+        }
+        const auditor = registry.createAssignment({
+          taskId, role: 'auditor', identity: auditorIdentity,
+          auditAttemptId: `attempt-${role}`, auditRevision: revision,
+        });
+        if (!auditor.ok) throw new Error('expected current finalization auditor');
 
         for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
           expect(registry.updateAssignment({
@@ -1480,7 +1766,9 @@ describe('SupervisionTaskRegistry', () => {
     const dbPath = join(dir, 'registry.sqlite');
     let registry = new SupervisionTaskRegistry({ dbPath });
     try {
-      expect(registry.createOrGet({ projectName: 'alpha', taskId: 'cancel-me', objective: 'cancel safely' }).ok).toBe(true);
+      expect(registry.createOrGet({
+        projectName: 'alpha', taskId: 'cancel-me', classification: 'integration_task', objective: 'cancel safely',
+      }).ok).toBe(true);
       const owner = identity('deck_alpha_w1');
       const assignment = registry.createAssignment({
         taskId: 'cancel-me', role: 'implementer', identity: owner,
@@ -1640,5 +1928,172 @@ describe('SupervisionTaskRegistry', () => {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('dry-runs and applies bounded housekeeping without deleting provenance or touching active exceptions', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-housekeeping-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const now = 30 * 24 * 60 * 60_000;
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    const task = (taskId: string, objective: string, createdAt = 1_000) => {
+      expect(registry.createOrGet({
+        taskId, topLevelTaskId: 'housekeeping-top', projectName: 'alpha',
+        classification: 'independent_top_level', objective, now: createdAt,
+      })).toMatchObject({ ok: true });
+    };
+    const assignment = (taskId: string, assignmentId: string) => {
+      const created = registry.createAssignment({
+        taskId, assignmentId, role: 'implementer', identity: identity(`deck_${assignmentId}`), now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      return created.value;
+    };
+    const rewriteTask = (taskId: string, patch: Record<string, unknown>) => {
+      const row = db.prepare('SELECT payload_json AS payload FROM supervision_tasks WHERE task_id = ?')
+        .get(taskId) as { payload: string };
+      const payload = { ...JSON.parse(row.payload), ...patch };
+      db.prepare(`UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ?
+                  WHERE task_id = ?`)
+        .run(payload.status, payload.currentRevision ?? null, JSON.stringify(payload), payload.updatedAt, taskId);
+    };
+    const rewriteAssignment = (assignmentId: string, patch: Record<string, unknown>) => {
+      const row = db.prepare('SELECT payload_json AS payload FROM supervision_task_assignments WHERE assignment_id = ?')
+        .get(assignmentId) as { payload: string };
+      const payload = { ...JSON.parse(row.payload), ...patch };
+      db.prepare(`UPDATE supervision_task_assignments SET status = ?, lease_id = ?, audit_revision = ?,
+                    verdict = ?, payload_json = ?, updated_at = ? WHERE assignment_id = ?`)
+        .run(payload.status, payload.leaseId ?? '', payload.auditRevision ?? null, payload.verdict ?? null,
+          JSON.stringify(payload), payload.updatedAt, assignmentId);
+    };
+
+    try {
+      task('a-completed-stale', 'completed but aggregate delegated');
+      assignment('a-completed-stale', 'a-completed-worker');
+      rewriteAssignment('a-completed-worker', { status: 'finalized', leaseId: 'stale-finalized-lease', updatedAt: 2_000 });
+      rewriteTask('a-completed-stale', {
+        status: 'delegated', currentRevision: 'completed-r1', commitSha: 'abc1234',
+        pushRemoteRef: 'refs/heads/dev', updatedAt: 3_000,
+      });
+      db.prepare(`INSERT INTO supervision_audit_attestations
+        (attempt_id, task_id, assignment_id, revision, verdict, auditor_session_name, findings, created_at)
+        VALUES ('completed-pass-attempt','a-completed-stale','a-completed-worker','completed-r1','PASS',
+          'deck_auditor','retained PASS evidence',2500)`).run();
+
+      task('b-cancelled-stale', 'cancelled but aggregate validated');
+      assignment('b-cancelled-stale', 'b-cancelled-worker');
+      rewriteAssignment('b-cancelled-worker', { status: 'cancelled', leaseId: 'stale-cancelled-lease', updatedAt: 2_000 });
+      rewriteTask('b-cancelled-stale', { status: 'validated', updatedAt: 3_000 });
+      db.prepare(`INSERT INTO supervision_task_file_claims
+        (task_id, assignment_id, file_path, claim_mode, created_at) VALUES (?, ?, ?, 'read_only', ?)`)
+        .run('b-cancelled-stale', 'b-cancelled-worker', 'src/stale.ts', 2_000);
+
+      task('c-live-active', 'live active work');
+      assignment('c-live-active', 'c-live-worker');
+      rewriteAssignment('c-live-worker', { status: 'implementing', leaseId: 'live-lease', updatedAt: 2_000 });
+      rewriteTask('c-live-active', { status: 'implementing', updatedAt: 3_000 });
+
+      task('d-rework-split', 'legitimate R2 rework recovery');
+      assignment('d-rework-split', 'd-rework-worker');
+      rewriteAssignment('d-rework-worker', {
+        status: 'rework', leaseId: 'rework-lease', auditRevision: 'revision-r2', verdict: 'REWORK', updatedAt: now - 500,
+      });
+      rewriteTask('d-rework-split', { status: 'ready_for_audit', currentRevision: 'revision-r1', updatedAt: now - 500 });
+
+      task('e-old-pass', 'PASS awaiting integration');
+      assignment('e-old-pass', 'e-pass-worker');
+      rewriteAssignment('e-pass-worker', { status: 'passed', leaseId: '', verdict: 'PASS', updatedAt: 2_000 });
+      rewriteTask('e-old-pass', { status: 'passed', currentRevision: 'pass-r1', updatedAt: 3_000 });
+
+      task('f-duplicate-original', '  Same   Objective  ', now - 1_000);
+      task('g-duplicate-copy', 'same objective', now - 500);
+      task('h-empty-planned', 'never dispatched garbage');
+
+      const eventsBefore = new Map(registry.list({ includeArchived: true }).map((item) => (
+        [item.taskId, registry.listEvents(item.taskId).length]
+      )));
+      const dryRun = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 20, now });
+      expect(dryRun).toMatchObject({
+        mode: 'dryRun', scanned: 8, hasMore: false, activeCount: 8, archivedCount: 0,
+        applyAuthorized: false,
+      });
+      expect(dryRun.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ taskId: 'a-completed-stale', kind: 'release_terminal_assignment' }),
+        expect.objectContaining({ taskId: 'a-completed-stale', kind: 'repair_aggregate', toStatus: 'finalized' }),
+        expect.objectContaining({ taskId: 'a-completed-stale', kind: 'archive_terminal' }),
+        expect.objectContaining({ taskId: 'b-cancelled-stale', kind: 'archive_terminal' }),
+        expect.objectContaining({ taskId: 'd-rework-split', kind: 'repair_revision', toRevision: 'revision-r2' }),
+        expect.objectContaining({ taskId: 'g-duplicate-copy', kind: 'mark_duplicate_candidate' }),
+        expect.objectContaining({ taskId: 'h-empty-planned', kind: 'archive_abandoned' }),
+      ]));
+      expect(registry.get('a-completed-stale')).not.toHaveProperty('archivedAt');
+
+      const applied = registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 20, now });
+      expect(applied).toMatchObject({ activeCount: 5, archivedCount: 3, applyAuthorized: true });
+      expect(registry.list().map((item) => item.taskId)).toEqual([
+        'c-live-active', 'd-rework-split', 'e-old-pass', 'f-duplicate-original', 'g-duplicate-copy',
+      ]);
+      expect(registry.list({ history: true }).map((item) => item.taskId)).toEqual([
+        'a-completed-stale', 'b-cancelled-stale', 'h-empty-planned',
+      ]);
+      expect(registry.list({ includeArchived: true })).toHaveLength(8);
+      expect(registry.get('d-rework-split')).toMatchObject({
+        status: 'rework', currentRevision: 'revision-r2',
+      });
+      expect(registry.get('d-rework-split')).not.toHaveProperty('archivedAt');
+      expect(registry.get('c-live-active')).toMatchObject({ status: 'implementing' });
+      expect(registry.get('c-live-active')).not.toHaveProperty('archivedAt');
+      expect(registry.get('e-old-pass')).toMatchObject({ status: 'passed' });
+      expect(registry.get('e-old-pass')).not.toHaveProperty('archivedAt');
+      expect(registry.get('g-duplicate-copy')).toMatchObject({
+        duplicateCandidate: true, duplicateCandidateOf: 'f-duplicate-original',
+      });
+      expect(registry.get('g-duplicate-copy')).not.toHaveProperty('archivedAt');
+      expect(registry.getAssignment('a-completed-worker')).toMatchObject({ status: 'finalized', leaseId: '' });
+      expect(registry.getAssignment('b-cancelled-worker')).toMatchObject({ status: 'cancelled', leaseId: '' });
+      expect(db.prepare('SELECT COUNT(*) AS n FROM supervision_task_file_claims').get()).toEqual({ n: 0 });
+      expect(db.prepare(`SELECT revision, verdict, findings FROM supervision_audit_attestations
+                         WHERE attempt_id='completed-pass-attempt'`).get()).toEqual({
+        revision: 'completed-r1', verdict: 'PASS', findings: 'retained PASS evidence',
+      });
+      expect(registry.get('a-completed-stale')).toMatchObject({
+        archivedAt: now, currentRevision: 'completed-r1', commitSha: 'abc1234', pushRemoteRef: 'refs/heads/dev',
+      });
+      for (const [taskId, count] of eventsBefore) {
+        expect(registry.listEvents(taskId).length).toBeGreaterThanOrEqual(count);
+      }
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.list()).toHaveLength(5);
+      expect(registry.list({ history: true })).toHaveLength(3);
+      expect(registry.housekeepingApplyAuthorized('alpha')).toBe(true);
+    } finally {
+      registry.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('pushes the housekeeping page bound into SQLite and returns a deterministic cursor', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    for (const suffix of ['a', 'b', 'c', 'd']) {
+      expect(registry.createOrGet({
+        taskId: `bounded-${suffix}`, projectName: 'alpha', objective: `bounded ${suffix}`, now: 10,
+      })).toMatchObject({ ok: true });
+    }
+    const prepare = vi.spyOn(database, 'prepare');
+    const first = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 2, now: 20 });
+    expect(first).toMatchObject({ scanned: 2, hasMore: true, nextCursor: 'bounded-b' });
+    expect(prepare.mock.calls.some(([sql]) => (
+      String(sql).includes('FROM supervision_tasks t') && String(sql).includes('LIMIT ?')
+    ))).toBe(true);
+    expect(registry.reconcileHousekeeping({
+      mode: 'dryRun', cursor: first.nextCursor, limit: 2, now: 20,
+      projectName: 'alpha',
+    })).toMatchObject({ scanned: 2, hasMore: false });
+    registry.close();
+    database.close();
   });
 });

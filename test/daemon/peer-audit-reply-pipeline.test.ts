@@ -7,11 +7,9 @@ import {
   type PeerAuditReplyCurrentBindings,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 
-const capability = 'A'.repeat(32);
 const envelope: PeerAuditReplyEnvelope = {
   version: PEER_AUDIT_REPLY_VERSION,
   attemptId: 'attempt_1',
-  replyCapability: capability,
   verdict: 'PASS',
   findings: 'Looks good.',
   validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '1 passed' }],
@@ -47,7 +45,6 @@ function evaluate(overrides: Partial<Parameters<typeof processPeerAuditReplyAuth
     receivedAt: authority.deadlineAt - 1,
     authority,
     current,
-    capabilityMatches: (provided) => provided === capability,
     onInvalidReply,
     onDeadline,
     reduce,
@@ -66,18 +63,17 @@ describe('peer-audit reply authority pipeline', () => {
     vi.useRealTimers();
   });
 
-  it('checks capability and bound identities before deadline or evidence', () => {
-    const capabilityRejected = evaluate({
-      envelope: { ...envelope, validations: [] },
+  it('checks attempt and bound identities before deadline or evidence', () => {
+    const attemptRejected = evaluate({
+      envelope: { ...envelope, attemptId: 'wrong-attempt', validations: [] },
       receivedAt: authority.deadlineAt,
-      capabilityMatches: () => false,
       current: { ...current, sender: undefined, baselineValid: false },
     });
-    expect(capabilityRejected.result).toEqual({
-      ok: false, error: 'invalid_capability', internalReason: 'capability_rejected',
+    expect(attemptRejected.result).toEqual({
+      ok: false, error: 'attempt_mismatch', internalReason: 'attempt_rejected',
     });
-    expect(capabilityRejected.onDeadline).not.toHaveBeenCalled();
-    expect(capabilityRejected.reduce).not.toHaveBeenCalled();
+    expect(attemptRejected.onDeadline).not.toHaveBeenCalled();
+    expect(attemptRejected.reduce).not.toHaveBeenCalled();
 
     const senderRejected = evaluate({
       envelope: { ...envelope, validations: [] },
@@ -117,7 +113,7 @@ describe('peer-audit reply authority pipeline', () => {
       current: { ...current, controllerRevision: authority.controllerRevision + 1 },
     });
     expect(revisionRejected.result).toEqual({
-      ok: false, error: 'identity_mismatch', internalReason: 'revision_rejected',
+      ok: false, error: 'revision_mismatch', internalReason: 'revision_rejected',
     });
     expect(revisionRejected.onDeadline).not.toHaveBeenCalled();
 
@@ -171,7 +167,6 @@ describe('peer-audit reply authority pipeline', () => {
       auditorSessionInstanceId: authority.sender.sessionInstanceId,
       auditorRuntimeEpoch: authority.sender.runtimeEpoch,
       selectionIntent: 'explicit_picker',
-      capabilityHash: 'stored_hash',
     };
     controller.request(start);
     controller.dispatchResolved({
@@ -205,7 +200,6 @@ describe('peer-audit reply authority pipeline', () => {
       receivedAt: boundAuthority.deadlineAt - 2,
       authority: boundAuthority,
       current: boundCurrent,
-      capabilityMatches: () => true,
       onInvalidReply: () => { controller.invalidReply({ attemptId: envelope.attemptId }); },
       onDeadline: () => { controller.timeout({ attemptId: envelope.attemptId, occurredAt: boundAuthority.deadlineAt }); },
       reduce,
@@ -221,7 +215,6 @@ describe('peer-audit reply authority pipeline', () => {
       receivedAt: boundAuthority.deadlineAt - 1,
       authority: boundAuthority,
       current: boundCurrent,
-      capabilityMatches: () => true,
       onInvalidReply: () => { controller.invalidReply({ attemptId: envelope.attemptId }); },
       onDeadline: () => { controller.timeout({ attemptId: envelope.attemptId, occurredAt: boundAuthority.deadlineAt }); },
       reduce,

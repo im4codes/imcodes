@@ -120,7 +120,18 @@ describe('memory MCP shared contracts', () => {
     expect(sendMessage.description).toContain('durable FIFO fallback');
     expect(sendMessage.description).toContain('queue always uses FIFO');
     expect(sendMessage.description).toContain('delivered/queued/failed status');
-    expect(delegationReply.description).toContain('multiple replies until it expires');
+    expect(delegationReply.description).toContain('append-only');
+    expect(delegationReply.inputSchema.properties).not.toHaveProperty('replyCapability');
+    const peerAuditReply = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY];
+    expect(peerAuditReply.inputSchema.required).toEqual([
+      'taskId',
+      'assignmentId',
+      'attemptId',
+      'revision',
+      'receiptKind',
+      'findings',
+      'validations',
+    ]);
 
     const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
     const sendMessageText = sendMessage.inputSchema.properties?.message as { description?: string } | undefined;

@@ -53,9 +53,14 @@ const RECOVERY_FORBIDDEN_SOURCES: readonly SupervisionTaskLifecycleStatus[] =
 export interface SupervisionVisibilityItem {
   taskId?: string;
   projectName?: string;
+  classification?: string;
   status?: string;
   assignments?: ReadonlyArray<{
     assignmentId?: string;
+    role?: string;
+    status?: string;
+    leaseId?: string;
+    auditAttemptId?: string;
     identity?: { sessionName?: string };
   }>;
 }
@@ -121,12 +126,25 @@ export interface SupervisionRegistryPort {
     assignmentId: string;
     callerSessionName: string;
   }): { ok: true; value: unknown; replay?: boolean } | { ok: false; reason: string };
-  list(filter: { projectName?: string; status?: string; topLevelTaskId?: string; ownerSessionName?: string }): SupervisionVisibilityItem[];
+  list(filter: {
+    projectName?: string; status?: string; topLevelTaskId?: string; ownerSessionName?: string;
+    includeArchived?: boolean; history?: boolean; cursor?: string; limit?: number;
+  }): SupervisionVisibilityItem[];
   get(taskId: string): SupervisionVisibilityItem | undefined;
   recover(input: { taskId: string; toStatus: SupervisionRecoveryTargetStatus; reason: string }):
     | void
     | { ok: true; value?: { status?: string }; replay?: boolean }
     | { ok: false; reason: string };
+  rebindAuditAssignment?(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: {
+      sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
+      agentType: string; providerFamily: string;
+    };
+    reason: string;
+  }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
+  housekeeping(input: { mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number }): unknown;
 }
 
 export interface SupervisionMcpToolDeps {
@@ -136,6 +154,10 @@ export interface SupervisionMcpToolDeps {
   isAdmin?: (caller: McpRuntimeCaller) => boolean;
   /** Live daemon identity gate; caller fields alone never establish Brain authority. */
   isProjectBrain?: (caller: McpRuntimeCaller) => boolean;
+  resolveSessionIdentity?: (sessionName: string) => {
+    sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
+    agentType: string; providerFamily: string;
+  } | undefined;
 }
 
 function ok(value: ToolResult): ToolResult { return { status: 'ok', ...value }; }
@@ -164,14 +186,25 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     ownerSessionName: z.string().min(1).optional(),
     /** Legacy published alias of ownerSessionName; kept for compatibility. */
     target: z.string().min(1).optional(),
+    includeArchived: z.boolean().optional(),
+    history: z.boolean().optional(),
+    cursor: z.string().min(1).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
   },
   [SUPERVISION_MCP_TOOLS.GET]: {
     taskId: z.string().min(1),
   },
   [SUPERVISION_MCP_TOOLS.RECOVER]: {
     taskId: z.string().min(1),
-    toStatus: z.enum([...SUPERVISION_RECOVERY_TARGET_STATUSES] as [string, ...string[]]),
+    toStatus: z.enum([...SUPERVISION_RECOVERY_TARGET_STATUSES] as [string, ...string[]]).optional(),
+    assignmentId: z.string().min(1).optional(),
+    rebindSessionName: z.string().min(1).optional(),
     reason: z.string().min(1).max(2000),
+  },
+  [SUPERVISION_MCP_TOOLS.HOUSEKEEPING]: {
+    mode: z.enum(['dryRun', 'apply']),
+    cursor: z.string().min(1).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
   },
 } as const;
 
@@ -182,6 +215,7 @@ const DESCRIPTIONS: Record<SupervisionMcpToolName, string> = {
   [SUPERVISION_MCP_TOOLS.LIST]: 'List project tasks for its Brain, otherwise tasks you participate in.',
   [SUPERVISION_MCP_TOOLS.GET]: 'Read a project task as its Brain, otherwise a task you participate in.',
   [SUPERVISION_MCP_TOOLS.RECOVER]: 'Restricted task recovery.',
+  [SUPERVISION_MCP_TOOLS.HOUSEKEEPING]: 'Bounded task retention census or administrative apply; provenance is retained.',
 };
 
 export function createSupervisionMcpToolHandlers(
@@ -214,12 +248,24 @@ export function createSupervisionMcpToolHandlers(
       if (requestedAssignmentId && !boundAssignmentId) {
         return err('identity_rejected', 'assignment is not visible to this caller');
       }
+      const intent = String(input.intent ?? '');
+      const boundAssignment = boundAssignmentId
+        ? callerAssignments.find((assignment) => assignment.assignmentId === boundAssignmentId)
+        : undefined;
+      if (intent === 'open_audit' && task?.classification === 'integration_slice') {
+        const historicalAudit = (task.assignments ?? []).some((assignment) => (
+          assignment.role === 'auditor' && Boolean(assignment.auditAttemptId)
+        ));
+        if (!historicalAudit) {
+          return err('role_forbidden', 'integration_slice cannot open an audit; merge validated slices first');
+        }
+      }
       // `cancel` is the one intent with both task- and assignment-scoped forms.
       // Only an explicit assignmentId selects the narrow form. Inferring the
       // caller's sole assignment here made a task-level cancel report success
       // while leaving the durable task row unchanged when that assignment was
       // already retired.
-      const intentAssignmentId = String(input.intent ?? '') === 'cancel' && !requestedAssignmentId
+      const intentAssignmentId = intent === 'cancel' && !requestedAssignmentId
         ? undefined
         : boundAssignmentId;
       // `finish` is assignment-scoped. A matching structured audit may have
@@ -228,7 +274,7 @@ export function createSupervisionMcpToolHandlers(
       // transition table first made the only valid terminal edge unreachable.
       // The registry verifies the exact audit revision/attempt and atomically
       // revokes this assignment's lease and claims.
-      if (String(input.intent ?? '') === 'finish' && boundAssignmentId && reg.finishAssignment) {
+      if (intent === 'finish' && boundAssignmentId && reg.finishAssignment) {
         if (input.status !== undefined) {
           return err('model_supplied_status', 'Lifecycle status is daemon-owned; send an intent instead.');
         }
@@ -248,7 +294,17 @@ export function createSupervisionMcpToolHandlers(
           note: input.note === undefined ? undefined : String(input.note),
           status: input.status,
         },
-        currentStatus: reg.getStatus(taskId),
+        // Recovery after assignment-scoped cancellation must reuse the same
+        // logical task. When the aggregate is already implementing, a leased
+        // delegated replacement assignment still owns its own delegated ->
+        // implementing edge; feeding the aggregate status into the pure state
+        // machine incorrectly made both start and claim unreachable.
+        currentStatus: (intent === 'start' || intent === 'claim')
+          && task?.status === 'implementing'
+          && boundAssignment?.status === 'delegated'
+          && Boolean(boundAssignment.leaseId)
+          ? 'delegated'
+          : reg.getStatus(taskId),
       });
       if (!outcome.ok) return err(outcome.refusal ?? 'refused', outcome.detail);
       const applied = reg.applyIntent({
@@ -276,6 +332,17 @@ export function createSupervisionMcpToolHandlers(
       if (status !== undefined && !isSupervisionTaskLifecycleStatus(status)) {
         return err('invalid_status', 'status must be a fixed lifecycle id');
       }
+      const includeArchived = input.includeArchived === true;
+      const history = input.history === true;
+      if (includeArchived && history) {
+        return err('validation_failed', 'includeArchived and history are mutually exclusive');
+      }
+      const historyFilter = {
+        ...(includeArchived ? { includeArchived: true } : {}),
+        ...(history ? { history: true } : {}),
+        ...(input.cursor === undefined ? {} : { cursor: String(input.cursor) }),
+        ...(input.limit === undefined ? {} : { limit: Number(input.limit) }),
+      };
       const projectName = caller.projectName?.trim() || '';
       if (projectName && isProjectBrain(caller)) {
         const explicitOwner = input.ownerSessionName === undefined
@@ -285,13 +352,16 @@ export function createSupervisionMcpToolHandlers(
           && String(input.target) !== String(input.ownerSessionName)) {
           return err('conflicting_owner_filter', 'target and ownerSessionName disagree');
         }
-        return ok({
-          tasks: reg.list({
+        const tasks = reg.list({
             projectName,
             status,
             topLevelTaskId: input.topLevelTaskId === undefined ? undefined : String(input.topLevelTaskId),
             ...(explicitOwner ? { ownerSessionName: explicitOwner } : {}),
-          }),
+            ...historyFilter,
+          });
+        return ok({
+          tasks,
+          count: tasks.length,
           ownerScope: 'project_brain',
         });
       }
@@ -305,11 +375,14 @@ export function createSupervisionMcpToolHandlers(
         status,
         topLevelTaskId: input.topLevelTaskId === undefined ? undefined : String(input.topLevelTaskId),
         ownerSessionName: scope.ownerSessionName,
+        ...historyFilter,
       });
       // Post-filter: an explicit owner filter must never widen visibility beyond
       // the tasks this caller actually participates in.
+      const tasks = rows.filter((row) => supervisionCallerParticipates(row, callerSession));
       return ok({
-        tasks: rows.filter((row) => supervisionCallerParticipates(row, callerSession)),
+        tasks,
+        count: tasks.length,
         ownerScope: scope.source,
       });
     },
@@ -337,11 +410,29 @@ export function createSupervisionMcpToolHandlers(
       const input = (args ?? {}) as Record<string, unknown>;
       const reg = need();
       if (!reg) return err('unavailable', 'supervision registry not bound');
+      const assignmentId = String(input.assignmentId ?? '').trim();
+      const rebindSessionName = String(input.rebindSessionName ?? '').trim();
+      const reason = String(input.reason ?? '').trim();
+      const taskId = String(input.taskId ?? '');
+      if (assignmentId || rebindSessionName) {
+        if (!assignmentId || !rebindSessionName || !reason) return err('validation_failed', 'audit rebind requires assignmentId, rebindSessionName and reason');
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        if (!task || !caller.projectName || caller.projectName !== taskProjectName
+          || (!isAdmin(caller) && !isProjectBrain(caller))) {
+          return err('forbidden', 'audit identity rebind requires the authoritative project Brain or administrator');
+        }
+        const identity = deps.resolveSessionIdentity?.(rebindSessionName);
+        if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
+        const rebound = reg.rebindAuditAssignment?.({ taskId, assignmentId, identity, reason });
+        if (!rebound) return err('unavailable', 'audit identity rebind is not bound');
+        if (!rebound.ok) return err(rebound.reason, `audit identity rebind rejected: ${rebound.reason}`);
+        return ok({ taskId, assignmentId, rebindSessionName, replay: rebound.replay === true });
+      }
       const target = String(input.toStatus ?? '');
       if (!(SUPERVISION_RECOVERY_TARGET_STATUSES as readonly string[]).includes(target)) {
         return err('invalid_target_status', 'recovery target must be a restricted enum member');
       }
-      const taskId = String(input.taskId ?? '');
       const current = reg.getStatus(taskId);
       const task = reg.get(taskId);
       const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
@@ -357,12 +448,30 @@ export function createSupervisionMcpToolHandlers(
       if (RECOVERY_FORBIDDEN_SOURCES.includes(current)) {
         return err('illegal_transition', `recovery cannot move a ${current} task`);
       }
-      const reason = String(input.reason ?? '').trim();
       if (!reason) return err('reason_required');
       const recovered = reg.recover({ taskId, toStatus: target as SupervisionRecoveryTargetStatus, reason });
       if (recovered && !recovered.ok) return err(recovered.reason, `task recovery rejected: ${recovered.reason}`);
       const actualStatus = recovered?.value?.status ?? target;
       return ok({ taskId, fromStatus: current, toStatus: actualStatus });
+    },
+
+    async [SUPERVISION_MCP_TOOLS.HOUSEKEEPING](args) {
+      const input = (args ?? {}) as Record<string, unknown>;
+      const reg = need();
+      if (!reg) return err('unavailable', 'supervision registry not bound');
+      const projectName = caller.projectName?.trim() || '';
+      if (!projectName || (!isAdmin(caller) && !isProjectBrain(caller))) {
+        return err('forbidden', 'housekeeping requires the authoritative project Brain or administrator');
+      }
+      const mode = String(input.mode ?? '');
+      if (mode !== 'dryRun' && mode !== 'apply') return err('validation_failed', 'mode must be dryRun or apply');
+      const result = reg.housekeeping({
+        mode,
+        projectName,
+        ...(input.cursor === undefined ? {} : { cursor: String(input.cursor) }),
+        ...(input.limit === undefined ? {} : { limit: Number(input.limit) }),
+      });
+      return ok({ result });
     },
   };
 }

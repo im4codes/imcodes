@@ -15,6 +15,7 @@ import type {
   SupervisionMcpToolDeps,
   SupervisionRegistryPort,
 } from './supervision-mcp-tools.js';
+import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 
 /**
  * One live-session authority check shared by the MCP project list and the Web
@@ -64,6 +65,8 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     recover: (input) => {
       return getSupervisionTaskRegistry().recoverTask(input);
     },
+    rebindAuditAssignment: (input) => getSupervisionTaskRegistry().rebindAuditAssignment(input),
+    housekeeping: (input) => getSupervisionTaskRegistry().reconcileHousekeeping(input),
   };
 }
 
@@ -79,6 +82,17 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         projectName,
         coordinatorSessionName: sessionName,
       }, sessions);
+    },
+    resolveSessionIdentity: (sessionName) => {
+      const session = listSessions().find((candidate) => candidate.name === sessionName);
+      if (!session?.sessionInstanceId || !session.runtimeEpoch) return undefined;
+      return {
+        sessionName: session.name,
+        sessionInstanceId: session.sessionInstanceId,
+        runtimeEpoch: session.runtimeEpoch,
+        agentType: session.agentType,
+        providerFamily: resolvePeerAuditProviderFamily(session),
+      };
     },
   };
 }

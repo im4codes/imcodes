@@ -21,10 +21,31 @@ import {
   buildSupervisionDecisionPrompt,
   buildSupervisionDecisionRepairPrompt,
   buildSupervisionOrchestratorContext,
+  buildSupervisionTaskFinalizationContract,
 } from '../../src/daemon/supervision-prompts.js';
 import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/peer-audit.js';
 
 describe('supervision prompts', () => {
+  it('states merge-before-audit and exactly one overall audit in every locale', () => {
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      const contract = buildSupervisionTaskFinalizationContract(locale);
+      expect(contract).toContain('integration_slice');
+      expect(contract).toContain('integration_task');
+      expect(contract).toContain('independent_top_level');
+      expect(contract).toContain('integrationManifest');
+      expect(contract).toContain('overall');
+      expect(contract).toContain('deliveryMode=append');
+      expect(contract).toContain('implementation_finished');
+    }
+
+    const english = buildSupervisionTaskFinalizationContract('en');
+    expect(english).toContain('without starting an audit');
+    expect(english).toContain('integration_slice audit registration is forbidden');
+    expect(english).toContain('one matching PASS');
+    expect(english).not.toContain('each slice ownerSession/revision/auditAttemptId/PASS');
+    expect(english).not.toContain('matching independent audit PASS, then marks ready_for_integration');
+  });
+
   // Wording snapshot, NOT a behavioural gate. There is no execution-time
   // interception of git/release/deploy anywhere in the daemon, so this asserts
   // only that the explicit prohibition text stays present and that we never
@@ -148,8 +169,10 @@ describe('supervision prompts', () => {
 
   it('builds a bounded lightweight brief with non-destructive executable validation and structured reply', () => {
     const prompt = buildPeerAuditBriefV1({
+      taskId: 'supervision_task_1',
+      assignmentId: 'supervision_assignment_1',
       attemptId: 'attempt_1',
-      replyCapability: 'A'.repeat(32),
+      revision: 'revision_1',
       taskRequest: 'Implement the requested behavior',
       completedResult: 'Implementation and tests complete',
       acceptanceCriteria: ['Focused tests pass', 'No tracked source is modified by the audit'],
@@ -167,8 +190,9 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Inspect worktree state before and after');
     expect(prompt).toContain('Report exact commands/tools/devices/environments and observed outcomes');
     expect(prompt).toContain('taskId, assignmentId, exactError, completedSafeWork, and recommendedNextAction');
-    expect(prompt).toContain('imcodes audit-reply --attempt-id attempt_1');
-    expect(prompt).toContain('--capability ' + 'A'.repeat(32));
+    expect(prompt).toContain('imcodes audit-reply --task-id supervision_task_1 --assignment-id supervision_assignment_1 --attempt-id attempt_1 --revision revision_1 --receipt-kind final');
+    expect(prompt).not.toContain('replyCapability');
+    expect(prompt).not.toContain('--capability');
     expect(prompt).not.toContain('P2P_VERDICT');
     expect(prompt).not.toContain('Selected automation audit mode');
     expect(peerAuditByteLength(prompt)).toBeLessThanOrEqual(PEER_AUDIT_BRIEF_TOTAL_BYTES);
@@ -177,7 +201,6 @@ describe('supervision prompts', () => {
   it('accepts complete bound evidence first and never instructs an unconditional full-suite rerun', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_evidence_complete',
-      replyCapability: 'E'.repeat(32),
       taskRequest: 'Review the frozen revision',
       completedResult: 'Manifest frozen; command and exit-code receipt attached.',
       acceptanceCriteria: ['Bind exact bytes and assess the result'],
@@ -197,7 +220,6 @@ describe('supervision prompts', () => {
   it('generates only a bounded rerun instruction when executable evidence is missing', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_evidence_gap',
-      replyCapability: 'G'.repeat(32),
       taskRequest: 'Review the frozen revision',
       completedResult: 'Implementation claimed complete without an executable receipt.',
       acceptanceCriteria: ['Verify the concrete gap'],
@@ -215,7 +237,6 @@ describe('supervision prompts', () => {
     const secret = `Bearer ${'s'.repeat(40)}`;
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_2',
-      replyCapability: 'B'.repeat(32),
       taskRequest: `${'你'.repeat(2800)} ${secret}`,
       completedResult: `done ${secret}`,
       acceptanceCriteria: ['No secret survives'],
@@ -231,7 +252,6 @@ describe('supervision prompts', () => {
   it('enforces list/total budgets and describes unavailable checks and disposable side effects', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_budget',
-      replyCapability: 'C'.repeat(32),
       taskRequest: 'Exact acceptance: preserve ordinary send --reply behavior.',
       completedResult: 'Result summary without raw history, tool payloads, or file bodies.',
       acceptanceCriteria: Array.from({ length: 100 }, (_, index) => `criterion-${index}-${'你'.repeat(200)}`),
@@ -246,7 +266,7 @@ describe('supervision prompts', () => {
 
     expect(prompt).toContain('Exact acceptance: preserve ordinary send --reply behavior.');
     expect(prompt).toContain('Explain unavailable checks');
-    expect(prompt).toContain('disposable local files');
+    expect(prompt).toContain('explicitly isolated fixtures');
     expect(prompt).toContain('Do not run reset/clean');
     expect(prompt).toContain('stop/report if validation creates an unexpected tracked diff');
     expect(prompt).not.toContain('criterion-99-');
@@ -502,7 +522,6 @@ describe('supervision prompts', () => {
     // incidental findings, so repeat rounds diverge instead of converging.
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_rerun',
-      replyCapability: 'B'.repeat(32),
       taskRequest: 'Implement the requested behavior',
       completedResult: 'Fixed the three blocking findings',
       acceptanceCriteria: ['Focused tests pass'],
@@ -519,7 +538,6 @@ describe('supervision prompts', () => {
   it('omits the re-audit section entirely on a first-round brief', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_first',
-      replyCapability: 'C'.repeat(32),
       taskRequest: 'Implement the requested behavior',
       completedResult: 'Implementation complete',
       acceptanceCriteria: ['Focused tests pass'],

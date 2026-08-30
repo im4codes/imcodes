@@ -65,6 +65,10 @@ import {
 import { PEER_AUDIT_REPLY_TOTAL_BYTES, PEER_AUDIT_REPLY_VERSION } from '../../shared/peer-audit.js';
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -136,6 +140,7 @@ describe('Hook server /send endpoint', () => {
     clearPeerAuditReplyIngressRateLimits();
     registerPeerAuditReplyIngressHandler(null);
     resetTransportQueueStoreForTests();
+    resetSupervisionTaskRegistryForTests();
     refreshSessionWatcherMock.mockReset();
     refreshSessionWatcherMock.mockResolvedValue(false);
     const result = await startHookServer(hookCallback);
@@ -145,6 +150,7 @@ describe('Hook server /send endpoint', () => {
 
   afterEach(async () => {
     registerPeerAuditReplyIngressHandler(null);
+    resetSupervisionTaskRegistryForTests();
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
@@ -219,7 +225,6 @@ describe('Hook server /send endpoint', () => {
     const validReply = {
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: 'attempt-1',
-      replyCapability: 'A'.repeat(32),
       verdict: 'PASS',
       findings: 'Validated.',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '1 passed' }],
@@ -279,7 +284,7 @@ describe('Hook server /send endpoint', () => {
       expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
     });
 
-    it('accepts a manual send_message audit capability through the real hook ingress fallback', async () => {
+    it('accepts a manual send_message audit receipt through the real hook ingress fallback', async () => {
       const origin = {
         sessionName: 'deck_proj_brain',
         sessionInstanceId: 'brain-instance',
@@ -295,6 +300,31 @@ describe('Hook server /send endpoint', () => {
         : name === origin.sessionName
           ? makeSession({ name: origin.sessionName, sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch })
           : undefined);
+      const taskId = 'manual-audit-hook-task';
+      const assignmentId = 'manual-audit-hook-assignment';
+      const revision = 'manual-audit-hook-r1';
+      const registry = getSupervisionTaskRegistry();
+      expect(registry.createOrGet({
+        taskId,
+        projectName: 'proj',
+        classification: 'integration_task',
+        objective: 'exercise the tokenless manual audit hook',
+        currentRevision: revision,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId,
+        taskId,
+        role: 'auditor',
+        identity: {
+          sessionName: target.sessionName,
+          sessionInstanceId: target.sessionInstanceId,
+          runtimeEpoch: target.runtimeEpoch,
+          agentType: 'claude-code',
+          providerFamily: 'anthropic',
+        },
+        auditAttemptId: 'manual-audit-hook-attempt',
+        auditRevision: revision,
+      }).ok).toBe(true);
       const created = getDelegationReplyStore().create({
         origin,
         target,
@@ -302,6 +332,10 @@ describe('Hook server /send endpoint', () => {
         messageId: 'manual-audit-message',
         purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         auditAttemptId: 'manual-audit-hook-attempt',
+        auditRevision: revision,
+        auditedSessionName: origin.sessionName,
+        taskId,
+        assignmentId,
         now: Date.now(),
       });
 
@@ -311,7 +345,10 @@ describe('Hook server /send endpoint', () => {
         JSON.stringify({
           ...validReply,
           attemptId: 'manual-audit-hook-attempt',
-          replyCapability: created.replyCapability,
+          taskId,
+          assignmentId,
+          revision,
+          receiptKind: 'final',
         }),
         'application/json',
         { 'x-imcodes-session': target.sessionName },

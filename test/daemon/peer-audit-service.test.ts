@@ -147,12 +147,13 @@ describe('PeerAuditService integration', () => {
     expect(dispatchMock).toHaveBeenCalledTimes(1);
     expect(emitStatusMock.mock.calls.map((call) => call[0]?.phase)).toEqual(['preparing', 'sent', 'waiting_reply']);
     const brief = String(dispatchMock.mock.calls[0]?.[0]?.brief);
-    const capability = /--capability ([A-Za-z0-9_-]+)/.exec(brief)?.[1];
-    expect(capability).toBeTruthy();
+    expect(brief).not.toContain('--capability');
+    expect(brief).not.toContain('replyCapability');
     const registry = getSupervisionTaskRegistry();
     expect(registry.createOrGet({
       taskId: 'task-peer-service-receipt', projectName: 'peer-service',
       objective: 'persist peer audit receipt', currentRevision: list.list.revision,
+      classification: 'independent_top_level',
     }).ok).toBe(true);
     expect(registry.createAssignment({
       assignmentId: 'assignment-peer-service-implementer', taskId: 'task-peer-service-receipt',
@@ -177,19 +178,10 @@ describe('PeerAuditService integration', () => {
       },
     });
     expect((saved.transportConfig?.supervision as Record<string, unknown>).auditMode).toBeUndefined();
-    if (!result.ok || !capability) return;
+    if (!result.ok) return;
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: 'B'.repeat(32),
-      verdict: 'PASS',
-      findings: 'forged',
-      validations: [],
-    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'invalid_capability' });
-    await expect(service.acceptReply({
-      version: PEER_AUDIT_REPLY_VERSION,
-      attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'static review only',
       validations: [],
@@ -197,7 +189,6 @@ describe('PeerAuditService integration', () => {
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'wrong sender',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
@@ -205,7 +196,6 @@ describe('PeerAuditService integration', () => {
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'wrong runtime identity',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
@@ -213,7 +203,6 @@ describe('PeerAuditService integration', () => {
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'Focused tests passed.',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
@@ -229,22 +218,20 @@ describe('PeerAuditService integration', () => {
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'duplicate',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
-    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
     expect(emitResultMock).toHaveBeenCalledTimes(1);
     service.shutdown();
     const restarted = new PeerAuditService();
     await expect(restarted.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'late after restart',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
-    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
   });
 
   it('moves an exact queued audit delivery to waiting so cancellation does not remove an already delivered row', async () => {
@@ -826,12 +813,11 @@ describe('PeerAuditService integration', () => {
     if (!result.ok) throw new Error(result.error);
     await flush();
     const brief = String(dispatchMock.mock.calls[0]?.[0]?.brief);
-    const capability = /--capability ([A-Za-z0-9_-]+)/.exec(brief)?.[1];
-    if (!result.ok || !capability) return;
+    expect(brief).not.toContain('--capability');
+    if (!result.ok) return;
     await service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'REWORK',
       findings: 'Add the missing race test.',
       validations: [],

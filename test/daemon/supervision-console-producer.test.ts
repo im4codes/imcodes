@@ -282,6 +282,25 @@ describe('assignment, pool and validation projections', () => {
     expect(snapshot.tasks).toHaveLength(1);
   });
 
+  it('uses the canonical default-visible predicate for task cards, assignments, and pool counts', () => {
+    seedTask('implementing');
+    db.prepare("UPDATE supervision_task_assignments SET pool_kind='primary'").run();
+    db.prepare(`INSERT INTO supervision_tasks
+      (task_id, project_name, top_level_task_id, classification, status, payload_json, created_at, updated_at)
+      VALUES ('tsk_archived','codedeck','top-archived','independent_top_level','finalized',?,1,1)`)
+      .run(JSON.stringify({ objective: 'retained history', archivedAt: 123, archiveReason: 'terminal_retention' }));
+    db.prepare(`INSERT INTO supervision_task_assignments
+      (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch,
+       agent_type, provider_family, lease_id, generation, payload_json, created_at, updated_at, pool_kind)
+      VALUES ('asg_archived','tsk_archived','implementer','finalized','deck_old','i2','e2',
+       'codex','openai','',1,'{}',1,1,'primary')`).run();
+
+    const snapshot = producer().buildSnapshot(SCOPE, 'sub-canonical-count');
+    expect(snapshot.tasks.map((task) => task.taskId)).toEqual(['tsk_console']);
+    expect(snapshot.assignments.map((assignment) => assignment.assignmentId)).toEqual(['asg_console']);
+    expect(snapshot.pools.find((pool) => pool.poolId === 'primary')?.activeCount).toBe(1);
+  });
+
   it('projects the canonical objective and daemon-authoritative owner activity', () => {
     seedTask('implementing');
     db.prepare("UPDATE supervision_tasks SET payload_json=? WHERE task_id='tsk_console'")

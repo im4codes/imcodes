@@ -34,6 +34,7 @@ import {
 } from '../../shared/supervision-execution-pool.js';
 import {
   isSupervisionTaskLifecycleStatus,
+  isSupervisionTaskVisibleByDefault,
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
@@ -122,6 +123,24 @@ export class SupervisionConsoleProducer {
     this.#onBoundary = options.onBoundary ?? (() => {});
     this.#broadcast = options.broadcast;
     this.#resolveSessionPresentation = options.resolveSessionPresentation;
+  }
+
+  #visibleTaskIds(projectName: string): Set<string> {
+    const rows = this.#db.prepare(
+      'SELECT task_id, payload_json FROM supervision_tasks WHERE project_name = ? ORDER BY task_id ASC',
+    ).all(projectName) as Array<{ task_id?: unknown; payload_json?: unknown }>;
+    const visible = new Set<string>();
+    for (const row of rows) {
+      let retention: { archivedAt?: number } = {};
+      try {
+        const parsed = JSON.parse(String(row.payload_json ?? '{}')) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          retention = parsed as { archivedAt?: number };
+        }
+      } catch { /* malformed legacy payload has no trustworthy archive marker */ }
+      if (isSupervisionTaskVisibleByDefault(retention)) visible.add(String(row.task_id));
+    }
+    return visible;
   }
 
   #transaction<T>(fn: () => T): T {
@@ -243,6 +262,7 @@ export class SupervisionConsoleProducer {
     let objective: string | undefined;
     try {
       const payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>;
+      if (!isSupervisionTaskVisibleByDefault(payload)) return undefined;
       objective = typeof payload.objective === 'string' && payload.objective.trim()
         ? payload.objective.trim() : undefined;
     } catch { /* malformed legacy payload: task id remains the fail-safe title */ }
@@ -267,6 +287,7 @@ export class SupervisionConsoleProducer {
 
   /** Project every assignment into its browser-safe row. */
   readAssignmentRows(projectName: string): SupervisionTaskConsoleAssignmentRow[] {
+    const visibleTaskIds = this.#visibleTaskIds(projectName);
     const rows = this.#db.prepare(
       `SELECT a.assignment_id, a.task_id, a.role, a.status, a.session_name, a.agent_type, a.provider_family,
               a.pool_kind, a.validation_state, a.observed_model, a.observed_provider, a.heartbeat_at,
@@ -278,6 +299,7 @@ export class SupervisionConsoleProducer {
     ).all(projectName) as Array<Record<string, unknown>>;
     const out: SupervisionTaskConsoleAssignmentRow[] = [];
     for (const row of rows) {
+      if (!visibleTaskIds.has(String(row.task_id))) continue;
       const status = String(row.status ?? '');
       // Same fail-closed rule as tasks: never project an unknown status.
       if (!isSupervisionTaskLifecycleStatus(status)) continue;
@@ -325,14 +347,12 @@ export class SupervisionConsoleProducer {
    * a broken console.
    */
   readPools(projectName: string): SupervisionTaskConsolePoolRow[] {
-    const counts = this.#db.prepare(
-      `SELECT a.pool_kind AS kind, COUNT(*) AS n FROM supervision_task_assignments a
-       INNER JOIN supervision_tasks t ON t.task_id = a.task_id
-       WHERE t.project_name = ? AND a.pool_kind IS NOT NULL
-         AND a.status NOT IN ('finalized','pushed','blocked','cancelled')
-       GROUP BY a.pool_kind`,
-    ).all(projectName) as Array<{ kind?: string; n?: number }>;
-    const byKind = new Map(counts.map((row) => [String(row.kind), Number(row.n ?? 0)]));
+    const byKind = new Map<string, number>();
+    for (const assignment of this.readAssignmentRows(projectName)) {
+      if (!assignment.poolKind
+        || ['finalized', 'pushed', 'blocked', 'cancelled'].includes(assignment.status)) continue;
+      byKind.set(assignment.poolKind, (byKind.get(assignment.poolKind) ?? 0) + 1);
+    }
     return SUPERVISION_EXECUTION_POOL_KINDS.map((kind) => ({
       poolId: kind,
       label: kind,
@@ -402,11 +422,8 @@ export class SupervisionConsoleProducer {
 
   buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
     const cursor = this.restoreCursor(scope);
-    const ids = this.#db.prepare(
-      'SELECT task_id FROM supervision_tasks WHERE project_name = ? ORDER BY task_id ASC',
-    ).all(scope.projectName) as Array<{ task_id: string }>;
-    const tasks = ids
-      .map((row) => this.readTaskRow(String(row.task_id), scope.projectName))
+    const tasks = [...this.#visibleTaskIds(scope.projectName)]
+      .map((taskId) => this.readTaskRow(taskId, scope.projectName))
       .filter((row): row is SupervisionTaskConsoleTaskRow => !!row);
     return {
       type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,

@@ -398,11 +398,14 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: {
     name: MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
-    description: 'Preferred structured reply for the active lightweight peer audit. Use only when the audit brief supplies an attempt id and one-time capability. This submits directly to daemon ingress; it never sends chat text or terminal keys.',
+    description: 'Append audit progress/final. Daemon authenticates current session and task/assignment/attempt/revision; no token.',
     inputSchema: objectSchema({
+      taskId: stringSchema('Exact task id supplied by the audit brief.'),
+      assignmentId: stringSchema('Exact auditor assignment id supplied by the audit brief.'),
       attemptId: stringSchema('Opaque attempt id supplied by the peer-audit brief.'),
-      replyCapability: stringSchema('One-time reply capability supplied by the peer-audit brief. Never repeat it in findings.'),
-      verdict: { type: 'string', enum: ['PASS', 'REWORK'], description: 'PASS only with applicable executable validation evidence; otherwise REWORK.' },
+      revision: stringSchema('Exact audited revision supplied by the audit brief.'),
+      receiptKind: { type: 'string', enum: ['progress', 'final'], description: 'progress appends evidence; final records the current verdict.' },
+      verdict: { type: 'string', enum: ['PASS', 'REWORK'], description: 'Required for final receipts; omit for progress. PASS requires applicable executable evidence.' },
       findings: stringSchema(`Concrete findings, at most ${PEER_AUDIT_FINDINGS_BYTES} UTF-8 bytes.`),
       validations: {
         type: 'array',
@@ -415,17 +418,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           summary: stringSchema(`Exact bounded outcome/unavailability reason, at most ${PEER_AUDIT_VALIDATION_ITEM_BYTES} UTF-8 bytes.`),
         }, ['kind', 'label', 'outcome', 'summary']),
       },
-    }, ['attemptId', 'replyCapability', 'verdict', 'findings', 'validations']),
+    }, ['taskId', 'assignmentId', 'attemptId', 'revision', 'receiptKind', 'findings', 'validations']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: {
     name: MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
-    description: 'Reply to a reply-enabled delegation using only the id and capability from its brief. The same capability may submit multiple replies until it expires; the daemon notifies the origin. Do not also send_message for the same reply.',
+    description: 'Submit an append-only reply. Daemon authenticates the current session against the durable delegation/assignment; no token.',
     inputSchema: objectSchema({
       delegationId: stringSchema('Opaque delegation id supplied by the reply-enabled brief.'),
-      replyCapability: stringSchema('Bounded reply capability supplied by the brief. It remains valid until expiry; never repeat it inside result.'),
       result: stringSchema(`One complete delegation reply, at most ${AGENT_DELEGATION_REPLY_RESULT_BYTES} UTF-8 bytes.`),
-    }, ['delegationId', 'replyCapability', 'result']),
+    }, ['delegationId', 'result']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
@@ -492,14 +494,14 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send text to an exact send_list_targets target. Callers and labels are invalid targets. append (default) joins the active turn with durable FIFO fallback; queue always uses FIFO. Not Team/P2P. Files are project-root paths, not bytes. Returns delivered/queued/failed status.',
+    description: 'Send to an exact send_list_targets target. Callers and labels are invalid targets. Existing-task continuations MUST append (default) with durable FIFO fallback; queue always uses FIFO for new work. Returns delivered/queued/failed status.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from the configured pool.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
       deliveryMode: {
         type: 'string',
         enum: [...Object.values(MEMORY_MCP_SEND_DELIVERY_MODES)],
-        description: 'Optional delivery policy. append (default) attempts a non-preemptive active-turn append with durable queue fallback; queue always uses ordinary durable FIFO and never inserts into the active turn.',
+        description: 'append joins the active task with FIFO fallback; queue never inserts into the active turn and rejects an existing taskId.',
       },
       files: {
         type: 'array',
@@ -507,10 +509,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
         maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
       },
-      reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id and bounded capability that may send multiple replies until expiry, and each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+      reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id, while the daemon authenticates its current session identity and accepts bounded append-only replies. Each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
       task: {
         ...objectSchema({
-          taskId: stringSchema('Optional existing visible task id to bind; omitted creates a task. Missing or inaccessible ids fail and are never silently reminted.'),
+          taskId: stringSchema('Optional existing visible task id to append. It reuses the exact active assignment and never mints another task/assignment; omitted creates genuinely new work. Missing or inaccessible ids fail and are never silently reminted.'),
           topLevelTaskId: stringSchema('Optional top-level task id.'),
           sliceId: stringSchema('Optional slice id.'),
           classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
@@ -567,7 +569,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
 
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
-    description: 'Start or bind a daemon-authoritative supervision task assignment. Creates durable SQLite task/assignment state; free text is not a completion signal.',
+    description: 'Start genuinely new daemon-authoritative supervision work or a replacement after prior implementers are terminal. Existing active-task addenda use send_message deliveryMode=append and MUST NOT mint another assignment. Creates durable SQLite task/assignment state; free text is not a completion signal.',
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. Omit to let daemon generate one.'),
       topLevelTaskId: stringSchema('Optional top-level task id. Defaults to taskId.'),

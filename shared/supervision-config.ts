@@ -38,6 +38,7 @@ export const SUPERVISION_CONTRACT_IDS = {
   CONTEXTUAL_AUDIT: 'contextual_audit_v1',
   REWORK_BRIEF: 'rework_brief_v1',
   WAITING_HEARTBEAT: 'supervision_waiting_heartbeat_v1',
+  IMPLEMENTATION_HEARTBEAT: 'supervision_implementation_heartbeat_v1',
   AUDIT_HEARTBEAT: 'supervision_audit_heartbeat_v1',
   AUDIT_TARGET_RECOVERY: 'supervision_audit_target_recovery_v1',
   AUDIT_MARKER_CORRECTION: 'supervision_audit_marker_correction_v1',
@@ -76,7 +77,7 @@ export const SUPERVISION_TRUSTED_CONTRACT_DELIVERY = {
   fallback: 'fixed_daemon_prefix',
   reinjectEveryEntrypoint: true,
   modelTextIsNonAuthoritative: true,
-  hardGateAuthority: ['delegation_eligibility', 'audit_reply_capability', 'matching_pass', 'stage_manifest_exact_set'],
+  hardGateAuthority: ['delegation_eligibility', 'authenticated_audit_receipt', 'matching_pass', 'stage_manifest_exact_set'],
 } as const;
 
 /**
@@ -101,7 +102,7 @@ export const SUPERVISION_USER_OVERRIDE = {
   /** Every gate below may be waived by an explicit user directive. */
   overridableGates: [
     'delegation_eligibility',
-    'audit_reply_capability',
+    'authenticated_audit_receipt',
     'matching_pass',
     'stage_manifest_exact_set',
     'pre_pass_stage_commit_push',
@@ -323,7 +324,7 @@ export type SupervisionTaskFinalizationState = SupervisionTaskLifecycleStatus;
 export const SUPERVISION_TASK_STATUS_CONTRACT_VERSION = 1;
 
 export const SUPERVISION_TASK_FINALIZATION_FIELDS = [
-  'taskId', 'topLevelTaskId', 'acceptance', 'integrationBoundary', 'sliceId', 'ownerSession',
+  'taskId', 'topLevelTaskId', 'classification', 'acceptance', 'integrationBoundary', 'sliceId', 'ownerSession',
   'integrationOwnerSession', 'revision', 'state', 'ownedFiles', 'dependencies', 'sharedFiles',
   'overlappingFiles', 'integrationTaskId', 'integrationManifest', 'auditAttemptId', 'auditRevision',
   'verdict', 'overallAuditAttemptId', 'overallAuditRevision', 'commitSha', 'pushResult',
@@ -345,6 +346,7 @@ export const SUPERVISION_TASK_FINALIZATION_CONTRACT = {
 export interface SupervisionTaskFinalizationRecord {
   taskId?: string | null;
   topLevelTaskId?: string | null;
+  classification?: SupervisionTaskClassification | null;
   acceptance?: readonly string[] | null;
   integrationBoundary?: string | null;
   sliceId?: string | null;
@@ -488,6 +490,22 @@ export function canMarkSupervisionSliceReadyForIntegration(
   return true;
 }
 
+/**
+ * New merge-before-audit handoff: a slice freezes validated bytes and hands
+ * them to the integration owner without minting an audit attempt. Historical
+ * rows continue through canMarkSupervisionSliceReadyForIntegration().
+ */
+export function canHandOffValidatedSupervisionManifestRow(
+  row: SupervisionTaskFinalizationRecord,
+): boolean {
+  if (row.classification !== 'integration_slice'
+    && row.classification !== 'independent_top_level') return false;
+  if (row.state !== 'validated' && row.state !== 'ready_for_integration') return false;
+  if (!row.ownerSession || !row.topLevelTaskId || String(row.revision ?? '').trim() === '') return false;
+  if (!isValidSupervisionOwnedPathspecs(row.ownedFiles)) return false;
+  return true;
+}
+
 export function canReleaseSupervisionTaskFinalization(
   task: SupervisionTaskFinalizationRecord,
   pass: SupervisionTaskFinalizationReleaseInput,
@@ -502,11 +520,23 @@ export function canReleaseSupervisionTaskFinalization(
   if (!task.integrationOwnerSession) return false;
   if (!task.topLevelTaskId || !task.integrationBoundary || !task.acceptance?.length) return false;
   if (!task.integrationManifest || task.integrationManifest.length === 0) return false;
-  if (!task.integrationManifest.every((slice) => canMarkSupervisionSliceReadyForIntegration(slice, {
+  const validatedManifest = task.classification === 'integration_task'
+    ? task.integrationManifest.every((row) => row.classification === 'integration_slice'
+      && canHandOffValidatedSupervisionManifestRow(row))
+    : task.classification === 'independent_top_level'
+      ? task.integrationManifest.length === 1
+        && task.integrationManifest[0]?.classification === 'independent_top_level'
+        && canHandOffValidatedSupervisionManifestRow(task.integrationManifest[0])
+      : false;
+  // Compatibility for already-audited historical rows. New integration_slice
+  // audit registration is refused elsewhere, so this branch can only consume
+  // durable records minted by an older daemon.
+  const historicalAuditedManifest = task.integrationManifest.every((slice) => canMarkSupervisionSliceReadyForIntegration(slice, {
     attemptId: String(slice.auditAttemptId ?? ''),
     revision: slice.revision ?? '',
     verdict: 'PASS',
-  }))) return false;
+  }));
+  if (!validatedManifest && !historicalAuditedManifest) return false;
   return validateSupervisionStageManifest({
     pathspecs: pass.pathspecs,
     stagedPaths: pass.stagedPaths,
@@ -579,6 +609,12 @@ export const SUPERVISION_TASK_REGISTRY_EVENT_TYPES = [
   'finalized',
   'blocked',
   'cancelled',
+  /** Machine signal: implementation bytes are merged, validated, and handed off; never an audit verdict. */
+  'implementation_finished',
+  /** Durable watchdog receipt. It is intentionally excluded from substantive progress clocks. */
+  'implementation_heartbeat',
+  /** Explicit durable progress checkpoint that resets the implementation-idle clock. */
+  'implementation_progress',
   'file_event',
   'scope_violation',
 ] as const;
@@ -641,12 +677,50 @@ export function isSupervisionTaskClassification(value: unknown): value is Superv
   return typeof value === 'string' && (SUPERVISION_TASK_CLASSIFICATIONS as readonly string[]).includes(value);
 }
 
+export function isAuditableSupervisionTaskClassification(
+  value: unknown,
+): value is Exclude<SupervisionTaskClassification, 'integration_slice'> {
+  return value === 'independent_top_level' || value === 'integration_task';
+}
+
 export function isSupervisionTaskLifecycleStatus(value: unknown): value is SupervisionTaskLifecycleStatus {
   return typeof value === 'string' && (SUPERVISION_TASK_LIFECYCLE_STATUSES as readonly string[]).includes(value);
 }
 
 export function isTerminalSupervisionTaskStatus(value: SupervisionTaskLifecycleStatus): boolean {
   return value === 'pushed' || value === 'finalized' || value === 'blocked' || value === 'cancelled';
+}
+
+export const SUPERVISION_TASK_CLEANUP_VERSION = 1 as const;
+export const SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE = 25 as const;
+export const SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE = 100 as const;
+export const SUPERVISION_TASK_ARCHIVE_GRACE_MS = 24 * 60 * 60_000;
+export const SUPERVISION_TASK_ABANDONED_AFTER_MS = 7 * 24 * 60 * 60_000;
+
+export type SupervisionTaskArchiveReason =
+  | 'terminal_retention'
+  | 'abandoned_planned'
+  | 'superseded';
+
+/** Durable retention metadata. Archiving hides a task; it never deletes evidence. */
+export interface SupervisionTaskRetentionMetadata {
+  archivedAt?: number;
+  archiveReason?: SupervisionTaskArchiveReason;
+  supersededBy?: string;
+  duplicateCandidate?: boolean;
+  duplicateCandidateOf?: string;
+  cleanupVersion?: typeof SUPERVISION_TASK_CLEANUP_VERSION;
+}
+
+/**
+ * One canonical default-list/card predicate shared by SQLite registry and Web
+ * console projection. Terminal exceptions remain visible until the bounded
+ * reconciler has durably archived them after the grace period.
+ */
+export function isSupervisionTaskVisibleByDefault(
+  task: SupervisionTaskRetentionMetadata,
+): boolean {
+  return task.archivedAt === undefined;
 }
 
 const SUPERVISION_TASK_ALLOWED_TRANSITIONS: Readonly<Record<SupervisionTaskLifecycleStatus, readonly SupervisionTaskLifecycleStatus[]>> = {

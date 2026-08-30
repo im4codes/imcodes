@@ -138,46 +138,100 @@ async function submitDelegatedPeerAuditReply(input: {
   receivedAt: number;
 }): Promise<{ ok: true } | { ok: false; error: typeof PEER_AUDIT_REPLY_ERRORS[keyof typeof PEER_AUDIT_REPLY_ERRORS] }> {
   const senderIdentity = boundIdentity(input.sender);
-  if (!senderIdentity) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
-  const authority = getDelegationReplyStore().matchPendingAuditAuthority({
+  if (!senderIdentity) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH };
+  let authority = getDelegationReplyStore().matchPendingAuditAuthority({
     auditAttemptId: input.envelope.attemptId,
-    replyCapability: input.envelope.replyCapability,
     sender: senderIdentity,
     now: input.receivedAt,
   });
-  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
+  const taskId = input.envelope.taskId?.trim();
+  const assignmentId = input.envelope.assignmentId?.trim();
+  const revision = input.envelope.revision?.trim();
+  const receiptKind = input.envelope.receiptKind;
+  if (!taskId || !assignmentId || !revision || !receiptKind) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH };
+  }
+  if ((authority.taskId && authority.taskId !== taskId)
+    || (authority.assignmentId && authority.assignmentId !== assignmentId)
+    || (authority.auditRevision && authority.auditRevision !== revision)) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH };
+  }
+  const registry = getSupervisionTaskRegistry();
+  const auditAssignment = registry.getAssignment(assignmentId);
+  if (!auditAssignment || auditAssignment.taskId !== taskId || auditAssignment.role !== 'auditor'
+    || auditAssignment.auditAttemptId !== input.envelope.attemptId
+    || auditAssignment.auditRevision !== revision) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH };
+  }
+  if (auditAssignment.identity.sessionName !== senderIdentity.sessionName
+    || auditAssignment.identity.sessionInstanceId !== senderIdentity.sessionInstanceId
+    || auditAssignment.identity.runtimeEpoch !== senderIdentity.runtimeEpoch) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH };
+  }
+  if (!identityMatches(authority.target, senderIdentity)) {
+    authority = getDelegationReplyStore().rebindAssignmentTarget({
+      delegationId: authority.delegationId,
+      taskId,
+      assignmentId,
+      target: senderIdentity,
+      now: input.receivedAt,
+    }) ?? authority;
+  }
   const evidence = validatePeerAuditPassEvidence(
-    input.envelope.verdict,
+    receiptKind === 'final' ? input.envelope.verdict : undefined,
     input.envelope.validations,
   );
   if (!evidence.ok) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
   }
   if (authority.auditRevision && authority.auditedSessionName) {
-    const persisted = getSupervisionTaskRegistry().applyMatchingAuditReceipt({
+    const persisted = registry.appendMatchingAuditReceipt({
+      taskId,
+      auditorAssignmentId: assignmentId,
       attemptId: input.envelope.attemptId,
-      revision: authority.auditRevision,
+      revision,
+      receiptKind,
       verdict: input.envelope.verdict,
       auditedSessionName: authority.auditedSessionName,
       auditorSessionName: input.sender.name,
+      auditorIdentity: auditAssignment.identity,
       findings: input.envelope.findings,
+      validations: input.envelope.validations,
       now: input.receivedAt,
     });
     // An audit may be intentionally unbound to a registry task. Every other
     // failure means a daemon-minted attempt no longer matches its authoritative
     // task/revision and must not be delivered as an accepted result.
     if (!persisted.ok && persisted.reason !== 'not_found') {
-      return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+      const error = persisted.reason === 'owner_mismatch'
+        ? PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH
+        : persisted.reason === 'old_revision'
+          ? PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH
+          : persisted.reason === 'old_audit_attempt'
+            ? PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH
+            : persisted.reason === 'receipt_closed'
+              ? PEER_AUDIT_REPLY_ERRORS.RECEIPT_CLOSED
+              : PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH;
+      return { ok: false, error };
     }
   }
   const received = getDelegationReplyStore().receive({
     delegationId: authority.delegationId,
-    replyCapability: input.envelope.replyCapability,
     result: delegatedPeerAuditResult(input.envelope),
     sender: senderIdentity,
+    authorizedSender: {
+      sessionName: auditAssignment.identity.sessionName,
+      sessionInstanceId: auditAssignment.identity.sessionInstanceId,
+      runtimeEpoch: auditAssignment.identity.runtimeEpoch,
+    },
     now: input.receivedAt,
   });
-  if (!received.ok) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+  if (!received.ok) return { ok: false, error: received.reason === 'identity'
+    ? PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH
+    : received.reason === 'expired'
+      ? PEER_AUDIT_REPLY_ERRORS.DEADLINE_EXPIRED
+      : PEER_AUDIT_REPLY_ERRORS.CONFLICTING_REPLAY };
   if (!received.replay) emitDelegationReplyTimeline(received.record);
   startBackgroundDelivery(received.record);
   return { ok: true };
@@ -191,7 +245,7 @@ function scheduleRetry(delegationId: string, notificationId: string, delayMs: nu
     retryTimers.delete(notificationId);
     const record = getDelegationReplyStore().getMessage(delegationId, notificationId);
     if (record?.result && record.status === AGENT_DELEGATION_REPLY_STATUSES.RECEIVED) {
-      if (Date.now() >= record.expiresAt) {
+      if (!(record.taskId && record.assignmentId) && Date.now() >= record.expiresAt) {
         getDelegationReplyStore().expire(delegationId);
         return;
       }
@@ -209,7 +263,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
   const existing = inFlight.get(record.notificationId);
   if (existing) return existing;
   const promise = (async (): Promise<DelegationReplyIngressResult> => {
-    if (Date.now() >= record.expiresAt) {
+    if (!(record.taskId && record.assignmentId) && Date.now() >= record.expiresAt) {
       getDelegationReplyStore().expire(record.delegationId);
       return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.EXPIRED };
     }
@@ -328,9 +382,19 @@ export async function submitDelegationReply(input: {
 
   const received = getDelegationReplyStore().receive({
     delegationId: decoded.value.delegationId,
-    replyCapability: decoded.value.replyCapability,
     result: decoded.value.result,
     sender: senderIdentity,
+    ...(() => {
+      const authority = getDelegationReplyStore().get(decoded.value.delegationId);
+      if (!authority?.assignmentId || !authority.taskId) return {};
+      const assignment = getSupervisionTaskRegistry().getAssignment(authority.assignmentId);
+      if (!assignment || assignment.taskId !== authority.taskId) return {};
+      return { authorizedSender: {
+        sessionName: assignment.identity.sessionName,
+        sessionInstanceId: assignment.identity.sessionInstanceId,
+        runtimeEpoch: assignment.identity.runtimeEpoch,
+      } };
+    })(),
   });
   if (!received.ok) {
     const error: AgentDelegationReplyError = received.reason === 'expired'
@@ -341,15 +405,13 @@ export async function submitDelegationReply(input: {
           ? AGENT_DELEGATION_REPLY_ERRORS.RATE_LIMITED
         : received.reason === 'identity'
           ? AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH
-          : received.reason === 'capability'
-            ? AGENT_DELEGATION_REPLY_ERRORS.INVALID_CAPABILITY
-            : AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID;
+          : AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID;
     return { ok: false, error };
   }
   const currentOrigin = boundIdentity(getSession(received.record.origin.sessionName));
   const currentTarget = boundIdentity(getSession(received.record.target.sessionName));
-  if (!identityMatches(received.record.origin, currentOrigin)
-    || !identityMatches(received.record.target, currentTarget)) {
+  if ((!received.record.assignmentId && !identityMatches(received.record.target, currentTarget))
+    || (!received.record.taskId && !identityMatches(received.record.origin, currentOrigin))) {
     getDelegationReplyStore().expire(received.record.delegationId);
     return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH };
   }

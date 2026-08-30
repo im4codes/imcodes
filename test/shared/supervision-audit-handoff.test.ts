@@ -6,7 +6,12 @@ import {
   type SupervisionAuditReceipt,
   type SupervisionHandoffContext,
 } from '../../shared/supervision-audit-handoff.js';
-import { SUPERVISION_TASK_LIFECYCLE_STATUSES } from '../../shared/supervision-config.js';
+import {
+  canReleaseSupervisionTaskFinalization,
+  SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  type SupervisionTaskFinalizationRecord,
+  type SupervisionTaskFinalizationReleaseInput,
+} from '../../shared/supervision-config.js';
 
 const ATTEMPT = '140fa35f-126f-4175-884d-1a2464bb25e8';
 const REVISION = '3eacaeca54522a05cb174831f19a2721d2e102c805b269437b3f9988064ac4ae';
@@ -104,6 +109,79 @@ describe('matching REWORK', () => {
     });
     expect(decision.action).toBe('hold');
     expect(decision.refusal).toBe('unresolved_development_owner');
+  });
+
+  it('returns combined integration REWORK to the integration owner, not a slice owner', () => {
+    const decision = decideSupervisionAuditHandoff({
+      receipt: receipt({ verdict: 'REWORK', findings: 'combined conflict' }),
+      context: context({
+        classification: 'integration_task',
+        declaredIntegrationOwner: 'deck_cd_brain',
+        developmentOwner: 'deck_slice_owner',
+      }),
+    });
+    expect(decision).toMatchObject({
+      action: 'return_to_rework',
+      developmentOwner: 'deck_cd_brain',
+      nextStatus: 'rework',
+    });
+    expect(decision.nextAction).not.toContain('deck_slice_owner');
+  });
+});
+
+describe('merge-before-audit finalization', () => {
+  const combinedRevision = 'combined-r1';
+  const attemptId = 'overall-attempt-r1';
+  const slices: SupervisionTaskFinalizationRecord[] = [
+    {
+      taskId: 'slice-a', topLevelTaskId: 'top', classification: 'integration_slice',
+      ownerSession: 'deck_slice_a', revision: 'slice-a-r1', state: 'validated',
+      ownedFiles: ['src/a.ts'],
+    },
+    {
+      taskId: 'slice-b', topLevelTaskId: 'top', classification: 'integration_slice',
+      ownerSession: 'deck_slice_b', revision: 'slice-b-r2', state: 'ready_for_integration',
+      ownedFiles: ['src/b.ts'],
+    },
+  ];
+  const task: SupervisionTaskFinalizationRecord = {
+    taskId: 'integration', topLevelTaskId: 'top', classification: 'integration_task',
+    integrationOwnerSession: 'deck_cd_brain', integrationBoundary: 'one coherent feature',
+    acceptance: ['combined behavior passes'], revision: combinedRevision,
+    overallAuditAttemptId: attemptId, overallAuditRevision: combinedRevision,
+    integrationManifest: slices, ownedFiles: ['src/a.ts', 'src/b.ts'],
+  };
+  const pass: SupervisionTaskFinalizationReleaseInput = {
+    attemptId, revision: combinedRevision, verdict: 'PASS',
+    pathspecs: ['src/a.ts', 'src/b.ts'], stagedPaths: ['src/a.ts', 'src/b.ts'],
+    conflictedPaths: [], untrackedOtherOwnerPaths: [],
+  };
+
+  it('accepts validated slice rows with no per-slice audit attempt or verdict', () => {
+    expect(slices.every((slice) => slice.auditAttemptId === undefined && slice.verdict === undefined)).toBe(true);
+    expect(canReleaseSupervisionTaskFinalization(task, pass)).toBe(true);
+  });
+
+  it('refuses stale/mismatched overall PASS and any non-exact staged set', () => {
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, attemptId: 'stale-attempt' })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, revision: 'stale-revision' })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, stagedPaths: ['src/a.ts'] })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, stagedPaths: [...pass.stagedPaths!, 'src/extra.ts'] })).toBe(false);
+  });
+
+  it('keeps historical per-slice PASS manifests compatible', () => {
+    const historical = slices.map((slice, index) => ({
+      ...slice,
+      classification: undefined,
+      auditAttemptId: `slice-attempt-${index}`,
+      auditRevision: slice.revision,
+      verdict: 'PASS' as const,
+    }));
+    expect(canReleaseSupervisionTaskFinalization({
+      ...task,
+      classification: undefined,
+      integrationManifest: historical,
+    }, pass)).toBe(true);
   });
 });
 

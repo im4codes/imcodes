@@ -211,6 +211,7 @@ describe('delegation send gate', () => {
         auditedSessionName: audited.name,
       },
       task: {
+        classification: 'integration_task',
         objective: 'audit the implementation',
         executionPool: 'primary',
         ownedFiles: ['src/owned.ts'],
@@ -495,6 +496,7 @@ describe('delegation send gate', () => {
         auditedSessionName: audited.name,
       },
       task: {
+        classification: 'integration_task',
         objective: 'audit the implementation',
         executionPool: 'primary',
         currentRevision: 'revision-under-audit',
@@ -523,7 +525,275 @@ describe('delegation send gate', () => {
         },
       },
     });
+    expect(getSupervisionTaskRegistry().get(result.taskId!)).toMatchObject({
+      classification: 'integration_task',
+      currentRevision: 'revision-under-audit',
+    });
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects integration_slice audit registration before registry, reply, or dispatch side effects', async () => {
+    const auditorConfig = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]');
+    const brain = supervisedBrain([auditorConfig]);
+    const audited = supervisedChild({
+      name: 'deck_alpha_slice_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const auditor = supervisedChild({
+      name: 'deck_alpha_slice_auditor', role: 'w2', agentType: 'claude-code-sdk', model: 'opus[1M]',
+    });
+    const sessions = [brain, audited, auditor];
+    const registry = getSupervisionTaskRegistry();
+    const createTask = vi.spyOn(registry, 'createOrGet');
+    const createAssignment = vi.spyOn(registry, 'createAssignment');
+    const createReplyAuthority = vi.spyOn(getDelegationReplyStore(), 'create');
+    const dispatchMessage = vi.fn(async () => {});
+
+    const result = await dispatchSendMessage(caller, {
+      target: auditor.name,
+      message: 'must not audit a slice',
+      reply: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'forbidden_slice_audit_attempt',
+        auditedSessionName: audited.name,
+      },
+      task: {
+        classification: 'integration_slice',
+        objective: 'slice is validated but not merged',
+        executionPool: 'primary',
+        currentRevision: 'slice-r1',
+        ownedFiles: ['src/slice.ts'],
+      },
+    }, deps(sessions, dispatchMessage));
+
+    expect(result).toMatchObject({
+      status: 'error', reason: 'validation_failed',
+      error: expect.stringContaining('integration_task or independent_top_level'),
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(createAssignment).not.toHaveBeenCalled();
+    expect(createReplyAuthority).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(registry.list()).toEqual([]);
+  });
+
+  it('appends a busy-task addendum to the exact existing assignment without minting another task or assignment', async () => {
+    const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
+    const brain = supervisedBrain([config]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_append_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const sessions = [brain, worker];
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    const created = await dispatchSendMessage(caller, {
+      target: worker.name,
+      message: 'start one logical task',
+      idempotencyKey: 'append-one-logical-task',
+      task: {
+        classification: 'integration_slice', objective: 'one task', executionPool: 'primary',
+        ownedFiles: ['src/one.ts'],
+      },
+    }, deps(sessions, dispatchMessage));
+    expect(created).toMatchObject({ status: 'accepted', taskId: expect.any(String), assignmentId: expect.any(String) });
+    if (created.status !== 'accepted' || !created.taskId || !created.assignmentId) throw new Error('expected task');
+
+    worker.state = 'running';
+    const registry = getSupervisionTaskRegistry();
+    const taskCount = registry.list().length;
+    const assignmentCount = registry.get(created.taskId)!.assignments.length;
+    const createTask = vi.spyOn(registry, 'createOrGet');
+    const createAssignment = vi.spyOn(registry, 'createAssignment');
+    dispatchMessage.mockClear();
+
+    const appended = await dispatchSendMessage(caller, {
+      target: worker.name,
+      message: 'clarification for the same active work',
+      deliveryMode: 'append',
+      task: {
+        taskId: created.taskId, executionPool: 'primary', ownedFiles: ['src/one.ts'],
+      },
+    }, deps(sessions, dispatchMessage));
+
+    expect(appended).toMatchObject({
+      status: 'accepted', taskId: created.taskId, assignmentId: created.assignmentId,
+      deliveries: [expect.objectContaining({ target: worker.name, status: 'queued' })],
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(createAssignment).not.toHaveBeenCalled();
+    expect(registry.list()).toHaveLength(taskCount);
+    expect(registry.get(created.taskId)!.assignments).toHaveLength(assignmentCount);
+    expect(registry.get(created.taskId)!.assignments.filter((item) => item.role === 'implementer'))
+      .toEqual([expect.objectContaining({ assignmentId: created.assignmentId })]);
+    expect(dispatchMessage).toHaveBeenCalledWith(worker, expect.any(String), expect.objectContaining({
+      deliveryMode: 'append',
+    }));
+
+    const otherWorker = supervisedChild({
+      name: 'deck_alpha_wrong_append_worker', role: 'w2', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const wrongTarget = await dispatchSendMessage(caller, {
+      target: otherWorker.name,
+      message: 'must not fork the existing implementation assignment',
+      deliveryMode: 'append',
+      task: { taskId: created.taskId, executionPool: 'primary' },
+    }, deps([...sessions, otherWorker], dispatchMessage));
+    expect(wrongTarget).toMatchObject({
+      status: 'error', reason: 'identity_rejected',
+      error: expect.stringContaining('authoritative active implementer assignment'),
+    });
+    expect(registry.list()).toHaveLength(taskCount);
+    expect(registry.get(created.taskId)!.assignments).toHaveLength(assignmentCount);
+  });
+
+  it.each([
+    ['blocked', 'blocked'],
+    ['FINISHED', 'ready_for_audit'],
+  ] as const)('fails closed before every side effect when the only historical implementer is %s', async (_label, terminalStatus) => {
+    const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
+    const brain = supervisedBrain([config]);
+    const worker = supervisedChild({
+      name: `deck_alpha_terminal_${terminalStatus}`, role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const sessions = [brain, worker];
+    const registry = getSupervisionTaskRegistry();
+    const dispatched = vi.fn(async () => {});
+    const created = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'create one implementation assignment',
+      task: {
+        classification: 'independent_top_level', objective: 'terminal continuation boundary',
+        executionPool: 'primary', ownedFiles: ['src/terminal.ts'],
+      },
+    }, deps(sessions, dispatched));
+    if (created.status !== 'accepted' || !created.taskId || !created.assignmentId) throw new Error('expected task');
+    const assignment = registry.getAssignment(created.assignmentId)!;
+    if (terminalStatus === 'blocked') {
+      expect(registry.updateAssignment({
+        assignmentId: assignment.assignmentId, identity: assignment.identity, status: 'blocked', blocker: 'human input required',
+      }).ok).toBe(true);
+    } else {
+      for (const status of ['implementing', 'validated'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: assignment.assignmentId, identity: assignment.identity, status,
+        }).ok).toBe(true);
+        expect(registry.updateTask({ taskId: created.taskId, status }).ok).toBe(true);
+      }
+      expect(registry.applyTaskIntent({
+        taskId: created.taskId, assignmentId: assignment.assignmentId,
+        intent: 'open_audit', toStatus: 'ready_for_audit',
+      })).toMatchObject({ ok: true });
+      expect(registry.listEvents(created.taskId)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          assignmentId: assignment.assignmentId, eventType: 'implementation_finished',
+          payload: expect.objectContaining({ implementationHandoff: 'FINISHED' }),
+        }),
+      ]));
+    }
+
+    const taskCount = registry.list().length;
+    const assignmentCount = registry.get(created.taskId)!.assignments.length;
+    const createTask = vi.spyOn(registry, 'createOrGet');
+    const createAssignment = vi.spyOn(registry, 'createAssignment');
+    const createReplyAuthority = vi.spyOn(getDelegationReplyStore(), 'create');
+    dispatched.mockClear();
+    const result = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'must not replace a terminal implementer', deliveryMode: 'append',
+      task: { taskId: created.taskId, executionPool: 'primary' },
+    }, deps(sessions, dispatched));
+    expect(result).toMatchObject({
+      status: 'error', reason: 'identity_rejected',
+      error: expect.stringContaining('no unique reusable implementer assignment'),
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(createAssignment).not.toHaveBeenCalled();
+    expect(createReplyAuthority).not.toHaveBeenCalled();
+    expect(dispatched).not.toHaveBeenCalled();
+    expect(registry.list()).toHaveLength(taskCount);
+    expect(registry.get(created.taskId)!.assignments).toHaveLength(assignmentCount);
+  });
+
+  it('reuses one explicit active replacement beside cancelled history, but rejects ambiguous active implementers', async () => {
+    const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
+    const brain = supervisedBrain([config]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_replacement_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const sessions = [brain, worker];
+    const dispatched = vi.fn(async () => 'queued' as const);
+    const created = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'initial assignment',
+      task: { classification: 'independent_top_level', objective: 'replacement', executionPool: 'primary' },
+    }, deps(sessions, dispatched));
+    if (created.status !== 'accepted' || !created.taskId || !created.assignmentId) throw new Error('expected task');
+    const registry = getSupervisionTaskRegistry();
+    const original = registry.getAssignment(created.assignmentId)!;
+    expect(registry.applyTaskIntent({
+      taskId: created.taskId, assignmentId: original.assignmentId, intent: 'cancel', toStatus: 'cancelled',
+    })).toMatchObject({ ok: true });
+    const replacement = registry.createAssignment({
+      taskId: created.taskId, role: 'implementer', identity: original.identity, scopeFiles: original.scopeFiles,
+    });
+    if (!replacement.ok) throw new Error(replacement.reason);
+
+    dispatched.mockClear();
+    const appended = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'append to explicit replacement', deliveryMode: 'append',
+      task: { taskId: created.taskId, executionPool: 'primary' },
+    }, deps(sessions, dispatched));
+    expect(appended).toMatchObject({
+      status: 'accepted', taskId: created.taskId, assignmentId: replacement.value.assignmentId,
+    });
+    expect(registry.get(created.taskId)!.assignments.filter((item) => item.role === 'implementer')).toHaveLength(2);
+
+    const ambiguous = registry.createAssignment({
+      taskId: created.taskId, role: 'implementer',
+      identity: { ...original.identity, sessionName: 'deck_alpha_other_active_worker' },
+      scopeFiles: original.scopeFiles,
+    });
+    if (!ambiguous.ok) throw new Error(ambiguous.reason);
+    const beforeCount = registry.get(created.taskId)!.assignments.length;
+    dispatched.mockClear();
+    const rejected = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'must not choose among active implementers', deliveryMode: 'append',
+      task: { taskId: created.taskId, executionPool: 'primary' },
+    }, deps(sessions, dispatched));
+    expect(rejected).toMatchObject({
+      status: 'error', reason: 'identity_rejected',
+      error: expect.stringContaining('no unique reusable implementer assignment'),
+    });
+    expect(registry.get(created.taskId)!.assignments).toHaveLength(beforeCount);
+    expect(dispatched).not.toHaveBeenCalled();
+  });
+
+  it('rejects queue for an existing task continuation before side effects while allowing queued independent work', async () => {
+    const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
+    const brain = supervisedBrain([config]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_queue_boundary', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const sessions = [brain, worker];
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    const created = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'independent work', deliveryMode: 'queue',
+      idempotencyKey: 'independent-queue-work',
+      task: { classification: 'independent_top_level', objective: 'independent', executionPool: 'primary' },
+    }, deps(sessions, dispatchMessage));
+    expect(created).toMatchObject({ status: 'accepted', taskId: expect.any(String) });
+    if (created.status !== 'accepted' || !created.taskId) throw new Error('expected independent task');
+
+    const registry = getSupervisionTaskRegistry();
+    const beforeTasks = registry.list().length;
+    const beforeAssignments = registry.get(created.taskId)!.assignments.length;
+    dispatchMessage.mockClear();
+    const rejected = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'must remain same task', deliveryMode: 'queue',
+      task: { taskId: created.taskId, executionPool: 'primary' },
+    }, deps(sessions, dispatchMessage));
+    expect(rejected).toMatchObject({
+      status: 'error', reason: 'validation_failed', error: expect.stringContaining('must use deliveryMode=append'),
+    });
+    expect(registry.list()).toHaveLength(beforeTasks);
+    expect(registry.get(created.taskId)!.assignments).toHaveLength(beforeAssignments);
+    expect(dispatchMessage).not.toHaveBeenCalled();
   });
 
   it('rejects an ordinary supervised task target outside the caller primary pool', async () => {

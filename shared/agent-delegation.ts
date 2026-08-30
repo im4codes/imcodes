@@ -42,8 +42,6 @@ export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
 export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
 export const AGENT_DELEGATION_REPLY_MAX_MESSAGES = 64;
-export const AGENT_DELEGATION_CAPABILITY_MIN_CHARS = 32;
-export const AGENT_DELEGATION_CAPABILITY_MAX_CHARS = 512;
 export const AGENT_DELEGATION_ID_MAX_BYTES = 256;
 export const AGENT_DELEGATION_REPLY_ERRORS = {
   OVERSIZE: 'oversize',
@@ -51,7 +49,6 @@ export const AGENT_DELEGATION_REPLY_ERRORS = {
   INVALID_VERSION: 'invalid_version',
   UNKNOWN_FIELD: 'unknown_field',
   INVALID_DELEGATION_ID: 'invalid_delegation_id',
-  INVALID_CAPABILITY: 'invalid_capability',
   INVALID_RESULT: 'invalid_result',
   IDENTITY_MISMATCH: 'identity_mismatch',
   EXPIRED: 'expired',
@@ -66,13 +63,11 @@ export type AgentDelegationReplyError =
 export interface AgentDelegationReplyEnvelope {
   version: typeof AGENT_DELEGATION_REPLY_VERSION;
   delegationId: string;
-  replyCapability: string;
   result: string;
 }
 
 export interface AgentDelegationReplyAuthority {
   delegationId: string;
-  replyCapability: string;
   /** Present only for a supervision audit; selects the dedicated reply ingress. */
   audit?: AgentDelegationAuditRequest;
 }
@@ -98,8 +93,8 @@ export const AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT =
  *
  * A child session must not turn a local NEEDS_INPUT/illegal-transition into a
  * silent wait that is visible only after somebody opens that session. The
- * reply capability is the authenticated return path to the coordinating Brain;
- * this instruction pins both durable ids so a report cannot be detached from
+ * daemon-authenticated current-session identity is the return authority to the
+ * coordinating Brain; this instruction pins both durable ids so a report cannot be detached from
  * the assignment that encountered the blocker.
  */
 export function buildAgentDelegationBlockerReportInstruction(
@@ -139,6 +134,10 @@ export interface AgentDelegationAuditRequest {
    * required and the daemon fails closed when it is absent.
    */
   auditedSessionName: string;
+  /** Durable registry bindings added by the daemon after assignment creation. */
+  taskId?: string;
+  assignmentId?: string;
+  revision?: string;
 }
 
 /**
@@ -345,22 +344,19 @@ export function buildAgentDelegationReplyInstruction(
 ): string {
   if (!isCanonicalAgentDelegationSessionName(replyToSession)) return '';
   if (authority) {
-    if (!isAgentDelegationOpaqueId(authority.delegationId)
-      || !isAgentDelegationReplyCapability(authority.replyCapability)) return '';
+    if (!isAgentDelegationOpaqueId(authority.delegationId)) return '';
     if (authority.audit?.kind === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) {
       return [
-        `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify({
-          delegationId: authority.delegationId,
-          replyCapability: authority.replyCapability,
-        })}`,
-        'This is a supervision audit reply capability. Do not use delegation_reply for this audit.',
+        `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify({ delegationId: authority.delegationId })}`,
+        'This is a supervision audit receipt channel. Do not use delegation_reply for this audit.',
         'Use the peer_audit_reply tool with these exact fields:',
-        `{ "attemptId": ${JSON.stringify(authority.audit.attemptId)}, "replyCapability": ${JSON.stringify(authority.replyCapability)}, "verdict": "PASS|REWORK", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
+        `{ "taskId": ${JSON.stringify(authority.audit.taskId ?? '')}, "assignmentId": ${JSON.stringify(authority.audit.assignmentId ?? '')}, "attemptId": ${JSON.stringify(authority.audit.attemptId)}, "revision": ${JSON.stringify(authority.audit.revision ?? '')}, "receiptKind": "progress|final", "verdict": "PASS|REWORK (final only)", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
+        'Receipts are authenticated by the daemon-bound current session and registry assignment; no token is supplied. Progress and corrected final receipts append to the same attempt. After the accepted final receipt, finish this exact auditor assignment so the overall gate can advance.',
       ].join('\n');
     }
     return [
       `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify(authority)}`,
-      `Use the delegation_reply tool with the delegationId and replyCapability above plus result: "<your response>" whenever you need to reply. The same capability may send multiple structured replies until it expires; each reply is routed directly to ${JSON.stringify(replyToSession)}. Do not use send_message or imcodes send for these replies.`,
+      `Use the delegation_reply tool with delegationId plus result: "<your response>" whenever you need to reply. The daemon authenticates the current session and accepts multiple append-only replies for the same delegation; each reply is routed directly to ${JSON.stringify(replyToSession)}. Do not use send_message or imcodes send for these replies.`,
     ].join('\n');
   }
   return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
@@ -379,13 +375,6 @@ export function isAgentDelegationOpaqueId(value: unknown): value is string {
     && BASE64URL_RE.test(value);
 }
 
-export function isAgentDelegationReplyCapability(value: unknown): value is string {
-  return typeof value === 'string'
-    && value.length >= AGENT_DELEGATION_CAPABILITY_MIN_CHARS
-    && value.length <= AGENT_DELEGATION_CAPABILITY_MAX_CHARS
-    && BASE64URL_RE.test(value);
-}
-
 export function extractAgentDelegationReplyAuthorityFromInstruction(
   text: string,
 ): AgentDelegationReplyAuthority | undefined {
@@ -398,15 +387,14 @@ export function extractAgentDelegationReplyAuthorityFromInstruction(
       const parsed = JSON.parse(raw) as unknown;
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
       const record = parsed as Record<string, unknown>;
-      if (Object.keys(record).length !== 2
+      const keys = Object.keys(record);
+      if ((keys.length !== 1 && keys.length !== 2)
         || !Object.prototype.hasOwnProperty.call(record, 'delegationId')
-        || !Object.prototype.hasOwnProperty.call(record, 'replyCapability')
         || !isAgentDelegationOpaqueId(record.delegationId)
-        || !isAgentDelegationReplyCapability(record.replyCapability)) return undefined;
-      return {
-        delegationId: record.delegationId,
-        replyCapability: record.replyCapability,
-      };
+        || (keys.length === 2 && !Object.prototype.hasOwnProperty.call(record, 'replyCapability'))) return undefined;
+      // replyCapability is accepted only as a historical marker field and is
+      // intentionally discarded.
+      return { delegationId: record.delegationId };
     } catch {
       return undefined;
     }
@@ -431,9 +419,6 @@ export function decodeAgentDelegationReplyEnvelope(
   if (!isAgentDelegationOpaqueId(record.delegationId)) {
     return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID };
   }
-  if (!isAgentDelegationReplyCapability(record.replyCapability)) {
-    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_CAPABILITY };
-  }
   if (typeof record.result !== 'string'
     || !record.result.trim()
     || agentDelegationByteLength(record.result) > AGENT_DELEGATION_REPLY_RESULT_BYTES) {
@@ -442,7 +427,6 @@ export function decodeAgentDelegationReplyEnvelope(
   const value: AgentDelegationReplyEnvelope = {
     version: AGENT_DELEGATION_REPLY_VERSION,
     delegationId: record.delegationId,
-    replyCapability: record.replyCapability,
     result: record.result,
   };
   if (agentDelegationByteLength(JSON.stringify(value)) > AGENT_DELEGATION_REPLY_TOTAL_BYTES) {

@@ -20,7 +20,6 @@ function request(attemptId: string, trigger: 'quick' | 'automatic' = 'quick'): P
     auditorSessionInstanceId: 'auditor-instance',
     auditorRuntimeEpoch: 'auditor-runtime',
     selectionIntent: 'explicit_picker',
-    capabilityHash: `hash-${attemptId}`,
   };
 }
 
@@ -55,6 +54,7 @@ describe('peer-audit controller reducer', () => {
       status: 'started',
       pending: { phase: 'preparing', startedAt: 1_000, deadlineAt: 901_000, revision: 1 },
     });
+    if (started.status === 'started') expect(started.pending).not.toHaveProperty('capabilityHash');
 
     vi.advanceTimersByTime(899_999);
     expect(controller.pending?.attemptId).toBe('attempt-1');

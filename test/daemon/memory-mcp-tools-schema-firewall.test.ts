@@ -106,18 +106,27 @@ describe('memory MCP tool schema firewall', () => {
     const peerAuditReply = vi.fn(async () => ({ ok: true }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
     const valid = {
+      taskId: 'supervision_task_12345678',
+      assignmentId: 'supervision_assignment_12345678',
       attemptId: 'attempt_12345678',
-      replyCapability: 'A'.repeat(32),
+      revision: 'revision_12345678',
+      receiptKind: 'final',
       verdict: 'PASS',
       findings: 'Focused tests passed.',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
     };
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({
+      ...valid,
+      verdict: undefined,
+    })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(peerAuditReply).not.toHaveBeenCalled();
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](valid)).resolves.toEqual({ status: 'ok', accepted: true });
     expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
       version: 'peer_audit_reply_v1',
       attemptId: valid.attemptId,
-      replyCapability: valid.replyCapability,
+      receiptKind: 'final',
     }));
+    expect(peerAuditReply.mock.calls[0]?.[0]).not.toHaveProperty('replyCapability');
 
     const forged = await handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({ ...valid, injectedTarget: 'other-session' });
     expect(forged).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
@@ -129,7 +138,6 @@ describe('memory MCP tool schema firewall', () => {
     const handlers = createMemoryMcpToolHandlers(caller(), { delegationReply });
     const valid = {
       delegationId: 'delegation_identity_1234567890',
-      replyCapability: 'reply_capability_1234567890_ABCDEFG',
       result: 'Completed with exact evidence.',
     };
 
@@ -152,11 +160,14 @@ describe('memory MCP tool schema firewall', () => {
   });
 
   it('defers peer-audit PASS evidence policy until the sender-bound ingress', async () => {
-    const peerAuditReply = vi.fn(async () => ({ ok: false, error: 'invalid_capability' }));
+    const peerAuditReply = vi.fn(async () => ({ ok: false, error: 'attempt_mismatch' }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
     const structureOnlyPass = {
+      taskId: 'supervision_task_12345678',
+      assignmentId: 'supervision_assignment_12345678',
       attemptId: 'attempt_12345678',
-      replyCapability: 'A'.repeat(32),
+      revision: 'revision_12345678',
+      receiptKind: 'final',
       verdict: 'PASS',
       findings: 'No executable evidence was supplied.',
       validations: [],
@@ -914,6 +925,45 @@ describe('memory MCP tool schema firewall', () => {
           reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
         });
       }
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('carries deliveryMode through MCP ingress and refuses queue for an existing task continuation', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', runtimeType: 'transport',
+    });
+    const peer = sessionRecord({
+      name: 'deck_proj_append_peer', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch', runtimeType: 'transport',
+    });
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller(), {
+      sendDeps: { listSessions: () => [self, peer], dispatchMessage },
+    });
+    const client = new Client({ name: 'append-contract-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+      expect(contract.inputSchema.properties?.deliveryMode).toMatchObject({ enum: ['append', 'queue'] });
+      expect(contract.description).toContain('Existing-task continuations MUST append');
+      const result = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: peer.name,
+          message: 'same task continuation',
+          deliveryMode: 'queue',
+          task: { taskId: 'supervision_task_existing', executionPool: 'primary' },
+        },
+      });
+      expect(result.structuredContent).toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        error: expect.stringContaining('must use deliveryMode=append'),
+      });
       expect(dispatchMessage).not.toHaveBeenCalled();
     } finally {
       await client.close();

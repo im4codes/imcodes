@@ -17,8 +17,6 @@ import {
   PEER_AUDIT_VALIDATION_ITEM_BYTES,
   PEER_AUDIT_PATH_COUNT,
   PEER_AUDIT_PATH_ITEM_BYTES,
-  PEER_AUDIT_CAPABILITY_MIN_BITS,
-  PEER_AUDIT_CAPABILITY_MIN_CHARS,
   PEER_AUDIT_CANDIDATE_COUNT,
   PEER_AUDIT_REPLY_ERRORS,
   PEER_AUDIT_TERMINAL_OUTCOMES,
@@ -27,7 +25,6 @@ import {
   isPeerAuditVerdict,
   isPeerAuditValidationKind,
   isPeerAuditTerminalOutcome,
-  isPeerAuditCapability,
   isPeerAuditIdString,
   isPeerAuditOpaqueId,
   peerAuditByteLength,
@@ -56,10 +53,20 @@ import {
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 
-const CAP = 'A'.repeat(PEER_AUDIT_CAPABILITY_MIN_CHARS); // 32 base64url chars = 192 bits
 const passedItem: PeerAuditValidationItem = { kind: 'test', label: 'unit', outcome: 'passed', summary: 'ok' };
 function validReply(over: Partial<PeerAuditReplyEnvelope> = {}): Record<string, unknown> {
-  return { version: PEER_AUDIT_REPLY_VERSION, attemptId: 'att-1', replyCapability: CAP, verdict: 'PASS', findings: 'looks good', validations: [passedItem], ...over };
+  return {
+    version: PEER_AUDIT_REPLY_VERSION,
+    taskId: 'supervision_task_1',
+    assignmentId: 'supervision_assignment_1',
+    attemptId: 'att-1',
+    revision: 'revision-1',
+    receiptKind: 'final',
+    verdict: 'PASS',
+    findings: 'looks good',
+    validations: [passedItem],
+    ...over,
+  };
 }
 
 describe('peer-audit contract — versions, enums, limits', () => {
@@ -85,8 +92,6 @@ describe('peer-audit contract — versions, enums, limits', () => {
     expect(PEER_AUDIT_VALIDATION_ITEM_BYTES).toBe(512);
     expect(PEER_AUDIT_PATH_COUNT).toBe(128);
     expect(PEER_AUDIT_PATH_ITEM_BYTES).toBe(512);
-    expect(PEER_AUDIT_CAPABILITY_MIN_BITS).toBe(192);
-    expect(PEER_AUDIT_CAPABILITY_MIN_CHARS).toBe(32);
   });
   it('type guards accept members and reject non-members / wrong types', () => {
     expect(isPeerAuditTrigger('quick')).toBe(true);
@@ -117,17 +122,7 @@ describe('automatic audit orchestration result marker', () => {
   });
 });
 
-describe('base64url capability + id strings', () => {
-  it('requires base64url with >= 192 bits (32 chars) and bounded length', () => {
-    expect(isPeerAuditCapability(CAP)).toBe(true);
-    expect(isPeerAuditCapability('A'.repeat(31))).toBe(false); // 186 bits < 192
-    expect(isPeerAuditCapability('A'.repeat(32) + '+')).toBe(false); // '+' not base64url
-    expect(isPeerAuditCapability('A'.repeat(32) + '/')).toBe(false);
-    expect(isPeerAuditCapability('A'.repeat(32) + '=')).toBe(false); // no padding
-    expect(isPeerAuditCapability('A'.repeat(513))).toBe(false); // over max
-    expect(isPeerAuditCapability(123)).toBe(false);
-    expect(isPeerAuditCapability('Ab-_09' + 'A'.repeat(26))).toBe(true); // full base64url charset
-  });
+describe('identity strings', () => {
   it('id strings are non-empty and byte-bounded', () => {
     expect(isPeerAuditIdString('sess-1')).toBe(true);
     expect(isPeerAuditIdString('')).toBe(false);
@@ -181,9 +176,11 @@ describe('decodePeerAuditReplyEnvelope — strict schema', () => {
   it('rejects a wrong version', () => {
     expect(decodePeerAuditReplyEnvelope(validReply({ version: 'peer_audit_reply_v2' as never }))).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_VERSION });
   });
-  it('rejects an invalid attemptId and invalid capability', () => {
+  it('rejects an invalid attemptId and ignores a historical capability field', () => {
     expect(decodePeerAuditReplyEnvelope(validReply({ attemptId: '' }))).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_ATTEMPT_ID });
-    expect(decodePeerAuditReplyEnvelope(validReply({ replyCapability: 'short' }))).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY });
+    const decoded = decodePeerAuditReplyEnvelope({ ...validReply(), replyCapability: 'historical-token' });
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok) expect(decoded.value).not.toHaveProperty('replyCapability');
   });
   it('rejects an invalid verdict', () => {
     expect(decodePeerAuditReplyEnvelope(validReply({ verdict: 'MAYBE' as never }))).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_VERDICT });

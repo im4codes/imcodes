@@ -49,10 +49,12 @@ import {
 } from './supervision-prompts.js';
 import {
   getSupervisionStateStore,
+  getSupervisionTaskRegistry,
   SUPERVISION_STATE_VERSION,
   type PersistedSupervisionSessionIdentity,
   type PersistedSupervisionWaitState,
 } from './supervision-state-store.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_PURPOSES,
@@ -141,6 +143,9 @@ const SUPERVISION_PARKED_LABEL = 'Supervised: parked until the pending reply arr
  * would strand the run silently instead of surfacing to the human.
  */
 const SUPERVISION_WAITING_HEARTBEAT_MS = 10 * 60_000;
+const IMPLEMENTATION_IDLE_REMINDER_MS = 10 * 60_000;
+const IMPLEMENTATION_REMINDER_MAX_BACKOFF_MS = 60 * 60_000;
+const IMPLEMENTATION_WATCHDOG_TICK_MS = 60_000;
 const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
 /**
  * Provider/runtime projections are not guaranteed to publish the final
@@ -460,7 +465,7 @@ const FORBIDS_NEW_AUDIT_RE = /(?:\b(?:do\s+not|don't|never)\b[\s\S]{0,50}\b(?:se
 const WAITING_FOR_PEER_AUDIT_RE = /(?:\b(?:peer[- ]audit|independent\s+(?:audit|review)|audit)\b[\s\S]{0,80}\b(?:pass|verdict|reply|result|receipt)\b|\b(?:pass|verdict|reply|result|receipt)\b[\s\S]{0,80}\b(?:peer[- ]audit|independent\s+(?:audit|review))\b|(?:等待|等候|尚未收到|未收到|阻塞)[\s\S]{0,60}(?:独立)?(?:审计|审核|复审)[\s\S]{0,30}(?:通过|结论|裁决|回复|回执|结果)?)/iu;
 const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Perform only the already-audited repository or delivery finalization requested for this task (stage/commit/push, merge, release, publish, or deploy as applicable). Do not perform additional implementation work. Do not request or start another audit.';
 const SUPERVISED_REPOSITORY_FINALIZATION_ACTION = 'Implementation and validation are complete. Perform only the repository or delivery finalization explicitly requested by the task or user supervision rules; do not invent delivery work.';
-const PRE_AUDIT_SELF_RECONCILIATION_ACTION = 'Advance safe unfinished task-owned work from your own context in this same turn; do not stop at a status summary. If none can be safely advanced, report the exact human blocker. Do not stage, commit, push, merge, release, publish, or deploy before peer-audit PASS.';
+const PRE_AUDIT_SELF_RECONCILIATION_ACTION = 'Advance safe unfinished task-owned work from your own context in this same turn; do not stop at a status summary. An integration_slice must finish validation and hand its frozen manifest to the integration owner without starting an audit. Only the complete integration_task or a genuine independent_top_level revision may enter peer audit. If none can be safely advanced, report the exact human blocker. Do not stage, commit, push, merge, release, publish, or deploy before the one overall peer-audit PASS.';
 const COMPLETED_REPOSITORY_FINALIZATION_RE = /(?:\bcommit\s*:\s*[0-9a-f]{7,40}\b|\bpush\s*:\s*(?:origin\/)?[^\s]+\s+(?:succeeded|successful|done|complete)|\b(?:committed|pushed|merged|released|published|deployed)\b|(?:已完成并)?(?:提交并推送|提交且推送)|(?:已|成功)(?:提交|推送|合并|发布|部署)|推送成功)/iu;
 const AUDIT_WORTHY_TASK_RE = /(?:\b(?:implement|fix|add|remove|delete|change|modify|update|refactor|optimi[sz]e|build|configure|migrate|install|uninstall)\b|(?:修复|实现|新增|添加|删除|修改|改成|调整|重构|优化|美化|配置|迁移|安装|卸载))/iu;
 const COMPLETED_ENGINEERING_WORK_RE = /(?:\b(?:implemented|fixed|added|removed|deleted|changed|modified|updated|refactored|optimized|built|configured|migrated|installed|uninstalled)\b|\b(?:implementation|fix(?:es)?|changes?|tests?|typecheck|lint|build|validation|verification)\b[\s\S]{0,60}\b(?:complete|completed|done|passed)\b|(?:已|已经)(?:完成|实现|修复|新增|添加|删除|修改|调整|重构|优化|美化|配置|迁移|安装|卸载)|(?:实现|修复|改动|测试|验证|类型检查|构建)[\s\S]{0,30}(?:完成|通过))/iu;
@@ -868,6 +873,7 @@ class SupervisionAutomation {
   private heartbeatPausedForNeedsInput = new Set<string>();
   private emittedAuditResultAttemptIds: string[] = [];
   private emittedAuditResultAttemptIdSet = new Set<string>();
+  private implementationWatchdogTimer?: NodeJS.Timeout;
   /** Monotonic even across cancellation, so an old async verdict cannot match a replacement run. */
   private nextRunGeneration = 0;
   private initialized = false;
@@ -956,6 +962,115 @@ class SupervisionAutomation {
       }
     });
     this.restorePersistedWaitStates();
+    this.implementationWatchdogTimer = setInterval(() => {
+      this.checkImplementationAssignments(Date.now());
+    }, IMPLEMENTATION_WATCHDOG_TICK_MS);
+    this.implementationWatchdogTimer.unref?.();
+  }
+
+  /** Test seam for the durable single-implementer watchdog. */
+  __checkImplementationAssignmentsForTests(now: number): void {
+    if (process.env.NODE_ENV !== 'test') return;
+    this.checkImplementationAssignments(now);
+  }
+
+  private checkImplementationAssignments(now: number): void {
+    const registry = getSupervisionTaskRegistry();
+    // Production housekeeping is inert until an administrator has reviewed a
+    // dry-run and explicitly called apply. Once authorized, this advances one
+    // bounded cursor page per cooldown tick and remains restart-idempotent.
+    try {
+      registry.runApprovedHousekeepingBatch(now);
+    } catch (error) {
+      logger.warn({ err: error }, 'Bounded supervision housekeeping tick failed');
+    }
+    for (const task of registry.list()) {
+      const events = registry.listEvents(task.taskId);
+      for (const assignment of task.assignments) {
+        if (assignment.role !== 'implementer' || assignment.status !== 'implementing') continue;
+        const assignmentEvents = events.filter((event) => event.assignmentId === assignment.assignmentId);
+        const progressAt = Math.max(
+          assignment.updatedAt,
+          ...assignmentEvents
+            .filter((event) => event.eventType !== 'implementation_heartbeat')
+            .map((event) => event.createdAt),
+        );
+        const reminders = assignmentEvents.filter((event) => (
+          event.eventType === 'implementation_heartbeat'
+          && event.payload?.source === 'implementation_watchdog'
+          && event.createdAt > progressAt
+        ));
+        const latestReminder = reminders.at(-1);
+        const cooldown = latestReminder
+          ? Math.min(
+              IMPLEMENTATION_IDLE_REMINDER_MS * (2 ** Math.min(reminders.length - 1, 6)),
+              IMPLEMENTATION_REMINDER_MAX_BACKOFF_MS,
+            )
+          : IMPLEMENTATION_IDLE_REMINDER_MS;
+        const dueAt = latestReminder
+          ? latestReminder.createdAt + cooldown
+          : progressAt + IMPLEMENTATION_IDLE_REMINDER_MS;
+        if (now < dueAt) continue;
+
+        const runtime = getTransportRuntime(assignment.identity.sessionName);
+        if (!runtime) continue;
+        const activity = runtime.getDiagnosticSnapshot(now);
+        if (activity.status !== 'idle'
+          || activity.sending
+          || activity.pendingCount > 0
+          || activity.activeDispatchCount > 0
+          || activity.blockingWorkCount > 0) continue;
+        // Durable FIFO can retain an append while the provider remains busy or
+        // disconnected. Never enqueue a second watchdog reminder behind the
+        // first one: cooldown controls cadence, this queue check provides the
+        // independent hard bound of one pending reminder per assignment.
+        const reminderIdPrefix = `supervision-implementation-heartbeat:${assignment.assignmentId}:`;
+        if (runtime.pendingEntries.some((entry) => entry.clientMessageId.startsWith(reminderIdPrefix))) continue;
+        const reminderNumber = reminders.length + 1;
+        const clientMessageId = `${reminderIdPrefix}${reminderNumber}`;
+        const recorded = registry.recordImplementationHeartbeat({
+          assignmentId: assignment.assignmentId,
+          reminderNumber,
+          clientMessageId,
+          now,
+        });
+        if (!recorded.ok) continue;
+        const prompt = [
+          `[Contract: ${SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT}]`,
+          `Continue the existing task ${task.taskId} / assignment ${assignment.assignmentId}.`,
+          'Check current state; advance only safe unfinished implementation work.',
+          'This is an append to the same task, never new work or a new assignment.',
+          'After internal merge, validation, and Brain handoff, record the machine FINISHED handoff; do not claim audit PASS or Git finalization.',
+        ].join('\n');
+        timelineEmitter.emit(
+          assignment.identity.sessionName,
+          'user.message',
+          {
+            text: prompt,
+            clientMessageId,
+            taskId: task.taskId,
+            assignmentId: assignment.assignmentId,
+            automation: true,
+            automationKind: 'supervision-implementation-heartbeat',
+            memoryExcluded: true,
+          },
+          { source: 'daemon', confidence: 'high', eventId: clientMessageId },
+        );
+        try {
+          runtime.send(prompt, clientMessageId, undefined, undefined, {
+            timelineCommitted: true,
+            deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+          });
+        } catch (error) {
+          logger.warn({
+            taskId: task.taskId,
+            assignmentId: assignment.assignmentId,
+            session: assignment.identity.sessionName,
+            err: error,
+          }, 'Supervision implementation heartbeat dispatch failed');
+        }
+      }
+    }
   }
 
   setServerLink(_serverLink: ServerLink | null): void {
@@ -2899,7 +3014,7 @@ class SupervisionAutomation {
     current.terminalState = undefined;
     await this.dispatchContinueWithinLimits(current, {
       reason: 'A coordinator-owned lifecycle decision remains after the completed work.',
-      nextAction: 'Review the current structured task state and continue the next safe coordinator-owned step.',
+      nextAction: 'Review the structured task classification and state. For integration_slice, validate/freeze/handoff without audit; for incomplete integration_task, merge and validate all slice manifests first; only then dispatch one audit for the exact combined revision.',
     });
   }
 
@@ -3020,7 +3135,7 @@ class SupervisionAutomation {
 
     // ELIGIBILITY, not just existence. The check above only proves the target
     // record and runtime exist; a stopped session, an execution clone, a
-    // non-direct child, or one lacking identity/reply capability would sail
+    // non-direct child, or one lacking the reply-capable runtime contract would sail
     // past it and then get a 15-minute audit deadline armed against it.
     //
     // This calls the SAME authoritative validator the send tool uses. A second

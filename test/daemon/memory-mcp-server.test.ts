@@ -232,6 +232,15 @@ describe('memory MCP stdio server', () => {
         MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
         MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
       ]));
+      expect(bootstrap.tools.find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY)?.inputSchema.required).toEqual([
+        'taskId',
+        'assignmentId',
+        'attemptId',
+        'revision',
+        'receiptKind',
+        'findings',
+        'validations',
+      ]);
       expect(mcpToolSurfaceBytes(bootstrap.tools)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
       expect(client.getInstructions()).toBeUndefined();
       const bootstrapDescriptions = bootstrap.tools.map((tool) => tool.description ?? '').join('\n');
@@ -850,20 +859,34 @@ describe('memory MCP stdio server', () => {
     });
     try {
       await client.connect(transport);
-      const result = await callLazyTool(client, 'peer_audit_reply', {
+      const validReply = {
+          taskId: 'supervision_task_12345678',
+          assignmentId: 'supervision_assignment_12345678',
           attemptId: 'attempt_12345678',
-          replyCapability: 'A'.repeat(32),
+          revision: 'revision_12345678',
+          receiptKind: 'final',
           verdict: 'PASS',
           findings: 'Focused checks passed.',
           validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
-      });
+      };
+      for (const missing of ['taskId', 'assignmentId', 'revision'] as const) {
+        const incomplete: Record<string, unknown> = { ...validReply };
+        delete incomplete[missing];
+        const rejected = await callLazyTool(client, 'peer_audit_reply', incomplete);
+        expect(rejected).toMatchObject({ isError: true });
+      }
+      expect(received).toEqual([]);
+      const result = await callLazyTool(client, 'peer_audit_reply', validReply);
       expect(result.structuredContent).toEqual({ status: 'ok', accepted: true });
       expect(received).toEqual([{
         sender: 'deck_sub_worker',
         body: expect.objectContaining({
           version: 'peer_audit_reply_v1',
+          taskId: 'supervision_task_12345678',
+          assignmentId: 'supervision_assignment_12345678',
           attemptId: 'attempt_12345678',
-          replyCapability: 'A'.repeat(32),
+          revision: 'revision_12345678',
+          receiptKind: 'final',
         }),
       }]);
     } finally {
@@ -915,7 +938,6 @@ describe('memory MCP stdio server', () => {
       await client.connect(transport);
       const result = await callLazyTool(client, 'delegation_reply', {
           delegationId: 'delegation_identity_1234567890',
-          replyCapability: 'reply_capability_1234567890_ABCDEFG',
           result: 'Completed with exact evidence.',
       });
       expect(result.structuredContent).toEqual({
@@ -929,7 +951,6 @@ describe('memory MCP stdio server', () => {
         body: {
           version: 'agent_delegation_reply_v1',
           delegationId: 'delegation_identity_1234567890',
-          replyCapability: 'reply_capability_1234567890_ABCDEFG',
           result: 'Completed with exact evidence.',
         },
       }]);

@@ -839,16 +839,22 @@ async function postToHookServer(
 
 program
   .command('audit-reply')
-  .description('Submit one structured peer-audit reply to the running daemon (no terminal fallback)')
+  .description('Append a structured peer-audit receipt to the running daemon (no terminal fallback)')
+  .requiredOption('--task-id <id>', 'Exact supervision task id')
+  .requiredOption('--assignment-id <id>', 'Exact auditor assignment id')
   .requiredOption('--attempt-id <id>', 'Opaque peer-audit attempt id')
-  .requiredOption('--capability <capability>', 'One-time peer-audit reply capability')
-  .requiredOption('--verdict <verdict>', 'PASS or REWORK')
+  .requiredOption('--revision <revision>', 'Exact audited revision')
+  .requiredOption('--receipt-kind <kind>', 'progress or final')
+  .option('--verdict <verdict>', 'PASS or REWORK; required for final receipts')
   .requiredOption('--findings-file <path>', 'UTF-8 findings file')
   .requiredOption('--validations-file <path>', 'JSON array of validation summary items')
   .action(async (opts: {
+    taskId: string;
+    assignmentId: string;
     attemptId: string;
-    capability: string;
-    verdict: string;
+    revision: string;
+    receiptKind: string;
+    verdict?: string;
     findingsFile: string;
     validationsFile: string;
   }) => {

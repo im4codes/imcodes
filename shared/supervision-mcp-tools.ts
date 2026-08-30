@@ -13,6 +13,8 @@ export const SUPERVISION_MCP_TOOLS = Object.freeze({
   GET: 'supervision_task_get',
   /** Administrative recovery; enum-restricted and transition-checked. */
   RECOVER: 'supervision_task_recover',
+  /** Bounded retention census/apply; apply is administrative and provenance-preserving. */
+  HOUSEKEEPING: 'supervision_task_housekeeping',
 } as const);
 export type SupervisionMcpToolName = typeof SUPERVISION_MCP_TOOLS[keyof typeof SUPERVISION_MCP_TOOLS];
 
@@ -21,6 +23,7 @@ export const SUPERVISION_MCP_TOOL_NAME_LIST: readonly SupervisionMcpToolName[] =
   SUPERVISION_MCP_TOOLS.LIST,
   SUPERVISION_MCP_TOOLS.GET,
   SUPERVISION_MCP_TOOLS.RECOVER,
+  SUPERVISION_MCP_TOOLS.HOUSEKEEPING,
 ]);
 
 /**
@@ -35,6 +38,7 @@ export const SUPERVISION_MCP_REGISTERED_TOOLS: readonly SupervisionMcpToolName[]
   SUPERVISION_MCP_TOOLS.LIST,
   SUPERVISION_MCP_TOOLS.GET,
   SUPERVISION_MCP_TOOLS.RECOVER,
+  SUPERVISION_MCP_TOOLS.HOUSEKEEPING,
 ]);
 
 /**

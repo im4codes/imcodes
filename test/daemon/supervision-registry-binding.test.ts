@@ -132,4 +132,17 @@ describe('supervision registry binding', () => {
       await close();
     }
   });
+
+  it('binds bounded housekeeping to the current real registry rather than a captured handle', () => {
+    seedTaskOwnedByCaller('housekeeping-before-reopen');
+    const port = createSupervisionRegistryPort();
+    expect(port.housekeeping({ mode: 'dryRun', projectName: '__legacy_unscoped__', limit: 1 })).toMatchObject({
+      mode: 'dryRun', scanned: 1, applyAuthorized: false,
+    });
+    resetSupervisionTaskRegistryForTests();
+    seedTaskOwnedByCaller('housekeeping-after-reopen');
+    expect(port.housekeeping({ mode: 'dryRun', projectName: '__legacy_unscoped__', limit: 10 })).toMatchObject({
+      mode: 'dryRun', scanned: expect.any(Number), applyAuthorized: false,
+    });
+  });
 });

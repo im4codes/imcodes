@@ -161,6 +161,10 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
       status: { type: 'string', enum: [...SUPERVISION_TASK_LIFECYCLE_STATUSES] },
       topLevelTaskId: { type: 'string' },
       ownerSessionName: { type: 'string' },
+      includeArchived: { type: 'boolean' },
+      history: { type: 'boolean' },
+      cursor: { type: 'string' },
+      limit: { type: 'integer', minimum: 1, maximum: 100 },
     },
   },
   supervision_task_get: {
@@ -169,18 +173,34 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
   },
   supervision_task_recover: {
     type: 'object', additionalProperties: false,
-    properties: { taskId: { type: 'string' } },
+    properties: {
+      taskId: { type: 'string' },
+      toStatus: { type: 'string', enum: ['recovered', 'blocked', 'cancelled'] },
+      assignmentId: { type: 'string' },
+      rebindSessionName: { type: 'string' },
+      reason: { type: 'string' },
+    },
+  },
+  supervision_task_housekeeping: {
+    type: 'object', additionalProperties: false, required: ['mode'],
+    properties: {
+      mode: { type: 'string', enum: ['dryRun', 'apply'] },
+      cursor: { type: 'string' },
+      limit: { type: 'integer', minimum: 1, maximum: 100 },
+    },
   },
 } as const);
 
 /** Every schema that accepts a status must expose it as a closed enum. */
 export function supervisionSchemaStatusEnums(): string[][] {
   const found: string[][] = [];
-  const visit = (node: unknown): void => {
+  const visit = (node: unknown, key?: string): void => {
     if (!node || typeof node !== 'object') return;
     const record = node as Record<string, unknown>;
-    if (Array.isArray(record.enum)) found.push(record.enum.map(String));
-    for (const value of Object.values(record)) visit(value);
+    if (Array.isArray(record.enum) && ['intent', 'status', 'validationState', 'toStatus'].includes(key ?? '')) {
+      found.push(record.enum.map(String));
+    }
+    for (const [childKey, value] of Object.entries(record)) visit(value, childKey);
   };
   visit(SUPERVISION_MCP_TOOL_SCHEMAS);
   return found;

@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
@@ -19,6 +22,7 @@ import {
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
 
 const CALLER = {
   userId: 'u1', serverId: 's1', projectName: 'codedeck',
@@ -28,19 +32,33 @@ const CALLER = {
 /** Records what the production dispatch actually reached. */
 class FakeRegistry implements SupervisionRegistryPort {
   statuses = new Map<string, string>([['tsk_a', 'planned'], ['tsk_other', 'planned']]);
+  classifications = new Map<string, string>([['tsk_a', 'integration_task'], ['tsk_other', 'integration_task']]);
   /** tsk_a belongs to the caller; tsk_other belongs to someone else. */
   participants = new Map<string, string[]>([
     ['tsk_a', ['deck_cd_brain']],
     ['tsk_other', ['deck_someone_else']],
   ]);
+  assignmentStates = new Map<string, Array<{
+    assignmentId: string; role: string; status: string; leaseId: string; auditAttemptId?: string;
+    identity: { sessionName: string };
+  }>>();
   applied: any[] = [];
   recovered: any[] = [];
+  rebound: any[] = [];
+  housekeepingCalls: any[] = [];
   listCalls: any[] = [];
   item(taskId: string) {
+    const explicit = this.assignmentStates.get(taskId);
     return {
       taskId,
       projectName: 'codedeck',
-      assignments: (this.participants.get(taskId) ?? []).map((sessionName) => ({ identity: { sessionName } })),
+      classification: this.classifications.get(taskId),
+      status: this.statuses.get(taskId),
+      assignments: explicit ?? (this.participants.get(taskId) ?? []).map((sessionName, index) => ({
+        assignmentId: `${taskId}-assignment-${index}`,
+        role: 'implementer', status: this.statuses.get(taskId) ?? 'planned', leaseId: 'lease',
+        identity: { sessionName },
+      })),
     };
   }
   getStatus(taskId: string) { return this.statuses.get(taskId); }
@@ -54,6 +72,14 @@ class FakeRegistry implements SupervisionRegistryPort {
   }
   get(taskId: string) { return this.statuses.has(taskId) ? this.item(taskId) : undefined; }
   recover(input: any) { this.recovered.push(input); this.statuses.set(input.taskId, input.toStatus); }
+  rebindAuditAssignment(input: any) {
+    this.rebound.push(input);
+    return { ok: true as const, value: { assignmentId: input.assignmentId } };
+  }
+  housekeeping(input: any) {
+    this.housekeepingCalls.push(input);
+    return { mode: input.mode, scanned: 2, activeCount: 1, archivedCount: 1, actions: [] };
+  }
 }
 
 let registry: FakeRegistry;
@@ -76,7 +102,7 @@ async function call(name: string, args: Record<string, unknown>) {
 beforeEach(async () => { await connect(); });
 
 describe('production MCP registration', () => {
-  it('publishes ALL FOUR supervision tools on the REAL server surface', async () => {
+  it('publishes every supervision tool on the REAL server surface', async () => {
     const listed = await client.listTools();
     const names = listed.tools.map((t) => t.name);
     for (const tool of SUPERVISION_MCP_REGISTERED_TOOLS) {
@@ -107,7 +133,7 @@ describe('production MCP registration', () => {
     expect(out).toMatchObject({ status: 'ok', intent: 'start', fromStatus: 'planned', toStatus: 'implementing' });
     // Proof it reached the store, not just a schema.
     expect(registry.applied).toEqual([{
-      taskId: 'tsk_a', intent: 'start', toStatus: 'implementing',
+      taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0', intent: 'start', toStatus: 'implementing',
       validationState: undefined, note: undefined,
     }]);
     expect(registry.statuses.get('tsk_a')).toBe('implementing');
@@ -132,7 +158,7 @@ describe('production MCP registration', () => {
     expect(registry.statuses.get('tsk_a')).not.toBe('finalized');
     // Nothing the model sent as `status` reached the store.
     expect(registry.applied).toEqual([{
-      taskId: 'tsk_a', intent: 'start', toStatus: 'implementing',
+      taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0', intent: 'start', toStatus: 'implementing',
       validationState: undefined, note: undefined,
     }]);
   });
@@ -154,6 +180,124 @@ describe('production MCP registration', () => {
     const out = await call(SUPERVISION_MCP_TOOLS.INTENT, { intent: 'open_audit', taskId: 'tsk_a' });
     expect(out).toMatchObject({ status: 'error', reason: 'illegal_transition' });
     expect(registry.applied).toEqual([]);
+  });
+
+  it('refuses integration_slice open_audit at the production MCP handler before registry mutation', async () => {
+    registry.classifications.set('tsk_a', 'integration_slice');
+    registry.statuses.set('tsk_a', 'validated');
+    registry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'slice-worker', role: 'implementer', status: 'validated', leaseId: 'slice-lease',
+      identity: { sessionName: 'deck_cd_brain' },
+    }]);
+    const out = await call(SUPERVISION_MCP_TOOLS.INTENT, {
+      intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'slice-worker',
+    });
+    expect(out).toMatchObject({ status: 'error', reason: 'role_forbidden' });
+    expect(registry.applied).toEqual([]);
+    expect(registry.assignmentStates.get('tsk_a')).toHaveLength(1);
+  });
+
+  it('keeps a historical already-bound slice audit compatible without allowing a new auditor row', async () => {
+    registry.classifications.set('tsk_a', 'integration_slice');
+    registry.statuses.set('tsk_a', 'validated');
+    registry.assignmentStates.set('tsk_a', [
+      {
+        assignmentId: 'slice-worker', role: 'implementer', status: 'validated', leaseId: 'slice-lease',
+        identity: { sessionName: 'deck_cd_brain' },
+      },
+      {
+        assignmentId: 'historical-auditor', role: 'auditor', status: 'auditing', leaseId: 'audit-lease',
+        auditAttemptId: 'historical-attempt', identity: { sessionName: 'deck_historical_auditor' },
+      },
+    ]);
+    const out = await call(SUPERVISION_MCP_TOOLS.INTENT, {
+      intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'slice-worker',
+    });
+    expect(out).toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
+    expect(registry.applied).toHaveLength(1);
+    expect(registry.assignmentStates.get('tsk_a')).toHaveLength(2);
+  });
+});
+
+describe('replacement implementer recovery through the real MCP server', () => {
+  it.each(['start', 'claim'] as const)('advances one leased delegated replacement with %s under an already-implementing aggregate after SQLite reopen', async (intent) => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-replacement-implementer-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'replacement-same-logical-task';
+    const replacementId = 'replacement-implementer';
+    const owner = {
+      sessionName: CALLER.sessionName!, sessionInstanceId: 'replacement-instance', runtimeEpoch: 'replacement-epoch',
+      agentType: 'codex-sdk', providerFamily: 'openai',
+    };
+    try {
+      let actual = new SupervisionTaskRegistry({ dbPath });
+      expect(actual.createOrGet({
+        taskId, projectName: 'codedeck', classification: 'independent_top_level', objective: 'resume same task',
+      }).ok).toBe(true);
+      const old = actual.createAssignment({
+        assignmentId: 'superseded-implementer', taskId, role: 'implementer', identity: owner,
+        scopeFiles: ['src/a.ts'],
+      });
+      const replacement = actual.createAssignment({
+        assignmentId: replacementId, taskId, role: 'implementer', identity: owner,
+        scopeFiles: ['src/a.ts'],
+      });
+      if (!old.ok || !replacement.ok) throw new Error('fixture assignments failed');
+      const replacementLease = replacement.value.leaseId;
+      expect(actual.updateTask({ taskId, status: 'implementing' }).ok).toBe(true);
+      expect(actual.applyTaskIntent({
+        taskId, assignmentId: old.value.assignmentId, intent: 'cancel', toStatus: 'cancelled',
+        note: 'superseded',
+      })).toMatchObject({ ok: true });
+      expect(actual.get(taskId)).toMatchObject({
+        status: 'implementing',
+        assignments: expect.arrayContaining([
+          expect.objectContaining({ assignmentId: old.value.assignmentId, status: 'cancelled', leaseId: '' }),
+          expect.objectContaining({ assignmentId: replacementId, status: 'delegated', leaseId: replacementLease }),
+        ]),
+      });
+      actual.close();
+
+      actual = new SupervisionTaskRegistry({ dbPath });
+      const before = actual.get(taskId)!;
+      const port: SupervisionRegistryPort = {
+        getStatus: (id) => actual.get(id)?.status,
+        applyIntent: (input) => actual.applyTaskIntent(input),
+        finishAssignment: ({ assignmentId, callerSessionName }) => actual.finishAssignment({
+          assignmentId, callerSessionName,
+        }),
+        list: (filter) => actual.list(filter as never) as never,
+        get: (id) => actual.get(id) as never,
+        recover: (input) => actual.recoverTask(input),
+      };
+      const server = createMemoryMcpServer(CALLER, {}, {}, { registry: port, isAdmin: () => true });
+      const mcpClient = new Client({ name: 'replacement-implementer-test', version: '1' });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([server.connect(serverTransport), mcpClient.connect(clientTransport)]);
+      try {
+        const response = await mcpClient.callTool({
+          name: SUPERVISION_MCP_TOOLS.INTENT,
+          arguments: { intent, taskId, assignmentId: replacementId },
+        });
+        expect(response.structuredContent).toMatchObject({
+          status: 'ok', fromStatus: 'delegated', toStatus: 'implementing',
+        });
+      } finally {
+        await mcpClient.close();
+        await server.close();
+      }
+
+      const after = actual.get(taskId)!;
+      expect(after.status).toBe('implementing');
+      expect(after.assignments).toHaveLength(before.assignments.length);
+      expect(after.assignments).toEqual(expect.arrayContaining([
+        expect.objectContaining({ assignmentId: replacementId, status: 'implementing', leaseId: replacementLease }),
+        expect.objectContaining({ assignmentId: old.value.assignmentId, status: 'cancelled', leaseId: '' }),
+      ]));
+      actual.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -184,6 +328,20 @@ describe('list/get visibility guards', () => {
     expect(registry.listCalls.at(-1)).toMatchObject({ projectName: 'codedeck' });
     expect(await brain[SUPERVISION_MCP_TOOLS.GET]({ taskId: 'tsk_other' }))
       .toMatchObject({ status: 'ok', task: { taskId: 'tsk_other', projectName: 'codedeck' } });
+  });
+
+  it('threads explicit history filters without changing the default list surface', async () => {
+    const brain = createSupervisionMcpToolHandlers(CALLER, { registry, isProjectBrain: () => true });
+    const defaultList: any = await brain[SUPERVISION_MCP_TOOLS.LIST]({});
+    expect(defaultList.count).toBe(defaultList.tasks.length);
+    expect(registry.listCalls.at(-1)).not.toHaveProperty('includeArchived');
+    const history: any = await brain[SUPERVISION_MCP_TOOLS.LIST]({ history: true, cursor: 'tsk_0', limit: 25 });
+    expect(history.count).toBe(history.tasks.length);
+    expect(registry.listCalls.at(-1)).toMatchObject({
+      projectName: 'codedeck', history: true, cursor: 'tsk_0', limit: 25,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.LIST]({ history: true, includeArchived: true }))
+      .toMatchObject({ status: 'error', reason: 'validation_failed' });
   });
 
   it('LIST with an explicit target the caller does not participate in returns NOTHING', async () => {
@@ -234,6 +392,43 @@ describe('list/get visibility guards', () => {
 });
 
 describe('administrative recover', () => {
+  it('rebinds an existing auditor only through project-Brain authority and live daemon identity', async () => {
+    const liveIdentity = {
+      sessionName: 'deck_sub_rebound', sessionInstanceId: 'instance-rebound', runtimeEpoch: 'epoch-rebound',
+      agentType: 'codex-sdk', providerFamily: 'openai',
+    };
+    const participant = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      resolveSessionIdentity: () => liveIdentity,
+    });
+    expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'tsk_a', assignmentId: 'auditor-a', rebindSessionName: liveIdentity.sessionName,
+      reason: 'authorized device replacement',
+    })).toMatchObject({ status: 'error', reason: 'forbidden' });
+    expect(registry.rebound).toEqual([]);
+
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === liveIdentity.sessionName ? liveIdentity : undefined,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'tsk_a', assignmentId: 'auditor-a', rebindSessionName: 'missing-runtime',
+      reason: 'must bind observed runtime',
+    })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'tsk_a', assignmentId: 'auditor-a', rebindSessionName: liveIdentity.sessionName,
+      reason: 'authorized device replacement',
+    })).toEqual({
+      status: 'ok', taskId: 'tsk_a', assignmentId: 'auditor-a',
+      rebindSessionName: liveIdentity.sessionName, replay: false,
+    });
+    expect(registry.rebound).toEqual([{
+      taskId: 'tsk_a', assignmentId: 'auditor-a', identity: liveIdentity,
+      reason: 'authorized device replacement',
+    }]);
+  });
+
   it('is authorized, enum-restricted and transition-checked', async () => {
     const out = await call(SUPERVISION_MCP_TOOLS.RECOVER, { taskId: 'tsk_a', toStatus: 'recovered', reason: 'wedged' });
     expect(out).toMatchObject({ status: 'ok', fromStatus: 'planned', toStatus: 'recovered' });
@@ -310,6 +505,26 @@ describe('administrative recover', () => {
   });
 });
 
+describe('bounded housekeeping administration', () => {
+  it('keeps dryRun/apply admin-only and forwards the bounded cursor contract', async () => {
+    const out: any = await call(SUPERVISION_MCP_TOOLS.HOUSEKEEPING, {
+      mode: 'dryRun', cursor: 'tsk_0', limit: 25,
+    });
+    expect(out).toMatchObject({
+      status: 'ok',
+      result: { mode: 'dryRun', scanned: 2, activeCount: 1, archivedCount: 1 },
+    });
+    expect(registry.housekeepingCalls).toEqual([{
+      mode: 'dryRun', projectName: 'codedeck', cursor: 'tsk_0', limit: 25,
+    }]);
+
+    await connect(false);
+    expect(await call(SUPERVISION_MCP_TOOLS.HOUSEKEEPING, { mode: 'apply' }))
+      .toMatchObject({ status: 'error', reason: 'forbidden' });
+    expect(registry.housekeepingCalls).toEqual([]);
+  });
+});
+
 describe('published schema enums match the fixed constants exactly', () => {
   it('derives intent, status, validation and recovery enums from contract constants', async () => {
     const listed = await client.listTools();
@@ -319,6 +534,9 @@ describe('published schema enums match the fixed constants exactly', () => {
     expect(intent.properties.validationState.enum).toEqual([...SUPERVISION_CONSOLE_VALIDATION_STATES]);
     expect(byName.get(SUPERVISION_MCP_TOOLS.RECOVER).properties.toStatus.enum)
       .toEqual([...SUPERVISION_RECOVERY_TARGET_STATUSES]);
+    expect(byName.get(SUPERVISION_MCP_TOOLS.HOUSEKEEPING).properties.mode.enum)
+      .toEqual(['dryRun', 'apply']);
+    expect(byName.get(SUPERVISION_MCP_TOOLS.LIST).properties.limit.maximum).toBe(100);
     // The recovery enum must never include a shipped terminal.
     for (const shipped of ['finalized', 'pushed']) {
       expect(SUPERVISION_RECOVERY_TARGET_STATUSES as readonly string[], shipped).not.toContain(shipped);

@@ -1,4 +1,3 @@
-import { timingSafeEqual } from 'node:crypto';
 import {
   PEER_AUDIT_REPLY_ERRORS,
   PEER_AUDIT_REPLY_VERSION,
@@ -98,7 +97,7 @@ export type PeerAuditReplyIngressResult =
 
 export type PeerAuditReplyInternalReason =
   | 'accepted'
-  | 'capability_rejected'
+  | 'attempt_rejected'
   | 'sender_identity_rejected'
   | 'destination_identity_rejected'
   | 'baseline_rejected'
@@ -169,7 +168,6 @@ export interface PeerAuditReplyAuthorityPipelineInput<T> {
   receivedAt: number;
   authority?: PeerAuditReplyAuthority;
   current: PeerAuditReplyCurrentBindings;
-  capabilityMatches: (providedCapability: string) => boolean;
   onInvalidReply?: (reason: Exclude<PeerAuditReplyInternalReason, 'accepted' | 'deadline_expired' | 'reducer_rejected'>) => void;
   onDeadline: () => void;
   reduce: (reply: PeerAuditAcceptedReply) => PeerAuditReplyReducerDecision<T>;
@@ -183,7 +181,7 @@ export function registerPeerAuditReplyIngressHandler(handler: PeerAuditReplyIngr
   activeHandler = handler;
 }
 
-/** Register the durable `send_message` audit-capability bridge. */
+/** Register the durable `send_message` assignment-bound audit bridge. */
 export function registerDelegatedPeerAuditReplyIngressHandler(
   handler: DelegatedPeerAuditReplyIngressHandler | null,
 ): void {
@@ -207,22 +205,16 @@ export function decodePeerAuditReplyCommandStructure(raw: unknown): PeerAuditPar
   );
 }
 
-/** Constant-time comparison used by controller/reply validation. */
-export function peerAuditCapabilityMatches(expected: string, actual: string): boolean {
-  const expectedBytes = Buffer.from(expected, 'utf8');
-  const actualBytes = Buffer.from(actual, 'utf8');
-  if (expectedBytes.length !== actualBytes.length) return false;
-  return timingSafeEqual(expectedBytes, actualBytes);
-}
-
 export function foldPeerAuditReplyPublicError(reason: Exclude<PeerAuditReplyInternalReason, 'accepted'>): PeerAuditReplyError {
   switch (reason) {
-    case 'capability_rejected':
-      return PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY;
+    case 'attempt_rejected':
+      return PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH;
     case 'sender_identity_rejected':
     case 'destination_identity_rejected':
     case 'baseline_rejected':
+      return PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH;
     case 'revision_rejected':
+      return PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH;
     case 'reducer_rejected':
       return PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH;
     case 'deadline_expired':
@@ -239,7 +231,7 @@ function identityMatches(expected: PeerAuditReplyBoundIdentity, actual: PeerAudi
 }
 
 /**
- * Runs only after raw cap/schema/rate admission. The ordering here is the
+ * Runs only after raw schema/rate admission. The ordering here is the
  * authority boundary: deadline and evidence are invisible until all bindings
  * are valid, and only sanitized data reaches the reducer.
  */
@@ -254,9 +246,8 @@ export function processPeerAuditReplyAuthority<T>(
   };
 
   const authority = input.authority;
-  if (!authority || authority.attemptId !== input.envelope.attemptId
-    || !input.capabilityMatches(input.envelope.replyCapability)) {
-    return reject('capability_rejected');
+  if (!authority || authority.attemptId !== input.envelope.attemptId) {
+    return reject('attempt_rejected');
   }
   if (!identityMatches(authority.sender, input.current.sender)) return reject('sender_identity_rejected');
   if (!identityMatches(authority.destination, input.current.destination)) return reject('destination_identity_rejected');
@@ -278,6 +269,7 @@ export function processPeerAuditReplyAuthority<T>(
   }
   const evidence = validatePeerAuditPassEvidence(input.envelope.verdict, input.envelope.validations);
   if (!evidence.ok) return reject('evidence_rejected');
+  if (!input.envelope.verdict) return reject('evidence_rejected');
 
   const decision = input.reduce({
     attemptId: input.envelope.attemptId,
@@ -333,11 +325,11 @@ export async function submitPeerAuditReply(input: {
     ? await activeHandler(request)
     : { ok: false as const, error: 'ingress_unavailable' as const };
   if (!handled.ok
-    && (handled.error === PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY
+    && (handled.error === PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH
       || handled.error === 'ingress_unavailable')
     && delegatedAuditHandler) {
     const delegated = await delegatedAuditHandler(request);
-    if (delegated.ok || delegated.error !== PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY) {
+    if (delegated.ok || delegated.error !== PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH) {
       return delegated.ok ? { ok: true } : { ok: false, error: delegated.error };
     }
   }

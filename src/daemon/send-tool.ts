@@ -36,7 +36,11 @@ import {
   isDelegationReplyCapableAgentType,
   type AgentDelegationAuditRequest,
 } from '../../shared/agent-delegation.js';
-import { readSupervisionSnapshotFromTransportConfig, type SupervisionTaskMetadata } from '../../shared/supervision-config.js';
+import {
+  isAuditableSupervisionTaskClassification,
+  readSupervisionSnapshotFromTransportConfig,
+  type SupervisionTaskMetadata,
+} from '../../shared/supervision-config.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import {
   evaluateSupervisionExecutionBinding,
@@ -675,6 +679,14 @@ export async function dispatchSendMessage(
     && !Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(input.deliveryMode)) {
     return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'deliveryMode is invalid' };
   }
+  if (input.task?.taskId?.trim()
+    && input.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'an existing task continuation must use deliveryMode=append; queue would fork the logical task',
+    };
+  }
   if (Buffer.byteLength(input.message, 'utf8') > MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES) {
     return { status: 'error', reason: MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED, error: `message exceeds ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} bytes` };
   }
@@ -874,6 +886,7 @@ export async function dispatchSendMessage(
   let supervisedTaskId: string | undefined;
   let supervisedAssignmentId: string | undefined;
   let supervisedExecutionBinding: SupervisionExecutionBinding | undefined;
+  let reusedContinuationAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
 
   if (input.task) {
     const targetRecord = dispatchable[0]!;
@@ -938,12 +951,76 @@ export async function dispatchSendMessage(
           error: 'task is not visible to this caller',
         };
       }
+      if (input.audit && !isAuditableSupervisionTaskClassification(existing.classification)) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: 'integration_slice cannot register an audit; merge validated slices into one integration_task revision first',
+        };
+      }
+      if (!input.audit) {
+        const implementers = existing.assignments.filter((assignment) => assignment.role === 'implementer');
+        if (implementers.length > 0) {
+          const reusableImplementers = implementers.filter((assignment) => (
+            ['delegated', 'implementing', 'retrying_external_ci', 'rework'] as const
+          ).includes(assignment.status as 'delegated' | 'implementing' | 'retrying_external_ci' | 'rework'));
+          if (reusableImplementers.length !== 1) {
+            return {
+              status: 'error',
+              reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+              error: 'task continuation has no unique reusable implementer assignment; use authoritative task_start/recovery for replacement work',
+            };
+          }
+          const continuation = reusableImplementers[0]!;
+          const sameTarget = continuation.identity.sessionName === targetIdentity.sessionName
+            && continuation.identity.sessionInstanceId === targetIdentity.sessionInstanceId
+            && continuation.identity.runtimeEpoch === targetIdentity.runtimeEpoch
+            && continuation.identity.agentType === targetIdentity.agentType
+            && continuation.identity.providerFamily === targetIdentity.providerFamily;
+          if (!sameTarget) {
+            return {
+              status: 'error',
+              reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+              error: 'task continuation must append to the authoritative active implementer assignment',
+            };
+          }
+          const requestedScope = [...new Set([
+            ...(input.task.ownedFiles ?? []),
+            ...(input.task.sharedFiles ?? []),
+          ])].sort();
+          if (requestedScope.length > 0
+            && JSON.stringify(requestedScope) !== JSON.stringify([...continuation.scopeFiles].sort())) {
+            return {
+              status: 'error',
+              reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+              error: 'task continuation cannot replace the existing assignment ownedFiles',
+            };
+          }
+          if (input.task.currentRevision && existing.currentRevision
+            && input.task.currentRevision !== existing.currentRevision) {
+            return {
+              status: 'error',
+              reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+              error: 'task continuation revision does not match the authoritative task revision',
+            };
+          }
+          reusedContinuationAssignment = continuation;
+        }
+      }
       taskId = existing.taskId;
     } else {
+      const classification = input.task.classification ?? 'integration_slice';
+      if (input.audit && !isAuditableSupervisionTaskClassification(classification)) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: 'audit task metadata must classify the combined revision as integration_task or independent_top_level',
+        };
+      }
       const task = registry.createOrGet({
         projectName: callerProjectName,
         topLevelTaskId: input.task.topLevelTaskId,
-        classification: input.task.classification ?? 'integration_slice',
+        classification,
         objective: input.task.objective,
         acceptance: input.task.acceptance,
         baseRevision: input.task.baseRevision,
@@ -977,22 +1054,24 @@ export async function dispatchSendMessage(
         }
       }
     }
-    const assignment = registry.createAssignment({
-      taskId,
-      role: input.audit ? 'auditor' : 'implementer',
-      identity: targetIdentity,
-      scopeFiles: [...(input.task.ownedFiles ?? []), ...(input.task.sharedFiles ?? [])],
-      claimMode: input.audit ? 'read_only' : 'exclusive',
-      auditAttemptId: input.task.auditAttemptId ?? input.audit?.attemptId,
-      auditRevision: input.task.auditRevision ?? input.task.currentRevision,
-      ...(executionBinding ? { executionBinding } : {}),
-      ...(input.task.economyPolicy ? { economyPolicy: input.task.economyPolicy } : {}),
-      ...(auditRoutingReason ? { auditRoutingReason } : {}),
-      ...(auditDegradedReason ? { auditDegradedReason } : {}),
-      ...(provisioning ? { provisioning } : {}),
-      idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
-      now,
-    });
+    const assignment = reusedContinuationAssignment
+      ? { ok: true as const, value: reusedContinuationAssignment, replay: true as const }
+      : registry.createAssignment({
+          taskId,
+          role: input.audit ? 'auditor' : 'implementer',
+          identity: targetIdentity,
+          scopeFiles: [...(input.task.ownedFiles ?? []), ...(input.task.sharedFiles ?? [])],
+          claimMode: input.audit ? 'read_only' : 'exclusive',
+          auditAttemptId: input.task.auditAttemptId ?? input.audit?.attemptId,
+          auditRevision: input.task.auditRevision ?? input.task.currentRevision,
+          ...(executionBinding ? { executionBinding } : {}),
+          ...(input.task.economyPolicy ? { economyPolicy: input.task.economyPolicy } : {}),
+          ...(auditRoutingReason ? { auditRoutingReason } : {}),
+          ...(auditDegradedReason ? { auditDegradedReason } : {}),
+          ...(provisioning ? { provisioning } : {}),
+          idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
+          now,
+      });
     if (!assignment.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: `task registry rejected assignment: ${assignment.reason}` };
 
     supervisedTaskId = taskId;
@@ -1035,6 +1114,8 @@ export async function dispatchSendMessage(
           ...(input.audit && delegatedAuditRevision
             ? { auditRevision: delegatedAuditRevision }
             : {}),
+          ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
+          ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
           now,
         })
       : null;
@@ -1053,7 +1134,7 @@ export async function dispatchSendMessage(
         })
       : '';
     const assignmentMessage = [
-      ...(supervisedExecutionBinding ? [
+      ...(supervisedExecutionBinding && !reusedContinuationAssignment ? [
           '[Daemon-resolved development assignment]',
           `Pool: ${supervisedExecutionBinding.pool}`,
           `Requested config: ${JSON.stringify(supervisedExecutionBinding.requested)}`,

@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
@@ -29,6 +29,7 @@ export interface DelegationReplyBoundIdentity {
 
 export interface DelegationReplyRecord {
   delegationId: string;
+  /** Historical hashes remain readable but are no longer authority. */
   capabilityHash: string;
   origin: DelegationReplyBoundIdentity;
   target: DelegationReplyBoundIdentity;
@@ -39,6 +40,8 @@ export interface DelegationReplyRecord {
   auditAttemptId?: string;
   auditRevision?: string;
   auditedSessionName?: string;
+  taskId?: string;
+  assignmentId?: string;
   status: AgentDelegationReplyStatus;
   result?: string;
   createdAt: number;
@@ -56,12 +59,13 @@ export interface CreateDelegationReplyInput {
   auditAttemptId?: string;
   auditRevision?: string;
   auditedSessionName?: string;
+  taskId?: string;
+  assignmentId?: string;
   now?: number;
 }
 
 export interface CreatedDelegationReply {
   record: DelegationReplyRecord;
-  replyCapability: string;
 }
 
 export type ReceiveDelegationReplyResult =
@@ -78,18 +82,8 @@ function opaqueId(bytes = 24): string {
   return randomBytes(bytes).toString('base64url');
 }
 
-function capabilityHash(capability: string): string {
-  return createHash('sha256').update(capability, 'utf8').digest('base64url');
-}
-
 function resultKey(result: string): string {
   return createHash('sha256').update(result, 'utf8').digest('base64url');
-}
-
-function capabilityMatches(storedHash: string, capability: string): boolean {
-  const expected = Buffer.from(storedHash, 'utf8');
-  const actual = Buffer.from(capabilityHash(capability), 'utf8');
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 function identityMatches(left: DelegationReplyBoundIdentity, right: DelegationReplyBoundIdentity): boolean {
@@ -117,6 +111,8 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
   const auditedSessionName = typeof row.auditedSessionName === 'string' && row.auditedSessionName
     ? row.auditedSessionName
     : undefined;
+  const taskId = typeof row.taskId === 'string' && row.taskId ? row.taskId : undefined;
+  const assignmentId = typeof row.assignmentId === 'string' && row.assignmentId ? row.assignmentId : undefined;
   return {
     delegationId: rowString(row, 'delegationId'),
     capabilityHash: rowString(row, 'capabilityHash'),
@@ -137,6 +133,8 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
     ...(auditAttemptId ? { auditAttemptId } : {}),
     ...(auditRevision ? { auditRevision } : {}),
     ...(auditedSessionName ? { auditedSessionName } : {}),
+    ...(taskId ? { taskId } : {}),
+    ...(assignmentId ? { assignmentId } : {}),
     status: rowString(row, 'status') as AgentDelegationReplyStatus,
     ...(result !== undefined ? { result } : {}),
     createdAt: Number(row.createdAt ?? 0),
@@ -183,6 +181,8 @@ export class DelegationReplyStore {
         audit_attempt_id TEXT,
         audit_revision TEXT,
         audited_session_name TEXT,
+        task_id TEXT,
+        assignment_id TEXT,
         status TEXT NOT NULL,
         result TEXT,
         created_at INTEGER NOT NULL,
@@ -221,6 +221,8 @@ export class DelegationReplyStore {
     if (!names.has('audited_session_name')) {
       this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN audited_session_name TEXT');
     }
+    if (!names.has('task_id')) this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN task_id TEXT');
+    if (!names.has('assignment_id')) this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN assignment_id TEXT');
     // Preserve durable replies created by versions that stored the single
     // message directly on the authority row.
     const legacyRows = this.#db.prepare(`
@@ -262,7 +264,6 @@ export class DelegationReplyStore {
   create(input: CreateDelegationReplyInput): CreatedDelegationReply {
     const now = input.now ?? Date.now();
     const delegationId = opaqueId();
-    const replyCapability = opaqueId(32);
     const notificationId = opaqueId();
     this.#db.prepare(`
       INSERT INTO delegation_replies (
@@ -270,12 +271,12 @@ export class DelegationReplyStore {
         origin_session_name, origin_session_instance_id, origin_runtime_epoch,
         target_session_name, target_session_instance_id, target_runtime_epoch,
         dispatch_id, message_id, notification_id, purpose, audit_attempt_id,
-        audit_revision, audited_session_name, status,
+        audit_revision, audited_session_name, task_id, assignment_id, status,
         created_at, expires_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       delegationId,
-      capabilityHash(replyCapability),
+      '',
       input.origin.sessionName,
       input.origin.sessionInstanceId,
       input.origin.runtimeEpoch,
@@ -289,6 +290,8 @@ export class DelegationReplyStore {
       input.auditAttemptId ?? null,
       input.auditRevision ?? null,
       input.auditedSessionName ?? null,
+      input.taskId ?? null,
+      input.assignmentId ?? null,
       AGENT_DELEGATION_REPLY_STATUSES.PENDING,
       now,
       now + AGENT_DELEGATION_REPLY_TTL_MS,
@@ -296,7 +299,7 @@ export class DelegationReplyStore {
     );
     const record = this.get(delegationId);
     if (!record) throw new Error('delegation reply authority insert failed');
-    return { record, replyCapability };
+    return { record };
   }
 
   get(delegationId: string): DelegationReplyRecord | undefined {
@@ -317,6 +320,8 @@ export class DelegationReplyStore {
         audit_attempt_id AS auditAttemptId,
         audit_revision AS auditRevision,
         audited_session_name AS auditedSessionName,
+        task_id AS taskId,
+        assignment_id AS assignmentId,
         status,
         result,
         created_at AS createdAt,
@@ -346,6 +351,8 @@ export class DelegationReplyStore {
         authority.audit_attempt_id AS auditAttemptId,
         authority.audit_revision AS auditRevision,
         authority.audited_session_name AS auditedSessionName,
+        authority.task_id AS taskId,
+        authority.assignment_id AS assignmentId,
         message.status,
         message.result,
         authority.created_at AS createdAt,
@@ -357,6 +364,32 @@ export class DelegationReplyStore {
       WHERE message.delegation_id = ? AND message.notification_id = ?
     `).get(delegationId, notificationId) as Record<string, unknown> | undefined;
     return row ? parseRow(row) : undefined;
+  }
+
+  /** Apply only after the registry has recorded an explicit Brain-authorized rebind. */
+  rebindAssignmentTarget(input: {
+    delegationId: string;
+    taskId: string;
+    assignmentId: string;
+    target: DelegationReplyBoundIdentity;
+    now?: number;
+  }): DelegationReplyRecord | undefined {
+    const current = this.get(input.delegationId);
+    if (!current || current.taskId !== input.taskId || current.assignmentId !== input.assignmentId) return undefined;
+    this.#db.prepare(`
+      UPDATE delegation_replies
+      SET target_session_name = ?, target_session_instance_id = ?, target_runtime_epoch = ?, updated_at = ?
+      WHERE delegation_id = ? AND task_id = ? AND assignment_id = ?
+    `).run(
+      input.target.sessionName,
+      input.target.sessionInstanceId,
+      input.target.runtimeEpoch,
+      input.now ?? Date.now(),
+      input.delegationId,
+      input.taskId,
+      input.assignmentId,
+    );
+    return this.get(input.delegationId);
   }
 
   #getMessageByResultKey(delegationId: string, key: string): DelegationReplyRecord | undefined {
@@ -372,15 +405,13 @@ export class DelegationReplyStore {
 
   matchPendingAuthority(input: {
     delegationId: string;
-    replyCapability: string;
     now?: number;
   }): DelegationReplyRecord | undefined {
     const current = this.get(input.delegationId);
     const now = input.now ?? Date.now();
     if (!current
       || current.status !== AGENT_DELEGATION_REPLY_STATUSES.PENDING
-      || now >= current.expiresAt
-      || !capabilityMatches(current.capabilityHash, input.replyCapability)) return undefined;
+      || now >= current.expiresAt) return undefined;
     return current;
   }
 
@@ -388,13 +419,12 @@ export class DelegationReplyStore {
    * Resolve the reply authority minted by `send_message({ audit: ... })`.
    *
    * Manual supervision audits intentionally expose `peer_audit_reply`, not
-   * `delegation_reply`, but their capability is stored in this durable table.
-   * Binding by attempt + exact target identity + capability keeps that bridge
-   * fail closed without turning the attempt id into an existence oracle.
+   * `delegation_reply`. This durable dispatch row is discovery only; the
+   * registry's attempt/revision/assignment/current-session identity is the
+   * fail-closed authority and survives daemon restart.
    */
   matchPendingAuditAuthority(input: {
     auditAttemptId: string;
-    replyCapability: string;
     sender: DelegationReplyBoundIdentity;
     now?: number;
   }): DelegationReplyRecord | undefined {
@@ -407,24 +437,23 @@ export class DelegationReplyStore {
       input.auditAttemptId,
     ) as Array<{ delegationId?: unknown }>;
     if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') return undefined;
-    const current = this.matchPendingAuthority({
-      delegationId: rows[0].delegationId,
-      replyCapability: input.replyCapability,
-      now: input.now,
-    });
+    const current = this.get(rows[0].delegationId);
+    const now = input.now ?? Date.now();
     return current
       && current.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
       && current.auditAttemptId === input.auditAttemptId
-      && identityMatches(current.target, input.sender)
+      && (Boolean(current.taskId && current.assignmentId)
+        || (current.status !== AGENT_DELEGATION_REPLY_STATUSES.EXPIRED && now < current.expiresAt))
       ? current
       : undefined;
   }
 
   receive(input: {
     delegationId: string;
-    replyCapability: string;
     result: string;
     sender: DelegationReplyBoundIdentity;
+    /** Current registry identity after an explicit assignment recovery/rebind. */
+    authorizedSender?: DelegationReplyBoundIdentity;
     now?: number;
   }): ReceiveDelegationReplyResult {
     const now = input.now ?? Date.now();
@@ -435,15 +464,13 @@ export class DelegationReplyStore {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'not_found' };
       }
-      if (!capabilityMatches(current.capabilityHash, input.replyCapability)) {
-        this.#db.exec('ROLLBACK');
-        return { ok: false, reason: 'capability' };
-      }
-      if (!identityMatches(current.target, input.sender)) {
+      const expectedSender = input.authorizedSender ?? current.target;
+      if (!identityMatches(expectedSender, input.sender)) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'identity' };
       }
-      if (current.status === AGENT_DELEGATION_REPLY_STATUSES.EXPIRED || now >= current.expiresAt) {
+      if (!(current.taskId && current.assignmentId)
+        && (current.status === AGENT_DELEGATION_REPLY_STATUSES.EXPIRED || now >= current.expiresAt)) {
         this.#db.prepare(`
           UPDATE delegation_replies SET status = ?, updated_at = ? WHERE delegation_id = ?
         `).run(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED, now, input.delegationId);
@@ -459,10 +486,6 @@ export class DelegationReplyStore {
       const messageCount = Number((this.#db.prepare(`
         SELECT COUNT(*) AS count FROM delegation_reply_messages WHERE delegation_id = ?
       `).get(input.delegationId) as { count?: unknown } | undefined)?.count ?? 0);
-      if (current.purpose && messageCount > 0) {
-        this.#db.exec('ROLLBACK');
-        return { ok: false, reason: 'already_replied' };
-      }
       if (messageCount >= AGENT_DELEGATION_REPLY_MAX_MESSAGES) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'limit' };
@@ -569,6 +592,10 @@ export class DelegationReplyStore {
         message.notification_id AS notificationId,
         authority.purpose,
         authority.audit_attempt_id AS auditAttemptId,
+        authority.audit_revision AS auditRevision,
+        authority.audited_session_name AS auditedSessionName,
+        authority.task_id AS taskId,
+        authority.assignment_id AS assignmentId,
         message.status,
         message.result,
         authority.created_at AS createdAt,

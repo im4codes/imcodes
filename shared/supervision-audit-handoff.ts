@@ -20,6 +20,7 @@
  */
 import {
   isSupervisionTaskLifecycleStatus,
+  type SupervisionTaskClassification,
   type SupervisionTaskLifecycleStatus,
 } from './supervision-config.js';
 import { PEER_AUDIT_VERDICTS, type PeerAuditVerdict } from './peer-audit.js';
@@ -63,6 +64,8 @@ export interface SupervisionAuditReceipt {
 
 export interface SupervisionHandoffContext {
   currentStatus: SupervisionTaskLifecycleStatus;
+  /** Classification of the audited revision when known. */
+  classification?: SupervisionTaskClassification;
   /** The attempt this task is actually waiting on. */
   expectedAttemptId: string;
   /** The revision currently frozen for audit. */
@@ -188,7 +191,13 @@ export function decideSupervisionAuditHandoff(input: {
   }
 
   if (receipt.verdict === 'REWORK') {
-    const developmentOwner = context.developmentOwner?.trim();
+    // Once slices have been merged, REWORK belongs to the combined revision
+    // and its integration owner. Returning findings to an original slice owner
+    // would mutate bytes outside the audited composition and fragment the next
+    // audit round. Historical/non-integration receipts keep their old owner.
+    const developmentOwner = context.classification === 'integration_task'
+      ? context.declaredIntegrationOwner?.trim() || context.parentIntegrationOwner?.trim()
+      : context.developmentOwner?.trim();
     if (!developmentOwner) {
       return {
         action: 'hold',

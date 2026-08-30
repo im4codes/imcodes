@@ -199,46 +199,40 @@ describe('agent delegation shared contract', () => {
     expect(isAgentDelegationControlInstructionText(instruction)).toBe(true);
   });
 
-  it('builds and validates a reusable bounded structured delegation reply authority', () => {
+  it('builds and validates a reusable tokenless structured delegation reply authority', () => {
     const delegationId = 'delegation_identity_1234567890';
-    const replyCapability = 'reply_capability_1234567890_ABCDEFG';
     const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {
       delegationId,
-      replyCapability,
     });
     expect(instruction).toContain(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER);
     expect(instruction).toContain('delegation_reply');
     expect(instruction).toContain(delegationId);
-    expect(instruction).toContain(replyCapability);
-    expect(instruction).toContain('multiple structured replies until it expires');
+    expect(instruction).not.toContain('replyCapability');
+    expect(instruction).toContain('multiple append-only replies');
     expect(instruction).not.toContain('send your response using: imcodes send');
     expect(stripAgentDelegationControlInstructions(`task\n${instruction}`)).toBe('task');
     expect(extractAgentDelegationReplyAuthorityFromInstruction(instruction)).toEqual({
       delegationId,
-      replyCapability,
     });
     expect(extractAgentDelegationReplyAuthorityFromInstruction(
-      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} {"delegationId":"${delegationId}","replyCapability":"${replyCapability}","forged":true}`,
+      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} {"delegationId":"${delegationId}","forged":true}`,
     )).toBeUndefined();
 
     expect(decodeAgentDelegationReplyEnvelope({
       version: AGENT_DELEGATION_REPLY_VERSION,
       delegationId,
-      replyCapability,
       result: 'PASS with evidence',
     })).toEqual({
       ok: true,
       value: {
         version: AGENT_DELEGATION_REPLY_VERSION,
         delegationId,
-        replyCapability,
         result: 'PASS with evidence',
       },
     });
     expect(decodeAgentDelegationReplyEnvelope({
       version: AGENT_DELEGATION_REPLY_VERSION,
       delegationId,
-      replyCapability,
       result: 'ok',
       forged: true,
     })).toEqual({ ok: false, error: 'unknown_field' });
@@ -262,24 +256,27 @@ describe('agent delegation shared contract', () => {
 
   it('renders supervision-audit reply authorities as peer_audit_reply instructions, not free-text delegation replies', () => {
     const delegationId = 'delegation_identity_1234567890';
-    const replyCapability = 'reply_capability_1234567890_ABCDEFG';
     const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {
       delegationId,
-      replyCapability,
       audit: {
         kind: 'supervision_audit',
         attemptId: 'attempt-r5',
         auditedSessionName: 'deck_sub_implementation',
+        taskId: 'supervision_task_exact',
+        assignmentId: 'supervision_assignment_exact',
+        revision: 'revision-r5',
       },
     });
     expect(instruction).toContain(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER);
     expect(instruction).toContain('peer_audit_reply');
     expect(instruction).toContain('"attemptId": "attempt-r5"');
-    expect(instruction).toContain('"replyCapability":');
+    expect(instruction).not.toContain('replyCapability');
+    expect(instruction).toContain('"taskId": "supervision_task_exact"');
+    expect(instruction).toContain('"assignmentId": "supervision_assignment_exact"');
+    expect(instruction).toContain('"revision": "revision-r5"');
     expect(instruction).not.toContain('Use the delegation_reply tool');
     expect(extractAgentDelegationReplyAuthorityFromInstruction(instruction)).toEqual({
       delegationId,
-      replyCapability,
     });
   });
 
