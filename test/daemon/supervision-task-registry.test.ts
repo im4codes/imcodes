@@ -39,6 +39,9 @@ function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
     list: (filter: never) => registry().list(filter) as never,
     get: (taskId: string) => registry().get(taskId) as never,
     recover: (input: Parameters<SupervisionTaskRegistry['recoverTask']>[0]) => registry().recoverTask(input),
+    coordinateTaskAssignment: (input: Parameters<SupervisionTaskRegistry['coordinateTaskAssignment']>[0]) => (
+      registry().coordinateTaskAssignment(input)
+    ),
   };
 }
 
@@ -674,6 +677,292 @@ describe('SupervisionTaskRegistry', () => {
     } finally {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('lets Brain atomically repair a misprojected REWORK owner and preserves audit history across restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-brain-coordination-recovery-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'brain-coordination-recovery';
+    const revision = 'brain-coordination-r1';
+    const attemptId = 'brain-coordination-audit-r1';
+    const coordinatorIdentity = identity('deck_brain_coordination_brain');
+    const implementerIdentity = identity('deck_brain_coordination_worker');
+    const reboundIdentity = {
+      ...implementerIdentity,
+      sessionInstanceId: 'instance-deck_brain_coordination_worker-restarted',
+      runtimeEpoch: 'epoch-deck_brain_coordination_worker-restarted',
+    };
+    const auditorIdentity = identity('deck_brain_coordination_auditor', 'claude-code-sdk');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'repair a wedged coordination projection', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const coordinator = registry.createAssignment({
+        assignmentId: `${taskId}-coordinator`, taskId, role: 'coordinator', identity: coordinatorIdentity,
+        scopeFiles: ['src/brain.ts'],
+      });
+      const implementer = registry.createAssignment({
+        assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: implementerIdentity,
+        scopeFiles: ['src/one.ts'], auditAttemptId: attemptId, auditRevision: revision,
+      });
+      const auditor = registry.createAssignment({
+        assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', identity: auditorIdentity,
+        required: false, auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!coordinator.ok || !implementer.ok || !auditor.ok) throw new Error('coordination fixture creation failed');
+
+      for (const status of ['implementing', 'validated'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
+          revision, auditAttemptId: attemptId, auditRevision: revision,
+        })).toMatchObject({ ok: true });
+      }
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'validated' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'ready_for_audit' })).toMatchObject({ ok: true });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'REWORK', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'mapper provenance missing', validations: [], now: 80,
+      })).toMatchObject({ ok: true, value: { verdict: 'REWORK' } });
+      for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'rework'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: coordinator.value.assignmentId, identity: coordinatorIdentity, status,
+        }), status).toMatchObject({ ok: true });
+      }
+      expect(registry.getTaskRecord(taskId)).toMatchObject({ status: 'ready_for_audit', currentRevision: revision });
+      expect(registry.getAssignment(coordinator.value.assignmentId)).toMatchObject({ status: 'rework' });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'validated', auditAttemptId: attemptId, auditRevision: revision,
+      });
+
+      const request = {
+        taskId, assignmentId: implementer.value.assignmentId,
+        taskStatus: 'rework' as const, assignmentStatus: 'rework' as const,
+        scopeFiles: ['src/one.ts', 'src/two.ts'], clearLease: true,
+        identity: reboundIdentity,
+        idempotencyKey: 'brain-repair-rework-owner-r1',
+        reason: 'move REWORK from coordinator to the original implementer', now: 100,
+      };
+      const receiptsBefore = registry.listAuditReceipts(taskId);
+      const assignmentCount = registry.listAssignments(taskId).length;
+      const eventCount = registry.listEvents(taskId).length;
+      const splitBefore = registry.get(taskId);
+      expect(registry.coordinateTaskAssignment({
+        ...request,
+        taskStatus: undefined,
+        idempotencyKey: 'brain-repair-split-task-projection-refused',
+        reason: 'scope expansion must reset task and assignment atomically',
+        now: 90,
+      })).toEqual({ ok: false, reason: 'invalid_transition' });
+      expect(registry.get(taskId)).toEqual(splitBefore);
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+      expect(registry.coordinateTaskAssignment(request)).toMatchObject({
+        ok: true, value: { status: 'rework', currentRevision: revision },
+      });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        identity: reboundIdentity, status: 'rework', scopeFiles: ['src/one.ts', 'src/two.ts'],
+        leaseId: '', generation: 2, blocker: request.reason,
+      });
+      expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('auditAttemptId');
+      expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('auditRevision');
+      expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('verdict');
+      expect(registry.getAssignment(coordinator.value.assignmentId)).toMatchObject({
+        status: 'rework', identity: coordinatorIdentity,
+      });
+      expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
+        status: 'auditing', auditAttemptId: attemptId, auditRevision: revision, verdict: 'REWORK',
+      });
+      expect(registry.listAssignments(taskId)).toHaveLength(assignmentCount);
+      expect(registry.listAuditReceipts(taskId)).toEqual(receiptsBefore);
+      expect(registry.listEvents(taskId).slice(eventCount)).toEqual([
+        expect.objectContaining({
+          assignmentId: implementer.value.assignmentId, eventType: 'recovered', status: 'rework',
+          payload: expect.objectContaining({
+            source: 'brain_coordination_override', idempotencyKey: request.idempotencyKey,
+            priorTaskStatus: 'ready_for_audit', priorAssignmentStatus: 'validated',
+            preservedRevision: revision, identity: reboundIdentity, priorIdentity: implementerIdentity,
+          }),
+        }),
+        expect.objectContaining({
+          eventType: 'recovered', status: 'rework',
+          payload: expect.objectContaining({ assignmentId: implementer.value.assignmentId }),
+        }),
+      ]);
+      expect(registry.listEvents(taskId).slice(eventCount)[1]).not.toHaveProperty('assignmentId');
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const persisted = registry.get(taskId);
+      const persistedEventCount = registry.listEvents(taskId).length;
+      expect(registry.coordinateTaskAssignment({ ...request, now: 200 })).toMatchObject({
+        ok: true, replay: true, value: { status: 'rework', currentRevision: revision },
+      });
+      expect(registry.get(taskId)).toEqual(persisted);
+      expect(registry.listEvents(taskId)).toHaveLength(persistedEventCount);
+      expect(registry.listAuditReceipts(taskId)).toEqual(receiptsBefore);
+
+      const beforeConflict = registry.get(taskId);
+      expect(registry.coordinateTaskAssignment({
+        ...request, identity: undefined, now: 250,
+      })).toEqual({ ok: false, reason: 'conflicting_replay' });
+      expect(registry.coordinateTaskAssignment({
+        ...request, reason: 'different operation with reused key', now: 300,
+      })).toEqual({ ok: false, reason: 'conflicting_replay' });
+      expect(registry.get(taskId)).toEqual(beforeConflict);
+      expect(registry.listEvents(taskId)).toHaveLength(persistedEventCount);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps Brain coordination recovery fail-closed for auditors, success targets, and concrete finalization evidence', () => {
+    const registry = makeRegistry();
+    const taskId = 'brain-coordination-refusals';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'prove recovery refusal is side-effect free', currentRevision: 'r1',
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
+      identity: identity('deck_coordination_refusal_worker'), scopeFiles: ['src/one.ts'],
+    });
+    const auditor = registry.createAssignment({
+      assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', required: false,
+      identity: identity('deck_coordination_refusal_auditor'),
+      auditAttemptId: 'attempt-r1', auditRevision: 'r1',
+    });
+    if (!implementer.ok || !auditor.ok) throw new Error('coordination refusal fixture failed');
+    const assertNoMutation = (operation: () => unknown, expected: unknown) => {
+      const before = registry.get(taskId);
+      const events = registry.listEvents(taskId).length;
+      expect(operation()).toEqual(expected);
+      expect(registry.get(taskId)).toEqual(before);
+      expect(registry.listEvents(taskId)).toHaveLength(events);
+    };
+    assertNoMutation(() => registry.coordinateTaskAssignment({
+      taskId, assignmentId: auditor.value.assignmentId, assignmentStatus: 'rework',
+      idempotencyKey: 'auditor-status-refused', reason: 'must not rewrite an auditor',
+    }), { ok: false, reason: 'role_forbidden' });
+    assertNoMutation(() => registry.coordinateTaskAssignment({
+      taskId, assignmentId: implementer.value.assignmentId,
+      assignmentStatus: 'passed' as never,
+      idempotencyKey: 'success-target-refused', reason: 'must not invent PASS',
+    }), { ok: false, reason: 'invalid' });
+
+    expect(registry.updateTask({ taskId, commitSha: 'a'.repeat(40) })).toMatchObject({ ok: true });
+    const closed = registry.get(taskId);
+    const closedEvents = registry.listEvents(taskId).length;
+    expect(registry.coordinateTaskAssignment({
+      taskId, assignmentId: implementer.value.assignmentId,
+      taskStatus: 'rework', assignmentStatus: 'rework',
+      idempotencyKey: 'finalization-evidence-refused', reason: 'must preserve commit evidence',
+    })).toEqual({ ok: false, reason: 'receipt_closed' });
+    expect(registry.get(taskId)).toEqual(closed);
+    expect(registry.listEvents(taskId)).toHaveLength(closedEvents);
+    registry.close();
+  });
+
+  it('never lets a scope-only recovery make unaudited files inherit an existing matching PASS', () => {
+    const registry = makeRegistry();
+    const taskId = 'brain-coordination-scope-after-pass';
+    const revision = 'scope-after-pass-r1';
+    const attemptId = 'scope-after-pass-audit-r1';
+    const workerIdentity = identity('deck_scope_after_pass_worker');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'keep audited scope exact', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: workerIdentity,
+      scopeFiles: ['src/audited.ts'], auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!worker.ok) throw new Error('scope-after-PASS fixture creation failed');
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: worker.value.assignmentId, identity: workerIdentity, status,
+        revision, auditAttemptId: attemptId, auditRevision: revision,
+      }), status).toMatchObject({ ok: true });
+    }
+    expect(registry.updateAssignment({
+      assignmentId: worker.value.assignmentId, identity: workerIdentity,
+      status: 'passed', revision, auditAttemptId: attemptId, auditRevision: revision,
+      verdict: 'PASS', primaryReviewPassed: true, crossVendorAuditPassed: true,
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: worker.value.assignmentId, identity: workerIdentity,
+      status: 'ready_for_integration', revision, auditAttemptId: attemptId, auditRevision: revision,
+      verdict: 'PASS', primaryReviewPassed: true, crossVendorAuditPassed: true,
+    })).toMatchObject({ ok: true });
+
+    const before = registry.get(taskId);
+    const eventCount = registry.listEvents(taskId).length;
+    expect(registry.coordinateTaskAssignment({
+      taskId, assignmentId: worker.value.assignmentId,
+      scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+      idempotencyKey: 'scope-only-after-pass-refused',
+      reason: 'must not let a new file inherit PASS',
+    })).toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(registry.get(taskId)).toEqual(before);
+    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+
+    expect(registry.coordinateTaskAssignment({
+      taskId, assignmentId: worker.value.assignmentId,
+      taskStatus: 'rework', assignmentStatus: 'rework',
+      scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+      idempotencyKey: 'scope-after-pass-requires-rework',
+      reason: 'invalidate old audit before expanding scope',
+    })).toMatchObject({ ok: true, value: { status: 'rework' } });
+    expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({
+      status: 'rework', scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+    });
+    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('auditAttemptId');
+    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('auditRevision');
+    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('verdict');
+    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('primaryReviewPassed');
+    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('crossVendorAuditPassed');
+    registry.close();
+  });
+
+  it('never lets scope-only recovery inherit validation or pre-PASS audit provenance', () => {
+    for (const status of ['validated', 'ready_for_audit', 'auditing'] as const) {
+      const registry = makeRegistry();
+      const taskId = `brain-coordination-scope-${status}`;
+      const revision = `scope-${status}-r1`;
+      const attemptId = `scope-${status}-audit-r1`;
+      const workerIdentity = identity(`deck_scope_${status}_worker`);
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'keep validation and audit provenance bound to exact scope', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const worker = registry.createAssignment({
+        assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: workerIdentity,
+        scopeFiles: ['src/audited.ts'], auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!worker.ok) throw new Error('pre-PASS scope fixture creation failed');
+      const path = ['implementing', 'validated', 'ready_for_audit', 'auditing'] as const;
+      for (const nextStatus of path.slice(0, path.indexOf(status) + 1)) {
+        expect(registry.updateAssignment({
+          assignmentId: worker.value.assignmentId, identity: workerIdentity, status: nextStatus,
+          revision, auditAttemptId: attemptId, auditRevision: revision,
+        }), `${status}:${nextStatus}`).toMatchObject({ ok: true });
+      }
+
+      const before = registry.get(taskId);
+      const eventCount = registry.listEvents(taskId).length;
+      expect(registry.coordinateTaskAssignment({
+        taskId, assignmentId: worker.value.assignmentId,
+        scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+        idempotencyKey: `scope-only-${status}-refused`,
+        reason: 'must invalidate old validation and audit provenance before expanding scope',
+      }), status).toEqual({ ok: false, reason: 'invalid_transition' });
+      expect(registry.get(taskId)).toEqual(before);
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+      registry.close();
     }
   });
 

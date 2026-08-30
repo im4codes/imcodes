@@ -12,6 +12,7 @@ import {
   isSupervisionTaskLifecycleStatus,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
+  SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import {
@@ -189,6 +190,11 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
       toStatus: { type: 'string', enum: [...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES] },
       assignmentId: { type: 'string' },
       rebindSessionName: { type: 'string' },
+      taskStatus: { type: 'string', enum: [...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES] },
+      assignmentStatus: { type: 'string', enum: [...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES] },
+      scopeFiles: { type: 'array', minItems: 1, items: { type: 'string' } },
+      clearLease: { type: 'boolean' },
+      idempotencyKey: { type: 'string' },
       reason: { type: 'string' },
     },
   },

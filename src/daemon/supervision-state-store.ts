@@ -15,7 +15,9 @@ import {
   SUPERVISION_TASK_CLEANUP_VERSION,
   SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE,
   SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
+  SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
   type SupervisionTaskArchiveReason,
+  type SupervisionBrainCoordinationRecoveryStatus,
   type SessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
 import type { SupervisionAuditDepth } from './supervision-broker.js';
@@ -2325,6 +2327,172 @@ export class SupervisionTaskRegistry {
       this.#writeTask(reboundTask, 'recovered', { ...payload, assignmentId });
       this.#db.exec('COMMIT');
       return { ok: true, value: reboundTask };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Authoritative project-Brain repair for a wedged coordination shape.
+   *
+   * This deliberately bypasses the ordinary forward-only transition table,
+   * but only into non-success recovery states. Audit receipts and historical
+   * events remain append-only; PASS/finalization/Git evidence can never be
+   * manufactured through this path.
+   */
+  coordinateTaskAssignment(input: {
+    taskId: string;
+    assignmentId: string;
+    taskStatus?: SupervisionBrainCoordinationRecoveryStatus;
+    assignmentStatus?: SupervisionBrainCoordinationRecoveryStatus;
+    scopeFiles?: readonly string[];
+    clearLease?: boolean;
+    identity?: PersistedSupervisionTaskAssignmentIdentity;
+    idempotencyKey: string;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const idempotencyKey = normalizeTaskString(input.idempotencyKey);
+    const reason = normalizeTaskString(input.reason);
+    const taskStatus = input.taskStatus;
+    const assignmentStatus = input.assignmentStatus;
+    const scopeFiles = input.scopeFiles === undefined ? undefined : normalizeTaskArray(input.scopeFiles);
+    const allowedStatuses = SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES as readonly string[];
+    const validIdentity = input.identity === undefined || [
+      input.identity.sessionName,
+      input.identity.sessionInstanceId,
+      input.identity.runtimeEpoch,
+      input.identity.agentType,
+      input.identity.providerFamily,
+    ].every((value) => Boolean(normalizeTaskString(value)));
+    if (!taskId || !assignmentId || !idempotencyKey || !reason
+      || (!taskStatus && !assignmentStatus && scopeFiles === undefined
+        && input.clearLease !== true && input.identity === undefined)
+      || (taskStatus !== undefined && !allowedStatuses.includes(taskStatus))
+      || (assignmentStatus !== undefined && !allowedStatuses.includes(assignmentStatus))
+      || !validIdentity
+      || (scopeFiles !== undefined && (scopeFiles.length === 0
+        || scopeFiles.length !== input.scopeFiles?.length
+        || !scopeFiles.every(validRepoPath)))) {
+      return { ok: false, reason: 'invalid' };
+    }
+
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(taskId);
+      const assignment = this.getAssignment(assignmentId);
+      if (!task || !assignment || assignment.taskId !== taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'receipt_closed' };
+      }
+      if (assignment.role === 'auditor' && (assignmentStatus !== undefined || scopeFiles !== undefined)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'role_forbidden' };
+      }
+      const claims = this.listFileClaims(taskId);
+      if (scopeFiles && claims.some((claim) => (
+        claim.assignmentId === assignmentId && !scopeFiles.includes(claim.path)
+      ))) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'manifest_mismatch' };
+      }
+
+      const nextAssignmentStatus = assignmentStatus ?? assignment.status;
+      const resetsAudit = nextAssignmentStatus === 'implementing' || nextAssignmentStatus === 'rework';
+      const resetsTaskAudit = taskStatus === 'implementing' || taskStatus === 'rework';
+      const scopeChanged = scopeFiles !== undefined && !sameStringArray(scopeFiles, assignment.scopeFiles);
+      const hasValidationOrAuditProvenance = Boolean(
+        assignment.auditAttemptId
+        || assignment.auditRevision
+        || assignment.verdict
+        || assignment.primaryReviewPassed === true
+        || assignment.crossVendorAuditPassed === true,
+      ) || [
+        'validated', 'ready_for_audit', 'auditing', 'passed',
+        'ready_for_integration', 'integrating', 'final_audit', 'finalizing',
+      ].includes(assignment.status);
+      if (scopeChanged && hasValidationOrAuditProvenance && (!resetsAudit || !resetsTaskAudit)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+
+      const priorEvents = this.listEvents(taskId).filter((event) => (
+        event.eventType === 'recovered'
+        && event.payload?.source === 'brain_coordination_override'
+        && event.payload?.idempotencyKey === idempotencyKey
+      ));
+      const exactReplay = priorEvents.find((event) => (
+        event.assignmentId === assignmentId
+        && event.payload?.requestedTaskStatus === (taskStatus ?? null)
+        && event.payload?.requestedAssignmentStatus === (assignmentStatus ?? null)
+        && event.payload?.requestedClearLease === (input.clearLease === true)
+        && event.payload?.reason === reason
+        && JSON.stringify(event.payload?.requestedIdentity ?? null) === JSON.stringify(input.identity ?? null)
+        && JSON.stringify(event.payload?.requestedScopeFiles ?? null) === JSON.stringify(scopeFiles ?? null)
+      ));
+      if (priorEvents.length > 0) {
+        this.#db.exec('ROLLBACK');
+        return exactReplay
+          ? { ok: true, value: task, replay: true }
+          : { ok: false, reason: 'conflicting_replay' };
+      }
+
+      const nextAssignment: PersistedSupervisionTaskAssignment = {
+        ...assignment,
+        identity: input.identity ?? assignment.identity,
+        status: nextAssignmentStatus,
+        scopeFiles: scopeFiles ?? assignment.scopeFiles,
+        leaseId: input.clearLease === true ? '' : assignment.leaseId,
+        generation: assignment.generation + 1,
+        ...(resetsAudit ? {
+          auditAttemptId: undefined,
+          auditRevision: undefined,
+          verdict: undefined,
+          primaryReviewPassed: undefined,
+          crossVendorAuditPassed: undefined,
+          auditRoutingReason: undefined,
+          auditDegradedReason: undefined,
+        } : {}),
+        blocker: reason,
+        updatedAt: now,
+      };
+      const nextTask: PersistedSupervisionTaskRecord = {
+        ...task,
+        status: taskStatus ?? task.status,
+        blocker: reason,
+        updatedAt: now,
+      };
+      const payload = {
+        source: 'brain_coordination_override',
+        idempotencyKey,
+        reason,
+        requestedTaskStatus: taskStatus ?? null,
+        requestedAssignmentStatus: assignmentStatus ?? null,
+        requestedScopeFiles: scopeFiles ?? null,
+        requestedClearLease: input.clearLease === true,
+        requestedIdentity: input.identity ?? null,
+        taskStatus: nextTask.status,
+        assignmentStatus: nextAssignment.status,
+        scopeFiles: nextAssignment.scopeFiles,
+        clearLease: input.clearLease === true,
+        ...(input.identity ? { identity: input.identity, priorIdentity: assignment.identity } : {}),
+        priorTaskStatus: task.status,
+        priorAssignmentStatus: assignment.status,
+        priorScopeFiles: assignment.scopeFiles,
+        preservedRevision: task.currentRevision,
+      };
+      this.#writeAssignment(nextAssignment, 'recovered', payload);
+      this.#writeTask(nextTask, 'recovered', { ...payload, assignmentId });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: nextTask };
     } catch (error) {
       this.#db.exec('ROLLBACK');
       throw error;

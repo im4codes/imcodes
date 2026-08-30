@@ -320,6 +320,19 @@ export type SupervisionTaskLifecycleStatus = typeof SUPERVISION_TASK_LIFECYCLE_S
 export const SUPERVISION_TASK_FINALIZATION_STATES = SUPERVISION_TASK_LIFECYCLE_STATUSES;
 export type SupervisionTaskFinalizationState = SupervisionTaskLifecycleStatus;
 
+/**
+ * Recovery-only states the authoritative project Brain may force when the
+ * ordinary transition machine is wedged. These are deliberately non-success
+ * states: coordination recovery can get work moving again, but cannot invent
+ * validation, audit PASS, a commit, a push, or finalization evidence.
+ */
+export const SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES = [
+  'delegated', 'implementing', 'retrying_external_ci', 'rework',
+  'blocked', 'recovered', 'cancelled',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[];
+export type SupervisionBrainCoordinationRecoveryStatus =
+  typeof SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES[number];
+
 /** Bump only alongside a schema migration that maps every prior status forward. */
 export const SUPERVISION_TASK_STATUS_CONTRACT_VERSION = 1;
 

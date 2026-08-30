@@ -68,6 +68,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     },
     rebindAuditAssignment: (input) => getSupervisionTaskRegistry().rebindAuditAssignment(input),
     rebindTaskAssignmentRevision: (input) => getSupervisionTaskRegistry().rebindTaskAssignmentRevision(input),
+    coordinateTaskAssignment: (input) => getSupervisionTaskRegistry().coordinateTaskAssignment(input),
     housekeeping: (input) => getSupervisionTaskRegistry().reconcileHousekeeping(input),
   };
 }
@@ -86,14 +87,18 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
       }, sessions);
     },
     resolveSessionIdentity: (sessionName) => {
-      const session = listSessions().find((candidate) => candidate.name === sessionName);
+      const sessions = listSessions();
+      const session = sessions.find((candidate) => candidate.name === sessionName);
       if (!session?.sessionInstanceId || !session.runtimeEpoch) return undefined;
+      const projectName = resolveEffectiveProjectName(session, sessions);
+      if (!projectName) return undefined;
       return {
         sessionName: session.name,
         sessionInstanceId: session.sessionInstanceId,
         runtimeEpoch: session.runtimeEpoch,
         agentType: session.agentType,
         providerFamily: resolvePeerAuditProviderFamily(session),
+        projectName,
       };
     },
     worktreeGc: async (input) => runSupervisionWorktreeGc(input, {

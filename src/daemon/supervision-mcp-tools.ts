@@ -24,9 +24,11 @@ import {
 } from './supervision-intent-ops.js';
 import {
   SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
+  SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   isSupervisionTaskLifecycleStatus,
   type SupervisionTaskRecoveryTargetStatus,
+  type SupervisionBrainCoordinationRecoveryStatus,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
@@ -148,6 +150,20 @@ export interface SupervisionRegistryPort {
     evidenceManifestSha256: string;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
+  coordinateTaskAssignment?(input: {
+    taskId: string;
+    assignmentId: string;
+    taskStatus?: SupervisionBrainCoordinationRecoveryStatus;
+    assignmentStatus?: SupervisionBrainCoordinationRecoveryStatus;
+    scopeFiles?: string[];
+    clearLease?: boolean;
+    identity?: {
+      sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
+      agentType: string; providerFamily: string;
+    };
+    idempotencyKey: string;
+    reason: string;
+  }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   housekeeping(input: { mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number }): unknown;
 }
 
@@ -160,7 +176,7 @@ export interface SupervisionMcpToolDeps {
   isProjectBrain?: (caller: McpRuntimeCaller) => boolean;
   resolveSessionIdentity?: (sessionName: string) => {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
-    agentType: string; providerFamily: string;
+    agentType: string; providerFamily: string; projectName: string;
   } | undefined;
   /** Physical worktree cleanup shares the already-authorized housekeeping ingress. */
   worktreeGc?: (input: {
@@ -211,6 +227,11 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     toRevision: z.string().min(1).optional(),
     ownedFiles: z.array(z.string().min(1)).min(1).optional(),
     evidenceManifestSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    taskStatus: z.enum([...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES]).optional(),
+    assignmentStatus: z.enum([...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES]).optional(),
+    scopeFiles: z.array(z.string().min(1)).min(1).optional(),
+    clearLease: z.boolean().optional(),
+    idempotencyKey: z.string().min(1).max(200).optional(),
     reason: z.string().min(1).max(2000),
   },
   [SUPERVISION_MCP_TOOLS.HOUSEKEEPING]: {
@@ -311,11 +332,14 @@ export function createSupervisionMcpToolHandlers(
         // delegated replacement assignment still owns its own delegated ->
         // implementing edge; feeding the aggregate status into the pure state
         // machine incorrectly made both start and claim unreachable.
-        currentStatus: (intent === 'start' || intent === 'claim')
-          && task?.status === 'implementing'
-          && boundAssignment?.status === 'delegated'
-          && Boolean(boundAssignment.leaseId)
-          ? 'delegated'
+        // Assignment-scoped intents must be resolved against the assignment,
+        // not the aggregate task.  A legitimate REWORK receipt can leave the
+        // owner at `rework` while an older daemon still projects the task as
+        // `ready_for_audit`; consulting the aggregate made both validation and
+        // the subsequent audit handoff unreachable.  Task-only cancel remains
+        // task-scoped because intentAssignmentId is deliberately absent above.
+        currentStatus: intent !== 'cancel' && intentAssignmentId && boundAssignment
+          ? boundAssignment.status
           : reg.getStatus(taskId),
       });
       if (!outcome.ok) return err(outcome.refusal ?? 'refused', outcome.detail);
@@ -430,8 +454,64 @@ export function createSupervisionMcpToolHandlers(
         ? input.ownedFiles.map((path) => String(path))
         : [];
       const evidenceManifestSha256 = String(input.evidenceManifestSha256 ?? '').trim();
+      const taskStatus = String(input.taskStatus ?? '').trim();
+      const assignmentStatus = String(input.assignmentStatus ?? '').trim();
+      const scopeFiles = Array.isArray(input.scopeFiles)
+        ? input.scopeFiles.map((path) => String(path))
+        : [];
+      const clearLease = input.clearLease === true;
+      const idempotencyKey = String(input.idempotencyKey ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
+      const coordinationOverrideRequested = Boolean(
+        taskStatus || assignmentStatus || scopeFiles.length > 0 || clearLease || idempotencyKey,
+      );
+      if (coordinationOverrideRequested) {
+        if (!assignmentId || !reason || !idempotencyKey
+          || (!taskStatus && !assignmentStatus && scopeFiles.length === 0 && !clearLease && !rebindSessionName)
+          || fromRevision || toRevision || ownedFiles.length > 0
+          || evidenceManifestSha256 || input.toStatus !== undefined) {
+          return err('validation_failed', 'coordination override requires assignmentId, idempotencyKey, reason, and at least one taskStatus/assignmentStatus/scopeFiles/clearLease/rebindSessionName field only');
+        }
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        const authorized = isAdmin(caller) || Boolean(
+          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
+        );
+        if (!task || !authorized) {
+          return err('forbidden', 'coordination override requires the authoritative project Brain or administrator');
+        }
+        const identity = rebindSessionName
+          ? deps.resolveSessionIdentity?.(rebindSessionName)
+          : undefined;
+        if (rebindSessionName && !identity) {
+          return err('identity_rejected', 'coordination identity target has no live daemon-observed identity');
+        }
+        if (identity && identity.projectName !== taskProjectName) {
+          return err('forbidden', 'coordination identity target must belong to the task project');
+        }
+        const reboundIdentity = identity ? {
+          sessionName: identity.sessionName,
+          sessionInstanceId: identity.sessionInstanceId,
+          runtimeEpoch: identity.runtimeEpoch,
+          agentType: identity.agentType,
+          providerFamily: identity.providerFamily,
+        } : undefined;
+        const coordinated = reg.coordinateTaskAssignment?.({
+          taskId,
+          assignmentId,
+          ...(taskStatus ? { taskStatus: taskStatus as SupervisionBrainCoordinationRecoveryStatus } : {}),
+          ...(assignmentStatus ? { assignmentStatus: assignmentStatus as SupervisionBrainCoordinationRecoveryStatus } : {}),
+          ...(scopeFiles.length > 0 ? { scopeFiles } : {}),
+          ...(clearLease ? { clearLease: true } : {}),
+          ...(reboundIdentity ? { identity: reboundIdentity } : {}),
+          idempotencyKey,
+          reason,
+        });
+        if (!coordinated) return err('unavailable', 'coordination override is not bound');
+        if (!coordinated.ok) return err(coordinated.reason, `coordination override rejected: ${coordinated.reason}`);
+        return ok({ taskId, assignmentId, replay: coordinated.replay === true });
+      }
       const revisionRecoveryRequested = Boolean(
         fromRevision || toRevision || ownedFiles.length > 0 || evidenceManifestSha256,
       );
@@ -466,7 +546,21 @@ export function createSupervisionMcpToolHandlers(
         }
         const identity = deps.resolveSessionIdentity?.(rebindSessionName);
         if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
-        const rebound = reg.rebindAuditAssignment?.({ taskId, assignmentId, identity, reason });
+        if (identity.projectName !== taskProjectName) {
+          return err('forbidden', 'audit identity target must belong to the task project');
+        }
+        const rebound = reg.rebindAuditAssignment?.({
+          taskId,
+          assignmentId,
+          identity: {
+            sessionName: identity.sessionName,
+            sessionInstanceId: identity.sessionInstanceId,
+            runtimeEpoch: identity.runtimeEpoch,
+            agentType: identity.agentType,
+            providerFamily: identity.providerFamily,
+          },
+          reason,
+        });
         if (!rebound) return err('unavailable', 'audit identity rebind is not bound');
         if (!rebound.ok) return err(rebound.reason, `audit identity rebind rejected: ${rebound.reason}`);
         return ok({ taskId, assignmentId, rebindSessionName, replay: rebound.replay === true });
