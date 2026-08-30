@@ -1737,12 +1737,26 @@ export class SupervisionTaskRegistry {
       if (receipts.length > 0 && !latestFinal) return { ok: false, reason: 'invalid_transition' };
       authenticatedAuditVerdict = verdict;
       if (receipts.length > 0) {
-        const exact = assignments.filter((assignment) => assignment.role !== 'auditor'
+        const exact = assignments.filter((assignment) => assignment.role === 'implementer'
           && assignment.auditAttemptId === existing.auditAttemptId
           && assignment.auditRevision === existing.auditRevision);
-        const candidates = exact.length > 0 ? exact : assignments.filter((assignment) => (
-          assignment.role !== 'auditor'
+        const pendingImplementers = assignments.filter((assignment) => (
+          assignment.role === 'implementer'
           && AUDIT_RECEIPT_PENDING_TARGET_STATUSES.has(assignment.status)
+        ));
+        if (exact.length === 0) {
+          const boundFallbacks = pendingImplementers.filter((assignment) => (
+            assignment.auditAttemptId !== undefined || assignment.auditRevision !== undefined
+          ));
+          if (boundFallbacks.some((assignment) => assignment.auditAttemptId !== existing.auditAttemptId)) {
+            return { ok: false, reason: 'old_audit_attempt' };
+          }
+          if (boundFallbacks.some((assignment) => assignment.auditRevision !== existing.auditRevision)) {
+            return { ok: false, reason: 'old_revision' };
+          }
+        }
+        const candidates = exact.length > 0 ? exact : pendingImplementers.filter((assignment) => (
+          assignment.auditAttemptId === undefined && assignment.auditRevision === undefined
         ));
         if (candidates.length !== 1) return { ok: false, reason: 'ambiguous_assignment' };
         authenticatedAuditTarget = candidates[0];

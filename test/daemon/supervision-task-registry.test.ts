@@ -862,6 +862,176 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('finishes a receipted auditor against the unique implementer without treating the coordinator as an audit target', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-audit-finish-target-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'audit-finish-production-shape';
+    const revision = 'audit-finish-r1';
+    const attemptId = 'audit-finish-attempt-1';
+    const coordinatorIdentity = identity('deck_audit_finish_brain');
+    const implementerIdentity = identity('deck_audit_finish_worker');
+    const auditorIdentity = identity('deck_audit_finish_auditor');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'finish exact audited implementer', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const coordinator = registry.createAssignment({
+        assignmentId: 'audit-finish-coordinator', taskId, role: 'coordinator', identity: coordinatorIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      const implementer = registry.createAssignment({
+        assignmentId: 'audit-finish-implementer', taskId, role: 'implementer', identity: implementerIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      const auditor = registry.createAssignment({
+        assignmentId: 'audit-finish-auditor', taskId, role: 'auditor', identity: auditorIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!coordinator.ok || !implementer.ok || !auditor.ok) throw new Error('expected production assignments');
+      for (const status of ['implementing', 'validated'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
+        })).toMatchObject({ ok: true });
+      }
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'REWORK', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'production-shaped correction', validations: [], now: 100,
+      })).toMatchObject({ ok: true, value: { sequence: 1, verdict: 'REWORK' } });
+
+      const coordinatorBefore = registry.getAssignment(coordinator.value.assignmentId);
+      const assignmentCount = registry.get(taskId)?.assignments.length;
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision, now: 110,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'rework', verdict: 'REWORK', blocker: 'production-shaped correction',
+      });
+      expect(registry.getAssignment(coordinator.value.assignmentId)).toEqual(coordinatorBefore);
+      expect(registry.get(taskId)?.assignments).toHaveLength(assignmentCount!);
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const beforeReplay = registry.get(taskId);
+      const eventCount = registry.listEvents(taskId).length;
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision, now: 120,
+      })).toMatchObject({ ok: true, replay: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.get(taskId)).toEqual(beforeReplay);
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed without mutation when a receipt has multiple true implementer targets', () => {
+    const registry = makeRegistry();
+    const taskId = 'audit-finish-ambiguous-implementers';
+    const revision = 'audit-finish-ambiguous-r1';
+    const attemptId = 'audit-finish-ambiguous-attempt';
+    const auditorIdentity = identity('deck_audit_finish_ambiguous_auditor');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'preserve multiple implementer ambiguity', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId: 'audit-finish-ambiguous-coordinator', taskId, role: 'coordinator',
+      identity: identity('deck_audit_finish_ambiguous_brain'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    for (const [index, sessionName] of ['deck_audit_finish_worker_a', 'deck_audit_finish_worker_b'].entries()) {
+      const owner = identity(sessionName);
+      const implementer = registry.createAssignment({
+        assignmentId: `audit-finish-ambiguous-implementer-${index}`, taskId, role: 'implementer', identity: owner,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!implementer.ok) throw new Error(implementer.reason);
+      for (const status of ['implementing', 'validated'] as const) {
+        expect(registry.updateAssignment({ assignmentId: implementer.value.assignmentId, identity: owner, status }))
+          .toMatchObject({ ok: true });
+      }
+    }
+    const auditor = registry.createAssignment({
+      assignmentId: 'audit-finish-ambiguous-auditor', taskId, role: 'auditor', identity: auditorIdentity,
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+      receiptKind: 'final', verdict: 'REWORK', auditorSessionName: auditorIdentity.sessionName,
+      auditorIdentity, findings: 'must remain ambiguous', validations: [], now: 100,
+    })).toMatchObject({ ok: true });
+    const before = registry.get(taskId);
+    const eventCount = registry.listEvents(taskId).length;
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision, now: 110,
+    })).toEqual({ ok: false, reason: 'ambiguous_assignment' });
+    expect(registry.get(taskId)).toEqual(before);
+    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+    registry.close();
+  });
+
+  it.each([
+    {
+      label: 'attempt mismatch',
+      implementerAttemptId: 'different-attempt',
+      implementerRevision: 'audit-finish-mismatch-r1',
+      reason: 'old_audit_attempt',
+    },
+    {
+      label: 'revision mismatch',
+      implementerAttemptId: 'audit-finish-mismatch-attempt',
+      implementerRevision: 'different-revision',
+      reason: 'old_revision',
+    },
+  ] as const)('fails closed without mutation on a pending implementer $label', ({
+    label, implementerAttemptId, implementerRevision, reason,
+  }) => {
+    const registry = makeRegistry();
+    const suffix = label.replace(' ', '-');
+    const taskId = `audit-finish-${suffix}`;
+    const revision = 'audit-finish-mismatch-r1';
+    const attemptId = 'audit-finish-mismatch-attempt';
+    const implementerIdentity = identity(`deck_audit_finish_${suffix}_worker`);
+    const auditorIdentity = identity(`deck_audit_finish_${suffix}_auditor`);
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: `fail closed on ${label}`, currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: implementerIdentity,
+      auditAttemptId: implementerAttemptId, auditRevision: implementerRevision,
+    });
+    const auditor = registry.createAssignment({
+      assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', identity: auditorIdentity,
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!implementer.ok || !auditor.ok) throw new Error('expected mismatch assignments');
+    for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
+      })).toMatchObject({ ok: true });
+    }
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+      receiptKind: 'final', verdict: 'REWORK', auditorSessionName: auditorIdentity.sessionName,
+      auditorIdentity, findings: `must reject ${label}`, validations: [], now: 100,
+    })).toMatchObject({ ok: true });
+    const beforeTask = registry.get(taskId);
+    const beforeEvents = registry.listEvents(taskId);
+    const beforeReceipts = registry.listAuditReceipts(taskId);
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision, now: 110,
+    })).toEqual({ ok: false, reason });
+    expect(registry.get(taskId)).toEqual(beforeTask);
+    expect(registry.listEvents(taskId)).toEqual(beforeEvents);
+    expect(registry.listAuditReceipts(taskId)).toEqual(beforeReceipts);
+    registry.close();
+  });
+
   it('hands off a validated integration slice without registering or consuming an audit', () => {
     const registry = makeRegistry();
     const taskId = 'validated-slice-no-audit';
