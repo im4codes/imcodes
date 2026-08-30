@@ -243,6 +243,69 @@ function prepareStructuredFinalizationShape(
   };
 }
 
+function rewritePersistedAssignment(
+  database: InstanceType<typeof DatabaseSync>,
+  assignment: ReturnType<SupervisionTaskRegistry['getAssignment']> & {},
+): void {
+  database.prepare(`
+    UPDATE supervision_task_assignments SET
+      role = ?, status = ?, session_name = ?, session_instance_id = ?, runtime_epoch = ?,
+      agent_type = ?, provider_family = ?, lease_id = ?, generation = ?, audit_attempt_id = ?,
+      audit_revision = ?, verdict = ?, blocker = ?, payload_json = ?, updated_at = ?
+    WHERE assignment_id = ?
+  `).run(
+    assignment.role, assignment.status, assignment.identity.sessionName,
+    assignment.identity.sessionInstanceId, assignment.identity.runtimeEpoch,
+    assignment.identity.agentType, assignment.identity.providerFamily,
+    assignment.leaseId, assignment.generation, assignment.auditAttemptId ?? null,
+    assignment.auditRevision ?? null, assignment.verdict ?? null, assignment.blocker ?? null,
+    JSON.stringify(assignment), assignment.updatedAt, assignment.assignmentId,
+  );
+}
+
+function prepareFinalizedAuditAuthorityReplayGap(
+  registry: SupervisionTaskRegistry,
+  database: InstanceType<typeof DatabaseSync>,
+  taskId: string,
+  options: { receiptVerdict?: 'PASS' | 'REWORK'; omitReceipt?: boolean } = {},
+) {
+  const shape = prepareStructuredFinalizationShape(registry, taskId, { leaveAuditorUnfinalized: true });
+  const receiptVerdict = options.receiptVerdict ?? 'PASS';
+  if (!options.omitReceipt) {
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: shape.auditor.assignmentId,
+      attemptId: shape.attemptId, revision: shape.revision,
+      receiptKind: 'final', verdict: receiptVerdict,
+      auditorSessionName: shape.auditor.identity.sessionName,
+      auditorIdentity: shape.auditor.identity,
+      findings: `immutable ${receiptVerdict} receipt`,
+      validations: [{ kind: 'test', label: 'frozen', outcome: 'passed', summary: 'frozen evidence passed' }],
+      now: 100,
+    })).toMatchObject({ ok: true, value: { verdict: receiptVerdict } });
+  }
+
+  const auditor = registry.getAssignment(shape.auditor.assignmentId)!;
+  rewritePersistedAssignment(database, {
+    ...auditor,
+    status: 'finalized',
+    leaseId: '',
+    verdict: receiptVerdict,
+    updatedAt: 110,
+  });
+  const implementer = registry.getAssignment(shape.implementer.assignmentId)!;
+  const historicalImplementer = { ...implementer, updatedAt: 110 };
+  delete historicalImplementer.auditAttemptId;
+  delete historicalImplementer.crossVendorAuditPassed;
+  rewritePersistedAssignment(database, historicalImplementer);
+  expect(registry.getAssignment(shape.auditor.assignmentId)).toMatchObject({ status: 'finalized', leaseId: '' });
+  expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+    status: 'ready_for_integration', auditRevision: shape.revision, verdict: 'PASS',
+  });
+  expect(registry.getAssignment(shape.implementer.assignmentId)?.auditAttemptId).toBeUndefined();
+  expect(registry.getAssignment(shape.implementer.assignmentId)?.crossVendorAuditPassed).toBeUndefined();
+  return shape;
+}
+
 function prepareStaleRuntimeIntegrationOwnerShape(
   registry: SupervisionTaskRegistry,
   taskId: string,
@@ -1588,6 +1651,180 @@ describe('SupervisionTaskRegistry', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it.each(['auditor', 'project Brain'] as const)(
+    'repairs finalized-auditor PASS authority through exact %s replay and is idempotent after reopen',
+    (caller) => {
+      const dir = mkdtempSync(join(tmpdir(), 'imcodes-finalized-audit-authority-replay-'));
+      const dbPath = join(dir, 'supervision-state.sqlite');
+      const taskId = `finalized-audit-authority-${caller.replace(' ', '-')}`;
+      try {
+        let database = new DatabaseSync(dbPath);
+        let registry = new SupervisionTaskRegistry({ database });
+        const shape = prepareFinalizedAuditAuthorityReplayGap(registry, database, taskId);
+        const assignmentCount = registry.get(taskId)?.assignments.length;
+        const receiptsBefore = registry.listAuditReceipts(taskId);
+        const eventsBefore = registry.listEvents(taskId);
+
+        const repair = caller === 'auditor'
+          ? registry.finishAssignment({
+            assignmentId: shape.auditor.assignmentId,
+            identity: shape.auditor.identity,
+            revision: shape.revision,
+            now: 120,
+          })
+          : registry.finishAssignmentAsProjectBrain({
+            assignmentId: shape.auditor.assignmentId,
+            callerProjectName: 'alpha',
+            now: 120,
+          });
+        expect(repair).toMatchObject({
+          ok: true, replay: true, value: { status: 'finalized', leaseId: '' },
+        });
+        expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+          status: 'ready_for_integration',
+          auditAttemptId: shape.attemptId,
+          auditRevision: shape.revision,
+          verdict: 'PASS',
+          crossVendorAuditPassed: true,
+        });
+        expect(registry.get(taskId)?.assignments).toHaveLength(assignmentCount!);
+        expect(registry.listAuditReceipts(taskId)).toEqual(receiptsBefore);
+        const repairEvents = registry.listEvents(taskId).slice(eventsBefore.length);
+        expect(repairEvents).toEqual([
+          expect.objectContaining({
+            assignmentId: shape.implementer.assignmentId,
+            eventType: 'recovered',
+            status: 'ready_for_integration',
+            payload: expect.objectContaining({
+              source: 'finalized_auditor_replay_audit_authority',
+              auditorAssignmentId: shape.auditor.assignmentId,
+              auditAttemptId: shape.attemptId,
+              auditRevision: shape.revision,
+              verdict: 'PASS',
+            }),
+          }),
+        ]);
+        const snapshotAfterRepair = registry.get(taskId);
+        const eventsAfterRepair = registry.listEvents(taskId);
+        registry.close();
+        database.close();
+
+        database = new DatabaseSync(dbPath);
+        registry = new SupervisionTaskRegistry({ database });
+        const replay = caller === 'auditor'
+          ? registry.finishAssignment({
+            assignmentId: shape.auditor.assignmentId,
+            identity: shape.auditor.identity,
+            revision: shape.revision,
+            now: 130,
+          })
+          : registry.finishAssignmentAsProjectBrain({
+            assignmentId: shape.auditor.assignmentId,
+            callerProjectName: 'alpha',
+            now: 130,
+          });
+        expect(replay).toMatchObject({ ok: true, replay: true });
+        expect(registry.get(taskId)).toEqual(snapshotAfterRepair);
+        expect(registry.listEvents(taskId)).toEqual(eventsAfterRepair);
+        expect(registry.listAuditReceipts(taskId)).toEqual(receiptsBefore);
+
+        if (caller === 'auditor') {
+          expect(registry.finalizeIntegration({
+            ...shape.finalization,
+            identity: shape.owner.identity,
+            now: 140,
+          })).toMatchObject({
+            ok: true,
+            value: { status: 'finalized', finalization: { auditAttemptId: shape.attemptId } },
+          });
+        }
+        registry.close();
+        database.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    { label: 'missing final receipt', mutate: 'missing-receipt', reason: 'old_audit_attempt' },
+    { label: 'REWORK receipt', mutate: 'rework-receipt', reason: 'old_audit_attempt' },
+    { label: 'stale attempt', mutate: 'stale-attempt', reason: 'old_audit_attempt' },
+    { label: 'stale revision', mutate: 'stale-revision', reason: 'old_revision' },
+    { label: 'stale verdict', mutate: 'stale-verdict', reason: 'old_audit_attempt' },
+    { label: 'self audit', mutate: 'self-audit', reason: 'owner_mismatch' },
+    { label: 'multiple candidates', mutate: 'ambiguous', reason: 'ambiguous_assignment' },
+    { label: 'active implementer lease', mutate: 'active-lease', reason: 'invalid_transition' },
+    { label: 'active implementer claim', mutate: 'active-claim', reason: 'invalid_transition' },
+    { label: 'closed Git evidence', mutate: 'closed', reason: 'receipt_closed' },
+    { label: 'closed integration-owner state', mutate: 'closed-owner', reason: 'receipt_closed' },
+  ] as const)('refuses finalized-auditor authority repair for $label with zero mutation', ({ mutate, reason }) => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = `finalized-audit-authority-refusal-${mutate}`;
+    const shape = prepareFinalizedAuditAuthorityReplayGap(registry, database, taskId, {
+      ...(mutate === 'missing-receipt' ? { omitReceipt: true } : {}),
+      ...(mutate === 'rework-receipt' ? { receiptVerdict: 'REWORK' as const } : {}),
+    });
+    const implementer = registry.getAssignment(shape.implementer.assignmentId)!;
+    if (mutate === 'stale-attempt') {
+      rewritePersistedAssignment(database, { ...implementer, auditAttemptId: 'stale-attempt' });
+    } else if (mutate === 'stale-revision') {
+      rewritePersistedAssignment(database, { ...implementer, auditRevision: 'stale-revision' });
+    } else if (mutate === 'stale-verdict') {
+      rewritePersistedAssignment(database, { ...implementer, verdict: 'REWORK' });
+    } else if (mutate === 'self-audit') {
+      rewritePersistedAssignment(database, { ...implementer, identity: shape.auditor.identity });
+    } else if (mutate === 'ambiguous') {
+      const second = registry.createAssignment({
+        assignmentId: `${taskId}-second-implementer`, taskId, role: 'implementer',
+        identity: identity(`${taskId}-second-worker`), auditRevision: shape.revision,
+      });
+      if (!second.ok) throw new Error(second.reason);
+      rewritePersistedAssignment(database, {
+        ...second.value,
+        status: 'ready_for_integration',
+        verdict: 'PASS',
+        updatedAt: 111,
+      });
+    } else if (mutate === 'active-lease') {
+      rewritePersistedAssignment(database, {
+        ...implementer,
+        leaseId: 'supervision_lease_still_writing',
+        updatedAt: 111,
+      });
+    } else if (mutate === 'active-claim') {
+      database.prepare(`
+        INSERT INTO supervision_task_file_claims
+          (task_id, assignment_id, file_path, claim_mode, created_at)
+        VALUES (?, ?, ?, 'exclusive', ?)
+      `).run(taskId, implementer.assignmentId, shape.files[0], 111);
+    } else if (mutate === 'closed') {
+      expect(registry.updateTask({ taskId, commitSha: 'b'.repeat(40), now: 111 })).toMatchObject({ ok: true });
+    } else if (mutate === 'closed-owner') {
+      rewritePersistedAssignment(database, {
+        ...registry.getAssignment(shape.owner.assignmentId)!,
+        status: 'committed',
+        updatedAt: 111,
+      });
+    }
+
+    const before = registry.get(taskId);
+    const eventsBefore = registry.listEvents(taskId);
+    const receiptsBefore = registry.listAuditReceipts(taskId);
+    expect(registry.finishAssignment({
+      assignmentId: shape.auditor.assignmentId,
+      identity: shape.auditor.identity,
+      revision: shape.revision,
+      now: 120,
+    })).toEqual({ ok: false, reason });
+    expect(registry.get(taskId)).toEqual(before);
+    expect(registry.listEvents(taskId)).toEqual(eventsBefore);
+    expect(registry.listAuditReceipts(taskId)).toEqual(receiptsBefore);
+    registry.close();
+    database.close();
   });
 
   it('finishes a receipted auditor against the sole revision-only pending implementer without targeting the coordinator', () => {

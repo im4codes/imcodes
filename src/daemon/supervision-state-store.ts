@@ -690,6 +690,91 @@ const AUDIT_RECEIPT_PENDING_TARGET_STATUSES = new Set<SupervisionTaskLifecycleSt
   'rework',
 ]);
 
+type FinalizedAuditAuthorityReplayPlan =
+  | { kind: 'noop' }
+  | { kind: 'repair'; target: PersistedSupervisionTaskAssignment; receipt: PersistedSupervisionAuditReceipt }
+  | { kind: 'reject'; reason: 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'old_audit_attempt' | 'ambiguous_assignment' | 'receipt_closed' };
+
+/**
+ * Recognise the one historical shape left by daemons that finalized an exact
+ * PASS auditor before copying the immutable receipt authority to the selected
+ * implementer. This is deliberately not a general audit-target selector: a
+ * repair is possible only for one required, still-open implementer whose
+ * ready-for-integration projection already carries the exact PASS revision.
+ */
+function planFinalizedAuditAuthorityReplay(input: {
+  task: PersistedSupervisionTaskRecord;
+  auditor: PersistedSupervisionTaskAssignment;
+  assignments: readonly PersistedSupervisionTaskAssignment[];
+  receipts: readonly PersistedSupervisionAuditReceipt[];
+  claimedAssignmentIds: ReadonlySet<string>;
+}): FinalizedAuditAuthorityReplayPlan {
+  const { task, auditor, assignments, receipts, claimedAssignmentIds } = input;
+  const attemptId = normalizeTaskString(auditor.auditAttemptId);
+  const revision = normalizeTaskString(auditor.auditRevision);
+  const activeImplementers = assignments.filter((assignment) => (
+    assignment.role === 'implementer'
+    && assignment.required
+    && !['cancelled', 'recovered', 'finalized'].includes(assignment.status)
+  ));
+  const alreadyBound = activeImplementers.length === 1
+    && activeImplementers[0].status === 'ready_for_integration'
+    && activeImplementers[0].auditAttemptId === attemptId
+    && activeImplementers[0].auditRevision === revision
+    && activeImplementers[0].verdict?.trim().toUpperCase() === 'PASS'
+    && activeImplementers[0].crossVendorAuditPassed === true;
+  if (alreadyBound || activeImplementers.length === 0) return { kind: 'noop' };
+
+  const hasAuthorityGap = activeImplementers.some((assignment) => (
+    assignment.status === 'ready_for_integration'
+    && (assignment.auditAttemptId !== attemptId
+      || assignment.auditRevision !== revision
+      || assignment.verdict?.trim().toUpperCase() !== 'PASS'
+      || assignment.crossVendorAuditPassed !== true)
+  ));
+  if (!hasAuthorityGap) return { kind: 'noop' };
+  if (activeImplementers.length !== 1) return { kind: 'reject', reason: 'ambiguous_assignment' };
+  if (activeImplementers[0].leaseId
+    || claimedAssignmentIds.has(activeImplementers[0].assignmentId)) {
+    return { kind: 'reject', reason: 'invalid_transition' };
+  }
+
+  const target = activeImplementers[0];
+  const integrationHasClosedState = assignments.some((assignment) => (
+    assignment.role === 'integration_owner'
+    && ['integrating', 'final_audit', 'finalizing', 'committed', 'pushed', 'finalized'].includes(assignment.status)
+  ));
+  if (task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt
+    || task.status !== 'ready_for_integration' || integrationHasClosedState) {
+    return { kind: 'reject', reason: 'receipt_closed' };
+  }
+  if (!attemptId) return { kind: 'reject', reason: 'old_audit_attempt' };
+  if (!revision || task.currentRevision !== revision || target.auditRevision !== revision) {
+    return { kind: 'reject', reason: 'old_revision' };
+  }
+  if (target.status !== 'ready_for_integration') return { kind: 'reject', reason: 'invalid_transition' };
+  if (target.identity.sessionName === auditor.identity.sessionName) {
+    return { kind: 'reject', reason: 'owner_mismatch' };
+  }
+  if (target.auditAttemptId !== undefined
+    || target.verdict?.trim().toUpperCase() !== 'PASS'
+    || target.crossVendorAuditPassed !== undefined) {
+    return { kind: 'reject', reason: 'old_audit_attempt' };
+  }
+
+  const latestFinal = receipts.filter((receipt) => (
+    receipt.assignmentId === auditor.assignmentId
+    && receipt.attemptId === attemptId
+    && receipt.revision === revision
+    && receipt.receiptKind === 'final'
+  )).at(-1);
+  if (!latestFinal || latestFinal.verdict !== 'PASS'
+    || auditor.verdict?.trim().toUpperCase() !== 'PASS') {
+    return { kind: 'reject', reason: 'old_audit_attempt' };
+  }
+  return { kind: 'repair', target, receipt: latestFinal };
+}
+
 function isExactAuditReceiptTarget(
   assignment: PersistedSupervisionTaskAssignment,
   attemptId: string,
@@ -1146,6 +1231,17 @@ export class SupervisionTaskRegistry {
   listFileClaims(taskId: string): PersistedSupervisionTaskFileClaim[] {
     void taskId;
     return [];
+  }
+
+  /** Legacy claim rows stay hidden from the public evidence projection, but a
+   * finalized-auditor repair must still treat them as active write authority. */
+  #claimedAssignmentIds(taskId: string): Set<string> {
+    if (this.#closed) return new Set();
+    const rows = this.#db.prepare(`
+      SELECT DISTINCT assignment_id AS assignmentId
+      FROM supervision_task_file_claims WHERE task_id = ?
+    `).all(taskId) as Array<{ assignmentId?: string }>;
+    return new Set(rows.map((row) => normalizeTaskString(row.assignmentId)).filter((value): value is string => Boolean(value)));
   }
 
   listEvents(taskId: string): PersistedSupervisionTaskEvent[] {
@@ -1752,8 +1848,71 @@ export class SupervisionTaskRegistry {
         return { ok: false, reason: requestedRevision ? 'old_revision' : 'invalid_transition' };
       }
       if (receipts.length > 0 && !latestFinal) return { ok: false, reason: 'invalid_transition' };
+      const claimedAssignmentIds = this.#claimedAssignmentIds(existing.taskId);
       if (existing.status === 'finalized' && !existing.leaseId
-        && !this.listFileClaims(existing.taskId).some((claim) => claim.assignmentId === existing.assignmentId)) {
+        && !claimedAssignmentIds.has(existing.assignmentId)) {
+        const replayPlan = planFinalizedAuditAuthorityReplay({
+          task,
+          auditor: existing,
+          assignments,
+          receipts: this.listAuditReceipts(existing.taskId),
+          claimedAssignmentIds,
+        });
+        if (replayPlan.kind === 'reject') return { ok: false, reason: replayPlan.reason };
+        if (replayPlan.kind === 'repair') {
+          const now = input.now ?? Date.now();
+          this.#db.exec('BEGIN IMMEDIATE');
+          try {
+            const lockedTask = this.getTaskRecord(existing.taskId);
+            const lockedAuditor = this.getAssignment(existing.assignmentId);
+            if (!lockedTask || !lockedAuditor) {
+              this.#db.exec('ROLLBACK');
+              return { ok: false, reason: 'not_found' };
+            }
+            const lockedClaimedAssignmentIds = this.#claimedAssignmentIds(existing.taskId);
+            if (lockedAuditor.status !== 'finalized' || lockedAuditor.leaseId
+              || lockedAuditor.auditAttemptId !== existing.auditAttemptId
+              || lockedAuditor.auditRevision !== existing.auditRevision
+              || (requestedRevision && requestedRevision !== lockedAuditor.auditRevision)
+              || lockedClaimedAssignmentIds.has(lockedAuditor.assignmentId)) {
+              this.#db.exec('ROLLBACK');
+              return { ok: false, reason: 'invalid_transition' };
+            }
+            const lockedPlan = planFinalizedAuditAuthorityReplay({
+              task: lockedTask,
+              auditor: lockedAuditor,
+              assignments: this.listAssignments(existing.taskId),
+              receipts: this.listAuditReceipts(existing.taskId),
+              claimedAssignmentIds: lockedClaimedAssignmentIds,
+            });
+            if (lockedPlan.kind === 'reject') {
+              this.#db.exec('ROLLBACK');
+              return { ok: false, reason: lockedPlan.reason };
+            }
+            if (lockedPlan.kind === 'repair') {
+              const repaired: PersistedSupervisionTaskAssignment = {
+                ...lockedPlan.target,
+                auditAttemptId: lockedAuditor.auditAttemptId,
+                auditRevision: lockedAuditor.auditRevision,
+                verdict: 'PASS',
+                crossVendorAuditPassed: true,
+                updatedAt: now,
+              };
+              this.#writeAssignment(repaired, 'recovered', {
+                source: 'finalized_auditor_replay_audit_authority',
+                auditorAssignmentId: lockedAuditor.assignmentId,
+                auditAttemptId: lockedAuditor.auditAttemptId,
+                auditRevision: lockedAuditor.auditRevision,
+                receiptId: lockedPlan.receipt.receiptId,
+                verdict: 'PASS',
+              });
+            }
+            this.#db.exec('COMMIT');
+          } catch (error) {
+            this.#db.exec('ROLLBACK');
+            throw error;
+          }
+        }
         return { ok: true, value: existing, replay: true };
       }
       authenticatedAuditVerdict = verdict;
