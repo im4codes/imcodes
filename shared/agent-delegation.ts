@@ -4,6 +4,7 @@ import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 import { PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS } from './peer-audit.js';
+import { SUPERVISION_CONTRACT_IDS } from './supervision-config.js';
 
 export const AGENT_DELEGATION_TARGET_FIELD = 'delegateTarget' as const;
 
@@ -80,13 +81,15 @@ export const AGENT_DELEGATION_BLOCKER_REPORT_FIELDS = [
   'recommendedNextAction',
 ] as const;
 
+export const AGENT_DELEGATION_CONTRACT_REFS = [SUPERVISION_CONTRACT_IDS.MESSAGING] as const;
+
 export interface AgentDelegationBlockerContext {
   taskId: string;
   assignmentId: string;
 }
 
 export const AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT =
-  'Delegated blocker escalation: if a worker or auditor encounters a blocker, illegal_transition, contract contradiction, needs Brain adjudication, or cannot safely continue, it must immediately use its authenticated reply-capable channel to report taskId, assignmentId, exactError, completedSafeWork, and recommendedNextAction before waiting. A child-only NEEDS_INPUT message is not a report. The daemon only supplies deduplicated heartbeat/continue reminders and never substitutes audit-result chat.' as const;
+  JSON.stringify({ contractRefs: AGENT_DELEGATION_CONTRACT_REFS, rule: 'blocker' });
 
 /**
  * Machine-facing escalation contract for delegated work.
@@ -103,14 +106,11 @@ export function buildAgentDelegationBlockerReportInstruction(
   const taskId = context.taskId.trim();
   const assignmentId = context.assignmentId.trim();
   if (!taskId || !assignmentId) return '';
-  return [
-    '[Delegated blocker escalation contract]',
-    AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT,
-    'Do not merely print "needs takeover" in this child session and wait; the user must not have to open child sessions to discover blockers.',
-    `The report result must be one JSON object with exactly these fields: ${AGENT_DELEGATION_BLOCKER_REPORT_FIELDS.join(', ')}.`,
-    `Use taskId=${JSON.stringify(taskId)} and assignmentId=${JSON.stringify(assignmentId)}; exactError must preserve the precise refusal/error, completedSafeWork must list only work safely completed, and recommendedNextAction must request the concrete Brain adjudication or next step.`,
-    'For an audit, peer_audit_reply remains the only PASS/REWORK verdict channel; delegation_reply may be used for this blocker report but must never claim a verdict.',
-  ].join('\n');
+  return JSON.stringify({
+    contractRefs: AGENT_DELEGATION_CONTRACT_REFS,
+    binding: { taskId, assignmentId },
+    onBlock: 'reply_immediately',
+  });
 }
 
 export const AGENT_DELEGATION_PURPOSES = {
@@ -345,18 +345,27 @@ export function buildAgentDelegationReplyInstruction(
   if (!isCanonicalAgentDelegationSessionName(replyToSession)) return '';
   if (authority) {
     if (!isAgentDelegationOpaqueId(authority.delegationId)) return '';
+    const marker = `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify({
+      delegationId: authority.delegationId,
+      contractRefs: AGENT_DELEGATION_CONTRACT_REFS,
+    })}`;
     if (authority.audit?.kind === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) {
       return [
-        `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify({ delegationId: authority.delegationId })}`,
-        'This is a supervision audit receipt channel. Do not use delegation_reply for this audit.',
-        'Use the peer_audit_reply tool with these exact fields:',
-        `{ "taskId": ${JSON.stringify(authority.audit.taskId ?? '')}, "assignmentId": ${JSON.stringify(authority.audit.assignmentId ?? '')}, "attemptId": ${JSON.stringify(authority.audit.attemptId)}, "revision": ${JSON.stringify(authority.audit.revision ?? '')}, "receiptKind": "progress|final", "verdict": "PASS|REWORK (final only)", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
-        'Receipts are authenticated by the daemon-bound current session and registry assignment; no token is supplied. Progress and corrected final receipts append to the same attempt. After the accepted final receipt, finish this exact auditor assignment so the overall gate can advance.',
+        marker,
+        JSON.stringify({
+          tool: 'peer_audit_reply',
+          binding: {
+            taskId: authority.audit.taskId ?? '',
+            assignmentId: authority.audit.assignmentId ?? '',
+            attemptId: authority.audit.attemptId,
+            revision: authority.audit.revision ?? '',
+          },
+        }),
       ].join('\n');
     }
     return [
-      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify(authority)}`,
-      `Use the delegation_reply tool with delegationId plus result: "<your response>" whenever you need to reply. The daemon authenticates the current session and accepts multiple append-only replies for the same delegation; each reply is routed directly to ${JSON.stringify(replyToSession)}. Do not use send_message or imcodes send for these replies.`,
+      marker,
+      JSON.stringify({ tool: 'delegation_reply', binding: { delegationId: authority.delegationId, target: replyToSession } }),
     ].join('\n');
   }
   return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
@@ -388,10 +397,12 @@ export function extractAgentDelegationReplyAuthorityFromInstruction(
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
       const record = parsed as Record<string, unknown>;
       const keys = Object.keys(record);
-      if ((keys.length !== 1 && keys.length !== 2)
+      const allowed = new Set(['delegationId', 'replyCapability', 'contractRefs']);
+      if (keys.some((key) => !allowed.has(key))
         || !Object.prototype.hasOwnProperty.call(record, 'delegationId')
         || !isAgentDelegationOpaqueId(record.delegationId)
-        || (keys.length === 2 && !Object.prototype.hasOwnProperty.call(record, 'replyCapability'))) return undefined;
+        || (Object.prototype.hasOwnProperty.call(record, 'contractRefs')
+          && JSON.stringify(record.contractRefs) !== JSON.stringify(AGENT_DELEGATION_CONTRACT_REFS))) return undefined;
       // replyCapability is accepted only as a historical marker field and is
       // intentionally discarded.
       return { delegationId: record.delegationId };

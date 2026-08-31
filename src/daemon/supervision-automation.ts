@@ -1035,13 +1035,15 @@ class SupervisionAutomation {
           now,
         });
         if (!recorded.ok) continue;
-        const prompt = [
-          `[Contract: ${SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT}]`,
-          `Continue the existing task ${task.taskId} / assignment ${assignment.assignmentId}.`,
-          'Check current state; advance only safe unfinished implementation work.',
-          'This is an append to the same task, never new work or a new assignment.',
-          'After internal merge, validation, and Brain handoff, record the machine FINISHED handoff; do not claim audit PASS or Git finalization.',
-        ].join('\n');
+        const prompt = JSON.stringify({
+          contractRefs: [
+            SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
+            SUPERVISION_CONTRACT_IDS.MESSAGING,
+            SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+          ],
+          binding: { mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId },
+          action: 'advance_safe_unfinished',
+        });
         timelineEmitter.emit(
           assignment.identity.sessionName,
           'user.message',

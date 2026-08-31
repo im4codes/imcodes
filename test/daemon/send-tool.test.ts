@@ -604,7 +604,7 @@ describe('send-tool', () => {
       auditAttemptId: 'automatic_audit_attempt_1',
     });
     expect(dispatchMessage.mock.calls[0][1]).toContain('peer_audit_reply');
-    expect(dispatchMessage.mock.calls[0][1]).toContain('"attemptId": "automatic_audit_attempt_1"');
+    expect(dispatchMessage.mock.calls[0][1]).toContain('"attemptId":"automatic_audit_attempt_1"');
     expect(dispatchMessage.mock.calls[0][1]).not.toContain('Use the delegation_reply tool');
 
     await expect(dispatchSendMessage(caller, {

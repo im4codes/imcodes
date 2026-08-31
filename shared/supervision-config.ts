@@ -46,6 +46,7 @@ export const SUPERVISION_CONTRACT_IDS = {
   TASK_FINALIZATION: 'supervision_task_finalization_v1',
   DELEGATION_ELIGIBILITY: 'supervision_delegation_eligibility_v1',
   TASK_REGISTRY: 'supervision_task_registry_v1',
+  MESSAGING: 'supervision_messaging_v1',
 } as const;
 
 export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
@@ -58,6 +59,7 @@ export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
   SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
   SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
   SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
+  SUPERVISION_CONTRACT_IDS.MESSAGING,
 ] as const;
 
 /**

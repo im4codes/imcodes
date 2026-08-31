@@ -1679,32 +1679,32 @@ describe('TransportSessionRuntime', () => {
     const firstPayload = mock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
     const secondPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
     expect(firstPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
-    expect(firstPayload.messagePreamble).toContain('[Contract: supervision_orchestrator_context_v1]');
+    expect(firstPayload.messagePreamble).toContain('"contractId":"supervision_orchestrator_context_v1"');
     expect(firstPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_END);
     expect(secondPayload.messagePreamble).toBe(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
     expect(String(secondPayload.assembledMessage)).toContain(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
-    expect(String(secondPayload.assembledMessage)).not.toContain('[Contract: supervision_orchestrator_context_v1]');
+    expect(String(secondPayload.assembledMessage)).not.toContain('"contractId":"supervision_orchestrator_context_v1"');
   });
 
   it('re-injects a changed supervision contract block and resets it after compaction', async () => {
     const englishPreamble = buildSupervisionExecutionPreamble('en');
-    const chinesePreamble = buildSupervisionExecutionPreamble('zh-CN');
+    const changedPreamble = buildSupervisionExecutionPreamble('zh-CN').replace('"v":1', '"v":2');
 
     runtime.send('seed contracts', 'supervision-change-1', undefined, englishPreamble);
     await flushDispatch();
     mock.fireComplete('sess-1');
     await flushDispatch();
 
-    runtime.send('locale changed', 'supervision-change-2', undefined, chinesePreamble);
+    runtime.send('contract changed', 'supervision-change-2', undefined, changedPreamble);
     await flushDispatch();
     const changedPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
     expect(changedPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
-    expect(changedPayload.messagePreamble).toContain('统筹者模式');
+    expect(changedPayload.messagePreamble).toContain('"v":2');
     expect(changedPayload.messagePreamble).not.toBe(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
     mock.fireComplete('sess-1');
     await flushDispatch();
 
-    runtime.send('/compact', 'supervision-compact-control', undefined, chinesePreamble);
+    runtime.send('/compact', 'supervision-compact-control', undefined, changedPreamble);
     await flushDispatch();
     expect((mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>).messagePreamble).toBeUndefined();
     mock.fireComplete('sess-1', {
@@ -1715,21 +1715,21 @@ describe('TransportSessionRuntime', () => {
     });
     await flushDispatch();
 
-    runtime.send('after compact', 'supervision-change-3', undefined, chinesePreamble);
+    runtime.send('after compact', 'supervision-change-3', undefined, changedPreamble);
     await flushDispatch();
     const afterCompactPayload = mock.provider.send.mock.calls[3]?.[1] as Record<string, unknown>;
     expect(afterCompactPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
-    expect(afterCompactPayload.messagePreamble).toContain('统筹者模式');
+    expect(afterCompactPayload.messagePreamble).toContain('"v":2');
   });
 
   it('chooses only the last supervision contract block across one queued batch', async () => {
     const englishPreamble = buildSupervisionExecutionPreamble('en');
-    const chinesePreamble = buildSupervisionExecutionPreamble('zh-CN');
+    const changedPreamble = buildSupervisionExecutionPreamble('zh-CN').replace('"v":1', '"v":2');
 
     runtime.send('active unsupervised turn', 'supervision-batch-seed');
     await flushDispatch();
     expect(runtime.send('queued old contracts', 'supervision-batch-old', undefined, englishPreamble)).toBe('queued');
-    expect(runtime.send('queued new contracts', 'supervision-batch-new', undefined, chinesePreamble)).toBe('queued');
+    expect(runtime.send('queued new contracts', 'supervision-batch-new', undefined, changedPreamble)).toBe('queued');
 
     mock.fireComplete('sess-1');
     await flushDispatch();
@@ -1737,19 +1737,19 @@ describe('TransportSessionRuntime', () => {
     const batchPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
     const preamble = String(batchPayload.messagePreamble);
     expect(preamble.match(new RegExp(SUPERVISION_CONTRACT_PREAMBLE_START, 'g'))).toHaveLength(1);
-    expect(preamble.match(/\[Contract: supervision_orchestrator_context_v1\]/g)).toHaveLength(1);
-    expect(preamble).toContain('统筹者模式');
-    expect(preamble).not.toContain('Orchestrator mode:');
+    expect(preamble.match(/"contractId":"supervision_orchestrator_context_v1"/g)).toHaveLength(1);
+    expect(preamble).toContain('"v":2');
+    expect(preamble).not.toContain('"v":1,"role":"orchestrator"');
   });
 
   it('rolls back a rejected queued-batch contract reservation', async () => {
     const englishPreamble = buildSupervisionExecutionPreamble('en');
-    const chinesePreamble = buildSupervisionExecutionPreamble('zh-CN');
+    const changedPreamble = buildSupervisionExecutionPreamble('zh-CN').replace('"v":1', '"v":2');
 
     runtime.send('active unsupervised turn', 'supervision-rollback-seed');
     await flushDispatch();
     runtime.send('queued old contracts', 'supervision-rollback-old', undefined, englishPreamble);
-    runtime.send('queued new contracts', 'supervision-rollback-new', undefined, chinesePreamble);
+    runtime.send('queued new contracts', 'supervision-rollback-new', undefined, changedPreamble);
     (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
       code: 'TRANSPORT_TURN_TIMEOUT',
       message: 'provider did not accept the contract batch',
@@ -1760,11 +1760,11 @@ describe('TransportSessionRuntime', () => {
     await flushDispatch();
     expect(runtime.getStatus()).toBe('error');
 
-    runtime.send('retry after rejection', 'supervision-rollback-retry', undefined, chinesePreamble);
+    runtime.send('retry after rejection', 'supervision-rollback-retry', undefined, changedPreamble);
     await flushDispatch();
     const retryPayload = mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>;
     expect(retryPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
-    expect(retryPayload.messagePreamble).toContain('统筹者模式');
+    expect(retryPayload.messagePreamble).toContain('"v":2');
     expect(retryPayload.messagePreamble).not.toBe(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
   });
 

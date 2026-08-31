@@ -37,6 +37,7 @@ import {
   type AgentDelegationAuditRequest,
 } from '../../shared/agent-delegation.js';
 import {
+  SUPERVISION_CONTRACT_IDS,
   isAuditableSupervisionTaskClassification,
   readSupervisionSnapshotFromTransportConfig,
   type SupervisionTaskMetadata,
@@ -1163,11 +1164,17 @@ export async function dispatchSendMessage(
       : '';
     const assignmentMessage = [
       ...(supervisedExecutionBinding && !reusedContinuationAssignment ? [
-          '[Daemon-resolved development assignment]',
-          `Pool: ${supervisedExecutionBinding.pool}`,
-          `Requested config: ${JSON.stringify(supervisedExecutionBinding.requested)}`,
-          `Observed runtime identity: ${JSON.stringify(supervisedExecutionBinding.actual)}`,
-          'Eligibility was decided by the coordinator from daemon evidence. Start the task directly; do not self-report or guess your model.',
+          JSON.stringify({
+            contractRefs: [SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY, SUPERVISION_CONTRACT_IDS.MESSAGING],
+            binding: {
+              mode: 'new_assignment',
+              taskId: supervisedTaskId,
+              assignmentId: supervisedAssignmentId,
+              pool: supervisedExecutionBinding.pool,
+              requested: supervisedExecutionBinding.requested,
+              actual: supervisedExecutionBinding.actual,
+            },
+          }),
           '',
         ] : []),
       input.message,

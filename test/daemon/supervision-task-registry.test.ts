@@ -3719,11 +3719,11 @@ describe('SupervisionTaskRegistry', () => {
     expect(replay.assignmentId).toBe(result.assignmentId);
     expect(result.deliveries[0]).toMatchObject({ delegationId: expect.any(String) });
     const sent = String(dispatchMessage.mock.calls[0]?.[1] ?? '');
-    expect(sent).toContain('Use the delegation_reply tool');
-    expect(sent).toContain('[Delegated blocker escalation contract]');
-    expect(sent).toContain(`taskId=${JSON.stringify(result.taskId)}`);
-    expect(sent).toContain(`assignmentId=${JSON.stringify(result.assignmentId)}`);
-    expect(sent).toContain('exactError, completedSafeWork, recommendedNextAction');
+    expect(sent).toContain('"tool":"delegation_reply"');
+    expect(sent).toContain('"contractRefs":["supervision_messaging_v1"]');
+    expect(sent).toContain(`"taskId":"${result.taskId}"`);
+    expect(sent).toContain(`"assignmentId":"${result.assignmentId}"`);
+    expect(sent).toContain('"onBlock":"reply_immediately"');
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
     expect(getSupervisionTaskRegistry().get(result.taskId!)?.assignments[0]?.executionBinding).toMatchObject({
       pool: 'primary',
@@ -4276,6 +4276,12 @@ describe('SupervisionTaskRegistry', () => {
       expect.stringContaining('append exact recovered work'),
       expect.objectContaining({ deliveryMode: 'append' }),
     );
+    const continuationMessage = String(dispatchMessage.mock.calls.at(-1)?.[1] ?? '');
+    expect(continuationMessage).toContain('"contractRefs":["supervision_messaging_v1"]');
+    expect(continuationMessage).toContain(`"taskId":"${taskId}"`);
+    expect(continuationMessage).toContain(`"assignmentId":"${exact.value.assignmentId}"`);
+    expect(continuationMessage).not.toContain('Delegated blocker escalation:');
+    expect(continuationMessage).not.toContain('[Daemon-resolved development assignment]');
     expect(registry.listAssignments(taskId)).toHaveLength(assignmentCount);
 
     const ambiguous = await dispatchSendMessage(caller, {

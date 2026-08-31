@@ -421,10 +421,10 @@ describe('SupervisionAutomation', () => {
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
     const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(prompt).toContain('执行模式：advance_safe_work');
-    expect(prompt).toContain('本轮立即推进可安全处理的未完成项');
+    expect(prompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(prompt).not.toContain('Continue the same task.');
     expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
-    expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY);
+    expect(prompt).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
@@ -2355,8 +2355,8 @@ describe('SupervisionAutomation', () => {
     const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(continuePrompt).toContain('[Contract: supervision_continue_v1]');
     expect(continuePrompt).toContain('Execution mode: advance_safe_work');
-    expect(continuePrompt).toContain('advance safe unfinished work now; do not stop at a summary');
-    expect(continuePrompt).toContain('If none is safe, report the exact human blocker');
+    expect(continuePrompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
+    expect(continuePrompt).toContain('If none can be safely advanced, report the exact human blocker');
     expect(continuePrompt).not.toContain('CC3 GN targets 修复的变更尚未提交。');
     expect(continuePrompt).not.toContain('Target ID (pass directly to send_message; do not look it up):');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
@@ -2379,7 +2379,7 @@ describe('SupervisionAutomation', () => {
     await waitForTransportSendCount(1);
     const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(continuePrompt).toContain('[Contract: supervision_continue_v1]');
-    expect(continuePrompt).toContain('advance safe unfinished work now');
+    expect(continuePrompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(continuePrompt).not.toContain('imcodes send --reply');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
@@ -2580,7 +2580,7 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
     const preAuditContinue = String(mockTransportRuntime.send.mock.calls[2]?.[0]);
-    expect(preAuditContinue).toContain('advance safe unfinished work now; do not stop at a summary');
+    expect(preAuditContinue).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(preAuditContinue).toContain('Do not stage, commit, push, merge, release, publish, or deploy before the one overall peer-audit PASS.');
     expect(preAuditContinue).not.toContain(mixedAction);
     expect(preAuditContinue).not.toContain(finalizationAction);
@@ -2634,7 +2634,7 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(continuePrompt).toContain('advance safe unfinished work now; do not stop at a summary');
+    expect(continuePrompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(continuePrompt).toContain('Do not stage, commit, push');
     expect(continuePrompt).not.toContain('Run the focused tests, fix failures, then commit and push.');
   });
@@ -2656,7 +2656,7 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(continuePrompt).toContain('advance safe unfinished work now; do not stop at a summary');
+    expect(continuePrompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(continuePrompt).not.toContain('imcodes send --reply');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
@@ -5189,7 +5189,7 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       expect(mockTransportRuntime.send).toHaveBeenLastCalledWith(
-        expect.stringContaining(`existing task ${taskId} / assignment ${assignmentId}`),
+        expect.stringContaining(`"mode":"continue_existing","taskId":"${taskId}","assignmentId":"${assignmentId}"`),
         `supervision-implementation-heartbeat:${assignmentId}:1`,
         undefined,
         undefined,
