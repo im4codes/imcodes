@@ -64,7 +64,6 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.144.1",
     "@opencode-ai/sdk": "^1.18.4",
-    "@qoder-ai/qoder-agent-sdk": "1.0.11",
     "commander": "^12.1.0",
     "croner": "^10.0.1",
     "fzf": "^0.5.2",
@@ -77,6 +76,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@qoder-ai/qoder-agent-sdk": "1.0.11",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.5.13",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
@@ -106,5 +106,13 @@
   },
   "bundleDependencies": [
     "@huggingface/transformers"
-  ]
+  ],
+  "peerDependencies": {
+    "@qoder-ai/qoder-agent-sdk": "1.0.11"
+  },
+  "peerDependenciesMeta": {
+    "@qoder-ai/qoder-agent-sdk": {
+      "optional": true
+    }
+  }
 }
