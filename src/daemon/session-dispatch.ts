@@ -53,6 +53,12 @@ export interface SessionDispatchMessageOptions {
   sharedActor?: SharedActorEnvelope;
   /** Node MCP send_message: prefer provider-native append before FIFO. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
+  /**
+   * Internal daemon transport binding. The live /send boundary validates this
+   * against the registry and creates/verifies the exact assignment worktree
+   * before acknowledging delivery.
+   */
+  supervision?: { taskId: string; assignmentId: string };
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;

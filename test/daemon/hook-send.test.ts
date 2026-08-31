@@ -4,6 +4,10 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import http from 'http';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
 
@@ -69,6 +73,7 @@ import {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
 } from '../../src/daemon/supervision-state-store.js';
+import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervision-worktree-inspector.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -534,6 +539,101 @@ describe('Hook server /send endpoint', () => {
   // ── Successful delivery ──────────────────────────────────────────────────
 
   describe('Successful delivery', () => {
+    it('provisions the unique missing implementer worktree at the live /send boundary before delivery', async () => {
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-worktree-'));
+      const source = join(temp, 'source');
+      const worktrees = join(temp, 'worktrees');
+      mkdirSync(source, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: source });
+      writeFileSync(join(source, 'fixture.txt'), 'base\n');
+      execFileSync('git', ['add', 'fixture.txt'], { cwd: source });
+      execFileSync('git', ['-c', 'user.name=IM.codes Test', '-c', 'user.email=test@im.codes', 'commit', '-qm', 'base'], { cwd: source });
+      const baseRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
+      const priorRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = worktrees;
+
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code', projectDir: source,
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const worker = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Coder', agentType: 'codex', projectDir: source,
+        sessionInstanceId: 'worker-instance', runtimeEpoch: 'worker-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
+      listSessionsMock.mockReturnValue([brain, worker]);
+
+      const taskId = 'live-hook-missing-worktree-task';
+      const assignmentId = 'live-hook-missing-worktree-assignment';
+      const registry = getSupervisionTaskRegistry();
+      expect(registry.createOrGet({
+        taskId, projectName: 'proj', objective: 'production missing-before-manual-recovery regression', baseRevision,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', scopeFiles: [],
+        identity: {
+          sessionName: worker.name,
+          sessionInstanceId: worker.sessionInstanceId,
+          runtimeEpoch: worker.runtimeEpoch,
+          agentType: worker.agentType,
+          providerFamily: 'openai',
+        },
+      }).ok).toBe(true);
+      const expectedRepo = resolveSupervisionAssignmentWorktree({ sessionName: worker.name, assignmentId });
+      expect(existsSync(expectedRepo)).toBe(false);
+      sendProcessSessionMessageForAutomationMock.mockImplementationOnce(async () => {
+        expect(existsSync(expectedRepo)).toBe(true);
+        expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: expectedRepo, encoding: 'utf8' }).trim()).toBe(baseRevision);
+      });
+
+      try {
+        // No supervision envelope: this is the production shape from an
+        // already-running MCP bridge that bypassed the newer caller-side helper.
+        const res = await postSend(port, { from: brain.name, to: worker.name, message: 'start assigned work' });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true, target: worker.name } });
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(worker.name, 'start assigned work');
+      } finally {
+        if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+        else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed without delivery when more than one missing assignment could match a stale bridge send', async () => {
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code',
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const worker = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Coder', agentType: 'codex',
+        sessionInstanceId: 'worker-instance', runtimeEpoch: 'worker-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
+      listSessionsMock.mockReturnValue([brain, worker]);
+      const registry = getSupervisionTaskRegistry();
+      for (const suffix of ['one', 'two']) {
+        const taskId = `ambiguous-missing-${suffix}`;
+        expect(registry.createOrGet({ taskId, projectName: 'proj', objective: suffix }).ok).toBe(true);
+        expect(registry.createAssignment({
+          assignmentId: `${taskId}-assignment`, taskId, role: 'implementer', scopeFiles: [],
+          identity: {
+            sessionName: worker.name,
+            sessionInstanceId: worker.sessionInstanceId,
+            runtimeEpoch: worker.runtimeEpoch,
+            agentType: worker.agentType,
+            providerFamily: 'openai',
+          },
+        }).ok).toBe(true);
+      }
+
+      const res = await postSend(port, { from: brain.name, to: worker.name, message: 'must not guess' });
+      expect(res).toEqual({
+        status: 500,
+        body: { ok: false, error: `${worker.name}: ambiguous missing assignment worktrees for target (2)` },
+      });
+      expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+    });
+
     it('delivers shell-originated callback sends when the target is an exact active session name', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });

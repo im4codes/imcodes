@@ -283,6 +283,7 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
             message,
             depth: 0,
             ...(options.deliveryMode ? { deliveryMode: options.deliveryMode } : {}),
+            ...(options.supervision ? { supervision: options.supervision } : {}),
           });
           return response.queued === true ? 'queued' : 'sent';
         }),

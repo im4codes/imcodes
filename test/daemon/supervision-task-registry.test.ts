@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it, beforeEach, vi } from 'vitest';
@@ -11,7 +12,7 @@ import {
   type PersistedSupervisionTaskAssignmentIdentity,
 } from '../../src/daemon/supervision-state-store.js';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
-import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../src/daemon/send-tool.js';
+import { dispatchHookSend, dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../src/daemon/send-tool.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
@@ -22,6 +23,7 @@ import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
+import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervision-worktree-inspector.js';
 
 /** Adapts the real registry to the audited handler port. */
 function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
@@ -3732,12 +3734,179 @@ describe('SupervisionTaskRegistry', () => {
     expect(sent).toContain(`"assignmentId":"${result.assignmentId}"`);
     expect(sent).toContain('"onBlock":"reply_immediately"');
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect(dispatchMessage.mock.calls[0]?.[2]).toMatchObject({
+      supervision: { taskId: result.taskId, assignmentId: result.assignmentId },
+    });
     expect(getSupervisionTaskRegistry().get(result.taskId!)?.assignments[0]?.executionBinding).toMatchObject({
       pool: 'primary',
       requested: { providerFamily: 'openai', model: 'gpt-5.6' },
       actual: { sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-deck_alpha_w1', runtimeEpoch: 'epoch-deck_alpha_w1', model: 'gpt-5.6' },
       origin: 'reused',
     });
+  });
+
+  it('creates and verifies the exact worktree before live-hook delivery for exact-target and autoProvision tasks', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'imcodes-send-worktree-e2e-'));
+    const source = join(temp, 'source');
+    const worktrees = join(temp, 'worktrees');
+    mkdirSync(source, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: source });
+    writeFileSync(join(source, 'fixture.txt'), 'base\n');
+    execFileSync('git', ['add', 'fixture.txt'], { cwd: source });
+    execFileSync('git', ['-c', 'user.name=IM.codes Test', '-c', 'user.email=test@im.codes', 'commit', '-qm', 'base'], { cwd: source });
+    const baseRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
+    const priorRoot = process.env.IMCODES_WORKTREES_ROOT;
+    process.env.IMCODES_WORKTREES_ROOT = worktrees;
+
+    const brain = session('deck_alpha_brain');
+    const exactWorker = session('deck_sub_exact_worker');
+    const autoWorker = session('deck_sub_auto_worker');
+    for (const item of [brain, exactWorker, autoWorker]) item.projectDir = source;
+    exactWorker.parentSession = brain.name;
+    autoWorker.parentSession = brain.name;
+    const sessions = [brain, exactWorker, autoWorker];
+    const deliveryOrder: string[] = [];
+    const liveDispatch = async (target: SessionRecord, message: string, options: { supervision?: { taskId: string; assignmentId: string } }) => {
+      if (!options.supervision) throw new Error('missing supervision transport binding');
+      const expectedRepo = resolveSupervisionAssignmentWorktree({
+        sessionName: target.name,
+        assignmentId: options.supervision.assignmentId,
+      });
+      expect(existsSync(expectedRepo)).toBe(true);
+      const hook = await dispatchHookSend({
+        from: brain.name,
+        targetRecords: [target],
+        message,
+        projectRoot: source,
+        supervision: options.supervision,
+      }, {
+        listSessions: () => sessions,
+        getSession: (name) => sessions.find((item) => item.name === name),
+        dispatchMessage: async () => {
+          expect(existsSync(expectedRepo)).toBe(true);
+          expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: expectedRepo, encoding: 'utf8' }).trim()).toBe(baseRevision);
+          deliveryOrder.push(target.name);
+        },
+      });
+      if (hook.errors.length > 0) throw new Error(hook.errors.join('; '));
+    };
+
+    try {
+      const caller = { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: source };
+      const exact = await dispatchSendMessage(caller, {
+        target: exactWorker.name,
+        message: 'exact target',
+        idempotencyKey: 'worktree-e2e-exact',
+        task: { objective: 'exact target worktree', baseRevision },
+      }, { listSessions: () => sessions, dispatchMessage: liveDispatch, exactTargetOnly: true });
+      expect(exact).toMatchObject({ status: 'accepted', assignmentId: expect.any(String) });
+
+      const provisionSupervisionTarget = vi.fn(async () => ({
+        ok: true as const,
+        target: autoWorker,
+        evidence: {
+          selectedPool: 'primary' as const,
+          selectedConfig: {
+            agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+            capabilityId: buildSupervisionExecutionCapabilityId({
+              agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+            }),
+          },
+          createdSessionName: autoWorker.name,
+        },
+      }));
+      const automatic = await dispatchSendMessage(caller, {
+        message: 'automatic target',
+        idempotencyKey: 'worktree-e2e-auto',
+        task: { objective: 'automatic target worktree', baseRevision, autoProvision: true, executionPool: 'primary' },
+      }, { listSessions: () => sessions, dispatchMessage: liveDispatch, exactTargetOnly: true, provisionSupervisionTarget });
+      expect(automatic).toMatchObject({ status: 'accepted', assignmentId: expect.any(String) });
+      expect(deliveryOrder).toEqual([exactWorker.name, autoWorker.name]);
+    } finally {
+      if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+      else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an explicit binding when the live target agentType differs without ensure, dispatch, or registry mutation', async () => {
+    const brain = session('deck_alpha_brain');
+    const target = session('deck_sub_identity_target', 'alpha', 'codex');
+    const sessions = [brain, target];
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'hook-agent-type-mismatch-task';
+    const assignmentId = 'hook-agent-type-mismatch-assignment';
+    expect(registry.createOrGet({ taskId, projectName: 'alpha', objective: 'agent type mismatch' }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId, assignmentId, role: 'implementer', scopeFiles: [],
+      identity: { ...identity(target.name, 'codex-sdk'), providerFamily: 'openai' },
+    }).ok).toBe(true);
+    const before = JSON.stringify(registry.get(taskId));
+    const eventCount = registry.listEvents(taskId).length;
+    const ensure = vi.fn();
+    const dispatchMessage = vi.fn();
+
+    const result = await dispatchHookSend({
+      from: brain.name,
+      targetRecords: [target],
+      message: 'must refuse wrong agent type',
+      projectRoot: '/work/alpha',
+      supervision: { taskId, assignmentId },
+    }, {
+      listSessions: () => sessions,
+      getSession: (name) => sessions.find((item) => item.name === name),
+      ensureSupervisionAssignmentWorktree: ensure,
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({
+      delivered: [], queued: [],
+      errors: [expect.stringContaining('supervision binding does not match the live task, implementer, and target identity')],
+    });
+    expect(ensure).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify(registry.get(taskId))).toBe(before);
+    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+  });
+
+  it('rejects stale-bridge fallback when the resolved live providerFamily differs without ensure, dispatch, or registry mutation', async () => {
+    const brain = session('deck_alpha_brain');
+    const target = session('deck_sub_provider_target');
+    target.providerId = 'anthropic';
+    const sessions = [brain, target];
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'hook-provider-mismatch-task';
+    const assignmentId = 'hook-provider-mismatch-assignment';
+    expect(registry.createOrGet({ taskId, projectName: 'alpha', objective: 'provider mismatch' }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId, assignmentId, role: 'implementer', scopeFiles: [],
+      identity: { ...identity(target.name, target.agentType), providerFamily: 'openai' },
+    }).ok).toBe(true);
+    const before = JSON.stringify(registry.get(taskId));
+    const eventCount = registry.listEvents(taskId).length;
+    const ensure = vi.fn();
+    const dispatchMessage = vi.fn();
+
+    const result = await dispatchHookSend({
+      from: brain.name,
+      targetRecords: [target],
+      message: 'stale bridge must refuse wrong provider',
+      projectRoot: '/work/alpha',
+    }, {
+      listSessions: () => sessions,
+      getSession: (name) => sessions.find((item) => item.name === name),
+      ensureSupervisionAssignmentWorktree: ensure,
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({
+      delivered: [], queued: [],
+      errors: [expect.stringContaining('active implementer identity does not match the live target agent/provider')],
+    });
+    expect(ensure).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify(registry.get(taskId))).toBe(before);
+    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
   });
 
   it('send_message provisions before dispatch and durably projects the selected pool/config/session evidence', async () => {
@@ -3787,7 +3956,9 @@ describe('SupervisionTaskRegistry', () => {
     expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
     expect(ensureSupervisionAssignmentWorktree).toHaveBeenCalledTimes(1);
     expect(order).toEqual(['worktree', 'dispatch']);
-    expect(dispatchMessage).toHaveBeenCalledWith(worker, expect.stringContaining('provision then dispatch'), expect.any(Object));
+    expect(dispatchMessage).toHaveBeenCalledWith(worker, expect.stringContaining('provision then dispatch'), expect.objectContaining({
+      supervision: { taskId: sent.taskId, assignmentId: sent.assignmentId },
+    }));
     expect(sent).toMatchObject({
       status: 'accepted',
       provisioning: { selectedPool: 'primary', provisionAttemptId: 'supervision_provision_test', createdSessionName: worker.name },

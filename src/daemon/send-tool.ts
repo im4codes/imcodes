@@ -1,4 +1,5 @@
 import path from 'path';
+import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
 import { IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG } from '../../shared/imcodes-send.js';
@@ -96,6 +97,7 @@ import {
 } from './delegation-reply-authority.js';
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
+import { resolveSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -326,6 +328,8 @@ export interface HookSendDispatchInput {
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** This `/send` spawns work; see {@link SendMessageInput.newWorkload}. */
   newWorkload?: boolean;
+  /** Registry binding supplied by the managed MCP bridge for supervised work. */
+  supervision?: { taskId: string; assignmentId: string };
 }
 
 export interface HookSendDispatchResult {
@@ -531,6 +535,106 @@ async function defaultEnsureSupervisionAssignmentWorktree(req: {
   });
   if (!base.ok) return base;
   return provisioner.ensureSupervisionAssignmentWorktree({ ...req, baseRevision: base.baseRevision });
+}
+
+const HOOK_WORKTREE_RECOVERY_STATUSES = new Set([
+  'delegated',
+  'implementing',
+  'retrying_external_ci',
+  'rework',
+]);
+
+function assignmentMatchesLiveTargetBase(
+  assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
+  target: SessionRecord,
+): boolean {
+  return Boolean(assignment
+    && assignment.role === 'implementer'
+    && assignment.required
+    && HOOK_WORKTREE_RECOVERY_STATUSES.has(assignment.status)
+    && assignment.identity.sessionName === target.name
+    && assignment.identity.sessionInstanceId === target.sessionInstanceId
+    && assignment.identity.runtimeEpoch === target.runtimeEpoch);
+}
+
+function assignmentMatchesLiveTarget(
+  assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
+  target: SessionRecord,
+): boolean {
+  return assignmentMatchesLiveTargetBase(assignment, target)
+    && assignment?.identity.agentType === target.agentType
+    && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target);
+}
+
+async function ensureHookSupervisionAssignmentWorktree(input: {
+  callerRecord?: SessionRecord;
+  projectRoot?: string | null;
+  target: SessionRecord;
+  binding?: { taskId: string; assignmentId: string };
+  ensure?: SendToolDeps['ensureSupervisionAssignmentWorktree'];
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const registry = getSupervisionTaskRegistry();
+  let task = input.binding ? registry.get(input.binding.taskId) : undefined;
+  let assignment = input.binding ? registry.getAssignment(input.binding.assignmentId) : undefined;
+
+  if (input.binding) {
+    if (!task || !assignment
+      || assignment.taskId !== task.taskId
+      || !assignmentMatchesLiveTarget(assignment, input.target)
+      || (input.callerRecord?.projectName && task.projectName !== input.callerRecord.projectName)) {
+      return { ok: false, error: 'supervision binding does not match the live task, implementer, and target identity' };
+    }
+  } else {
+    // Compatibility backstop for an already-running MCP bridge that predates
+    // the explicit transport binding. Only a UNIQUE active implementer whose
+    // exact worktree path is absent can be recovered; existing (possibly dirty)
+    // worktrees are never reset, cleaned, or made a reason to block ordinary
+    // messages.
+    if (!input.callerRecord?.projectName) return { ok: true };
+    const candidates = registry.list({
+      projectName: input.callerRecord.projectName,
+      ownerSessionName: input.target.name,
+    }).flatMap((candidateTask) => candidateTask.assignments
+      .filter((candidateAssignment) => assignmentMatchesLiveTargetBase(candidateAssignment, input.target))
+      .map((candidateAssignment) => ({ task: candidateTask, assignment: candidateAssignment })));
+    if (candidates.some(({ assignment: candidateAssignment }) => (
+      !assignmentMatchesLiveTarget(candidateAssignment, input.target)
+    ))) {
+      return { ok: false, error: 'active implementer identity does not match the live target agent/provider' };
+    }
+    const missing = candidates
+      .filter(({ assignment: candidateAssignment }) => !existsSync(resolveSupervisionAssignmentWorktree({
+        sessionName: input.target.name,
+        assignmentId: candidateAssignment.assignmentId,
+      })));
+    if (missing.length === 0) return { ok: true };
+    if (missing.length !== 1) {
+      return { ok: false, error: `ambiguous missing assignment worktrees for target (${missing.length})` };
+    }
+    task = missing[0].task;
+    assignment = missing[0].assignment;
+  }
+
+  const projectRoot = input.projectRoot?.trim() || input.callerRecord?.projectDir?.trim();
+  if (!projectRoot || !task || !assignment) {
+    return { ok: false, error: 'assignment worktree provisioning requires an authoritative project root and binding' };
+  }
+  const ensured = await (input.ensure ?? defaultEnsureSupervisionAssignmentWorktree)({
+    projectRoot,
+    sessionName: input.target.name,
+    assignmentId: assignment.assignmentId,
+    baseRevision: task.baseRevision,
+  });
+  if (!ensured.ok) {
+    return { ok: false, error: `assignment worktree provisioning blocked: ${ensured.reason}: ${ensured.detail}` };
+  }
+  if (task.baseRevision !== ensured.baseRevision) {
+    const baseBound = registry.updateTask({ taskId: task.taskId, baseRevision: ensured.baseRevision });
+    if (!baseBound.ok) {
+      return { ok: false, error: `assignment worktree base binding rejected: ${baseBound.reason}` };
+    }
+  }
+  return { ok: true };
 }
 
 /** Narrow an unknown error to its `ExecutionCloneError.code` when present. */
@@ -1261,6 +1365,9 @@ export async function dispatchSendMessage(
         dispatchId,
         messageId,
         deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+        ...(!input.audit && supervisedTaskId && supervisedAssignmentId
+          ? { supervision: { taskId: supervisedTaskId, assignmentId: supervisedAssignmentId } }
+          : {}),
         ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
       });
       deliveries.push({
@@ -1715,6 +1822,19 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   }
 
   for (const target of hookGate.dispatchable) {
+    const worktreeGate = await ensureHookSupervisionAssignmentWorktree({
+      callerRecord,
+      projectRoot: input.projectRoot,
+      target,
+      ...(input.supervision ? { binding: input.supervision } : {}),
+      ...(deps?.ensureSupervisionAssignmentWorktree
+        ? { ensure: deps.ensureSupervisionAssignmentWorktree }
+        : {}),
+    });
+    if (!worktreeGate.ok) {
+      errors.push(`${target.name}: ${worktreeGate.error}`);
+      continue;
+    }
     const messageId = createSendMessageId();
     const replyAuthority = input.reply
       ? createDelegationReplyAuthority({

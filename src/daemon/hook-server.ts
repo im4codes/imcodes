@@ -350,6 +350,19 @@ interface SendRequest {
   depth?: number;
   reply?: boolean;
   deliveryMode?: MemoryMcpSendDeliveryMode;
+  supervision?: { taskId: string; assignmentId: string };
+}
+
+function validSupervisionSendBinding(value: unknown): value is NonNullable<SendRequest['supervision']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(record).length === 2
+    && typeof record.taskId === 'string'
+    && record.taskId.trim().length > 0
+    && Buffer.byteLength(record.taskId, 'utf8') <= 512
+    && typeof record.assignmentId === 'string'
+    && record.assignmentId.trim().length > 0
+    && Buffer.byteLength(record.assignmentId, 'utf8') <= 512;
 }
 
 async function handleSend(body: SendRequest): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -366,6 +379,9 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   if (body.deliveryMode !== undefined
       && !Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(body.deliveryMode)) {
     return { status: 400, body: { ok: false, error: 'invalid delivery mode' } };
+  }
+  if (body.supervision !== undefined && !validSupervisionSendBinding(body.supervision)) {
+    return { status: 400, body: { ok: false, error: 'invalid supervision binding' } };
   }
 
   if (containsLegacyAuditControlMarker(message)) {
@@ -386,6 +402,9 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
+  }
+  if (body.supervision && result.targets.length !== 1) {
+    return { status: 400, body: { ok: false, error: 'supervision binding requires one exact target' } };
   }
 
   // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
@@ -434,6 +453,7 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
       projectRoot,
       reply: body.reply === true,
       ...(body.deliveryMode ? { deliveryMode: body.deliveryMode } : {}),
+      ...(body.supervision ? { supervision: body.supervision } : {}),
     });
   } catch (err) {
     return { status: 400, body: { ok: false, error: (err as Error).message } };
