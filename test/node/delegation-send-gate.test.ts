@@ -12,6 +12,11 @@ import {
 } from '../../src/daemon/send-tool.js';
 import { resolvePeerAuditCandidateList } from '../../src/daemon/peer-audit-candidates.js';
 import {
+  clearSupervisionAutoProvisionStateForTests,
+  provisionSupervisionTarget,
+} from '../../src/daemon/supervision-auto-provision.js';
+import type { SubSessionRecord } from '../../src/daemon/subsession-manager.js';
+import {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
 } from '../../src/daemon/supervision-state-store.js';
@@ -164,6 +169,7 @@ function supervisedChild(input: {
 describe('delegation send gate', () => {
   beforeEach(() => {
     clearSendIdempotencyCacheForTests();
+    clearSupervisionAutoProvisionStateForTests();
     resetSupervisionTaskRegistryForTests();
     resetDelegationReplyStoreForTests();
   });
@@ -404,6 +410,95 @@ describe('delegation send gate', () => {
     const legacySessions = [legacyBrain, matching, missingPreset];
     expect(listSendTargets(caller, { executionPool: 'primary' }, deps(legacySessions))
       .items.map((item) => item.sessionName)).toEqual([missingPreset.name]);
+  });
+
+  it('auto-provisions and dispatches to one visible child carrying the exact configured CC preset', async () => {
+    const presetA = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]', 'preset-a');
+    const brain = supervisedBrain([presetA]);
+    const ordinary = supervisedChild({
+      name: 'deck_alpha_ordinary_cc',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      model: 'opus[1M]',
+    });
+    const sessions = [brain, ordinary];
+    const startSubSession = vi.fn(async (sub: SubSessionRecord) => {
+      sessions.push(session({
+        name: `deck_sub_${sub.id}`,
+        projectName: 'alpha',
+        projectDir: sub.cwd ?? '/work/alpha',
+        role: 'w2',
+        parentSession: sub.parentSession ?? undefined,
+        label: sub.label ?? undefined,
+        agentType: sub.type,
+        runtimeType: sub.runtimeType ?? 'transport',
+        activeModel: sub.requestedModel ?? undefined,
+        requestedModel: sub.requestedModel ?? undefined,
+        ccPreset: sub.ccPreset ?? undefined,
+        executionCloneMetadata: undefined,
+        userCreated: true,
+      }));
+    });
+    const autoProvision = (request: Parameters<typeof provisionSupervisionTarget>[0]) => (
+      provisionSupervisionTarget(request, {
+        now: () => NOW,
+        listSessions: () => sessions,
+        getSession: (name) => sessions.find((candidate) => candidate.name === name),
+        startSubSession,
+        wait: async () => {},
+        readyTimeoutMs: 1,
+      })
+    );
+    const dispatchMessage = vi.fn(async () => {});
+
+    const result = await dispatchSendMessage(caller, {
+      message: 'run with preset-a',
+      idempotencyKey: 'preset-auto-provision-1',
+      task: {
+        objective: 'run with preset-a',
+        autoProvision: true,
+        executionPool: 'primary',
+        requestedExecutionType: presetA,
+      },
+    }, {
+      ...deps(sessions, dispatchMessage),
+      provisionSupervisionTarget: autoProvision,
+    });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      provisioning: {
+        selectedConfig: presetA,
+        origin: 'spawned',
+        createdSessionName: expect.any(String),
+      },
+      taskId: expect.any(String),
+      assignmentId: expect.any(String),
+    });
+    expect(startSubSession).toHaveBeenCalledTimes(1);
+    expect(startSubSession).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'claude-code-sdk',
+      ccPreset: 'preset-a',
+      parentSession: brain.name,
+    }));
+    const createdName = result.status === 'accepted' ? result.provisioning?.createdSessionName : undefined;
+    const created = sessions.find((candidate) => candidate.name === createdName);
+    expect(created).toMatchObject({
+      userCreated: true,
+      parentSession: brain.name,
+      ccPreset: 'preset-a',
+      executionCloneMetadata: undefined,
+    });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect(dispatchMessage.mock.calls[0]?.[0]).toMatchObject({ name: createdName, ccPreset: 'preset-a' });
+    const assignment = result.status === 'accepted' && result.assignmentId
+      ? getSupervisionTaskRegistry().getAssignment(result.assignmentId)
+      : undefined;
+    expect(assignment?.executionBinding).toMatchObject({
+      origin: 'spawned',
+      requested: presetA,
+      actual: { sessionName: createdName, ccPresetId: 'preset-a' },
+    });
   });
 
   it('marks pool members as new-work, queue-only, or unavailable from authoritative availability', () => {

@@ -24,6 +24,16 @@ function config(agentType: string, providerFamily: string, model: string): Super
   return { ...value, capabilityId: buildSupervisionExecutionCapabilityId(value) };
 }
 
+function presetConfig(
+  agentType: string,
+  providerFamily: string,
+  model: string,
+  ccPresetId: string,
+): SupervisionExecutionConfig {
+  const value = { agentType, providerFamily, runtimeType: 'transport' as const, model, ccPresetId };
+  return { ...value, capabilityId: buildSupervisionExecutionCapabilityId(value) };
+}
+
 const OPENAI = config('codex-sdk', 'openai', 'gpt-5.6-sol');
 const ANTHROPIC = config('claude-code-sdk', 'anthropic', 'opus');
 
@@ -81,6 +91,7 @@ function harness(initial: SessionRecord[], override: Partial<SupervisionAutoProv
       runtimeType: sub.runtimeType ?? 'transport',
       providerId: sub.type === 'claude-code-sdk' ? 'anthropic' : 'openai',
       activeModel: sub.requestedModel ?? undefined,
+      ccPreset: sub.ccPreset ?? undefined,
       projectDir: sub.cwd ?? '/repo',
     }));
   });
@@ -130,7 +141,63 @@ describe('supervision auto provisioning', () => {
     const result = await provisionSupervisionTarget(request(), h.deps);
 
     expect(result).toMatchObject({ ok: true, target: { name: ready.name } });
+    expect(result).toMatchObject({ evidence: { origin: 'reused' } });
     expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('reuses only the exact ready CC preset and keeps ordinary and different-preset sessions isolated', async () => {
+    const presetA = presetConfig('claude-code-sdk', 'anthropic', 'opus[1M]', 'preset-a');
+    const brain = parent([presetA]);
+    const ordinary = session('deck_sub_ordinary', {
+      parentSession: brain.name,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+    });
+    const presetB = session('deck_sub_preset_b', {
+      parentSession: brain.name,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      ccPreset: 'preset-b',
+    });
+    const exact = session('deck_sub_preset_a', {
+      parentSession: brain.name,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      ccPreset: 'preset-a',
+    });
+    const h = harness([brain, ordinary, presetB, exact]);
+
+    const result = await provisionSupervisionTarget(request({ requestedCapabilityId: presetA.capabilityId }), h.deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      target: { name: exact.name, ccPreset: 'preset-a' },
+      evidence: { selectedConfig: presetA, origin: 'reused' },
+    });
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('does not let a preset session satisfy an ordinary same-model config', async () => {
+    const ordinaryConfig = config('claude-code-sdk', 'anthropic', 'opus');
+    const brain = parent([ordinaryConfig]);
+    const preset = session('deck_sub_preset', {
+      parentSession: brain.name,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      ccPreset: 'preset-a',
+    });
+    const h = harness([brain, preset]);
+
+    const result = await provisionSupervisionTarget(request(), h.deps);
+
+    expect(result).toMatchObject({ ok: true, evidence: { origin: 'spawned' } });
+    expect(result.ok && result.target.name).not.toBe(preset.name);
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(h.start).toHaveBeenCalledWith(expect.not.objectContaining({ ccPreset: expect.anything() }));
   });
 
   it('creates exactly one configured child, binds it to the Brain, and waits for routable identity', async () => {
@@ -142,13 +209,50 @@ describe('supervision auto provisioning', () => {
     expect(result).toMatchObject({
       ok: true,
       target: { role: 'w1', parentSession: brain.name, agentType: 'codex-sdk' },
-      evidence: { selectedPool: 'primary', selectedConfig: OPENAI },
+      evidence: { selectedPool: 'primary', selectedConfig: OPENAI, origin: 'spawned' },
     });
     expect(h.start).toHaveBeenCalledTimes(1);
     expect(h.start).toHaveBeenCalledWith(expect.objectContaining({
       type: 'codex-sdk', requestedModel: 'gpt-5.6-sol', parentSession: brain.name, fresh: true,
     }));
     expect(result.ok && result.evidence.createdSessionName).toBe(result.ok && result.target.name);
+  });
+
+  it('creates a visible child with the exact CC preset when no matching preset session is ready', async () => {
+    const presetA = presetConfig('claude-code-sdk', 'anthropic', 'opus[1M]', 'preset-a');
+    const brain = parent([presetA]);
+    const ordinary = session('deck_sub_ordinary', {
+      parentSession: brain.name,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+    });
+    const h = harness([brain, ordinary]);
+
+    const result = await provisionSupervisionTarget(request({ requestedCapabilityId: presetA.capabilityId }), h.deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      target: {
+        parentSession: brain.name,
+        userCreated: true,
+        ccPreset: 'preset-a',
+      },
+      evidence: {
+        selectedConfig: presetA,
+        origin: 'spawned',
+        provisionAttemptId: expect.any(String),
+        createdSessionName: expect.any(String),
+      },
+    });
+    expect(result.ok && result.evidence.createdSessionName).toBe(result.ok && result.target.name);
+    expect(h.start).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'claude-code-sdk',
+      requestedModel: 'opus[1M]',
+      ccPreset: 'preset-a',
+      parentSession: brain.name,
+      fresh: true,
+    }));
   });
 
   it('does not release the reservation until the created session becomes routable', async () => {
@@ -188,7 +292,8 @@ describe('supervision auto provisioning', () => {
   });
 
   it('uses one atomic reservation for concurrent requests for the same pool gap', async () => {
-    const brain = parent([OPENAI]);
+    const presetA = presetConfig('claude-code-sdk', 'anthropic', 'opus[1M]', 'preset-a');
+    const brain = parent([presetA]);
     const sessions = [brain];
     let release!: () => void;
     const launched = new Promise<void>((resolve) => { release = resolve; });
@@ -198,7 +303,9 @@ describe('supervision auto provisioning', () => {
         parentSession: brain.name,
         label: sub.label ?? undefined,
         agentType: sub.type,
+        providerId: 'anthropic',
         activeModel: sub.requestedModel ?? undefined,
+        ccPreset: sub.ccPreset ?? undefined,
       }));
     });
     const deps: SupervisionAutoProvisionDeps = {
@@ -217,6 +324,7 @@ describe('supervision auto provisioning', () => {
 
     expect(a.ok && a.target.name).toBe(b.ok && b.target.name);
     expect(start).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledWith(expect.objectContaining({ ccPreset: 'preset-a' }));
   });
 
   it('enforces the configured per-pool auto-spawn maximum and launch cooldown', async () => {
@@ -289,7 +397,7 @@ describe('supervision auto provisioning', () => {
       target: { name: fallback.name },
       auditRoutingReason: 'same_family_degraded',
       auditDegradedReason: failure === 'readiness_timeout' ? 'cross_vendor_provision_timeout' : 'cross_vendor_provision_failed',
-      evidence: { failureReason: failure },
+      evidence: { failureReason: failure, origin: 'reused', createdSessionName: undefined },
     });
     expect(result.ok && result.target.name).not.toBe(audited.name);
   });

@@ -56,6 +56,7 @@ export type SupervisionProvisionFailureReason = typeof SUPERVISION_PROVISION_FAI
 export interface SupervisionProvisioningEvidence {
   selectedPool: SupervisionProvisionPool;
   selectedConfig?: SupervisionExecutionConfig;
+  origin?: SupervisionExecutionOrigin;
   provisionAttemptId?: string;
   createdSessionName?: string;
   failureReason?: SupervisionProvisionFailureReason;

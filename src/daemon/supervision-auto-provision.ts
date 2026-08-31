@@ -109,7 +109,8 @@ function configMatchesSession(config: SupervisionExecutionConfig, session: Sessi
     && (session.runtimeType ?? 'process') === config.runtimeType
     && resolvePeerAuditProviderFamily(session) === config.providerFamily
     && typeof model === 'string'
-    && normalizeSupervisionExecutionModel(session.agentType, model) === config.model;
+    && normalizeSupervisionExecutionModel(session.agentType, model) === config.model
+    && session.ccPreset === config.ccPresetId;
 }
 
 function matchingChildren(
@@ -202,7 +203,11 @@ async function provisionConfig(
     const now = deps.now();
     const existingReady = readyChildren(deps.listSessions(), parent, config, now)[0];
     if (existingReady) {
-      return { ok: true, target: existingReady, evidence: { selectedPool, selectedConfig: config } };
+      return {
+        ok: true,
+        target: existingReady,
+        evidence: { selectedPool, selectedConfig: config, origin: 'reused' },
+      };
     }
 
     const until = cooldownUntil.get(`${parent.name}\0${request.pool}`) ?? 0;
@@ -245,6 +250,7 @@ async function provisionConfig(
           runtimeType: config.runtimeType,
           providerId: config.agentType,
           requestedModel: config.model,
+          ...(config.ccPresetId ? { ccPreset: config.ccPresetId } : {}),
           parentSession: parent.name,
           fresh: true,
           label: `Auto ${selectedPool}`,
@@ -274,6 +280,7 @@ async function provisionConfig(
           evidence: {
             selectedPool,
             selectedConfig: config,
+            origin: 'spawned',
             provisionAttemptId: identity.attemptId,
             createdSessionName: identity.sessionName,
           },
@@ -360,7 +367,11 @@ export async function provisionSupervisionTarget(
     const ready = configs.flatMap((config) => readyChildren(sessions, parent, config, deps.now()))[0];
     if (ready) {
       const config = configs.find((candidate) => configMatchesSession(candidate, ready))!;
-      return { ok: true, target: ready, evidence: { selectedPool, selectedConfig: config } };
+      return {
+        ok: true,
+        target: ready,
+        evidence: { selectedPool, selectedConfig: config, origin: 'reused' },
+      };
     }
     const config = configs[0]!;
     const status = configurationAvailability(sessions, parent, config, deps.now());
@@ -380,7 +391,7 @@ export async function provisionSupervisionTarget(
     return {
       ok: true,
       target: crossReady,
-      evidence: { selectedPool, selectedConfig: config },
+      evidence: { selectedPool, selectedConfig: config, origin: 'reused' },
       auditRoutingReason: 'cross_vendor_preferred',
     };
   }
@@ -414,7 +425,13 @@ export async function provisionSupervisionTarget(
     return {
       ok: true,
       target: sameReady,
-      evidence: { ...(crossEvidence ?? { selectedPool, selectedConfig: config }), selectedConfig: config, degradedReason },
+      evidence: {
+        ...(crossEvidence ?? { selectedPool, selectedConfig: config }),
+        selectedConfig: config,
+        origin: 'reused',
+        createdSessionName: undefined,
+        degradedReason,
+      },
       auditRoutingReason: 'same_family_degraded',
       auditDegradedReason: degradedReason,
     };
