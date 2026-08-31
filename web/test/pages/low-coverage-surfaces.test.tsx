@@ -355,6 +355,21 @@ describe('low-coverage page and component surfaces', () => {
     const view = render(<AdminPage onBack={vi.fn()} />);
 
     expect(await screen.findByText('newbie')).toBeTruthy();
+    const scrollContainer = screen.getByTestId('admin-page-scroll');
+    expect(scrollContainer.style.height).toBe('100%');
+    expect(scrollContainer.style.overflowY).toBe('auto');
+    expect(scrollContainer.style.boxSizing).toBe('border-box');
+
+    fireEvent.click(screen.getByRole('button', { name: 'admin.filter_pending (1)' }));
+    expect(screen.getByText('newbie')).toBeTruthy();
+    expect(screen.queryByText('ada')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'admin.filter_all (2)' }));
+    fireEvent.input(screen.getByPlaceholderText('admin.search_placeholder'), { target: { value: 'ada' } });
+    expect(screen.getByText('ada')).toBeTruthy();
+    expect(screen.queryByText('newbie')).toBeNull();
+    fireEvent.input(screen.getByPlaceholderText('admin.search_placeholder'), { target: { value: '' } });
+
     fireEvent.click(screen.getByText('admin.approve'));
     await waitFor(() => expect(adminApi.approveUser).toHaveBeenCalledWith('u-pending'));
 
@@ -363,5 +378,27 @@ describe('low-coverage page and component surfaces', () => {
     expect(toggleButtons.length).toBeGreaterThan(0);
     fireEvent.click(toggleButtons[0]);
     await waitFor(() => expect(adminApi.updateAdminSettings).toHaveBeenCalledWith({ registration_enabled: 'false' }));
+  });
+
+  it('AdminPage paginates filtered users and resets pagination when searching', async () => {
+    adminApi.fetchAdminUsers.mockResolvedValue(Array.from({ length: 22 }, (_, index) => ({
+      id: `user-${index + 1}`,
+      username: `user-${String(index + 1).padStart(2, '0')}`,
+      displayName: `User ${index + 1}`,
+      status: index === 21 ? 'pending' : 'active',
+      isAdmin: false,
+      createdAt: 1778460000000 + index,
+    })));
+    render(<AdminPage onBack={vi.fn()} />);
+
+    expect(await screen.findByText('user-01')).toBeTruthy();
+    expect(screen.queryByText('user-21')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'admin.next_page' }));
+    expect(screen.getByText('user-21')).toBeTruthy();
+    expect(screen.queryByText('user-01')).toBeNull();
+
+    fireEvent.input(screen.getByPlaceholderText('admin.search_placeholder'), { target: { value: 'user-01' } });
+    expect(screen.getByText('user-01')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'admin.previous_page' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

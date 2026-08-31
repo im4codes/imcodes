@@ -6967,7 +6967,7 @@ export function App() {
       )}
 
       {showAdminPage && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden' }}>
           <AdminPage onBack={() => setShowAdminPage(false)} />
         </div>
       )}

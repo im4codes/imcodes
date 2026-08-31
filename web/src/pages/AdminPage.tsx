@@ -15,6 +15,9 @@ interface Props {
   onBack: () => void;
 }
 
+type UserStatusFilter = 'all' | 'pending' | 'active' | 'disabled';
+const USERS_PER_PAGE = 20;
+
 export function AdminPage({ onBack }: Props) {
   const { t } = useTranslation();
 
@@ -23,6 +26,9 @@ export function AdminPage({ onBack }: Props) {
   const [loading, setLoading] = useState(true);
   const [confirmAction, setConfirmAction] = useState<{ type: 'disable' | 'delete'; user: AdminUser } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<UserStatusFilter>('all');
+  const [usernameQuery, setUsernameQuery] = useState('');
+  const [requestedPage, setRequestedPage] = useState(1);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -78,6 +84,20 @@ export function AdminPage({ onBack }: Props) {
 
   const registrationEnabled = settings['registration_enabled'] === 'true';
   const requireApproval = settings['require_approval'] === 'true';
+  const normalizedUsernameQuery = usernameQuery.trim().toLocaleLowerCase();
+  const filteredUsers = users.filter((user) => (
+    (statusFilter === 'all' || user.status === statusFilter)
+    && (!normalizedUsernameQuery || (user.username ?? '').toLocaleLowerCase().includes(normalizedUsernameQuery))
+  ));
+  const totalPages = Math.max(1, Math.ceil(filteredUsers.length / USERS_PER_PAGE));
+  const currentPage = Math.min(requestedPage, totalPages);
+  const visibleUsers = filteredUsers.slice((currentPage - 1) * USERS_PER_PAGE, currentPage * USERS_PER_PAGE);
+  const statusCounts: Record<UserStatusFilter, number> = {
+    all: users.length,
+    pending: users.filter((user) => user.status === 'pending').length,
+    active: users.filter((user) => user.status === 'active').length,
+    disabled: users.filter((user) => user.status === 'disabled').length,
+  };
 
   const cardStyle: Record<string, string> = {
     background: '#1e293b',
@@ -121,7 +141,13 @@ export function AdminPage({ onBack }: Props) {
   };
 
   return (
-    <div style={{ background: '#0a0e1a', color: '#e2e8f0', minHeight: '100%', padding: '20px', overflowY: 'auto' }}>
+    <div
+      data-testid="admin-page-scroll"
+      style={{
+        background: '#0a0e1a', color: '#e2e8f0', height: '100%', minHeight: 0,
+        boxSizing: 'border-box', padding: '20px', overflowY: 'auto', WebkitOverflowScrolling: 'touch',
+      }}
+    >
       <div style={{ maxWidth: '720px', margin: '0 auto' }}>
         <button onClick={onBack} style={{ ...btnSecondary, marginBottom: '20px' }}>
           {t('admin.back')}
@@ -173,8 +199,50 @@ export function AdminPage({ onBack }: Props) {
             {/* User List */}
             <div style={cardStyle}>
               <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '16px', color: '#94a3b8' }}>
-                {t('admin.users')} ({users.length})
+                {t('admin.users')} ({filteredUsers.length}/{users.length})
               </h2>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '14px' }}>
+                <input
+                  type="search"
+                  value={usernameQuery}
+                  onInput={(event) => {
+                    setUsernameQuery(event.currentTarget.value);
+                    setRequestedPage(1);
+                  }}
+                  placeholder={t('admin.search_placeholder')}
+                  aria-label={t('admin.search_placeholder')}
+                  style={{
+                    width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: '8px',
+                    border: '1px solid #475569', background: '#0f172a', color: '#e2e8f0', fontSize: '13px',
+                    outline: 'none',
+                  }}
+                />
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                  {(['all', 'pending', 'active', 'disabled'] as const).map((filter) => {
+                    const selected = statusFilter === filter;
+                    return (
+                      <button
+                        key={filter}
+                        type="button"
+                        aria-pressed={selected}
+                        onClick={() => {
+                          setStatusFilter(filter);
+                          setRequestedPage(1);
+                        }}
+                        style={{
+                          padding: '6px 10px', borderRadius: '9999px', cursor: 'pointer', fontSize: '12px',
+                          border: selected ? '1px solid #60a5fa' : '1px solid #475569',
+                          background: selected ? '#3b82f633' : '#0f172a',
+                          color: selected ? '#93c5fd' : '#94a3b8',
+                        }}
+                      >
+                        {t(`admin.filter_${filter}`)} ({statusCounts[filter]})
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
 
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
@@ -189,7 +257,7 @@ export function AdminPage({ onBack }: Props) {
                     </tr>
                   </thead>
                   <tbody>
-                    {users.map((user) => (
+                    {visibleUsers.map((user) => (
                       <tr key={user.id} style={{ borderBottom: '1px solid #1e293b' }}>
                         <td style={{ padding: '10px 8px' }}>{user.username ?? '-'}</td>
                         <td style={{ padding: '10px 8px', color: '#94a3b8' }}>{user.displayName ?? '-'}</td>
@@ -227,9 +295,39 @@ export function AdminPage({ onBack }: Props) {
                         </td>
                       </tr>
                     ))}
+                    {filteredUsers.length === 0 && (
+                      <tr>
+                        <td colSpan={6} style={{ padding: '24px 8px', textAlign: 'center', color: '#64748b' }}>
+                          {t('admin.no_users_found')}
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
+              {filteredUsers.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px', marginTop: '14px' }}>
+                  <button
+                    type="button"
+                    disabled={currentPage === 1}
+                    onClick={() => setRequestedPage((page) => Math.max(1, page - 1))}
+                    style={{ ...btnSecondary, padding: '6px 10px', opacity: currentPage === 1 ? 0.45 : 1 }}
+                  >
+                    {t('admin.previous_page')}
+                  </button>
+                  <span style={{ color: '#94a3b8', fontSize: '12px', minWidth: '88px', textAlign: 'center' }}>
+                    {t('admin.page_info', { current: currentPage, total: totalPages })}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={currentPage === totalPages}
+                    onClick={() => setRequestedPage((page) => Math.min(totalPages, page + 1))}
+                    style={{ ...btnSecondary, padding: '6px 10px', opacity: currentPage === totalPages ? 0.45 : 1 }}
+                  >
+                    {t('admin.next_page')}
+                  </button>
+                </div>
+              )}
             </div>
           </>
         )}
