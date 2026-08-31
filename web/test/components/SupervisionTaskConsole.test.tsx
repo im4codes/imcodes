@@ -560,6 +560,41 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.getByText('supervision_task_console.event_op.assignment_upsert')).toBeTruthy();
   });
 
+  it('does not count stale aggregate rows as active without a required live lease', () => {
+    const tasks = {
+      live: {
+        taskId: 'live', title: 'Live', status: 'implementing' as const, phase: 'active' as const,
+        validationState: 'pending' as const, updatedAt: NOW, lastEventId: 1,
+      },
+      stale: {
+        taskId: 'stale', title: 'Stale', status: 'implementing' as const, phase: 'active' as const,
+        validationState: 'passed' as const, updatedAt: NOW - 1, lastEventId: 2,
+      },
+      settled: {
+        taskId: 'settled', title: 'Settled', status: 'implementing' as const, phase: 'active' as const,
+        validationState: 'passed' as const, updatedAt: NOW - 2, lastEventId: 3,
+      },
+    };
+    const assignment = (taskId: string, status: 'implementing' | 'validated' | 'finalized', leaseActive: boolean) => ({
+      assignmentId: `asg-${taskId}`, taskId, status,
+      phase: supervisionConsoleStatusGroup(status), role: 'implementer', required: true, leaseActive,
+      validationState: 'passed' as const, updatedAt: NOW, lastEventId: 4,
+    });
+    render(<SupervisionTaskConsoleView state={state({
+      tasks,
+      assignments: {
+        live: assignment('live', 'implementing', true),
+        stale: assignment('stale', 'validated', false),
+        settled: assignment('settled', 'finalized', false),
+      },
+    })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
+
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 1/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 1/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_history 1/ })).toBeTruthy();
+    expect(screen.getByTestId('task-card-live')).toBeTruthy();
+  });
+
   it('limits history to ten rows until show-more is requested', () => {
     const tasks = Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`done-${index}`, {
       taskId: `done-${index}`, title: `Done ${index}`, status: 'pushed' as const, phase: 'final' as const,

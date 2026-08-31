@@ -712,6 +712,7 @@ const AUDIT_RECEIPT_TO_AUDITING: Partial<Record<SupervisionTaskLifecycleStatus, 
 };
 
 const AUDIT_RECEIPT_PENDING_TARGET_STATUSES = new Set<SupervisionTaskLifecycleStatus>([
+  'validated',
   'ready_for_audit',
   'auditing',
   'rework',
@@ -1055,6 +1056,12 @@ export class SupervisionTaskRegistry {
     // it to one small page. Broader archive/aggregate cleanup remains inert
     // until Brain inspects dry-run counts and explicitly authorizes apply.
     this.#reconcileCancelledTaskResources();
+    // A final authenticated receipt is durable authority, but older daemons
+    // could crash (or reject the follow-up FINISHED edge) after persisting it
+    // and before releasing the auditor/implementer leases. Repair only exact,
+    // unambiguous rows through the ordinary finish path. Any refusal is a
+    // zero-mutation no-op, leaving the same-object Brain/manual fallback live.
+    this.#reconcileAcceptedFinalAuditReceipts();
   }
 
   /** Atomically repair rows left by the legacy task-only cancel write. */
@@ -1103,6 +1110,43 @@ export class SupervisionTaskRegistry {
     } catch (error) {
       this.#db.exec('ROLLBACK');
       throw error;
+    }
+  }
+
+  #reconcileAcceptedFinalAuditReceipts(): void {
+    const rows = this.#db.prepare(`
+      SELECT DISTINCT a.assignment_id AS assignmentId
+      FROM supervision_task_assignments a
+      INNER JOIN supervision_audit_receipts r
+        ON r.assignment_id = a.assignment_id
+       AND r.attempt_id = a.audit_attempt_id
+       AND r.revision = a.audit_revision
+       AND r.receipt_kind = 'final'
+      WHERE a.role = 'auditor'
+        AND a.status NOT IN ('finalized', 'cancelled', 'committed', 'pushed')
+      ORDER BY a.updated_at ASC, a.assignment_id ASC
+      LIMIT ${SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE}
+    `).all() as Array<{ assignmentId?: unknown }>;
+    for (const row of rows) {
+      if (typeof row.assignmentId !== 'string') continue;
+      const assignment = this.getAssignment(row.assignmentId);
+      if (!assignment?.auditRevision) continue;
+      // finishAssignment revalidates the latest final receipt, exact
+      // attempt/revision, unique target, identity and legal transitions under
+      // its own write transaction. A refusal preserves every byte of history.
+      try {
+        this.finishAssignment({
+          assignmentId: assignment.assignmentId,
+          identity: assignment.identity,
+          revision: assignment.auditRevision,
+        });
+      } catch (error) {
+        // Startup must remain available so Brain can use the same-object
+        // manual recovery path. The receipt and every assignment stay intact
+        // because finishAssignment owns an atomic transaction.
+        logger.warn({ err: error, assignmentId: assignment.assignmentId },
+          'Accepted supervision audit receipt reconciliation deferred');
+      }
     }
   }
 
@@ -2194,6 +2238,8 @@ export class SupervisionTaskRegistry {
           current = {
             ...current,
             status,
+            leaseId: '',
+            cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
             auditAttemptId: existing.auditAttemptId,
             auditRevision: existing.auditRevision,
             verdict: authenticatedAuditVerdict,
@@ -2211,6 +2257,8 @@ export class SupervisionTaskRegistry {
               verdict: authenticatedAuditVerdict,
             });
         }
+        this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE assignment_id = ?')
+          .run(authenticatedAuditTarget.assignmentId);
       }
       if (bindMissingTaskRevision) {
         this.#writeTask({ ...task, currentRevision: resolvedRevision, updatedAt: now }, this.#taskEventFor(task.status), {
@@ -3443,9 +3491,18 @@ export class SupervisionTaskRegistry {
       this.#applyHousekeepingAction(reworkProjectionRepair, now);
       return;
     }
-    const required = assignments.filter((assignment) => (
-      assignment.required && assignment.role !== 'auditor' && assignment.status !== 'cancelled'
+    // Pre-integration aggregate authority belongs to required implementers.
+    // A coordinator is an observer/orchestrator and an auditor is represented
+    // by its authenticated receipt; stale rows in either role must not hold an
+    // otherwise matching implementation PASS at ready_for_audit forever.
+    const requiredImplementers = assignments.filter((assignment) => (
+      assignment.required && assignment.role === 'implementer' && assignment.status !== 'cancelled'
     ));
+    const required = requiredImplementers.length > 0
+      ? requiredImplementers
+      : assignments.filter((assignment) => (
+          assignment.required && assignment.role === 'integration_owner' && assignment.status !== 'cancelled'
+        ));
     if (required.length === 0) return;
     const next = required.every((assignment) => assignment.status === 'finalized')
       ? 'finalized'

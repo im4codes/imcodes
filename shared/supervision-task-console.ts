@@ -283,6 +283,46 @@ export function supervisionConsoleTabForStatus(
   return SUPERVISION_CONSOLE_TAB_BY_STATUS[status];
 }
 
+/**
+ * Resolve the product tab from durable task authority plus the assignments
+ * that can actually keep an active lifecycle alive.
+ *
+ * A stale aggregate task row must never look Active merely because an old
+ * runtime is still running or idle. Active requires at least one required,
+ * leased assignment whose own lifecycle is active. Settled required
+ * assignments move a stale active aggregate to History; every other mismatch
+ * is conservatively Pending until the registry repairs it.
+ */
+export function supervisionConsoleTabForTask(
+  task: Pick<SupervisionTaskConsoleTaskRow, 'status'>,
+  assignments: readonly Pick<
+    SupervisionTaskConsoleAssignmentRow,
+    'role' | 'required' | 'leaseActive' | 'status'
+  >[],
+): SupervisionConsoleTab {
+  const taskTab = supervisionConsoleTabForStatus(task.status);
+  if (taskTab !== 'active') return taskTab;
+  const required = assignments.filter((assignment) => (
+    assignment.required === true
+    || (assignment.required === undefined
+      && (assignment.role === 'implementer' || assignment.role === 'auditor'))
+  ));
+  // Old cached snapshots predate leaseActive. Preserve their task-status
+  // partition until a fresh authoritative snapshot arrives rather than
+  // manufacturing a downgrade from missing wire data.
+  if (required.length === 0 || required.some((assignment) => assignment.leaseActive === undefined)) {
+    return taskTab;
+  }
+  if (required.some((assignment) => (
+    assignment.leaseActive === true
+    && supervisionConsoleTabForStatus(assignment.status) === 'active'
+  ))) return 'active';
+  if (required.length > 0 && required.every((assignment) => (
+    supervisionConsoleTabForStatus(assignment.status) === 'history'
+  ))) return 'history';
+  return 'pending';
+}
+
 /** Authoritative session activity presented by the daemon; never heartbeat-derived. */
 export const SUPERVISION_CONSOLE_SESSION_STATES = [
   'running', 'idle', 'needs_input', 'offline', 'unknown',
@@ -348,6 +388,10 @@ export interface SupervisionTaskConsoleAssignmentRow {
   phase: SupervisionConsoleStatusGroup;
   /** Free-form slice role, e.g. "implementer" / "auditor". */
   role?: string;
+  /** Durable participation authority; projected as a boolean only. */
+  required?: boolean;
+  /** Whether a non-empty durable lease exists. The lease id never crosses the wire. */
+  leaseActive?: boolean;
   ownerSessionName?: string;
   /** Human label; may differ from the canonical session name. */
   ownerSessionLabel?: string;
@@ -592,6 +636,8 @@ function isAssignmentRow(value: unknown): boolean {
     && typeof value.taskId === 'string'
     && isSupervisionTaskLifecycleStatus(value.status)
     && hasDerivedPhase(value)
+    && (value.required === undefined || typeof value.required === 'boolean')
+    && (value.leaseActive === undefined || typeof value.leaseActive === 'boolean')
     && (value.auditVerdict === undefined || isPeerAuditVerdict(value.auditVerdict))
     && (value.poolKind === undefined || (SUPERVISION_EXECUTION_POOL_KINDS as readonly string[]).includes(value.poolKind as string))
     && (value.sessionState === undefined || (SUPERVISION_CONSOLE_SESSION_STATES as readonly string[]).includes(value.sessionState as string))

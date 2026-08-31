@@ -20,6 +20,7 @@ import {
   isValidSupervisionTaskConsoleEvent,
   supervisionConsoleStatusGroup,
   supervisionConsoleTabForStatus,
+  supervisionConsoleTabForTask,
   type SupervisionTaskConsoleCursorState,
   type SupervisionTaskConsoleTaskRow,
 } from '../../shared/supervision-task-console.js';
@@ -95,6 +96,22 @@ describe('supervision task console status grouping', () => {
     expect(supervisionConsoleTabForStatus('ready_for_integration')).toBe('pending');
     expect(supervisionConsoleTabForStatus('blocked')).toBe('pending');
     expect(supervisionConsoleTabForStatus('cancelled')).toBe('history');
+  });
+
+  it('downgrades a stale active aggregate from durable required-assignment authority', () => {
+    const task = taskRow({ status: 'implementing' });
+    expect(supervisionConsoleTabForTask(task, [{
+      role: 'implementer', required: true, leaseActive: true, status: 'implementing',
+    }])).toBe('active');
+    expect(supervisionConsoleTabForTask(task, [{
+      role: 'implementer', required: true, leaseActive: false, status: 'validated',
+    }])).toBe('pending');
+    expect(supervisionConsoleTabForTask(task, [{
+      role: 'implementer', required: true, leaseActive: false, status: 'finalized',
+    }])).toBe('history');
+    expect(supervisionConsoleTabForTask(task, [{
+      role: 'implementer', status: 'implementing',
+    }])).toBe('active');
   });
 });
 

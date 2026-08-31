@@ -221,7 +221,9 @@ describe('automatic supervision audit materialization', () => {
       session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
     ];
     let hasEvidence = false;
-    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+    const dispatch = vi.fn(async (caller: SendRuntimeCaller, input: SendMessageInput) => {
+      expect(caller).toMatchObject({ userId: 'deck_alpha_brain', sessionName: 'deck_alpha_brain' });
+      expect(input.target).toBe('deck_alpha_auditor');
       expect(input.audit).toMatchObject({
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId: automaticAttempt(taskId, revision),

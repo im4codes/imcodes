@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import {
   SUPERVISION_CONSOLE_TABS,
   supervisionConsoleStatusGroup,
-  supervisionConsoleTabForStatus,
+  supervisionConsoleTabForTask,
   type SupervisionConsoleTab,
   type SupervisionConsoleSessionState,
   type SupervisionTaskConsoleAssignmentRow,
@@ -138,7 +138,7 @@ function taskPriority(
   assignments: readonly SupervisionTaskConsoleAssignmentRow[],
 ): number {
   const roleAssignments = taskRoleAssignments(assignments);
-  const tab = supervisionConsoleTabForStatus(task.status);
+  const tab = supervisionConsoleTabForTask(task, assignments);
   if (task.status === 'blocked' || task.blocker) return 0;
   if (tab !== 'active') {
     const group = supervisionConsoleStatusGroup(task.status);
@@ -158,7 +158,7 @@ function authoritativeActivityAt(
   task: SupervisionTaskConsoleTaskRow,
   assignments: readonly SupervisionTaskConsoleAssignmentRow[],
 ): number {
-  if (supervisionConsoleTabForStatus(task.status) !== 'active') return task.updatedAt;
+  if (supervisionConsoleTabForTask(task, assignments) !== 'active') return task.updatedAt;
   const roleAssignments = taskRoleAssignments(assignments);
   if (roleAssignments.length === 0) return task.updatedAt;
   return Math.max(...roleAssignments.map((assignment) => (
@@ -230,7 +230,7 @@ function TaskCard(props: {
   const { t } = useTranslation();
   const implementer = props.assignments.find(isImplementerAssignment);
   const auditor = props.assignments.find(isAuditAssignment);
-  const taskTab = supervisionConsoleTabForStatus(props.task.status);
+  const taskTab = supervisionConsoleTabForTask(props.task, props.assignments);
   const dominantState = taskTab === 'history'
     ? 'terminal'
     : taskTab === 'pending'
@@ -358,14 +358,14 @@ export function SupervisionTaskConsoleView(props: {
   }, [props.state.assignments]);
   const allTasks = useMemo(() => Object.values(props.state.tasks).filter((task) => isSupervisionTaskLifecycleStatus(task.status)), [props.state.tasks]);
   const historyTasks = useMemo(() => allTasks
-    .filter((task) => supervisionConsoleTabForStatus(task.status) === 'history')
+    .filter((task) => supervisionConsoleTabForTask(task, assignmentsByTask.get(task.taskId) ?? []) === 'history')
     .sort((left, right) => right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId)), [allTasks]);
   const activeTasks = useMemo(() => sortSupervisionConsoleTasks(
-    allTasks.filter((task) => supervisionConsoleTabForStatus(task.status) === 'active'),
+    allTasks.filter((task) => supervisionConsoleTabForTask(task, assignmentsByTask.get(task.taskId) ?? []) === 'active'),
     assignmentsByTask,
   ), [allTasks, assignmentsByTask]);
   const pendingTasks = useMemo(() => sortSupervisionConsoleTasks(
-    allTasks.filter((task) => supervisionConsoleTabForStatus(task.status) === 'pending'),
+    allTasks.filter((task) => supervisionConsoleTabForTask(task, assignmentsByTask.get(task.taskId) ?? []) === 'pending'),
     assignmentsByTask,
   ), [allTasks, assignmentsByTask]);
 

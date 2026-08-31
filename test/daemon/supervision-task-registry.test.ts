@@ -2415,6 +2415,150 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('repairs an accepted final receipt crash window on reopen without losing manual fallback history', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-final-receipt-reconcile-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'accepted-final-receipt-reconcile';
+    const revision = 'accepted-final-receipt-r1';
+    const attemptId = 'accepted-final-receipt-attempt';
+    const implementerIdentity = identity('deck_receipt_worker');
+    const coordinatorIdentity = identity('deck_receipt_brain');
+    const auditorIdentity = identity('deck_receipt_auditor');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'recover exact accepted final receipt', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const implementer = registry.createAssignment({
+        taskId, role: 'implementer', identity: implementerIdentity, auditRevision: revision,
+      });
+      const coordinator = registry.createAssignment({
+        taskId, role: 'coordinator', identity: coordinatorIdentity, auditRevision: revision,
+      });
+      const auditor = registry.createAssignment({
+        taskId, role: 'auditor', identity: auditorIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!implementer.ok || !coordinator.ok || !auditor.ok) throw new Error('expected assignments');
+      for (const status of ['implementing', 'validated'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
+        })).toMatchObject({ ok: true });
+      }
+      for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+        expect(registry.updateAssignment({
+          assignmentId: coordinator.value.assignmentId, identity: coordinatorIdentity, status,
+        })).toMatchObject({ ok: true });
+      }
+      for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+        expect(registry.updateTask({ taskId, status })).toMatchObject({ ok: true });
+      }
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'exact PASS persisted before crash',
+        validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'passed' }],
+        now: 100,
+      })).toMatchObject({ ok: true, value: { verdict: 'PASS' } });
+      expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({ status: 'auditing' });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({ status: 'validated' });
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.listAuditReceipts(taskId)).toEqual([
+        expect.objectContaining({ attemptId, revision, receiptKind: 'final', verdict: 'PASS' }),
+      ]);
+      expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
+        status: 'finalized', leaseId: '', verdict: 'PASS',
+      });
+      expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+        status: 'ready_for_integration', leaseId: '', auditAttemptId: attemptId,
+        auditRevision: revision, verdict: 'PASS', crossVendorAuditPassed: true,
+      });
+      expect(registry.getAssignment(coordinator.value.assignmentId)).toMatchObject({ status: 'ready_for_audit' });
+      expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision,
+      })).toMatchObject({ ok: true, replay: true });
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an ambiguous accepted receipt recoverable instead of blocking registry startup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-final-receipt-fallback-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const taskId = 'accepted-final-receipt-fallback';
+    const revision = 'accepted-final-receipt-fallback-r1';
+    const attemptId = 'accepted-final-receipt-fallback-attempt';
+    const primaryIdentity = identity('deck_receipt_primary');
+    const staleIdentity = identity('deck_receipt_stale');
+    const auditorIdentity = identity('deck_receipt_fallback_auditor');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'preserve same-object fallback after ambiguous receipt', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const primary = registry.createAssignment({
+        taskId, role: 'implementer', identity: primaryIdentity, auditRevision: revision,
+      });
+      const stale = registry.createAssignment({
+        taskId, role: 'implementer', identity: staleIdentity, auditRevision: revision,
+      });
+      const auditor = registry.createAssignment({
+        taskId, role: 'auditor', identity: auditorIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!primary.ok || !stale.ok || !auditor.ok) throw new Error('expected assignments');
+      for (const worker of [primary.value, stale.value]) {
+        for (const status of ['implementing', 'validated'] as const) {
+          expect(registry.updateAssignment({
+            assignmentId: worker.assignmentId, identity: worker.identity, status,
+          })).toMatchObject({ ok: true });
+        }
+      }
+      for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+        expect(registry.updateTask({ taskId, status })).toMatchObject({ ok: true });
+      }
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+        auditorIdentity, findings: 'exact PASS retained across fallback',
+        validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'passed' }],
+        now: 100,
+      })).toMatchObject({ ok: true });
+      registry.close();
+
+      // The bounded boot repair must fail closed on ambiguity without making
+      // the registry unavailable or consuming the immutable receipt.
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
+        status: 'auditing', leaseId: expect.any(String), verdict: 'PASS',
+      });
+      expect(registry.listAuditReceipts(taskId)).toEqual([
+        expect.objectContaining({ attemptId, revision, receiptKind: 'final', verdict: 'PASS' }),
+      ]);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: stale.value.assignmentId,
+        intent: 'cancel', toStatus: 'cancelled', note: 'Brain resolved exact stale candidate',
+      })).toMatchObject({ ok: true });
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+      expect(registry.getAssignment(primary.value.assignmentId)).toMatchObject({
+        status: 'ready_for_integration', leaseId: '', auditAttemptId: attemptId,
+        auditRevision: revision, verdict: 'PASS',
+      });
+      expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('atomically propagates receipted PASS authority to structured finalization and replays after reopen', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-audit-finish-finalization-'));
     const dbPath = join(dir, 'supervision-state.sqlite');

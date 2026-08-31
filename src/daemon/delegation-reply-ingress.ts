@@ -122,13 +122,20 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   );
 }
 
-function delegatedPeerAuditResult(envelope: PeerAuditReplyEnvelope): string {
+function delegatedPeerAuditResult(
+  envelope: PeerAuditReplyEnvelope,
+  assignmentHandoff?: { status: 'finished'; replay: boolean } | { status: 'blocked'; exactError: string },
+): string {
   return JSON.stringify({
     status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+    taskId: envelope.taskId,
+    assignmentId: envelope.assignmentId,
     attemptId: envelope.attemptId,
+    revision: envelope.revision,
     verdict: envelope.verdict,
     findings: envelope.findings,
     validations: envelope.validations,
+    ...(assignmentHandoff ? { assignmentHandoff } : {}),
   });
 }
 
@@ -185,6 +192,7 @@ async function submitDelegatedPeerAuditReply(input: {
   if (!evidence.ok) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
   }
+  let assignmentHandoff: { status: 'finished'; replay: boolean } | { status: 'blocked'; exactError: string } | undefined;
   if (authority.auditRevision && authority.auditedSessionName) {
     const persisted = registry.appendMatchingAuditReceipt({
       taskId,
@@ -215,10 +223,37 @@ async function submitDelegatedPeerAuditReply(input: {
               : PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH;
       return { ok: false, error };
     }
+    // Progress is durable registry evidence, not a user-facing completion.
+    // Keep the reply authority open and avoid normal intermediate chatter in
+    // the Brain session. The one final PASS/REWORK notification below carries
+    // the exact binding and completion/blocker result.
+    if (receiptKind === 'progress') return { ok: true };
+    if (persisted.ok) {
+      try {
+        const finished = registry.finishAssignment({
+          assignmentId,
+          identity: auditAssignment.identity,
+          revision,
+          now: input.receivedAt,
+        });
+        assignmentHandoff = finished.ok
+          ? { status: 'finished', replay: finished.replay === true }
+          : { status: 'blocked', exactError: `task finish rejected: ${finished.reason}` };
+      } catch (error) {
+        // The final receipt remains immutable and the existing assignment is
+        // still recoverable through its ordinary owner/Brain same-object
+        // finish path. Surface this once in the durable final notification;
+        // never turn a cleanup failure into a lost verdict.
+        assignmentHandoff = {
+          status: 'blocked',
+          exactError: `task finish failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
   }
   const received = getDelegationReplyStore().receive({
     delegationId: authority.delegationId,
-    result: delegatedPeerAuditResult(input.envelope),
+    result: delegatedPeerAuditResult(input.envelope, assignmentHandoff),
     sender: senderIdentity,
     authorizedSender: {
       sessionName: auditAssignment.identity.sessionName,

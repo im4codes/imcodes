@@ -221,6 +221,8 @@ describe('restart reconstruction from SQLite alone', () => {
 describe('assignment, pool and validation projections', () => {
   it('projects assignments with pool kind, observed provider and validation state', () => {
     seedTask('implementing');
+    db.prepare("UPDATE supervision_task_assignments SET payload_json=? WHERE assignment_id='asg_console'")
+      .run(JSON.stringify({ required: true }));
     db.prepare(`UPDATE supervision_task_assignments SET pool_kind='primary',
       validation_state='passed', observed_model='gpt-5.6-sol', observed_provider='openai',
       heartbeat_at=555 WHERE assignment_id='asg_console'`).run();
@@ -229,9 +231,19 @@ describe('assignment, pool and validation projections', () => {
     expect(rows[0]).toMatchObject({
       assignmentId: 'asg_console', taskId: 'tsk_console', status: 'implementing', phase: 'active',
       role: 'implementer', ownerSessionName: 'deck_sub_4s48141x', poolKind: 'primary',
+      required: true, leaseActive: true,
       observedModel: 'gpt-5.6-sol', observedProvider: 'openai', validationState: 'passed',
       heartbeatAt: 555,
     });
+  });
+
+  it('projects only lease presence and never exposes the durable lease id', () => {
+    seedTask('implementing');
+    const row = producer().readAssignmentRows(SCOPE.projectName)[0]!;
+    expect(row.leaseActive).toBe(true);
+    expect(row).not.toHaveProperty('leaseId');
+    db.prepare("UPDATE supervision_task_assignments SET lease_id='' WHERE assignment_id='asg_console'").run();
+    expect(producer().readAssignmentRows(SCOPE.projectName)[0]!.leaseActive).toBe(false);
   });
 
   it('falls back to provider_family when no observed provider is recorded', () => {

@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => ({
   },
   timelineEmit: vi.fn(),
   appendMatchingAuditReceipt: vi.fn(),
+  finishAssignment: vi.fn(),
   getAssignment: vi.fn(),
 }));
 
@@ -52,6 +53,7 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 vi.mock('../../src/daemon/supervision-state-store.js', () => ({
   getSupervisionTaskRegistry: () => ({
     appendMatchingAuditReceipt: mocks.appendMatchingAuditReceipt,
+    finishAssignment: mocks.finishAssignment,
     getAssignment: mocks.getAssignment,
   }),
 }));
@@ -133,6 +135,7 @@ describe('delegation reply ingress', () => {
     mocks.store.listReceived.mockReset().mockReturnValue([]);
     mocks.timelineEmit.mockReset();
     mocks.appendMatchingAuditReceipt.mockReset().mockReturnValue({ ok: true, value: {} });
+    mocks.finishAssignment.mockReset().mockReturnValue({ ok: true, value: {}, replay: false });
     mocks.getAssignment.mockReset();
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
   });
@@ -252,6 +255,14 @@ describe('delegation reply ingress', () => {
       authorizedSender: target,
       result: expect.stringContaining('"verdict":"PASS"'),
     }));
+    const visibleResult = JSON.parse(mocks.store.receive.mock.calls[0]![0].result) as Record<string, unknown>;
+    expect(visibleResult).toMatchObject({
+      taskId: auditRecord.taskId,
+      assignmentId: auditRecord.assignmentId,
+      attemptId: auditRecord.auditAttemptId,
+      revision: auditRecord.auditRevision,
+      verdict: 'PASS',
+    });
     expect(mocks.appendMatchingAuditReceipt).toHaveBeenCalledWith({
       taskId: auditRecord.taskId,
       auditorAssignmentId: auditRecord.assignmentId,
@@ -266,12 +277,91 @@ describe('delegation reply ingress', () => {
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '29 passed' }],
       now: 100,
     });
+    expect(mocks.finishAssignment).toHaveBeenCalledWith({
+      assignmentId: auditRecord.assignmentId,
+      identity: expect.objectContaining(target),
+      revision: auditRecord.auditRevision,
+      now: 100,
+    });
+    expect(visibleResult.assignmentHandoff).toEqual({ status: 'finished', replay: false });
     expect(mocks.timelineEmit).toHaveBeenCalledWith(
       origin.sessionName,
       AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
       expect.objectContaining({ result: expect.stringContaining('"attemptId":"attempt_manual_audit_1"') }),
       expect.any(Object),
     );
+  });
+
+  it('persists progress without Brain chatter and reports a blocked final handoff once', async () => {
+    const auditRecord = {
+      ...record,
+      purpose: 'supervision_audit' as const,
+      auditAttemptId: 'attempt_quiet_progress_1',
+      auditRevision: 'revision-quiet-progress-1',
+      auditedSessionName: origin.sessionName,
+      taskId: 'supervision_task_quiet_progress_1',
+      assignmentId: 'supervision_assignment_quiet_progress_1',
+    };
+    mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
+    mocks.store.receive.mockImplementation((input: { result: string }) => ({
+      ok: true, record: { ...auditRecord, result: input.result }, replay: false,
+    }));
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: auditRecord.assignmentId,
+      taskId: auditRecord.taskId,
+      role: 'auditor',
+      auditAttemptId: auditRecord.auditAttemptId,
+      auditRevision: auditRecord.auditRevision,
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId: auditRecord.taskId,
+        assignmentId: auditRecord.assignmentId,
+        attemptId: auditRecord.auditAttemptId,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'progress',
+        findings: 'Evidence inspection is complete.',
+        validations: [],
+      }),
+      senderSessionName: target.sessionName,
+      now: 100,
+    })).resolves.toEqual({ ok: true });
+    expect(mocks.appendMatchingAuditReceipt).toHaveBeenCalledOnce();
+    expect(mocks.store.receive).not.toHaveBeenCalled();
+    expect(mocks.timelineEmit).not.toHaveBeenCalled();
+    expect(mocks.finishAssignment).not.toHaveBeenCalled();
+
+    mocks.finishAssignment.mockReturnValue({ ok: false, reason: 'old_revision' });
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId: auditRecord.taskId,
+        assignmentId: auditRecord.assignmentId,
+        attemptId: auditRecord.auditAttemptId,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'final',
+        verdict: 'REWORK',
+        findings: 'Exact blocker remains.',
+        validations: [{ kind: 'test', label: 'focused', outcome: 'failed', summary: 'counterexample failed' }],
+      }),
+      senderSessionName: target.sessionName,
+      now: 110,
+    })).resolves.toEqual({ ok: true });
+    expect(mocks.store.receive).toHaveBeenCalledOnce();
+    const result = JSON.parse(mocks.store.receive.mock.calls[0]![0].result) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      taskId: auditRecord.taskId,
+      assignmentId: auditRecord.assignmentId,
+      attemptId: auditRecord.auditAttemptId,
+      revision: auditRecord.auditRevision,
+      verdict: 'REWORK',
+      assignmentHandoff: { status: 'blocked', exactError: 'task finish rejected: old_revision' },
+    });
+    expect(mocks.timelineEmit).toHaveBeenCalledOnce();
   });
 
   it('rejects a delegated audit receipt that contradicts the authoritative task revision', async () => {

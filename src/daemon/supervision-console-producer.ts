@@ -292,7 +292,8 @@ export class SupervisionConsoleProducer {
       `SELECT a.assignment_id, a.task_id, a.role, a.status, a.session_name, a.agent_type, a.provider_family,
               a.pool_kind, a.validation_state, a.observed_model, a.observed_provider, a.heartbeat_at,
               a.audit_attempt_id, a.verdict, a.blocker, a.next_action,
-              a.recovery_state, a.recovery_reason, a.last_durable_event_id, a.updated_at
+              a.recovery_state, a.recovery_reason, a.last_durable_event_id, a.updated_at,
+              a.lease_id, a.payload_json
        FROM supervision_task_assignments a
        INNER JOIN supervision_tasks t ON t.task_id = a.task_id
        WHERE t.project_name = ? ORDER BY a.assignment_id ASC`,
@@ -306,6 +307,11 @@ export class SupervisionConsoleProducer {
       const verdict = row.verdict === 'PASS' || row.verdict === 'REWORK' ? row.verdict : undefined;
       const ownerSessionName = row.session_name ? String(row.session_name) : undefined;
       const durableObservedAt = Number(row.updated_at ?? 0);
+      let required: boolean | undefined;
+      try {
+        const payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>;
+        if (typeof payload.required === 'boolean') required = payload.required;
+      } catch { /* malformed legacy payload keeps the conservative browser fallback */ }
       const presentation = ownerSessionName
         ? this.#resolveSessionPresentation?.(ownerSessionName, durableObservedAt)
         : undefined;
@@ -315,6 +321,8 @@ export class SupervisionConsoleProducer {
         status,
         phase: supervisionConsoleStatusGroup(status),
         role: row.role ? String(row.role) : undefined,
+        required,
+        leaseActive: typeof row.lease_id === 'string' && row.lease_id.trim().length > 0,
         ownerSessionName,
         ownerSessionLabel: presentation?.label,
         ownerAgentType: row.agent_type ? String(row.agent_type) : undefined,
