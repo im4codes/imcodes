@@ -2761,11 +2761,19 @@ export class SupervisionTaskRegistry {
       const sourceBindingMatches = (revision: string | undefined) => (
         !revision || Boolean(fromRevision && revision === fromRevision)
       );
+      // A crashed/older control plane can persist the inspected target on the
+      // implementer before projecting it to the task. Accept only that narrow
+      // split; the task must still match the declared source revision and all
+      // worktree, lifecycle, PASS, Git, and ambiguity gates below still apply.
+      const assignmentBindingMatches = sourceBindingMatches(assignment.auditRevision)
+        || Boolean(fromRevision
+          && task.currentRevision === fromRevision
+          && assignment.auditRevision === toRevision);
       const exactStaleShape = Boolean(
         !HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(task.status)
         && !HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(assignment.status)
         && sourceBindingMatches(task.currentRevision)
-        && sourceBindingMatches(assignment.auditRevision)
+        && assignmentBindingMatches
         && assignment.role === 'implementer'
         && assignment.required
         && activeImplementers.length === 1
@@ -2784,7 +2792,7 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
           : activeAuditor ? { ok: false, reason: 'invalid_transition' }
-            : !sourceBindingMatches(task.currentRevision) || !sourceBindingMatches(assignment.auditRevision)
+            : !sourceBindingMatches(task.currentRevision) || !assignmentBindingMatches
                 ? { ok: false, reason: 'old_revision' }
                 : { ok: false, reason: 'invalid_transition' };
       }

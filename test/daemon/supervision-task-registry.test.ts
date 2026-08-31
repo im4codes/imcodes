@@ -1021,6 +1021,147 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('converges an inspected assignment-target/task-source split without weakening recovery gates', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = prepareSameObjectRevisionRecoveryShape(registry, 'assignment-target-task-source-split');
+    const historicalAuditorIdentity = identity('deck_split_r1_auditor', 'claude-code-sdk');
+    const historicalAuditor = registry.createAssignment({
+      assignmentId: `${shape.taskId}-r1-auditor`, taskId: shape.taskId,
+      role: 'auditor', required: false, identity: historicalAuditorIdentity,
+      auditAttemptId: `${shape.taskId}-r1-attempt`, auditRevision: shape.fromRevision,
+    });
+    if (!historicalAuditor.ok) throw new Error(historicalAuditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: historicalAuditor.value.assignmentId, identity: historicalAuditorIdentity,
+      status: 'auditing', auditAttemptId: `${shape.taskId}-r1-attempt`,
+      auditRevision: shape.fromRevision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId: shape.taskId, auditorAssignmentId: historicalAuditor.value.assignmentId,
+      attemptId: `${shape.taskId}-r1-attempt`, revision: shape.fromRevision,
+      receiptKind: 'final', verdict: 'REWORK', auditorSessionName: historicalAuditorIdentity.sessionName,
+      auditorIdentity: historicalAuditorIdentity, findings: 'immutable R1 finding',
+      validations: [{ kind: 'test', label: 'R1', outcome: 'failed', summary: 'R1 requires correction' }],
+      now: 100,
+    })).toMatchObject({ ok: true, value: { verdict: 'REWORK' } });
+    expect(registry.applyTaskIntent({
+      taskId: shape.taskId, assignmentId: historicalAuditor.value.assignmentId,
+      intent: 'cancel', toStatus: 'cancelled', note: 'retain the completed R1 audit row',
+    })).toMatchObject({ ok: true });
+
+    const implementer = registry.getAssignment(shape.implementer.assignmentId)!;
+    rewritePersistedAssignment(database, {
+      ...implementer,
+      // Production split: the authoritative inspector already projected R2
+      // to this exact implementer, while the task row remains on R1.
+      auditRevision: shape.toRevision,
+      updatedAt: 200,
+    });
+    expect(registry.get(shape.taskId)).toMatchObject({ currentRevision: shape.fromRevision });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+      status: 'implementing', auditAttemptId: `${shape.taskId}-r1-attempt`,
+      auditRevision: shape.toRevision, verdict: 'REWORK',
+    });
+
+    const receiptsBefore = registry.listAuditReceipts(shape.taskId);
+    const assignmentsBefore = registry.listAssignments(shape.taskId).length;
+    const leaseBefore = registry.getAssignment(shape.implementer.assignmentId)!.leaseId;
+    const request = {
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'preserve' as const, idempotencyKey: 'converge-assignment-target-task-source-r2',
+      reason: 'atomically converge the exact inspected assignment and stale task projection',
+      now: 300,
+    };
+    const splitState = registry.get(shape.taskId);
+    const splitEvents = registry.listEvents(shape.taskId).length;
+    expect(registry.rebindTaskAssignmentRevision({
+      ...request, fromRevision: shape.toRevision,
+      idempotencyKey: 'must-not-disguise-split-as-target-replay',
+    })).toEqual({ ok: false, reason: 'invalid' });
+    expect(registry.get(shape.taskId)).toEqual(splitState);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(splitEvents);
+    expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
+      ok: true, value: { status: 'implementing', currentRevision: shape.toRevision },
+    });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+      status: 'implementing', auditRevision: shape.toRevision, leaseId: leaseBefore,
+    });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('auditAttemptId');
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('verdict');
+    expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentsBefore);
+    expect(registry.listAuditReceipts(shape.taskId)).toEqual(receiptsBefore);
+
+    const eventCount = registry.listEvents(shape.taskId).length;
+    expect(registry.rebindTaskAssignmentRevision({ ...request, now: 400 })).toMatchObject({
+      ok: true, replay: true, value: { currentRevision: shape.toRevision },
+    });
+    expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
+    expect(registry.rebindTaskAssignmentRevision({
+      ...request,
+      worktreeSnapshot: {
+        ...request.worktreeSnapshot,
+        files: request.worktreeSnapshot.files.map((file, index) => (
+          index === 0 ? { ...file, sha256: 'c'.repeat(64) } : file
+        )),
+      },
+      now: 500,
+    })).toEqual({ ok: false, reason: 'conflicting_replay' });
+    expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
+    registry.close();
+    database.close();
+  });
+
+  it('rejects task-null/assignment-target recovery without an exact declared source', () => {
+    for (const [name, fromRevision] of [
+      ['omitted-source', undefined],
+      ['claimed-source', 'fabricated-source-r1'],
+    ] as const) {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      const taskId = `task-null-assignment-target-${name}`;
+      const assignmentId = `${taskId}-implementer`;
+      const toRevision = 'inspected-target-r2';
+      const owner = identity(`deck_${name}_worker`);
+      const files = ['src/null-target.ts'];
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'reject a target assignment without an exact task source',
+      })).toMatchObject({ ok: true });
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: owner,
+        auditRevision: toRevision,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      rewritePersistedAssignment(database, {
+        ...registry.getAssignment(assignmentId)!, status: 'implementing', updatedAt: 100,
+      });
+      expect(registry.getTaskRecord(taskId)).not.toHaveProperty('currentRevision');
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        status: 'implementing', auditRevision: toRevision,
+      });
+
+      const beforeTask = registry.get(taskId);
+      const beforeAssignment = registry.getAssignment(assignmentId);
+      const eventCount = registry.listEvents(taskId).length;
+      expect(registry.rebindTaskAssignmentRevision({
+        taskId, assignmentId, fromRevision, toRevision,
+        worktreeSnapshot: recoveryWorktreeSnapshot(files),
+        leaseAction: 'preserve', idempotencyKey: `${taskId}-must-refuse`,
+        reason: 'target assignment cannot supply a missing task source',
+      }), name).toEqual({ ok: false, reason: 'old_revision' });
+      expect(registry.get(taskId), name).toEqual(beforeTask);
+      expect(registry.getAssignment(assignmentId), name).toEqual(beforeAssignment);
+      expect(registry.listEvents(taskId), name).toHaveLength(eventCount);
+      registry.close();
+      database.close();
+    }
+  });
+
   it('normalizes stale nonterminal projections and a missing lease in one exact rebind', () => {
     const registry = makeRegistry();
     const shape = prepareSameObjectRevisionRecoveryShape(registry, 'stale-status-missing-lease-rebind');
