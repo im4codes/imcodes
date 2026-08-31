@@ -478,6 +478,106 @@ function prepareSameObjectRevisionRecoveryShape(
   };
 }
 
+function seedFinalAuditReceipt(
+  database: InstanceType<typeof DatabaseSync>,
+  input: {
+    receiptId: string;
+    taskId: string;
+    assignmentId: string;
+    attemptId: string;
+    revision: string;
+    verdict: 'PASS' | 'REWORK';
+    senderIdentity: PersistedSupervisionTaskAssignmentIdentity;
+    createdAt: number;
+  },
+): void {
+  database.prepare(`
+    INSERT INTO supervision_audit_receipts (
+      receipt_id, task_id, assignment_id, attempt_id, revision, sequence,
+      receipt_kind, verdict, findings, validations_json, receipt_digest,
+      supersedes_receipt_id, sender_identity_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, 1, 'final', ?, ?, '[]', ?, NULL, ?, ?)
+  `).run(
+    input.receiptId, input.taskId, input.assignmentId, input.attemptId, input.revision,
+    input.verdict, `immutable ${input.verdict} receipt`, `${input.receiptId}-digest`,
+    JSON.stringify(input.senderIdentity), input.createdAt,
+  );
+}
+
+function prepareFinalizedPassedSuccessorRecoveryShape(
+  registry: SupervisionTaskRegistry,
+  database: InstanceType<typeof DatabaseSync>,
+  taskId: string,
+  receiptBinding: 'exact' | 'missing' | 'wrong-verdict' | 'wrong-attempt'
+    | 'foreign-task' | 'foreign-assignment' = 'exact',
+) {
+  const shape = prepareSameObjectRevisionRecoveryShape(registry, taskId);
+  const toRevision = registry.getAssignment(shape.auditor.assignmentId)!.auditRevision!;
+  const sourceAuditorIdentity = identity(`${taskId}-source-auditor`, 'claude-code-sdk');
+  const sourceAuditor = registry.createAssignment({
+    assignmentId: `${taskId}-source-auditor`, taskId, role: 'auditor', required: false,
+    identity: sourceAuditorIdentity,
+    auditAttemptId: `${taskId}-r1-attempt`, auditRevision: shape.fromRevision,
+  });
+  if (!sourceAuditor.ok) throw new Error(sourceAuditor.reason);
+  rewritePersistedAssignment(database, {
+    ...sourceAuditor.value, status: 'finalized', leaseId: '', verdict: 'REWORK', updatedAt: 120,
+  });
+  seedFinalAuditReceipt(database, {
+    receiptId: `${taskId}-r1-rework-receipt`, taskId,
+    assignmentId: sourceAuditor.value.assignmentId,
+    attemptId: `${taskId}-r1-attempt`, revision: shape.fromRevision,
+    verdict: 'REWORK', senderIdentity: sourceAuditorIdentity, createdAt: 120,
+  });
+
+  const targetAuditor = registry.getAssignment(shape.auditor.assignmentId)!;
+  rewritePersistedAssignment(database, {
+    ...targetAuditor, status: 'finalized', leaseId: '', verdict: 'PASS', updatedAt: 130,
+  });
+  if (receiptBinding !== 'missing') {
+    let receiptTaskId = taskId;
+    let receiptAssignmentId = targetAuditor.assignmentId;
+    let receiptAttemptId = targetAuditor.auditAttemptId!;
+    if (receiptBinding === 'foreign-task' || receiptBinding === 'foreign-assignment') {
+      const foreignTaskId = `${taskId}-foreign`;
+      expect(registry.createOrGet({
+        taskId: foreignTaskId, projectName: 'other-project',
+        classification: 'independent_top_level', objective: 'foreign audit evidence',
+        currentRevision: toRevision,
+      })).toMatchObject({ ok: true });
+      const foreignAuditor = registry.createAssignment({
+        assignmentId: `${foreignTaskId}-auditor`, taskId: foreignTaskId,
+        role: 'auditor', required: false, identity: identity(`${foreignTaskId}-auditor`),
+        auditAttemptId: `${foreignTaskId}-attempt`, auditRevision: toRevision,
+      });
+      if (!foreignAuditor.ok) throw new Error(foreignAuditor.reason);
+      if (receiptBinding === 'foreign-task') receiptTaskId = foreignTaskId;
+      else receiptAssignmentId = foreignAuditor.value.assignmentId;
+    } else if (receiptBinding === 'wrong-attempt') {
+      receiptAttemptId = `${targetAuditor.auditAttemptId}-wrong`;
+    }
+    seedFinalAuditReceipt(database, {
+      receiptId: `${taskId}-target-receipt-${receiptBinding}`,
+      taskId: receiptTaskId, assignmentId: receiptAssignmentId,
+      attemptId: receiptAttemptId, revision: toRevision,
+      verdict: receiptBinding === 'wrong-verdict' ? 'REWORK' : 'PASS',
+      senderIdentity: targetAuditor.identity, createdAt: 130,
+    });
+    if (receiptBinding === 'exact') {
+      database.prepare(`
+        INSERT INTO supervision_audit_attestations
+          (attempt_id, task_id, assignment_id, revision, verdict,
+           auditor_session_name, findings, created_at)
+        VALUES (?, ?, ?, ?, 'PASS', ?, 'immutable matching R2 PASS', 130)
+      `).run(
+        targetAuditor.auditAttemptId, taskId, shape.implementer.assignmentId, toRevision,
+        targetAuditor.identity.sessionName,
+      );
+    }
+  }
+  return { ...shape, toRevision, sourceAuditor: sourceAuditor.value };
+}
+
 beforeEach(() => {
   resetSupervisionTaskRegistryForTests();
   clearSendIdempotencyCacheForTests();
@@ -1028,6 +1128,144 @@ describe('SupervisionTaskRegistry', () => {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('atomically binds an R1 REWORK implementer to its sole finalized matching R2 PASS without fabricating completion', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = prepareFinalizedPassedSuccessorRecoveryShape(
+      registry, database, 'finalized-passed-successor-recovery',
+    );
+    const assignmentCount = registry.listAssignments(shape.taskId).length;
+    const receipts = registry.listAuditReceipts(shape.taskId);
+    const originalLeaseId = registry.getAssignment(shape.implementer.assignmentId)!.leaseId;
+    const targetAuditor = registry.getAssignment(shape.auditor.assignmentId);
+    const request = {
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'preserve' as const,
+      idempotencyKey: 'bind-finalized-passed-successor-r2',
+      reason: 'atomically repair the R1/R2 projection without replacing the implementer',
+      now: 200,
+    };
+
+    expect(registry.get(shape.taskId)).toMatchObject({
+      status: 'rework', currentRevision: shape.fromRevision,
+    });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+      status: 'rework', leaseId: originalLeaseId,
+      auditAttemptId: `${shape.taskId}-r1-attempt`, auditRevision: shape.fromRevision,
+      verdict: 'REWORK',
+    });
+    expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
+      ok: true, value: { status: 'implementing', currentRevision: shape.toRevision },
+    });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+      status: 'implementing', leaseId: originalLeaseId, auditRevision: shape.toRevision,
+    });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('auditAttemptId');
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('verdict');
+    expect(registry.get(shape.taskId)).not.toHaveProperty('commitSha');
+    expect(registry.get(shape.taskId)).not.toHaveProperty('pushRemoteRef');
+    expect(registry.get(shape.taskId)).not.toHaveProperty('finalization');
+    expect(registry.getAssignment(shape.auditor.assignmentId)).toEqual(targetAuditor);
+    expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
+    expect(registry.listAuditReceipts(shape.taskId)).toEqual(receipts);
+
+    const beforeFinishEvents = registry.listEvents(shape.taskId).length;
+    expect(registry.finishAssignment({
+      assignmentId: shape.implementer.assignmentId,
+      identity: shape.implementerIdentity,
+      revision: shape.toRevision,
+      now: 300,
+    })).toMatchObject({
+      ok: true,
+      value: {
+        status: 'ready_for_integration', leaseId: '',
+        auditAttemptId: targetAuditor?.auditAttemptId,
+        auditRevision: shape.toRevision, verdict: 'PASS',
+      },
+    });
+    const afterFinishEvents = registry.listEvents(shape.taskId).length;
+    expect(afterFinishEvents).toBeGreaterThan(beforeFinishEvents);
+    expect(registry.finishAssignment({
+      assignmentId: shape.implementer.assignmentId,
+      identity: shape.implementerIdentity,
+      revision: shape.toRevision,
+      now: 400,
+    })).toMatchObject({ ok: true, replay: true, value: { status: 'ready_for_integration' } });
+    expect(registry.listEvents(shape.taskId)).toHaveLength(afterFinishEvents);
+    expect(registry.listAuditReceipts(shape.taskId)).toEqual(receipts);
+    registry.close();
+    database.close();
+  });
+
+  it.each([
+    'missing', 'wrong-verdict', 'wrong-attempt', 'foreign-task', 'foreign-assignment',
+  ] as const)('rejects a %s finalized-successor receipt without mutation', (receiptBinding) => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = prepareFinalizedPassedSuccessorRecoveryShape(
+      registry, database, `finalized-successor-${receiptBinding}`, receiptBinding,
+    );
+    const before = registry.get(shape.taskId);
+    const assignments = registry.listAssignments(shape.taskId);
+    const receipts = registry.listAuditReceipts(shape.taskId);
+    const events = registry.listEvents(shape.taskId).length;
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'preserve', idempotencyKey: `refuse-${receiptBinding}-successor`,
+      reason: 'nonmatching PASS evidence must not authorize recovery',
+    })).toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    expect(registry.listAssignments(shape.taskId)).toEqual(assignments);
+    expect(registry.listAuditReceipts(shape.taskId)).toEqual(receipts);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(events);
+    registry.close();
+    database.close();
+  });
+
+  it('rejects ambiguous finalized matching successors without mutation', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = prepareFinalizedPassedSuccessorRecoveryShape(
+      registry, database, 'ambiguous-finalized-passed-successor',
+    );
+    const secondIdentity = identity('ambiguous-finalized-passed-successor-auditor-2');
+    const second = registry.createAssignment({
+      assignmentId: `${shape.taskId}-target-auditor-2`, taskId: shape.taskId,
+      role: 'auditor', required: false, identity: secondIdentity,
+      auditAttemptId: `${shape.taskId}-r2-attempt-2`, auditRevision: shape.toRevision,
+    });
+    if (!second.ok) throw new Error(second.reason);
+    rewritePersistedAssignment(database, {
+      ...second.value, status: 'finalized', leaseId: '', verdict: 'PASS', updatedAt: 140,
+    });
+    seedFinalAuditReceipt(database, {
+      receiptId: `${shape.taskId}-r2-pass-receipt-2`, taskId: shape.taskId,
+      assignmentId: second.value.assignmentId, attemptId: `${shape.taskId}-r2-attempt-2`,
+      revision: shape.toRevision, verdict: 'PASS', senderIdentity: secondIdentity, createdAt: 140,
+    });
+    const before = registry.get(shape.taskId);
+    const assignments = registry.listAssignments(shape.taskId);
+    const receipts = registry.listAuditReceipts(shape.taskId);
+    const events = registry.listEvents(shape.taskId).length;
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'preserve', idempotencyKey: 'refuse-ambiguous-passed-successor',
+      reason: 'multiple exact finalized PASS successors must fail closed',
+    })).toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    expect(registry.listAssignments(shape.taskId)).toEqual(assignments);
+    expect(registry.listAuditReceipts(shape.taskId)).toEqual(receipts);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(events);
+    registry.close();
+    database.close();
   });
 
   it('converges an inspected assignment-target/task-source split without weakening recovery gates', () => {

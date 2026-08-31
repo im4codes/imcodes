@@ -2802,10 +2802,11 @@ export class SupervisionTaskRegistry {
       const protectedRevisions = new Set([
         fromRevision, task.currentRevision, assignment.auditRevision, toRevision,
       ].filter((value): value is string => Boolean(value)));
-      const conflictingTargetPassAssignment = assignments.some((candidate) => (
+      const targetPassAssignments = assignments.filter((candidate) => (
         candidate.verdict?.trim().toUpperCase() === 'PASS'
         && candidate.auditRevision === toRevision
       ));
+      const conflictingTargetPassAssignment = targetPassAssignments.length > 0;
       const conflictingLivePassAssignment = assignments.some((candidate) => (
         !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
         && (candidate.verdict?.trim().toUpperCase() === 'PASS'
@@ -2818,15 +2819,59 @@ export class SupervisionTaskRegistry {
       // explicitly reopens the same object after a real CI failure. It cannot
       // authorize the target revision, so only pre-existing PASS authority for
       // that target conflicts with a fresh rebind/audit cycle.
-      const conflictingTargetPassAttestation = this.#db.prepare(
-        `SELECT 1 AS ok FROM supervision_audit_attestations
-         WHERE task_id = ? AND revision = ? AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
-      ).get(taskId, toRevision) as { ok?: number } | undefined;
+      const targetPassAttestations = this.#db.prepare(
+        `SELECT attempt_id AS attemptId, assignment_id AS assignmentId
+         FROM supervision_audit_attestations
+         WHERE task_id = ? AND revision = ? AND UPPER(TRIM(verdict)) = 'PASS'`,
+      ).all(taskId, toRevision) as Array<{ attemptId?: unknown; assignmentId?: unknown }>;
       const conflictingTargetPassReceipt = this.#db.prepare(
         `SELECT 1 AS ok FROM supervision_audit_receipts
          WHERE task_id = ? AND revision = ? AND receipt_kind = 'final'
            AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
       ).get(taskId, toRevision) as { ok?: number } | undefined;
+      const auditReceipts = this.listAuditReceipts(taskId);
+      const exactFinalizedTargetPasses = targetPassAssignments.filter((candidate) => {
+        if (candidate.role !== 'auditor' || candidate.status !== 'finalized'
+          || candidate.leaseId || !candidate.auditAttemptId) return false;
+        const latestFinal = auditReceipts.filter((receipt) => (
+          receipt.assignmentId === candidate.assignmentId
+          && receipt.attemptId === candidate.auditAttemptId
+          && receipt.revision === toRevision
+          && receipt.receiptKind === 'final'
+        )).at(-1);
+        return latestFinal?.verdict === 'PASS';
+      });
+      const exactPassedSuccessor = exactFinalizedTargetPasses.length === 1
+        ? exactFinalizedTargetPasses[0]
+        : undefined;
+      const exactSourceReworkAuditors = assignments.filter((candidate) => {
+        if (!fromRevision || !assignment.auditAttemptId
+          || candidate.role !== 'auditor'
+          || !['cancelled', 'finalized'].includes(candidate.status)
+          || candidate.leaseId
+          || candidate.auditAttemptId !== assignment.auditAttemptId
+          || candidate.auditRevision !== fromRevision
+          || candidate.verdict?.trim().toUpperCase() !== 'REWORK') return false;
+        const latestFinal = auditReceipts.filter((receipt) => (
+          receipt.assignmentId === candidate.assignmentId
+          && receipt.attemptId === candidate.auditAttemptId
+          && receipt.revision === fromRevision
+          && receipt.receiptKind === 'final'
+        )).at(-1);
+        return latestFinal?.verdict === 'REWORK';
+      });
+      const exactPassedSuccessorAuthority = Boolean(
+        exactPassedSuccessor
+        && exactSourceReworkAuditors.length === 1
+        && targetPassAssignments.length === 1
+        && targetPassAttestations.every((attestation) => (
+          attestation.attemptId === exactPassedSuccessor.auditAttemptId
+          && attestation.assignmentId === assignmentId
+        )),
+      );
+      const targetPassConflictFree = !conflictingTargetPassAssignment
+        && targetPassAttestations.length === 0
+        && conflictingTargetPassReceipt?.ok !== 1;
       const sourceBindingMatches = (revision: string | undefined) => (
         !revision || Boolean(fromRevision && revision === fromRevision)
       );
@@ -2848,10 +2893,18 @@ export class SupervisionTaskRegistry {
         && activeImplementers.length === 1
         && activeImplementers[0]?.assignmentId === assignmentId
         && !activeAuditor
-        && !conflictingTargetPassAssignment
+        && (targetPassConflictFree || Boolean(
+          exactPassedSuccessorAuthority
+          && fromRevision
+          && task.currentRevision === fromRevision
+          && assignment.auditRevision === fromRevision
+          && task.status === 'rework'
+          && assignment.status === 'rework'
+          && assignment.verdict?.trim().toUpperCase() === 'REWORK'
+          && assignment.leaseId
+          && input.leaseAction === 'preserve'
+        ))
         && !conflictingLivePassAssignment
-        && conflictingTargetPassAttestation?.ok !== 1
-        && conflictingTargetPassReceipt?.ok !== 1
         && !task.commitSha
         && !task.pushRemoteRef
         && !task.finalization
