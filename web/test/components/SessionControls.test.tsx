@@ -186,8 +186,16 @@ vi.mock('../../src/components/QuickInputPanel.js', () => ({
 }));
 
 vi.mock('../../src/components/VoiceOverlay.js', () => ({
-  VoiceOverlay: ({ open, onSend }: { open: boolean; onSend: (text: string) => void }) => open ? (
-    <button onClick={() => onSend('voice combo message')}>voice-overlay-send</button>
+  VoiceOverlay: ({ open, onSend, onClose, initialText }: {
+    open: boolean;
+    onSend: (text: string) => 'accepted' | 'pending' | 'rejected';
+    onClose: () => void;
+    initialText?: string;
+  }) => open ? (
+    <button onClick={() => {
+      const text = `${initialText?.trim() ? `${initialText.trim()} ` : ''}voice combo message`;
+      if (onSend(text) === 'accepted') onClose();
+    }}>voice-overlay-send</button>
   ) : null,
 }));
 
@@ -220,6 +228,7 @@ vi.mock('../../src/components/AtPicker.js', () => ({
       return (
         <div>
           <button onClick={() => onSelectAllConfig?.(p2pConfig, p2pConfig?.rounds ?? 1, 'config')}>mock-select-all-config</button>
+          <button onClick={() => onSelectAllConfig?.(p2pConfig, p2pConfig?.rounds ?? 1, 'audit>review>plan')}>mock-select-all-combo</button>
           <button onClick={() => onSelectMachine?.('office-pc', 'Office PC')}>mock-select-machine</button>
           <button>files</button>
           <button onClick={() => setStage('agents')}>agents</button>
@@ -493,6 +502,37 @@ const subSession = (name: string, label: string): SessionInfo =>
     label,
     agentType: 'codex',
   });
+
+async function openVoiceComboConfirmation(ws: ReturnType<typeof makeWs>, sessionName: string) {
+  const attachmentPath = `/tmp/${sessionName}.png`;
+  sessionStorage.setItem(`rcc_draft_attachments_session:${sessionName}`, JSON.stringify([{
+    path: attachmentPath,
+    name: `${sessionName}.png`,
+    seq: 1,
+  }]));
+  const onSend = vi.fn();
+  render(
+    <SessionControls
+      ws={ws as any}
+      activeSession={makeSession({ name: sessionName })}
+      quickData={makeQuickData() as any}
+      onSend={onSend}
+    />,
+  );
+  await flushAsync();
+  await waitFor(() => expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1'));
+
+  const input = screen.getByRole('textbox') as HTMLDivElement;
+  input.textContent = '@';
+  fireEvent.input(input);
+  fireEvent.click(screen.getByText('mock-select-all-combo'));
+  fireEvent.click(screen.getByTitle('voice_input'));
+  const voiceSend = screen.getByText('voice-overlay-send');
+  fireEvent.click(voiceSend);
+
+  const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
+  return { attachmentPath, dialog, onSend, voiceSend };
+}
 
 describe('SessionControls', () => {
 afterEach(() => {
@@ -7296,6 +7336,188 @@ afterEach(() => {
     });
   });
 
+  it('sends the current attachment snapshot through the voice composer path', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/voice-proof.png' } });
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'voice-attachment-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-voice"
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['voice'], 'voice-proof.png', { type: 'image/png' })],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1'));
+
+    fireEvent.click(screen.getByTitle('voice_input'));
+    fireEvent.click(screen.getByText('voice-overlay-send'));
+
+    expectSendPayload(ws, {
+      sessionName: 'voice-attachment-session',
+      text: '#1:(/tmp/voice-proof.png) voice combo message',
+    });
+    expect(onSend).toHaveBeenCalledWith(
+      'voice-attachment-session',
+      '#1:(/tmp/voice-proof.png) voice combo message',
+      expect.objectContaining({
+        attachments: [expect.objectContaining({ daemonPath: '/tmp/voice-proof.png' })],
+      }),
+    );
+    expect(screen.queryByTestId('attachment-tag-1')).toBeNull();
+    expect(screen.queryByText('voice-overlay-send')).toBeNull();
+  });
+
+  it('keeps voice text and uploaded attachments retryable while another upload is active', async () => {
+    let resolveSecondUpload!: (value: { attachment: { daemonPath: string } }) => void;
+    uploadFileMock
+      .mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/voice-ready.png' } })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecondUpload = resolve; }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'voice-upload-active' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-voice"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: { files: [new File(['ready'], 'ready.png', { type: 'image/png' })], getData: () => '' },
+    });
+    await waitFor(() => expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1'));
+    fireEvent.paste(input, {
+      clipboardData: { files: [new File(['pending'], 'pending.png', { type: 'image/png' })], getData: () => '' },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByTitle('voice_input'));
+    fireEvent.click(screen.getByText('voice-overlay-send'));
+
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+    expect(screen.getByText('voice-overlay-send')).toBeTruthy();
+    expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+    resolveSecondUpload({ attachment: { daemonPath: '/tmp/voice-pending.png' } });
+  });
+
+  it('keeps the voice transcript open when the active session disappears before payload construction', () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'voice-session-removed' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('voice_input'));
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={null}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByText('voice-overlay-send'));
+
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+    expect(screen.getByText('voice-overlay-send')).toBeTruthy();
+  });
+
+  it('keeps the voice transcript and attachment snapshot after a synchronous local send rejection', async () => {
+    const sessionName = 'voice-local-rejection';
+    sessionStorage.setItem(`rcc_draft_attachments_session:${sessionName}`, JSON.stringify([{
+      path: '/tmp/voice-retry.png',
+      name: 'voice-retry.png',
+      seq: 1,
+    }]));
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementationOnce(() => { throw new Error('local voice send failed'); });
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: sessionName })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1'));
+
+    fireEvent.click(screen.getByTitle('voice_input'));
+    fireEvent.click(screen.getByText('voice-overlay-send'));
+
+    expect(onSend).toHaveBeenCalledWith(
+      sessionName,
+      '#1:(/tmp/voice-retry.png) voice combo message',
+      expect.objectContaining({ localFailure: 'local voice send failed' }),
+    );
+    expect(screen.getByText('voice-overlay-send')).toBeTruthy();
+    expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+  });
+
+  it('keeps a voice combo retryable when confirmation is cancelled', async () => {
+    const ws = makeWs();
+    const { dialog } = await openVoiceComboConfirmation(ws, 'voice-combo-cancel');
+
+    expect(screen.getByText('voice-overlay-send')).toBeTruthy();
+    expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /^cancel$/i }));
+
+    expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
+    expect(screen.getByText('voice-overlay-send')).toBeTruthy();
+    expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
+  it('closes a confirmed voice combo exactly once and cannot resend its old transcript', async () => {
+    const ws = makeWs();
+    const { attachmentPath, dialog, onSend } = await openVoiceComboConfirmation(ws, 'voice-combo-success');
+    const confirm = within(dialog).getByRole('button', { name: /^send$/i });
+
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+
+    expectLastSendPayload(ws, {
+      sessionName: 'voice-combo-success',
+      text: `#1:(${attachmentPath}) voice combo message`,
+      p2pMode: 'audit>review>plan',
+    });
+    expect(gatherSendCalls(ws)).toHaveLength(1);
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('voice-overlay-send')).toBeNull();
+    expect(screen.queryByTestId('attachment-tag-1')).toBeNull();
+  });
+
+  it('retains a voice combo and attachments when confirmed local send rejects', async () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementationOnce(() => { throw new Error('confirmed voice combo failed'); });
+    const { dialog, onSend } = await openVoiceComboConfirmation(ws, 'voice-combo-reject');
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
+
+    expect(onSend).toHaveBeenCalledWith(
+      'voice-combo-reject',
+      expect.stringContaining('voice combo message'),
+      expect.objectContaining({ localFailure: 'confirmed voice combo failed' }),
+    );
+    expect(screen.getByText('voice-overlay-send')).toBeTruthy();
+    expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+  });
+
   it('renders independent progress rows for a concurrent multi-file upload batch', async () => {
     type UploadResolver = (value: { attachment: { daemonPath: string } }) => void;
     const pendingUploads: Array<{
@@ -8456,6 +8678,87 @@ afterEach(() => {
     expect((screen.getByRole('button', { name: 'settings_button' }) as HTMLButtonElement).disabled).toBe(true);
     expect(document.querySelector('.menu-dropdown')).toBeFalsy();
     expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
+  it('keeps the owner composer writable when viewer shares are outgoing', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'shared-owner-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          sharedState: { effectiveRole: 'viewer', status: 'active', outgoing: true },
+        })}
+        serverId="srv-owner"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    input.textContent = 'owner message after sharing windows';
+    fireEvent.input(input);
+    const send = screen.getByRole('button', { name: /send/i }) as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
+    fireEvent.click(send);
+    expectSendPayload(ws, {
+      sessionName: 'shared-owner-session',
+      text: 'owner message after sharing windows',
+    });
+  });
+
+  it('keeps the third outgoing shared window writable after switching across three coexisting sessions', () => {
+    const ws = makeWs();
+    const sharedSessions = [1, 2, 3].map((index) => makeSession({
+      name: `shared-owner-session-${index}`,
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      sharedState: {
+        effectiveRole: index === 1 ? 'participant' : 'viewer',
+        status: 'active',
+        outgoing: true,
+      },
+    }));
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={sharedSessions[0]}
+        sessions={sharedSessions}
+        serverId="srv-owner"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={sharedSessions[1]}
+        sessions={sharedSessions}
+        serverId="srv-owner"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={sharedSessions[2]}
+        sessions={sharedSessions}
+        serverId="srv-owner"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    input.textContent = 'third shared window remains live';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, {
+      sessionName: 'shared-owner-session-3',
+      text: 'third shared window remains live',
+    });
   });
 
   it('shows a model selector for gemini-sdk and sends /model', () => {

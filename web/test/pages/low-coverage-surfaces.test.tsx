@@ -325,7 +325,7 @@ describe('low-coverage page and component surfaces', () => {
 
   it('VoiceOverlay starts listening, inserts partial text, and sends trimmed text', async () => {
     vi.useFakeTimers();
-    const onSend = vi.fn();
+    const onSend = vi.fn(() => 'accepted' as const);
     const onClose = vi.fn();
     render(<VoiceOverlay open initialText="hello" onSend={onSend} onClose={onClose} />);
 
@@ -337,6 +337,30 @@ describe('low-coverage page and component surfaces', () => {
 
     expect(onSend).toHaveBeenCalledWith('hello world');
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it('VoiceOverlay keeps the transcript open when the parent rejects the send', () => {
+    const onSend = vi.fn(() => 'rejected' as const);
+    const onClose = vi.fn();
+    render(<VoiceOverlay open initialText="retry this" onSend={onSend} onClose={onClose} />);
+
+    fireEvent.click(screen.getByText('voice.send'));
+
+    expect(onSend).toHaveBeenCalledWith('retry this');
+    expect(onClose).not.toHaveBeenCalled();
+    expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('retry this');
+  });
+
+  it('VoiceOverlay keeps the transcript open while parent confirmation is pending', () => {
+    const onSend = vi.fn(() => 'pending' as const);
+    const onClose = vi.fn();
+    render(<VoiceOverlay open initialText="confirm this" onSend={onSend} onClose={onClose} />);
+
+    fireEvent.click(screen.getByText('voice.send'));
+
+    expect(onSend).toHaveBeenCalledWith('confirm this');
+    expect(onClose).not.toHaveBeenCalled();
+    expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('confirm this');
   });
 
   it('VoiceOverlay restarts on the first tap after native listening stops itself', async () => {

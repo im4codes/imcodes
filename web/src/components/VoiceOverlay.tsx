@@ -5,7 +5,7 @@ import * as VoiceInput from './VoiceInput.js';
 interface Props {
   open: boolean;
   onClose: () => void;
-  onSend: (text: string) => void;
+  onSend: (text: string) => 'accepted' | 'pending' | 'rejected';
   initialText?: string;
 }
 
@@ -184,8 +184,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListeningState(false);
-    onSend(text);
-    onClose();
+    if (onSend(text) === 'accepted') onClose();
   }, [onSend, onClose, setListeningState]);
 
   const handleClose = useCallback(() => {

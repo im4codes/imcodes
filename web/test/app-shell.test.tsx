@@ -32,6 +32,7 @@ const {
   getAuthKeyIdMock,
   getServerUrlMock,
   initializeServerScopedAuthMock,
+  listManagedSharesForServerMock,
   listP2pRunsMock,
   nativeState,
   openSharedEntryMock,
@@ -54,6 +55,7 @@ const {
   getAuthKeyIdMock: vi.fn(async () => null as string | null),
   getServerUrlMock: vi.fn(async () => null as string | null),
   initializeServerScopedAuthMock: vi.fn(async () => undefined),
+  listManagedSharesForServerMock: vi.fn(),
   listP2pRunsMock: vi.fn(),
   nativeState: { value: false },
   openSharedEntryMock: vi.fn(),
@@ -140,6 +142,7 @@ vi.mock('../src/api.js', () => {
     discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
     getApiKey: vi.fn(() => 'api-key-1'),
+    listManagedSharesForServer: (...args: unknown[]) => listManagedSharesForServerMock(...args),
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
     normalizeLocalWebPreviewPath: (path: string) => path.startsWith('/') ? path : `/${path}`,
     openSharedEntry: (...args: unknown[]) => openSharedEntryMock(...args),
@@ -670,16 +673,46 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, active, visible, zIndex, onFocus, onViewRepo }: any) => (
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, onFocus, onViewRepo, onShareSession, sharedState }: any) => {
+    const incomingViewer = !!sharedState
+      && sharedState.outgoing !== true
+      && sharedState.effectiveRole !== 'participant';
+    return (
     <div
       data-testid={`sub-session-window-${sub?.id}`}
       data-active={String(active)}
       data-visible={String(visible)}
+      data-shared-outgoing={String(sharedState?.outgoing === true)}
+      data-share-role={sharedState?.effectiveRole ?? ''}
       style={{ zIndex }}
       onMouseDown={onFocus}
     >
       sub-session-window
       <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
+      <input aria-label={`sub-window-composer-${sub?.id}`} disabled={incomingViewer} />
+      <button
+        disabled={incomingViewer}
+        onClick={() => ws?.sendSessionCommand?.(sub.sessionName, `message-for-${sub.id}`, {})}
+      >sub-window-send-{sub?.id}</button>
+      <button
+        onClick={() => onShareSession?.({
+          name: sub.sessionName,
+          project: sub.label ?? sub.sessionName,
+          role: 'w1',
+          agentType: sub.type,
+          state: sub.state,
+        }, sub.id)}
+      >sub-window-share-{sub?.id}</button>
+    </div>
+    );
+  },
+}));
+vi.mock('../src/components/ShareSessionDialog.js', () => ({
+  ShareSessionDialog: ({ onClose, onSharesChanged }: any) => (
+    <div>
+      share-session-dialog
+      <button onClick={onSharesChanged}>share-session-refresh</button>
+      <button onClick={onClose}>share-session-close</button>
     </div>
   ),
 }));
@@ -997,6 +1030,8 @@ beforeEach(() => {
   getServerUrlMock.mockResolvedValue(null);
   initializeServerScopedAuthMock.mockReset();
   initializeServerScopedAuthMock.mockResolvedValue(undefined);
+  listManagedSharesForServerMock.mockReset();
+  listManagedSharesForServerMock.mockResolvedValue([]);
   fetchMeMock.mockResolvedValue({
     id: 'user-1',
     is_admin: true,
@@ -3900,6 +3935,121 @@ describe('App shell', () => {
     });
     expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('false');
     expect(windowDomOrder()).toEqual(orderBeforeFocusChange);
+  }, 20_000);
+
+  it('keeps the third outgoing shared window writable and exactly routed across role and subscription refresh', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const makeSubs = () => ['a', 'b', 'c'].map((suffix, index) => ({
+      id: `sub-${index + 1}`,
+      sessionName: `deck_sub_alpha_${suffix}`,
+      parentSession: 'deck_alpha_brain',
+      label: suffix.toUpperCase(),
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }));
+    const outgoingShares = (role: 'viewer' | 'participant') => makeSubs().map((sub, index) => ({
+      id: `share-${index + 1}`,
+      targetUserId: `recipient-${index + 1}`,
+      targetUserDisplayName: `Recipient ${index + 1}`,
+      role,
+      status: 'active',
+      target: { kind: 'subsession', serverId: 'srv-1', subSessionId: sub.id },
+    }));
+    useSubSessionsState.subSessions = makeSubs();
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    listManagedSharesForServerMock.mockResolvedValue(outgoingShares('viewer'));
+
+    const { App } = await importApp();
+    render(<App />);
+    const ws = await getActiveWsClient();
+    await waitFor(() => expect(listManagedSharesForServerMock).toHaveBeenCalledWith('srv-1'));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    fireEvent.click(screen.getByText('subbar-open-sub-3'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.getByTestId('sub-session-window-sub-2')).toBeTruthy();
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('true');
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-shared-outgoing')).toBe('true');
+    });
+    const thirdComposer = screen.getByLabelText('sub-window-composer-sub-3') as HTMLInputElement;
+    expect(thirdComposer.disabled).toBe(false);
+    fireEvent.click(screen.getByText('sub-window-send-sub-3'));
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith(
+      'deck_sub_alpha_c',
+      'message-for-sub-3',
+      {},
+    );
+
+    // Recreate the hook snapshots like a background sub-session subscription
+    // refresh, and refresh the managed grants at the same time. Neither fresh
+    // object identities nor a recipient role change may turn the owner's third
+    // composer into an incoming viewer surface or move focus away from it.
+    useSubSessionsState.subSessions = makeSubs();
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    listManagedSharesForServerMock.mockResolvedValue(outgoingShares('participant'));
+    fireEvent.click(screen.getByText('sub-window-share-sub-3'));
+    fireEvent.click(await screen.findByText('share-session-refresh'));
+    await act(async () => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'deck_alpha_brain',
+          project: 'Alpha',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'process',
+        }],
+      });
+    });
+
+    await waitFor(() => {
+      const third = screen.getByTestId('sub-session-window-sub-3');
+      expect(third.getAttribute('data-active')).toBe('true');
+      expect(third.getAttribute('data-shared-outgoing')).toBe('true');
+      expect(third.getAttribute('data-share-role')).toBe('participant');
+      expect((screen.getByLabelText('sub-window-composer-sub-3') as HTMLInputElement).disabled).toBe(false);
+    });
+    fireEvent.click(screen.getByText('sub-window-send-sub-3'));
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith(
+      'deck_sub_alpha_c',
+      'message-for-sub-3',
+      {},
+    );
+
+    // The inverse authority boundary remains fail-closed: when the parent is
+    // an incoming viewer surface rather than an outgoing owner grant, every
+    // child composer is read-only, including the focused third window.
+    listManagedSharesForServerMock.mockResolvedValue([]);
+    fireEvent.click(screen.getByText('share-session-refresh'));
+    await act(async () => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'deck_alpha_brain',
+          project: 'Alpha',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'process',
+          sharedState: { status: 'active', effectiveRole: 'viewer' },
+        }],
+      });
+    });
+    await waitFor(() => {
+      expect((screen.getByLabelText('sub-window-composer-sub-1') as HTMLInputElement).disabled).toBe(true);
+      expect((screen.getByLabelText('sub-window-composer-sub-2') as HTMLInputElement).disabled).toBe(true);
+      expect((screen.getByLabelText('sub-window-composer-sub-3') as HTMLInputElement).disabled).toBe(true);
+    });
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {

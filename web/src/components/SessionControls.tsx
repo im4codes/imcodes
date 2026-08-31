@@ -964,6 +964,7 @@ interface PendingSendPayload {
 }
 
 interface BuildSendPayloadOptions {
+  textOverride?: string;
   modeOverride?: string;
   syntheticAtTargets?: PendingAtTarget[];
   syntheticConfigOverride?: {
@@ -977,6 +978,8 @@ interface PendingComboSendConfirmation {
   payload: PendingSendPayload;
   modeLabel: string;
   clearComposer: boolean;
+  retainOnRejection: boolean;
+  onConfirmedAccepted?: () => void;
 }
 
 type ManualP2pTargetCandidate = {
@@ -1267,6 +1270,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
   const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
+  const pendingComboSendConfirmRef = useRef<PendingComboSendConfirmation | null>(null);
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const [fileDragActive, setFileDragActive] = useState(false);
@@ -1421,7 +1425,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [t]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const sharedState = activeSession?.sharedState ?? null;
-  const isShareScopedSession = !!sharedState;
+  // `outgoing` describes grants owned by the current user. Their viewer/
+  // participant role belongs to the recipient and must never turn the owner's
+  // own composer into a share-scoped, read-only surface.
+  const isShareScopedSession = !!sharedState && sharedState.outgoing !== true;
   const canSharedSessionSend = !isShareScopedSession
     || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
   // Session settings mutate the owner session, so shared access is a positive
@@ -3537,7 +3544,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
     const normalizedOptions: BuildSendPayloadOptions =
       typeof options === 'string' ? { modeOverride: options } : (options ?? {});
-    let text = getText();
+    let text = normalizedOptions.textOverride ?? getText();
     // Capture the user's OWN composed body BEFORE any synthetic @-prefix,
     // delegation/P2P rewrite, quote block, or attachment refs are concatenated.
     // Alias markers (A′) resolve against THIS body only — a `;;(secret)` buried
@@ -3893,7 +3900,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const finalizeSend = useCallback((
     payload: PendingSendPayload,
-    options?: { clearComposer?: boolean; programmaticDelegation?: boolean },
+    options?: { clearComposer?: boolean; programmaticDelegation?: boolean; retainOnRejection?: boolean },
   ): 'accepted' | 'rejected' => {
     if (!activeSession) return 'rejected';
     if (uploading && !options?.programmaticDelegation) {
@@ -4022,7 +4029,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         ...(localFailure ? { localFailure } : {}),
       });
     }
-    if (options?.clearComposer) {
+    if (options?.clearComposer && (!localFailure || !options.retainOnRejection)) {
       clearComposerState();
     }
     return localFailure ? 'rejected' : 'accepted';
@@ -4212,25 +4219,36 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return null;
   }, [attachments.length, hasConfiguredP2pParticipants, p2pMode, quotes, t]);
 
-  const requestSend = useCallback((payload: PendingSendPayload | null, options?: { clearComposer?: boolean }) => {
-    if (!payload) return;
+  const requestSend = useCallback((
+    payload: PendingSendPayload | null,
+    options?: {
+      clearComposer?: boolean;
+      retainOnRejection?: boolean;
+      onConfirmedAccepted?: () => void;
+    },
+  ): 'accepted' | 'pending' | 'rejected' => {
+    if (!payload) return 'rejected';
     const validationError = getSendValidationError(payload);
     if (validationError) {
       showSendWarning(validationError);
-      return;
+      return 'rejected';
     }
     clearSendWarning();
     const comboMode = typeof payload.extra.p2pMode === 'string' ? payload.extra.p2pMode : null;
     if (comboMode && isComboMode(comboMode) && !skipComboSendConfirm) {
       setRememberComboSendChoice(false);
-      setPendingComboSendConfirm({
+      const confirmation: PendingComboSendConfirmation = {
         payload,
         modeLabel: getP2pModeLabel(comboMode, t),
         clearComposer: !!options?.clearComposer,
-      });
-      return;
+        retainOnRejection: !!options?.retainOnRejection,
+        onConfirmedAccepted: options?.onConfirmedAccepted,
+      };
+      pendingComboSendConfirmRef.current = confirmation;
+      setPendingComboSendConfirm(confirmation);
+      return 'pending';
     }
-    finalizeSend(payload, options);
+    return finalizeSend(payload, options);
   }, [clearSendWarning, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
   const handleSend = useCallback(() => {
@@ -4334,27 +4352,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
+    pendingComboSendConfirmRef.current = null;
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
   }, [maybePersistComboSendSkip]);
 
   const handleComboSendConfirm = useCallback(() => {
-    const pending = pendingComboSendConfirm;
+    const pending = pendingComboSendConfirmRef.current;
     if (!pending) return;
+    // Consume the authority before sending. A repeated click or stale handler
+    // can therefore never dispatch the same voice transcript twice.
+    pendingComboSendConfirmRef.current = null;
     maybePersistComboSendSkip();
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
-    finalizeSend(pending.payload, { clearComposer: pending.clearComposer });
-  }, [finalizeSend, maybePersistComboSendSkip, pendingComboSendConfirm]);
+    const outcome = finalizeSend(pending.payload, {
+      clearComposer: pending.clearComposer,
+      retainOnRejection: pending.retainOnRejection,
+    });
+    if (outcome === 'accepted') pending.onConfirmedAccepted?.();
+  }, [finalizeSend, maybePersistComboSendSkip]);
 
   const sendOpenSpecPrompt = useCallback((text: string) => {
     finalizeSend({ text, extra: {} }, { clearComposer: false });
   }, [finalizeSend]);
 
-  // Voice overlay send handler — applies same P2P mode as text send
+  // Voice is an alternate editor for the same composer, not a separate send
+  // lane. Reuse the ordinary payload builder so the current attachment/quote/
+  // routing snapshot is sent and cleared with the same success semantics.
   const handleVoiceSend = useCallback((voiceText: string) => {
-    requestSend(buildModeOnlySendPayload(voiceText));
-  }, [buildModeOnlySendPayload, requestSend]);
+    return requestSend(buildSendPayload({ textOverride: voiceText }), {
+      clearComposer: true,
+      retainOnRejection: true,
+      onConfirmedAccepted: () => setVoiceOpen(false),
+    });
+  }, [buildSendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
