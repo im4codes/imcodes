@@ -100,11 +100,19 @@ export function inspectSupervisionAssignmentWorktree(input: {
       .filter((path) => semanticallyDiffers(worktreePath, path));
     const stagedPaths = lines(git(worktreePath, ['diff', '--cached', '--name-only', 'HEAD', '--']));
     const conflictedPaths = lines(git(worktreePath, ['diff', '--name-only', '--diff-filter=U', '--']));
-    const untrackedPaths = lines(git(worktreePath, ['ls-files', '--others', '--exclude-standard']));
-    const changedPaths = [...new Set([...tracked, ...stagedPaths, ...untrackedPaths])].sort();
-    if (![...changedPaths, ...conflictedPaths].every(validRepoPath)) {
+    const rawUntrackedPaths = lines(git(worktreePath, ['ls-files', '--others', '--exclude-standard']));
+    if (![...tracked, ...stagedPaths, ...rawUntrackedPaths, ...conflictedPaths].every(validRepoPath)) {
       return { ok: false, reason: 'worktree_unsafe' };
     }
+    // Tooling caches may be linked into an isolated worktree for local builds.
+    // They are neither source evidence nor safe to follow. Inspect the link
+    // itself and omit every untracked symlink without naming special folders.
+    const untrackedPaths = rawUntrackedPaths.filter((path) => {
+      const absolute = resolve(worktreePath, path);
+      if (!within(worktreePath, absolute)) throw new Error('unsafe worktree path');
+      try { return !lstatSync(absolute).isSymbolicLink(); } catch { return true; }
+    });
+    const changedPaths = [...new Set([...tracked, ...stagedPaths, ...untrackedPaths])].sort();
     const files = changedPaths.map((path): SupervisionWorktreeFileSnapshot => {
       const absolute = resolve(worktreePath, path);
       if (!within(worktreePath, absolute)) throw new Error('unsafe worktree path');

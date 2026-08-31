@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import {
+  mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -57,6 +59,32 @@ describe('authoritative supervision worktree inspection', () => {
     });
   });
 
+  it('omits an untracked dependency symlink without following it or hiding real source changes', () => {
+    const shape = fixture();
+    const sharedCache = join(shape.root, 'shared-cache');
+    mkdirSync(sharedCache);
+    writeFileSync(join(sharedCache, 'outside.js'), 'must not enter the manifest\n');
+    symlinkSync(sharedCache, join(shape.repo, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    writeFileSync(join(shape.repo, 'base.txt'), 'changed\n');
+    writeFileSync(join(shape.repo, 'new.ts'), 'export const value = 1;\n');
+    expect(execFileSync('git', ['ls-files', '--others', '--exclude-standard'], {
+      cwd: shape.repo, encoding: 'utf8',
+    }).split('\n')).toContain('node_modules');
+
+    expect(inspectSupervisionAssignmentWorktree({
+      sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
+    })).toMatchObject({
+      ok: true,
+      snapshot: {
+        files: [
+          { path: 'base.txt', sha256: createHash('sha256').update('changed\n').digest('hex') },
+          { path: 'new.ts', sha256: createHash('sha256').update('export const value = 1;\n').digest('hex') },
+        ],
+        untrackedPaths: ['new.ts'],
+      },
+    });
+  });
+
   it('ignores stale evidence metadata and binds current worktree bytes without mutation', () => {
     const shape = fixture();
     const evidence = join(shape.assignmentRoot, 'evidence', 'candidate-manifest.sha256');
@@ -91,5 +119,23 @@ describe('authoritative supervision worktree inspection', () => {
     expect(inspectSupervisionAssignmentWorktree({
       sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
     })).toMatchObject({ ok: true, snapshot: { stagedPaths: ['base.txt'] } });
+  });
+
+  it('continues to report conflicted paths for the registry gate', () => {
+    const shape = fixture();
+    const mainBranch = execFileSync('git', ['branch', '--show-current'], {
+      cwd: shape.repo, encoding: 'utf8',
+    }).trim();
+    execFileSync('git', ['checkout', '-qb', 'conflict-side'], { cwd: shape.repo });
+    writeFileSync(join(shape.repo, 'base.txt'), 'side\n');
+    execFileSync('git', ['commit', '-qam', 'side'], { cwd: shape.repo });
+    execFileSync('git', ['checkout', '-q', mainBranch], { cwd: shape.repo });
+    writeFileSync(join(shape.repo, 'base.txt'), 'main\n');
+    execFileSync('git', ['commit', '-qam', 'main'], { cwd: shape.repo });
+    expect(spawnSync('git', ['merge', 'conflict-side'], { cwd: shape.repo }).status).not.toBe(0);
+
+    expect(inspectSupervisionAssignmentWorktree({
+      sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
+    })).toMatchObject({ ok: true, snapshot: { conflictedPaths: ['base.txt'] } });
   });
 });
