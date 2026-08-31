@@ -85,6 +85,54 @@ interface UpdateCost {
   reflected: number;
 }
 
+interface FixtureNetworkIsolation {
+  preferenceRequests: number;
+  imageRequests: number;
+}
+
+/**
+ * Keep the production-renderer benchmark independent of services and public
+ * internet that are deliberately absent from its static fixture server.
+ *
+ * Two fixture inputs otherwise participate in the document's `load` event:
+ * ChatView loads the real `show_tool_calls` preference, and generated markdown
+ * includes delayed picsum.photos images to exercise layout shifts. Vite preview
+ * proxies the preference request to port 8787 (there is no backend in this CI
+ * job), while a slow or blocked public image can keep `page.goto(..., load)`
+ * pending even though the harness is already rendered and ready. Neither
+ * dependency is part of the per-update renderer cost this spec measures.
+ *
+ * Fulfil both at the browser boundary rather than relaxing navigation or test
+ * timeouts. The SVG preserves each generated image's requested dimensions, so
+ * image rows still have realistic layout without nondeterministic network I/O.
+ */
+async function isolateFixtureNetwork(page: Page): Promise<FixtureNetworkIsolation> {
+  const observed: FixtureNetworkIsolation = { preferenceRequests: 0, imageRequests: 0 };
+
+  await page.route('**/api/preferences/show_tool_calls', async (route) => {
+    observed.preferenceRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ value: true }),
+    });
+  });
+
+  await page.route('https://picsum.photos/**', async (route) => {
+    observed.imageRequests += 1;
+    const match = new URL(route.request().url()).pathname.match(/\/(\d+)\/(\d+)$/u);
+    const width = Number(match?.[1] ?? 320);
+    const height = Number(match?.[2] ?? 180);
+    await route.fulfill({
+      status: 200,
+      contentType: 'image/svg+xml',
+      body: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#111827"/></svg>`,
+    });
+  });
+
+  return observed;
+}
+
 async function waitForHarness(page: Page): Promise<void> {
   await page.waitForFunction(() => {
     const harness = (window as unknown as { __chatTimelineHarness?: { ready: boolean } }).__chatTimelineHarness;
@@ -165,6 +213,7 @@ async function measureAppendUpdates(page: Page, updates: number): Promise<Update
 }
 
 test('streaming stays flat as the conversation grows', async ({ page }) => {
+  const isolated = await isolateFixtureNetwork(page);
   const results: Array<{ size: number; cost: UpdateCost }> = [];
   for (const size of SIZES) {
     await page.goto(`${FIXTURE}?size=${size}`);
@@ -184,6 +233,8 @@ test('streaming stays flat as the conversation grows', async ({ page }) => {
   for (const result of results) {
     expect(result.cost.reflected, `${result.size} updates reached the DOM`).toBeGreaterThan(0.9);
   }
+  expect(isolated.preferenceRequests, 'fixture preference reads stayed inside the browser harness').toBe(SIZES.length);
+  expect(isolated.imageRequests, 'fixture images stayed inside the browser harness').toBeGreaterThan(0);
   const { ratio, baseline, largest } = growthRatio(results.map((r) => r.cost.medianMs));
   expect(
     ratio,
@@ -193,6 +244,7 @@ test('streaming stays flat as the conversation grows', async ({ page }) => {
 });
 
 test('message arrival stays flat as the conversation grows', async ({ page }) => {
+  const isolated = await isolateFixtureNetwork(page);
   const results: Array<{ size: number; cost: UpdateCost }> = [];
   for (const size of SIZES) {
     await page.goto(`${FIXTURE}?size=${size}`);
@@ -210,6 +262,8 @@ test('message arrival stays flat as the conversation grows', async ({ page }) =>
   for (const result of results) {
     expect(result.cost.reflected, `${result.size} updates reached the DOM`).toBeGreaterThan(0.9);
   }
+  expect(isolated.preferenceRequests, 'fixture preference reads stayed inside the browser harness').toBe(SIZES.length);
+  expect(isolated.imageRequests, 'fixture images stayed inside the browser harness').toBeGreaterThan(0);
   const { ratio, baseline, largest } = growthRatio(results.map((r) => r.cost.medianMs));
   expect(
     ratio,
