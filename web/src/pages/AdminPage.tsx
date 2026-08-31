@@ -144,8 +144,9 @@ export function AdminPage({ onBack }: Props) {
     <div
       data-testid="admin-page-scroll"
       style={{
-        background: '#0a0e1a', color: '#e2e8f0', height: '100%', minHeight: 0,
-        boxSizing: 'border-box', padding: '20px', overflowY: 'auto', WebkitOverflowScrolling: 'touch',
+        background: '#0a0e1a', color: '#e2e8f0', flex: '1 1 auto', width: '100%', height: '100%', minHeight: 0,
+        boxSizing: 'border-box', padding: '20px', overflowY: 'auto', overscrollBehaviorY: 'contain',
+        touchAction: 'pan-y', WebkitOverflowScrolling: 'touch',
       }}
     >
       <div style={{ maxWidth: '720px', margin: '0 auto' }}>

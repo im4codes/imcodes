@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { AddProject } from '../../src/pages/AddProject.js';
 import { AdminPage } from '../../src/pages/AdminPage.js';
+import { DashboardPage } from '../../src/pages/DashboardPage.js';
 import { AutoFixControls } from '../../src/pages/AutoFixControls.js';
 import { AutoFixMonitor } from '../../src/pages/AutoFixMonitor.js';
 import { ProjectSettings } from '../../src/pages/ProjectSettings.js';
@@ -15,6 +16,7 @@ import type { AutoFixTaskStatus } from '../../src/types.js';
 
 const {
   adminApi,
+  dashboardApi,
   nativeApi,
   translate,
   voiceApi,
@@ -27,6 +29,9 @@ const {
     fetchAdminSettings: vi.fn(),
     fetchAdminUsers: vi.fn(),
     updateAdminSettings: vi.fn(),
+  },
+  dashboardApi: {
+    apiFetch: vi.fn(),
   },
   nativeApi: {
     addServerToList: vi.fn(),
@@ -71,6 +76,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/api.js', () => ({
+  apiFetch: (...args: unknown[]) => dashboardApi.apiFetch(...args),
   approveUser: (...args: unknown[]) => adminApi.approveUser(...args),
   deleteAdminUser: (...args: unknown[]) => adminApi.deleteAdminUser(...args),
   disableUser: (...args: unknown[]) => adminApi.disableUser(...args),
@@ -140,6 +146,11 @@ beforeEach(() => {
   adminApi.deleteAdminUser.mockResolvedValue(undefined);
   adminApi.disableUser.mockResolvedValue(undefined);
   adminApi.updateAdminSettings.mockResolvedValue(undefined);
+  dashboardApi.apiFetch.mockImplementation(async (path: string) => {
+    if (path === '/api/server') return { servers: [] };
+    if (path === '/api/auth/user/me/keys') return { keys: [] };
+    return {};
+  });
   nativeApi.getServerList.mockResolvedValue(['https://cloud.im.codes']);
   nativeApi.addServerToList.mockResolvedValue(undefined);
   nativeApi.removeServerFromList.mockResolvedValue(undefined);
@@ -170,7 +181,9 @@ describe('low-coverage page and component surfaces', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'alpha' } });
     fireEvent.input(screen.getByPlaceholderText('/home/user/projects/my-project'), { target: { value: '/work/alpha' } });
-    changeSelect(screen.getAllByRole('combobox')[2], 'github');
+    const issueTrackerSelect = screen.getByText('Issue Tracker').parentElement?.querySelector('select');
+    expect(issueTrackerSelect).not.toBeNull();
+    fireEvent.change(issueTrackerSelect!, { target: { value: 'github' } });
     fireEvent.input(await screen.findByPlaceholderText('ghp_...'), { target: { value: 'ghp_token' } });
     fireEvent.input(screen.getByPlaceholderText('myorg/myrepo'), { target: { value: 'imcodes/app' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add Project' }));
@@ -357,7 +370,10 @@ describe('low-coverage page and component surfaces', () => {
     expect(await screen.findByText('newbie')).toBeTruthy();
     const scrollContainer = screen.getByTestId('admin-page-scroll');
     expect(scrollContainer.style.height).toBe('100%');
+    expect(scrollContainer.style.flex).toBe('1 1 auto');
     expect(scrollContainer.style.overflowY).toBe('auto');
+    expect(scrollContainer.style.overscrollBehaviorY).toBe('contain');
+    expect(scrollContainer.style.touchAction).toBe('pan-y');
     expect(scrollContainer.style.boxSizing).toBe('border-box');
 
     fireEvent.click(screen.getByRole('button', { name: 'admin.filter_pending (1)' }));
@@ -400,5 +416,39 @@ describe('low-coverage page and component surfaces', () => {
     fireEvent.input(screen.getByPlaceholderText('admin.search_placeholder'), { target: { value: 'user-01' } });
     expect(screen.getByText('user-01')).toBeTruthy();
     expect((screen.getByRole('button', { name: 'admin.previous_page' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('DashboardPage shows authorized shared resources instead of device onboarding when no server is owned', async () => {
+    const sharedEntry = {
+      id: 'share-dashboard',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer' as const,
+      status: 'active' as const,
+      target: { kind: 'main' as const, serverId: 'srv-shared', sessionName: 'deck_shared_brain' },
+      targetLabel: 'Shared Conversation',
+    };
+    const onOpenSharedEntry = vi.fn();
+    const props = {
+      onSelectServer: vi.fn(),
+      onLogout: vi.fn(),
+      onOpenUsageSummary: vi.fn(),
+      sharedEntries: [sharedEntry],
+      sharedEntriesLoading: false,
+      sharedEntriesLoaded: true,
+      sharedEntriesError: null,
+      openingSharedEntryId: null,
+      onOpenSharedEntry,
+      onRefreshSharedEntries: vi.fn(),
+    };
+    const view = render(<DashboardPage {...props} />);
+
+    expect(await screen.findByText('Shared Conversation')).toBeTruthy();
+    expect(screen.queryByText('Connect a Device')).toBeNull();
+    fireEvent.click(screen.getByText('Shared Conversation'));
+    expect(onOpenSharedEntry).toHaveBeenCalledWith(sharedEntry);
+
+    view.rerender(<DashboardPage {...props} sharedEntries={[]} />);
+    expect(await screen.findByText('Connect a Device')).toBeTruthy();
   });
 });

@@ -5913,9 +5913,29 @@ export function App() {
             <div>{trans('common.loading')}</div>
           </div>
         ) : !selectedServerId ? (
-          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+          <div style={{ position: 'relative', flex: 1, minHeight: 0, overflowY: 'auto' }}>
+            {isMobile && (
+              <button
+                type="button"
+                class="mobile-dashboard-menu-button"
+                aria-label={trans('sidebar.expand')}
+                onClick={() => setMobileSidebarOpen(true)}
+              >≡</button>
+            )}
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
-              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onOpenUsageSummary={() => setShowUsageSummaryPage(true)} onServersLoaded={setServers} />
+              <DashboardPage
+                onSelectServer={handleSelectServer}
+                onLogout={handleLogout}
+                onOpenUsageSummary={() => setShowUsageSummaryPage(true)}
+                onServersLoaded={setServers}
+                sharedEntries={sharedEntries}
+                sharedEntriesLoading={sharedEntriesLoading}
+                sharedEntriesLoaded={sharedEntriesLoaded}
+                sharedEntriesError={sharedEntriesError}
+                openingSharedEntryId={openingSharedEntryId}
+                onOpenSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
+                onRefreshSharedEntries={() => void refreshSharedEntries()}
+              />
             </Suspense>
           </div>
         ) : (
@@ -6440,7 +6460,7 @@ export function App() {
       {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
 
       {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
-      {isMobile && selectedServerId && (
+      {isMobile && (
         <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onPointerDown={(e) => { if (e.target === e.currentTarget) closeSidebar(); }}>
           <div ref={sidebarPanelRef} class="mobile-sidebar-panel">
             <div class="mobile-sidebar-header">
@@ -6456,32 +6476,45 @@ export function App() {
                   onClick={() => { setShowSettingsPage(true); closeSidebar(); }}
                   title="Settings"
                 >⚙</button>
-                <button
-                  class="mobile-sidebar-hdr-btn"
-                  onClick={() => {
-                    setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
-                    setShowSharedContextManagement(true);
-                    closeSidebar();
-                  }}
-                  title={trans('sharedContext.management.title')}
-                >CTX</button>
-                <button
-                  class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
-                  onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
-                  title="Server bar"
-                >≡</button>
-                <button
-                  class={`mobile-sidebar-hdr-btn${mobileHideTabBar ? '' : ' active'}`}
-                  onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
-                  title="Session tabs"
-                >⊞</button>
+                {isAdmin && (
+                  <button
+                    class="mobile-sidebar-hdr-btn"
+                    onClick={() => { setShowAdminPage(true); closeSidebar(); }}
+                    title={trans('admin.title')}
+                  >🛡</button>
+                )}
+                {selectedServerId && (
+                  <button
+                    class="mobile-sidebar-hdr-btn"
+                    onClick={() => {
+                      setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
+                      setShowSharedContextManagement(true);
+                      closeSidebar();
+                    }}
+                    title={trans('sharedContext.management.title')}
+                  >CTX</button>
+                )}
+                {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && (
+                  <button
+                    class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
+                    onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
+                    title="Server bar"
+                  >≡</button>
+                )}
+                {selectedServerId && (
+                  <button
+                    class={`mobile-sidebar-hdr-btn${mobileHideTabBar ? '' : ' active'}`}
+                    onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
+                    title="Session tabs"
+                  >⊞</button>
+                )}
                 <button class="mobile-sidebar-close" onClick={() => closeSidebar()}>✕</button>
               </div>
             </div>
             <div class="mobile-sidebar-body">
               <ErrorBoundary>
               {/* Server switcher — collapsible via sidebar toggle */}
-              {!mobileHideServerBar && (
+              {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && !mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
                   {servers.map((s) => {
                     const online = isServerOnline(s);
@@ -6509,7 +6542,7 @@ export function App() {
                 </div>
               )}
               {/* Session tree — collapsible via sidebar toggle */}
-              {!mobileHideTabBar && <SessionTree
+              {selectedServerId && !mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
                 sessions={visibleMainSessions}
                 subSessions={subSessions}
@@ -6533,7 +6566,7 @@ export function App() {
                 onResizeHeight={saveSessionTreeHeight}
               />}
               {/* P2P ring progress */}
-              {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
+              {selectedServerId && discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
                 <P2pRingProgress
                   key={d.id}
                   completedRounds={Math.max(0, d.currentRound - 1)}
@@ -6548,7 +6581,7 @@ export function App() {
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
-              {visiblePinnedPanels.map((panel) => {
+              {selectedServerId && visiblePinnedPanels.map((panel) => {
                 const height = pinnedPanelHeights[panel.id] ?? 240;
                 const ctx: PanelRenderContext = {
                   ws: wsRef.current,
@@ -6589,7 +6622,7 @@ export function App() {
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
-              {connected && (daemonStats || daemonVersionForDisplay) && (
+              {selectedServerId && connected && (daemonStats || daemonVersionForDisplay) && (
                 <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
@@ -6967,7 +7000,14 @@ export function App() {
       )}
 
       {showAdminPage && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden' }}>
+        <div
+          data-testid="admin-page-overlay"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
+            width: '100%', height: '100dvh', minHeight: 0, boxSizing: 'border-box',
+            background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden',
+          }}
+        >
           <AdminPage onBack={() => setShowAdminPage(false)} />
         </div>
       )}

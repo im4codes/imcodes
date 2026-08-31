@@ -378,7 +378,14 @@ vi.mock('../src/pages/ServerSetupPage.js', () => ({
   ),
 }));
 vi.mock('../src/pages/NativeAuthBridge.js', () => ({ NativeAuthBridge: textComponent('native-auth-bridge') }));
-vi.mock('../src/pages/DashboardPage.js', () => ({ DashboardPage: textComponent('dashboard-page') }));
+vi.mock('../src/pages/DashboardPage.js', () => ({
+  DashboardPage: ({ sharedEntries = [] }: { sharedEntries?: Array<{ id: string }> }) => (
+    <div>
+      <span>dashboard-page</span>
+      <span data-testid="dashboard-shared-count">{sharedEntries.length}</span>
+    </div>
+  ),
+}));
 vi.mock('../src/pages/DiscussionsPage.js', () => ({
   DiscussionsPage: ({ initialTab }: any) => (
     <div>
@@ -1698,6 +1705,106 @@ describe('App shell', () => {
 
     expect(await screen.findByText('dashboard-page')).toBeTruthy();
     expect(fetchMeMock).toHaveBeenCalled();
+  }, 20_000);
+
+  it('lets a mobile admin open navigation and the admin page without an associated server', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers: [] };
+        return {};
+      });
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'sidebar.expand' }));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      expect(screen.queryByTitle('sharedContext.management.title')).toBeNull();
+      expect(screen.queryByTitle('Server bar')).toBeNull();
+      expect(screen.queryByTitle('Session tabs')).toBeNull();
+      expect(screen.queryByText('session-tree')).toBeNull();
+      fireEvent.click(screen.getByTitle('admin.title'));
+
+      expect(await screen.findByText('admin-page')).toBeTruthy();
+      const overlay = screen.getByTestId('admin-page-overlay');
+      expect(overlay.style.display).toBe('flex');
+      expect(overlay.style.height).toBe('100dvh');
+      expect(overlay.style.overflow).toBe('hidden');
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('lets a mobile user with no owned server open a shared session from the main shell', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const sharedEntry = {
+      id: 'share-zero-owned',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      target: { kind: 'main' as const, serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+      targetLabel: 'Shared Beta',
+    };
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers: [] };
+        return {};
+      });
+      discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+      openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-zero-owned', 'dispatch-zero-owned'));
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+      await waitFor(() => expect(screen.getByTestId('dashboard-shared-count').textContent).toBe('1'));
+      fireEvent.click(screen.getByRole('button', { name: 'sidebar.expand' }));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      expect(view.container.querySelector('.mobile-sidebar-body')?.scrollHeight).toBeGreaterThanOrEqual(0);
+      fireEvent.click(screen.getByText('Shared Beta'));
+
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
+      expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+      expect(screen.queryByText('dashboard-page')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('keeps the admin entry in mobile navigation when a server is selected', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      expect(screen.getByTitle('admin.title')).toBeTruthy();
+      expect(screen.getByTitle('sharedContext.management.title')).toBeTruthy();
+      expect(screen.getByText('session-tree')).toBeTruthy();
+      fireEvent.click(screen.getByTitle('admin.title'));
+      expect(await screen.findByText('admin-page')).toBeTruthy();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   }, 20_000);
 
   it('connects the selected server, merges session_list, and renders the session shell', async () => {
