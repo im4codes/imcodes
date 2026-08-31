@@ -2636,7 +2636,11 @@ export class SupervisionTaskRegistry {
       ? undefined : normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
     if (!taskId || !assignmentId || !toRevision || fromRevision === toRevision
       || !reason || !idempotencyKey
-      || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)) {
+      || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)
+      // A successful revision rebind always normalizes the required
+      // implementer to an active lease. `clear` is valid for coordination
+      // recovery, but cannot truthfully describe this atomic transition.
+      || input.leaseAction === 'clear') {
       return { ok: false, reason: 'invalid' };
     }
 
@@ -2708,44 +2712,52 @@ export class SupervisionTaskRegistry {
       const protectedRevisions = new Set([
         fromRevision, task.currentRevision, assignment.auditRevision, toRevision,
       ].filter((value): value is string => Boolean(value)));
-      const conflictingPassAssignment = assignments.some((candidate) => (
+      const conflictingTargetPassAssignment = assignments.some((candidate) => (
         candidate.verdict?.trim().toUpperCase() === 'PASS'
-        && Boolean(candidate.auditRevision && protectedRevisions.has(candidate.auditRevision))
+        && candidate.auditRevision === toRevision
       ));
-      const placeholders = [...protectedRevisions].map(() => '?').join(', ');
-      const conflictingPassAttestation = this.#db.prepare(
+      const conflictingLivePassAssignment = assignments.some((candidate) => (
+        !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+        && (candidate.verdict?.trim().toUpperCase() === 'PASS'
+          || candidate.primaryReviewPassed === true
+          || candidate.crossVendorAuditPassed === true)
+        && (candidate.assignmentId === assignmentId
+          || Boolean(candidate.auditRevision && protectedRevisions.has(candidate.auditRevision)))
+      ));
+      // Immutable PASS history for the source revision is retained when Brain
+      // explicitly reopens the same object after a real CI failure. It cannot
+      // authorize the target revision, so only pre-existing PASS authority for
+      // that target conflicts with a fresh rebind/audit cycle.
+      const conflictingTargetPassAttestation = this.#db.prepare(
         `SELECT 1 AS ok FROM supervision_audit_attestations
-         WHERE task_id = ? AND revision IN (${placeholders}) AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
-      ).get(taskId, ...protectedRevisions) as { ok?: number } | undefined;
-      const conflictingPassReceipt = this.#db.prepare(
+         WHERE task_id = ? AND revision = ? AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
+      ).get(taskId, toRevision) as { ok?: number } | undefined;
+      const conflictingTargetPassReceipt = this.#db.prepare(
         `SELECT 1 AS ok FROM supervision_audit_receipts
-         WHERE task_id = ? AND revision IN (${placeholders}) AND receipt_kind = 'final'
+         WHERE task_id = ? AND revision = ? AND receipt_kind = 'final'
            AND UPPER(TRIM(verdict)) = 'PASS' LIMIT 1`,
-      ).get(taskId, ...protectedRevisions) as { ok?: number } | undefined;
+      ).get(taskId, toRevision) as { ok?: number } | undefined;
       const sourceBindingMatches = (revision: string | undefined) => (
         !revision || Boolean(fromRevision && revision === fromRevision)
       );
-      const leaseCanContinue = input.leaseAction === 'renew'
-        || (input.leaseAction === 'preserve' && Boolean(assignment.leaseId));
       const exactStaleShape = Boolean(
-        ['implementing', 'rework'].includes(task.status)
-        && ['implementing', 'rework'].includes(assignment.status)
+        !HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(task.status)
+        && !HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(assignment.status)
         && sourceBindingMatches(task.currentRevision)
         && sourceBindingMatches(assignment.auditRevision)
         && assignment.role === 'implementer'
         && assignment.required
-        && leaseCanContinue
         && activeImplementers.length === 1
         && activeImplementers[0]?.assignmentId === assignmentId
         && !activeAuditor
-        && !conflictingPassAssignment
-        && conflictingPassAttestation?.ok !== 1
-        && conflictingPassReceipt?.ok !== 1
+        && !conflictingTargetPassAssignment
+        && !conflictingLivePassAssignment
+        && conflictingTargetPassAttestation?.ok !== 1
+        && conflictingTargetPassReceipt?.ok !== 1
         && !task.commitSha
         && !task.pushRemoteRef
         && !task.finalization
         && !task.archivedAt
-        && this.listFileClaims(taskId).length === 0
       );
       if (!exactStaleShape) {
         this.#db.exec('ROLLBACK');
@@ -2777,7 +2789,8 @@ export class SupervisionTaskRegistry {
       const reboundAssignment: PersistedSupervisionTaskAssignment = {
         ...assignment,
         scopeFiles: targetScopeFiles,
-        leaseId: input.leaseAction === 'renew' ? stableLeaseId() : assignment.leaseId,
+        leaseId: input.leaseAction === 'preserve' && assignment.leaseId
+          ? assignment.leaseId : stableLeaseId(),
         status: 'implementing',
         generation: assignment.generation + 1,
         auditAttemptId: undefined,

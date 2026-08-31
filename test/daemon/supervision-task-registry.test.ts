@@ -910,25 +910,13 @@ describe('SupervisionTaskRegistry', () => {
         toRevision: shape.toRevision,
         ownedFiles: shape.files,
         scopeFiles: shape.scopeFiles,
-        leaseAction: 'renew' as const,
+        leaseAction: 'preserve' as const,
         idempotencyKey: 'same-object-revision-recovery-r3',
         evidenceManifestSha256: shape.evidenceManifestSha256,
         worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
         reason: 'bind validated frozen R3 without replacing the GC objects',
         now: 500,
       };
-
-      const emptyLeaseState = registry.get(shape.taskId);
-      const emptyLeaseEvents = registry.listEvents(shape.taskId).length;
-      for (const leaseAction of ['preserve', 'clear'] as const) {
-        expect(registry.rebindTaskAssignmentRevision({
-          ...request,
-          leaseAction,
-          idempotencyKey: `same-object-revision-${leaseAction}-empty-lease-refused`,
-        }), leaseAction).toEqual({ ok: false, reason: 'invalid_transition' });
-        expect(registry.get(shape.taskId)).toEqual(emptyLeaseState);
-        expect(registry.listEvents(shape.taskId)).toHaveLength(emptyLeaseEvents);
-      }
 
       expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
         ok: true,
@@ -957,7 +945,7 @@ describe('SupervisionTaskRegistry', () => {
             fromRevision: shape.fromRevision, toRevision: shape.toRevision,
             ownedFiles: shape.files,
             scopeFiles: shape.scopeFiles,
-            leaseAction: 'renew',
+            leaseAction: 'preserve',
             evidenceManifestSha256: shape.evidenceManifestSha256,
             previousAuditAttemptId: `${shape.taskId}-r1-attempt`, previousVerdict: 'REWORK',
           }),
@@ -1008,6 +996,270 @@ describe('SupervisionTaskRegistry', () => {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('normalizes stale nonterminal projections and a missing lease in one exact rebind', () => {
+    const registry = makeRegistry();
+    const shape = prepareSameObjectRevisionRecoveryShape(registry, 'stale-status-missing-lease-rebind');
+    expect(registry.updateTask({ taskId: shape.taskId, status: 'validated' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: shape.implementer.assignmentId, identity: shape.implementerIdentity,
+      status: 'validated', revision: shape.fromRevision,
+      auditAttemptId: `${shape.taskId}-r1-attempt`, auditRevision: shape.fromRevision,
+      verdict: 'REWORK',
+    })).toMatchObject({ ok: true, value: { status: 'validated' } });
+    expect(registry.coordinateTaskAssignment({
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      leaseAction: 'clear', idempotencyKey: 'stale-status-clear-lease-fixture',
+      reason: 'reproduce a stale nonterminal projection without a lease', now: 400,
+    })).toMatchObject({ ok: true, value: { status: 'validated' } });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+      status: 'validated', leaseId: '', auditRevision: shape.fromRevision, verdict: 'REWORK',
+    });
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'preserve', idempotencyKey: 'stale-status-missing-lease-bind-r3',
+      reason: 'normalize the exact same implementer and worktree in one atomic recovery', now: 500,
+    })).toMatchObject({
+      ok: true, value: { status: 'implementing', currentRevision: shape.toRevision },
+    });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+      status: 'implementing', auditRevision: shape.toRevision,
+      leaseId: expect.stringMatching(/^supervision_lease_/),
+    });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('auditAttemptId');
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('verdict');
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('primaryReviewPassed');
+    expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('crossVendorAuditPassed');
+    expect(registry.listAuditReceipts(shape.taskId)).toEqual([]);
+    registry.close();
+  });
+
+  it('rejects leaseAction clear before revision-rebind mutation', () => {
+    const registry = makeRegistry();
+    const shape = prepareSameObjectRevisionRecoveryShape(registry, 'revision-rebind-clear-refusal');
+    const before = registry.get(shape.taskId);
+    const beforeAssignment = registry.getAssignment(shape.implementer.assignmentId);
+    const eventCount = registry.listEvents(shape.taskId).length;
+
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId,
+      assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision,
+      toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'clear',
+      idempotencyKey: 'revision-rebind-must-not-persist-clear',
+      reason: 'clear contradicts the active lease required by a successful revision rebind',
+      now: 500,
+    })).toEqual({ ok: false, reason: 'invalid' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toEqual(beforeAssignment);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
+    registry.close();
+  });
+
+  it('rebinds an explicitly reopened post-PASS CI failure without letting R1 PASS qualify R2', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'post-pass-ci-failure-rebind';
+    const fromRevision = 'post-pass-ci-failure-r1';
+    const toRevision = 'post-pass-ci-failure-r2';
+    const attemptId = 'post-pass-ci-failure-audit-r1';
+    const files = ['src/daemon/post-pass-fix.ts', 'test/daemon/post-pass-fix.test.ts'];
+    const implementerIdentity = identity('deck_post_pass_worker');
+    const auditorIdentity = identity('deck_post_pass_auditor', 'claude-code-sdk');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'repair a real external CI failure after matching PASS', currentRevision: fromRevision,
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
+      identity: implementerIdentity, scopeFiles: files,
+      auditAttemptId: attemptId, auditRevision: fromRevision,
+    });
+    const auditor = registry.createAssignment({
+      assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', required: false,
+      identity: auditorIdentity, scopeFiles: files,
+      auditAttemptId: attemptId, auditRevision: fromRevision,
+    });
+    if (!implementer.ok || !auditor.ok) throw new Error('post-PASS CI fixture creation failed');
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: implementer.value.assignmentId, identity: implementerIdentity,
+        status, revision: fromRevision, auditAttemptId: attemptId, auditRevision: fromRevision,
+      }), status).toMatchObject({ ok: true });
+    }
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: fromRevision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      attemptId, revision: fromRevision, receiptKind: 'final', verdict: 'PASS',
+      auditorSessionName: auditorIdentity.sessionName, auditorIdentity,
+      findings: 'R1 matched before external CI found a real error',
+      validations: [{ kind: 'test', label: 'R1', outcome: 'passed', summary: 'R1 frozen evidence passed' }],
+      now: 100,
+    })).toMatchObject({ ok: true, value: { revision: fromRevision, verdict: 'PASS' } });
+    expect(registry.applyMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      attemptId, revision: fromRevision, verdict: 'PASS',
+      auditedSessionName: implementerIdentity.sessionName,
+      auditorSessionName: auditorIdentity.sessionName,
+      findings: 'authenticated R1 PASS',
+      validations: [{ kind: 'test', label: 'R1', outcome: 'passed', summary: 'R1 matched' }],
+      now: 110,
+    })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', verdict: 'PASS' } });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity,
+      revision: fromRevision, now: 120,
+    })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+
+    const request = {
+      taskId, assignmentId: implementer.value.assignmentId,
+      fromRevision, toRevision, worktreeSnapshot: recoveryWorktreeSnapshot(files),
+      leaseAction: 'preserve' as const, idempotencyKey: 'post-pass-ci-failure-bind-r2',
+      reason: 'bind the exact compile-clean R2 after Brain reopens the same object',
+    };
+    const beforeReopen = registry.get(taskId);
+    const beforeReopenEvents = registry.listEvents(taskId).length;
+    expect(registry.rebindTaskAssignmentRevision(request)).toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(registry.get(taskId)).toEqual(beforeReopen);
+    expect(registry.listEvents(taskId)).toHaveLength(beforeReopenEvents);
+
+    expect(registry.coordinateTaskAssignment({
+      taskId, assignmentId: implementer.value.assignmentId,
+      taskStatus: 'implementing', assignmentStatus: 'implementing', leaseAction: 'renew',
+      idempotencyKey: 'post-pass-ci-failure-explicit-reopen',
+      reason: 'external CI found a real R1 compile error; require corrected R2 and fresh audit',
+      now: 200,
+    })).toMatchObject({ ok: true, value: { status: 'implementing', currentRevision: fromRevision } });
+    expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+      status: 'implementing', leaseId: expect.stringMatching(/^supervision_lease_/),
+    });
+    expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('auditAttemptId');
+    expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('auditRevision');
+    expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('verdict');
+
+    const historicalReceipts = registry.listAuditReceipts(taskId);
+    const historicalAttestations = database.prepare(`
+      SELECT attempt_id AS attemptId, revision, verdict
+      FROM supervision_audit_attestations WHERE task_id = ? ORDER BY created_at
+    `).all(taskId);
+    expect(historicalReceipts).toEqual([expect.objectContaining({
+      attemptId, revision: fromRevision, receiptKind: 'final', verdict: 'PASS',
+    })]);
+    expect(historicalAttestations).toEqual([expect.objectContaining({
+      attemptId, revision: fromRevision, verdict: 'PASS',
+    })]);
+    expect(registry.rebindTaskAssignmentRevision({ ...request, now: 300 })).toMatchObject({
+      ok: true, value: { status: 'implementing', currentRevision: toRevision },
+    });
+    expect(registry.listAuditReceipts(taskId)).toEqual(historicalReceipts);
+    expect(database.prepare(`
+      SELECT attempt_id AS attemptId, revision, verdict
+      FROM supervision_audit_attestations WHERE task_id = ? ORDER BY created_at
+    `).all(taskId)).toEqual(historicalAttestations);
+    expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
+      status: 'finalized', auditRevision: fromRevision, verdict: 'PASS', leaseId: '',
+    });
+    expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+      status: 'implementing', auditRevision: toRevision,
+    });
+    expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('auditAttemptId');
+    expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('verdict');
+    expect(registry.get(taskId)).toMatchObject({ status: 'implementing', currentRevision: toRevision });
+    registry.close();
+    database.close();
+  });
+
+  it('rejects assignment-only terminal PASS rows for the target revision without mutation', () => {
+    for (const terminalStatus of ['finalized', 'cancelled'] as const) {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      const shape = prepareSameObjectRevisionRecoveryShape(
+        registry, `target-pass-assignment-only-${terminalStatus}`,
+      );
+      const legacyIdentity = identity(`deck_target_pass_${terminalStatus}_auditor`);
+      const legacy = registry.createAssignment({
+        assignmentId: `${shape.taskId}-legacy-target-pass`, taskId: shape.taskId,
+        role: 'auditor', required: false, identity: legacyIdentity,
+        auditAttemptId: `${shape.taskId}-legacy-target-pass-attempt`,
+        auditRevision: shape.toRevision,
+      });
+      if (!legacy.ok) throw new Error('legacy target PASS fixture creation failed');
+      rewritePersistedAssignment(database, {
+        ...legacy.value,
+        status: terminalStatus,
+        leaseId: '',
+        verdict: 'PASS',
+        updatedAt: 200,
+      });
+      expect(registry.listAuditReceipts(shape.taskId)).toEqual([]);
+      expect(database.prepare(`
+        SELECT 1 AS ok FROM supervision_audit_attestations
+        WHERE task_id = ? AND revision = ?
+      `).get(shape.taskId, shape.toRevision)).toBeUndefined();
+      const before = registry.get(shape.taskId);
+      const eventCount = registry.listEvents(shape.taskId).length;
+      expect(registry.rebindTaskAssignmentRevision({
+        taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+        fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+        worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+        leaseAction: 'preserve', idempotencyKey: `${shape.taskId}-must-refuse`,
+        reason: 'assignment-only target PASS must remain authoritative',
+      }), terminalStatus).toEqual({ ok: false, reason: 'invalid_transition' });
+      expect(registry.get(shape.taskId), terminalStatus).toEqual(before);
+      expect(registry.listEvents(shape.taskId), terminalStatus).toHaveLength(eventCount);
+      registry.close();
+      database.close();
+    }
+  });
+
+  it('treats legacy file claims as metadata while exact worktree bytes still gate recovery', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = prepareSameObjectRevisionRecoveryShape(registry, 'revision-recovery-metadata-claims');
+    database.prepare(`
+      INSERT INTO supervision_task_file_claims
+        (task_id, assignment_id, file_path, claim_mode, created_at)
+      VALUES (?, ?, ?, 'exclusive', 100), (?, ?, ?, 'read_only', 101)
+    `).run(
+      shape.taskId, shape.implementer.assignmentId, 'stale/active-metadata-claim.ts',
+      shape.taskId, shape.auditor.assignmentId, 'stale/historical-metadata-claim.ts',
+    );
+    expect(database.prepare(`
+      SELECT COUNT(*) AS count FROM supervision_task_file_claims WHERE task_id = ?
+    `).get(shape.taskId)).toEqual({ count: 2 });
+    const request = {
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'preserve' as const, idempotencyKey: 'metadata-claims-do-not-veto',
+      reason: 'assignment worktree bytes are recovery authority; claims are provenance only',
+    };
+    expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
+      ok: true, value: { currentRevision: shape.toRevision, status: 'implementing' },
+    });
+    const state = registry.get(shape.taskId);
+    const events = registry.listEvents(shape.taskId).length;
+    const first = request.worktreeSnapshot.files[0]!;
+    expect(registry.rebindTaskAssignmentRevision({
+      ...request,
+      worktreeSnapshot: {
+        ...request.worktreeSnapshot,
+        files: [{ ...first, sha256: 'd'.repeat(64) }, ...request.worktreeSnapshot.files.slice(1)],
+      },
+    })).toEqual({ ok: false, reason: 'conflicting_replay' });
+    expect(registry.get(shape.taskId)).toEqual(state);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(events);
+    registry.close();
+    database.close();
   });
 
   it('atomically binds null task/audit revisions from exact file events and replays after SQLite reopen', () => {
@@ -1488,7 +1740,13 @@ describe('SupervisionTaskRegistry', () => {
 
     const lifecycleRegistry = makeRegistry();
     const lifecycle = prepareSameObjectRevisionRecoveryShape(lifecycleRegistry, 'revision-recovery-lifecycle');
-    expect(lifecycleRegistry.updateTask({ taskId: lifecycle.taskId, status: 'validated' })).toMatchObject({ ok: true });
+    for (const status of [
+      'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration',
+      'integrating', 'final_audit', 'finalizing', 'committed',
+    ] as const) {
+      expect(lifecycleRegistry.updateTask({ taskId: lifecycle.taskId, status }), status)
+        .toMatchObject({ ok: true });
+    }
     expect(lifecycleRegistry.rebindTaskAssignmentRevision({
       taskId: lifecycle.taskId, assignmentId: lifecycle.implementer.assignmentId,
       fromRevision: lifecycle.fromRevision, toRevision: lifecycle.toRevision,
