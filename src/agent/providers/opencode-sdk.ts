@@ -369,6 +369,10 @@ export class OpenCodeSdkProvider implements TransportProvider {
     attachments: true,
     contextSupport: 'full-normalized-context-injection',
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    restartDurableDeliveryId: {
+      restartDurable: true,
+      replayAfterAcceptance: 'deduplicated',
+    },
   };
 
   private client: OpenCodeClientLike | null = null;

@@ -273,7 +273,13 @@ export function buildSupervisionDelegationEligibilityPolicy(_locale?: Supervisio
     rejectAvailability: ['limited', 'offline', 'missing', 'unknown'],
     busy: 'queue_only',
     forbidAgentTypes: 'product_policy',
-    independentAudit: { self: false, preferDifferentProviderFamily: true, sameFamilyFallback: 'record_degraded', exactBoundTarget: true },
+    independentAudit: {
+      self: false,
+      preferDifferentProviderFamily: true,
+      sameFamilyFallback: 'record_degraded',
+      manual: 'exact_bound_target',
+      automatic: 'reply_capable_transport+proven_restart_durable_delivery_id_after_ready_for_audit',
+    },
     decisions: 'tool_schema',
   });
 }
@@ -286,6 +292,7 @@ export function buildSupervisionMessagingContract(): string {
     binding: { unchanged: 'continue_existing', changed: 'delta_only', unknownOrMismatch: 'fail_closed' },
     delegation_reply: { auth: 'daemon_session', mode: 'append_only', verdict: false },
     peer_audit_reply: { verdictChannel: 'only', bind: ['taskId', 'assignmentId', 'attemptId', 'revision'], progress: true, final: ['PASS', 'REWORK'] },
+    automaticAudit: { materialize: 'once_after_open_audit', target: 'reply_capable_transport+proven_restart_durable_delivery_id', recovery: 'boot_sweep', failure: 'Brain_same_object_manual_exact_route', successChatter: false },
     blocker: { immediateReply: true, fields: ['taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'recommendedNextAction'] },
     heartbeat: { reminderOnly: true, substitutesReply: false },
     gate: 'tool_schema+authority_handler',

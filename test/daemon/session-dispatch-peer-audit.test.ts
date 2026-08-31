@@ -9,11 +9,13 @@ const injectPrivateMock = vi.fn();
 const getSessionMock = vi.fn();
 const getTransportRuntimeMock = vi.fn();
 const ensureTransportRuntimeForPendingResendMock = vi.fn();
+const drainTransportResendQueueForDispatchMock = vi.fn();
 const enqueueResendMock = vi.fn();
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: (...args: unknown[]) => getTransportRuntimeMock(...args),
   ensureTransportRuntimeForPendingResend: (...args: unknown[]) => ensureTransportRuntimeForPendingResendMock(...args),
+  drainTransportResendQueueForDispatch: (...args: unknown[]) => drainTransportResendQueueForDispatchMock(...args),
 }));
 
 vi.mock('../../src/daemon/transport-resend-queue.js', () => ({
@@ -79,6 +81,8 @@ describe('peer-audit dedicated dispatch', () => {
     });
     ensureTransportRuntimeForPendingResendMock.mockReset();
     ensureTransportRuntimeForPendingResendMock.mockResolvedValue(undefined);
+    drainTransportResendQueueForDispatchMock.mockReset();
+    drainTransportResendQueueForDispatchMock.mockResolvedValue(undefined);
     enqueueResendMock.mockReset();
     enqueueResendMock.mockReturnValue({ accepted: true, droppedOldest: false, pendingVersion: 1 });
   });
@@ -212,6 +216,22 @@ describe('peer-audit dedicated dispatch', () => {
 
     expect(appendExternalMock).not.toHaveBeenCalled();
     expect(sendMock).toHaveBeenCalledWith('wait your turn', 'send_message_12345678');
+  });
+
+  it('persists daemon-owned control traffic before draining the live runtime', async () => {
+    await expect(dispatchSessionMessage(target(), 'automatic audit', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      durableQueue: true,
+    })).resolves.toBe('queued');
+
+    expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
+      text: 'automatic audit',
+      commandId: 'send_message_12345678',
+      clientMessageId: 'send_message_12345678',
+    }));
+    expect(drainTransportResendQueueForDispatchMock).toHaveBeenCalledWith('deck_sub_audit123');
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
   it('durably queues MCP delivery when the transport runtime is unavailable', async () => {

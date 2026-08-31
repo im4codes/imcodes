@@ -734,6 +734,25 @@ export const SUPERVISION_EXECUTION_STATUS_MARKERS = {
 } as const;
 
 export type SupervisionMode = typeof SUPERVISION_MODE[keyof typeof SUPERVISION_MODE];
+export const SUPERVISION_TASK_AUDIT_POLICIES = [
+  'auto_allow_degraded',
+  'auto_strict_cross_vendor',
+] as const;
+export type SupervisionTaskAuditPolicy = typeof SUPERVISION_TASK_AUDIT_POLICIES[number];
+
+export function isSupervisionTaskAuditPolicy(value: unknown): value is SupervisionTaskAuditPolicy {
+  return typeof value === 'string'
+    && (SUPERVISION_TASK_AUDIT_POLICIES as readonly string[]).includes(value);
+}
+
+/** Snapshot the Brain-owned automatic-audit choice for a newly created task. */
+export function supervisionTaskAuditPolicyFromSnapshot(
+  snapshot: Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined,
+): SupervisionTaskAuditPolicy | undefined {
+  return snapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+    ? 'auto_allow_degraded'
+    : undefined;
+}
 
 /**
  * Single mode authority for every daemon-owned automatic supervision action.

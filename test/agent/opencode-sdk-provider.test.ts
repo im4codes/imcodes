@@ -554,6 +554,77 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('deduplicates the same stable delivery id after the provider client restarts', async () => {
+    const harness = createHarness();
+    harness.client.session.promptAsync.mockImplementation((options: any) => {
+      harness.messages.set(options.body.messageID, {
+        info: {
+          id: options.body.messageID,
+          sessionID: options.path.id,
+          role: 'user',
+        },
+        parts: options.body.parts,
+      });
+      return result(undefined);
+    });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const payload = {
+      userMessage: 'audit the exact revision',
+      assembledMessage: 'audit the exact revision',
+      deliveryId: 'stable-auto-audit-delivery',
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'p' },
+        authoritySource: 'none',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    } satisfies ProviderContextPayload;
+
+    const first = new OpenCodeSdkProvider();
+    await first.connect({});
+    const firstRoute = await first.createSession({
+      sessionKey: 'restart-stable-route',
+      cwd: '/tmp/project',
+    });
+    await first.send(firstRoute, payload);
+    expect(first.capabilities.restartDurableDeliveryId).toEqual({
+      restartDurable: true,
+      replayAfterAcceptance: 'deduplicated',
+    });
+    const acceptedMessageId = harness.client.session.promptAsync.mock.calls[0]![0].body.messageID;
+    await first.disconnect();
+
+    const restarted = new OpenCodeSdkProvider();
+    await restarted.connect({});
+    const restartedRoute = await restarted.createSession({
+      sessionKey: 'restart-stable-route',
+      cwd: '/tmp/project',
+      skipCreate: true,
+      resumeId: 'oc-session-1',
+    });
+    await restarted.send(restartedRoute, payload);
+
+    expect(harness.client.session.promptAsync).toHaveBeenCalledOnce();
+    expect(harness.client.session.message).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'oc-session-1', messageID: acceptedMessageId },
+    }));
+    await restarted.disconnect();
+  });
+
   it('surfaces a missing prompt_async delivery as recoverable and reuses its message ID on retry', async () => {
     vi.useFakeTimers();
     const harness = createHarness();

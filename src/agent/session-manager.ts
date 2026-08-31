@@ -1370,7 +1370,7 @@ async function recoverTransportRuntimeAfterError(
 async function drainTransportResendQueueIntoRuntime(
   runtime: TransportSessionRuntime,
   sessionName: string,
-  context: 'reconnect' | 'launch' | 'provider-ready',
+  context: 'reconnect' | 'launch' | 'provider-ready' | 'explicit-dispatch',
 ): Promise<void> {
   const pendingCount = getResendCount(sessionName);
   if (pendingCount === 0) return;
@@ -1480,6 +1480,13 @@ async function drainTransportResendQueueIntoRuntime(
   } catch (err) {
     logger.warn({ err, session: sessionName, context }, 'transport resend drain failed');
   }
+}
+
+/** Drain control traffic that was deliberately persisted before delivery. */
+export async function drainTransportResendQueueForDispatch(sessionName: string): Promise<void> {
+  const runtime = getTransportRuntime(sessionName);
+  if (!runtime?.providerSessionId) return;
+  await drainTransportResendQueueIntoRuntime(runtime, sessionName, 'explicit-dispatch');
 }
 
 interface TransportSessionStatePayloadBuild {

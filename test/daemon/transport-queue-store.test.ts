@@ -271,6 +271,13 @@ describe('TransportQueueStore', () => {
     expect(snapshot.pendingMessageEntries[0]?.status).toBe('queued');
   });
 
+  it('restores an unexpired prior-process handoff only when restart recovery is explicit', () => {
+    store.enqueue({ sessionName: 'deck', clientMessageId: 'msg-restart', text: 'lease', now: 100 });
+    store.markHandoffInFlight('deck', ['msg-restart'], 60_000, 200);
+    expect(store.restoreExpiredHandoffs('deck', 201).pendingMessageEntries[0]?.status).toBe('handoff_inflight');
+    expect(store.restoreExpiredHandoffs('deck', 202, { includeUnexpired: true }).pendingMessageEntries[0]?.status).toBe('queued');
+  });
+
   it('reset creates a new epoch and clears live entries', () => {
     const before = store.enqueue({ sessionName: 'deck', clientMessageId: 'msg-1', text: 'queued', now: 100 });
     const after = store.reset('deck', 'user_clear', 200);

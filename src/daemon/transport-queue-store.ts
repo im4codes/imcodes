@@ -828,19 +828,30 @@ export class TransportQueueStore {
     }
   }
 
-  restoreExpiredHandoffs(sessionNameInput: string, now = Date.now()): QueueSnapshot {
+  restoreExpiredHandoffs(
+    sessionNameInput: string,
+    now = Date.now(),
+    options: { includeUnexpired?: boolean } = {},
+  ): QueueSnapshot {
     const sessionName = normalizeSessionName(sessionNameInput);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.ensureMeta(sessionName, now);
-      this.db.prepare(`
+      const restored = this.db.prepare(`
         UPDATE queue_entries
         SET status = 'queued', handoff_id = NULL, handoff_started_at = NULL, handoff_expires_at = NULL, updated_at = ?
-        WHERE session_name = ? AND status = 'handoff_inflight' AND handoff_expires_at IS NOT NULL AND handoff_expires_at <= ?
-      `).run(now, sessionName, now);
-      const version = this.bumpVersion(sessionName, now);
+        WHERE session_name = ? AND status = 'handoff_inflight'
+          AND (? = 1 OR (handoff_expires_at IS NOT NULL AND handoff_expires_at <= ?))
+      `).run(now, sessionName, options.includeUnexpired ? 1 : 0, now);
+      const version = Number(restored.changes ?? 0) > 0
+        ? this.bumpVersion(sessionName, now)
+        : undefined;
       this.db.exec('COMMIT');
-      return this.readSnapshot(sessionName, 'restore_expired_handoffs', version);
+      return this.readSnapshot(
+        sessionName,
+        options.includeUnexpired ? 'restore_restart_handoffs' : 'restore_expired_handoffs',
+        version,
+      );
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;

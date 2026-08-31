@@ -10,6 +10,7 @@ import {
   canTransitionSupervisionTaskStatus,
   isSupervisionTaskVisibleByDefault,
   isSupervisionTaskClassification,
+  isSupervisionTaskAuditPolicy,
   isSupervisionTaskLifecycleStatus,
   SUPERVISION_TASK_ABANDONED_AFTER_MS,
   SUPERVISION_TASK_ARCHIVE_GRACE_MS,
@@ -21,6 +22,7 @@ import {
   type SupervisionTaskArchiveReason,
   type SupervisionBrainCoordinationRecoveryStatus,
   type SupervisionRecoveryLeaseAction,
+  type SupervisionTaskAuditPolicy,
   type SessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
 import type { SupervisionAuditDepth } from './supervision-broker.js';
@@ -353,6 +355,8 @@ export interface PersistedSupervisionTaskRecord {
   classification: import('../../shared/supervision-config.js').SupervisionTaskClassification;
   objective: string;
   acceptance: string[];
+  /** Brain-owned creation snapshot. Missing keeps the legacy manual audit path. */
+  auditPolicy?: SupervisionTaskAuditPolicy;
   integrationOwnerAssignmentId?: string;
   baseRevision?: string;
   currentRevision?: string;
@@ -447,6 +451,8 @@ export interface SupervisionTaskCreateInput {
   classification?: import('../../shared/supervision-config.js').SupervisionTaskClassification | null;
   objective?: string | null;
   acceptance?: readonly string[] | null;
+  /** Internal Brain-derived value; never published on worker task metadata. */
+  auditPolicy?: SupervisionTaskAuditPolicy | null;
   baseRevision?: string | null;
   currentRevision?: string | null;
   idempotencyKey?: string | null;
@@ -820,7 +826,10 @@ function safeJsonParseObject(text: string | undefined): Record<string, unknown> 
 function parseTaskRow(row: Record<string, unknown>): PersistedSupervisionTaskRecord | undefined {
   const payload = safeJsonParseObject(typeof row.payloadJson === 'string' ? row.payloadJson : undefined);
   if (!payload || payload.version !== SUPERVISION_TASK_REGISTRY_DB_VERSION) return undefined;
-  return payload as unknown as PersistedSupervisionTaskRecord;
+  const record = payload as unknown as PersistedSupervisionTaskRecord;
+  if (isSupervisionTaskAuditPolicy(payload.auditPolicy)) return { ...record, auditPolicy: payload.auditPolicy };
+  const { auditPolicy: _invalidAuditPolicy, ...legacy } = record;
+  return legacy;
 }
 
 function parseAssignmentRow(row: Record<string, unknown>): PersistedSupervisionTaskAssignment | undefined {
@@ -1695,6 +1704,7 @@ export class SupervisionTaskRegistry {
         classification,
         objective: normalizeTaskString(input.objective) ?? 'Delegated supervised task',
         acceptance: normalizeTaskArray(input.acceptance),
+        ...(isSupervisionTaskAuditPolicy(input.auditPolicy) ? { auditPolicy: input.auditPolicy } : {}),
         ...(normalizeTaskString(input.baseRevision) ? { baseRevision: normalizeTaskString(input.baseRevision) } : {}),
         ...(normalizeTaskString(input.currentRevision) ? { currentRevision: normalizeTaskString(input.currentRevision) } : {}),
         status: 'planned',

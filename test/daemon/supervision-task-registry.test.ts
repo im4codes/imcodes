@@ -287,6 +287,22 @@ function rewritePersistedAssignment(
   );
 }
 
+function rewritePersistedTask(
+  database: InstanceType<typeof DatabaseSync>,
+  task: ReturnType<SupervisionTaskRegistry['get']> & {},
+): void {
+  database.prepare(`
+    UPDATE supervision_tasks SET
+      status = ?, current_revision = ?, commit_sha = ?, push_remote_ref = ?,
+      blocker = ?, payload_json = ?, updated_at = ?
+    WHERE task_id = ?
+  `).run(
+    task.status, task.currentRevision ?? null, task.commitSha ?? null,
+    task.pushRemoteRef ?? null, task.blocker ?? null, JSON.stringify(task),
+    task.updatedAt, task.taskId,
+  );
+}
+
 function prepareFinalizedAuditAuthorityReplayGap(
   registry: SupervisionTaskRegistry,
   database: InstanceType<typeof DatabaseSync>,
@@ -512,6 +528,24 @@ function prepareFinalizedPassedSuccessorRecoveryShape(
     | 'foreign-task' | 'foreign-assignment' = 'exact',
 ) {
   const shape = prepareSameObjectRevisionRecoveryShape(registry, taskId);
+  // This specialized fixture models the exact production precondition named
+  // by the test: the original implementer is already in R1 REWORK. The shared
+  // recovery fixture intentionally leaves it implementing for other boundary
+  // cases, so project the REWORK state here before seeding the finalized R2
+  // successor evidence.
+  const implementer = registry.getAssignment(shape.implementer.assignmentId)!;
+  rewritePersistedAssignment(database, {
+    ...implementer,
+    status: 'rework',
+    verdict: 'REWORK',
+    blocker: 'R1 finding retained until finalized R2 successor recovery',
+  });
+  const task = registry.get(taskId)!;
+  rewritePersistedTask(database, {
+    ...task,
+    status: 'rework',
+    blocker: 'R1 finding retained until finalized R2 successor recovery',
+  });
   const toRevision = registry.getAssignment(shape.auditor.assignmentId)!.auditRevision!;
   const sourceAuditorIdentity = identity(`${taskId}-source-auditor`, 'claude-code-sdk');
   const sourceAuditor = registry.createAssignment({

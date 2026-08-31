@@ -203,6 +203,26 @@ export interface ProviderCompactCapability {
 }
 
 /**
+ * Proof-backed provider acceptance for a caller-supplied stable delivery id.
+ *
+ * This is intentionally structured rather than a generic boolean: consumers
+ * may rely on it only when the adapter proves that the same id is accepted at
+ * most once across a daemon/provider-client restart. Runtime type, provider
+ * name, queue support, or the mere presence of a delivery id are not proof.
+ */
+export interface ProviderRestartDurableDeliveryIdCapability {
+  restartDurable: true;
+  replayAfterAcceptance: 'deduplicated';
+}
+
+export function hasRestartDurableDeliveryIdAcceptance(
+  capability: ProviderRestartDurableDeliveryIdCapability | undefined,
+): capability is ProviderRestartDurableDeliveryIdCapability {
+  return capability?.restartDurable === true
+    && capability.replayAfterAcceptance === 'deduplicated';
+}
+
+/**
  * Provider capability flags.
  * Consumers MUST check the relevant flag before calling optional interface methods.
  */
@@ -236,6 +256,8 @@ export interface ProviderCapabilities {
   backgroundSubagentWake?: BackgroundSubagentWakeMode;
   /** Whether a delegation reply can enter the provider's currently active turn without cancellation or FIFO queueing. */
   activeDelegationNotification?: AgentDelegationActiveNotificationMode;
+  /** Proof-backed restart-stable delivery-id acceptance. Never infer this capability. */
+  restartDurableDeliveryId?: ProviderRestartDurableDeliveryIdCapability;
 }
 
 export interface ProviderDelegationNotification {

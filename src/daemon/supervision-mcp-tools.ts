@@ -194,6 +194,8 @@ export interface SupervisionMcpToolDeps {
   worktreeGc?: (input: {
     mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number;
   }) => Promise<unknown>;
+  /** Post-commit automatic audit materialization. Errors never roll back the legal handoff. */
+  dispatchReadyAudit?: (taskId: string) => Promise<unknown>;
 }
 
 function ok(value: ToolResult): ToolResult { return { status: 'ok', ...value }; }
@@ -399,6 +401,15 @@ export function createSupervisionMcpToolHandlers(
         note: input.note === undefined ? undefined : String(input.note),
       });
       if (applied && !applied.ok) return err(applied.reason, `task intent rejected: ${applied.reason}`);
+      if (outcome.intent === 'open_audit') {
+        try {
+          await deps.dispatchReadyAudit?.(taskId);
+        } catch {
+          // The ready_for_audit commit is authoritative. The dispatcher owns
+          // its durable blocker report and the one-shot boot sweep retries a
+          // crash between this commit and materialization.
+        }
+      }
       return ok({
         intent: outcome.intent, fromStatus: outcome.fromStatus,
         toStatus: outcome.toStatus ?? null, validationState: outcome.validationState,

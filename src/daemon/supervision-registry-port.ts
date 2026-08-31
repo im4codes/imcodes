@@ -166,5 +166,9 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
       // use by an agent eligible for deletion.
       protectedPaths: [process.cwd(), ...listSessions().map((session) => session.projectDir)],
     }),
+    dispatchReadyAudit: async (taskId) => {
+      const { dispatchReadyAudit } = await import('./send-tool.js');
+      return dispatchReadyAudit(taskId);
+    },
   };
 }

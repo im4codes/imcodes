@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -249,6 +249,37 @@ describe('production MCP registration', () => {
     expect(audit).toMatchObject({
       status: 'ok', intent: 'open_audit', fromStatus: 'validated', toStatus: 'ready_for_audit',
     });
+  });
+
+  it('runs automatic audit materialization only after a successful open_audit commit', async () => {
+    const directRegistry = new FakeRegistry();
+    directRegistry.statuses.set('tsk_a', 'validated');
+    directRegistry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'worker-a', role: 'implementer', status: 'validated', leaseId: 'lease-a',
+      identity: { sessionName: 'deck_cd_brain' },
+    }]);
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'dispatched' });
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      registry: directRegistry,
+      dispatchReadyAudit,
+    });
+
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'worker-a',
+    })).resolves.toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
+    expect(directRegistry.applied).toHaveLength(1);
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledWith('tsk_a');
+
+    directRegistry.statuses.set('tsk_a', 'finalized');
+    directRegistry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'worker-a', role: 'implementer', status: 'finalized', leaseId: '',
+      identity: { sessionName: 'deck_cd_brain' },
+    }]);
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'worker-a',
+    })).resolves.toMatchObject({ status: 'error' });
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
   });
 
   it('refuses integration_slice open_audit at the production MCP handler before registry mutation', async () => {

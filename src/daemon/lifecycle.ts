@@ -8,6 +8,7 @@ import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
+import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { initializeDirectFileTransfer, shutdownDirectFileTransfers } from './direct-file-transfer.js';
 import { loadMemoryShortRefsFromStore } from '../context/memory-short-ref.js';
@@ -1329,6 +1330,11 @@ export async function startup(): Promise<DaemonContext> {
 
   supervisionAutomation.init();
   supervisionAutomation.setServerLink(serverLink);
+  // One recovery pass closes the durable ready_for_audit -> dispatch crash
+  // window. Post-open hooks own normal materialization; no polling worker.
+  void dispatchReadyAuditSweep().catch((err) => {
+    logger.warn({ err }, 'automatic supervision audit boot sweep failed');
+  });
 
   // Supervision task console: durable SQLite projection -> outbox -> this link.
   // Capability injection, no process-global registry: the binding receives the

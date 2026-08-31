@@ -28,7 +28,7 @@ import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getSession as getStoredSession, type SessionRecord } from '../store/session-store.js';
-import { ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
+import { drainTransportResendQueueForDispatch, ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { enqueueResend } from './transport-resend-queue.js';
@@ -59,6 +59,8 @@ export interface SessionDispatchMessageOptions {
    * before acknowledging delivery.
    */
   supervision?: { taskId: string; assignmentId: string };
+  /** Persist before delivery. Used by daemon-owned exactly-once control traffic. */
+  durableQueue?: boolean;
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
@@ -175,6 +177,26 @@ export async function dispatchSessionMessage(
 ): Promise<SessionDispatchMessageResult> {
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     const runtime = getTransportRuntime(target.name);
+    if (options.durableQueue) {
+      const queued = enqueueResend(target.name, {
+        text: message,
+        commandId: options.messageId,
+        clientMessageId: options.messageId,
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        queuedAt: Date.now(),
+      });
+      if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        ...buildTransportQueueSnapshotPayload(target.name, 'session_dispatch_durable'),
+      }, { source: 'daemon', confidence: 'high' });
+      if (runtime?.providerSessionId) {
+        await drainTransportResendQueueForDispatch(target.name);
+      } else {
+        void ensureTransportRuntimeForPendingResend(target.name);
+      }
+      return 'queued';
+    }
     if (!runtime?.providerSessionId) {
       const queued = enqueueResend(target.name, {
         text: message,

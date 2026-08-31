@@ -41,6 +41,7 @@ import {
   SUPERVISION_CONTRACT_IDS,
   isAuditableSupervisionTaskClassification,
   readSupervisionSnapshotFromTransportConfig,
+  supervisionTaskAuditPolicyFromSnapshot,
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
@@ -88,7 +89,12 @@ const EXECUTION_CLONE_TERMINAL_REASON_DESTROYED: ExecutionCloneTerminalReason =
   EXECUTION_CLONE_TERMINAL_REASONS.find((reason) => reason === 'destroyed')
   ?? EXECUTION_CLONE_TERMINAL_REASONS[0];
 import type { SessionRecord } from '../store/session-store.js';
-import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
+import {
+  getSupervisionTaskRegistry,
+  type PersistedSupervisionTaskAssignment,
+  type PersistedSupervisionTaskAssignmentIdentity,
+  type SupervisionTaskSnapshot,
+} from './supervision-state-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { isExecutionClone } from './execution-clone.js';
 import {
@@ -98,6 +104,12 @@ import {
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
 import { resolveSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
+import { getProvider } from '../agent/provider-registry.js';
+import {
+  hasRestartDurableDeliveryIdAcceptance,
+  type ProviderRestartDurableDeliveryIdCapability,
+} from '../agent/transport-provider.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -244,6 +256,12 @@ export interface SendMessageInput {
    * only internal callers that know they are creating work set it.
    */
   newWorkload?: boolean;
+  /** Daemon-only provenance. The published MCP allowlist never accepts it. */
+  automaticSupervision?: true;
+  /** Daemon-only durable message identity for crash-recoverable control traffic. */
+  internalMessageId?: SendMessageId;
+  /** Daemon-only: persist to the transport queue before attempting delivery. */
+  internalDurableQueue?: true;
 }
 
 export interface SendMessageDelivery {
@@ -759,6 +777,12 @@ function eligibleSupervisionPoolsForTarget(
   ));
 }
 
+function deterministicSendMessageId(seed: string): SendMessageId {
+  const hex = createHash('sha256').update(seed).digest('hex');
+  const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+  return `send_message_${uuid}`;
+}
+
 
 function supervisionTaskIdentityForTarget(target: SessionRecord): PersistedSupervisionTaskAssignmentIdentity | undefined {
   if (!target.sessionInstanceId || !target.runtimeEpoch) return undefined;
@@ -1193,6 +1217,9 @@ export async function dispatchSendMessage(
       taskId = existing.taskId;
     } else {
       const classification = input.task.classification ?? 'integration_slice';
+      const taskAuditPolicy = isAuditableSupervisionTaskClassification(classification)
+        ? supervisionTaskAuditPolicyFromSnapshot(readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig))
+        : undefined;
       if (input.audit && !isAuditableSupervisionTaskClassification(classification)) {
         return {
           status: 'error',
@@ -1206,6 +1233,7 @@ export async function dispatchSendMessage(
         classification,
         objective: input.task.objective,
         acceptance: input.task.acceptance,
+        ...(taskAuditPolicy ? { auditPolicy: taskAuditPolicy } : {}),
         baseRevision: input.task.baseRevision,
         currentRevision: input.task.currentRevision,
         idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
@@ -1287,7 +1315,10 @@ export async function dispatchSendMessage(
   }
 
   for (const target of dispatchable) {
-    const messageId = createSendMessageId();
+    const messageId = input.internalMessageId
+      ?? (input.automaticSupervision && supervisedAssignmentId && input.audit
+        ? deterministicSendMessageId(`auto-audit:${supervisedAssignmentId}:${input.audit.attemptId}`)
+        : createSendMessageId());
     // A newly registered assignment must always have an authenticated return
     // path. Without this, a worker that hits illegal_transition or a contract
     // contradiction can only print NEEDS_INPUT in its own transcript and
@@ -1351,6 +1382,14 @@ export async function dispatchSendMessage(
         `Base: ${supervisedWorktree.baseRevision}`,
         '',
       ] : []),
+      ...(input.automaticSupervision && input.audit ? [
+        JSON.stringify({
+          automaticAudit: true,
+          eligibilityDecision: auditRoutingReason,
+          ...(auditDegradedReason ? { degradedReason: auditDegradedReason } : {}),
+        }),
+        '',
+      ] : []),
       input.message,
       ...(taskBlockerContract ? ['', taskBlockerContract] : []),
     ].join('\n');
@@ -1364,6 +1403,7 @@ export async function dispatchSendMessage(
       const dispatchResult = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
+        ...(input.internalDurableQueue ? { durableQueue: true } : {}),
         deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
         ...(!input.audit && supervisedTaskId && supervisedAssignmentId
           ? { supervision: { taskId: supervisedTaskId, assignmentId: supervisedAssignmentId } }
@@ -1408,6 +1448,364 @@ export async function dispatchSendMessage(
   };
   if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
   return accepted;
+}
+
+export type ReadyAuditDispatchResult =
+  | { status: 'ignored'; reason: string }
+  | { status: 'replayed'; assignmentId: string; attemptId: string; messageId?: SendMessageId }
+  | { status: 'dispatched'; assignmentId: string; attemptId: string; messageId: SendMessageId }
+  | { status: 'blocked'; reason: string; reported: boolean };
+
+export interface ReadyAuditDispatchDeps {
+  registry?: ReturnType<typeof getSupervisionTaskRegistry>;
+  listSessions?: () => SessionRecord[];
+  listTargets?: typeof listSendTargets;
+  dispatch?: typeof dispatchSendMessage;
+  hasDeliveryEvidence?: (sessionName: string, messageId: SendMessageId) => boolean;
+  resolveRestartDurableDeliveryIdCapability?: (
+    session: SessionRecord,
+  ) => ProviderRestartDurableDeliveryIdCapability | undefined;
+  /** Internal boot-sweep marker: prior-process handoffs are abandoned. */
+  recoverRestartHandoffs?: boolean;
+  now?: () => number;
+}
+
+function automaticAuditAttemptId(taskId: string, revision: string): string {
+  const digest = createHash('sha256').update(`${taskId}\0${revision}`).digest('hex');
+  return `auto-audit-${digest.slice(0, 24)}`;
+}
+
+function hasDurableDeliveryEvidence(sessionName: string, messageId: SendMessageId): boolean {
+  try {
+    const store = getTransportQueueStore();
+    if (store.hasDeliveryTombstone(sessionName, messageId)) return true;
+    return store.readSnapshot(sessionName).pendingMessageEntries.some(
+      (entry) => entry.clientMessageId === messageId && entry.status === 'queued',
+    );
+  } catch {
+    return false;
+  }
+}
+
+function restartDurableDeliveryIdCapability(
+  session: SessionRecord,
+  deps: ReadyAuditDispatchDeps,
+): ProviderRestartDurableDeliveryIdCapability | undefined {
+  const injected = deps.resolveRestartDurableDeliveryIdCapability?.(session);
+  if (injected) return injected;
+  const providerId = session.providerId?.trim();
+  if (!providerId) return undefined;
+  return getProvider(providerId)?.capabilities.restartDurableDeliveryId;
+}
+
+function hasProvenAutomaticAuditDelivery(
+  session: SessionRecord,
+  deps: ReadyAuditDispatchDeps,
+): boolean {
+  return hasRestartDurableDeliveryIdAcceptance(
+    restartDurableDeliveryIdCapability(session, deps),
+  );
+}
+
+function recoverAutomaticAuditHandoff(
+  sessionName: string,
+  messageId: SendMessageId,
+  deps: ReadyAuditDispatchDeps,
+): boolean {
+  try {
+    const store = getTransportQueueStore();
+    const before = store.readSnapshot(sessionName, 'automatic_audit_handoff_recovery_before');
+    if (!before.pendingMessageEntries.some((entry) => (
+      entry.clientMessageId === messageId && entry.status === 'handoff_inflight'
+    ))) return false;
+    const after = store.restoreExpiredHandoffs(sessionName, (deps.now ?? Date.now)(), {
+      includeUnexpired: deps.recoverRestartHandoffs === true,
+    });
+    return after.pendingMessageEntries.some((entry) => (
+      entry.clientMessageId === messageId && entry.status === 'queued'
+    ));
+  } catch {
+    return false;
+  }
+}
+
+function exactLiveSessionForAssignment(
+  assignment: PersistedSupervisionTaskAssignment,
+  sessions: readonly SessionRecord[],
+): SessionRecord | undefined {
+  return sessions.find((session) => (
+    session.name === assignment.identity.sessionName
+    && session.sessionInstanceId === assignment.identity.sessionInstanceId
+    && session.runtimeEpoch === assignment.identity.runtimeEpoch
+  ));
+}
+
+function eligibleAutomaticAuditTransportTarget(
+  brain: SessionRecord,
+  audited: PersistedSupervisionTaskAssignment,
+  allowSameFamily: boolean,
+  deps: ReadyAuditDispatchDeps,
+): string | undefined {
+  const sessions = (deps.listSessions ?? listSessions)();
+  const auditedSession = sessions.find(
+    (session) => session.name === audited.identity.sessionName,
+  );
+  if (!auditedSession) return undefined;
+  const listed = (deps.listTargets ?? listSendTargets)({
+    userId: brain.name,
+    sessionName: brain.name,
+    projectName: brain.projectName ?? null,
+    projectRoot: brain.projectDir,
+  }, { executionPool: 'primary', limit: MAX_TARGET_LIST_LIMIT });
+  if (listed.status !== 'ok') return undefined;
+  const liveByName = new Map(sessions.map((session) => [session.name, session]));
+  const auditedFamily = resolvePeerAuditProviderFamily(auditedSession);
+  const eligible = listed.items
+    .filter((item) => (
+      item.target !== audited.identity.sessionName
+      && item.replyCapable
+      && (item.dispatchMode === 'new_work' || item.dispatchMode === 'queue_only')
+      && item.eligiblePools?.includes('primary')
+      && (() => {
+        const live = liveByName.get(item.target);
+        return Boolean(
+          live
+          && (live.runtimeType ?? getSessionRuntimeType(live.agentType)) === 'transport'
+          && hasProvenAutomaticAuditDelivery(live, deps),
+        );
+      })()
+    ))
+    .sort((left, right) => left.target.localeCompare(right.target));
+  return eligible.find((item) => item.providerFamily !== auditedFamily)?.target
+    ?? (allowSameFamily ? eligible.find((item) => item.providerFamily === auditedFamily)?.target : undefined);
+}
+
+function boundedAuditBrief(task: SupervisionTaskSnapshot, revision: string): string {
+  const shorten = (value: string, max = 800) => value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+  const files = task.touchedFiles.length > 0
+    ? task.touchedFiles
+    : task.assignments.flatMap((assignment) => assignment.scopeFiles);
+  return [
+    '[Daemon-resolved automatic matching audit]',
+    `taskId=${task.taskId}`,
+    `revision=${revision}`,
+    `classification=${task.classification}`,
+    `objective=${shorten(task.objective)}`,
+    '',
+    'Acceptance:',
+    ...task.acceptance.slice(0, 20).map((item) => `- ${shorten(item, 500)}`),
+    '',
+    'Evidence-first independent audit. Verify the exact revision and return one final PASS/REWORK via peer_audit_reply.',
+    'Do not edit code, stage, commit, push, deploy, install, upgrade, restart, or create a replacement task/audit.',
+    'On PASS, integrationOwner is the same-project Brain; on failure report bounded concrete findings.',
+    ...(files.length > 0 ? ['', 'Referenced files:', ...[...new Set(files)].sort().slice(0, 40).map((file) => `- ${file}`)] : []),
+  ].join('\n');
+}
+
+function automaticBlockerMessage(input: {
+  taskId: string;
+  assignmentId: string;
+  exactError: string;
+}): string {
+  return JSON.stringify({
+    taskId: input.taskId,
+    assignmentId: input.assignmentId,
+    exactError: input.exactError,
+    completedSafeWork: 'ready_for_audit is durable; no auditor replacement or Git side effect was created',
+    recommendedNextAction: 'Brain must recover the same object or manually exact-route one eligible matching auditor for the current revision',
+  });
+}
+
+async function reportAutomaticAuditBlocker(
+  task: SupervisionTaskSnapshot,
+  implementer: PersistedSupervisionTaskAssignment,
+  coordinator: PersistedSupervisionTaskAssignment,
+  exactError: string,
+  deps: ReadyAuditDispatchDeps,
+): Promise<boolean> {
+  const sessions = (deps.listSessions ?? listSessions)();
+  const origin = exactLiveSessionForAssignment(implementer, sessions);
+  const target = exactLiveSessionForAssignment(coordinator, sessions);
+  if (!origin || !target || target.role !== 'brain') return false;
+  const messageId = deterministicSendMessageId(`auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`);
+  const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
+  if (hasEvidence(target.name, messageId)) return true;
+  const dispatched = await (deps.dispatch ?? dispatchSendMessage)({
+    userId: origin.name,
+    sessionName: origin.name,
+    projectName: task.projectName,
+    projectRoot: origin.projectDir,
+  }, {
+    target: target.name,
+    message: automaticBlockerMessage({ taskId: task.taskId, assignmentId: implementer.assignmentId, exactError }),
+    idempotencyKey: `auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`,
+    internalMessageId: messageId,
+    internalDurableQueue: true,
+  });
+  return dispatched.status === 'accepted';
+}
+
+/**
+ * Materialize one automatic matching audit from durable task facts. Repeated
+ * calls, concurrent post-open hooks, and boot recovery converge on the same
+ * assignment, attempt, and transport message id.
+ */
+export async function dispatchReadyAudit(
+  taskId: string,
+  deps: ReadyAuditDispatchDeps = {},
+): Promise<ReadyAuditDispatchResult> {
+  const registry = deps.registry ?? getSupervisionTaskRegistry();
+  const task = registry.get(taskId);
+  if (!task) return { status: 'ignored', reason: 'task_not_found' };
+  if (!task.auditPolicy) return { status: 'ignored', reason: 'manual_policy' };
+  if (!isAuditableSupervisionTaskClassification(task.classification)) {
+    return { status: 'ignored', reason: 'classification_not_auditable' };
+  }
+  if (task.status !== 'ready_for_audit') return { status: 'ignored', reason: 'not_ready_for_audit' };
+  const sessions = (deps.listSessions ?? listSessions)();
+  const coordinators = task.assignments.filter((assignment) => assignment.role === 'coordinator');
+  const coordinator = coordinators.find((assignment) => exactLiveSessionForAssignment(assignment, sessions)?.role === 'brain');
+  const reporter = task.assignments.find((assignment) => (
+    (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+    && Boolean(exactLiveSessionForAssignment(assignment, sessions))
+  ));
+  const revision = task.currentRevision?.trim();
+  if (!revision) {
+    const reason = 'missing_current_revision';
+    const reported = reporter && coordinator
+      ? await reportAutomaticAuditBlocker(task, reporter, coordinator, reason, deps)
+      : false;
+    return { status: 'blocked', reason, reported };
+  }
+
+  const implementers = task.assignments.filter((assignment) => (
+    (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+    && assignment.status === 'ready_for_audit'
+    && assignment.auditRevision === revision
+  ));
+  const implementer = implementers.length === 1 ? implementers[0] : undefined;
+  if (!implementer || !coordinator) {
+    const exactError = !implementer ? 'automatic audit requires one exact ready implementer revision' : 'automatic audit requires the live same-project Brain coordinator';
+    const reported = reporter && coordinator
+      ? await reportAutomaticAuditBlocker(task, reporter, coordinator, exactError, deps)
+      : false;
+    return { status: 'blocked', reason: exactError, reported };
+  }
+
+  const attemptId = automaticAuditAttemptId(task.taskId, revision);
+  const existingAudits = task.assignments.filter((assignment) => (
+    assignment.role === 'auditor'
+    && assignment.auditRevision === revision
+    && !['rework', 'cancelled', 'finalized'].includes(assignment.status)
+  ));
+  if (existingAudits.length > 1) {
+    const reason = 'multiple live auditors exist for the exact revision';
+    const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+    return { status: 'blocked', reason, reported };
+  }
+  const existingAudit = existingAudits[0];
+  let recoveredExistingMessageId: SendMessageId | undefined;
+  // A Brain may have used the documented manual fallback after an automatic
+  // routing failure. Its live exact assignment is authoritative and must not
+  // receive a second automatic brief.
+  if (existingAudit?.auditAttemptId && existingAudit.auditAttemptId !== attemptId) {
+    return { status: 'replayed', assignmentId: existingAudit.assignmentId, attemptId: existingAudit.auditAttemptId };
+  }
+  if (existingAudit) {
+    const target = exactLiveSessionForAssignment(existingAudit, sessions);
+    if (!target) {
+      const reason = 'existing automatic auditor identity is no longer live';
+      const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+      return { status: 'blocked', reason, reported };
+    }
+    if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) !== 'transport') {
+      const reason = 'existing automatic auditor is not a transport runtime target';
+      const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+      return { status: 'blocked', reason, reported };
+    }
+    if (!hasProvenAutomaticAuditDelivery(target, deps)) {
+      const reason = 'existing automatic auditor lacks proven restart-durable stable-delivery-id acceptance';
+      const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+      return { status: 'blocked', reason, reported };
+    }
+    const messageId = deterministicSendMessageId(`auto-audit:${existingAudit.assignmentId}:${attemptId}`);
+    const recoveredHandoff = recoverAutomaticAuditHandoff(target.name, messageId, deps);
+    if (!recoveredHandoff && (deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(target.name, messageId)) {
+      return { status: 'replayed', assignmentId: existingAudit.assignmentId, attemptId, messageId };
+    }
+    if (recoveredHandoff) recoveredExistingMessageId = messageId;
+  }
+
+  const brain = exactLiveSessionForAssignment(coordinator, sessions)!;
+  // Automatic materialization is deliberately transport-only. Process peers
+  // remain valid for the existing Brain-controlled exact/manual audit path,
+  // but plain tmux delivery has no recipient-side durable command-id boundary
+  // and therefore cannot satisfy restart-safe exactly-once auto delivery.
+  const target = existingAudit
+    ? existingAudit.identity.sessionName
+    : eligibleAutomaticAuditTransportTarget(
+      brain,
+      implementer,
+      task.auditPolicy === 'auto_allow_degraded',
+      deps,
+    );
+  if (!target) {
+    const reason = task.auditPolicy === 'auto_strict_cross_vendor'
+      ? 'automatic audit requires one live reply-capable cross-vendor transport target with proven restart-durable stable-delivery-id acceptance'
+      : 'automatic audit requires one live reply-capable transport target with proven restart-durable stable-delivery-id acceptance';
+    const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+    return { status: 'blocked', reason, reported };
+  }
+  const result = await (deps.dispatch ?? dispatchSendMessage)({
+    userId: brain.name,
+    sessionName: brain.name,
+    projectName: task.projectName,
+    projectRoot: brain.projectDir,
+  }, {
+    target,
+    message: boundedAuditBrief(task, revision),
+    reply: true,
+    idempotencyKey: `auto-audit:${task.taskId}:${revision}`,
+    newWorkload: true,
+    automaticSupervision: true,
+    ...(recoveredExistingMessageId ? { internalMessageId: recoveredExistingMessageId } : {}),
+    internalDurableQueue: true,
+    audit: {
+      kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      attemptId,
+      auditedSessionName: implementer.identity.sessionName,
+      ...(task.auditPolicy === 'auto_strict_cross_vendor' ? { strictCrossVendor: true } : {}),
+    },
+    task: {
+      taskId: task.taskId,
+      currentRevision: revision,
+      auditRevision: revision,
+      auditAttemptId: attemptId,
+      executionPool: 'primary',
+    },
+  });
+  if (result.status !== 'accepted' || !result.assignmentId) {
+    const reason = result.status === 'error' ? result.error : `automatic audit dispatch ${result.status}`;
+    const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+    return { status: 'blocked', reason, reported };
+  }
+  const messageId = result.messageId
+    ?? deterministicSendMessageId(`auto-audit:${result.assignmentId}:${attemptId}`);
+  return { status: 'dispatched', assignmentId: result.assignmentId, attemptId, messageId };
+}
+
+/** One bounded startup recovery pass; no interval worker or new state machine. */
+export async function dispatchReadyAuditSweep(deps: ReadyAuditDispatchDeps = {}): Promise<ReadyAuditDispatchResult[]> {
+  const registry = deps.registry ?? getSupervisionTaskRegistry();
+  const ready = registry.list({ status: 'ready_for_audit' })
+    .filter((task) => Boolean(task.auditPolicy));
+  const results: ReadyAuditDispatchResult[] = [];
+  for (const task of ready) results.push(await dispatchReadyAudit(task.taskId, {
+    ...deps,
+    registry,
+    recoverRestartHandoffs: true,
+  }));
+  return results;
 }
 
 /**
