@@ -25,6 +25,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import {
   MEMORY_MCP_TOOL_NAME_LIST, MEMORY_MCP_TOOL_NAMES,
+  SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
   SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
 } from '../../shared/memory-mcp-contracts.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
@@ -310,6 +311,7 @@ describe('memory MCP stdio server', () => {
       });
       expect(Object.keys(finishSchema?.properties ?? {}).sort()).toEqual([
         ...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
+        ...SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
         'externalTaskId',
         'evidence',
       ].sort());

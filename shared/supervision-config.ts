@@ -89,7 +89,14 @@ export const SUPERVISION_TRUSTED_CONTRACT_DELIVERY = {
   fallback: 'fixed_daemon_prefix',
   reinjectEveryEntrypoint: true,
   modelTextIsNonAuthoritative: true,
-  hardGateAuthority: ['delegation_eligibility', 'authenticated_audit_receipt', 'matching_pass', 'stage_manifest_exact_set'],
+  hardGateAuthority: [
+    'delegation_eligibility',
+    'authenticated_audit_receipt',
+    'matching_pass',
+    'actual_git_conflict_free',
+    'explicit_non_broad_git_add',
+    'forbidden_stage_prefixes',
+  ],
 } as const;
 
 /**
@@ -116,7 +123,6 @@ export const SUPERVISION_USER_OVERRIDE = {
     'delegation_eligibility',
     'authenticated_audit_receipt',
     'matching_pass',
-    'stage_manifest_exact_set',
     'pre_pass_stage_commit_push',
   ],
   /** Recorded for attribution; the user owns the outcome of an overridden action. */
@@ -417,15 +423,7 @@ export interface SupervisionTaskFinalizationReleaseInput {
 }
 
 export type SupervisionStageManifestIssue =
-  | 'invalid_pathspec'
-  | 'missing_manifest'
-  | 'missing_staged_paths'
-  | 'staged_extra'
-  | 'staged_missing'
-  | 'owned_files_mismatch'
-  | 'shared_file_without_integration_owner'
-  | 'staged_conflict'
-  | 'untracked_other_owner';
+  | 'invalid_pathspec';
 
 export interface SupervisionStageManifestValidationInput {
   pathspecs?: readonly string[] | null;
@@ -434,25 +432,6 @@ export interface SupervisionStageManifestValidationInput {
   ownedFiles?: readonly string[] | null;
   conflictedPaths?: readonly string[] | null;
   untrackedOtherOwnerPaths?: readonly string[] | null;
-}
-
-function normalizeSupervisionPathSet(paths: readonly string[] | null | undefined): string[] {
-  return [...new Set((paths ?? [])
-    .filter((value): value is string => typeof value === 'string')
-    .map((value) => value.trim())
-    .filter(Boolean))]
-    .sort();
-}
-
-function supervisionPathspecContains(pathspec: string, file: string): boolean {
-  const trimmed = pathspec.trim();
-  if (!trimmed) return false;
-  if (trimmed.endsWith('/')) return file.startsWith(trimmed);
-  return file === trimmed;
-}
-
-function sameSupervisionPathSet(a: readonly string[], b: readonly string[]): boolean {
-  return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
 export function isValidSupervisionOwnedPathspecs(paths: readonly string[] | null | undefined): boolean {
@@ -471,39 +450,9 @@ export function validateSupervisionStageManifest(
   input: SupervisionStageManifestValidationInput,
 ): { ok: true } | { ok: false; issue: SupervisionStageManifestIssue; path?: string } {
   if (!isValidSupervisionOwnedPathspecs(input.pathspecs)) return { ok: false, issue: 'invalid_pathspec' };
-  const pathspecSet = normalizeSupervisionPathSet(input.pathspecs);
-  const conflicted = normalizeSupervisionPathSet(input.conflictedPaths);
-  if (conflicted.length) return { ok: false, issue: 'staged_conflict', path: conflicted[0] };
-  for (const untracked of normalizeSupervisionPathSet(input.untrackedOtherOwnerPaths)) {
-    if (pathspecSet.some((pathspec) => supervisionPathspecContains(pathspec, untracked))) {
-      return { ok: false, issue: 'untracked_other_owner', path: untracked };
-    }
-  }
-  const manifest = input.integrationManifest ?? [];
-  if (manifest.length === 0) return { ok: false, issue: 'missing_manifest' };
-  const expected: string[] = [];
-  const seen = new Set<string>();
-  for (const slice of manifest) {
-    const files = normalizeSupervisionPathSet(slice.ownedFiles);
-    if (!files.length) return { ok: false, issue: 'missing_manifest' };
-    for (const file of files) {
-      if (seen.has(file)) return { ok: false, issue: 'shared_file_without_integration_owner', path: file };
-      seen.add(file);
-      expected.push(file);
-    }
-  }
-  const expectedSet = normalizeSupervisionPathSet(expected);
-  const ownedSet = normalizeSupervisionPathSet(input.ownedFiles);
-  if (!sameSupervisionPathSet(ownedSet, expectedSet)) return { ok: false, issue: 'owned_files_mismatch' };
-  const stagedSet = normalizeSupervisionPathSet(input.stagedPaths);
-  if (!stagedSet.length) return { ok: false, issue: 'missing_staged_paths' };
-  for (const staged of stagedSet) {
-    if (!isValidSupervisionOwnedPathspecs([staged])) return { ok: false, issue: 'invalid_pathspec', path: staged };
-    if (!expectedSet.includes(staged)) return { ok: false, issue: 'staged_extra', path: staged };
-  }
-  for (const expectedPath of expectedSet) {
-    if (!stagedSet.includes(expectedPath)) return { ok: false, issue: 'staged_missing', path: expectedPath };
-  }
+  // All other fields are caller-reported provenance metadata. They cannot
+  // authorize or veto finalization. The integration worktree's Git index and
+  // conflict state are inspected at the authoritative finalization boundary.
   return { ok: true };
 }
 
@@ -548,25 +497,9 @@ export function canReleaseSupervisionTaskFinalization(
   if (String(task.revision ?? '') !== String(pass.revision)) return false;
   if (String(auditRevision ?? '') !== String(pass.revision)) return false;
   if (!task.integrationOwnerSession) return false;
-  if (!task.topLevelTaskId || !task.integrationBoundary || !task.acceptance?.length) return false;
-  if (!task.integrationManifest || task.integrationManifest.length === 0) return false;
-  const validatedManifest = task.classification === 'integration_task'
-    ? task.integrationManifest.every((row) => row.classification === 'integration_slice'
-      && canHandOffValidatedSupervisionManifestRow(row))
-    : task.classification === 'independent_top_level'
-      ? task.integrationManifest.length === 1
-        && task.integrationManifest[0]?.classification === 'independent_top_level'
-        && canHandOffValidatedSupervisionManifestRow(task.integrationManifest[0])
-      : false;
-  // Compatibility for already-audited historical rows. New integration_slice
-  // audit registration is refused elsewhere, so this branch can only consume
-  // durable records minted by an older daemon.
-  const historicalAuditedManifest = task.integrationManifest.every((slice) => canMarkSupervisionSliceReadyForIntegration(slice, {
-    attemptId: String(slice.auditAttemptId ?? ''),
-    revision: slice.revision ?? '',
-    verdict: 'PASS',
-  }));
-  if (!validatedManifest && !historicalAuditedManifest) return false;
+  // Manifest rows, owned files, and caller-reported staged/untracked sets are
+  // record-only. Only explicit safe pathspecs are evaluated here; actual Git
+  // conflicts and staged bytes belong to the integration worktree boundary.
   return validateSupervisionStageManifest({
     pathspecs: pass.pathspecs,
     stagedPaths: pass.stagedPaths,

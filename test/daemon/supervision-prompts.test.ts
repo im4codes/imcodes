@@ -25,6 +25,7 @@ import {
   buildSupervisionDecisionRepairPrompt,
   buildSupervisionOrchestratorContext,
   buildSupervisionTaskFinalizationContract,
+  buildSupervisionTaskRegistryContract,
 } from '../../src/daemon/supervision-prompts.js';
 import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/peer-audit.js';
 
@@ -47,6 +48,70 @@ describe('supervision prompts', () => {
     expect(english).toContain('one matching PASS');
     expect(english).not.toContain('each slice ownerSession/revision/auditAttemptId/PASS');
     expect(english).not.toContain('matching independent audit PASS, then marks ready_for_integration');
+  });
+
+  it('makes finalization metadata record-only and actual Git state authoritative in every locale', () => {
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      const contract = buildSupervisionTaskFinalizationContract(locale);
+      expect(contract).toContain('ownedFiles');
+      expect(contract).toContain('scopeFiles');
+      expect(contract).toContain('integrationManifest');
+      expect(contract).toContain('Git');
+      expect(contract).toContain('git add');
+      expect(contract).toContain('openspec/');
+      expect(contract).toContain('docs/');
+      expect(contract).toContain('state');
+      expect(contract).toContain('field');
+      expect(contract).toContain('gate');
+      expect(contract).toContain('receipt');
+      expect(contract).toContain('worktree/Git/PASS');
+    }
+
+    const english = buildSupervisionTaskFinalizationContract('en');
+    expect(english).toContain('provenance records only');
+    expect(english).toContain('never authorizes or vetoes finalization');
+    expect(english).toContain('actual integration worktree/Git bytes are the source of truth');
+    expect(english).toContain('unresolved Git conflicts block');
+    expect(english).toContain('explicit non-broad pathspecs');
+    expect(english).toContain('current requirement or demonstrated failure');
+    expect(english).toContain('smallest reliable design');
+    expect(english).toContain('evolve only for real requirements');
+
+    const systemPreamble = buildSupervisionExecutionPreamble('en');
+    expect(systemPreamble).toContain('current requirement or demonstrated failure');
+    expect(systemPreamble).toContain('why worktree/Git/PASS is insufficient');
+
+    const decision = buildSupervisionDecisionPrompt({
+      taskRequest: 'Finalize the audited change.',
+      assistantResponse: 'Audit passed.',
+      snapshot: { mode: SUPERVISION_MODE.SUPERVISED_AUDIT },
+    });
+    expect(decision).toContain('selectively stage the reviewed worktree diff');
+    expect(decision).toContain('metadata is not an allowlist');
+  });
+
+  it('requires rigorous essentials without design-for-design in every locale', () => {
+    const evolutionTerm = {
+      en: 'evolve', 'zh-CN': 'evolve', 'zh-TW': 'evolve', es: 'evolucionando',
+      ru: 'развивать', ja: 'evolve', ko: 'evolve',
+    } as const;
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      const finalization = buildSupervisionTaskFinalizationContract(locale);
+      const registry = buildSupervisionTaskRegistryContract(locale);
+      expect(finalization).toContain('current requirement');
+      expect(finalization).toContain('demonstrated failure');
+      expect(finalization).toContain('smallest reliable design');
+      expect(finalization).toContain(evolutionTerm[locale]);
+      expect(registry).toContain('REWORK');
+      expect(registry).toContain('edit allowlist');
+    }
+
+    const english = buildSupervisionTaskFinalizationContract('en');
+    expect(english).toContain('one matching PASS');
+    expect(english).toContain('unresolved Git conflicts block');
+    expect(english).toContain('explicit non-broad pathspecs');
+    expect(english).toContain('never stage openspec/');
+    expect(english).toContain('docs/');
   });
 
   // Wording snapshot, NOT a behavioural gate. There is no execution-time

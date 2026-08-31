@@ -5,6 +5,7 @@ import {
   MEMORY_MCP_TOOL_CONTRACTS,
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
+  SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
   SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
   buildMcpDisabledResult,
   pickAllowedMcpArgs,
@@ -40,6 +41,17 @@ describe('memory MCP shared contracts', () => {
     expect(finalization.properties?.verdict?.enum).toEqual(['PASS']);
     expect(finalization.properties?.ciResult?.enum).toEqual(['success']);
     expect(finalization.properties?.pushResult?.enum).toEqual(['pushed', 'already_present']);
+    for (const field of SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS) {
+      expect(finalization.required).not.toContain(field);
+      expect(finalization.properties).toHaveProperty(field);
+      expect(finalization.properties?.[field]?.type).toBeUndefined();
+    }
+
+    const start = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START].inputSchema;
+    expect(start.properties?.scopeFiles?.type).toBeUndefined();
+    const sendTask = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+      .inputSchema.properties?.task as { properties?: Record<string, { type?: string }> } | undefined;
+    expect(sendTask?.properties?.ownedFiles?.type).toBeUndefined();
   });
 
   it('exposes the registered MCP tool names including the execution-clone destroy + machine tools', () => {

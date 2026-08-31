@@ -144,9 +144,13 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
 
 export const SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS = [
   'assignmentId', 'revision', 'auditAttemptId', 'auditRevision', 'verdict',
-  'ownedFiles', 'integrationManifest', 'integrationOwner', 'commitSha',
-  'pushResult', 'pushRemoteRef', 'stagedPaths', 'conflictedPaths',
-  'untrackedOtherOwnerPaths', 'externalRunId', 'externalHeadSha', 'ciResult',
+  'integrationOwner', 'commitSha', 'pushResult', 'pushRemoteRef',
+  'externalRunId', 'externalHeadSha', 'ciResult',
+] as const;
+
+export const SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS = [
+  'ownedFiles', 'integrationManifest', 'stagedPaths', 'conflictedPaths',
+  'untrackedOtherOwnerPaths',
 ] as const;
 
 /**
@@ -528,7 +532,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
           objective: stringSchema('Task objective/title.'),
           acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
-          ownedFiles: { type: 'array', items: stringSchema('Repo-relative attributed path.'), description: 'Optional attribution metadata; never an edit ACL or validation authority.' },
+          ownedFiles: { description: 'Optional attribution metadata; unusable values are ignored and never become an edit ACL or validation authority.' },
           sharedFiles: { type: 'array', items: stringSchema('Repo-relative shared path.'), description: 'Shared files.' },
           dependencies: { type: 'array', items: stringSchema('Task dependencies.'), description: 'Dependencies.' },
           integrationOwner: stringSchema('Integration owner assignment/session reference.'),
@@ -587,7 +591,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       role: { type: 'string', enum: ['coordinator', 'integration_owner', 'implementer', 'auditor'], description: 'Assignment role for the caller session.' },
       objective: stringSchema('Short objective/title.'),
       acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
-      scopeFiles: { type: 'array', items: stringSchema('Repo-relative owned/shared path.'), description: 'Assignment scope paths.' },
+      scopeFiles: { description: 'Optional provenance paths; unusable values are ignored and never restrict edits.' },
       claimMode: { type: 'string', enum: ['exclusive', 'shared', 'read_only'], description: 'File claim mode. Auditors are forced read_only.' },
       idempotencyKey: stringSchema('Retry key; replay returns the same taskId/assignmentId.'),
     }, ['role', 'objective']),
@@ -628,20 +632,15 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       auditAttemptId: stringSchema('Exact overall matching audit attempt.'),
       auditRevision: stringSchema('Exact overall audited revision.'),
       verdict: { type: 'string', enum: ['PASS'] },
-      ownedFiles: { type: 'array', items: stringSchema('Owned path.') },
-      integrationManifest: {
-        type: 'array', items: objectSchema({
-          path: stringSchema('Owned path.'),
-          sha256: stringSchema('Exact file SHA-256.', { pattern: '^[0-9a-f]{64}$' }),
-        }, ['path', 'sha256']),
-      },
+      ownedFiles: { description: 'Caller-reported attribution data; unusable values are ignored.' },
+      integrationManifest: { description: 'Caller-reported manifest data; unusable values are ignored.' },
       integrationOwner: stringSchema('Canonical integration owner session.'),
       commitSha: stringSchema('Exact pushed commit.', { pattern: '^[0-9a-f]{40}$' }),
       pushResult: { type: 'string', enum: ['pushed', 'already_present'] },
       pushRemoteRef: stringSchema('Exact pushed remote ref.'),
-      stagedPaths: { type: 'array', items: stringSchema('Path staged for the exact commit.') },
-      conflictedPaths: { type: 'array', items: stringSchema('Unresolved conflict path; must be empty.') },
-      untrackedOtherOwnerPaths: { type: 'array', items: stringSchema('Untracked path owned elsewhere; must be empty.') },
+      stagedPaths: { description: 'Caller-reported staged data; unusable values are ignored.' },
+      conflictedPaths: { description: 'Caller-reported conflict data; unusable values are ignored.' },
+      untrackedOtherOwnerPaths: { description: 'Caller-reported untracked data; unusable values are ignored.' },
       externalRunId: stringSchema('Successful CI run id.'),
       externalHeadSha: stringSchema('CI head SHA.', { pattern: '^[0-9a-f]{40}$' }),
       externalTaskId: stringSchema('Optional external workflow id.'),
@@ -652,7 +651,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
-    description: 'Record a caller-reported in-scope file event; no filesystem or Git scan is implied.',
+    description: 'Record a caller-reported repository file event; new paths expand provenance without blocking, and no filesystem or Git scan is implied.',
     inputSchema: objectSchema({
       assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
       filePath: stringSchema('Normalized repo-relative path.'),

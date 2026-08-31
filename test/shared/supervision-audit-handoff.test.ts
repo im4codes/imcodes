@@ -171,11 +171,29 @@ describe('merge-before-audit finalization', () => {
     }
   });
 
-  it('refuses stale/mismatched overall PASS and any non-exact staged set', () => {
+  it('refuses stale/mismatched PASS but treats caller path metadata as record-only', () => {
     expect(canReleaseSupervisionTaskFinalization(task, { ...pass, attemptId: 'stale-attempt' })).toBe(false);
     expect(canReleaseSupervisionTaskFinalization(task, { ...pass, revision: 'stale-revision' })).toBe(false);
-    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, stagedPaths: ['src/a.ts'] })).toBe(false);
-    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, stagedPaths: [...pass.stagedPaths!, 'src/extra.ts'] })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, stagedPaths: ['src/a.ts'] })).toBe(true);
+    expect(canReleaseSupervisionTaskFinalization(task, {
+      ...pass,
+      stagedPaths: ['stale/reported.ts'],
+      conflictedPaths: ['caller/reported-conflict.ts'],
+      untrackedOtherOwnerPaths: ['caller/reported-untracked.ts'],
+    })).toBe(true);
+    expect(canReleaseSupervisionTaskFinalization({
+      ...task,
+      ownedFiles: undefined,
+      integrationManifest: undefined,
+    }, pass)).toBe(true);
+  });
+
+  it('keeps only explicit non-broad and forbidden-prefix pathspec boundaries', () => {
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, pathspecs: [] })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, pathspecs: ['.'] })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, pathspecs: ['-A'] })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, pathspecs: ['docs/design.md'] })).toBe(false);
+    expect(canReleaseSupervisionTaskFinalization(task, { ...pass, pathspecs: ['openspec/change.md'] })).toBe(false);
   });
 
   it('keeps historical per-slice PASS manifests compatible', () => {

@@ -116,6 +116,26 @@ describe('memory MCP tool schema firewall', () => {
     });
   });
 
+  it('does not require caller-reported path metadata at the finalization schema boundary', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller());
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
+      assignmentId: 'supervision_assignment_missing',
+      revision: 'combined-r1',
+      auditAttemptId: 'overall-audit-r1',
+      auditRevision: 'combined-r1',
+      verdict: 'PASS',
+      integrationOwner: 'deck_proj_brain',
+      commitSha: '1'.repeat(40),
+      pushResult: 'pushed',
+      pushRemoteRef: 'refs/heads/dev',
+      externalRunId: 'run-1',
+      externalHeadSha: '1'.repeat(40),
+      ciResult: 'success',
+    });
+    expect(result).toMatchObject({ status: 'error' });
+    expect(String(result.message)).not.toContain('invalid structured finalization');
+  });
+
   it('submits peer audit replies only through the strict structured dependency', async () => {
     const peerAuditReply = vi.fn(async () => ({ ok: true }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });

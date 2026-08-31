@@ -155,10 +155,24 @@ import {
 
 type ToolResult = Record<string, unknown>;
 
-const integrationManifestEntrySchema = z.object({
-  path: z.string().min(1),
-  sha256: z.string().regex(/^[0-9a-f]{64}$/),
-}).strict();
+const recordOnlyPathArraySchema = z.unknown().optional().transform((value) => (
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : []
+));
+
+const recordOnlyManifestSchema = z.unknown().optional().transform((value) => (
+  Array.isArray(value)
+    ? value.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const path = Reflect.get(item, 'path');
+      const sha256 = Reflect.get(item, 'sha256');
+      return typeof path === 'string' && typeof sha256 === 'string'
+        ? [{ path, sha256 }]
+        : [];
+    })
+    : []
+));
 
 const integrationFinalizationSchema = z.object({
   assignmentId: z.string().min(1),
@@ -166,15 +180,15 @@ const integrationFinalizationSchema = z.object({
   auditAttemptId: z.string().min(1),
   auditRevision: z.string().min(1),
   verdict: z.literal('PASS'),
-  ownedFiles: z.array(z.string().min(1)).min(1),
-  integrationManifest: z.array(integrationManifestEntrySchema).min(1),
+  ownedFiles: recordOnlyPathArraySchema,
+  integrationManifest: recordOnlyManifestSchema,
   integrationOwner: z.string().min(1),
   commitSha: z.string().regex(/^[0-9a-f]{40}$/),
   pushResult: z.enum(['pushed', 'already_present']),
   pushRemoteRef: z.string().min(1),
-  stagedPaths: z.array(z.string().min(1)).min(1),
-  conflictedPaths: z.array(z.string()),
-  untrackedOtherOwnerPaths: z.array(z.string()),
+  stagedPaths: recordOnlyPathArraySchema,
+  conflictedPaths: recordOnlyPathArraySchema,
+  untrackedOtherOwnerPaths: recordOnlyPathArraySchema,
   externalRunId: z.string().min(1),
   externalHeadSha: z.string().regex(/^[0-9a-f]{40}$/),
   externalTaskId: z.string().min(1).optional(),
@@ -1507,14 +1521,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             .includes(assignment.status)
         ));
         if (active.length > 0) {
-          const requestedScope = [...new Set(stringArrayArg(args, 'scopeFiles'))].sort();
           const same = active.length === 1
             && active[0]!.identity.sessionName === identity.sessionName
             && active[0]!.identity.sessionInstanceId === identity.sessionInstanceId
             && active[0]!.identity.runtimeEpoch === identity.runtimeEpoch
             && active[0]!.identity.agentType === identity.agentType
-            && active[0]!.identity.providerFamily === identity.providerFamily
-            && JSON.stringify([...active[0]!.scopeFiles].sort()) === JSON.stringify(requestedScope);
+            && active[0]!.identity.providerFamily === identity.providerFamily;
           return same
             ? {
                 status: 'ok', taskId: task.value.taskId,
@@ -1591,7 +1603,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const identity = await supervisionTaskIdentity();
       if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
-      const finalized = getSupervisionTaskRegistry().finalizeIntegration({ ...parsed.data, identity });
+      const finalized = getSupervisionTaskRegistry().finalizeIntegration({
+        ...parsed.data,
+        // Keep the persisted record shape stable. Invalid caller metadata was
+        // reduced to an empty record above and never supplies authorization.
+        ownedFiles: parsed.data.ownedFiles ?? [],
+        integrationManifest: parsed.data.integrationManifest ?? [],
+        stagedPaths: parsed.data.stagedPaths ?? [],
+        conflictedPaths: parsed.data.conflictedPaths ?? [],
+        untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+        identity,
+      });
       return finalized.ok
         ? { status: 'ok', item: finalized.value, idempotentReplay: finalized.replay === true }
         : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `integration_finalize rejected: ${finalized.reason}`);

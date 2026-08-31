@@ -506,7 +506,12 @@ describe('SupervisionTaskRegistry', () => {
       },
     );
 
-    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](shape.finalization))
+    const productionFinalization: Record<string, unknown> = { ...shape.finalization };
+    for (const field of [
+      'ownedFiles', 'integrationManifest', 'stagedPaths',
+      'conflictedPaths', 'untrackedOtherOwnerPaths',
+    ]) delete productionFinalization[field];
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](productionFinalization))
       .resolves.toMatchObject({
         status: 'ok', idempotentReplay: false,
         item: {
@@ -519,6 +524,9 @@ describe('SupervisionTaskRegistry', () => {
             auditAttemptId: shape.attemptId,
             auditRevision: shape.revision,
             verdict: 'PASS',
+            ownedFiles: [],
+            integrationManifest: [],
+            stagedPaths: [],
             ciResult: 'success',
           },
         },
@@ -542,56 +550,58 @@ describe('SupervisionTaskRegistry', () => {
       'assignment:finalized', 'task:finalized',
     ]);
 
-    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](shape.finalization))
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
+      ...shape.finalization,
+      ownedFiles: 'not-an-array',
+      integrationManifest: { stale: true },
+      stagedPaths: 42,
+      conflictedPaths: ['caller-only-conflict.ts'],
+      untrackedOtherOwnerPaths: ['caller-only-untracked.ts'],
+    }))
       .resolves.toMatchObject({ status: 'ok', idempotentReplay: true, item: { status: 'finalized' } });
     expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount + 15);
     expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
   });
 
-  it('uses authoritative file events as evidence while keeping larger scopes authorization-only', () => {
-    const cases = [
-      { taskId: 'structured-finalization-scope-13-owned-12', scopeCount: 13, ownedCount: 12 },
-      { taskId: 'structured-finalization-scope-31-owned-26', scopeCount: 31, ownedCount: 26 },
-    ];
-    for (const testCase of cases) {
-      const registry = makeRegistry();
-      const files = Array.from(
-        { length: testCase.ownedCount },
-        (_, index) => `src/actual-${String(index).padStart(2, '0')}.ts`,
-      );
-      const authorizedUntouchedFiles = Array.from(
-        { length: testCase.scopeCount - testCase.ownedCount },
-        (_, index) => `test/authorized-untouched-${String(index).padStart(2, '0')}.test.ts`,
-      );
-      const shape = prepareStructuredFinalizationShape(registry, testCase.taskId, {
-        files,
-        authorizedUntouchedFiles,
-        ownerFileCount: 1,
-      });
-      expect(shape.scopeFiles).toHaveLength(testCase.scopeCount);
-      expect(registry.recordFileEvent({
-        assignmentId: shape.implementer.assignmentId,
-        identity: shape.implementer.identity,
-        path: files[1]!,
-        operation: 'modify',
-        idempotencyKey: `${testCase.taskId}-authoritative-file-1`,
-      })).toMatchObject({ ok: true, replay: true });
-      expect(registry.listFileEvents(shape.taskId).map((event) => event.path).sort()).toEqual(files);
-      expect(registry.finalizeIntegration({
-        ...shape.finalization,
-        identity: shape.owner.identity,
-      })).toMatchObject({
-        ok: true,
-        value: {
-          status: 'finalized',
-          finalization: { ownedFiles: files, stagedPaths: files },
+  it('records caller path metadata without using it as finalization authority', () => {
+    const registry = makeRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-record-only');
+    const eventCount = registry.listEvents(shape.taskId).length;
+    expect(registry.finalizeIntegration({
+      ...shape.finalization,
+      ownedFiles: ['src/reported-only.ts', 'src/reported-only.ts'],
+      integrationManifest: [{ path: '../not-authority', sha256: 'not-a-hash' }],
+      stagedPaths: ['docs/reported-only.md'],
+      conflictedPaths: ['src/caller-reported-conflict.ts'],
+      untrackedOtherOwnerPaths: ['src/caller-reported-untracked.ts'],
+      identity: shape.owner.identity,
+    })).toMatchObject({
+      ok: true,
+      value: {
+        status: 'finalized',
+        finalization: {
+          ownedFiles: ['src/reported-only.ts'],
+          integrationManifest: [{ path: '../not-authority', sha256: 'not-a-hash' }],
+          stagedPaths: ['docs/reported-only.md'],
         },
-      });
-      registry.close();
-    }
+      },
+    });
+    const finalizedEventCount = registry.listEvents(shape.taskId).length;
+    expect(finalizedEventCount).toBeGreaterThan(eventCount);
+    expect(registry.finalizeIntegration({
+      ...shape.finalization,
+      ownedFiles: [],
+      integrationManifest: [],
+      stagedPaths: [],
+      conflictedPaths: [],
+      untrackedOtherOwnerPaths: [],
+      identity: shape.owner.identity,
+    })).toMatchObject({ ok: true, replay: true });
+    expect(registry.listEvents(shape.taskId)).toHaveLength(finalizedEventCount);
+    registry.close();
   });
 
-  it('fails closed without lifecycle mutation on out-of-scope or other-assignment file events', () => {
+  it('does not let out-of-scope or other-assignment file-event metadata veto finalization', () => {
     const outsideRegistry = makeRegistry();
     const outside = prepareStructuredFinalizationShape(outsideRegistry, 'structured-finalization-outside-event');
     expect(outsideRegistry.recordFileEvent({
@@ -601,14 +611,10 @@ describe('SupervisionTaskRegistry', () => {
       operation: 'modify',
       idempotencyKey: 'outside-scope-event',
     })).toMatchObject({ ok: true });
-    const outsideBefore = outsideRegistry.get(outside.taskId);
-    const outsideEventCount = outsideRegistry.listEvents(outside.taskId).length;
     expect(outsideRegistry.finalizeIntegration({
       ...outside.finalization,
       identity: outside.owner.identity,
-    })).toEqual({ ok: false, reason: 'manifest_mismatch' });
-    expect(outsideRegistry.get(outside.taskId)).toEqual(outsideBefore);
-    expect(outsideRegistry.listEvents(outside.taskId)).toHaveLength(outsideEventCount);
+    })).toMatchObject({ ok: true, value: { status: 'finalized' } });
     outsideRegistry.close();
 
     const otherRegistry = makeRegistry();
@@ -628,18 +634,14 @@ describe('SupervisionTaskRegistry', () => {
       operation: 'modify',
       idempotencyKey: 'other-assignment-event',
     })).toMatchObject({ ok: true });
-    const otherBefore = otherRegistry.get(other.taskId);
-    const otherEventCount = otherRegistry.listEvents(other.taskId).length;
     expect(otherRegistry.finalizeIntegration({
       ...other.finalization,
       identity: other.owner.identity,
-    })).toEqual({ ok: false, reason: 'manifest_mismatch' });
-    expect(otherRegistry.get(other.taskId)).toEqual(otherBefore);
-    expect(otherRegistry.listEvents(other.taskId)).toHaveLength(otherEventCount);
+    })).toMatchObject({ ok: true, value: { status: 'finalized' } });
     otherRegistry.close();
   });
 
-  it('fails closed on stale audit, dirty staged sets, conflicts, foreign owners, and self-audit without mutation', () => {
+  it('keeps matching audit, Git/CI identity, foreign-owner, and self-audit boundaries fail closed', () => {
     const registry = makeRegistry();
     const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-refusals');
     const initial = registry.get(shape.taskId);
@@ -652,23 +654,12 @@ describe('SupervisionTaskRegistry', () => {
       .toEqual({ ok: false, reason: 'old_revision' });
     expect(call({ auditAttemptId: `${shape.attemptId}-stale` }))
       .toEqual({ ok: false, reason: 'old_audit_attempt' });
-    expect(call({ stagedPaths: [shape.files[0]] }))
-      .toEqual({ ok: false, reason: 'manifest_mismatch' });
-    expect(call({ conflictedPaths: [shape.files[0]] }))
-      .toEqual({ ok: false, reason: 'invalid' });
-    expect(call({ untrackedOtherOwnerPaths: ['src/foreign.ts'] }))
-      .toEqual({ ok: false, reason: 'invalid' });
-    expect(call({ ownedFiles: [...shape.files, shape.files[0]!] }))
-      .toEqual({ ok: false, reason: 'invalid' });
     expect(call({ ciResult: 'failure' as never }))
       .toEqual({ ok: false, reason: 'invalid' });
     expect(call({ pushRemoteRef: 'heads/dev' }))
       .toEqual({ ok: false, reason: 'invalid' });
     expect(call({ externalHeadSha: 'b'.repeat(40) }))
       .toEqual({ ok: false, reason: 'manifest_mismatch' });
-    expect(call({
-      integrationManifest: shape.files.map((path) => ({ path, sha256: 'not-a-hash' })),
-    })).toEqual({ ok: false, reason: 'invalid' });
     expect(call({}, identity('foreign-integration-owner')))
       .toEqual({ ok: false, reason: 'owner_mismatch' });
     expect(registry.get(shape.taskId)).toEqual(initial);
@@ -849,11 +840,6 @@ describe('SupervisionTaskRegistry', () => {
         reason: 'owner_mismatch',
       },
       {
-        taskId: 'stale-owner-scope-mismatch',
-        options: { replacementScopeFiles: ['src/final-a.ts'] },
-        reason: 'owner_mismatch',
-      },
-      {
         taskId: 'stale-owner-not-project-brain',
         options: { addBrainCoordinator: false },
         reason: 'owner_mismatch',
@@ -877,6 +863,24 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.listEvents(shape.taskId), testCase.taskId).toHaveLength(eventCount);
       registry.close();
     }
+  });
+
+  it('does not use scope metadata to veto an otherwise exact stale-owner rebind', () => {
+    const registry = makeRegistry();
+    const shape = prepareStaleRuntimeIntegrationOwnerShape(registry, 'stale-owner-scope-record-only', {
+      replacementScopeFiles: ['src/reported-different.ts'],
+    });
+    expect(registry.finalizeIntegration({
+      ...shape.finalization,
+      identity: shape.replacementIdentity,
+    })).toMatchObject({
+      ok: true,
+      value: {
+        status: 'finalized',
+        integrationOwnerAssignmentId: shape.replacement.assignmentId,
+      },
+    });
+    registry.close();
   });
 
   it('atomically rebinds one frozen revision on the same task/assignment and persists replay across restart', () => {
@@ -964,21 +968,40 @@ describe('SupervisionTaskRegistry', () => {
         ok: true, replay: true,
         value: { status: 'implementing', currentRevision: shape.toRevision },
       });
+      expect(registry.rebindTaskAssignmentRevision({
+        ...request,
+        ownedFiles: ['caller/reported-only.ts'],
+        scopeFiles: ['caller/reported-only.ts'],
+        evidenceManifestSha256: 'f'.repeat(64),
+        now: 910,
+      })).toMatchObject({ ok: true, replay: true });
       expect(registry.listEvents(shape.taskId)).toHaveLength(persistedEvents);
       expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
       expect(registry.getAssignment(shape.implementer.assignmentId)?.leaseId).toBe(renewedLeaseId);
       const persistedState = registry.get(shape.taskId);
       const firstFile = request.worktreeSnapshot.files[0]!;
-      for (const [name, changedFile] of [
-        ['same-path-changed-bytes', { path: firstFile.path, sha256: 'c'.repeat(64) }],
-        ['same-path-changed-to-deletion', { path: firstFile.path, deleted: true as const }],
+      for (const [name, worktreeSnapshot] of [
+        ['changed-head', { ...request.worktreeSnapshot, headSha: 'b'.repeat(40) }],
+        ['same-path-changed-bytes', {
+          ...request.worktreeSnapshot,
+          files: [{ path: firstFile.path, sha256: 'c'.repeat(64) }, ...request.worktreeSnapshot.files.slice(1)],
+        }],
+        ['same-path-changed-to-deletion', {
+          ...request.worktreeSnapshot,
+          files: [{ path: firstFile.path, deleted: true as const }, ...request.worktreeSnapshot.files.slice(1)],
+        }],
+        ['added-path', {
+          ...request.worktreeSnapshot,
+          files: [...request.worktreeSnapshot.files, { path: 'src/added-after-freeze.ts', sha256: 'e'.repeat(64) }],
+        }],
+        ['removed-path', {
+          ...request.worktreeSnapshot,
+          files: request.worktreeSnapshot.files.slice(1),
+        }],
       ] as const) {
         expect(registry.rebindTaskAssignmentRevision({
           ...request,
-          worktreeSnapshot: {
-            ...request.worktreeSnapshot,
-            files: [changedFile, ...request.worktreeSnapshot.files.slice(1)],
-          },
+          worktreeSnapshot,
           now: 925,
         }), name).toEqual({ ok: false, reason: 'conflicting_replay' });
         expect(registry.get(shape.taskId), name).toEqual(persistedState);
@@ -1221,7 +1244,7 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
-  it('treats legacy file claims as metadata while exact worktree bytes still gate recovery', () => {
+  it('treats legacy claims as metadata while exact worktree bytes still gate recovery', () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const shape = prepareSameObjectRevisionRecoveryShape(registry, 'revision-recovery-metadata-claims');
@@ -1474,16 +1497,6 @@ describe('SupervisionTaskRegistry', () => {
       const receiptsBefore = registry.listAuditReceipts(taskId);
       const assignmentCount = registry.listAssignments(taskId).length;
       const eventCount = registry.listEvents(taskId).length;
-      const splitBefore = registry.get(taskId);
-      expect(registry.coordinateTaskAssignment({
-        ...request,
-        taskStatus: undefined,
-        idempotencyKey: 'brain-repair-split-task-projection-refused',
-        reason: 'scope expansion must reset task and assignment atomically',
-        now: 90,
-      })).toEqual({ ok: false, reason: 'invalid_transition' });
-      expect(registry.get(taskId)).toEqual(splitBefore);
-      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
       expect(registry.coordinateTaskAssignment(request)).toMatchObject({
         ok: true, value: { status: 'rework', currentRevision: revision },
       });
@@ -1594,7 +1607,7 @@ describe('SupervisionTaskRegistry', () => {
     registry.close();
   });
 
-  it('never lets a scope-only recovery make unaudited files inherit an existing matching PASS', () => {
+  it('records scope-only provenance without changing an existing matching PASS', () => {
     const registry = makeRegistry();
     const taskId = 'brain-coordination-scope-after-pass';
     const revision = 'scope-after-pass-r1';
@@ -1602,7 +1615,7 @@ describe('SupervisionTaskRegistry', () => {
     const workerIdentity = identity('deck_scope_after_pass_worker');
     expect(registry.createOrGet({
       taskId, projectName: 'alpha', classification: 'independent_top_level',
-      objective: 'keep audited scope exact', currentRevision: revision,
+      objective: 'keep PASS bound to revision rather than path metadata', currentRevision: revision,
     })).toMatchObject({ ok: true });
     const worker = registry.createAssignment({
       assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: workerIdentity,
@@ -1626,38 +1639,26 @@ describe('SupervisionTaskRegistry', () => {
       verdict: 'PASS', primaryReviewPassed: true, crossVendorAuditPassed: true,
     })).toMatchObject({ ok: true });
 
-    const before = registry.get(taskId);
     const eventCount = registry.listEvents(taskId).length;
     expect(registry.coordinateTaskAssignment({
       taskId, assignmentId: worker.value.assignmentId,
       scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
       leaseAction: 'preserve',
-      idempotencyKey: 'scope-only-after-pass-refused',
-      reason: 'must not let a new file inherit PASS',
-    })).toEqual({ ok: false, reason: 'invalid_transition' });
-    expect(registry.get(taskId)).toEqual(before);
-    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
-
-    expect(registry.coordinateTaskAssignment({
-      taskId, assignmentId: worker.value.assignmentId,
-      taskStatus: 'rework', assignmentStatus: 'rework',
-      scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
-      leaseAction: 'preserve',
-      idempotencyKey: 'scope-after-pass-requires-rework',
-      reason: 'invalidate old audit before expanding scope',
-    })).toMatchObject({ ok: true, value: { status: 'rework' } });
+      idempotencyKey: 'scope-only-after-pass-recorded',
+      reason: 'record a newly observed path without changing authority',
+    })).toMatchObject({ ok: true });
     expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({
-      status: 'rework', scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+      status: 'ready_for_integration', scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+      auditAttemptId: attemptId, auditRevision: revision, verdict: 'PASS',
+      primaryReviewPassed: true, crossVendorAuditPassed: true,
     });
-    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('auditAttemptId');
-    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('auditRevision');
-    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('verdict');
-    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('primaryReviewPassed');
-    expect(registry.getAssignment(worker.value.assignmentId)).not.toHaveProperty('crossVendorAuditPassed');
+    expect(registry.getAssignment(worker.value.assignmentId)?.blocker).toBeUndefined();
+    expect(registry.getTaskRecord(taskId)).toMatchObject({ currentRevision: revision });
+    expect(registry.listEvents(taskId)).toHaveLength(eventCount + 1);
     registry.close();
   });
 
-  it('never lets scope-only recovery inherit validation or pre-PASS audit provenance', () => {
+  it('records scope-only provenance without clearing validation or pre-PASS audit identity', () => {
     for (const status of ['validated', 'ready_for_audit', 'auditing'] as const) {
       const registry = makeRegistry();
       const taskId = `brain-coordination-scope-${status}`;
@@ -1666,7 +1667,7 @@ describe('SupervisionTaskRegistry', () => {
       const workerIdentity = identity(`deck_scope_${status}_worker`);
       expect(registry.createOrGet({
         taskId, projectName: 'alpha', classification: 'independent_top_level',
-        objective: 'keep validation and audit provenance bound to exact scope', currentRevision: revision,
+        objective: 'keep validation and audit provenance bound to revision', currentRevision: revision,
       })).toMatchObject({ ok: true });
       const worker = registry.createAssignment({
         assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: workerIdentity,
@@ -1681,17 +1682,20 @@ describe('SupervisionTaskRegistry', () => {
         }), `${status}:${nextStatus}`).toMatchObject({ ok: true });
       }
 
-      const before = registry.get(taskId);
       const eventCount = registry.listEvents(taskId).length;
       expect(registry.coordinateTaskAssignment({
         taskId, assignmentId: worker.value.assignmentId,
         scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
         leaseAction: 'preserve',
-        idempotencyKey: `scope-only-${status}-refused`,
-        reason: 'must invalidate old validation and audit provenance before expanding scope',
-      }), status).toEqual({ ok: false, reason: 'invalid_transition' });
-      expect(registry.get(taskId)).toEqual(before);
-      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+        idempotencyKey: `scope-only-${status}-recorded`,
+        reason: 'record a newly observed path without changing authority',
+      }), status).toMatchObject({ ok: true });
+      expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({
+        status, scopeFiles: ['src/audited.ts', 'src/unaudited.ts'],
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      expect(registry.getAssignment(worker.value.assignmentId)?.blocker).toBeUndefined();
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount + 1);
       registry.close();
     }
   });
@@ -3310,8 +3314,20 @@ describe('SupervisionTaskRegistry', () => {
     expect(first.ok).toBe(true);
     expect(replay).toMatchObject({ ok: true, replay: true });
     expect(registry.listFileEvents('task-files')).toHaveLength(1);
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'rework'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: impl.value.assignmentId,
+        identity: implementer,
+        status,
+        ...(status === 'rework' ? { verdict: 'REWORK' as const } : {}),
+      }), status).toMatchObject({ ok: true });
+    }
     expect(registry.recordFileEvent({ assignmentId: impl.value.assignmentId, identity: implementer, path: 'src/out.ts', operation: 'create' })).toMatchObject({ ok: true });
-    expect(registry.get('task-files')).toMatchObject({ status: 'delegated', touchedFiles: ['src/ok.ts', 'src/out.ts'] });
+    expect(registry.get('task-files')).toMatchObject({ status: 'rework', touchedFiles: ['src/ok.ts', 'src/out.ts'] });
+    expect(registry.getAssignment(impl.value.assignmentId)).toMatchObject({
+      status: 'rework', scopeFiles: ['src/ok.ts', 'src/out.ts'], verdict: 'REWORK',
+    });
+    expect(registry.getAssignment(impl.value.assignmentId)?.blocker).toBeUndefined();
     registry.close();
   });
 
@@ -3425,7 +3441,7 @@ describe('SupervisionTaskRegistry', () => {
     registry.close();
   });
 
-  it('reconciles hooks against declared scope, duplicate deliveries, rename/delete and restart recovery', () => {
+  it('reconciles observed paths as provenance, duplicate deliveries, rename/delete and restart recovery', () => {
     const dir = mkdtempSync(join(tmpdir(), 'supervision-task-registry-'));
     const dbPath = join(dir, 'tasks.sqlite');
     try {
@@ -3438,12 +3454,15 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.recordFileEvent({ assignmentId: assignment.value.assignmentId, identity: owner, path: 'src/old.ts', operation: 'rename', beforeHash: 'old', afterHash: 'new', idempotencyKey: 'rename-1' })).toMatchObject({ ok: true, replay: true });
       expect(registry.recordFileEvent({ assignmentId: assignment.value.assignmentId, identity: owner, path: 'src/new.ts', operation: 'delete', beforeHash: 'new', idempotencyKey: 'delete-1' }).ok).toBe(true);
       expect(registry.reconcileScope({ taskId: 'task-restart', trackedPaths: ['src/old.ts', 'src/new.ts'], currentRevision: 'rev1' }).ok).toBe(true);
-      expect(registry.reconcileScope({ taskId: 'task-restart', trackedPaths: ['src/old.ts', 'src/new.ts', 'src/untracked.ts'] })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+      expect(registry.reconcileScope({ taskId: 'task-restart', trackedPaths: ['src/old.ts', 'src/new.ts', 'src/untracked.ts'] })).toMatchObject({ ok: true });
       registry.close();
       const reopened = new SupervisionTaskRegistry({ dbPath });
       expect(reopened.get('task-restart')?.touchedFiles).toEqual(['src/new.ts', 'src/old.ts']);
       expect(reopened.get('task-restart')?.currentRevision).toBe('rev1');
-      expect(reopened.get('task-restart')?.assignments[0]?.executionBinding).toStrictEqual(persistedExecutionBinding('deck_sub_restart'));
+      expect(reopened.get('task-restart')?.assignments[0]).toMatchObject({
+        scopeFiles: ['src/new.ts', 'src/old.ts', 'src/untracked.ts'],
+        executionBinding: persistedExecutionBinding('deck_sub_restart'),
+      });
       reopened.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -4155,7 +4174,10 @@ describe('SupervisionTaskRegistry', () => {
       scopeFiles: ['src/join.ts'], idempotencyKey: 'join-existing-once',
     } as const;
     const first = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START](request);
-    const replay = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START](request);
+    const replay = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
+      ...request,
+      scopeFiles: ['src/observed-later.ts'],
+    });
     expect(first).toMatchObject({ status: 'ok', taskId: 'existing-start-task' });
     expect(replay).toMatchObject({
       status: 'ok', taskId: 'existing-start-task',
@@ -4163,6 +4185,7 @@ describe('SupervisionTaskRegistry', () => {
     });
     expect(registry.list({ projectName: 'alpha' })).toHaveLength(1);
     expect(registry.get('existing-start-task')?.assignments).toHaveLength(2);
+    expect(registry.getAssignment(first.assignmentId as string)?.scopeFiles).toEqual(['src/join.ts']);
   });
 
   it('supervision_task_start makes missing, foreign-project and inaccessible task ids indistinguishable', async () => {

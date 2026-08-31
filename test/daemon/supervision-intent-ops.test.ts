@@ -132,7 +132,7 @@ describe('published MCP schemas', () => {
       .toEqual([...SUPERVISION_TASK_LIFECYCLE_STATUSES]);
   });
 
-  it('publishes the complete same-object recovery evidence and lease contract without clearLease', () => {
+  it('publishes recovery authority while keeping file lists record-only and omitting clearLease', () => {
     const recovery = SUPERVISION_MCP_TOOL_SCHEMAS.supervision_task_recover;
     expect(recovery.required).toEqual(['taskId', 'reason']);
     expect(recovery.additionalProperties).toBe(false);
@@ -141,14 +141,15 @@ describe('published MCP schemas', () => {
       assignmentId: expect.any(Object),
       fromRevision: expect.any(Object),
       toRevision: expect.any(Object),
-      ownedFiles: expect.objectContaining({ type: 'array' }),
-      scopeFiles: expect.objectContaining({ type: 'array', minItems: 1 }),
+      ownedFiles: expect.objectContaining({ description: expect.stringContaining('provenance') }),
+      scopeFiles: expect.objectContaining({ description: expect.stringContaining('never restrict edits') }),
       evidenceManifestSha256: expect.objectContaining({ pattern: '^[a-f0-9]{64}$' }),
       leaseAction: expect.objectContaining({ enum: [...SUPERVISION_RECOVERY_LEASE_ACTIONS] }),
       idempotencyKey: expect.any(Object),
       reason: expect.any(Object),
     }));
-    expect(recovery.properties.ownedFiles).not.toHaveProperty('minItems');
+    expect(recovery.properties.ownedFiles).not.toHaveProperty('type');
+    expect(recovery.properties.scopeFiles).not.toHaveProperty('type');
     expect(recovery.properties).not.toHaveProperty('clearLease');
   });
 
