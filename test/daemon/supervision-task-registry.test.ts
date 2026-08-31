@@ -543,9 +543,14 @@ function prepareFinalizedPassedSuccessorRecoveryShape(
   const task = registry.get(taskId)!;
   rewritePersistedTask(database, {
     ...task,
-    status: 'rework',
-    blocker: 'R1 finding retained until finalized R2 successor recovery',
+    status: 'implementing',
+    blocker: 'R1 REWORK retained while project coordination remains active',
   });
+  const coordinator = registry.createAssignment({
+    assignmentId: `${taskId}-coordinator`, taskId, role: 'coordinator', required: false,
+    identity: identity(`${taskId}-coordinator`),
+  });
+  if (!coordinator.ok) throw new Error(coordinator.reason);
   const toRevision = registry.getAssignment(shape.auditor.assignmentId)!.auditRevision!;
   const sourceAuditorIdentity = identity(`${taskId}-source-auditor`, 'claude-code-sdk');
   const sourceAuditor = registry.createAssignment({
@@ -609,7 +614,7 @@ function prepareFinalizedPassedSuccessorRecoveryShape(
       );
     }
   }
-  return { ...shape, toRevision, sourceAuditor: sourceAuditor.value };
+  return { ...shape, toRevision, sourceAuditor: sourceAuditor.value, coordinator: coordinator.value };
 }
 
 beforeEach(() => {
@@ -1185,7 +1190,7 @@ describe('SupervisionTaskRegistry', () => {
     };
 
     expect(registry.get(shape.taskId)).toMatchObject({
-      status: 'rework', currentRevision: shape.fromRevision,
+      status: 'implementing', currentRevision: shape.fromRevision,
     });
     expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
       status: 'rework', leaseId: originalLeaseId,
@@ -1235,6 +1240,29 @@ describe('SupervisionTaskRegistry', () => {
     database.close();
   });
 
+  it('keeps the ordinary task-and-implementer REWORK finalized-successor recovery path', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = prepareFinalizedPassedSuccessorRecoveryShape(
+      registry, database, 'ordinary-finalized-passed-successor',
+    );
+    rewritePersistedTask(database, {
+      ...registry.get(shape.taskId)!, status: 'rework', updatedAt: 150,
+    });
+    expect(registry.get(shape.taskId)).toMatchObject({ status: 'rework' });
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+      leaseAction: 'preserve', idempotencyKey: 'bind-ordinary-finalized-successor-r2',
+      reason: 'preserve the ordinary exact task and implementer REWORK path',
+    })).toMatchObject({
+      ok: true, value: { status: 'implementing', currentRevision: shape.toRevision },
+    });
+    registry.close();
+    database.close();
+  });
+
   it.each([
     'missing', 'wrong-verdict', 'wrong-attempt', 'foreign-task', 'foreign-assignment',
   ] as const)('rejects a %s finalized-successor receipt without mutation', (receiptBinding) => {
@@ -1247,6 +1275,11 @@ describe('SupervisionTaskRegistry', () => {
     const assignments = registry.listAssignments(shape.taskId);
     const receipts = registry.listAuditReceipts(shape.taskId);
     const events = registry.listEvents(shape.taskId).length;
+    expect(before).toMatchObject({ status: 'implementing', currentRevision: shape.fromRevision });
+    expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
+      status: 'rework', auditRevision: shape.fromRevision, verdict: 'REWORK',
+      leaseId: expect.any(String),
+    });
     expect(registry.rebindTaskAssignmentRevision({
       taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
       fromRevision: shape.fromRevision, toRevision: shape.toRevision,
@@ -1300,6 +1333,60 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.listEvents(shape.taskId)).toHaveLength(events);
     registry.close();
     database.close();
+  });
+
+  it('keeps aggregate-implementing successor recovery narrow when source lifecycle or evidence is not exact', () => {
+    for (const variant of [
+      'implementer-implementing',
+      'implementer-validated',
+      'missing-active-lease',
+      'inactive-coordinator',
+      'mismatched-source-receipt',
+    ] as const) {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      const shape = prepareFinalizedPassedSuccessorRecoveryShape(
+        registry, database, `aggregate-implementing-${variant}`,
+      );
+      const implementer = registry.getAssignment(shape.implementer.assignmentId)!;
+      if (variant === 'implementer-implementing' || variant === 'implementer-validated') {
+        rewritePersistedAssignment(database, {
+          ...implementer,
+          status: variant === 'implementer-implementing' ? 'implementing' : 'validated',
+          updatedAt: 150,
+        });
+      } else if (variant === 'missing-active-lease') {
+        rewritePersistedAssignment(database, { ...implementer, leaseId: '', updatedAt: 150 });
+      } else if (variant === 'inactive-coordinator') {
+        rewritePersistedAssignment(database, {
+          ...registry.getAssignment(shape.coordinator.assignmentId)!,
+          status: 'cancelled', leaseId: '', updatedAt: 150,
+        });
+      } else {
+        database.prepare(
+          `UPDATE supervision_audit_receipts SET revision = ? WHERE receipt_id = ?`,
+        ).run('mismatched-source-r0', `${shape.taskId}-r1-rework-receipt`);
+      }
+
+      const before = registry.get(shape.taskId);
+      const assignments = registry.listAssignments(shape.taskId);
+      const receipts = registry.listAuditReceipts(shape.taskId);
+      const events = registry.listEvents(shape.taskId).length;
+      expect(before).toMatchObject({ status: 'implementing', currentRevision: shape.fromRevision });
+      expect(registry.rebindTaskAssignmentRevision({
+        taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+        fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+        worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
+        leaseAction: 'preserve', idempotencyKey: `refuse-${variant}`,
+        reason: 'aggregate implementing must not widen successor recovery',
+      }), variant).toEqual({ ok: false, reason: 'invalid_transition' });
+      expect(registry.get(shape.taskId), variant).toEqual(before);
+      expect(registry.listAssignments(shape.taskId), variant).toEqual(assignments);
+      expect(registry.listAuditReceipts(shape.taskId), variant).toEqual(receipts);
+      expect(registry.listEvents(shape.taskId), variant).toHaveLength(events);
+      registry.close();
+      database.close();
+    }
   });
 
   it('converges an inspected assignment-target/task-source split without weakening recovery gates', () => {

@@ -2879,6 +2879,18 @@ export class SupervisionTaskRegistry {
           && attestation.assignmentId === assignmentId
         )),
       );
+      const activeCoordinationAssignments = assignments.filter((candidate) => (
+        candidate.role !== 'implementer'
+        && candidate.role !== 'auditor'
+        && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+      ));
+      const aggregateImplementingFromCoordination = task.status === 'implementing'
+        && activeCoordinationAssignments.length > 0
+        && activeCoordinationAssignments.every((candidate) => (
+          ['coordinator', 'integration_owner'].includes(candidate.role)
+          && ['delegated', 'implementing'].includes(candidate.status)
+          && Boolean(candidate.leaseId)
+        ));
       const targetPassConflictFree = !conflictingTargetPassAssignment
         && targetPassAttestations.length === 0
         && conflictingTargetPassReceipt?.ok !== 1;
@@ -2908,7 +2920,7 @@ export class SupervisionTaskRegistry {
           && fromRevision
           && task.currentRevision === fromRevision
           && assignment.auditRevision === fromRevision
-          && task.status === 'rework'
+          && (task.status === 'rework' || aggregateImplementingFromCoordination)
           && assignment.status === 'rework'
           && assignment.verdict?.trim().toUpperCase() === 'REWORK'
           && assignment.leaseId
