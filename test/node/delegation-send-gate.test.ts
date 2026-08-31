@@ -77,6 +77,12 @@ const deps = (sessions: SessionRecord[], dispatchMessage = vi.fn(async () => {})
   now: () => NOW,
   listSessions: () => sessions,
   dispatchMessage,
+  ensureSupervisionAssignmentWorktree: async (input: { assignmentId: string }) => ({
+    ok: true as const,
+    worktreePath: `/worktrees/${input.assignmentId}/repo`,
+    baseRevision: 'a'.repeat(40),
+    created: true,
+  }),
 });
 
 function executionConfig(

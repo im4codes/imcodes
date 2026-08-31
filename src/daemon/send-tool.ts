@@ -95,6 +95,7 @@ import {
   expireDelegationReplyAuthority,
 } from './delegation-reply-authority.js';
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
+import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -373,6 +374,13 @@ export interface SendToolDeps {
   destroyExecutionClone?: (req: DestroyExecutionCloneDepRequest) => Promise<void>;
   /** Explicit Brain-authorized pool reuse/provisioning. Ordinary sends never call it. */
   provisionSupervisionTarget?: (req: SupervisionAutoProvisionRequest) => Promise<SupervisionAutoProvisionResult>;
+  /** Create or verify the exact assignment worktree before worker delivery. */
+  ensureSupervisionAssignmentWorktree?: (req: {
+    projectRoot: string;
+    sessionName: string;
+    assignmentId: string;
+    baseRevision?: string | null;
+  }) => Promise<SupervisionWorktreeProvisionResult>;
   /**
    * Authoritative liveness check used when a refresh snapshot momentarily
    * omits a previously routable session. The MCP directory uses this to retain
@@ -508,6 +516,21 @@ async function defaultDestroyExecutionClone(req: DestroyExecutionCloneDepRequest
 async function defaultProvisionSupervisionTarget(req: SupervisionAutoProvisionRequest): Promise<SupervisionAutoProvisionResult> {
   const { provisionSupervisionTarget } = await import('./supervision-auto-provision.js');
   return provisionSupervisionTarget(req);
+}
+
+async function defaultEnsureSupervisionAssignmentWorktree(req: {
+  projectRoot: string;
+  sessionName: string;
+  assignmentId: string;
+  baseRevision?: string | null;
+}): Promise<SupervisionWorktreeProvisionResult> {
+  const provisioner = await import('./supervision-worktree-provision.js');
+  const base = await provisioner.resolveSupervisionWorktreeBase({
+    projectRoot: req.projectRoot,
+    requestedBaseRevision: req.baseRevision,
+  });
+  if (!base.ok) return base;
+  return provisioner.ensureSupervisionAssignmentWorktree({ ...req, baseRevision: base.baseRevision });
 }
 
 /** Narrow an unknown error to its `ExecutionCloneError.code` when present. */
@@ -747,9 +770,42 @@ export async function dispatchSendMessage(
       : input.target ?? '';
   const cacheKey = idempotencyKey ? `${caller.userId}\0${caller.sessionName}\0${idempotencyTarget}\0${idempotencyKey}` : '';
   const now = d.now();
+  const ensureAssignmentWorktree = async (taskId: string, assignmentId: string, sessionName: string) => {
+    if (!caller.projectRoot) {
+      return { ok: false as const, error: 'assignment worktree provisioning requires the caller project root' };
+    }
+    const registry = getSupervisionTaskRegistry();
+    const task = registry.get(taskId);
+    const ensured = await (deps?.ensureSupervisionAssignmentWorktree
+      ?? defaultEnsureSupervisionAssignmentWorktree)({
+        projectRoot: caller.projectRoot,
+        sessionName,
+        assignmentId,
+        baseRevision: task?.baseRevision ?? input.task?.baseRevision,
+      });
+    if (!ensured.ok) {
+      return { ok: false as const, error: `assignment worktree provisioning blocked: ${ensured.reason}: ${ensured.detail}` };
+    }
+    if (task?.baseRevision !== ensured.baseRevision) {
+      const baseBound = registry.updateTask({ taskId, baseRevision: ensured.baseRevision, now });
+      if (!baseBound.ok) {
+        return { ok: false as const, error: `assignment worktree base binding rejected: ${baseBound.reason}` };
+      }
+    }
+    return { ok: true as const, value: ensured };
+  };
   if (cacheKey) {
     const cached = idempotencyCache.get(cacheKey);
-    if (cached && cached.expiresAt > now) return { ...cached.result, idempotentReplay: true };
+    if (cached && cached.expiresAt > now) {
+      if (cached.result.taskId && cached.result.assignmentId) {
+        const assignment = getSupervisionTaskRegistry().getAssignment(cached.result.assignmentId);
+        if (assignment?.role === 'implementer') {
+          const ensured = await ensureAssignmentWorktree(cached.result.taskId, cached.result.assignmentId, assignment.identity.sessionName);
+          if (!ensured.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: ensured.error };
+        }
+      }
+      return { ...cached.result, idempotentReplay: true };
+    }
     if (cached) idempotencyCache.delete(cacheKey);
   }
 
@@ -905,6 +961,7 @@ export async function dispatchSendMessage(
   let supervisedTaskId: string | undefined;
   let supervisedAssignmentId: string | undefined;
   let supervisedExecutionBinding: SupervisionExecutionBinding | undefined;
+  let supervisedWorktree: Extract<SupervisionWorktreeProvisionResult, { ok: true }> | undefined;
   let reusedContinuationAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
 
   if (input.task) {
@@ -1098,6 +1155,13 @@ export async function dispatchSendMessage(
 
     supervisedTaskId = taskId;
     supervisedAssignmentId = assignment.value.assignmentId;
+    if (!input.audit) {
+      const ensured = await ensureAssignmentWorktree(taskId, assignment.value.assignmentId, targetIdentity.sessionName);
+      if (!ensured.ok) {
+        return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: ensured.error };
+      }
+      supervisedWorktree = ensured.value;
+    }
   }
 
   const delegatedAuditRevision = input.task
@@ -1177,6 +1241,12 @@ export async function dispatchSendMessage(
           }),
           '',
         ] : []),
+      ...(supervisedWorktree && !reusedContinuationAssignment ? [
+        '[Authoritative assignment worktree]',
+        `Path: ${supervisedWorktree.worktreePath}`,
+        `Base: ${supervisedWorktree.baseRevision}`,
+        '',
+      ] : []),
       input.message,
       ...(taskBlockerContract ? ['', taskBlockerContract] : []),
     ].join('\n');

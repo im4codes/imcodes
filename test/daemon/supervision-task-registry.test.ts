@@ -131,6 +131,13 @@ function recoveryWorktreeSnapshot(paths: readonly string[], _evidenceManifestSha
   };
 }
 
+const ensureTestAssignmentWorktree = async (input: { assignmentId: string }) => ({
+  ok: true as const,
+  worktreePath: `/worktrees/${input.assignmentId}/repo`,
+  baseRevision: 'a'.repeat(40),
+  created: true,
+});
+
 function prepareStructuredFinalizationShape(
   registry: SupervisionTaskRegistry,
   taskId: string,
@@ -3707,10 +3714,10 @@ describe('SupervisionTaskRegistry', () => {
     const dispatchMessage = vi.fn(async () => undefined);
     const result = await dispatchSendMessage({ userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' }, {
       target: 'deck_alpha_w1', message: 'do task', idempotencyKey: 'same', task: { topLevelTaskId: 'top', objective: 'task via send', ownedFiles: ['src/a.ts'] },
-    }, { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true });
+    }, { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, ensureSupervisionAssignmentWorktree: ensureTestAssignmentWorktree });
     const replay = await dispatchSendMessage({ userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' }, {
       target: 'deck_alpha_w1', message: 'do task', idempotencyKey: 'same', task: { topLevelTaskId: 'top', objective: 'task via send', ownedFiles: ['src/a.ts'] },
-    }, { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true });
+    }, { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, ensureSupervisionAssignmentWorktree: ensureTestAssignmentWorktree });
     if (result.status !== 'accepted' || replay.status !== 'accepted') throw new Error('expected accepted');
     expect(result.taskId).toBeTruthy();
     expect(result.assignmentId).toBeTruthy();
@@ -3745,7 +3752,17 @@ describe('SupervisionTaskRegistry', () => {
         agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
       }),
     };
-    const dispatchMessage = vi.fn(async () => undefined);
+    const order: string[] = [];
+    const dispatchMessage = vi.fn(async () => { order.push('dispatch'); });
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { assignmentId: string }) => {
+      order.push('worktree');
+      return {
+        ok: true as const,
+        worktreePath: `/worktrees/${input.assignmentId}/repo`,
+        baseRevision: 'c'.repeat(40),
+        created: true,
+      };
+    });
     const provisionSupervisionTarget = vi.fn(async () => ({
       ok: true as const,
       target: worker,
@@ -3764,20 +3781,69 @@ describe('SupervisionTaskRegistry', () => {
         idempotencyKey: 'auto-provision-task',
         task: { autoProvision: true, executionPool: 'primary', objective: 'automatic capacity' },
       },
-      { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, provisionSupervisionTarget },
+      { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, provisionSupervisionTarget, ensureSupervisionAssignmentWorktree },
     );
 
     expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
+    expect(ensureSupervisionAssignmentWorktree).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['worktree', 'dispatch']);
     expect(dispatchMessage).toHaveBeenCalledWith(worker, expect.stringContaining('provision then dispatch'), expect.any(Object));
     expect(sent).toMatchObject({
       status: 'accepted',
       provisioning: { selectedPool: 'primary', provisionAttemptId: 'supervision_provision_test', createdSessionName: worker.name },
     });
     if (sent.status !== 'accepted' || !sent.assignmentId) throw new Error('expected provisioned assignment');
+    expect(String(dispatchMessage.mock.calls[0]?.[1])).toContain(`/worktrees/${sent.assignmentId}/repo`);
+    expect(String(dispatchMessage.mock.calls[0]?.[1])).toContain('c'.repeat(40));
+    expect(getSupervisionTaskRegistry().get(sent.taskId!)).toMatchObject({ baseRevision: 'c'.repeat(40) });
     expect(getSupervisionTaskRegistry().getAssignment(sent.assignmentId)).toMatchObject({
       executionBinding: { origin: 'spawned', actual: { sessionName: worker.name } },
       provisioning: { selectedConfig, createdSessionName: worker.name },
     });
+  });
+
+  it('does not dispatch a missing-worktree assignment and retries the same object after recovery', async () => {
+    const brain = session('deck_alpha_brain');
+    const worker = session('deck_alpha_w1');
+    const sessions = [brain, worker];
+    const dispatchMessage = vi.fn(async () => undefined);
+    const ensureSupervisionAssignmentWorktree = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: 'create_failed', detail: 'simulated interrupted git worktree add' })
+      .mockImplementation(async (input: { assignmentId: string }) => ({
+        ok: true as const,
+        worktreePath: `/worktrees/${input.assignmentId}/repo`,
+        baseRevision: 'd'.repeat(40),
+        created: true,
+      }));
+    const request = {
+      target: worker.name,
+      message: 'deliver only after worktree recovery',
+      idempotencyKey: 'missing-worktree-recovery',
+      task: { objective: 'recover same assignment' },
+    } as const;
+    const caller = { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' };
+    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, ensureSupervisionAssignmentWorktree };
+
+    const failed = await dispatchSendMessage(caller, request, deps);
+    expect(failed).toMatchObject({
+      status: 'error', reason: 'validation_failed',
+      error: expect.stringContaining('create_failed: simulated interrupted git worktree add'),
+    });
+    expect(dispatchMessage).not.toHaveBeenCalled();
+    const afterFailure = getSupervisionTaskRegistry().list();
+    expect(afterFailure).toHaveLength(1);
+    expect(afterFailure[0]).toMatchObject({
+      status: 'delegated',
+      assignments: expect.arrayContaining([expect.objectContaining({ role: 'implementer', status: 'delegated' })]),
+    });
+    const failedAssignmentId = afterFailure[0]!.assignments.find((assignment) => assignment.role === 'implementer')!.assignmentId;
+
+    const recovered = await dispatchSendMessage(caller, request, deps);
+    expect(recovered).toMatchObject({ status: 'accepted', taskId: afterFailure[0]!.taskId, assignmentId: failedAssignmentId });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect(getSupervisionTaskRegistry().list()).toHaveLength(1);
+    expect(getSupervisionTaskRegistry().get(afterFailure[0]!.taskId)?.assignments.filter((assignment) => assignment.role === 'implementer'))
+      .toHaveLength(1);
   });
 
   it('persists an availability-driven same-family audit degradation without changing the Brain-named route', async () => {
@@ -3878,7 +3944,7 @@ describe('SupervisionTaskRegistry', () => {
         idempotencyKey: 'cross-entrypoint-provider-family',
         task: { objective: 'canonical provider family', ownedFiles: ['src/cross-entrypoint.ts'] },
       },
-      { listSessions: () => sessions, dispatchMessage: async () => undefined, exactTargetOnly: true },
+      { listSessions: () => sessions, dispatchMessage: async () => undefined, exactTargetOnly: true, ensureSupervisionAssignmentWorktree: ensureTestAssignmentWorktree },
     );
     expect(sent).toMatchObject({ status: 'accepted', taskId: expect.any(String), assignmentId: expect.any(String) });
     if (sent.status !== 'accepted' || !sent.assignmentId || !sent.taskId) throw new Error('expected task assignment');
@@ -4206,7 +4272,7 @@ describe('SupervisionTaskRegistry', () => {
       idempotencyKey: 'bind-existing-once',
       task: { taskId: 'existing-visible-task', objective: 'must not mint a replacement' },
     } as const;
-    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true };
+    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, ensureSupervisionAssignmentWorktree: ensureTestAssignmentWorktree };
 
     const first = await dispatchSendMessage(
       { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' },
@@ -4260,7 +4326,7 @@ describe('SupervisionTaskRegistry', () => {
     const sessions = [session('deck_alpha_brain'), session('deck_alpha_w1'), session('deck_alpha_w2')];
     sessions[1]!.state = 'busy';
     const dispatchMessage = vi.fn(async () => 'queued' as const);
-    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true };
+    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, ensureSupervisionAssignmentWorktree: ensureTestAssignmentWorktree };
     const caller = { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' };
 
     const sent = await dispatchSendMessage(caller, {

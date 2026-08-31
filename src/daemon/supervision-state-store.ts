@@ -525,6 +525,8 @@ export interface PersistedSupervisionAuditReceipt {
 export interface SupervisionTaskUpdateInput {
   taskId: string;
   status?: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus;
+  /** Immutable Git base selected before an assignment worktree is delivered. */
+  baseRevision?: string | null;
   currentRevision?: string | number | null;
   commitSha?: string | null;
   pushRemoteRef?: string | null;
@@ -1744,9 +1746,14 @@ export class SupervisionTaskRegistry {
     if (!isSupervisionTaskLifecycleStatus(nextStatus)) return { ok: false, reason: 'invalid' };
     if (!canTransitionSupervisionTaskStatus(existing.status, nextStatus)) return { ok: false, reason: 'invalid_transition' };
     const now = input.now ?? Date.now();
+    const requestedBaseRevision = normalizeTaskString(input.baseRevision);
+    if (requestedBaseRevision && existing.baseRevision && requestedBaseRevision !== existing.baseRevision) {
+      return { ok: false, reason: 'conflicting_replay' };
+    }
     const record: PersistedSupervisionTaskRecord = {
       ...existing,
       status: nextStatus,
+      ...(requestedBaseRevision ? { baseRevision: requestedBaseRevision } : {}),
       ...(normalizeTaskString(input.currentRevision) ? { currentRevision: normalizeTaskString(input.currentRevision) } : {}),
       ...(normalizeTaskString(input.commitSha) ? { commitSha: normalizeTaskString(input.commitSha) } : {}),
       ...(normalizeTaskString(input.pushRemoteRef) ? { pushRemoteRef: normalizeTaskString(input.pushRemoteRef) } : {}),
