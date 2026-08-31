@@ -17,6 +17,9 @@ html { position: fixed; }
   --chrome-warm: #f59e0b;
   /* The desktop vertical rail is one compact bottom sub-session card wide. */
   --subsession-compact-card-width: 54px;
+  /* Team progress needs readable topics/status while remaining much narrower
+     than the existing sidebar or a floating panel. */
+  --team-discussion-rail-width: clamp(184px, 17vw, 220px);
   /* Mobile layer contract: persistent navigation stays above session windows,
      while full-screen work surfaces must cover the navigation instead of
      rendering their headers underneath it. */
@@ -5653,6 +5656,34 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-card-rail .subsession-card-model { margin-left: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .subsession-card-rail .subsession-card-ctx { position: absolute; left: 3px; right: 3px; bottom: 2px; width: auto !important; }
 .subcard-bar-vertical-mode .subcard-toolbar { min-height: 29px; }
+
+/* Team discussion layout mirrors the sub-session rail: a real root flex child
+   plus a portal, never a fixed overlay over chat or the composer. */
+.team-discussion-rail-host { position: relative; display: flex; flex: 0 0 var(--team-discussion-rail-width); width: var(--team-discussion-rail-width); min-width: var(--team-discussion-rail-width); max-width: var(--team-discussion-rail-width); min-height: 0; overflow: hidden; border-left: 1px solid rgba(96,165,250,0.24); background: linear-gradient(180deg, #0b1422 0%, #070c15 100%); box-shadow: inset 1px 0 0 rgba(255,255,255,0.035), -8px 0 24px rgba(0,0,0,0.22); z-index: 1; }
+.team-discussion-rail { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
+.team-discussion-rail-header { display: grid; flex: 0 0 auto; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; min-height: 38px; padding: 5px 6px; border-bottom: 1px solid rgba(96,165,250,0.20); background: linear-gradient(180deg, rgba(37,99,235,0.13), rgba(15,23,42,0.18)); }
+.team-discussion-rail-title { min-width: 0; overflow: hidden; color: #bfdbfe; font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.team-discussion-rail-count { display: inline-flex; min-width: 20px; height: 20px; align-items: center; justify-content: center; padding: 0 5px; border: 1px solid rgba(96,165,250,0.28); border-radius: 999px; color: #bfdbfe; background: rgba(37,99,235,0.16); font-size: 9px; font-weight: 700; }
+.team-discussion-layout-controls { display: inline-flex; align-items: center; justify-content: flex-end; gap: 3px; }
+.team-discussion-rail-header .team-discussion-layout-controls { grid-column: 1 / -1; }
+.team-discussion-layout-button { display: inline-flex; width: 24px; height: 22px; align-items: center; justify-content: center; padding: 0; border: 1px solid rgba(96,165,250,0.28); border-radius: 5px; color: #93c5fd; background: rgba(15,23,42,0.74); cursor: pointer; font: inherit; font-size: 12px; line-height: 1; }
+.team-discussion-layout-button:hover { color: #eff6ff; border-color: rgba(96,165,250,0.62); background: rgba(37,99,235,0.24); }
+.team-discussion-layout-button:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; }
+.team-discussion-layout-button[aria-pressed='true'] { color: #a7f3d0; border-color: rgba(52,211,153,0.56); background: rgba(6,95,70,0.30); }
+.team-discussion-rail-scroll { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(96,165,250,0.38) transparent; touch-action: pan-y; }
+.team-discussion-rail-scroll::-webkit-scrollbar { width: 5px; }
+.team-discussion-rail-scroll::-webkit-scrollbar-track { background: transparent; }
+.team-discussion-rail-scroll::-webkit-scrollbar-thumb { background: rgba(96,165,250,0.34); border-radius: 3px; }
+.team-discussion-bottom { border-top: 1px solid rgba(96,165,250,0.12); }
+.team-discussion-bottom > .team-discussion-layout-controls { width: 100%; padding: 4px 8px 0; }
+.discussion-panel-rail { gap: 6px; padding: 6px; overflow: visible; }
+.discussion-panel-rail .discussions-progress-card-mobile { min-width: 0 !important; padding: 6px !important; border-radius: 7px !important; }
+.discussion-panel-rail .discussions-progress-mobile-row { gap: 3px; }
+.discussion-panel-rail .discussions-progress-mobile-row .discussions-progress-kicker { display: none; }
+.discussion-panel-rail .discussions-progress-badge { padding: 1px 4px; }
+.discussion-panel-rail .p2p-timer-hop-compact,
+.discussion-panel-rail .controls-queued-item-actor { display: none; }
+.discussion-panel-rail .discussions-progress-mobile-title { overflow: hidden; color: #cbd5e1; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 1280px) {
   .subcard-bar-vertical-mode .subcard-toolbar-btn-labeled { min-width: 30px; margin-left: 0; padding-left: 7px; padding-right: 7px; }

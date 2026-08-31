@@ -114,6 +114,7 @@ import {
   SUBSESSION_DESKTOP_DOCK_SIDE,
   SUBSESSION_DESKTOP_LAYOUT,
 } from '../../src/subsession-desktop-layout-preference.js';
+import { TEAM_DISCUSSION_LAYOUT } from '../../src/team-discussion-layout-preference.js';
 
 const LOCALE_DIR = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/i18n/locales');
 
@@ -1023,6 +1024,53 @@ describe('SubSessionBar', () => {
     expect(restored.getByTestId('p2p-progress-card').getAttribute('data-ultra-compact')).toBe('true');
   });
 
+  it('portals Team discussions into a compact right rail and exposes both layout choices', () => {
+    const host = document.createElement('aside');
+    document.body.append(host);
+    const onTeamDiscussionLayoutChange = vi.fn();
+    const discussion = {
+      id: 'p2p_run_rail',
+      topic: 'Responsive Team audit',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 2,
+      completedHops: 0,
+      totalHops: 2,
+    };
+
+    try {
+      const view = render(
+        <SubSessionBar
+          subSessions={[makeSubSession()]}
+          openIds={new Set()}
+          desktopLayoutCapable
+          teamDiscussionLayout={TEAM_DISCUSSION_LAYOUT.RIGHT}
+          onTeamDiscussionLayoutChange={onTeamDiscussionLayoutChange}
+          teamDiscussionRailHost={host}
+          discussions={[discussion]}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+
+      expect(view.queryByTestId('team-discussion-bottom')).toBeNull();
+      expect(host.querySelector('[data-testid="team-discussion-rail"]')).toBeTruthy();
+      expect(host.querySelector('[data-testid="team-discussion-rail-scroll"]')).toBeTruthy();
+      expect(host.querySelector('[data-testid="p2p-progress-card"]')?.getAttribute('data-ultra-compact')).toBe('true');
+      expect(host.querySelector('[data-testid="team-discussion-layout-right"]')?.getAttribute('aria-pressed')).toBe('true');
+
+      fireEvent.click(host.querySelector('[data-testid="team-discussion-layout-bottom"]')!);
+      expect(onTeamDiscussionLayoutChange).toHaveBeenCalledWith(TEAM_DISCUSSION_LAYOUT.BOTTOM);
+    } finally {
+      host.remove();
+    }
+  });
+
   it('recalculates accent colors and reports visual order after drag reorder', async () => {
     const onVisualOrderChange = vi.fn();
     const subSessions = [
@@ -1658,7 +1706,18 @@ describe('SubSessionBar', () => {
   it('ships desktop layout labels in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
-      for (const key of ['switch_to_vertical', 'switch_to_horizontal', 'vertical_rail', 'dock_side', 'dock_left', 'dock_right']) {
+      for (const key of [
+        'switch_to_vertical',
+        'switch_to_horizontal',
+        'vertical_rail',
+        'dock_side',
+        'dock_left',
+        'dock_right',
+        'team_layout',
+        'team_dock_right',
+        'team_dock_bottom',
+        'team_right_rail',
+      ]) {
         expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
       }
     }

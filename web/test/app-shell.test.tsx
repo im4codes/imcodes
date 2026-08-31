@@ -13,6 +13,10 @@ import {
   SUBSESSION_DESKTOP_LAYOUT,
   SUBSESSION_DESKTOP_LAYOUT_STORAGE_KEY,
 } from '../src/subsession-desktop-layout-preference.js';
+import {
+  TEAM_DISCUSSION_LAYOUT,
+  TEAM_DISCUSSION_LAYOUT_STORAGE_KEY,
+} from '../src/team-discussion-layout-preference.js';
 
 const {
   apiFetchMock,
@@ -559,17 +563,28 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     desktopDockSide,
     onDesktopDockSideChange,
     verticalRailHost,
+    teamDiscussionLayout,
+    onTeamDiscussionLayoutChange,
+    teamDiscussionRailHost,
   }: any) => (
     <div
       data-testid="app-shell-subsession-bar"
       data-running-discussions={String(totalRunningDiscussions)}
       data-desktop-layout={desktopLayout}
       data-desktop-dock-side={desktopDockSide}
+      data-team-discussion-layout={teamDiscussionLayout}
     >
       {verticalRailHost && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && createPortal(
         <div data-testid="app-shell-subsession-vertical-rail">mock vertical rail</div>,
         verticalRailHost,
       )}
+      {teamDiscussionRailHost
+        && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT
+        && discussions.length > 0
+        && createPortal(
+          <div data-testid="app-shell-team-discussion-rail">mock Team discussion rail</div>,
+          teamDiscussionRailHost,
+        )}
       sub-session-bar
       {desktopLayoutCapable && onDesktopLayoutChange && (
         <button
@@ -594,6 +609,18 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
             data-testid="app-shell-subsession-dock-right"
             onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
           >dock-right</button>
+        </>
+      )}
+      {desktopLayoutCapable && onTeamDiscussionLayoutChange && (
+        <>
+          <button
+            data-testid="app-shell-team-discussion-right"
+            onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.RIGHT)}
+          >team-right</button>
+          <button
+            data-testid="app-shell-team-discussion-bottom"
+            onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.BOTTOM)}
+          >team-bottom</button>
         </>
       )}
       {openSpecAutoProjection && (
@@ -1883,6 +1910,78 @@ describe('App shell', () => {
       version: 1,
       side: SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT,
     });
+  }, 20_000);
+
+  it('defaults Team discussions right at low height, then preserves a manual bottom choice', async () => {
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 640 });
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    try {
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+      await act(async () => {
+        ws.emit({
+          type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+          run: {
+            id: 'run-team-rail',
+            status: 'running',
+            current_round: 1,
+            total_rounds: 2,
+            total_hops: 2,
+            active_phase: 'hop',
+            initiator_session: 'deck_alpha_brain',
+          },
+        });
+      });
+
+      let host = await screen.findByTestId('team-discussion-rail-host');
+      expect(await screen.findByTestId('app-shell-team-discussion-rail')).toBeTruthy();
+      expect(screen.getByTestId('app-shell-subsession-bar').dataset.teamDiscussionLayout)
+        .toBe(TEAM_DISCUSSION_LAYOUT.RIGHT);
+      expect(localStorage.getItem(TEAM_DISCUSSION_LAYOUT_STORAGE_KEY)).toBeNull();
+      const layout = host.parentElement!;
+      expect(Array.from(layout.children).indexOf(layout.querySelector('.main')!))
+        .toBeLessThan(Array.from(layout.children).indexOf(host));
+
+      fireEvent.click(screen.getByTestId('app-shell-team-discussion-bottom'));
+      await waitFor(() => expect(screen.queryByTestId('team-discussion-rail-host')).toBeNull());
+      expect(JSON.parse(localStorage.getItem(TEAM_DISCUSSION_LAYOUT_STORAGE_KEY)!)).toEqual({
+        version: 1,
+        layout: TEAM_DISCUSSION_LAYOUT.BOTTOM,
+      });
+
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 500 });
+      window.dispatchEvent(new Event('resize'));
+      await waitFor(() => expect(screen.getByTestId('app-shell-subsession-bar').dataset.teamDiscussionLayout)
+        .toBe(TEAM_DISCUSSION_LAYOUT.BOTTOM));
+
+      view.unmount();
+      render(<App />);
+      const refreshedWs = await getActiveWsClient();
+      await act(async () => {
+        refreshedWs.emit({
+          type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+          run: {
+            id: 'run-team-rail-refresh',
+            status: 'running',
+            current_round: 1,
+            total_rounds: 1,
+            total_hops: 1,
+            initiator_session: 'deck_alpha_brain',
+          },
+        });
+      });
+      await screen.findByTestId('app-shell-p2p-discussion-p2p_run-team-rail-refresh');
+      expect(screen.queryByTestId('team-discussion-rail-host')).toBeNull();
+      expect(screen.getByTestId('app-shell-subsession-bar').dataset.teamDiscussionLayout)
+        .toBe(TEAM_DISCUSSION_LAYOUT.BOTTOM);
+    } finally {
+      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
+    }
   }, 20_000);
 
   it('keeps the saved desktop rail preference untouched while mobile uses its original layout', async () => {

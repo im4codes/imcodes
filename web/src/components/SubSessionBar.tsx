@@ -47,6 +47,10 @@ import {
   type SubSessionDesktopLayout,
 } from '../subsession-desktop-layout-preference.js';
 import {
+  TEAM_DISCUSSION_LAYOUT,
+  type TeamDiscussionLayout,
+} from '../team-discussion-layout-preference.js';
+import {
   DIRECT_CONNECTIVITY_ENDPOINT_KIND,
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_CONNECTIVITY_ROUTE,
@@ -118,6 +122,9 @@ interface Props {
   desktopDockSide?: SubSessionDesktopDockSide;
   onDesktopDockSideChange?: (side: SubSessionDesktopDockSide) => void;
   verticalRailHost?: HTMLElement | null;
+  teamDiscussionLayout?: TeamDiscussionLayout;
+  onTeamDiscussionLayoutChange?: (layout: TeamDiscussionLayout) => void;
+  teamDiscussionRailHost?: HTMLElement | null;
   idleFlashTokens?: Map<string, number>;
   sharedSubSessionStates?: ReadonlyMap<string, SharedStateSummary>;
   onOpen: (id: string) => void;
@@ -707,10 +714,12 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
+  const isTeamDiscussionRail = desktopLayoutCapable
+    && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
   const collapsed = controlledCollapsed ?? internalCollapsed;
@@ -1385,9 +1394,71 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     )
     : null;
 
+  const renderTeamDiscussionLayoutControls = () => onTeamDiscussionLayoutChange ? (
+    <div class="team-discussion-layout-controls" role="group" aria-label={t('subsessionBar.team_layout')}>
+      <button
+        type="button"
+        class="team-discussion-layout-button"
+        data-testid="team-discussion-layout-right"
+        aria-label={t('subsessionBar.team_dock_right')}
+        title={t('subsessionBar.team_dock_right')}
+        aria-pressed={teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT}
+        onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.RIGHT)}
+      >
+        <span aria-hidden="true">→</span>
+      </button>
+      <button
+        type="button"
+        class="team-discussion-layout-button"
+        data-testid="team-discussion-layout-bottom"
+        aria-label={t('subsessionBar.team_dock_bottom')}
+        title={t('subsessionBar.team_dock_bottom')}
+        aria-pressed={teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.BOTTOM}
+        onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.BOTTOM)}
+      >
+        <span aria-hidden="true">↓</span>
+      </button>
+    </div>
+  ) : null;
+
+  const renderTeamDiscussionCards = (rail: boolean) => (
+    <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}${!isMobile && p2pDesktopCompact ? ' discussion-panel-desktop-compact' : ''}${rail ? ' discussion-panel-rail' : ''}`}>
+      {discussions.map((discussion) => (
+        <P2pProgressCard
+          key={discussion.id}
+          discussion={discussion}
+          compact={!isMobile && !p2pDesktopCompact && !rail}
+          mobile={isMobile}
+          ultraCompact={rail || (!isMobile && p2pDesktopCompact)}
+          hidden={isMobile && p2pHidden}
+          onToggleHide={isMobile ? () => setP2pHidden((value) => !value) : undefined}
+          onStopDiscussion={onStopDiscussion}
+          onClick={discussion.fileId && onViewDiscussion ? () => onViewDiscussion(discussion.fileId!) : undefined}
+        />
+      ))}
+    </div>
+  );
+
+  const teamDiscussionRail = isTeamDiscussionRail && teamDiscussionRailHost && discussions.length > 0
+    ? createPortal(
+      <div class="team-discussion-rail" data-testid="team-discussion-rail">
+        <div class="team-discussion-rail-header">
+          <span class="team-discussion-rail-title">{t('discussion.team_label')}</span>
+          <span class="team-discussion-rail-count">{discussions.length}</span>
+          {renderTeamDiscussionLayoutControls()}
+        </div>
+        <div class="team-discussion-rail-scroll" data-testid="team-discussion-rail-scroll">
+          {renderTeamDiscussionCards(true)}
+        </div>
+      </div>,
+      teamDiscussionRailHost,
+    )
+    : null;
+
   return (
     <>
     {verticalRail}
+    {teamDiscussionRail}
     <div class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}`}>
       {/* Toolbar */}
       <div class="subcard-toolbar">
@@ -1733,21 +1804,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       )}
 
       {/* Discussions panel — above sub-session buttons */}
-      {discussions.length > 0 && (
-        <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}${!isMobile && p2pDesktopCompact ? ' discussion-panel-desktop-compact' : ''}`}>
-          {discussions.map((d) => (
-            <P2pProgressCard
-              key={d.id}
-              discussion={d}
-              compact={!isMobile && !p2pDesktopCompact}
-              mobile={isMobile}
-              ultraCompact={!isMobile && p2pDesktopCompact}
-              hidden={isMobile && p2pHidden}
-              onToggleHide={isMobile ? () => setP2pHidden((v) => !v) : undefined}
-              onStopDiscussion={onStopDiscussion}
-              onClick={d.fileId && onViewDiscussion ? () => onViewDiscussion(d.fileId!) : undefined}
-            />
-          ))}
+      {discussions.length > 0 && !isTeamDiscussionRail && (
+        <div class="team-discussion-bottom" data-testid="team-discussion-bottom">
+          {!isMobile && renderTeamDiscussionLayoutControls()}
+          {renderTeamDiscussionCards(false)}
         </div>
       )}
 

@@ -62,6 +62,24 @@ describe('styles.css regression contracts', () => {
     expect(cssWithoutComments).not.toMatch(/\.subsession-vertical-rail-host\s*\{[^}]*(?:136px|148px)/);
   });
 
+  it('keeps the Team discussion rail narrow, in root flex flow, and independently scrollable', () => {
+    const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
+    expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*17vw,\s*220px\)/);
+
+    const hostRule = cssWithoutComments.match(/\.team-discussion-rail-host\s*\{[^}]*\}/)?.[0];
+    expect(hostRule).toMatch(/display:\s*flex/);
+    expect(hostRule).toMatch(/flex:\s*0\s+0\s+var\(--team-discussion-rail-width\)/);
+    expect(hostRule).not.toMatch(/position:\s*(fixed|absolute)/);
+    for (const property of ['width', 'min-width', 'max-width']) {
+      expect(hostRule).toMatch(new RegExp(`${property}:\\s*var\\(--team-discussion-rail-width\\)`));
+    }
+
+    const scrollRule = cssWithoutComments.match(/\.team-discussion-rail-scroll\s*\{[^}]*\}/)?.[0];
+    expect(scrollRule).toMatch(/overflow-y:\s*auto/);
+    expect(scrollRule).toMatch(/overflow-x:\s*hidden/);
+    expect(scrollRule).toMatch(/touch-action:\s*pan-y/);
+  });
+
   it('shows the fast-audit label on desktop and keeps the mobile control icon-only', () => {
     const desktopRule = css.match(/\.shortcut-btn-peer-audit-label\s*\{[^}]*\}/)?.[0];
     expect(desktopRule).toBeTruthy();

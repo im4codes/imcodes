@@ -63,6 +63,13 @@ import {
   type SubSessionDesktopDockSide,
   type SubSessionDesktopLayout,
 } from './subsession-desktop-layout-preference.js';
+import {
+  defaultTeamDiscussionLayout,
+  loadTeamDiscussionLayout,
+  saveTeamDiscussionLayout,
+  TEAM_DISCUSSION_LAYOUT,
+  type TeamDiscussionLayout,
+} from './team-discussion-layout-preference.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
 import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
@@ -873,6 +880,32 @@ export function App() {
     // Like the layout choice, docking is a desktop-only local preference.
     saveSubSessionDesktopDockSide(side);
   }, []);
+  const [manualTeamDiscussionLayout, setManualTeamDiscussionLayout] = useState<TeamDiscussionLayout | null>(
+    () => loadTeamDiscussionLayout(),
+  );
+  const [automaticTeamDiscussionLayout, setAutomaticTeamDiscussionLayout] = useState<TeamDiscussionLayout>(
+    () => defaultTeamDiscussionLayout(
+      window.innerHeight,
+      !/iPhone|iPad|iPod|Android/i.test(navigator.userAgent),
+    ),
+  );
+  const teamDiscussionLayout = manualTeamDiscussionLayout ?? automaticTeamDiscussionLayout;
+  const [teamDiscussionRailHost, setTeamDiscussionRailHost] = useState<HTMLElement | null>(null);
+  const handleTeamDiscussionLayoutChange = useCallback((layout: TeamDiscussionLayout) => {
+    setManualTeamDiscussionLayout(layout);
+    saveTeamDiscussionLayout(layout);
+  }, []);
+  useEffect(() => {
+    if (manualTeamDiscussionLayout !== null) return undefined;
+    const updateAutomaticLayout = () => {
+      setAutomaticTeamDiscussionLayout(defaultTeamDiscussionLayout(
+        window.innerHeight,
+        !/iPhone|iPad|iPod|Android/i.test(navigator.userAgent),
+      ));
+    };
+    window.addEventListener('resize', updateAutomaticLayout);
+    return () => window.removeEventListener('resize', updateAutomaticLayout);
+  }, [manualTeamDiscussionLayout]);
   const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
   const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
     const el = desktopWorkspaceBoundsRef.current;
@@ -3467,6 +3500,13 @@ export function App() {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   isMobileRef.current = isMobile;
   const desktopLayoutCapable = !isMobile;
+  const visibleTeamDiscussions = useMemo(() => discussions.filter((discussion) => (
+    isP2pDiscussionVisibleInSubSessionBar(discussion, {
+      activeSession,
+      activeRootSession,
+      visibleSubSessionNames: p2pDiscussionScopeSubSessionNames,
+    })
+  )), [activeRootSession, activeSession, discussions, p2pDiscussionScopeSubSessionNames]);
   const mobileRemoteSurfaceActive = isMobile
     && ((remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
       || (remoteDesktopWallOpen && !remoteDesktopWallMinimized));
@@ -5633,6 +5673,22 @@ export function App() {
       : null
   );
 
+  const renderTeamDiscussionRailHost = () => (
+    !isMobile
+      && selectedServerId
+      && visibleTeamDiscussions.length > 0
+      && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT
+      ? (
+        <aside
+          ref={setTeamDiscussionRailHost}
+          class="team-discussion-rail-host"
+          data-testid="team-discussion-rail-host"
+          aria-label={trans('subsessionBar.team_right_rail')}
+        />
+      )
+      : null
+  );
+
   return (
     <div
       class={`layout${isMobile ? ' layout-mobile' : ''}${mobileRemoteSurfaceActive ? ' layout-mobile-remote-surface-active' : ''}`}
@@ -6378,6 +6434,9 @@ export function App() {
                 desktopDockSide={subSessionDesktopDockSide}
                 onDesktopDockSideChange={handleSubSessionDesktopDockSideChange}
                 verticalRailHost={subSessionVerticalRailHost}
+                teamDiscussionLayout={teamDiscussionLayout}
+                onTeamDiscussionLayoutChange={handleTeamDiscussionLayoutChange}
+                teamDiscussionRailHost={teamDiscussionRailHost}
                 collapsed={subSessionBarCollapsed}
                 onCollapsedChange={setSubSessionBarCollapsed}
                 onVisualOrderChange={handleSubSessionVisualOrderChange}
@@ -6405,11 +6464,7 @@ export function App() {
                 }}
                 onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
                 onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
-                discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
-                  activeSession,
-                  activeRootSession,
-                  visibleSubSessionNames: p2pDiscussionScopeSubSessionNames,
-                }))}
+                discussions={visibleTeamDiscussions}
                 // Daemon-wide running count (NOT scoped to this
                 // session) so the View Discussions (📋) button shows
                 // a badge even when the user is viewing a session
@@ -6458,6 +6513,7 @@ export function App() {
       </main>
 
       {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
+      {renderTeamDiscussionRailHost()}
 
       {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
       {isMobile && (
