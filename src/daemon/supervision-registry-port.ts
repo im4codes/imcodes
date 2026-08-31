@@ -17,6 +17,7 @@ import type {
 } from './supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { runSupervisionWorktreeGc } from './supervision-worktree-gc.js';
+import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 
 /**
  * One live-session authority check shared by the MCP project list and the Web
@@ -78,7 +79,17 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       return getSupervisionTaskRegistry().recoverTask(input);
     },
     rebindAuditAssignment: (input) => getSupervisionTaskRegistry().rebindAuditAssignment(input),
-    rebindTaskAssignmentRevision: (input) => getSupervisionTaskRegistry().rebindTaskAssignmentRevision(input),
+    rebindTaskAssignmentRevision: (input) => {
+      const registry = getSupervisionTaskRegistry();
+      const assignment = registry.getAssignment(input.assignmentId);
+      if (!assignment || assignment.taskId !== input.taskId) return { ok: false, reason: 'not_found' };
+      const inspected = inspectSupervisionAssignmentWorktree({
+        sessionName: assignment.identity.sessionName,
+        assignmentId: assignment.assignmentId,
+      });
+      if (!inspected.ok) return { ok: false, reason: inspected.reason };
+      return registry.rebindTaskAssignmentRevision({ ...input, worktreeSnapshot: inspected.snapshot });
+    },
     coordinateTaskAssignment: (input) => getSupervisionTaskRegistry().coordinateTaskAssignment(input),
     housekeeping: (input) => getSupervisionTaskRegistry().reconcileHousekeeping(input),
   };

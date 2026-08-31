@@ -53,6 +53,12 @@ function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
     coordinateTaskAssignment: (input: Parameters<SupervisionTaskRegistry['coordinateTaskAssignment']>[0]) => (
       registry().coordinateTaskAssignment(input)
     ),
+    rebindTaskAssignmentRevision: (input: Omit<Parameters<SupervisionTaskRegistry['rebindTaskAssignmentRevision']>[0], 'worktreeSnapshot'>) => (
+      registry().rebindTaskAssignmentRevision({
+        ...input,
+        worktreeSnapshot: recoveryWorktreeSnapshot(input.ownedFiles ?? [], input.evidenceManifestSha256),
+      })
+    ),
   };
 }
 
@@ -114,6 +120,15 @@ function session(name: string, projectName = 'alpha', agentType = 'codex-sdk'): 
 
 function makeRegistry(): SupervisionTaskRegistry {
   return new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+}
+
+function recoveryWorktreeSnapshot(paths: readonly string[], _evidenceManifestSha256?: string) {
+  return {
+    worktreePath: '/tmp/authoritative-assignment/repo',
+    headSha: 'a'.repeat(40),
+    files: [...paths].sort().map((path) => ({ path, sha256: 'b'.repeat(64) })),
+    stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+  };
 }
 
 function prepareStructuredFinalizationShape(
@@ -898,6 +913,7 @@ describe('SupervisionTaskRegistry', () => {
         leaseAction: 'renew' as const,
         idempotencyKey: 'same-object-revision-recovery-r3',
         evidenceManifestSha256: shape.evidenceManifestSha256,
+        worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
         reason: 'bind validated frozen R3 without replacing the GC objects',
         now: 500,
       };
@@ -963,6 +979,23 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.listEvents(shape.taskId)).toHaveLength(persistedEvents);
       expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
       expect(registry.getAssignment(shape.implementer.assignmentId)?.leaseId).toBe(renewedLeaseId);
+      const persistedState = registry.get(shape.taskId);
+      const firstFile = request.worktreeSnapshot.files[0]!;
+      for (const [name, changedFile] of [
+        ['same-path-changed-bytes', { path: firstFile.path, sha256: 'c'.repeat(64) }],
+        ['same-path-changed-to-deletion', { path: firstFile.path, deleted: true as const }],
+      ] as const) {
+        expect(registry.rebindTaskAssignmentRevision({
+          ...request,
+          worktreeSnapshot: {
+            ...request.worktreeSnapshot,
+            files: [changedFile, ...request.worktreeSnapshot.files.slice(1)],
+          },
+          now: 925,
+        }), name).toEqual({ ok: false, reason: 'conflicting_replay' });
+        expect(registry.get(shape.taskId), name).toEqual(persistedState);
+        expect(registry.listEvents(shape.taskId), name).toHaveLength(persistedEvents);
+      }
       expect(registry.updateAssignment({
         assignmentId: shape.implementer.assignmentId, identity: shape.implementerIdentity,
         status: 'validated', revision: shape.toRevision, auditRevision: shape.toRevision,
@@ -1015,6 +1048,7 @@ describe('SupervisionTaskRegistry', () => {
         leaseAction: 'renew' as const,
         idempotencyKey: 'null-revision-bind-frozen-r1',
         evidenceManifestSha256: 'e'.repeat(64),
+        worktreeSnapshot: recoveryWorktreeSnapshot(ownedFiles, 'e'.repeat(64)),
         reason: 'atomically bind exact frozen evidence without replacement objects',
         now: 500,
       };
@@ -1042,6 +1076,79 @@ describe('SupervisionTaskRegistry', () => {
     } finally {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a zero-source slice from its clean worktree and ignores missing or misleading metadata', () => {
+    const registry = makeRegistry();
+    const taskId = 'zero-source-worktree-recovery';
+    const assignmentId = `${taskId}-implementer`;
+    const owner = identity('deck_zero_source_worker');
+    const fromRevision = 'stale-projection-r0';
+    const toRevision = 'macos-dual-arch-qualification-cx1-r1-86639573';
+    const evidenceManifestSha256 = '8'.repeat(64);
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_slice',
+      objective: 'qualify exact bytes without changing source', currentRevision: fromRevision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: owner,
+      scopeFiles: [], auditRevision: fromRevision,
+    })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId, identity: owner, status: 'implementing', revision: fromRevision,
+      auditRevision: fromRevision,
+    })).toMatchObject({ ok: true });
+    // Historical/caller-reported metadata may be incomplete or simply stale;
+    // it must not override the exact clean worktree observed below.
+    expect(registry.recordFileEvent({
+      assignmentId, identity: owner, path: 'stale/reported-but-unchanged.ts',
+      operation: 'modify', idempotencyKey: 'stale-reference-only-event',
+    })).toMatchObject({ ok: true });
+    const snapshot = recoveryWorktreeSnapshot([], evidenceManifestSha256);
+    const request = {
+      taskId, assignmentId, fromRevision, toRevision, worktreeSnapshot: snapshot,
+      leaseAction: 'preserve' as const, idempotencyKey: 'zero-source-bind-r1',
+      evidenceManifestSha256, reason: 'bind the exact clean qualification worktree',
+    };
+    expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
+      ok: true, value: { currentRevision: toRevision, status: 'implementing' },
+    });
+    const events = registry.listEvents(taskId).length;
+    expect(registry.rebindTaskAssignmentRevision({
+      ...request,
+      ownedFiles: ['fabricated/not-in-worktree.ts'],
+      scopeFiles: ['stale/metadata-only.ts'],
+      evidenceManifestSha256: 'stale metadata is not authority',
+    })).toMatchObject({ ok: true, replay: true });
+    expect(registry.listEvents(taskId)).toHaveLength(events);
+    registry.close();
+  });
+
+  it('rejects staged or conflicted worktree recovery before mutation', () => {
+    for (const [name, override] of [
+      ['staged', { stagedPaths: ['src/a.ts'] }],
+      ['conflicted', { conflictedPaths: ['src/a.ts'] }],
+    ] as const) {
+      const registry = makeRegistry();
+      const shape = prepareSameObjectRevisionRecoveryShape(registry, `worktree-${name}`);
+      const before = registry.get(shape.taskId);
+      const eventCount = registry.listEvents(shape.taskId).length;
+      const snapshot = {
+        ...recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256), ...override,
+      };
+      expect(registry.rebindTaskAssignmentRevision({
+        taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+        fromRevision: shape.fromRevision, toRevision: shape.toRevision,
+        worktreeSnapshot: snapshot,
+        leaseAction: 'preserve', idempotencyKey: `unsafe-${name}`,
+        evidenceManifestSha256: shape.evidenceManifestSha256, reason: 'must fail closed',
+      }), name).toEqual({ ok: false, reason: 'manifest_mismatch' });
+      expect(registry.get(shape.taskId)).toEqual(before);
+      expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
+      registry.close();
     }
   });
 
@@ -1351,6 +1458,7 @@ describe('SupervisionTaskRegistry', () => {
         taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
         fromRevision: shape.fromRevision, toRevision: shape.toRevision,
         ownedFiles: shape.files, evidenceManifestSha256: shape.evidenceManifestSha256,
+        worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
         leaseAction: 'preserve', idempotencyKey: `${testCase.taskId}-refusal`,
         reason: 'must fail closed',
       })).toEqual({ ok: false, reason: testCase.expected });
@@ -1365,15 +1473,17 @@ describe('SupervisionTaskRegistry', () => {
       taskId: scope.taskId, assignmentId: scope.implementer.assignmentId,
       fromRevision: scope.fromRevision, toRevision: scope.toRevision,
       ownedFiles: [scope.files[0]!], evidenceManifestSha256: scope.evidenceManifestSha256,
+      worktreeSnapshot: recoveryWorktreeSnapshot(scope.files, scope.evidenceManifestSha256),
       leaseAction: 'preserve', idempotencyKey: 'scope-owned-mismatch',
       reason: 'scope mismatch',
-    })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+    })).toMatchObject({ ok: true, value: { currentRevision: scope.toRevision } });
     expect(scopeRegistry.rebindTaskAssignmentRevision({
       taskId: scope.taskId, assignmentId: scope.implementer.assignmentId,
       fromRevision: scope.fromRevision, toRevision: scope.toRevision,
-      ownedFiles: scope.files, leaseAction: 'preserve', idempotencyKey: 'scope-empty-evidence',
+      ownedFiles: scope.files, leaseAction: 'preserve', idempotencyKey: 'scope-owned-mismatch',
       evidenceManifestSha256: '', reason: 'empty evidence',
-    })).toEqual({ ok: false, reason: 'invalid' });
+      worktreeSnapshot: recoveryWorktreeSnapshot(scope.files, scope.evidenceManifestSha256),
+    })).toMatchObject({ ok: true, replay: true });
     scopeRegistry.close();
 
     const lifecycleRegistry = makeRegistry();
@@ -1383,6 +1493,7 @@ describe('SupervisionTaskRegistry', () => {
       taskId: lifecycle.taskId, assignmentId: lifecycle.implementer.assignmentId,
       fromRevision: lifecycle.fromRevision, toRevision: lifecycle.toRevision,
       ownedFiles: lifecycle.files, evidenceManifestSha256: lifecycle.evidenceManifestSha256,
+      worktreeSnapshot: recoveryWorktreeSnapshot(lifecycle.files, lifecycle.evidenceManifestSha256),
       leaseAction: 'preserve', idempotencyKey: 'lifecycle-refusal',
       reason: 'illegal lifecycle',
     })).toEqual({ ok: false, reason: 'invalid_transition' });
@@ -1400,6 +1511,7 @@ describe('SupervisionTaskRegistry', () => {
       taskId: pass.taskId, assignmentId: pass.implementer.assignmentId,
       fromRevision: pass.fromRevision, toRevision: pass.toRevision,
       ownedFiles: pass.files, evidenceManifestSha256: pass.evidenceManifestSha256,
+      worktreeSnapshot: recoveryWorktreeSnapshot(pass.files, pass.evidenceManifestSha256),
       leaseAction: 'preserve', idempotencyKey: 'pass-conflict-refusal',
       reason: 'PASS conflict',
     })).toEqual({ ok: false, reason: 'invalid_transition' });

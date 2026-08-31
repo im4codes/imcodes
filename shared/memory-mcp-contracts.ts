@@ -528,7 +528,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
           objective: stringSchema('Task objective/title.'),
           acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
-          ownedFiles: { type: 'array', items: stringSchema('Repo-relative owned path.'), description: 'Owned files.' },
+          ownedFiles: { type: 'array', items: stringSchema('Repo-relative attributed path.'), description: 'Optional attribution metadata; never an edit ACL or validation authority.' },
           sharedFiles: { type: 'array', items: stringSchema('Repo-relative shared path.'), description: 'Shared files.' },
           dependencies: { type: 'array', items: stringSchema('Task dependencies.'), description: 'Dependencies.' },
           integrationOwner: stringSchema('Integration owner assignment/session reference.'),

@@ -518,7 +518,6 @@ export function canMarkSupervisionSliceReadyForIntegration(
   if (slice.auditAttemptId !== pass.attemptId) return false;
   if (String(slice.revision ?? '') !== String(pass.revision)) return false;
   if (String(slice.auditRevision ?? '') !== String(pass.revision)) return false;
-  if (!isValidSupervisionOwnedPathspecs(slice.ownedFiles)) return false;
   return true;
 }
 
@@ -534,7 +533,6 @@ export function canHandOffValidatedSupervisionManifestRow(
     && row.classification !== 'independent_top_level') return false;
   if (row.state !== 'validated' && row.state !== 'ready_for_integration') return false;
   if (!row.ownerSession || !row.topLevelTaskId || String(row.revision ?? '').trim() === '') return false;
-  if (!isValidSupervisionOwnedPathspecs(row.ownedFiles)) return false;
   return true;
 }
 

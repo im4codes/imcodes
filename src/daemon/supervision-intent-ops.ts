@@ -195,7 +195,7 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
       rebindSessionName: { type: 'string' },
       fromRevision: { type: 'string' },
       toRevision: { type: 'string' },
-      ownedFiles: { type: 'array', minItems: 1, items: { type: 'string' } },
+      ownedFiles: { type: 'array', items: { type: 'string' } },
       evidenceManifestSha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
       taskStatus: { type: 'string', enum: [...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES] },
       assignmentStatus: { type: 'string', enum: [...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES] },

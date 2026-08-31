@@ -42,6 +42,7 @@ import type {
 // is erased at runtime, so this cannot create a cycle.
 import type { SupervisionRecoveryTargetStatus } from './supervision-mcp-tools.js';
 import { SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH } from './supervision-intent-ops.js';
+import type { SupervisionWorktreeSnapshot } from './supervision-worktree-inspector.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -666,6 +667,21 @@ const FINALIZATION_COMMIT_RE = /^[0-9a-f]{40}$/;
 
 function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameWorktreeManifest(
+  left: unknown,
+  right: readonly SupervisionWorktreeSnapshot['files'][number][],
+): boolean {
+  if (!Array.isArray(left) || left.length !== right.length) return false;
+  return left.every((value, index) => {
+    if (!value || typeof value !== 'object') return false;
+    const entry = value as { path?: unknown; sha256?: unknown; deleted?: unknown };
+    const expected = right[index];
+    return entry.path === expected?.path
+      && entry.sha256 === expected.sha256
+      && entry.deleted === expected.deleted;
+  });
 }
 
 /**
@@ -2597,11 +2613,14 @@ export class SupervisionTaskRegistry {
     assignmentId: string;
     fromRevision?: string;
     toRevision: string;
-    ownedFiles: readonly string[];
+    /** Caller-reported attribution only; never recovery authority. */
+    ownedFiles?: readonly string[];
     scopeFiles?: readonly string[];
+    worktreeSnapshot: SupervisionWorktreeSnapshot;
     leaseAction: SupervisionRecoveryLeaseAction;
     idempotencyKey: string;
-    evidenceManifestSha256: string;
+    /** Caller-reported provenance only; never recovery authority. */
+    evidenceManifestSha256?: string;
     reason: string;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
@@ -2612,17 +2631,31 @@ export class SupervisionTaskRegistry {
     const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
     const reason = normalizeTaskString(input.reason);
     const idempotencyKey = normalizeTaskString(input.idempotencyKey);
-    const ownedFiles = normalizeTaskArray(input.ownedFiles);
-    const scopeFiles = input.scopeFiles === undefined ? undefined : normalizeTaskArray(input.scopeFiles);
+    const ownedFiles = normalizeTaskArray(input.ownedFiles ?? []).filter(validRepoPath);
+    const scopeFiles = input.scopeFiles === undefined
+      ? undefined : normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
     if (!taskId || !assignmentId || !toRevision || fromRevision === toRevision
-      || !evidenceManifestSha256 || !FINALIZATION_SHA256_RE.test(evidenceManifestSha256)
       || !reason || !idempotencyKey
-      || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)
-      || ownedFiles.length === 0 || ownedFiles.length !== input.ownedFiles.length
-      || !ownedFiles.every(validRepoPath)
-      || (scopeFiles !== undefined && (scopeFiles.length === 0
-        || scopeFiles.length !== input.scopeFiles?.length
-        || !scopeFiles.every(validRepoPath)))) return { ok: false, reason: 'invalid' };
+      || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)) {
+      return { ok: false, reason: 'invalid' };
+    }
+
+    const worktree = input.worktreeSnapshot;
+    if (!worktree || !Array.isArray(worktree.files) || !Array.isArray(worktree.stagedPaths)
+      || !Array.isArray(worktree.conflictedPaths) || !Array.isArray(worktree.untrackedPaths)) {
+      return { ok: false, reason: 'manifest_mismatch' };
+    }
+    const worktreeFiles = [...worktree.files].sort((a, b) => a.path.localeCompare(b.path));
+    const worktreePaths = worktreeFiles.map((file) => file.path);
+    const worktreeValid = FINALIZATION_COMMIT_RE.test(worktree.headSha)
+      && worktree.stagedPaths.length === 0
+      && worktree.conflictedPaths.length === 0
+      && worktreePaths.length === new Set(worktreePaths).size
+      && worktreeFiles.every((file) => validRepoPath(file.path)
+        && ((file.deleted === true && file.sha256 === undefined)
+          || (file.deleted !== true && Boolean(file.sha256 && FINALIZATION_SHA256_RE.test(file.sha256)))))
+      && worktree.untrackedPaths.every((path) => worktreePaths.includes(path));
+    if (!worktreeValid) return { ok: false, reason: 'manifest_mismatch' };
 
     const now = input.now ?? Date.now();
     this.#db.exec('BEGIN IMMEDIATE');
@@ -2634,17 +2667,9 @@ export class SupervisionTaskRegistry {
         return { ok: false, reason: 'not_found' };
       }
 
-      const authoritativeOwnedFiles = normalizeTaskArray(this.listFileEvents(taskId)
-        .filter((event) => event.assignmentId === assignmentId)
-        .map((event) => event.path));
       const targetScopeFiles = scopeFiles ?? assignment.scopeFiles;
       const exactReplay = task.currentRevision === toRevision && assignment.auditRevision === toRevision;
       if (exactReplay) {
-        if (!sameStringArray(authoritativeOwnedFiles, ownedFiles)
-          || !ownedFiles.every((path) => targetScopeFiles.includes(path))) {
-          this.#db.exec('ROLLBACK');
-          return { ok: false, reason: 'manifest_mismatch' };
-        }
         const priorEvents = this.listEvents(taskId).filter((event) => (
           event.assignmentId === assignmentId
           && event.eventType === 'recovered'
@@ -2655,19 +2680,13 @@ export class SupervisionTaskRegistry {
           event.payload?.fromRevision === (fromRevision ?? null)
           && event.payload?.toRevision === toRevision
           && event.payload?.leaseAction === input.leaseAction
-          && event.payload?.evidenceManifestSha256 === evidenceManifestSha256
+          && event.payload?.worktreeHeadSha === worktree.headSha
           && sameStringArray(
-            Array.isArray(event.payload?.ownedFiles)
-              ? event.payload.ownedFiles.map((path) => String(path))
-              : [],
-            ownedFiles,
+            Array.isArray(event.payload?.worktreePaths)
+              ? event.payload.worktreePaths.map((path) => String(path)) : [],
+            worktreePaths,
           )
-          && sameStringArray(
-            Array.isArray(event.payload?.scopeFiles)
-              ? event.payload.scopeFiles.map((path) => String(path))
-              : [],
-            scopeFiles ?? assignment.scopeFiles,
-          )
+          && sameWorktreeManifest(event.payload?.worktreeManifest, worktreeFiles)
         ));
         this.#db.exec('ROLLBACK');
         return priorEvents.length === 0 ? { ok: false, reason: 'conflicting_replay' }
@@ -2709,8 +2728,7 @@ export class SupervisionTaskRegistry {
       const leaseCanContinue = input.leaseAction === 'renew'
         || (input.leaseAction === 'preserve' && Boolean(assignment.leaseId));
       const exactStaleShape = Boolean(
-        task.classification !== 'integration_slice'
-        && ['implementing', 'rework'].includes(task.status)
+        ['implementing', 'rework'].includes(task.status)
         && ['implementing', 'rework'].includes(assignment.status)
         && sourceBindingMatches(task.currentRevision)
         && sourceBindingMatches(assignment.auditRevision)
@@ -2723,8 +2741,6 @@ export class SupervisionTaskRegistry {
         && !conflictingPassAssignment
         && conflictingPassAttestation?.ok !== 1
         && conflictingPassReceipt?.ok !== 1
-        && sameStringArray(authoritativeOwnedFiles, ownedFiles)
-        && ownedFiles.every((path) => targetScopeFiles.includes(path))
         && !task.commitSha
         && !task.pushRemoteRef
         && !task.finalization
@@ -2735,10 +2751,7 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
           : activeAuditor ? { ok: false, reason: 'invalid_transition' }
-            : !sameStringArray(authoritativeOwnedFiles, ownedFiles)
-              || !ownedFiles.every((path) => targetScopeFiles.includes(path))
-              ? { ok: false, reason: 'manifest_mismatch' }
-              : !sourceBindingMatches(task.currentRevision) || !sourceBindingMatches(assignment.auditRevision)
+            : !sourceBindingMatches(task.currentRevision) || !sourceBindingMatches(assignment.auditRevision)
                 ? { ok: false, reason: 'old_revision' }
                 : { ok: false, reason: 'invalid_transition' };
       }
@@ -2749,10 +2762,15 @@ export class SupervisionTaskRegistry {
         reason,
         fromRevision: fromRevision ?? null,
         toRevision,
+        // These two fields are retained for attribution only. Replay and
+        // authorization intentionally ignore them.
         ownedFiles,
         scopeFiles: targetScopeFiles,
+        worktreeHeadSha: worktree.headSha,
+        worktreePaths,
+        worktreeManifest: worktreeFiles,
         leaseAction: input.leaseAction,
-        evidenceManifestSha256,
+        ...(evidenceManifestSha256 ? { evidenceManifestSha256 } : {}),
         ...(assignment.auditAttemptId ? { previousAuditAttemptId: assignment.auditAttemptId } : {}),
         ...(assignment.verdict ? { previousVerdict: assignment.verdict } : {}),
       };

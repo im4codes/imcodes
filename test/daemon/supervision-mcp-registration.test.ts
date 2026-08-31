@@ -622,6 +622,32 @@ describe('administrative recover', () => {
     expect(registry.revisionRebound).toEqual([request]);
 
     registry.revisionRebound = [];
+    const {
+      ownedFiles: _omitted,
+      scopeFiles: _scopeOmitted,
+      evidenceManifestSha256: _evidenceOmitted,
+      ...metadataFree
+    } = request;
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](metadataFree)).toMatchObject({
+      status: 'ok', toRevision: 'gc-r3', replay: false,
+    });
+    expect(registry.revisionRebound).toEqual([metadataFree]);
+
+    registry.revisionRebound = [];
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      ...metadataFree, ownedFiles: [], scopeFiles: [],
+    })).toMatchObject({ status: 'ok', toRevision: 'gc-r3', replay: false });
+    expect(registry.revisionRebound).toEqual([{ ...metadataFree, ownedFiles: [], scopeFiles: [] }]);
+
+    registry.revisionRebound = [];
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      ...metadataFree, evidenceManifestSha256: 'stale provenance only',
+    })).toMatchObject({ status: 'ok', toRevision: 'gc-r3', replay: false });
+    expect(registry.revisionRebound).toEqual([{
+      ...metadataFree, evidenceManifestSha256: 'stale provenance only',
+    }]);
+
+    registry.revisionRebound = [];
     expect(await call(SUPERVISION_MCP_TOOLS.RECOVER, request)).toEqual({
       status: 'ok', taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
       fromRevision: 'gc-r1', toRevision: 'gc-r3', replay: false,
@@ -629,7 +655,7 @@ describe('administrative recover', () => {
     expect(registry.revisionRebound).toEqual([request]);
 
     registry.revisionRebound = [];
-    for (const missing of ['assignmentId', 'toRevision', 'ownedFiles', 'leaseAction', 'idempotencyKey', 'evidenceManifestSha256'] as const) {
+    for (const missing of ['assignmentId', 'toRevision', 'leaseAction', 'idempotencyKey'] as const) {
       const malformed = { ...request } as Record<string, unknown>;
       delete malformed[missing];
       const result: any = await client.callTool({
@@ -677,8 +703,25 @@ describe('administrative recover', () => {
           idempotencyKey: `${taskId}-file-${index}`,
         })).toMatchObject({ ok: true });
       }
+      const productionRegistry = {
+        getStatus: (id: string) => realRegistry.get(id)?.status,
+        applyIntent: (input: any) => realRegistry.applyTaskIntent(input),
+        list: (input: any) => realRegistry.list(input),
+        get: (id: string) => realRegistry.get(id),
+        recover: (input: any) => realRegistry.recoverTask(input),
+        coordinateTaskAssignment: (input: any) => realRegistry.coordinateTaskAssignment(input),
+        rebindTaskAssignmentRevision: (input: any) => realRegistry.rebindTaskAssignmentRevision({
+          ...input,
+          worktreeSnapshot: {
+            worktreePath: '/tmp/production-recovery-handler/repo',
+            headSha: 'a'.repeat(40),
+            files: ownedFiles.map((path) => ({ path, sha256: 'b'.repeat(64) })),
+            stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+          },
+        }),
+      } as unknown as SupervisionRegistryPort;
       const production = createSupervisionMcpToolHandlers(CALLER, {
-        registry: realRegistry, isProjectBrain: () => true,
+        registry: productionRegistry, isProjectBrain: () => true,
       });
       expect(await production[SUPERVISION_MCP_TOOLS.RECOVER]({
         taskId, assignmentId, leaseAction: 'clear',
@@ -888,7 +931,7 @@ describe('published schema enums match the fixed constants exactly', () => {
       fromRevision: expect.any(Object),
       toRevision: expect.any(Object),
       ownedFiles: expect.any(Object),
-      evidenceManifestSha256: expect.objectContaining({ pattern: '^[a-f0-9]{64}$' }),
+      evidenceManifestSha256: expect.any(Object),
       scopeFiles: expect.any(Object),
       leaseAction: expect.objectContaining({ enum: [...SUPERVISION_RECOVERY_LEASE_ACTIONS] }),
       idempotencyKey: expect.any(Object),

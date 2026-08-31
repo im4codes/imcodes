@@ -8,6 +8,7 @@ import {
 } from '../../shared/supervision-audit-handoff.js';
 import {
   canReleaseSupervisionTaskFinalization,
+  canHandOffValidatedSupervisionManifestRow,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   type SupervisionTaskFinalizationRecord,
   type SupervisionTaskFinalizationReleaseInput,
@@ -160,6 +161,14 @@ describe('merge-before-audit finalization', () => {
   it('accepts validated slice rows with no per-slice audit attempt or verdict', () => {
     expect(slices.every((slice) => slice.auditAttemptId === undefined && slice.verdict === undefined)).toBe(true);
     expect(canReleaseSupervisionTaskFinalization(task, pass)).toBe(true);
+  });
+
+  it('does not let omitted, empty, or misleading ownedFiles veto a validated handoff', () => {
+    for (const ownedFiles of [undefined, [], ['stale/metadata-only.ts']] as const) {
+      expect(canHandOffValidatedSupervisionManifestRow({
+        ...slices[0], ownedFiles,
+      })).toBe(true);
+    }
   });
 
   it('refuses stale/mismatched overall PASS and any non-exact staged set', () => {

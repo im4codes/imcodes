@@ -610,7 +610,7 @@ describe('delegation send gate', () => {
       message: 'clarification for the same active work',
       deliveryMode: 'append',
       task: {
-        taskId: created.taskId, executionPool: 'primary', ownedFiles: ['src/one.ts'],
+        taskId: created.taskId, executionPool: 'primary', ownedFiles: ['stale/metadata-only.ts'],
       },
     }, deps(sessions, dispatchMessage));
 
@@ -624,6 +624,7 @@ describe('delegation send gate', () => {
     expect(registry.get(created.taskId)!.assignments).toHaveLength(assignmentCount);
     expect(registry.get(created.taskId)!.assignments.filter((item) => item.role === 'implementer'))
       .toEqual([expect.objectContaining({ assignmentId: created.assignmentId })]);
+    expect(registry.getAssignment(created.assignmentId)?.scopeFiles).toEqual(['src/one.ts']);
     expect(dispatchMessage).toHaveBeenCalledWith(worker, expect.any(String), expect.objectContaining({
       deliveryMode: 'append',
     }));

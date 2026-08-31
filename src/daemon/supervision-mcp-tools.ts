@@ -155,11 +155,11 @@ export interface SupervisionRegistryPort {
     assignmentId: string;
     fromRevision?: string;
     toRevision: string;
-    ownedFiles: string[];
+    ownedFiles?: string[];
     scopeFiles?: string[];
     leaseAction: SupervisionRecoveryLeaseAction;
     idempotencyKey: string;
-    evidenceManifestSha256: string;
+    evidenceManifestSha256?: string;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   coordinateTaskAssignment?(input: {
@@ -238,8 +238,8 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     rebindSessionName: z.string().min(1).optional(),
     fromRevision: z.string().min(1).optional(),
     toRevision: z.string().min(1).optional(),
-    ownedFiles: z.array(z.string().min(1)).min(1).optional(),
-    evidenceManifestSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    ownedFiles: z.array(z.string().min(1)).optional(),
+    evidenceManifestSha256: z.string().optional(),
     taskStatus: z.enum([...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES]).optional(),
     assignmentStatus: z.enum([...SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES]).optional(),
     scopeFiles: z.array(z.string().min(1)).min(1).optional(),
@@ -510,15 +510,13 @@ export function createSupervisionMcpToolHandlers(
       const idempotencyKey = String(input.idempotencyKey ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
-      const revisionRecoveryRequested = Boolean(
-        fromRevision || toRevision || ownedFiles.length > 0 || evidenceManifestSha256,
-      );
+      const revisionRecoveryRequested = Boolean(fromRevision || toRevision);
       if (revisionRecoveryRequested) {
-        if (!assignmentId || !toRevision || ownedFiles.length === 0
-          || !evidenceManifestSha256 || !reason || !idempotencyKey
+        if (!assignmentId || !toRevision
+          || !reason || !idempotencyKey
           || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(leaseAction as SupervisionRecoveryLeaseAction)
           || rebindSessionName || taskStatus || assignmentStatus || input.toStatus !== undefined) {
-          return err('validation_failed', 'revision recovery requires assignmentId, toRevision, ownedFiles, evidenceManifestSha256, leaseAction, idempotencyKey and reason; fromRevision/scopeFiles are optional');
+          return err('validation_failed', 'revision recovery requires assignmentId, toRevision, leaseAction, idempotencyKey and reason; fromRevision/ownedFiles/scopeFiles/evidenceManifestSha256 are optional metadata');
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
@@ -531,10 +529,13 @@ export function createSupervisionMcpToolHandlers(
         const rebound = reg.rebindTaskAssignmentRevision?.({
           taskId, assignmentId,
           ...(fromRevision ? { fromRevision } : {}),
-          toRevision, ownedFiles,
-          ...(scopeFiles.length > 0 ? { scopeFiles } : {}),
+          toRevision,
+          ...(Array.isArray(input.ownedFiles) ? { ownedFiles } : {}),
+          ...(Array.isArray(input.scopeFiles) ? { scopeFiles } : {}),
           leaseAction: leaseAction as SupervisionRecoveryLeaseAction,
-          idempotencyKey, evidenceManifestSha256, reason,
+          idempotencyKey,
+          ...(typeof input.evidenceManifestSha256 === 'string' ? { evidenceManifestSha256 } : {}),
+          reason,
         });
         if (!rebound) return err('unavailable', 'revision recovery is not bound');
         if (!rebound.ok) return err(rebound.reason, `revision recovery rejected: ${rebound.reason}`);
@@ -548,7 +549,7 @@ export function createSupervisionMcpToolHandlers(
           || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(leaseAction as SupervisionRecoveryLeaseAction)
           || (!taskStatus && !assignmentStatus && scopeFiles.length === 0
             && leaseAction === 'preserve' && !rebindSessionName)
-          || evidenceManifestSha256 || input.toStatus !== undefined) {
+          || input.toStatus !== undefined) {
           return err('validation_failed', 'coordination override requires assignmentId, leaseAction, idempotencyKey, reason, and at least one taskStatus/assignmentStatus/scopeFiles/lease mutation/rebindSessionName field only');
         }
         const task = reg.get(taskId);

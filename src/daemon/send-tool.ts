@@ -1014,18 +1014,9 @@ export async function dispatchSendMessage(
               error: 'task continuation must append to the authoritative active implementer assignment',
             };
           }
-          const requestedScope = [...new Set([
-            ...(input.task.ownedFiles ?? []),
-            ...(input.task.sharedFiles ?? []),
-          ])].sort();
-          if (requestedScope.length > 0
-            && JSON.stringify(requestedScope) !== JSON.stringify([...continuation.scopeFiles].sort())) {
-            return {
-              status: 'error',
-              reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
-              error: 'task continuation cannot replace the existing assignment ownedFiles',
-            };
-          }
+          // ownedFiles/sharedFiles are append-only attribution hints, not an
+          // edit ACL. The assignment worktree is the implementation boundary;
+          // stale or incomplete metadata must not deadlock a continuation.
           if (input.task.currentRevision && existing.currentRevision
             && input.task.currentRevision !== existing.currentRevision) {
             return {
