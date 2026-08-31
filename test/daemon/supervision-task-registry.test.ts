@@ -2603,6 +2603,36 @@ describe('SupervisionTaskRegistry', () => {
     ]));
   });
 
+  it('rejects integration-slice verdict metadata without an exact revision before mutation', () => {
+    const registry = makeRegistry();
+    const taskId = 'slice-verdict-requires-revision';
+    const owner = identity('deck_slice_revision_worker');
+    expect(registry.createOrGet({
+      taskId, topLevelTaskId: 'top-feature', classification: 'integration_slice',
+      objective: 'bind implementation verdict to exact bytes',
+    })).toMatchObject({ ok: true });
+    const assignment = registry.createAssignment({
+      taskId, role: 'implementer', identity: owner, scopeFiles: ['src/slice.ts'],
+    });
+    if (!assignment.ok) throw new Error(assignment.reason);
+    const beforeTask = registry.get(taskId);
+    const beforeAssignment = registry.getAssignment(assignment.value.assignmentId);
+    const beforeEvents = registry.listEvents(taskId);
+
+    for (const revision of [undefined, '   ']) {
+      expect(registry.updateAssignment({
+        assignmentId: assignment.value.assignmentId,
+        identity: owner,
+        revision,
+        verdict: 'FINISHED',
+      })).toEqual({ ok: false, reason: 'old_revision' });
+      expect(registry.get(taskId)).toEqual(beforeTask);
+      expect(registry.getAssignment(assignment.value.assignmentId)).toEqual(beforeAssignment);
+      expect(registry.listEvents(taskId)).toEqual(beforeEvents);
+    }
+    registry.close();
+  });
+
   it('records an independent validated implementer FINISHED handoff without fabricating PASS', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-top-level-finish-'));
     const dbPath = join(dir, 'supervision-state.sqlite');
@@ -3728,7 +3758,24 @@ describe('SupervisionTaskRegistry', () => {
     expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]({
       assignmentId: assignment.assignmentId,
       revision: 'revision-1',
+      verdict: 'FINISHED',
     })).toMatchObject({ status: 'ok' });
+    expect(registry.get(assignment.taskId)).toMatchObject({ currentRevision: 'revision-1' });
+    expect(registry.getAssignment(assignment.assignmentId)).toMatchObject({
+      auditRevision: 'revision-1',
+      verdict: 'FINISHED',
+    });
+    const boundTask = registry.get(assignment.taskId);
+    const boundAssignment = registry.getAssignment(assignment.assignmentId);
+    const boundEventCount = registry.listEvents(assignment.taskId).length;
+    expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]({
+      assignmentId: assignment.assignmentId,
+      revision: 'revision-2',
+      verdict: 'FINISHED-again',
+    })).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(registry.get(assignment.taskId)).toEqual(boundTask);
+    expect(registry.getAssignment(assignment.assignmentId)).toEqual(boundAssignment);
+    expect(registry.listEvents(assignment.taskId)).toHaveLength(boundEventCount);
     expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]({
       assignmentId: assignment.assignmentId,
       filePath: 'src/cross-entrypoint.ts',
@@ -3750,7 +3797,7 @@ describe('SupervisionTaskRegistry', () => {
     }
     expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]({
       assignmentId: assignment.assignmentId,
-      revision: 'revision-2',
+      revision: 'revision-1',
       evidence: 'delegate completed',
     })).toMatchObject({ status: 'ok', item: { status: 'finalized' } });
   });

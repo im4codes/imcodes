@@ -1762,6 +1762,8 @@ export class SupervisionTaskRegistry {
     const existing = this.getAssignment(input.assignmentId);
     if (!existing) return { ok: false, reason: 'not_found' };
     if (!identityMatches(existing.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
+    const task = this.getTaskRecord(existing.taskId);
+    if (!task) return { ok: false, reason: 'not_found' };
     const nextStatus = input.status ?? existing.status;
     if (!isSupervisionTaskLifecycleStatus(nextStatus)) return { ok: false, reason: 'invalid' };
     if (!canTransitionSupervisionTaskStatus(existing.status, nextStatus)) return { ok: false, reason: 'invalid_transition' };
@@ -1772,15 +1774,37 @@ export class SupervisionTaskRegistry {
         crossVendorAuditPassed: input.crossVendorAuditPassed ?? existing.crossVendorAuditPassed === true,
       })) return { ok: false, reason: 'economy_requires_primary_review' };
     const isNewAuditAfterRework = existing.status === 'rework' && nextStatus === 'auditing';
+    const requestedRevision = normalizeTaskString(input.revision);
+    const requestedAuditRevision = normalizeTaskString(input.auditRevision);
+    const requestedVerdict = normalizeTaskString(input.verdict);
+    const isImplementationHandoffVerdict = requestedVerdict
+      && requestedVerdict.toUpperCase() !== 'PASS'
+      && requestedVerdict.toUpperCase() !== 'REWORK';
+    if (existing.role !== 'auditor' && isImplementationHandoffVerdict && !requestedRevision) {
+      return { ok: false, reason: 'old_revision' };
+    }
+    if (requestedRevision && requestedAuditRevision && requestedRevision !== requestedAuditRevision) {
+      return { ok: false, reason: 'old_revision' };
+    }
     if (!isNewAuditAfterRework && input.auditAttemptId && existing.auditAttemptId && input.auditAttemptId !== existing.auditAttemptId) return { ok: false, reason: 'old_audit_attempt' };
-    if (!isNewAuditAfterRework && input.revision !== undefined && existing.auditRevision && String(input.revision ?? '') !== existing.auditRevision) return { ok: false, reason: 'old_revision' };
+    if (!isNewAuditAfterRework && requestedRevision && existing.auditRevision && requestedRevision !== existing.auditRevision) return { ok: false, reason: 'old_revision' };
+    const bindsImplementationRevision = existing.role !== 'auditor' && Boolean(requestedRevision);
+    // A slice/top-level implementer owns the task revision directly. An
+    // integration_task may contain several implementer slice revisions, so its
+    // combined task revision remains owned by the integration handoff.
+    const bindsTaskRevision = bindsImplementationRevision && task.classification !== 'integration_task';
+    if (bindsTaskRevision && task.currentRevision && task.currentRevision !== requestedRevision) {
+      return { ok: false, reason: 'old_revision' };
+    }
     const now = input.now ?? Date.now();
     const record: PersistedSupervisionTaskAssignment = {
       ...existing,
       status: nextStatus,
       auditAttemptId: normalizeTaskString(input.auditAttemptId) ?? existing.auditAttemptId,
-      auditRevision: normalizeTaskString(input.auditRevision) ?? existing.auditRevision,
-      verdict: normalizeTaskString(input.verdict) ?? (nextStatus === 'auditing' ? undefined : existing.verdict),
+      auditRevision: requestedAuditRevision
+        ?? (bindsImplementationRevision ? requestedRevision : undefined)
+        ?? existing.auditRevision,
+      verdict: requestedVerdict ?? (nextStatus === 'auditing' ? undefined : existing.verdict),
       blocker: normalizeTaskString(input.blocker)
         ?? (nextStatus === 'auditing' || nextStatus === 'passed' || nextStatus === 'ready_for_integration' ? undefined : existing.blocker),
       externalRunId: normalizeTaskString(input.externalRunId) ?? existing.externalRunId,
@@ -1796,6 +1820,21 @@ export class SupervisionTaskRegistry {
       : nextStatus;
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      if (bindsTaskRevision) {
+        const lockedTask = this.getTaskRecord(existing.taskId);
+        if (!lockedTask || (lockedTask.currentRevision && lockedTask.currentRevision !== requestedRevision)) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: lockedTask ? 'old_revision' : 'not_found' };
+        }
+        if (lockedTask.currentRevision !== requestedRevision) {
+          this.#writeTask({ ...lockedTask, currentRevision: requestedRevision, updatedAt: now }, this.#taskEventFor(lockedTask.status), {
+            source: 'assignment_update',
+            assignmentId: existing.assignmentId,
+            revisionBound: true,
+            revision: requestedRevision,
+          });
+        }
+      }
       this.#writeAssignment(record, eventType as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, {
         source: 'assignment_update',
         ...(record.auditRoutingReason ? { auditRoutingReason: record.auditRoutingReason } : {}),
