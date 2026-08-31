@@ -3,6 +3,11 @@ import { CAPABILITY_MCP_TOOL_NAMES } from './capability-management.js';
 import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
 import { MESSAGE_PIN_MCP_TOOLS } from './message-pins.js';
 import { SUPERVISION_MCP_TOOLS } from './supervision-mcp-tools.js';
+export {
+  MCP_TOOL_DISCOVERY_DESCRIPTION,
+  MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS,
+} from './mcp-tool-distribution.js';
+import { MCP_TOOL_DISCOVERY_DESCRIPTION } from './mcp-tool-distribution.js';
 
 /** Protocol constants for the minimal MCP lazy-tool bootstrap surface. */
 export const MCP_TOOL_DISCOVERY_NAME = 'mcp_tool_search' as const;
@@ -14,23 +19,6 @@ export const MCP_TOOL_DISCOVERY_NAME = 'mcp_tool_search' as const;
  * instructions into every exposed tool definition, multiplying the same text
  * by the bootstrap tool count on every request.
  */
-export const MCP_TOOL_DISCOVERY_DESCRIPTION =
-  'Use mcp_tool_search to activate hidden MCP tools; activation publishes tools/list_changed.';
-
-/**
- * Runtime guidance for hosts that do not implement MCP tools/list_changed.
- *
- * The normal path remains activation followed by the host's bounded re-list.
- * `fallbackCall` is deliberately carried by the one bootstrap tool so an old
- * host can execute one exact activated tool without publishing every long-tail
- * schema or requiring a new MCP connection.
- */
-export const MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS = [
-  'After mcp_tool_search activates a tool, MCP hosts that support tools/list_changed must refresh the callable tool list on the same connection.',
-  'If the exact activated tool is still absent from the callable schema, call mcp_tool_search again with the exact tool name and fallbackCall { name, arguments }; this fail-safe invokes only that registered tool through its original validation and authority handler.',
-  'Never claim a discovered tool is callable merely because active=true, and never expose or preload the complete long-tail schema as a fallback.',
-].join(' ');
-
 export const MCP_TOOL_GROUP_QUERY_PREFIX = 'group:' as const;
 
 export interface McpToolGroupDefinition {
@@ -49,8 +37,11 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
       MEMORY_MCP_TOOL_NAMES.SEND_STOP, MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
       MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY, MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
       MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE, MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
+      MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
       SUPERVISION_MCP_TOOLS.LIST, SUPERVISION_MCP_TOOLS.GET, SUPERVISION_MCP_TOOLS.INTENT,
       MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT, SUPERVISION_MCP_TOOLS.RECOVER,
+      SUPERVISION_MCP_TOOLS.HOUSEKEEPING,
     ]),
   }),
   Object.freeze({

@@ -123,7 +123,7 @@ describe('message pin MCP tools', () => {
     const client = new Client({ name: 'pin-mcp-test', version: '0.1.0' });
     try {
       await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'group:aliases-pins' } });
       const tools = (await client.listTools()).tools;
       const names = tools.map((tool) => tool.name);
       expect(names).toEqual(expect.arrayContaining([...MESSAGE_PIN_MCP_TOOL_NAME_LIST]));

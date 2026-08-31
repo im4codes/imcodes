@@ -225,7 +225,7 @@ describe('alias MCP tools', () => {
       const client = new Client({ name: 'alias-mcp-test', version: '0.1.0' });
       try {
         await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-        await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
+        await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'group:aliases-pins' } });
         const listed = await client.listTools();
         const names = listed.tools.map((tool) => tool.name);
 

@@ -251,12 +251,33 @@ describe('memory MCP stdio server', () => {
       expect(bootstrapDescriptions.split(MCP_TOOL_DISCOVERY_DESCRIPTION)).toHaveLength(2);
       expect(bootstrapDescriptions.match(/mcp_tool_search/g)).toHaveLength(1);
 
-      const activation = await client.callTool({
+      const wildcard = await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
         arguments: { query: '*' },
       });
-      expect(activation.isError).not.toBe(true);
-      const listed = await client.listTools();
+      expect(wildcard).toMatchObject({
+        isError: true,
+        structuredContent: { status: 'error', reason: 'validation_failed' },
+      });
+
+      // Build the aggregate budget fixture by visiting bounded groups one at a
+      // time. No connection ever receives the full long-tail catalog.
+      const collected = new Map(bootstrap.tools.map((tool) => [tool.name, tool]));
+      for (const group of MCP_TOOL_GROUPS) {
+        const publication = await client.callTool({
+          name: MCP_TOOL_DISCOVERY_NAME,
+          arguments: { query: `group:${group.id}` },
+        });
+        expect(publication.isError).not.toBe(true);
+        const bounded = await client.listTools();
+        for (const tool of bounded.tools) collected.set(tool.name, tool);
+        const nonCore = bounded.tools.filter((tool) => (
+          tool.name !== MCP_TOOL_DISCOVERY_NAME
+          && !MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE.includes(tool.name)
+        ));
+        expect(nonCore.every((tool) => group.tools.includes(tool.name))).toBe(true);
+      }
+      const listed = { tools: [...collected.values()] };
       const listedNames = listed.tools.map((tool) => tool.name);
       const expectedFullNames = new Set([
         MCP_TOOL_DISCOVERY_NAME,
@@ -267,11 +288,6 @@ describe('memory MCP stdio server', () => {
         ...CAPABILITY_MCP_TOOL_NAMES,
       ]);
       expect(new Set(listedNames)).toEqual(expectedFullNames);
-      expect(activation.structuredContent).toMatchObject({
-        activated: expect.arrayContaining([...expectedFullNames].filter((name) => name !== MCP_TOOL_DISCOVERY_NAME)),
-      });
-      expect((activation.structuredContent as { activated: unknown[] }).activated)
-        .toHaveLength(expectedFullNames.size - 1);
       expect(listedNames).toContain(MCP_TOOL_DISCOVERY_NAME);
       // Memory tools plus the full alias CRUD tool set share the same server surface.
       expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
@@ -469,7 +485,8 @@ describe('memory MCP stdio server', () => {
         activated: [],
         activatedGroups: [],
         groups: [expect.objectContaining({
-          id: 'aliases-pins', name: 'aliases-pins', toolCount: 8, active: false,
+          id: 'aliases-pins', name: 'aliases-pins', toolCount: 8,
+          active: true, published: false, direct: false,
           tools: expect.arrayContaining([ALIAS_MCP_TOOLS.LIST, MESSAGE_PIN_MCP_TOOLS.LIST]),
         })],
       });
@@ -498,6 +515,14 @@ describe('memory MCP stdio server', () => {
         structuredContent: expect.objectContaining({ status: 'ok', pins: [] }),
       });
 
+      // Re-publishing an unchanged exact selector repairs hosts that missed a
+      // prior invalidation without broadening the bounded view.
+      await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'group:aliases-pins' },
+      });
+      expect(publish).toHaveBeenCalledTimes(2);
+
       const replacement = await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
         arguments: { query: 'group:scheduling' },
@@ -506,7 +531,7 @@ describe('memory MCP stdio server', () => {
         activatedGroups: ['scheduling'],
         groups: [expect.objectContaining({ id: 'scheduling', toolCount: 7, active: true })],
       });
-      expect(publish).toHaveBeenCalledTimes(2);
+      expect(publish).toHaveBeenCalledTimes(3);
       const replacementNames = (await client.listTools()).tools.map((tool) => tool.name);
       expect(replacementNames).toEqual(expect.arrayContaining([
         MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
@@ -567,7 +592,7 @@ describe('memory MCP stdio server', () => {
         arguments: { query: 'group:capability-management' },
       });
       expect(unauthorized.structuredContent).toMatchObject({
-        status: 'ok', activated: [], activatedGroups: ['capability-management'],
+        status: 'ok', activated: [], activatedGroups: [],
         groups: [expect.objectContaining({
           id: 'capability-management', toolCount: 0, tools: [], active: false,
         })],

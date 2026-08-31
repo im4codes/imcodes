@@ -8,7 +8,7 @@ import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
 import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
-import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -90,18 +90,7 @@ describe('buildProviderContextPayload', () => {
   });
 
   it('adds shared system guidance for every managed SDK provider id', () => {
-    const providerIds = [
-      'claude-code-sdk',
-      'gemini-sdk',
-      'kimi-sdk',
-      HERMES_AGENT_PROVIDER_ID,
-      'copilot-sdk',
-      'codex-sdk',
-      'cursor-headless',
-      'opencode-sdk',
-      'qwen',
-      'pi',
-    ];
+    const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
 
     for (const providerId of providerIds) {
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {

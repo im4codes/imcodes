@@ -124,7 +124,7 @@ async function connect(isAdmin = true) {
   client = new Client({ name: 'supervision-reg-test', version: '0.1.0' });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await Promise.all([client.connect(clientT), server.connect(serverT)]);
-  await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
+  await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'group:supervision' } });
 }
 
 async function call(name: string, args: Record<string, unknown>) {

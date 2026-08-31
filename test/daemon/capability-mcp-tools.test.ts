@@ -122,7 +122,7 @@ describe('capability MCP tools', () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
-      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'group:capability-management' } });
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
@@ -218,7 +218,7 @@ describe('capability MCP tools', () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
-      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'group:capability-management' } });
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
