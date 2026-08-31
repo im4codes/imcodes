@@ -7,7 +7,6 @@ export {
   MCP_TOOL_DISCOVERY_DESCRIPTION,
   MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS,
 } from './mcp-tool-distribution.js';
-import { MCP_TOOL_DISCOVERY_DESCRIPTION } from './mcp-tool-distribution.js';
 
 /** Protocol constants for the minimal MCP lazy-tool bootstrap surface. */
 export const MCP_TOOL_DISCOVERY_NAME = 'mcp_tool_search' as const;
