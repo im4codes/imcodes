@@ -72,15 +72,23 @@ export function validateSupervisionSemanticKey(
   return { ok: true, key };
 }
 
-/** Uniqueness suffix supplied by the daemon (ULID/UUID). Never model-provided. */
-const UNIQUE_SUFFIX_PATTERN = /^[0-9A-Za-z-]{8,64}$/u;
+/** Uniqueness suffix supplied by the daemon. Never model-provided. */
+const LEGACY_UNIQUE_SUFFIX_PATTERN = /^[0-9A-Za-z-]{8,64}$/u;
+/** SQLite INTEGER is at most 13 base36 digits; `-1`..`-7` are bounded
+ * collision escapes for caller-supplied historical ids occupying a candidate. */
+const DURABLE_SEQUENCE_SUFFIX_PATTERN = /^[0-9a-z]{1,13}(?:-[1-7])?$/u;
+
+function isValidUniqueSuffix(value: string): boolean {
+  return LEGACY_UNIQUE_SUFFIX_PATTERN.test(value)
+    || DURABLE_SEQUENCE_SUFFIX_PATTERN.test(value);
+}
 /** Audit rounds are daemon-counted; `r0` would imply an attempt that never ran. */
 const ROUND_PATTERN = /^r[1-9][0-9]{0,2}$/u;
 
 export interface SupervisionCanonicalIdInput {
   kind: SupervisionIdKind;
   semanticKey: string;
-  /** Daemon-supplied entropy. Same suffix ⇒ same id, which is what makes an
+  /** Daemon-supplied unique value. Same suffix ⇒ same id, which is what makes an
    *  idempotent retry return the identical canonical id. */
   uniqueSuffix: string;
   /** Audit attempts only, e.g. `r2`. */
@@ -92,7 +100,7 @@ export function mintSupervisionCanonicalId(
 ): { ok: true; id: string } | { ok: false; reason: SupervisionSemanticKeyRefusal | 'invalid_suffix' | 'invalid_round' } {
   const key = validateSupervisionSemanticKey(input.semanticKey);
   if (!key.ok) return key;
-  if (!UNIQUE_SUFFIX_PATTERN.test(input.uniqueSuffix)) return { ok: false, reason: 'invalid_suffix' };
+  if (!isValidUniqueSuffix(input.uniqueSuffix)) return { ok: false, reason: 'invalid_suffix' };
   if (input.round !== undefined && !ROUND_PATTERN.test(input.round)) return { ok: false, reason: 'invalid_round' };
   const prefix = SUPERVISION_ID_PREFIXES[input.kind];
   const round = input.round ? `${input.round}_` : '';
@@ -104,6 +112,25 @@ export interface SupervisionParsedCanonicalId {
   semanticKey: string;
   round?: string;
   uniqueSuffix: string;
+}
+
+export type SupervisionOpaqueIdKind = Extract<SupervisionIdKind, 'task' | 'assignment' | 'lease'>;
+
+export interface SupervisionParsedOpaqueId {
+  kind: SupervisionOpaqueIdKind;
+  sequence: string;
+}
+
+/** Parse new local registry ids; semantic ids continue through the canonical parser. */
+export function parseSupervisionOpaqueId(value: unknown): SupervisionParsedOpaqueId | undefined {
+  if (typeof value !== 'string') return undefined;
+  for (const kind of ['task', 'assignment', 'lease'] as const) {
+    const prefix = `${SUPERVISION_ID_PREFIXES[kind]}_`;
+    if (!value.startsWith(prefix)) continue;
+    const sequence = value.slice(prefix.length);
+    return DURABLE_SEQUENCE_SUFFIX_PATTERN.test(sequence) ? { kind, sequence } : undefined;
+  }
+  return undefined;
 }
 
 export function parseSupervisionCanonicalId(value: unknown): SupervisionParsedCanonicalId | undefined {
@@ -120,7 +147,7 @@ export function parseSupervisionCanonicalId(value: unknown): SupervisionParsedCa
   const maybeRound = parts.length >= 3 ? parts[parts.length - 2]! : undefined;
   const round = maybeRound && ROUND_PATTERN.test(maybeRound) ? maybeRound : undefined;
   const key = parts.slice(0, parts.length - (round ? 2 : 1)).join('_');
-  if (!UNIQUE_SUFFIX_PATTERN.test(uniqueSuffix)) return undefined;
+  if (!isValidUniqueSuffix(uniqueSuffix)) return undefined;
   if (!validateSupervisionSemanticKey(key).ok) return undefined;
   return round ? { kind, semanticKey: key, round, uniqueSuffix } : { kind, semanticKey: key, uniqueSuffix };
 }

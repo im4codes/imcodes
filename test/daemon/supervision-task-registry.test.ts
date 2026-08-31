@@ -231,7 +231,7 @@ function prepareStructuredFinalizationShape(
     })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
   } else {
     expect(registry.getAssignment(owner.value.assignmentId)).toMatchObject({
-      status: 'ready_for_integration', leaseId: expect.stringMatching(/^supervision_lease_/),
+      status: 'ready_for_integration', leaseId: expect.stringMatching(/^(?:lse|supervision_lease)_/),
     });
   }
   const finalization = {
@@ -1198,7 +1198,7 @@ describe('SupervisionTaskRegistry', () => {
     });
     expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
       status: 'implementing', auditRevision: shape.toRevision,
-      leaseId: expect.stringMatching(/^supervision_lease_/),
+      leaseId: expect.stringMatching(/^(?:lse|supervision_lease)_/),
     });
     expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('auditAttemptId');
     expect(registry.getAssignment(shape.implementer.assignmentId)).not.toHaveProperty('verdict');
@@ -1311,7 +1311,7 @@ describe('SupervisionTaskRegistry', () => {
       now: 200,
     })).toMatchObject({ ok: true, value: { status: 'implementing', currentRevision: fromRevision } });
     expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
-      status: 'implementing', leaseId: expect.stringMatching(/^supervision_lease_/),
+      status: 'implementing', leaseId: expect.stringMatching(/^(?:lse|supervision_lease)_/),
     });
     expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('auditAttemptId');
     expect(registry.getAssignment(implementer.value.assignmentId)).not.toHaveProperty('auditRevision');
@@ -1479,7 +1479,7 @@ describe('SupervisionTaskRegistry', () => {
         ok: true, value: { currentRevision: toRevision, status: 'implementing' },
       });
       const persistedLease = registry.getAssignment(assignmentId)?.leaseId;
-      expect(persistedLease).toMatch(/^supervision_lease_/);
+      expect(persistedLease).toMatch(/^(?:lse|supervision_lease)_/);
       expect(registry.getAssignment(assignmentId)).toMatchObject({
         auditRevision: toRevision, scopeFiles,
       });
@@ -4074,7 +4074,7 @@ describe('SupervisionTaskRegistry', () => {
       revision: 'wrong-revision',
     })).resolves.toMatchObject({ status: 'error' });
     expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
-      status: 'ready_for_audit', leaseId: expect.stringMatching(/^supervision_lease_/),
+      status: 'ready_for_audit', leaseId: expect.stringMatching(/^(?:lse|supervision_lease)_/),
     });
     expect(registry.listFileClaims('matching-pass-close')).toEqual([]);
 
@@ -4536,7 +4536,7 @@ describe('SupervisionTaskRegistry', () => {
         assignments: [expect.objectContaining({
           assignmentId: unrelated.value.assignmentId,
           status: 'delegated',
-          leaseId: expect.stringMatching(/^supervision_lease_/),
+          leaseId: expect.stringMatching(/^(?:lse|supervision_lease)_/),
         })],
         fileClaims: [],
       });

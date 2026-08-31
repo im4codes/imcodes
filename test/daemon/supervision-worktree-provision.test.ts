@@ -34,6 +34,21 @@ afterEach(() => {
 });
 
 describe('supervision assignment worktree provisioning', () => {
+  it.each([
+    'asg_2',
+    'supervision_assignment_22222222-2222-4222-8222-222222222222',
+  ])('provisions a safe worktree path for assignment id %s', async (assignmentId) => {
+    const shape = fixture();
+    const worktreePath = join(shape.root, 'worktrees', 'imcodes', 'deck_sub_worker', assignmentId, 'repo');
+    await expect(ensureSupervisionAssignmentWorktree({
+      projectRoot: shape.source, sessionName: 'deck_sub_worker', assignmentId,
+      baseRevision: shape.baseRevision, worktreePath,
+    })).resolves.toEqual({
+      ok: true, worktreePath, baseRevision: shape.baseRevision, created: true,
+    });
+    expect(git(worktreePath, 'rev-parse', 'HEAD')).toBe(shape.baseRevision);
+  });
+
   it('creates the exact detached base and replays without rebuilding it', async () => {
     const shape = fixture();
     const worktreePath = join(shape.root, 'worktrees', 'imcodes', 'deck_sub_worker', 'supervision_assignment_one', 'repo');

@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import {
   mintSupervisionCanonicalId,
   parseSupervisionCanonicalId,
+  parseSupervisionOpaqueId,
   validateSupervisionSemanticKey,
   type SupervisionIdKind,
 } from '../../shared/supervision-durable-identity.js';
@@ -78,7 +79,7 @@ export function mintSupervisionId(
  * A caller may still pass an id ONLY when it is one the daemon previously
  * minted and that already exists (idempotent retry / replay). A well-formed but
  * unknown canonical id is refused: that is the impersonation case, where a model
- * fabricates `tsk_<someone-elses-slice>_<uuid>` to write into another owner's
+ * fabricates `tsk_<someone-elses-slice>_<suffix>` to write into another owner's
  * task.
  */
 export function isAcceptableCallerSuppliedId(input: {
@@ -86,8 +87,13 @@ export function isAcceptableCallerSuppliedId(input: {
   kind: SupervisionIdKind;
   exists: (id: string) => boolean;
 }): boolean {
-  const parsed = parseSupervisionCanonicalId(input.id);
-  if (!parsed) return false;
-  if (parsed.kind !== input.kind) return false;
-  return input.exists(input.id);
+  const parsed = parseSupervisionCanonicalId(input.id) ?? parseSupervisionOpaqueId(input.id);
+  if (parsed) return parsed.kind === input.kind && input.exists(input.id);
+  const legacyPrefix = input.kind === 'task' ? 'supervision_task_'
+    : input.kind === 'assignment' ? 'supervision_assignment_'
+      : input.kind === 'lease' ? 'supervision_lease_' : undefined;
+  const legacyUuid = legacyPrefix && input.id.startsWith(legacyPrefix)
+    ? input.id.slice(legacyPrefix.length) : '';
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(legacyUuid)
+    && input.exists(input.id);
 }

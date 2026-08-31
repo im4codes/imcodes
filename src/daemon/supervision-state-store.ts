@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import type { PeerAuditReceiptKind, PeerAuditValidationItem, PeerAuditVerdict } from '../../shared/peer-audit.js';
+import { SUPERVISION_ID_PREFIXES } from '../../shared/supervision-durable-identity.js';
 
 import {
   canTransitionSupervisionTaskStatus,
@@ -634,9 +635,11 @@ export type SupervisionTaskRegistryResult<T> =
   | { ok: true; value: T; replay?: boolean }
   | { ok: false; reason: 'invalid' | 'duplicate_task' | 'duplicate_assignment' | 'not_found' | 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'old_audit_attempt' | 'manifest_mismatch' | 'role_forbidden' | 'ambiguous_assignment' | 'economy_requires_primary_review' | 'receipt_closed' | 'conflicting_replay' };
 
-function stableTaskId(): string { return `supervision_task_${randomUUID()}`; }
-function stableAssignmentId(): string { return `supervision_assignment_${randomUUID()}`; }
-function stableLeaseId(): string { return `supervision_lease_${randomUUID()}`; }
+const COMPACT_ID_COLLISION_ATTEMPTS = 8;
+
+function compactSequenceCandidate(sequence: string, attempt: number): string {
+  return attempt === 0 ? sequence : `${sequence}-${attempt.toString(36)}`;
+}
 
 function normalizeTaskString(value: string | number | null | undefined): string | undefined {
   const text = typeof value === 'number' ? String(value) : value?.trim();
@@ -1096,6 +1099,40 @@ export class SupervisionTaskRegistry {
 
 
   close(): void { if (this.#ownsDb && !this.#closed) this.#db.close(); this.#closed = true; }
+
+  /**
+   * Reuse the already-durable AUTOINCREMENT sequence of the event that the
+   * surrounding transaction is about to append. BEGIN IMMEDIATE serializes the
+   * read with that append across connections, so clocks, restarts and process
+   * counters cannot collide. No sequence table or migration is needed.
+   */
+  #nextEventSequence(): string {
+    const row = this.#db.prepare(
+      `SELECT CAST(COALESCE((SELECT seq FROM sqlite_sequence
+        WHERE name = 'supervision_task_events'), 0) + 1 AS TEXT) AS nextSequence`,
+    ).get() as { nextSequence?: unknown } | undefined;
+    const next = typeof row?.nextSequence === 'string' ? BigInt(row.nextSequence) : 1n;
+    return next.toString(36);
+  }
+
+  #mintOpaqueId(
+    kind: 'task' | 'assignment' | 'lease',
+    exists: (id: string) => boolean,
+  ): string {
+    const sequence = this.#nextEventSequence();
+    const prefix = SUPERVISION_ID_PREFIXES[kind];
+    for (let attempt = 0; attempt < COMPACT_ID_COLLISION_ATTEMPTS; attempt += 1) {
+      const id = `${prefix}_${compactSequenceCandidate(sequence, attempt)}`;
+      if (!exists(id)) return id;
+    }
+    throw new Error(`unable to mint unique ${kind} id from durable event sequence`);
+  }
+
+  #mintLeaseId(): string {
+    return this.#mintOpaqueId('lease', (id) => Boolean(this.#db.prepare(
+      'SELECT 1 AS found FROM supervision_task_assignments WHERE lease_id = ? LIMIT 1',
+    ).get(id)));
+  }
 
   #appendEvent(taskId: string, assignmentId: string | undefined, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, status: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus, payload: Record<string, unknown> | undefined, now: number): void {
     this.#db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
@@ -1617,40 +1654,53 @@ export class SupervisionTaskRegistry {
       const replay = typeof row?.taskId === 'string' ? this.getTaskRecord(row.taskId) : undefined;
       if (replay) return { ok: true, value: replay, replay: true };
     }
-    const proposedTaskKey = normalizeTaskString(input.semanticTaskKey);
-    let taskId: string;
-    if (proposedTaskKey) {
-      // Daemon-minted: typed prefix + validated key + daemon entropy.
-      const minted = mintSupervisionId(
-        { kind: 'task', semanticKey: proposedTaskKey },
-        { exists: (id) => !!this.getTaskRecord(id) },
-      );
-      if (!minted.ok) return { ok: false, reason: 'invalid' };
-      taskId = minted.id;
-    } else {
-      taskId = normalizeTaskString(input.taskId) ?? stableTaskId();
-    }
-    if (this.getTaskRecord(taskId)) return { ok: false, reason: 'duplicate_task' };
     const classification = input.classification ?? 'integration_slice';
     if (!isSupervisionTaskClassification(classification)) return { ok: false, reason: 'invalid' };
-    const record: PersistedSupervisionTaskRecord = {
-      version: SUPERVISION_TASK_REGISTRY_DB_VERSION,
-      taskId,
-      // Direct registry callers from before project scoping stay invisible to
-      // every real project rather than being guessed into the caller's scope.
-      projectName,
-      topLevelTaskId: normalizeTaskString(input.topLevelTaskId) ?? taskId,
-      classification,
-      objective: normalizeTaskString(input.objective) ?? 'Delegated supervised task',
-      acceptance: normalizeTaskArray(input.acceptance),
-      ...(normalizeTaskString(input.baseRevision) ? { baseRevision: normalizeTaskString(input.baseRevision) } : {}),
-      ...(normalizeTaskString(input.currentRevision) ? { currentRevision: normalizeTaskString(input.currentRevision) } : {}),
-      status: 'planned',
-      createdAt: now,
-      updatedAt: now,
-    };
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      const proposedTaskKey = normalizeTaskString(input.semanticTaskKey);
+      const sequence = this.#nextEventSequence();
+      let suffixAttempt = 0;
+      let taskId: string;
+      if (proposedTaskKey) {
+        // The semantic key stays readable; uniqueness comes from the same
+        // durable event sequence used by opaque ids.
+        const minted = mintSupervisionId(
+          { kind: 'task', semanticKey: proposedTaskKey },
+          {
+            uniqueSuffix: () => compactSequenceCandidate(sequence, suffixAttempt++),
+            exists: (id) => !!this.getTaskRecord(id),
+          },
+        );
+        if (!minted.ok) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'invalid' };
+        }
+        taskId = minted.id;
+      } else {
+        taskId = normalizeTaskString(input.taskId)
+          ?? this.#mintOpaqueId('task', (id) => !!this.getTaskRecord(id));
+      }
+      if (this.getTaskRecord(taskId)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'duplicate_task' };
+      }
+      const record: PersistedSupervisionTaskRecord = {
+        version: SUPERVISION_TASK_REGISTRY_DB_VERSION,
+        taskId,
+        // Direct registry callers from before project scoping stay invisible to
+        // every real project rather than being guessed into the caller's scope.
+        projectName,
+        topLevelTaskId: normalizeTaskString(input.topLevelTaskId) ?? taskId,
+        classification,
+        objective: normalizeTaskString(input.objective) ?? 'Delegated supervised task',
+        acceptance: normalizeTaskArray(input.acceptance),
+        ...(normalizeTaskString(input.baseRevision) ? { baseRevision: normalizeTaskString(input.baseRevision) } : {}),
+        ...(normalizeTaskString(input.currentRevision) ? { currentRevision: normalizeTaskString(input.currentRevision) } : {}),
+        status: 'planned',
+        createdAt: now,
+        updatedAt: now,
+      };
       this.#writeTask(record, 'created', { source: 'task_start' });
       if (key) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, created_at) VALUES (?, ?, ?)').run(taskIdempotencyKey, taskId, now);
       this.#db.exec('COMMIT');
@@ -1669,19 +1719,6 @@ export class SupervisionTaskRegistry {
       const replay = typeof row?.assignmentId === 'string' ? this.getAssignment(row.assignmentId) : undefined;
       if (replay) return { ok: true, value: replay, replay: true };
     }
-    const proposedAssignmentKey = normalizeTaskString(input.semanticAssignmentKey);
-    let assignmentId: string;
-    if (proposedAssignmentKey) {
-      const minted = mintSupervisionId(
-        { kind: 'assignment', semanticKey: proposedAssignmentKey },
-        { exists: (id) => !!this.getAssignment(id) },
-      );
-      if (!minted.ok) return { ok: false, reason: 'invalid' };
-      assignmentId = minted.id;
-    } else {
-      assignmentId = normalizeTaskString(input.assignmentId) ?? stableAssignmentId();
-    }
-    if (this.getAssignment(assignmentId)) return { ok: false, reason: 'duplicate_assignment' };
     if (!['coordinator','integration_owner','implementer','auditor'].includes(input.role)) return { ok: false, reason: 'invalid' };
     if (input.role === 'integration_owner') {
       const exactOwners = this.listAssignments(task.taskId).filter((assignment) => (
@@ -1704,29 +1741,54 @@ export class SupervisionTaskRegistry {
       return { ok: false, reason: 'duplicate_assignment' };
     }
     const scopeFiles = normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
-    const record: PersistedSupervisionTaskAssignment = {
-      version: SUPERVISION_TASK_REGISTRY_DB_VERSION,
-      assignmentId,
-      taskId: task.taskId,
-      role: input.role,
-      identity: input.identity,
-      scopeFiles,
-      required: input.required !== false,
-      status: 'delegated',
-      leaseId: stableLeaseId(),
-      generation: 1,
-      ...(normalizeTaskString(input.auditAttemptId) ? { auditAttemptId: normalizeTaskString(input.auditAttemptId) } : {}),
-      ...(normalizeTaskString(input.auditRevision) ? { auditRevision: normalizeTaskString(input.auditRevision) } : {}),
-      ...(input.executionBinding ? { executionBinding: input.executionBinding } : {}),
-      ...(input.economyPolicy ? { economyPolicy: input.economyPolicy } : {}),
-      ...(input.auditRoutingReason ? { auditRoutingReason: input.auditRoutingReason } : {}),
-      ...(input.auditDegradedReason ? { auditDegradedReason: input.auditDegradedReason } : {}),
-      ...(input.provisioning ? { provisioning: input.provisioning } : {}),
-      createdAt: now,
-      updatedAt: now,
-    };
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      const proposedAssignmentKey = normalizeTaskString(input.semanticAssignmentKey);
+      const sequence = this.#nextEventSequence();
+      let suffixAttempt = 0;
+      let assignmentId: string;
+      if (proposedAssignmentKey) {
+        const minted = mintSupervisionId(
+          { kind: 'assignment', semanticKey: proposedAssignmentKey },
+          {
+            uniqueSuffix: () => compactSequenceCandidate(sequence, suffixAttempt++),
+            exists: (id) => !!this.getAssignment(id),
+          },
+        );
+        if (!minted.ok) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'invalid' };
+        }
+        assignmentId = minted.id;
+      } else {
+        assignmentId = normalizeTaskString(input.assignmentId)
+          ?? this.#mintOpaqueId('assignment', (id) => !!this.getAssignment(id));
+      }
+      if (this.getAssignment(assignmentId)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'duplicate_assignment' };
+      }
+      const record: PersistedSupervisionTaskAssignment = {
+        version: SUPERVISION_TASK_REGISTRY_DB_VERSION,
+        assignmentId,
+        taskId: task.taskId,
+        role: input.role,
+        identity: input.identity,
+        scopeFiles,
+        required: input.required !== false,
+        status: 'delegated',
+        leaseId: this.#mintLeaseId(),
+        generation: 1,
+        ...(normalizeTaskString(input.auditAttemptId) ? { auditAttemptId: normalizeTaskString(input.auditAttemptId) } : {}),
+        ...(normalizeTaskString(input.auditRevision) ? { auditRevision: normalizeTaskString(input.auditRevision) } : {}),
+        ...(input.executionBinding ? { executionBinding: input.executionBinding } : {}),
+        ...(input.economyPolicy ? { economyPolicy: input.economyPolicy } : {}),
+        ...(input.auditRoutingReason ? { auditRoutingReason: input.auditRoutingReason } : {}),
+        ...(input.auditDegradedReason ? { auditDegradedReason: input.auditDegradedReason } : {}),
+        ...(input.provisioning ? { provisioning: input.provisioning } : {}),
+        createdAt: now,
+        updatedAt: now,
+      };
       this.#writeAssignment(record, 'delegated', { source: 'assignment_start' });
       if (record.role === 'integration_owner' && !task.integrationOwnerAssignmentId) {
         this.#writeTask({ ...task, integrationOwnerAssignmentId: assignmentId, status: task.status === 'planned' ? 'delegated' : task.status, updatedAt: now }, 'delegated', { source: 'integration_owner_assignment' });
@@ -2826,7 +2888,7 @@ export class SupervisionTaskRegistry {
         ...assignment,
         scopeFiles: targetScopeFiles,
         leaseId: input.leaseAction === 'preserve' && assignment.leaseId
-          ? assignment.leaseId : stableLeaseId(),
+          ? assignment.leaseId : this.#mintLeaseId(),
         status: 'implementing',
         generation: assignment.generation + 1,
         auditAttemptId: undefined,
@@ -2959,7 +3021,7 @@ export class SupervisionTaskRegistry {
         identity: input.identity ?? assignment.identity,
         status: nextAssignmentStatus,
         scopeFiles: scopeFiles ?? assignment.scopeFiles,
-        leaseId: input.leaseAction === 'renew' ? stableLeaseId()
+        leaseId: input.leaseAction === 'renew' ? this.#mintLeaseId()
           : input.leaseAction === 'clear' ? '' : assignment.leaseId,
         generation: assignment.generation + 1,
         ...(resetsAudit ? {

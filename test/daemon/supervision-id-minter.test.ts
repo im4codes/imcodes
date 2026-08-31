@@ -74,10 +74,14 @@ describe('daemon-minted canonical ids', () => {
 
 describe('caller-supplied id guard', () => {
   const known = `tsk_known-slice_${SUFFIX}`;
-  const exists = (id: string) => id === known;
+  const compact = 'tsk_1';
+  const legacy = 'supervision_task_11111111-1111-4111-8111-111111111111';
+  const exists = (id: string) => [known, compact, legacy].includes(id);
 
   it('accepts a previously minted id (idempotent replay)', () => {
     expect(isAcceptableCallerSuppliedId({ id: known, kind: 'task', exists })).toBe(true);
+    expect(isAcceptableCallerSuppliedId({ id: compact, kind: 'task', exists })).toBe(true);
+    expect(isAcceptableCallerSuppliedId({ id: legacy, kind: 'task', exists })).toBe(true);
   });
 
   it('REFUSES a well-formed but unknown id (impersonation)', () => {

@@ -741,7 +741,7 @@ describe('administrative recover', () => {
       });
       expect(realRegistry.getTaskRecord(taskId)).toMatchObject({ currentRevision: toRevision });
       expect(realRegistry.getAssignment(assignmentId)).toMatchObject({
-        auditRevision: toRevision, scopeFiles, leaseId: expect.stringMatching(/^supervision_lease_/),
+        auditRevision: toRevision, scopeFiles, leaseId: expect.stringMatching(/^(?:lse|supervision_lease)_/),
       });
     } finally {
       realRegistry.close();
