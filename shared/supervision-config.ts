@@ -61,6 +61,18 @@ export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
 ] as const;
 
 /**
+ * Delimit the stable, daemon-authored supervision preamble inside a per-turn
+ * transport message. The runtime uses these markers to inject an unchanged
+ * preamble once per provider conversation instead of spending the same prompt
+ * tokens on every user turn. A fresh runtime/conversation has no remembered
+ * signature and therefore receives the full block again.
+ */
+export const SUPERVISION_CONTRACT_PREAMBLE_START = '<!-- IMCODES_SUPERVISION_CONTRACT_PREAMBLE_START -->' as const;
+export const SUPERVISION_CONTRACT_PREAMBLE_END = '<!-- IMCODES_SUPERVISION_CONTRACT_PREAMBLE_END -->' as const;
+export const SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE =
+  `[Contracts in force (delivered as the supervision preamble; still binding): ${SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS.join(', ')}]`;
+
+/**
  * How the standing supervision contracts reach the model.
  *
  * `reinjectEveryEntrypoint` means every entrypoint RE-ASSERTS the contracts in

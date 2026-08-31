@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   normalizeSessionSupervisionSnapshot,
+  SUPERVISION_CONTRACT_PREAMBLE_END,
+  SUPERVISION_CONTRACT_PREAMBLE_START,
+  SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
   SUPERVISION_SUPPORTED_UI_LOCALES,
@@ -88,6 +91,8 @@ describe('supervision prompts', () => {
 
   it('gives ordinary supervised turns the same short localized status protocol', () => {
     const prompt = buildSupervisionExecutionPreamble('zh-CN');
+    expect(prompt.startsWith(SUPERVISION_CONTRACT_PREAMBLE_START)).toBe(true);
+    expect(prompt.endsWith(SUPERVISION_CONTRACT_PREAMBLE_END)).toBe(true);
     expect(prompt).toContain('以你自己的上下文为准');
     expect(prompt).toContain('不得用状态标记代替执行');
     expect(prompt).toContain('当前会话自己下一轮仍会执行具体工作');
@@ -95,6 +100,13 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
     expect(prompt).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
     expect(prompt).not.toContain('PASS 前不得');
+  });
+
+  it('uses one shared compact reference for continuation turns', () => {
+    const prompt = buildSupervisionContinuePrompt('Task', 'Result', { reason: 'Continue' });
+    expect(prompt).toContain(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
+    expect(prompt).not.toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
+    expect(prompt).not.toContain(SUPERVISION_CONTRACT_PREAMBLE_END);
   });
 
   it('distinguishes locally actionable work from delegated waiting in every locale', () => {

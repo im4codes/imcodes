@@ -84,6 +84,11 @@ import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../s
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import {
+  SUPERVISION_CONTRACT_PREAMBLE_END,
+  SUPERVISION_CONTRACT_PREAMBLE_START,
+  SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
+} from '../../shared/supervision-config.js';
 import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
@@ -504,6 +509,9 @@ export class TransportSessionRuntime implements SessionRuntime {
    *  bloats SDK prompt windows and can trigger provider auto-compaction. */
   private _lastInjectedPreferenceContextSignature: string | null = null;
   private _preferenceContextInjectionAttempt: { previous: string | null } | null = null;
+  /** Last full standing-contract preamble accepted by this provider conversation. */
+  private _lastInjectedSupervisionContractSignature: string | null = null;
+  private _supervisionContractInjectionAttempt: { previous: string | null } | null = null;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
@@ -690,6 +698,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         }
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
+          this._lastInjectedSupervisionContractSignature = null;
         }
         this.clearStalePendingCancelFallbackTimer();
         this._sending = false;
@@ -3104,6 +3113,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     if (shouldResetTransportPreferenceContextForSessionControl(message)) {
       this._lastInjectedPreferenceContextSignature = null;
+      this._lastInjectedSupervisionContractSignature = null;
     }
 
     if (isSessionCompactCommandText(message)) {
@@ -3250,6 +3260,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
       }
       this._preferenceContextInjectionAttempt = null;
+      this._supervisionContractInjectionAttempt = null;
       if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
         this._startupMemoryInjected = true;
         recordSyncedSummaryFingerprints(
@@ -3284,6 +3295,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this._preferenceContextInjectionAttempt) {
           this._lastInjectedPreferenceContextSignature = this._preferenceContextInjectionAttempt.previous;
           this._preferenceContextInjectionAttempt = null;
+        }
+        if (this._supervisionContractInjectionAttempt) {
+          this._lastInjectedSupervisionContractSignature = this._supervisionContractInjectionAttempt.previous;
+          this._supervisionContractInjectionAttempt = null;
         }
         if (this._activeDispatchId !== dispatchId || !this._sending || !this._activeTurn) {
           this._locallyCancelledDispatchIds.delete(dispatchId);
@@ -3634,21 +3649,37 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!entries || entries.length === 0) return undefined;
     const seen = new Set<string>();
     const parts: string[] = [];
+    let lastSupervisionContractBlock: string | undefined;
     const isControlMessage = userMessage?.trim().startsWith('/') === true;
     if (userMessage && shouldResetTransportPreferenceContextForSessionControl(userMessage)) {
       // The compact control command must stay raw, and the next real turn
       // should re-seed stable preferences because the provider may have
       // discarded prior context during compaction.
       this._lastInjectedPreferenceContextSignature = null;
+      this._lastInjectedSupervisionContractSignature = null;
     }
     for (const entry of entries) {
       const preamble = entry.messagePreamble?.trim();
       if (!preamble) continue;
-      const filtered = this.filterOneShotPreferenceContext(preamble, isControlMessage);
-      if (!filtered || seen.has(filtered)) continue;
-      seen.add(filtered);
-      parts.push(filtered);
+      const preferenceFiltered = this.filterOneShotPreferenceContext(preamble, isControlMessage);
+      if (!preferenceFiltered) continue;
+      const extracted = extractDelimitedBlocks(
+        preferenceFiltered,
+        SUPERVISION_CONTRACT_PREAMBLE_START,
+        SUPERVISION_CONTRACT_PREAMBLE_END,
+      );
+      if (extracted.blocks.length > 0) {
+        lastSupervisionContractBlock = extracted.blocks.at(-1);
+      }
+      const retained = extracted.withoutBlocks;
+      if (!retained || seen.has(retained)) continue;
+      seen.add(retained);
+      parts.push(retained);
     }
+    const supervisionContract = lastSupervisionContractBlock
+      ? this.filterOneShotSupervisionContractBlock(lastSupervisionContractBlock, isControlMessage)
+      : undefined;
+    if (supervisionContract && !seen.has(supervisionContract)) parts.push(supervisionContract);
     return parts.join('\n\n') || undefined;
   }
 
@@ -3667,6 +3698,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._lastInjectedPreferenceContextSignature = signature;
     }
     return preamble;
+  }
+
+  private filterOneShotSupervisionContractBlock(contractBlock: string, isControlMessage: boolean): string | undefined {
+    if (isControlMessage) return undefined;
+    const signature = normalizeStableContextSignature([contractBlock]);
+    if (signature && signature === this._lastInjectedSupervisionContractSignature) {
+      return SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE;
+    }
+    if (signature) {
+      this._supervisionContractInjectionAttempt ??= {
+        previous: this._lastInjectedSupervisionContractSignature,
+      };
+      this._lastInjectedSupervisionContractSignature = signature;
+    }
+    return contractBlock;
   }
 
   private async refreshContextBootstrap(options?: {
@@ -4046,23 +4092,27 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
   };
 }
 
-function extractPreferenceContextBlocks(text: string): { blocks: string[]; withoutBlocks: string } {
+function extractDelimitedBlocks(
+  text: string,
+  startMarker: string,
+  endMarker: string,
+): { blocks: string[]; withoutBlocks: string } {
   const blocks: string[] = [];
   const retained: string[] = [];
   let cursor = 0;
   while (cursor < text.length) {
-    const start = text.indexOf(PREFERENCE_CONTEXT_START, cursor);
+    const start = text.indexOf(startMarker, cursor);
     if (start < 0) {
       retained.push(text.slice(cursor));
       break;
     }
-    const end = text.indexOf(PREFERENCE_CONTEXT_END, start + PREFERENCE_CONTEXT_START.length);
+    const end = text.indexOf(endMarker, start + startMarker.length);
     if (end < 0) {
       retained.push(text.slice(cursor));
       break;
     }
     retained.push(text.slice(cursor, start));
-    const blockEnd = end + PREFERENCE_CONTEXT_END.length;
+    const blockEnd = end + endMarker.length;
     blocks.push(text.slice(start, blockEnd).trim());
     cursor = blockEnd;
   }
@@ -4070,6 +4120,10 @@ function extractPreferenceContextBlocks(text: string): { blocks: string[]; witho
     blocks,
     withoutBlocks: retained.join('').replace(/\n{3,}/g, '\n\n').trim(),
   };
+}
+
+function extractPreferenceContextBlocks(text: string): { blocks: string[]; withoutBlocks: string } {
+  return extractDelimitedBlocks(text, PREFERENCE_CONTEXT_START, PREFERENCE_CONTEXT_END);
 }
 
 function extractPreferenceContextTimelineItems(text: string | undefined): MemoryContextTimelinePreferenceItem[] {
@@ -4095,6 +4149,10 @@ function extractPreferenceContextTimelineItems(text: string | undefined): Memory
 }
 
 function normalizePreferenceContextSignature(blocks: readonly string[]): string {
+  return normalizeStableContextSignature(blocks);
+}
+
+function normalizeStableContextSignature(blocks: readonly string[]): string {
   return blocks.map((block) => block.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
 }
 

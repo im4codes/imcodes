@@ -4,7 +4,9 @@ import {
 } from '../../shared/agent-delegation.js';
 import {
   SUPERVISION_CONTRACT_IDS,
-  SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS,
+  SUPERVISION_CONTRACT_PREAMBLE_END,
+  SUPERVISION_CONTRACT_PREAMBLE_START,
+  SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
   SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS,
   SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES,
   SUPERVISION_DELEGATION_ELIGIBILITY_POLICY,
@@ -384,6 +386,7 @@ function buildSupervisionOutputLanguageLock(request: SupervisionBrokerRequest): 
 export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLocale): string {
   const copy = resolveExecutionPromptCopy(locale);
   return [
+    SUPERVISION_CONTRACT_PREAMBLE_START,
     buildSupervisionOrchestratorContext(locale),
     buildSupervisionTaskFinalizationContract(locale),
     buildSupervisionTaskRegistryContract(locale),
@@ -393,12 +396,14 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT,
     copy.reworkLoop,
     buildExecutionStatusContract(locale),
+    SUPERVISION_CONTRACT_PREAMBLE_END,
   ].join('\n');
 }
 
 export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale): string {
   const copy = resolveExecutionPromptCopy(locale);
   return [
+    SUPERVISION_CONTRACT_PREAMBLE_START,
     buildSupervisionOrchestratorContext(locale),
     buildSupervisionTaskFinalizationContract(locale),
     buildSupervisionTaskRegistryContract(locale),
@@ -406,6 +411,7 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
     copy.ownContext,
     copy.noSafeWork(SUPERVISION_EXECUTION_STATUS_MARKERS),
     buildExecutionStatusContract(locale),
+    SUPERVISION_CONTRACT_PREAMBLE_END,
   ].join(' ');
 }
 
@@ -1033,7 +1039,7 @@ function buildCompactContinueRulesSection(
  * context it is supposed to protect.
  */
 export function buildSupervisionContractsInForceLine(): string {
-  return `[Contracts in force (delivered as the supervision preamble; still binding): ${SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS.join(', ')}]`;
+  return SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE;
 }
 
 export function buildSupervisionContinuePrompt(
