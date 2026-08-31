@@ -275,8 +275,11 @@ describe('execution-clone send dispatch', () => {
     });
 
     const sentMessage = dispatchMessage.mock.calls[0][1] as string;
-    expect(sentMessage).toContain('imcodes send');
-    expect(sentMessage).toContain(BRAIN);
+    expect(sentMessage).toContain('<imcodes-agent-delegation-reply-instruction-v2>');
+    expect(sentMessage).toContain('"contractRefs":["supervision_messaging_v1"]');
+    expect(sentMessage).toContain('"tool":"delegation_reply"');
+    expect(sentMessage).toContain(`"target":"${BRAIN}"`);
+    expect(sentMessage).not.toContain('imcodes send');
   });
 
   it('rolls back (destroys) the clone when dispatch fails after creation — no orphan', async () => {

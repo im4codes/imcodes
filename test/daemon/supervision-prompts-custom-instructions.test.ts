@@ -145,9 +145,10 @@ describe('supervision prompt custom-instructions merge', () => {
     expect(prompt).toContain('Supervisor hint (verify first): Add a regression test for the new guardrail and run `npx vitest run`.');
     expect(prompt).toContain('Reported gap (advisory): no test covers the new fallback branch');
     expect(prompt).toContain('Rationale (advisory): tests missing');
-    expect(prompt).toContain('advance safe unfinished work now; do not stop at a summary');
-    expect(prompt).toContain('If none is safe, report the exact human blocker');
-    expect(prompt).toContain('Uncommitted files alone are not completion');
+    expect(prompt).toContain('[Contract: supervision_continue_v1]');
+    expect(prompt).toContain('supervision_orchestrator_context_v1');
+    expect(prompt).toContain('supervision_task_finalization_v1');
+    expect(prompt).not.toContain('"contractId":"supervision_task_finalization_v1"');
     // Action appears before the supporting reason.
     const idxNext = prompt.indexOf('Supervisor hint');
     const idxReason = prompt.indexOf('Rationale (advisory)');
@@ -176,8 +177,9 @@ describe('supervision prompt custom-instructions merge', () => {
     );
     expect(prompt).toContain('继续同一任务。');
     expect(prompt).toContain('监督提示（先核对）：继续实现');
-    expect(prompt).toContain('本轮立即推进可安全处理的未完成项');
-    expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
+    expect(prompt).toContain('执行模式：advance_safe_work');
+    expect(prompt).toContain('[Contract: supervision_continue_v1]');
+    expect(prompt).toContain('supervision_messaging_v1');
     expect(prompt).not.toContain('Continue the same task.');
   });
 

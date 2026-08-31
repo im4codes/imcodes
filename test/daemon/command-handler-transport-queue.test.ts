@@ -4072,9 +4072,13 @@ describe('handleWebCommand transport queue behavior', () => {
       'implement the feature',
       'cmd-heavy',
       undefined,
-      expect.stringContaining('回复中只用一个状态标记：<!-- IMCODES_EXEC: ADVANCE -->'),
+      expect.stringContaining('"contractId":"task_run_status_v1"'),
     );
-    expect(String(transportSend.mock.calls[0]?.[3])).toContain('对方仍有工作都不算');
+    const preamble = String(transportSend.mock.calls[0]?.[3]);
+    expect(preamble).toContain('"exactlyOne":true');
+    expect(preamble).toContain('"actBeforeMarker":true');
+    expect(preamble).toContain('"done":"<!-- IMCODES_EXEC: AUDIT_READY -->"');
+    expect(preamble).toContain('"delegateWorkIsLocal":false');
     expect(registerTaskIntentMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'cmd-heavy',
@@ -4121,9 +4125,11 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     const preamble = String(transportSend.mock.calls[0]?.[3]);
-    expect(preamble).toContain('以你自己的上下文为准');
-    expect(preamble).toContain('对方仍有工作都不算');
-    expect(preamble).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
+    expect(preamble).toContain('"contractId":"supervision_orchestrator_context_v1"');
+    expect(preamble).toContain('"fabricateOrInfer":false');
+    expect(preamble).toContain('"contractId":"task_run_status_v1"');
+    expect(preamble).toContain('"done":"<!-- IMCODES_EXEC: AUDIT_READY -->"');
+    expect(preamble).toContain('"delegateWorkIsLocal":false');
     expect(preamble).not.toContain('PASS 前不得');
   });
 
