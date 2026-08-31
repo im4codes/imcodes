@@ -105,6 +105,8 @@ describe('supervision prompts', () => {
   it('uses one shared compact reference for continuation turns', () => {
     const prompt = buildSupervisionContinuePrompt('Task', 'Result', { reason: 'Continue' });
     expect(prompt).toContain(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
+    expect(prompt).toContain(SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT);
+    expect(prompt).not.toContain('while safe recovery exists it MUST NOT');
     expect(prompt).not.toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
     expect(prompt).not.toContain(SUPERVISION_CONTRACT_PREAMBLE_END);
   });
@@ -604,19 +606,21 @@ describe('supervision user authority clause', () => {
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       const contract = buildSupervisionOrchestratorContext(locale);
       expect(contract, locale).toContain('Brain');
-      for (const gate of ['matching PASS', 'commit', 'push', 'finalization']) {
+      expect(contract, locale).toContain('control-plane/state-machine/lease/revision/scope/identity');
+      expect(contract, locale).toContain('validation→audit/rework');
+      for (const gate of ['validation', 'matching PASS', 'commit', 'push', 'CI success', 'deployment', 'finalization']) {
         expect(contract, `${locale}:${gate}`).toContain(gate);
       }
     }
     const en = buildSupervisionOrchestratorContext('en');
     const zh = buildSupervisionOrchestratorContext('zh-CN');
-    expect(en).toContain('authoritative project Brain owns coordination recovery');
-    expect(en).toContain('every worker must escalate control-plane errors to Brain');
-    expect(en).toContain('atomically repair non-success task/assignment state, identity, revision, scope, and leases');
-    expect(en).toContain('never fabricates validation, matching PASS, commit, push, or finalization evidence');
-    expect(zh).toContain('权威 project Brain 拥有本项目全部协调恢复权限');
-    expect(zh).toContain('sub/worker 遇到任何控制面错误必须立即上报 Brain');
-    expect(zh).toContain('不得创建替代对象');
-    expect(zh).toContain('不能伪造 validation、matching PASS、commit、push 或 finalization 证据');
+    expect(en).toContain('Brain MUST use its recovery authority or repair the control plane and continue the same object');
+    expect(en).toContain('MUST NOT poll/wait repeatedly, return repair to a worker, mint a replacement object, or call the defect a human blocker');
+    expect(en).toContain('After repair, immediately resume validation→audit/rework');
+    expect(en).toContain('MUST NOT fabricate or infer validation, matching PASS, commit, push, CI success, deployment, or finalization evidence');
+    expect(zh).toContain('Brain 必须主动使用恢复权限或修复控制面并继续同一对象');
+    expect(zh).toContain('不得反复轮询/等待、把修复退回 worker、创建替代对象或当作人工 blocker');
+    expect(zh).toContain('修复后立即恢复 validation→audit/rework');
+    expect(zh).toContain('不得伪造或推断 validation、matching PASS、commit、push、CI success、deployment、finalization 证据');
   });
 });
