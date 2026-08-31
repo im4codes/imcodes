@@ -92,7 +92,10 @@ describe('controlled-node i18n coverage', () => {
     // vacuously true.
     const keys = referencedKeys();
     expect(keys.size).toBeGreaterThan(10);
-    for (const expected of ['download_action', 'copy_install_link', 'copy_install_link_clipboard_error']) {
+    for (const expected of [
+      'download_action', 'copy_install_link', 'copy_install_link_clipboard_error',
+      'revoke_install_link', 'revoke_install_link_confirm',
+    ]) {
       expect(keys.has(expected)).toBe(true);
     }
   });

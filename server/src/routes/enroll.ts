@@ -23,6 +23,7 @@ import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_ENROLL_AUDIT_ACTION,
   CONTROLLED_NODE_OS_MAC,
   CONTROLLED_NODE_OS_WIN,
   CONTROLLED_NODE_TICKET_DELIVERY,
@@ -243,22 +244,64 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   );
 
   const now = Date.now();
-  const ticketExpiresAt = now + controlledNodeTicketTtlMs(delivery);
+  const ttlMs = controlledNodeTicketTtlMs(delivery);
+  const ticketExpiresAt = ttlMs === null ? null : now + ttlMs;
   const maxConsumes = controlledNodeTicketMaxConsumes(delivery);
 
-  const inserted = await (c.env.DB as Database).queryOne<{ id: string }>(
-    `INSERT INTO controlled_node_enrollments_v2
-       (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
-        encrypted_code, consumed_count, max_consumes, ticket_expires_at,
-        expires_at, reusable, created_at, host_server_id, install_code_hash)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, NULL, TRUE, $10, $11, $12)
-     RETURNING id`,
-    [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
-     encryptedCode, maxConsumes, ticketExpiresAt, now, hostServerId ?? null,
-     installCodeHash],
-  );
+  const encryptedTicket = delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    ? encryptBotConfig({ ticket: rawTicket }, encryptionKey)
+    : null;
+  const inserted = delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    ? await (c.env.DB as Database).queryOne<{
+      id: string; ticket_hash: string; encrypted_ticket: string;
+    }>(
+      `INSERT INTO controlled_node_enrollments_v2
+         (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+          encrypted_code, encrypted_ticket, delivery, consumed_count,
+          max_consumes, ticket_expires_at, expires_at, reusable, created_at,
+          host_server_id, install_code_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, NULL, NULL, TRUE, $11, $12, NULL)
+       ON CONFLICT (owner_user_id, os, arch, (COALESCE(host_server_id, '')))
+         WHERE delivery = 'remote_link'
+           AND revoked_at IS NULL
+           AND encrypted_ticket IS NOT NULL
+       DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id
+       RETURNING id, ticket_hash, encrypted_ticket`,
+      [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
+       encryptedCode, encryptedTicket, delivery, maxConsumes, now,
+       hostServerId ?? null],
+    )
+    : await (c.env.DB as Database).queryOne<{
+      id: string; ticket_hash: string; encrypted_ticket: string | null;
+    }>(
+      `INSERT INTO controlled_node_enrollments_v2
+         (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+          encrypted_code, encrypted_ticket, delivery, consumed_count,
+          max_consumes, ticket_expires_at, expires_at, reusable, created_at,
+          host_server_id, install_code_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, 0, $9, $10, NULL, TRUE, $11, $12, $13)
+       RETURNING id, ticket_hash, encrypted_ticket`,
+      [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
+       encryptedCode, delivery, maxConsumes, ticketExpiresAt, now,
+       hostServerId ?? null, installCodeHash],
+    );
   if (!inserted) {
     return c.json({ error: 'ticket_mint_failed' }, 500);
+  }
+
+  let issuedTicket = rawTicket;
+  if (delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK) {
+    try {
+      if (!inserted.encrypted_ticket) throw new Error('stable_remote_ticket_missing');
+      const decrypted = decryptBotConfig(inserted.encrypted_ticket, encryptionKey);
+      if (!/^[a-f0-9]{64}$/.test(decrypted.ticket ?? '')
+        || sha256Hex(decrypted.ticket) !== inserted.ticket_hash) {
+        throw new Error('stable_remote_ticket_corrupt');
+      }
+      issuedTicket = decrypted.ticket;
+    } catch {
+      return c.json({ error: 'ticket_mint_failed' }, 500);
+    }
   }
 
   // Fire-and-forget mint audit (event is non-state-bearing, post-commit).
@@ -274,7 +317,7 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
 
   return c.json({
     ticketId: inserted.id,
-    ticket: rawTicket,
+    ticket: issuedTicket,
     version: 2,
     os,
     arch,
@@ -292,6 +335,54 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
       }
       : {}),
   });
+});
+
+enrollRoutes.delete('/v2/ticket', requireAuth(), async (c) => {
+  const originCheck = checkOrigin(c);
+  if (!originCheck.ok) return c.json({ error: originCheck.reason }, 403);
+
+  const userId = c.get('userId' as never) as string;
+  const expectedOwnerUserId = c.req.header(EXPECTED_USER_ID_HEADER)?.trim();
+  if (!expectedOwnerUserId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED }, 428);
+  }
+  if (expectedOwnerUserId !== userId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.CHANGED }, 409);
+  }
+  const body = await c.req.json().catch(() => null);
+  const parsed = TICKET_BODY.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const { os, arch, hostServerId } = parsed.data;
+  if (parsed.data.delivery !== CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    || !isControlledNodeOs(os)
+    || !isControlledNodeArtifactArch(arch)
+    || !isCanonicalControlledNodePair(os, arch)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const now = Date.now();
+  const revoked = await (c.env.DB as Database).queryOne<{ id: string }>(
+    `UPDATE controlled_node_enrollments_v2
+        SET revoked_at = $1
+      WHERE owner_user_id = $2
+        AND os = $3
+        AND arch = $4
+        AND host_server_id IS NOT DISTINCT FROM $5
+        AND delivery = 'remote_link'
+        AND encrypted_ticket IS NOT NULL
+        AND revoked_at IS NULL
+      RETURNING id`,
+    [now, userId, os, arch, hostServerId ?? null],
+  );
+  if (revoked) {
+    await logAudit({
+      userId,
+      action: CONTROLLED_NODE_ENROLL_AUDIT_ACTION.TICKET_REVOKE,
+      ip: (c.get('clientIp' as never) as string) ?? 'unknown',
+      details: { ticketId: revoked.id, os, arch, hostServerId: hostServerId ?? null },
+    }, c.env.DB);
+  }
+  return c.json({ revoked: revoked !== null });
 });
 
 // ── GET /api/enroll/v2/download (bearer) ───────────────────────────────────
@@ -338,6 +429,7 @@ interface DownloadCommit {
   os: string;
   arch: string;
   artifactSha256: string;
+  delivery: string;
   encryptedCode: string;
   attemptId: string;
   ip: string;
@@ -357,16 +449,16 @@ async function reserveAttempt(
     // Lock the parent row.
     const candidate = await tx.queryOne<{
       id: string; owner_user_id: string; os: string; arch: string;
-      artifact_sha256: string; encrypted_code: string;
+      artifact_sha256: string; encrypted_code: string; delivery: string;
     }>(
       // Either credential resolves the same row: the download ticket, or the
       // short install code from a pasted command. Both are sha256 of a
       // high-entropy secret and each column is unique, so they cannot collide.
-      `SELECT id, owner_user_id, os, arch, artifact_sha256, encrypted_code
+      `SELECT id, owner_user_id, os, arch, artifact_sha256, encrypted_code, delivery
          FROM controlled_node_enrollments_v2
         WHERE (ticket_hash = $1 OR install_code_hash = $1)
           AND revoked_at IS NULL
-          AND ticket_expires_at > $2
+          AND (ticket_expires_at IS NULL OR ticket_expires_at > $2)
         FOR UPDATE`,
       [ticketHash, now],
     );
@@ -407,6 +499,7 @@ async function reserveAttempt(
       os: candidate.os,
       arch: candidate.arch,
       artifactSha256: candidate.artifact_sha256,
+      delivery: candidate.delivery,
       encryptedCode: candidate.encrypted_code,
       attemptId: attemptInsert.attempt_id,
       ip,
@@ -431,7 +524,7 @@ async function commitAttempt(db: Database, reservation: DownloadCommit, now: num
               last_consume_ip = $3
         WHERE id = $1
           AND revoked_at IS NULL
-          AND ticket_expires_at > $2
+          AND (ticket_expires_at IS NULL OR ticket_expires_at > $2)
           AND (max_consumes IS NULL OR consumed_count < max_consumes)
         RETURNING consumed_count`,
       [reservation.ticketId, now, reservation.ip],
@@ -659,12 +752,18 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
     }, c.env.DB).catch(() => {});
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
-  if (v.descriptor.sha256 !== reservation.artifactSha256) {
+  const stableRemoteLink = reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK;
+  if (!stableRemoteLink && v.descriptor.sha256 !== reservation.artifactSha256) {
     // Stale manifest pin; release the slot and surface the mismatch.
     artifactCatalog.invalidate(dir, downloadOs, downloadArch);
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
+  // A stable remote link is an owner credential, not a pin to one release.
+  // The catalog still verifies the current artifact before any authority is
+  // consumed; only the old mint-time digest comparison is omitted. Audit the
+  // exact verified bytes that are actually streamed below.
+  if (stableRemoteLink) reservation.artifactSha256 = v.descriptor.sha256;
 
   // Step 3: cheap post-verify transforms. No stream descriptor is open yet.
   let encryptionKey: string;

@@ -126,7 +126,7 @@ export interface ControlledNodeExecutableTicket {
   filename: string;
   sizeBytes: number;
   sha256: string;
-  expiresAt: number;
+  expiresAt: number | null;
   /** How this ticket is meant to reach the machine; decides its lifetime. */
   delivery: ControlledNodeTicketDelivery;
   ownerUserId: string;
@@ -232,20 +232,24 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
   const filename = typeof res.filename === 'string' ? res.filename : '';
   const sizeBytes = typeof res.sizeBytes === 'number' && Number.isFinite(res.sizeBytes) ? res.sizeBytes : null;
   const sha256 = typeof res.sha256 === 'string' && isControlledNodeArtifactSha256(res.sha256) ? res.sha256 : null;
-  const expiresAt = typeof res.expiresAt === 'number' && Number.isFinite(res.expiresAt) ? res.expiresAt : null;
   const ownerUserId = typeof res.ownerUserId === 'string' ? res.ownerUserId : '';
   // A server that predates delivery modes minted a browser-window ticket, which
   // is the safe assumption: it under-promises the lifetime rather than over.
   const delivery = isControlledNodeTicketDelivery(res.delivery)
     ? res.delivery
     : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
+  const expiresAt = typeof res.expiresAt === 'number' && Number.isFinite(res.expiresAt)
+    ? res.expiresAt
+    : res.expiresAt === null && delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+      ? null
+      : undefined;
   const installCommand = typeof res.installCommand === 'string' && res.installCommand.length > 0
     ? res.installCommand
     : undefined;
   if (ownerUserId && ownerUserId !== expectedOwnerUserId) {
     throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED);
   }
-  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === null || !ownerUserId) {
+  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === undefined || !ownerUserId) {
     throw new Error('invalid_ticket_response');
   }
   if (!isCanonicalControlledNodePair(os, arch)) throw new Error('invalid_ticket_response');
@@ -442,6 +446,7 @@ export async function mintControlledNodeInstallCommand(
     selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
   );
   if (!minted.installCommand) throw new Error('install_command_unsupported');
+  if (minted.expiresAt === null) throw new Error('invalid_ticket_response');
   return {
     command: minted.installCommand,
     expiresAt: minted.expiresAt,
@@ -461,7 +466,7 @@ export async function mintControlledNodeInstallCommand(
 export async function mintControlledNodeRemoteInstallLink(
   selection: ControlledNodeArtifactSelection,
   hostServerId?: string,
-): Promise<{ url: string; expiresAt: number; ticketId: string }> {
+): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(
     selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
   );
@@ -470,4 +475,29 @@ export async function mintControlledNodeRemoteInstallLink(
     expiresAt: minted.expiresAt,
     ticketId: minted.ticketId,
   };
+}
+
+/** Explicitly revoke the stable remote link for one owner/artifact/host binding. */
+export async function revokeControlledNodeRemoteInstallLink(
+  selection: ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<boolean> {
+  if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
+    throw new Error('controlled_node_non_canonical_pair');
+  }
+  const response = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      version: 2,
+      os: selection.os,
+      arch: selection.arch,
+      delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      ...(hostServerId ? { hostServerId } : {}),
+    }),
+  });
+  if (!isRecord(response) || typeof response.revoked !== 'boolean') {
+    throw new Error('invalid_ticket_response');
+  }
+  return response.revoked;
 }

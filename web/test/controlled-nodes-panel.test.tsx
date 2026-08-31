@@ -81,9 +81,10 @@ const beginControlledNodeDesktopDownload = vi.fn(() => ({
 }));
 const createControlledNodeRemoteInstallLink = vi.fn(async () => ({
   url: 'https://im.example.test/api/enroll/v2/bootstrap#ticket=remote-raw-ticket',
-  expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+  expiresAt: null,
   ticketId: 'tid-remote-1',
 }));
+const revokeControlledNodeRemoteInstallLink = vi.fn(async () => true);
 // Platform-faithful: these tests click the Windows row, so the fixture must be
 // the command the server actually mints for Windows. A curl fixture behind a
 // Windows click would assert clipboard behaviour against a string that platform
@@ -103,6 +104,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
     ...actual,
     downloadControlledNodeExecutable: (...a: unknown[]) => downloadControlledNodeExecutable(...a),
     createControlledNodeRemoteInstallLink: (...a: unknown[]) => createControlledNodeRemoteInstallLink(...a),
+    revokeControlledNodeRemoteInstallLink: (...a: unknown[]) => revokeControlledNodeRemoteInstallLink(...a),
     createControlledNodeInstallCommand: (...a: unknown[]) => createControlledNodeInstallCommand(...a),
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
@@ -423,6 +425,7 @@ describe('ControlledNodesPanel (12.3)', () => {
       '.controlled-nodes-download-btn',
       '.controlled-nodes-copy-link-btn',
       '.controlled-nodes-copy-command-btn',
+      '.controlled-nodes-revoke-link-btn',
     ]) {
       const child = rule(selector);
       expect({ selector, fullWidth: /width:\s*100%/.test(child) })
@@ -435,7 +438,9 @@ describe('ControlledNodesPanel (12.3)', () => {
     // share the row beneath it. Spanning is the container's job, so the button
     // itself still must not carry its own full-width sizing (asserted above).
     expect(css).toContain('.controlled-nodes-download-actions > .controlled-nodes-download-btn');
+    expect(css).toContain('.controlled-nodes-download-actions > .controlled-nodes-revoke-link-btn');
     expect(markup).toContain('class="controlled-nodes-copy-command-btn"');
+    expect(markup).toContain('class="controlled-nodes-revoke-link-btn"');
   });
 
   it('reports a denied clipboard instead of claiming the link was copied', async () => {
@@ -493,7 +498,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     }
   });
 
-  it('shows the link expiry and a copied confirmation, and surfaces mint failures', async () => {
+  it('shows a copied confirmation without inventing an expiry, and surfaces mint failures', async () => {
     const writeText = vi.fn(async () => {});
     vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
     const { container } = render(<ControlledNodesPanel />);
@@ -507,8 +512,9 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => {
       expect(btn.textContent).toContain('controlled_nodes.copy_install_link_copied');
     });
-    // The long window is only useful if the operator can see when it ends.
-    expect(container.textContent).toContain('controlled_nodes.copy_install_link_expires_at');
+    // The stable link ends only at explicit revocation; a fabricated expiry
+    // label would contradict the authority enforced by the server.
+    expect(container.textContent).not.toContain('controlled_nodes.copy_install_link_expires_at');
 
     // A mint failure must be visible, not swallowed into a silent no-op.
     createControlledNodeRemoteInstallLink.mockRejectedValueOnce(new Error('boom'));
@@ -516,6 +522,27 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => {
       expect(container.querySelector('.controlled-nodes-error')).toBeTruthy();
     });
+  });
+
+  it('revokes the stable artifact binding only after explicit confirmation', async () => {
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await waitFor(() => {
+      const found = container.querySelector(
+        '.controlled-nodes-download-item.is-win .controlled-nodes-revoke-link-btn',
+      );
+      if (!found) throw new Error('revoke-link button not found');
+      return found;
+    });
+
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(revokeControlledNodeRemoteInstallLink).toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+      expect(btn.textContent).toContain('controlled_nodes.revoke_install_link_done');
+    });
+    expect(confirm).toHaveBeenCalledWith('controlled_nodes.revoke_install_link_confirm');
+    expect(createControlledNodeRemoteInstallLink).not.toHaveBeenCalled();
   });
 
   it('fail-closes when artifacts lack arch metadata', async () => {

@@ -3726,14 +3726,14 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
 }
 /*
- * Two actions share one row. The container owns the width and the push-to-
+ * Artifact actions share one grid. The container owns the width and push-to-
  * bottom that the download button used to own alone; leaving `width:100%` and
  * `margin-top:auto` on the button itself would force the pair to stack.
  */
 .controlled-nodes-download-actions {
   display: grid;
-  /* Download spans the row as the primary action; the two copy actions share
-     the row beneath it, so neither competes with it or with each other. */
+  /* Download spans the primary row; copy actions share the second row and
+     explicit revocation spans the third, keeping narrow cards readable. */
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   align-items: stretch;
   gap: 6px;
@@ -3741,6 +3741,9 @@ html.native-ios-mac .chat-dl-btn {
   margin-top: auto;
 }
 .controlled-nodes-download-actions > .controlled-nodes-download-btn {
+  grid-column: 1 / -1;
+}
+.controlled-nodes-download-actions > .controlled-nodes-revoke-link-btn {
   grid-column: 1 / -1;
 }
 .controlled-nodes-download-btn {
@@ -3783,7 +3786,8 @@ html.native-ios-mac .chat-dl-btn {
 }
 /* Secondary to the download button: visibly not the primary action. */
 .controlled-nodes-copy-link-btn,
-.controlled-nodes-copy-command-btn {
+.controlled-nodes-copy-command-btn,
+.controlled-nodes-revoke-link-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3799,13 +3803,23 @@ html.native-ios-mac .chat-dl-btn {
   cursor: pointer;
 }
 .controlled-nodes-copy-link-btn:hover:not(:disabled),
-.controlled-nodes-copy-command-btn:hover:not(:disabled) {
+.controlled-nodes-copy-command-btn:hover:not(:disabled),
+.controlled-nodes-revoke-link-btn:hover:not(:disabled) {
   border-color: rgba(103, 232, 249, 0.6);
   background: rgba(30, 41, 59, 0.62);
   color: #fff;
 }
 .controlled-nodes-copy-link-btn:disabled,
-.controlled-nodes-copy-command-btn:disabled { cursor: wait; opacity: 0.58; }
+.controlled-nodes-copy-command-btn:disabled,
+.controlled-nodes-revoke-link-btn:disabled { cursor: wait; opacity: 0.58; }
+.controlled-nodes-revoke-link-btn {
+  border-color: rgba(251, 113, 133, 0.28);
+  color: #fecdd3;
+}
+.controlled-nodes-revoke-link-btn:hover:not(:disabled) {
+  border-color: rgba(251, 113, 133, 0.58);
+  background: rgba(127, 29, 29, 0.2);
+}
 @media (max-width: 420px) {
   .controlled-nodes-download-actions { grid-template-columns: minmax(0, 1fr); }
 }

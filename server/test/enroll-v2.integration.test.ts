@@ -384,46 +384,123 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     expect(count?.n).toBe('0');
   });
 
-  it('gives a remote install link a lifetime that can survive being carried to another machine', async () => {
+  it('returns one stable no-expiry link for concurrent copies of the same owner binding', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
 
-    const before = Date.now();
-    const res = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST',
-      headers: ticketHeaders(userId, o),
+    const copies = await Promise.all(Array.from({ length: 8 }, async () => {
+      const response = await app.request('/api/enroll/v2/ticket', {
+        method: 'POST',
+        headers: ticketHeaders(userId, o),
+        body: JSON.stringify({
+          version: 2, os: 'linux', arch: 'x64',
+          delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+        }),
+      });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{
+        ticketId: string; ticket: string; expiresAt: null;
+        delivery: string; maxConsumes: number | null;
+      }>;
+    }));
+    expect(new Set(copies.map(({ ticketId }) => ticketId)).size).toBe(1);
+    expect(new Set(copies.map(({ ticket }) => ticket)).size).toBe(1);
+    expect(copies.every(({ expiresAt }) => expiresAt === null)).toBe(true);
+    expect(copies.every(({ delivery }) => delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK)).toBe(true);
+    expect(copies.every(({ maxConsumes }) => maxConsumes === null)).toBe(true);
+
+    const row = await db.queryOne<{
+      ticket_expires_at: string | null; max_consumes: number | null;
+      encrypted_ticket: string | null; delivery: string; matching_rows: string;
+    }>(
+      `SELECT ticket_expires_at, max_consumes, encrypted_ticket, delivery,
+              (SELECT COUNT(*)::text FROM controlled_node_enrollments_v2
+                WHERE owner_user_id = $2 AND os = 'linux' AND arch = 'x64'
+                  AND delivery = 'remote_link' AND revoked_at IS NULL) AS matching_rows
+         FROM controlled_node_enrollments_v2 WHERE id = $1`,
+      [copies[0]!.ticketId, userId],
+    );
+    expect(row?.ticket_expires_at).toBeNull();
+    expect(row?.max_consumes).toBeNull();
+    expect(row?.encrypted_ticket).toEqual(expect.any(String));
+    expect(row?.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK);
+    expect(row?.matching_rows).toBe('1');
+
+    let mintAudits: Array<{ action: string; details: unknown }> = [];
+    await vi.waitFor(async () => {
+      mintAudits = await db.query<{ action: string; details: unknown }>(
+        `SELECT action, details FROM audit_log
+          WHERE user_id = $1 AND action = 'enroll.v2.ticket.mint'`,
+        [userId],
+      );
+      expect(mintAudits.length).toBeGreaterThan(0);
+    });
+    const serializedAudit = JSON.stringify(mintAudits);
+    expect(serializedAudit).not.toContain(copies[0]!.ticket);
+    expect(serializedAudit).not.toContain(row!.encrypted_ticket!);
+  });
+
+  it('keys stable links by the exact owner, canonical platform, and optional host binding', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const authHost = await owner(userId);
+    const otherHost = await owner(userId);
+    const mint = async (hostServerId?: string) => {
+      const response = await app.request('/api/enroll/v2/ticket', {
+        method: 'POST', headers: ticketHeaders(userId, authHost),
+        body: JSON.stringify({
+          version: 2, os: 'linux', arch: 'x64',
+          delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+          ...(hostServerId ? { hostServerId } : {}),
+        }),
+      });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{ ticketId: string; ticket: string }>;
+    };
+
+    const unbound = await mint();
+    expect(await mint()).toEqual(unbound);
+    const boundToAuthHost = await mint(authHost.serverId);
+    expect(await mint(authHost.serverId)).toEqual(boundToAuthHost);
+    const boundToOtherHost = await mint(otherHost.serverId);
+    expect(await mint(otherHost.serverId)).toEqual(boundToOtherHost);
+    expect(new Set([
+      unbound.ticketId, boundToAuthHost.ticketId, boundToOtherHost.ticketId,
+    ])).toHaveLength(3);
+    expect(new Set([
+      unbound.ticket, boundToAuthHost.ticket, boundToOtherHost.ticket,
+    ])).toHaveLength(3);
+  });
+
+  it('streams the currently verified artifact through an existing stable link after an upgrade', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const minted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({
         version: 2, os: 'linux', arch: 'x64',
         delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
       }),
     });
-    expect(res.status).toBe(200);
-    const body = await res.json() as {
-      ticketId: string; expiresAt: number; delivery: string; maxConsumes: number | null;
-    };
-    expect(body.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK);
-    expect(body.maxConsumes).toBeNull();
+    expect(minted.status).toBe(200);
+    const { ticket } = await minted.json() as { ticket: string };
 
-    // `before` is sampled ahead of the request, so the observed window is the
-    // TTL plus request latency. Band it rather than pin it; the exact value is
-    // asserted against the durable row below.
-    const ttl = body.expiresAt - before;
-    const expected = CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK];
-    expect(ttl).toBeGreaterThan(expected - 60_000);
-    expect(ttl).toBeLessThan(expected + 60_000);
+    const upgraded = Buffer.from('IMCODES_FAKE_EXECUTABLE_BINARY_v2');
+    await writeFile(join(exeDir, 'imcodes-node-linux'), upgraded);
+    await writeManifest('imcodes-node-linux', 'linux', 'x64', upgraded);
+    artifactCatalog.invalidate(exeDir, 'linux', 'x64');
 
-    // The durable row, not just the response, must carry the long window —
-    // download consumption is gated on ticket_expires_at.
-    const row = await db.queryOne<{
-      ticket_expires_at: string; created_at: string; max_consumes: number | null;
-    }>(
-      'SELECT ticket_expires_at, created_at, max_consumes FROM controlled_node_enrollments_v2 WHERE id = $1',
-      [body.ticketId],
-    );
-    expect(Number(row?.ticket_expires_at) - Number(row?.created_at)).toBe(expected);
-    expect(row?.max_consumes).toBeNull();
+    const response = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(response.status).toBe(200);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    expect(bytes.subarray(0, upgraded.length)).toEqual(upgraded);
   });
 
   it('migration upgrades only active reusable rows with the exact historical remote-link shape', async () => {
@@ -452,8 +529,9 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       return row!.id;
     };
 
+    const historicalRemoteTtl = 24 * 60 * 60 * 1000;
     const remote = await insertFixture({
-      ttlMs: CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK],
+      ttlMs: historicalRemoteTtl,
       reusable: true,
     });
     const browser = await insertFixture({
@@ -463,16 +541,16 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const installCommand = await insertFixture({
       // Even an accidentally remote-sized interval cannot override the
       // install-code discriminator.
-      ttlMs: CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK],
+      ttlMs: historicalRemoteTtl,
       reusable: true,
       installCodeHash: sha256(hex(16)),
     });
     const legacy = await insertFixture({
-      ttlMs: CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK],
+      ttlMs: historicalRemoteTtl,
       reusable: false,
     });
     const revoked = await insertFixture({
-      ttlMs: CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK],
+      ttlMs: historicalRemoteTtl,
       reusable: true,
       revokedAt: createdAt,
     });
@@ -565,7 +643,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     expect(row).toEqual({ consumed_count: machineCount, consumed_at: null, installs: String(machineCount) });
   });
 
-  it('bounds a remote link only by its 24-hour expiry and explicit revocation', async () => {
+  it('keeps a remote link until owner revocation, then mints a different replacement', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -582,32 +660,54 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       return response.json() as Promise<{ ticket: string; ticketId: string }>;
     };
 
-    const expiring = await mintRemote();
-    await db.execute(
-      'UPDATE controlled_node_enrollments_v2 SET ticket_expires_at = $2 WHERE id = $1',
-      [expiring.ticketId, Date.now()],
-    );
-    const expired = await app.request('/api/enroll/v2/download', {
-      headers: { authorization: `Bearer ${expiring.ticket}` },
+    const original = await mintRemote();
+    expect(await mintRemote()).toEqual(original);
+    const originalDownload = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${original.ticket}` },
     });
-    expect(expired.status).toBe(401);
+    expect(originalDownload.status).toBe(200);
+    await originalDownload.arrayBuffer();
 
-    const revokedLink = await mintRemote();
-    expect(revokedLink.ticketId).not.toBe(expiring.ticketId);
-    expect(revokedLink.ticket).not.toBe(expiring.ticket);
+    const otherUserId = `u_${hex(4)}`;
+    await createUser(db, otherUserId);
+    const otherOwner = await owner(otherUserId);
+    const foreignRevoke = await app.request('/api/enroll/v2/ticket', {
+      method: 'DELETE', headers: ticketHeaders(otherUserId, otherOwner),
+      body: JSON.stringify({
+        version: 2, os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }),
+    });
+    expect(foreignRevoke.status).toBe(200);
+    expect(await foreignRevoke.json()).toEqual({ revoked: false });
+    const stillLive = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${original.ticket}` },
+    });
+    expect(stillLive.status).toBe(200);
+    await stillLive.arrayBuffer();
+
+    const revoke = await app.request('/api/enroll/v2/ticket', {
+      method: 'DELETE', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }),
+    });
+    expect(revoke.status).toBe(200);
+    expect(await revoke.json()).toEqual({ revoked: true });
+    const revoked = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${original.ticket}` },
+    });
+    expect(revoked.status).toBe(401);
+
+    const replacement = await mintRemote();
+    expect(replacement.ticketId).not.toBe(original.ticketId);
+    expect(replacement.ticket).not.toBe(original.ticket);
     const replacementDownload = await app.request('/api/enroll/v2/download', {
-      headers: { authorization: `Bearer ${revokedLink.ticket}` },
+      headers: { authorization: `Bearer ${replacement.ticket}` },
     });
     expect(replacementDownload.status).toBe(200);
     await replacementDownload.arrayBuffer();
-    await db.execute(
-      'UPDATE controlled_node_enrollments_v2 SET revoked_at = $2 WHERE id = $1',
-      [revokedLink.ticketId, Date.now()],
-    );
-    const revoked = await app.request('/api/enroll/v2/download', {
-      headers: { authorization: `Bearer ${revokedLink.ticket}` },
-    });
-    expect(revoked.status).toBe(401);
   });
 
   it('keeps browser at three downloads and install-command at five hundred', async () => {

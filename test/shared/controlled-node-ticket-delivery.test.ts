@@ -10,19 +10,14 @@ import {
 } from '../../shared/controlled-node-artifacts.js';
 
 describe('controlled-node download ticket delivery', () => {
-  it('keeps the browser window short and the remote link long enough to carry', () => {
+  it('keeps the browser window short and the remote link stable until revocation', () => {
     // The browser operator is standing at the machine; seconds are enough and
     // a longer window is pure exposure.
     expect(CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER])
       .toBe(5 * 60 * 1000);
-    // The remote link has to survive being pasted into a chat and opened on the
-    // target machine later. Anything under an hour reintroduces the deadlock it
-    // exists to break: you cannot transfer the installer without the tool the
-    // installer installs.
+    // A stable copied link must not silently stop working because time passed.
     expect(CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK])
-      .toBe(24 * 60 * 60 * 1000);
-    expect(CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK])
-      .toBeGreaterThan(CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]);
+      .toBeNull();
   });
 
   it('defaults an absent or unknown delivery to the short browser window', () => {
@@ -50,11 +45,15 @@ describe('controlled-node download ticket delivery', () => {
       .toEqual(['browser', 'install_command', 'remote_link']);
   });
 
-  it('uses a real no-count-limit contract only for the 24-hour remote link', () => {
-    for (const mode of CONTROLLED_NODE_TICKET_DELIVERY_VALUES) {
+  it('uses no-expiry and no-count-limit contracts only for the stable remote link', () => {
+    for (const mode of [
+      CONTROLLED_NODE_TICKET_DELIVERY.BROWSER,
+      CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+    ]) {
       expect(Number.isSafeInteger(CONTROLLED_NODE_TICKET_TTL_MS[mode])).toBe(true);
       expect(CONTROLLED_NODE_TICKET_TTL_MS[mode]).toBeGreaterThan(0);
     }
+    expect(CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]).toBeNull();
     expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]).toBe(3);
     expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]).toBeNull();
     expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]).toBe(500);

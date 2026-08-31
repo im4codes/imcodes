@@ -1920,9 +1920,17 @@ export async function downloadControlledNodeExecutable(
 export async function createControlledNodeRemoteInstallLink(
   selection: import('./api/machines.js').ControlledNodeArtifactSelection,
   hostServerId?: string,
-): Promise<{ url: string; expiresAt: number; ticketId: string }> {
+): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
   const { mintControlledNodeRemoteInstallLink } = await import('./api/machines.js');
   return mintControlledNodeRemoteInstallLink(selection, hostServerId);
+}
+
+export async function revokeControlledNodeRemoteInstallLink(
+  selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<boolean> {
+  const machines = await import('./api/machines.js');
+  return machines.revokeControlledNodeRemoteInstallLink(selection, hostServerId);
 }
 
 export async function createControlledNodeInstallCommand(

@@ -228,8 +228,8 @@ export function compareControlledNodeArtifactPairs(
  *
  * The ticket itself is identical in kind; only its lifetime and download budget
  * differ. Browser tickets and install commands retain bounded budgets. A remote
- * link instead admits any number of downloads during its fixed 24-hour window;
- * expiry and explicit revocation remain its hard authority boundaries.
+ * link instead admits any number of downloads and remains valid until its owner
+ * explicitly revokes that stable owner/OS/arch/host binding.
  */
 export const CONTROLLED_NODE_TICKET_DELIVERY = {
   BROWSER: 'browser',
@@ -247,7 +247,9 @@ export const CONTROLLED_NODE_TICKET_DELIVERY_VALUES: readonly ControlledNodeTick
 ];
 
 /**
- * Ticket lifetime per delivery mode.
+ * Ticket lifetime per delivery mode. `null` means the stable remote-link
+ * credential ends only at owner revocation; it is not an accidental missing
+ * timestamp.
  *
  * The install command is deliberately long-lived: it is meant to be saved and
  * pasted on new machines whenever one is set up, and an expiry would silently
@@ -256,10 +258,10 @@ export const CONTROLLED_NODE_TICKET_DELIVERY_VALUES: readonly ControlledNodeTick
  * working and retention can reclaim the row.
  */
 export const CONTROLLED_NODE_TICKET_TTL_MS: Readonly<
-  Record<ControlledNodeTicketDelivery, number>
+  Record<ControlledNodeTicketDelivery, number | null>
 > = {
   [CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]: 5 * 60 * 1000,
-  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: 24 * 60 * 60 * 1000,
+  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: null,
   [CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]: 10 * 365 * 24 * 60 * 60 * 1000,
 };
 
@@ -268,7 +270,7 @@ export const CONTROLLED_NODE_TICKET_TTL_MS: Readonly<
  *
  * `browser` enrols one machine, with spare attempts so a failed download is
  * recoverable. `remote_link` uses `null` deliberately: it may be carried to any
- * number of machines during its 24-hour lifetime and must never fail because a
+ * number of machines until explicit revocation and must never fail because a
  * consume counter crossed an arbitrary threshold. The install command is a
  * separate, ten-year credential whose bounded fleet budget remains unchanged.
  *
@@ -337,11 +339,15 @@ export function isControlledNodeTicketDelivery(
  * flow into `now + undefined` and produce a NaN expiry. Failing to the short
  * window keeps every unrecognized input on the conservative side.
  */
-export function controlledNodeTicketTtlMs(delivery?: ControlledNodeTicketDelivery): number {
+export function controlledNodeTicketTtlMs(delivery?: ControlledNodeTicketDelivery): number | null {
   return isControlledNodeTicketDelivery(delivery)
     ? CONTROLLED_NODE_TICKET_TTL_MS[delivery]
     : CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
 }
+
+export const CONTROLLED_NODE_ENROLL_AUDIT_ACTION = {
+  TICKET_REVOKE: 'enroll.v2.ticket.revoke',
+} as const;
 
 /**
  * Download budget for a delivery mode, validated for the same reason as the

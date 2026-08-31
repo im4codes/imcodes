@@ -6,6 +6,7 @@ import {
   createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
+  revokeControlledNodeRemoteInstallLink,
 } from '../api.js';
 import {
   artifactSelectionKey,
@@ -132,10 +133,13 @@ export function ControlledNodesPanel({
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const [linkingKey, setLinkingKey] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [revokingLinkKey, setRevokingLinkKey] = useState<string | null>(null);
+  const [revokedLinkKey, setRevokedLinkKey] = useState<string | null>(null);
   const [commandKey, setCommandKey] = useState<string | null>(null);
   const [copiedCommandKey, setCopiedCommandKey] = useState<string | null>(null);
   const [linkExpiryByKey, setLinkExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const revokedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [presenceRefreshFailed, setPresenceRefreshFailed] = useState(error != null);
@@ -276,7 +280,10 @@ export function ControlledNodesPanel({
     }
     try {
       const ticket = await downloadControlledNodeExecutable(target, { desktopWindow });
-      setTicketExpiryByKey((prev) => ({ ...prev, [key]: ticket.expiresAt }));
+      const expiresAt = ticket.expiresAt;
+      if (expiresAt !== null) {
+        setTicketExpiryByKey((prev) => ({ ...prev, [key]: expiresAt }));
+      }
     } catch (err) {
       setDownloadError(t(controlledNodeDownloadErrorKey(err)));
     } finally {
@@ -288,6 +295,7 @@ export function ControlledNodesPanel({
   // setState against a torn-down component when the panel closes quickly.
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    if (revokedTimerRef.current) clearTimeout(revokedTimerRef.current);
   }, []);
 
   /**
@@ -350,9 +358,15 @@ export function ControlledNodesPanel({
         setDownloadError(t('controlled_nodes.copy_install_link_clipboard_error'));
         return;
       }
-      // Do not retain or render the bearer URL. Only the non-secret expiry is
-      // kept after the clipboard confirms that the operator received it.
-      setLinkExpiryByKey((prev) => ({ ...prev, [key]: link.expiresAt }));
+      // Do not retain or render the bearer URL. Stable links have no expiry;
+      // clear any legacy finite-expiry label that this row previously showed.
+      setLinkExpiryByKey((prev) => {
+        const next = { ...prev };
+        if (link.expiresAt === null) delete next[key];
+        else next[key] = link.expiresAt;
+        return next;
+      });
+      setRevokedLinkKey((current) => current === key ? null : current);
       setCopiedKey(key);
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
       copiedTimerRef.current = setTimeout(() => {
@@ -366,6 +380,35 @@ export function ControlledNodesPanel({
         : errorKey));
     } finally {
       setLinkingKey(null);
+    }
+  };
+
+  const onRevokeInstallLink = async (target: ControlledNodeArtifactSelection) => {
+    const key = artifactSelectionKey(target);
+    if (revokingLinkKey) return;
+    if (!window.confirm(t('controlled_nodes.revoke_install_link_confirm'))) return;
+    setRevokingLinkKey(key);
+    setDownloadError(null);
+    try {
+      await revokeControlledNodeRemoteInstallLink(target);
+      // Revocation targets the durable binding, never a bearer held in Web
+      // state. Clear only non-secret presentation state for this artifact.
+      setLinkExpiryByKey((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      setCopiedKey((current) => current === key ? null : current);
+      setRevokedLinkKey(key);
+      if (revokedTimerRef.current) clearTimeout(revokedTimerRef.current);
+      revokedTimerRef.current = setTimeout(() => {
+        setRevokedLinkKey(null);
+        revokedTimerRef.current = null;
+      }, 4000);
+    } catch {
+      setDownloadError(t('controlled_nodes.revoke_install_link_error'));
+    } finally {
+      setRevokingLinkKey(null);
     }
   };
 
@@ -799,10 +842,12 @@ export function ControlledNodesPanel({
             const isDownloading = downloadingKey === key;
             const isLinking = linkingKey === key;
             const isCopied = copiedKey === key;
+            const isRevokingLink = revokingLinkKey === key;
+            const isRevokedLink = revokedLinkKey === key;
             const isCommanding = commandKey === key;
             const isCommandCopied = copiedCommandKey === key;
             const linkExpiry = linkExpiryByKey[key];
-            const rowBusy = isDownloading || isLinking || isCommanding;
+            const rowBusy = isDownloading || isLinking || isRevokingLink || isCommanding;
             const platform = PLATFORM_PRESENTATION[target.os];
             return (
               <div key={key} class={`controlled-nodes-download-item is-${target.os}`}>
@@ -853,6 +898,20 @@ export function ControlledNodesPanel({
                       : isCommandCopied
                         ? t('controlled_nodes.copy_install_command_copied')
                         : t('controlled_nodes.copy_install_command')}
+                  </button>
+                  <button
+                    type="button"
+                    class="controlled-nodes-revoke-link-btn"
+                    disabled={rowBusy}
+                    title={t('controlled_nodes.revoke_install_link_hint')}
+                    aria-live="polite"
+                    onClick={() => void onRevokeInstallLink(target)}
+                  >
+                    {isRevokingLink
+                      ? t('controlled_nodes.revoke_install_link_pending')
+                      : isRevokedLink
+                        ? t('controlled_nodes.revoke_install_link_done')
+                        : t('controlled_nodes.revoke_install_link')}
                   </button>
                 </div>
                 {expiry != null && (
