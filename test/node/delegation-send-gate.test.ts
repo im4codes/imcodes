@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
@@ -24,7 +27,11 @@ import {
   getDelegationReplyStore,
   resetDelegationReplyStoreForTests,
 } from '../../src/daemon/delegation-reply-store.js';
-import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import {
+  AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_STATUSES,
+} from '../../shared/agent-delegation.js';
+import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervision-worktree-inspector.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
 import {
@@ -886,6 +893,140 @@ describe('delegation send gate', () => {
     expect(registry.get(created.taskId)!.assignments).toHaveLength(assignmentCount);
   });
 
+  it('renews an expired reply authority on an exact dirty continuation without reprovisioning its worktree', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'imcodes-continuation-reply-'));
+    const previousRoot = process.env.IMCODES_WORKTREES_ROOT;
+    process.env.IMCODES_WORKTREES_ROOT = temp;
+    const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
+    const brain = supervisedBrain([config]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_reply_renewal_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const sessions = [brain, worker];
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    const ensureWorktree = vi.fn(async (input: { assignmentId: string; sessionName: string }) => {
+      const worktreePath = resolveSupervisionAssignmentWorktree(input);
+      mkdirSync(worktreePath, { recursive: true });
+      return { ok: true as const, worktreePath, baseRevision: 'a'.repeat(40), created: true };
+    });
+    const testDeps = {
+      ...deps(sessions, dispatchMessage),
+      ensureSupervisionAssignmentWorktree: ensureWorktree,
+    };
+
+    try {
+      const created = await dispatchSendMessage(caller, {
+        target: worker.name,
+        message: 'start implementation',
+        task: { classification: 'integration_slice', objective: 'reply renewal', executionPool: 'primary' },
+      }, testDeps);
+      if (created.status !== 'accepted' || !created.taskId || !created.assignmentId) throw new Error('expected task');
+      const oldDelegationId = created.deliveries[0]?.delegationId;
+      if (!oldDelegationId) throw new Error('expected initial reply authority');
+      const worktreePath = resolveSupervisionAssignmentWorktree({
+        sessionName: worker.name,
+        assignmentId: created.assignmentId,
+      });
+      writeFileSync(join(worktreePath, 'implementation-in-progress.ts'), 'dirty bytes\n');
+      ensureWorktree.mockClear();
+      dispatchMessage.mockClear();
+
+      const appendWithReply = (message: string) => dispatchSendMessage(caller, {
+        target: worker.name,
+        message,
+        deliveryMode: 'append',
+        reply: true,
+        task: {
+          taskId: created.taskId,
+          assignmentId: created.assignmentId,
+          executionPool: 'primary',
+        },
+      }, testDeps);
+
+      const livePending = await appendWithReply('reuse the live reply path');
+      const repeatedLivePending = await appendWithReply('reuse it again');
+      for (const result of [livePending, repeatedLivePending]) {
+        expect(result).toMatchObject({
+          status: 'accepted',
+          deliveries: [expect.objectContaining({ delegationId: oldDelegationId })],
+        });
+      }
+      expect(ensureWorktree).not.toHaveBeenCalled();
+
+      getDelegationReplyStore().expire(oldDelegationId, NOW + 1);
+
+      const continued = await appendWithReply('continue with a fresh reply path');
+
+      expect(continued).toMatchObject({
+        status: 'accepted',
+        taskId: created.taskId,
+        assignmentId: created.assignmentId,
+        deliveries: [expect.objectContaining({
+          target: worker.name,
+          status: 'queued',
+          delegationId: expect.any(String),
+        })],
+      });
+      if (continued.status !== 'accepted') throw new Error('expected continuation');
+      const renewedDelegationId = continued.deliveries[0]?.delegationId;
+      expect(renewedDelegationId).not.toBe(oldDelegationId);
+      expect(ensureWorktree).not.toHaveBeenCalled();
+      expect(getDelegationReplyStore().get(oldDelegationId)).toMatchObject({
+        status: AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+      });
+      expect(getDelegationReplyStore().get(renewedDelegationId!)).toMatchObject({
+        taskId: created.taskId,
+        assignmentId: created.assignmentId,
+        target: {
+          sessionName: worker.name,
+          sessionInstanceId: worker.sessionInstanceId,
+          runtimeEpoch: worker.runtimeEpoch,
+        },
+        status: AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+      });
+      const repeatedRenewal = await appendWithReply('reuse the renewed reply path');
+      expect(repeatedRenewal).toMatchObject({
+        status: 'accepted',
+        deliveries: [expect.objectContaining({ delegationId: renewedDelegationId })],
+      });
+      const sender = {
+        sessionName: worker.name,
+        sessionInstanceId: worker.sessionInstanceId!,
+        runtimeEpoch: worker.runtimeEpoch!,
+      };
+      expect(getDelegationReplyStore().receive({
+        delegationId: renewedDelegationId!,
+        result: 'fresh bound reply',
+        sender,
+        now: NOW + 2,
+      })).toMatchObject({
+        ok: true,
+        record: {
+          taskId: created.taskId,
+          assignmentId: created.assignmentId,
+          result: 'fresh bound reply',
+        },
+      });
+
+      rmSync(worktreePath, { recursive: true, force: true });
+      await expect(dispatchSendMessage(caller, {
+        target: worker.name,
+        message: 'recover the now-missing exact worktree',
+        deliveryMode: 'append',
+        task: {
+          taskId: created.taskId,
+          assignmentId: created.assignmentId,
+          executionPool: 'primary',
+        },
+      }, testDeps)).resolves.toMatchObject({ status: 'accepted' });
+      expect(ensureWorktree).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previousRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+      else process.env.IMCODES_WORKTREES_ROOT = previousRoot;
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ['blocked', 'blocked', false],
     ['FINISHED with reply:true', 'ready_for_audit', true],
@@ -906,6 +1047,7 @@ describe('delegation send gate', () => {
       },
     }, deps(sessions, dispatched));
     if (created.status !== 'accepted' || !created.taskId || !created.assignmentId) throw new Error('expected task');
+    const initialDelegationId = created.deliveries[0]?.delegationId;
     const assignment = registry.getAssignment(created.assignmentId)!;
     if (terminalStatus === 'blocked') {
       expect(registry.updateAssignment({
@@ -956,7 +1098,11 @@ describe('delegation send gate', () => {
         deliveryMode: 'append',
       }));
       if (result.status !== 'accepted') throw new Error('expected accepted continuation');
-      expect(result.deliveries[0]).not.toHaveProperty('delegationId');
+      if (explicitReply) {
+        expect(result.deliveries[0]).toMatchObject({ delegationId: initialDelegationId });
+      } else {
+        expect(result.deliveries[0]).not.toHaveProperty('delegationId');
+      }
       expect(registry.getAssignment(created.assignmentId)).toMatchObject({
         assignmentId: created.assignmentId, status: 'ready_for_audit',
       });

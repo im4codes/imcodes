@@ -72,6 +72,11 @@ export type ReceiveDelegationReplyResult =
   | { ok: true; record: DelegationReplyRecord; replay: boolean }
   | { ok: false; reason: 'not_found' | 'capability' | 'identity' | 'expired' | 'already_replied' | 'limit' };
 
+export type CurrentAssignmentReplyAuthority =
+  | { status: 'none' }
+  | { status: 'matched'; record: DelegationReplyRecord }
+  | { status: 'ambiguous' };
+
 export interface DelegationReplyStoreOptions {
   dbPath?: string;
   database?: DatabaseSyncInstance;
@@ -413,6 +418,51 @@ export class DelegationReplyStore {
       || current.status !== AGENT_DELEGATION_REPLY_STATUSES.PENDING
       || now >= current.expiresAt) return undefined;
     return current;
+  }
+
+  /**
+   * Resolve an ordinary reply channel for one exact active assignment.
+   * Expired/closed history is non-authoritative. A duplicate live row fails
+   * closed so a continuation can never mint a third competing authority.
+   */
+  findCurrentAssignmentAuthority(input: {
+    taskId: string;
+    assignmentId: string;
+    origin: DelegationReplyBoundIdentity;
+    target: DelegationReplyBoundIdentity;
+    now?: number;
+  }): CurrentAssignmentReplyAuthority {
+    const now = input.now ?? Date.now();
+    const rows = this.#db.prepare(`
+      SELECT delegation_id AS delegationId
+      FROM delegation_replies
+      WHERE purpose IS NULL
+        AND task_id = ?
+        AND assignment_id = ?
+        AND origin_session_name = ?
+        AND origin_session_instance_id = ?
+        AND origin_runtime_epoch = ?
+        AND target_session_name = ?
+        AND target_session_instance_id = ?
+        AND target_runtime_epoch = ?
+        AND status = ?
+        AND expires_at > ?
+    `).all(
+      input.taskId,
+      input.assignmentId,
+      input.origin.sessionName,
+      input.origin.sessionInstanceId,
+      input.origin.runtimeEpoch,
+      input.target.sessionName,
+      input.target.sessionInstanceId,
+      input.target.runtimeEpoch,
+      AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+      now,
+    ) as Array<{ delegationId?: unknown }>;
+    if (rows.length === 0) return { status: 'none' };
+    if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') return { status: 'ambiguous' };
+    const record = this.get(rows[0].delegationId);
+    return record ? { status: 'matched', record } : { status: 'none' };
   }
 
   /**

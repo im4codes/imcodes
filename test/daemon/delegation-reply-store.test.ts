@@ -180,6 +180,41 @@ describe('DelegationReplyStore', () => {
     }
   });
 
+  it('selects one exact ordinary assignment authority and fails closed on duplicate current rows', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const exact = {
+      origin,
+      target,
+      taskId: 'task-ordinary',
+      assignmentId: 'assignment-ordinary',
+      messageId: 'message-ordinary',
+    } as const;
+    const first = store.create({ ...exact, dispatchId: 'dispatch-first', now: 100 });
+    const resolve = () => store.findCurrentAssignmentAuthority({
+      taskId: exact.taskId,
+      assignmentId: exact.assignmentId,
+      origin,
+      target,
+      now: 200,
+    });
+    expect(resolve()).toMatchObject({ status: 'matched', record: { delegationId: first.record.delegationId } });
+
+    const duplicate = store.create({ ...exact, dispatchId: 'dispatch-duplicate', now: 101 });
+    expect(resolve()).toEqual({ status: 'ambiguous' });
+    store.expire(first.record.delegationId, 102);
+    expect(resolve()).toMatchObject({ status: 'matched', record: { delegationId: duplicate.record.delegationId } });
+    expect(store.receive({
+      delegationId: duplicate.record.delegationId,
+      result: 'completed',
+      sender: target,
+      now: 201,
+    })).toMatchObject({ ok: true });
+    expect(resolve()).toEqual({ status: 'none' });
+    store.close();
+    database.close();
+  });
+
   it('accepts multiple ordinary replies, deduplicates each result, and keeps them bounded', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });

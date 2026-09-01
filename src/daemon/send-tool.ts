@@ -103,6 +103,7 @@ import {
   createDelegationReplyAuthority,
   expireDelegationReplyAuthority,
 } from './delegation-reply-authority.js';
+import { getDelegationReplyStore } from './delegation-reply-store.js';
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
 import { resolveSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
@@ -635,6 +636,13 @@ async function ensureHookSupervisionAssignmentWorktree(input: {
     ))) {
       return { ok: false, error: 'supervision auditor binding already has audit progress' };
     }
+    // An exact continuation owns this already-provisioned worktree. Its
+    // implementation bytes may be dirty by design, so do not run the clean
+    // provisioning gate again. Missing paths still use the normal provisioner.
+    if (existsSync(resolveSupervisionAssignmentWorktree({
+      sessionName: input.target.name,
+      assignmentId: assignment.assignmentId,
+    }))) return { ok: true };
   } else {
     // Compatibility backstop for an already-running MCP bridge that predates
     // the explicit transport binding. Only a UNIQUE active implementer whose
@@ -932,12 +940,29 @@ export async function dispatchSendMessage(
       : input.target ?? '';
   const cacheKey = idempotencyKey ? `${caller.userId}\0${caller.sessionName}\0${idempotencyTarget}\0${idempotencyKey}` : '';
   const now = d.now();
-  const ensureAssignmentWorktree = async (taskId: string, assignmentId: string, sessionName: string) => {
+  const ensureAssignmentWorktree = async (
+    taskId: string,
+    assignmentId: string,
+    sessionName: string,
+    existingAssignment = false,
+  ) => {
+    const registry = getSupervisionTaskRegistry();
+    const task = registry.get(taskId);
+    const worktreePath = resolveSupervisionAssignmentWorktree({ sessionName, assignmentId });
+    if (existingAssignment && existsSync(worktreePath)) {
+      return {
+        ok: true as const,
+        value: {
+          ok: true as const,
+          worktreePath,
+          baseRevision: task?.baseRevision ?? '',
+          created: false,
+        },
+      };
+    }
     if (!caller.projectRoot) {
       return { ok: false as const, error: 'assignment worktree provisioning requires the caller project root' };
     }
-    const registry = getSupervisionTaskRegistry();
-    const task = registry.get(taskId);
     const ensured = await (deps?.ensureSupervisionAssignmentWorktree
       ?? defaultEnsureSupervisionAssignmentWorktree)({
         projectRoot: caller.projectRoot,
@@ -962,7 +987,12 @@ export async function dispatchSendMessage(
       if (cached.result.taskId && cached.result.assignmentId) {
         const assignment = getSupervisionTaskRegistry().getAssignment(cached.result.assignmentId);
         if (assignment?.role === 'implementer' || assignment?.role === 'auditor') {
-          const ensured = await ensureAssignmentWorktree(cached.result.taskId, cached.result.assignmentId, assignment.identity.sessionName);
+          const ensured = await ensureAssignmentWorktree(
+            cached.result.taskId,
+            cached.result.assignmentId,
+            assignment.identity.sessionName,
+            true,
+          );
           if (!ensured.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: ensured.error };
         }
       }
@@ -1381,7 +1411,12 @@ export async function dispatchSendMessage(
         };
       }
     }
-    const ensured = await ensureAssignmentWorktree(taskId, assignment.value.assignmentId, targetIdentity.sessionName);
+    const ensured = await ensureAssignmentWorktree(
+      taskId,
+      assignment.value.assignmentId,
+      targetIdentity.sessionName,
+      Boolean(reusedAssignment),
+    );
     if (!ensured.ok) {
       return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: ensured.error };
     }
@@ -1421,11 +1456,46 @@ export async function dispatchSendMessage(
     // mint a second reply authority/card merely to deliver an addendum. The
     // original assignment's append-only reply channel remains authoritative;
     // callers can still explicitly request a fresh ordinary reply channel.
-    const replyRequired = !reusedContinuationAssignment && (
-      input.reply === true || Boolean(supervisedTaskId && supervisedAssignmentId)
-    );
-    const replyAuthority = replyRequired
-      ? createDelegationReplyAuthority({
+    const replyRequired = input.reply === true
+      || (!reusedContinuationAssignment && Boolean(supervisedTaskId && supervisedAssignmentId));
+    let replyAuthority: ReturnType<typeof createDelegationReplyAuthority> = null;
+    let createdReplyAuthority = false;
+    if (replyRequired && reusedContinuationAssignment && input.reply === true
+      && supervisedTaskId && supervisedAssignmentId
+      && callerRecord?.sessionInstanceId?.trim() && callerRecord.runtimeEpoch?.trim()
+      && target.sessionInstanceId?.trim() && target.runtimeEpoch?.trim()) {
+      const current = getDelegationReplyStore().findCurrentAssignmentAuthority({
+        taskId: supervisedTaskId,
+        assignmentId: supervisedAssignmentId,
+        origin: {
+          sessionName: callerRecord.name,
+          sessionInstanceId: callerRecord.sessionInstanceId.trim(),
+          runtimeEpoch: callerRecord.runtimeEpoch.trim(),
+        },
+        target: {
+          sessionName: target.name,
+          sessionInstanceId: target.sessionInstanceId.trim(),
+          runtimeEpoch: target.runtimeEpoch.trim(),
+        },
+        now,
+      });
+      if (current.status === 'ambiguous') {
+        deliveries.push({
+          target: target.name,
+          status: 'failed',
+          error: 'task continuation has multiple current reply authorities',
+        });
+        continue;
+      }
+      if (current.status === 'matched') {
+        replyAuthority = {
+          record: current.record,
+          authority: { delegationId: current.record.delegationId },
+        };
+      }
+    }
+    if (replyRequired && !replyAuthority) {
+      replyAuthority = createDelegationReplyAuthority({
           origin: callerRecord,
           target,
           dispatchId,
@@ -1437,8 +1507,9 @@ export async function dispatchSendMessage(
           ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
           ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
           now,
-        })
-      : null;
+        });
+      createdReplyAuthority = Boolean(replyAuthority);
+    }
     if (replyRequired && !replyAuthority) {
       deliveries.push({
         target: target.name,
@@ -1511,7 +1582,7 @@ export async function dispatchSendMessage(
         status: dispatchResult === 'queued' ? 'queued' : 'delivered',
       });
     } catch (err) {
-      if (replyAuthority) expireDelegationReplyAuthority(replyAuthority.record.delegationId);
+      if (replyAuthority && createdReplyAuthority) expireDelegationReplyAuthority(replyAuthority.record.delegationId);
       deliveries.push({ target: target.name, status: 'failed', error: sanitizeMcpErrorMessage(err) });
     }
   }

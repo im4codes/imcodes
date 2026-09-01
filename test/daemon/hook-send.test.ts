@@ -742,6 +742,60 @@ describe('Hook server /send endpoint', () => {
       }
     });
 
+    it('uses an explicit binding without reprovisioning an existing dirty assignment worktree', async () => {
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-explicit-continuation-'));
+      const previousRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = temp;
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code', projectDir: '/unused/project',
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const worker = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Coder', agentType: 'codex',
+        sessionInstanceId: 'worker-instance', runtimeEpoch: 'worker-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
+      listSessionsMock.mockReturnValue([brain, worker]);
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'explicit-bypass-one';
+      const assignmentId = `${taskId}-assignment`;
+      expect(registry.createOrGet({ taskId, projectName: 'proj', objective: 'continuation' }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', scopeFiles: [],
+        identity: {
+          sessionName: worker.name,
+          sessionInstanceId: worker.sessionInstanceId,
+          runtimeEpoch: worker.runtimeEpoch,
+          agentType: worker.agentType,
+          providerFamily: 'openai',
+        },
+      }).ok).toBe(true);
+      const worktree = resolveSupervisionAssignmentWorktree({ sessionName: worker.name, assignmentId });
+      mkdirSync(worktree, { recursive: true });
+      writeFileSync(join(worktree, 'dirty.ts'), 'implementation bytes\n');
+
+      try {
+        const delivered = await postSend(port, {
+          from: brain.name,
+          to: worker.name,
+          message: 'continue exact assignment',
+          supervision: { taskId, assignmentId },
+        });
+        expect(delivered).toMatchObject({
+          status: 200,
+          body: { ok: true, delivered: true, target: worker.name },
+        });
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+          worker.name,
+          'continue exact assignment',
+        );
+      } finally {
+        if (previousRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+        else process.env.IMCODES_WORKTREES_ROOT = previousRoot;
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
     it('delivers shell-originated callback sends when the target is an exact active session name', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });

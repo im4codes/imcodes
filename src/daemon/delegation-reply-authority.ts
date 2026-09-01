@@ -40,13 +40,13 @@ export function createDelegationReplyAuthority(input: {
     target,
     dispatchId: input.dispatchId,
     messageId: input.messageId,
+    ...(input.taskId ? { taskId: input.taskId } : {}),
+    ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
     ...(input.audit ? {
       purpose: input.audit.kind,
       auditAttemptId: input.audit.attemptId,
       auditedSessionName: input.audit.auditedSessionName,
       ...(input.auditRevision ? { auditRevision: input.auditRevision } : {}),
-      ...(input.taskId ? { taskId: input.taskId } : {}),
-      ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
     } : {}),
     ...(input.now !== undefined ? { now: input.now } : {}),
   });
