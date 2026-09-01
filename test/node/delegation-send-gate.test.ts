@@ -633,6 +633,145 @@ describe('delegation send gate', () => {
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
   });
 
+  it('redelivers one exact pending auditor with stable identity and never scans or creates another assignment', async () => {
+    const auditorConfig = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]');
+    const brain = supervisedBrain([auditorConfig]);
+    const audited = supervisedChild({
+      name: 'deck_alpha_impl', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const auditor = supervisedChild({
+      name: 'deck_alpha_auditor', role: 'w2', agentType: 'claude-code-sdk', model: 'opus[1M]',
+    });
+    const sessions = [brain, audited, auditor];
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'tsk_3f4';
+    const assignmentId = 'asg_3g0';
+    const attemptId = 'tsk_3f4-r1-manual-audit-cx1-v1';
+    const revision = 'supervision-reply-continuation-recovery-cx7-r1-d4406e3f';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task', objective: 'exact fallback audit', currentRevision: revision,
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', required: false,
+      identity: {
+        sessionName: brain.name,
+        sessionInstanceId: brain.sessionInstanceId,
+        runtimeEpoch: brain.runtimeEpoch,
+        agentType: brain.agentType,
+        providerFamily: 'openai',
+      },
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId, assignmentId, role: 'auditor',
+      identity: {
+        sessionName: auditor.name,
+        sessionInstanceId: auditor.sessionInstanceId,
+        runtimeEpoch: auditor.runtimeEpoch,
+        agentType: auditor.agentType,
+        providerFamily: 'anthropic',
+      },
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+    }).ok).toBe(true);
+    for (const suffix of ['missing-one', 'missing-two']) {
+      expect(registry.createOrGet({
+        taskId: `interferer-${suffix}`, projectName: 'alpha', objective: suffix,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        taskId: `interferer-${suffix}`, role: 'implementer',
+        identity: {
+          sessionName: auditor.name,
+          sessionInstanceId: auditor.sessionInstanceId,
+          runtimeEpoch: auditor.runtimeEpoch,
+          agentType: auditor.agentType,
+          providerFamily: 'anthropic',
+        },
+      }).ok).toBe(true);
+    }
+
+    const ensured = vi.fn(async (input: { assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: `/worktrees/${input.assignmentId}/repo`,
+      baseRevision: 'a'.repeat(40),
+      created: true,
+    }));
+    const messageIds: string[] = [];
+    const dispatchMessage = vi.fn(async (_target: SessionRecord, _message: string, options: { messageId: string; supervision?: { taskId: string; assignmentId: string } }) => {
+      messageIds.push(options.messageId);
+      expect(options.supervision).toEqual({ taskId, assignmentId });
+      if (messageIds.length === 1) throw new Error('simulated pre-delivery bridge failure');
+    });
+    const request = {
+      target: auditor.name,
+      message: 'redeliver the original exact audit',
+      reply: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId,
+        auditedSessionName: audited.name,
+      },
+      task: {
+        taskId,
+        assignmentId,
+        executionPool: 'primary' as const,
+        currentRevision: revision,
+        auditRevision: revision,
+        auditAttemptId: attemptId,
+      },
+    };
+    const injected = {
+      ...deps(sessions, dispatchMessage),
+      ensureSupervisionAssignmentWorktree: ensured,
+      hasDeliveryEvidence: () => false,
+    };
+
+    await expect(dispatchSendMessage(caller, request, injected)).resolves.toMatchObject({
+      status: 'error', error: 'simulated pre-delivery bridge failure',
+    });
+    await expect(dispatchSendMessage(caller, request, injected)).resolves.toMatchObject({
+      status: 'accepted', taskId, assignmentId,
+    });
+    expect(messageIds).toHaveLength(2);
+    expect(messageIds[0]).toBe(messageIds[1]);
+    expect(ensured.mock.calls.map(([input]) => input.assignmentId)).toEqual([assignmentId, assignmentId]);
+    expect(registry.get(taskId)?.assignments.filter((assignment) => assignment.role === 'auditor'))
+      .toEqual([expect.objectContaining({ assignmentId, auditAttemptId: attemptId, auditRevision: revision })]);
+
+    ensured.mockClear();
+    dispatchMessage.mockClear();
+    await expect(dispatchSendMessage(caller, {
+      ...request,
+      task: { ...request.task, auditRevision: 'different-revision' },
+    }, injected)).resolves.toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('exact pending assignment'),
+    });
+    expect(ensured).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+
+    await expect(dispatchSendMessage(caller, request, {
+      ...injected,
+      hasDeliveryEvidence: () => true,
+    })).resolves.toMatchObject({
+      status: 'error',
+      error: 'audit redelivery rejected because durable delivery evidence already exists',
+    });
+    expect(ensured).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+
+    expect(registry.updateAssignment({
+      assignmentId,
+      identity: registry.getAssignment(assignmentId)!.identity,
+      status: 'auditing',
+    }).ok).toBe(true);
+    await expect(dispatchSendMessage(caller, request, injected)).resolves.toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('no audit progress'),
+    });
+    expect(ensured).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
   it('rejects integration_slice audit registration before registry, reply, or dispatch side effects', async () => {
     const auditorConfig = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]');
     const brain = supervisedBrain([auditorConfig]);

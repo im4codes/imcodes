@@ -44,7 +44,9 @@ describe('DelegationReplyStore', () => {
       capabilityHash: '',
     });
     expect(store.matchPendingAuditAuthority({
-      auditAttemptId: 'audit_attempt_1', sender: target, now: created.record.expiresAt + 1,
+      taskId: 'supervision_task_1', assignmentId: 'supervision_assignment_1',
+      auditAttemptId: 'audit_attempt_1', auditRevision: 'revision-1',
+      sender: target, now: created.record.expiresAt + 1,
     })?.delegationId).toBe(created.record.delegationId);
     expect(store.receive({
       delegationId: created.record.delegationId,
@@ -72,9 +74,15 @@ describe('DelegationReplyStore', () => {
       auditAttemptId: 'attempt-audit-1', auditRevision: 'revision-1',
       taskId: 'task-1', assignmentId: 'assignment-1', now: 100,
     });
-    expect(store.matchPendingAuditAuthority({ auditAttemptId: 'attempt-audit-1', sender: target, now: 101 })?.delegationId)
+    expect(store.matchPendingAuditAuthority({
+      taskId: 'task-1', assignmentId: 'assignment-1', auditAttemptId: 'attempt-audit-1',
+      auditRevision: 'revision-1', sender: target, now: 101,
+    })?.delegationId)
       .toBe(created.record.delegationId);
-    expect(store.matchPendingAuditAuthority({ auditAttemptId: 'attempt-audit-other', sender: target, now: 101 })).toBeUndefined();
+    expect(store.matchPendingAuditAuthority({
+      taskId: 'task-1', assignmentId: 'assignment-1', auditAttemptId: 'attempt-audit-other',
+      auditRevision: 'revision-1', sender: target, now: 101,
+    })).toBeUndefined();
 
     const rebound = { sessionName: target.sessionName, sessionInstanceId: 'replacement-instance', runtimeEpoch: 'replacement-epoch' };
     expect(store.rebindAssignmentTarget({
@@ -87,6 +95,60 @@ describe('DelegationReplyStore', () => {
       .toEqual({ ok: false, reason: 'identity' });
     expect(store.receive({ delegationId: created.record.delegationId, result: 'after rebind', sender: rebound }))
       .toMatchObject({ ok: true, replay: false });
+    store.close();
+    database.close();
+  });
+
+  it('selects one exact current audit authority while expired and mismatched history remains non-authoritative', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const exact = {
+      origin,
+      target,
+      messageId: 'message-stable',
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-exact',
+      auditRevision: 'revision-exact',
+      taskId: 'task-exact',
+      assignmentId: 'assignment-exact',
+    } as const;
+    const expired = store.create({ ...exact, dispatchId: 'dispatch-failed', now: 100 });
+    store.expire(expired.record.delegationId, 101);
+    store.create({ ...exact, dispatchId: 'dispatch-old-attempt', auditAttemptId: 'attempt-old', now: 102 });
+    store.create({ ...exact, dispatchId: 'dispatch-old-revision', auditRevision: 'revision-old', now: 103 });
+    store.create({ ...exact, dispatchId: 'dispatch-other-task', taskId: 'task-other', now: 104 });
+    store.create({ ...exact, dispatchId: 'dispatch-other-assignment', assignmentId: 'assignment-other', now: 105 });
+    store.create({
+      ...exact,
+      dispatchId: 'dispatch-old-sender',
+      target: { ...target, runtimeEpoch: 'old-epoch' },
+      now: 105,
+    });
+    const current = store.create({ ...exact, dispatchId: 'dispatch-redelivery', now: 106 });
+    const match = () => store.matchPendingAuditAuthority({
+      taskId: exact.taskId,
+      assignmentId: exact.assignmentId,
+      auditAttemptId: exact.auditAttemptId,
+      auditRevision: exact.auditRevision,
+      sender: target,
+      now: 107,
+    });
+
+    expect(store.get(expired.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
+    expect(match()?.delegationId).toBe(current.record.delegationId);
+    expect(match()?.messageId).toBe(exact.messageId);
+    expect(store.matchPendingAuditAuthority({
+      taskId: exact.taskId,
+      assignmentId: exact.assignmentId,
+      auditAttemptId: exact.auditAttemptId,
+      auditRevision: exact.auditRevision,
+      sender: { ...target, runtimeEpoch: 'wrong-epoch' },
+      now: 107,
+    })).toBeUndefined();
+
+    store.create({ ...exact, dispatchId: 'dispatch-conflicting-current', now: 108 });
+    expect(match()).toBeUndefined();
+    expect(store.get(expired.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
     store.close();
     database.close();
   });
@@ -106,7 +168,9 @@ describe('DelegationReplyStore', () => {
 
       const reopened = new DelegationReplyStore({ dbPath });
       expect(reopened.matchPendingAuditAuthority({
-        auditAttemptId: 'attempt-restart', sender: target, now: created.record.expiresAt + 10_000,
+        taskId: 'task-restart', assignmentId: 'assignment-restart',
+        auditAttemptId: 'attempt-restart', auditRevision: 'revision-restart',
+        sender: target, now: created.record.expiresAt + 10_000,
       })).toMatchObject({ taskId: 'task-restart', assignmentId: 'assignment-restart' });
       expect(reopened.receive({ delegationId: created.record.delegationId, result: 'restored', sender: target }))
         .toMatchObject({ ok: true, replay: false });

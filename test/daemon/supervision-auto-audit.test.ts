@@ -512,6 +512,12 @@ describe('automatic supervision audit materialization', () => {
         },
         auditRoutingReason: 'cross_vendor_preferred',
       }),
+      ensureSupervisionAssignmentWorktree: async ({ assignmentId }) => ({
+        ok: true,
+        worktreePath: `/worktrees/${assignmentId}/repo`,
+        baseRevision: 'a'.repeat(40),
+        created: true,
+      }),
     });
 
     const result = await dispatchReadyAudit(taskId, {
@@ -526,7 +532,10 @@ describe('automatic supervision audit materialization', () => {
     expect(result, JSON.stringify(result)).toMatchObject({ status: 'dispatched', attemptId: automaticAttempt(taskId, revision) });
     expect(dispatchMessage).toHaveBeenCalledOnce();
     const options = dispatchMessage.mock.calls[0]![2];
-    expect(options).toMatchObject({ durableQueue: true });
+    expect(options).toMatchObject({
+      durableQueue: true,
+      supervision: { taskId, assignmentId: result.status === 'dispatched' ? result.assignmentId : '' },
+    });
     expect(options.messageId).toMatch(/^send_message_[0-9a-f-]{36}$/);
     expect(registry.get(result.status === 'dispatched' ? taskId : '')?.assignments)
       .toEqual(expect.arrayContaining([expect.objectContaining({

@@ -43,6 +43,7 @@ import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
+import { isSendMessageId, type SendMessageId } from '../../shared/send-message-id.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -351,6 +352,7 @@ interface SendRequest {
   reply?: boolean;
   deliveryMode?: MemoryMcpSendDeliveryMode;
   supervision?: { taskId: string; assignmentId: string };
+  messageId?: SendMessageId;
 }
 
 function validSupervisionSendBinding(value: unknown): value is NonNullable<SendRequest['supervision']> {
@@ -382,6 +384,9 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   }
   if (body.supervision !== undefined && !validSupervisionSendBinding(body.supervision)) {
     return { status: 400, body: { ok: false, error: 'invalid supervision binding' } };
+  }
+  if (body.messageId !== undefined && (!body.supervision || !isSendMessageId(body.messageId))) {
+    return { status: 400, body: { ok: false, error: 'invalid supervised message id' } };
   }
 
   if (containsLegacyAuditControlMarker(message)) {
@@ -454,6 +459,7 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
       reply: body.reply === true,
       ...(body.deliveryMode ? { deliveryMode: body.deliveryMode } : {}),
       ...(body.supervision ? { supervision: body.supervision } : {}),
+      ...(body.messageId ? { messageId: body.messageId } : {}),
     });
   } catch (err) {
     return { status: 400, body: { ok: false, error: (err as Error).message } };

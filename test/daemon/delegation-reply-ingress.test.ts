@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_VERSION,
@@ -68,6 +69,7 @@ import {
   submitPeerAuditReply,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 import { onDelegationReplyDelivered } from '../../src/daemon/delegation-reply-events.js';
+import { DelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import { ensureTransportRuntimeAvailable } from '../../src/agent/session-manager.js';
 
 const origin = {
@@ -245,7 +247,10 @@ describe('delegation reply ingress', () => {
     })).resolves.toEqual({ ok: true });
 
     expect(mocks.store.matchPendingAuditAuthority).toHaveBeenCalledWith({
+      taskId: auditRecord.taskId,
+      assignmentId: auditRecord.assignmentId,
       auditAttemptId: auditRecord.auditAttemptId,
+      auditRevision: auditRecord.auditRevision,
       sender: target,
       now: 100,
     });
@@ -290,6 +295,83 @@ describe('delegation reply ingress', () => {
       expect.objectContaining({ result: expect.stringContaining('"attemptId":"attempt_manual_audit_1"') }),
       expect.any(Object),
     );
+  });
+
+  it('accepts one final peer audit after failed dispatch expires old authority and exact redelivery mints the sole current authority', async () => {
+    const store = new DelegationReplyStore({ dbPath: ':memory:' });
+    const taskId = 'tsk_redelivery';
+    const assignmentId = 'asg_redelivery_auditor';
+    const attemptId = 'attempt-redelivery-r1';
+    const revision = 'revision-redelivery-r1';
+    const messageId = 'send_message_redelivery-stable';
+    const bound = {
+      origin,
+      target,
+      messageId,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      auditedSessionName: origin.sessionName,
+      taskId,
+      assignmentId,
+    } as const;
+    const failed = store.create({ ...bound, dispatchId: 'dispatch-failed', now: 10 });
+    store.expire(failed.record.delegationId, 11);
+    const redelivery = store.create({ ...bound, dispatchId: 'dispatch-redelivery', now: 12 });
+    const auditorAssignments = [{
+      assignmentId,
+      taskId,
+      role: 'auditor',
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    }];
+    mocks.store.matchPendingAuditAuthority.mockImplementation((input) => store.matchPendingAuditAuthority(input));
+    mocks.store.receive.mockImplementation((input) => store.receive(input));
+    mocks.getAssignment.mockImplementation((requested: string) => (
+      auditorAssignments.find((assignment) => assignment.assignmentId === requested)
+    ));
+
+    try {
+      await expect(submitPeerAuditReply({
+        rawBody: JSON.stringify({
+          version: PEER_AUDIT_REPLY_VERSION,
+          taskId,
+          assignmentId,
+          attemptId,
+          revision,
+          receiptKind: 'final',
+          verdict: 'PASS',
+          findings: 'Exact redelivery authority accepted.',
+          validations: [{ kind: 'test', label: 'redelivery', outcome: 'passed', summary: 'exact chain passed' }],
+        }),
+        senderSessionName: target.sessionName,
+        now: 20,
+      })).resolves.toEqual({ ok: true });
+
+      expect(auditorAssignments).toHaveLength(1);
+      expect(mocks.store.matchPendingAuditAuthority).toHaveBeenCalledWith({
+        taskId,
+        assignmentId,
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        sender: target,
+        now: 20,
+      });
+      expect(store.get(failed.record.delegationId)?.status).toBe('expired');
+      expect(store.get(redelivery.record.delegationId)).toMatchObject({
+        status: 'received',
+        taskId,
+        assignmentId,
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        messageId,
+      });
+      expect(mocks.appendMatchingAuditReceipt).toHaveBeenCalledOnce();
+      expect(mocks.finishAssignment).toHaveBeenCalledOnce();
+    } finally {
+      store.close();
+    }
   });
 
   it('persists progress without Brain chatter and reports a blocked final handoff once', async () => {

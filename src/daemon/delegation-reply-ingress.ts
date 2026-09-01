@@ -146,12 +146,6 @@ async function submitDelegatedPeerAuditReply(input: {
 }): Promise<{ ok: true } | { ok: false; error: typeof PEER_AUDIT_REPLY_ERRORS[keyof typeof PEER_AUDIT_REPLY_ERRORS] }> {
   const senderIdentity = boundIdentity(input.sender);
   if (!senderIdentity) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH };
-  let authority = getDelegationReplyStore().matchPendingAuditAuthority({
-    auditAttemptId: input.envelope.attemptId,
-    sender: senderIdentity,
-    now: input.receivedAt,
-  });
-  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
   const taskId = input.envelope.taskId?.trim();
   const assignmentId = input.envelope.assignmentId?.trim();
   const revision = input.envelope.revision?.trim();
@@ -159,6 +153,15 @@ async function submitDelegatedPeerAuditReply(input: {
   if (!taskId || !assignmentId || !revision || !receiptKind) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH };
   }
+  let authority = getDelegationReplyStore().matchPendingAuditAuthority({
+    taskId,
+    assignmentId,
+    auditAttemptId: input.envelope.attemptId,
+    auditRevision: revision,
+    sender: senderIdentity,
+    now: input.receivedAt,
+  });
+  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
   if ((authority.taskId && authority.taskId !== taskId)
     || (authority.assignmentId && authority.assignmentId !== assignmentId)
     || (authority.auditRevision && authority.auditRevision !== revision)) {

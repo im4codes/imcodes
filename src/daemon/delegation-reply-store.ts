@@ -424,26 +424,46 @@ export class DelegationReplyStore {
    * fail-closed authority and survives daemon restart.
    */
   matchPendingAuditAuthority(input: {
+    taskId: string;
+    assignmentId: string;
     auditAttemptId: string;
+    auditRevision: string;
     sender: DelegationReplyBoundIdentity;
     now?: number;
   }): DelegationReplyRecord | undefined {
     const rows = this.#db.prepare(`
       SELECT delegation_id AS delegationId
       FROM delegation_replies
-      WHERE purpose = ? AND audit_attempt_id = ?
+      WHERE purpose = ?
+        AND task_id = ?
+        AND assignment_id = ?
+        AND audit_attempt_id = ?
+        AND audit_revision = ?
+        AND target_session_name = ?
+        AND target_session_instance_id = ?
+        AND target_runtime_epoch = ?
+        AND status = ?
     `).all(
       AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      input.taskId,
+      input.assignmentId,
       input.auditAttemptId,
+      input.auditRevision,
+      input.sender.sessionName,
+      input.sender.sessionInstanceId,
+      input.sender.runtimeEpoch,
+      AGENT_DELEGATION_REPLY_STATUSES.PENDING,
     ) as Array<{ delegationId?: unknown }>;
     if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') return undefined;
     const current = this.get(rows[0].delegationId);
-    const now = input.now ?? Date.now();
     return current
       && current.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+      && current.taskId === input.taskId
+      && current.assignmentId === input.assignmentId
       && current.auditAttemptId === input.auditAttemptId
-      && (Boolean(current.taskId && current.assignmentId)
-        || (current.status !== AGENT_DELEGATION_REPLY_STATUSES.EXPIRED && now < current.expiresAt))
+      && current.auditRevision === input.auditRevision
+      && current.status === AGENT_DELEGATION_REPLY_STATUSES.PENDING
+      && identityMatches(current.target, input.sender)
       ? current
       : undefined;
   }

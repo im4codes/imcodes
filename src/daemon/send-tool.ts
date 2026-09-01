@@ -348,6 +348,8 @@ export interface HookSendDispatchInput {
   newWorkload?: boolean;
   /** Registry binding supplied by the managed MCP bridge for supervised work. */
   supervision?: { taskId: string; assignmentId: string };
+  /** Stable supervised delivery id supplied by the managed MCP bridge. */
+  messageId?: SendMessageId;
 }
 
 export interface HookSendDispatchResult {
@@ -368,6 +370,8 @@ export interface SendToolDeps {
   cancelSession?: (target: SessionRecord) => Promise<boolean>;
   isDispatchEnabled?: () => boolean;
   exactTargetOnly?: boolean;
+  /** Testable boundary for an already durably accepted supervised delivery. */
+  hasDeliveryEvidence?: (sessionName: string, messageId: SendMessageId) => boolean;
   /**
    * Whether the daemon currently advertises {@link EXECUTION_CLONE_CAPABILITY_V1}.
    * The clone send/destroy path is gated on this; defaults to `true` because the
@@ -562,6 +566,8 @@ const HOOK_WORKTREE_RECOVERY_STATUSES = new Set([
   'rework',
 ]);
 
+const AUDITOR_REDELIVERY_STATUS = 'delegated';
+
 function assignmentMatchesLiveTargetBase(
   assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
   target: SessionRecord,
@@ -584,6 +590,28 @@ function assignmentMatchesLiveTarget(
     && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target);
 }
 
+function explicitAssignmentMatchesLiveTarget(
+  task: SupervisionTaskSnapshot | undefined,
+  assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
+  target: SessionRecord,
+): boolean {
+  if (!task || !assignment || assignment.taskId !== task.taskId) return false;
+  if (assignment.role === 'implementer') return assignmentMatchesLiveTarget(assignment, target);
+  return Boolean(
+    assignment.role === 'auditor'
+    && assignment.required
+    && assignment.status === AUDITOR_REDELIVERY_STATUS
+    && assignment.auditAttemptId
+    && assignment.auditRevision
+    && task.currentRevision === assignment.auditRevision
+    && assignment.identity.sessionName === target.name
+    && assignment.identity.sessionInstanceId === target.sessionInstanceId
+    && assignment.identity.runtimeEpoch === target.runtimeEpoch
+    && assignment.identity.agentType === target.agentType
+    && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target)
+  );
+}
+
 async function ensureHookSupervisionAssignmentWorktree(input: {
   callerRecord?: SessionRecord;
   projectRoot?: string | null;
@@ -598,9 +626,17 @@ async function ensureHookSupervisionAssignmentWorktree(input: {
   if (input.binding) {
     if (!task || !assignment
       || assignment.taskId !== task.taskId
-      || !assignmentMatchesLiveTarget(assignment, input.target)
+      || !explicitAssignmentMatchesLiveTarget(task, assignment, input.target)
       || (input.callerRecord?.projectName && task.projectName !== input.callerRecord.projectName)) {
-      return { ok: false, error: 'supervision binding does not match the live task, implementer, and target identity' };
+      return { ok: false, error: 'supervision binding does not match the live task, assignment, revision, and target identity' };
+    }
+    const boundAudit = assignment?.role === 'auditor' ? assignment : undefined;
+    if (boundAudit && task && registry.listAuditReceipts(task.taskId).some((receipt) => (
+      receipt.assignmentId === boundAudit.assignmentId
+      && receipt.attemptId === boundAudit.auditAttemptId
+      && receipt.revision === boundAudit.auditRevision
+    ))) {
+      return { ok: false, error: 'supervision auditor binding already has audit progress' };
     }
   } else {
     // Compatibility backstop for an already-running MCP bridge that predates
@@ -846,13 +882,6 @@ export async function dispatchSendMessage(
       error: 'task.assignmentId requires an existing taskId',
     };
   }
-  if (input.audit && input.task?.assignmentId?.trim()) {
-    return {
-      status: 'error',
-      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
-      error: 'audit registration cannot reuse an implementer assignmentId',
-    };
-  }
   if (Buffer.byteLength(input.message, 'utf8') > MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES) {
     return { status: 'error', reason: MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED, error: `message exceeds ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} bytes` };
   }
@@ -868,6 +897,14 @@ export async function dispatchSendMessage(
       status: 'error',
       reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
       error: 'audit metadata requires one exact reply-enabled non-clone target and a valid attemptId',
+    };
+  }
+  if (input.audit && input.task?.auditAttemptId?.trim()
+    && input.task.auditAttemptId.trim() !== input.audit.attemptId) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'audit task binding attemptId does not match audit metadata',
     };
   }
 
@@ -927,7 +964,7 @@ export async function dispatchSendMessage(
     if (cached && cached.expiresAt > now) {
       if (cached.result.taskId && cached.result.assignmentId) {
         const assignment = getSupervisionTaskRegistry().getAssignment(cached.result.assignmentId);
-        if (assignment?.role === 'implementer') {
+        if (assignment?.role === 'implementer' || assignment?.role === 'auditor') {
           const ensured = await ensureAssignmentWorktree(cached.result.taskId, cached.result.assignmentId, assignment.identity.sessionName);
           if (!ensured.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: ensured.error };
         }
@@ -1091,6 +1128,7 @@ export async function dispatchSendMessage(
   let supervisedExecutionBinding: SupervisionExecutionBinding | undefined;
   let supervisedWorktree: Extract<SupervisionWorktreeProvisionResult, { ok: true }> | undefined;
   let reusedContinuationAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
+  let reusedAuditAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
 
   if (input.task) {
     const targetRecord = dispatchable[0]!;
@@ -1162,7 +1200,20 @@ export async function dispatchSendMessage(
           error: 'integration_slice cannot register an audit; merge validated slices into one integration_task revision first',
         };
       }
-      if (!input.audit) {
+      if (input.audit) {
+        const requestedAssignmentId = input.task.assignmentId?.trim();
+        if (requestedAssignmentId) {
+          const candidate = existing.assignments.find((assignment) => assignment.assignmentId === requestedAssignmentId);
+          if (!candidate) {
+            return {
+              status: 'error',
+              reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+              error: 'audit redelivery requires an exact existing assignment',
+            };
+          }
+          reusedAuditAssignment = candidate;
+        }
+      } else {
         const implementers = existing.assignments.filter((assignment) => assignment.role === 'implementer');
         if (input.task.assignmentId?.trim() && implementers.length === 0) {
           return {
@@ -1265,8 +1316,9 @@ export async function dispatchSendMessage(
         }
       }
     }
-    const assignment = reusedContinuationAssignment
-      ? { ok: true as const, value: reusedContinuationAssignment, replay: true as const }
+    const reusedAssignment = reusedAuditAssignment ?? reusedContinuationAssignment;
+    const assignment = reusedAssignment
+      ? { ok: true as const, value: reusedAssignment, replay: true as const }
       : registry.createAssignment({
           taskId,
           role: input.audit ? 'auditor' : 'implementer',
@@ -1287,13 +1339,52 @@ export async function dispatchSendMessage(
 
     supervisedTaskId = taskId;
     supervisedAssignmentId = assignment.value.assignmentId;
-    if (!input.audit) {
-      const ensured = await ensureAssignmentWorktree(taskId, assignment.value.assignmentId, targetIdentity.sessionName);
-      if (!ensured.ok) {
-        return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: ensured.error };
+    if (input.audit && assignment.replay) {
+      const authoritativeTask = registry.get(taskId);
+      const requestedAttemptId = input.task.auditAttemptId?.trim() || input.audit.attemptId;
+      const requestedRevision = String(
+        input.task.auditRevision ?? input.task.currentRevision ?? authoritativeTask?.currentRevision ?? '',
+      ).trim();
+      const receipts = registry.listAuditReceipts(taskId).filter((receipt) => (
+        receipt.assignmentId === assignment.value.assignmentId
+        && receipt.attemptId === assignment.value.auditAttemptId
+        && receipt.revision === assignment.value.auditRevision
+      ));
+      const sameTarget = assignment.value.identity.sessionName === targetIdentity.sessionName
+        && assignment.value.identity.sessionInstanceId === targetIdentity.sessionInstanceId
+        && assignment.value.identity.runtimeEpoch === targetIdentity.runtimeEpoch
+        && assignment.value.identity.agentType === targetIdentity.agentType
+        && assignment.value.identity.providerFamily === targetIdentity.providerFamily;
+      if (assignment.value.role !== 'auditor'
+        || assignment.value.status !== AUDITOR_REDELIVERY_STATUS
+        || assignment.value.auditAttemptId !== requestedAttemptId
+        || !requestedRevision
+        || assignment.value.auditRevision !== requestedRevision
+        || authoritativeTask?.currentRevision !== requestedRevision
+        || !sameTarget
+        || receipts.length > 0) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+          error: 'audit redelivery requires the exact pending assignment, target, attempt, revision, and identity with no audit progress',
+        };
       }
-      supervisedWorktree = ensured.value;
+      const messageId = deterministicSendMessageId(
+        `${input.automaticSupervision ? 'auto' : 'manual'}-audit:${assignment.value.assignmentId}:${input.audit.attemptId}`,
+      );
+      if ((deps?.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(targetIdentity.sessionName, messageId)) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: 'audit redelivery rejected because durable delivery evidence already exists',
+        };
+      }
     }
+    const ensured = await ensureAssignmentWorktree(taskId, assignment.value.assignmentId, targetIdentity.sessionName);
+    if (!ensured.ok) {
+      return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: ensured.error };
+    }
+    supervisedWorktree = ensured.value;
   }
 
   const delegatedAuditRevision = input.task
@@ -1316,8 +1407,8 @@ export async function dispatchSendMessage(
 
   for (const target of dispatchable) {
     const messageId = input.internalMessageId
-      ?? (input.automaticSupervision && supervisedAssignmentId && input.audit
-        ? deterministicSendMessageId(`auto-audit:${supervisedAssignmentId}:${input.audit.attemptId}`)
+      ?? (supervisedAssignmentId && input.audit
+        ? deterministicSendMessageId(`${input.automaticSupervision ? 'auto' : 'manual'}-audit:${supervisedAssignmentId}:${input.audit.attemptId}`)
         : createSendMessageId());
     // A newly registered assignment must always have an authenticated return
     // path. Without this, a worker that hits illegal_transition or a contract
@@ -1405,7 +1496,7 @@ export async function dispatchSendMessage(
         messageId,
         ...(input.internalDurableQueue ? { durableQueue: true } : {}),
         deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
-        ...(!input.audit && supervisedTaskId && supervisedAssignmentId
+        ...(supervisedTaskId && supervisedAssignmentId
           ? { supervision: { taskId: supervisedTaskId, assignmentId: supervisedAssignmentId } }
           : {}),
         ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
@@ -2233,7 +2324,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       errors.push(`${target.name}: ${worktreeGate.error}`);
       continue;
     }
-    const messageId = createSendMessageId();
+    const messageId = input.messageId ?? createSendMessageId();
     const replyAuthority = input.reply
       ? createDelegationReplyAuthority({
           origin: callerRecord,

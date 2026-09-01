@@ -634,6 +634,114 @@ describe('Hook server /send endpoint', () => {
       expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
     });
 
+    it('uses an exact pending auditor binding and ignores two unrelated missing implementer worktrees', async () => {
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-audit-worktree-'));
+      const source = join(temp, 'source');
+      const worktrees = join(temp, 'worktrees');
+      mkdirSync(source, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: source });
+      writeFileSync(join(source, 'fixture.txt'), 'base\n');
+      execFileSync('git', ['add', 'fixture.txt'], { cwd: source });
+      execFileSync('git', ['-c', 'user.name=IM.codes Test', '-c', 'user.email=test@im.codes', 'commit', '-qm', 'base'], { cwd: source });
+      const baseRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
+      const priorRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = worktrees;
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'codex-sdk', projectDir: source,
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const auditor = makeSession({
+        name: 'deck_proj_auditor', role: 'w1', agentType: 'claude-code', projectDir: source,
+        sessionInstanceId: 'auditor-instance', runtimeEpoch: 'auditor-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === auditor.name ? auditor : null);
+      listSessionsMock.mockReturnValue([brain, auditor]);
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'tsk_3ft';
+      const assignmentId = 'asg_3gm';
+      const attemptId = 'supervision-auto-audit-live-transport-audit-20260901-cx1-r1-6994afa1';
+      const revision = 'supervision-auto-audit-live-transport-cx3-r1-6994afa1';
+      const messageId = 'send_message_6994afa1-0000-4000-8000-000000000001';
+      expect(registry.createOrGet({
+        taskId, projectName: 'proj', classification: 'integration_task', objective: 'exact auditor worktree',
+        baseRevision, currentRevision: revision,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        taskId, assignmentId, role: 'auditor',
+        identity: {
+          sessionName: auditor.name,
+          sessionInstanceId: auditor.sessionInstanceId,
+          runtimeEpoch: auditor.runtimeEpoch,
+          agentType: auditor.agentType,
+          providerFamily: 'anthropic',
+        },
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+      }).ok).toBe(true);
+      const interfererAssignmentIds: string[] = [];
+      for (const suffix of ['one', 'two']) {
+        const interfererTaskId = `audit-worktree-interferer-${suffix}`;
+        const interfererAssignmentId = `${interfererTaskId}-assignment`;
+        interfererAssignmentIds.push(interfererAssignmentId);
+        expect(registry.createOrGet({
+          taskId: interfererTaskId, projectName: 'proj', objective: suffix, baseRevision,
+        }).ok).toBe(true);
+        expect(registry.createAssignment({
+          taskId: interfererTaskId, assignmentId: interfererAssignmentId, role: 'implementer',
+          identity: {
+            sessionName: auditor.name,
+            sessionInstanceId: auditor.sessionInstanceId,
+            runtimeEpoch: auditor.runtimeEpoch,
+            agentType: auditor.agentType,
+            providerFamily: 'anthropic',
+          },
+        }).ok).toBe(true);
+      }
+      const expectedRepo = resolveSupervisionAssignmentWorktree({ sessionName: auditor.name, assignmentId });
+      expect(existsSync(expectedRepo)).toBe(false);
+
+      try {
+        const missingBinding = await postSend(port, {
+          from: brain.name,
+          to: auditor.name,
+          message: 'must not accept a detached supervised message id',
+          messageId,
+        });
+        expect(missingBinding).toEqual({
+          status: 400,
+          body: { ok: false, error: 'invalid supervised message id' },
+        });
+        expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+        expect(existsSync(expectedRepo)).toBe(false);
+
+        const res = await postSend(port, {
+          from: brain.name,
+          to: auditor.name,
+          message: 'deliver exact existing audit',
+          supervision: { taskId, assignmentId },
+          messageId,
+        });
+        expect(res).toMatchObject({
+          status: 200,
+          body: { ok: true, delivered: true, target: auditor.name, messageId },
+        });
+        expect(existsSync(expectedRepo)).toBe(true);
+        for (const interfererAssignmentId of interfererAssignmentIds) {
+          expect(existsSync(resolveSupervisionAssignmentWorktree({
+            sessionName: auditor.name,
+            assignmentId: interfererAssignmentId,
+          }))).toBe(false);
+        }
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(auditor.name, 'deliver exact existing audit');
+        expect(registry.get(taskId)?.assignments.filter((assignment) => assignment.role === 'auditor'))
+          .toEqual([expect.objectContaining({ assignmentId, auditAttemptId: attemptId, auditRevision: revision })]);
+      } finally {
+        if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+        else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
     it('delivers shell-originated callback sends when the target is an exact active session name', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });
