@@ -139,6 +139,9 @@ describe('macOS remote-desktop executable entry points', () => {
     // lifecycleObservation must be a runtime probe, not a compiled-in true.
     expect(worker).toContain('macos::MacosSessionMonitor monitor;');
     expect(worker).toContain('monitor.ProbeReadiness() == rd::common::ReadinessState::kReady');
+    expect(worker).toContain(
+      'clipboard.ProbeCapability() == rd::common::ReadinessState::kReady',
+    );
     expect(worker).not.toMatch(/out->lifecycle_observation\s*=\s*true/);
   });
 

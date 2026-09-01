@@ -270,6 +270,121 @@ void CleanupFailsWhenItCannotActOnActiveGeneration() {
   }
 }
 
+// The readiness gate on the daemon side treats releaseInput/stopCapture as
+// CAPABILITY. A cold probe has no generation by construction, so if these were
+// liveness the whole system would be unstartable: readiness would be
+// UNAVAILABLE forever and no generation could ever be created to change it.
+void ReadinessReportsCleanupCapabilityNotLiveness() {
+  // The probe deliberately answers false for both, exactly as the shipped
+  // WorkerReadinessProbe does. The dispatcher must overwrite it.
+  macos::NativeReadinessV1 blank = ReadySnapshot();
+  blank.release_input = false;
+  blank.stop_capture = false;
+
+  {
+    // No live generation ANYWHERE -- has_session false, active zero. This is
+    // the exact cold-probe situation on a machine with no worker running.
+    FixedProbe probe(blank);
+    RecordingCleanup idle(0, false);
+    const auto readiness =
+        Run({"worker", macos::kNativeCommandReadinessV1}, &probe, &idle);
+    Check(readiness.outcome == macos::NativeCommandOutcome::kOk,
+          "cold readiness succeeds");
+    Check(readiness.stdout_text.find("\"releaseInput\":true") !=
+              std::string::npos,
+          "cold readiness advertises release-input capability");
+    Check(readiness.stdout_text.find("\"stopCapture\":true") !=
+              std::string::npos,
+          "cold readiness advertises stop-capture capability");
+    Check(idle.release_calls == 0 && idle.stop_calls == 0,
+          "readiness never invokes a cleanup verb to answer capability");
+
+    // ...and the SAME cleanup target, in the SAME state, still refuses to act.
+    // Capability and liveness must be able to disagree; that is the point.
+    const auto release =
+        Run({"worker", macos::kNativeCommandReleaseInputV1}, &probe, &idle);
+    Check(release.outcome == macos::NativeCommandOutcome::kFailed,
+          "advertised capability does not make cleanup succeed");
+    Check(release.stderr_text ==
+              "macos_remote_desktop_release_input_no_active_generation\n",
+          "cleanup still reports the no-active-generation reason");
+    const auto stop =
+        Run({"worker", macos::kNativeCommandStopCaptureV1}, &probe, &idle);
+    Check(stop.outcome == macos::NativeCommandOutcome::kFailed,
+          "advertised capability does not make stop-capture succeed");
+  }
+
+  {
+    // A build with no cleanup target must advertise no capability AND refuse
+    // the commands. Readiness and dispatch are driven by one predicate, so
+    // they cannot drift into advertising something undispatchable.
+    FixedProbe probe(ReadySnapshot());
+    const auto readiness =
+        Run({"worker", macos::kNativeCommandReadinessV1}, &probe, nullptr);
+    Check(readiness.outcome == macos::NativeCommandOutcome::kOk,
+          "readiness without a cleanup target still answers");
+    Check(readiness.stdout_text.find("\"releaseInput\":false") !=
+              std::string::npos,
+          "no cleanup target advertises no release-input capability");
+    Check(readiness.stdout_text.find("\"stopCapture\":false") !=
+              std::string::npos,
+          "no cleanup target advertises no stop-capture capability");
+    const auto release =
+        Run({"worker", macos::kNativeCommandReleaseInputV1}, &probe, nullptr);
+    Check(release.outcome == macos::NativeCommandOutcome::kFailed &&
+              release.stderr_text ==
+                  "macos_remote_desktop_cleanup_unavailable\n",
+          "no cleanup target refuses the command");
+    Check(macos::NativeCleanupCapabilityV1(nullptr) == false,
+          "capability predicate agrees with dispatch for a missing target");
+  }
+
+  {
+    // A probe that tries to claim capability it cannot know is overwritten,
+    // not trusted: the dispatcher is the only writer of these two fields.
+    macos::NativeReadinessV1 lying = ReadySnapshot();
+    lying.release_input = true;
+    lying.stop_capture = true;
+    FixedProbe probe(lying);
+    const auto readiness =
+        Run({"worker", macos::kNativeCommandReadinessV1}, &probe, nullptr);
+    Check(readiness.stdout_text.find("\"releaseInput\":false") !=
+              std::string::npos,
+          "a probe cannot fabricate release-input capability");
+    Check(readiness.stdout_text.find("\"stopCapture\":false") !=
+              std::string::npos,
+          "a probe cannot fabricate stop-capture capability");
+  }
+
+  {
+    RecordingCleanup active(7, true);
+    Check(macos::NativeCleanupCapabilityV1(&active) == true,
+          "capability predicate agrees with dispatch for a wired target");
+    // Stale/wrong generation is still refused while capability is advertised.
+    FixedProbe probe(blank);
+    const auto readiness =
+        Run({"worker", macos::kNativeCommandReadinessV1}, &probe, &active);
+    Check(readiness.stdout_text.find("\"releaseInput\":true") !=
+              std::string::npos,
+          "wired cleanup advertises capability");
+    const auto stale = Run(
+        {"worker", macos::kNativeCommandStopCaptureV1, "--generation", "6"},
+        &probe, &active);
+    Check(stale.outcome == macos::NativeCommandOutcome::kFailed,
+          "stale generation is refused despite advertised capability");
+    const auto future = Run(
+        {"worker", macos::kNativeCommandReleaseInputV1, "--generation", "8"},
+        &probe, &active);
+    Check(future.outcome == macos::NativeCommandOutcome::kFailed,
+          "unknown future generation is refused despite advertised capability");
+    const auto exact = Run(
+        {"worker", macos::kNativeCommandStopCaptureV1, "--generation", "7"},
+        &probe, &active);
+    Check(exact.outcome == macos::NativeCommandOutcome::kOk,
+          "the exact live generation still acts");
+  }
+}
+
 void CommandParsingRejectsMalformedGeneration() {
   FixedProbe probe(ReadySnapshot());
   RecordingCleanup cleanup(7, true);
@@ -871,6 +986,7 @@ int main() {
   ReadinessRejectsGenerationScoping();
   PermissionRegistrationIsExplicitAndUserControlled();
   CleanupFailsWhenItCannotActOnActiveGeneration();
+  ReadinessReportsCleanupCapabilityNotLiveness();
   CommandParsingRejectsMalformedGeneration();
   LaunchContextRefusesDefaults();
   HelloFrameIsExact();

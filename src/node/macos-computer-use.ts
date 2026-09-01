@@ -28,8 +28,8 @@ const MACOS_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
 const MACOS_AIDESK_EXECUTABLE = 'aidesk-agent';
 const MACOS_COMPUTER_USE_BUNDLE_ID = 'com.ifuryst.opencomputeruse';
 const MACOS_COMPUTER_USE_TEAM_ID = 'J9P29FA5BX';
-const MACOS_AIDESK_BUNDLE_ID = 'to.aidesk.app';
-const MACOS_AIDESK_TEAM_ID = 'M675E26Q67';
+export const MACOS_AIDESK_BUNDLE_ID = 'to.aidesk.app';
+export const MACOS_AIDESK_TEAM_ID = 'M675E26Q67';
 const MACOS_COMPUTER_USE_SOURCE_DIGEST = '.open-computer-use-source.sha256';
 
 export type MacosConsoleUser = MacosUserSession;

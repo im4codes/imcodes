@@ -1,6 +1,5 @@
-import { EventEmitter, once } from 'node:events';
+import { once } from 'node:events';
 import net from 'node:net';
-import type { ChildProcess } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -89,7 +88,15 @@ function artifact(setSha256 = 'a'.repeat(64)): VerifiedMacosRemoteDesktopArtifac
     manifestPath: '/verified/release/imcodes-remote-desktop.manifest.json',
     setSha256,
     components: {
-      worker: {} as never,
+      worker: {
+        kind: 'worker',
+        executablePath: '/verified/release/imcodes-remote-desktop-worker',
+        fileName: 'imcodes-remote-desktop-worker',
+        size: 1,
+        sha256: 'e'.repeat(64),
+        bundleIdentifier: 'cc.imcodes.node.remote-desktop-worker',
+        designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate leaf[subject.OU] = "M675E26Q67"',
+      },
       disclosure: {} as never,
       launchAgent: {
         kind: 'launchAgent',
@@ -740,6 +747,52 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     }
   });
 
+  // The native `releaseInput`/`stopCapture` fields are a CAPABILITY claim by
+  // the signed build, not a claim that a generation is live. That distinction
+  // is what makes the gate above satisfiable at all: readiness is collected by
+  // a cold, short-lived process that by construction owns no generation, so if
+  // the native side answered liveness these would be permanently false, every
+  // profile would be UNAVAILABLE forever, and no generation could ever be
+  // created to change it. The gate itself is deliberately NOT relaxed here --
+  // it still demands both -- so this pins the other half of the contract.
+  it('admits a profile only when every real gate holds, cleanup capability included', async () => {
+    const gates = [
+      ['screen recording denied', { screenRecording: false }],
+      ['session locked', { sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.LOCKED }],
+      ['session sleeping', { sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.SLEEPING }],
+      ['no lifecycle observation', { lifecycleObservation: false }],
+      ['no release-input capability', { releaseInput: false }],
+      ['no stop-capture capability', { stopCapture: false }],
+      ['ambiguous active user', { activeAquaUserUids: [501, 502] }],
+      ['no disclosure', { disclosure: false }],
+    ] as const;
+    for (const [label, override] of gates) {
+      const value = await readyHarness(snapshot(override));
+      expect(resolveMacosRemoteDesktopRuntimeProfile({
+        artifactVerified: true,
+        activeUserQualified: true,
+        ...value.readiness,
+      }).mode, label).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE);
+    }
+
+    // Only with every gate satisfied -- including cleanup capability, which a
+    // cold probe CAN legitimately answer -- does the profile become eligible.
+    const eligible = await readyHarness(snapshot());
+    const profile = resolveMacosRemoteDesktopRuntimeProfile({
+      artifactVerified: true,
+      activeUserQualified: true,
+      ...eligible.readiness,
+    });
+    expect(profile.mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.CONTROL);
+
+    // ...and an unverified artifact still overrides all of it.
+    expect(resolveMacosRemoteDesktopRuntimeProfile({
+      artifactVerified: false,
+      activeUserQualified: true,
+      ...eligible.readiness,
+    }).mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE);
+  });
+
   it('fails closed when the native executable lacks the readiness command', async () => {
     const errors: unknown[] = [];
     const verified = artifact();
@@ -765,17 +818,16 @@ describe('stock macOS remote-desktop production dependency factory', () => {
 
   it('treats a nonzero cleanup exit as failure and refuses generation 0', async () => {
     const verified = artifact();
-    const launches: Array<{ args: readonly string[]; child: ChildProcess }> = [];
+    const launches: Array<{ args: readonly string[] }> = [];
     const options = stockFactory({
       platform: 'darwin',
       arch: 'arm64',
       selectArtifact: vi.fn(async () => verified),
       resolveUserSession: async () => USER,
       executeNativeCommand: async () => JSON.stringify(snapshot()),
-      launchNativeCleanup: (_user, _executable, args) => {
-        const child = new EventEmitter() as ChildProcess;
-        launches.push({ args, child });
-        return child;
+      launchNativeCleanup: async (_user, _component, args) => {
+        launches.push({ args });
+        throw new Error('native cleanup failed');
       },
     })!;
     await options.resolveVerifiedArtifact();
@@ -783,9 +835,8 @@ describe('stock macOS remote-desktop production dependency factory', () => {
 
     // Spawn acceptance is not success: a command that exits nonzero must not be
     // reported as a completed release/stop.
-    const failing = options.releaseInput?.({ reason: 'close', workerGeneration: 3 });
-    launches[0]!.child.emit('exit', 2, null);
-    expect(await failing).toMatchObject({ ok: false });
+    expect(await options.releaseInput?.({ reason: 'close', workerGeneration: 3 }))
+      .toMatchObject({ ok: false });
 
     // Generation 0 means "whatever is live" to the native command, so a stale
     // request must be refused before anything is spawned.
@@ -795,13 +846,66 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     expect(launches).toHaveLength(launchCount);
   });
 
+  it('uses one responsibility-safe runner for readiness and generation cleanup', async () => {
+    const verified = artifact();
+    const storeRoot = await trustedStore(verified.releaseName!);
+    const executeResponsibleCommand = vi.fn(async ({ args }) => {
+      if (args[0] === MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.readiness) {
+        return { stdout: `${JSON.stringify(snapshot())}\n`, stderr: '' };
+      }
+      if (args[0] === MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.releaseInput) {
+        return { stdout: 'macos_remote_desktop_release_input_ok\n', stderr: '' };
+      }
+      return { stdout: '', stderr: 'macos_remote_desktop_stop_capture_no_active_generation\n' };
+    });
+    const options = stockFactory({
+      platform: 'darwin',
+      arch: 'arm64',
+      storeRoot,
+      responsibleAppPath: '/verified/aiDesk.to by IM.codes.app',
+      selectArtifact: vi.fn(async () => verified),
+      resolveUserSession: async () => USER,
+      executeResponsibleCommand,
+    })!;
+    await options.resolveVerifiedArtifact();
+    await options.resolveUserSession();
+
+    await expect(options.inspectReadiness(verified, USER)).resolves.toMatchObject({
+      screenRecording: true,
+      clipboard: true,
+    });
+    await expect(options.releaseInput?.({ reason: 'close', workerGeneration: 11 }))
+      .resolves.toEqual({ ok: true });
+    await expect(options.stopCapture?.({ reason: 'close', workerGeneration: 11 }))
+      .resolves.toMatchObject({ ok: false });
+
+    expect(executeResponsibleCommand).toHaveBeenCalledTimes(3);
+    for (const [request] of executeResponsibleCommand.mock.calls) {
+      expect(request.user).toBe(USER);
+      expect(request.component).toBe(verified.components.worker);
+      expect(request.appPath).toBe('/verified/aiDesk.to by IM.codes.app');
+    }
+    expect(executeResponsibleCommand.mock.calls.map(([request]) => request.args)).toEqual([
+      [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.readiness],
+      [
+        MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.releaseInput,
+        MACOS_REMOTE_DESKTOP_NATIVE_GENERATION_ARGUMENT,
+        '11',
+      ],
+      [
+        MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.stopCapture,
+        MACOS_REMOTE_DESKTOP_NATIVE_GENERATION_ARGUMENT,
+        '11',
+      ],
+    ]);
+  });
+
   it('uses bounded fixed cleanup commands and never carries an ambient credential', async () => {
     const verified = artifact();
     const launches: Array<{
       user: MacosUserSession;
-      executable: string;
+      component: VerifiedMacosRemoteDesktopArtifact['components']['worker'];
       args: readonly string[];
-      child: ChildProcess;
     }> = [];
     const options = stockFactory({
       platform: 'darwin',
@@ -809,26 +913,21 @@ describe('stock macOS remote-desktop production dependency factory', () => {
       selectArtifact: vi.fn(async () => verified),
       resolveUserSession: async () => USER,
       executeNativeCommand: async () => JSON.stringify(snapshot()),
-      launchNativeCleanup: (user, executable, args) => {
-        const child = new EventEmitter() as ChildProcess;
-        launches.push({ user, executable, args, child });
-        return child;
+      launchNativeCleanup: async (user, component, args) => {
+        launches.push({ user, component, args });
       },
     })!;
     await options.resolveVerifiedArtifact();
     await options.resolveUserSession();
     const release = options.releaseInput?.({ reason: 'close', workerGeneration: 7 });
     const stop = options.stopCapture?.({ reason: 'close', workerGeneration: 7 });
-    // Settle both children so the awaited results are real exit status, not
-    // spawn acceptance.
-    for (const entry of launches) (entry.child as EventEmitter).emit('exit', 0, null);
     expect(await release).toEqual({ ok: true });
     expect(await stop).toEqual({ ok: true });
 
-    expect(launches.map(({ user, executable, args }) => ({ user, executable, args }))).toEqual([
+    expect(launches).toEqual([
       {
         user: USER,
-        executable: verified.components.launchAgent.executablePath,
+        component: verified.components.worker,
         args: [
           MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.releaseInput,
           MACOS_REMOTE_DESKTOP_NATIVE_GENERATION_ARGUMENT,
@@ -837,7 +936,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
       },
       {
         user: USER,
-        executable: verified.components.launchAgent.executablePath,
+        component: verified.components.worker,
         args: [
           MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.stopCapture,
           MACOS_REMOTE_DESKTOP_NATIVE_GENERATION_ARGUMENT,
@@ -849,8 +948,9 @@ describe('stock macOS remote-desktop production dependency factory', () => {
 
     const invocation = macosRemoteDesktopNativeCommandInvocation(
       USER,
-      verified.components.launchAgent.executablePath,
+      '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app',
       [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.readiness],
+      { stdout: '/tmp/stdout', stderr: '/tmp/stderr' },
     );
     expect(invocation.env).toEqual({});
     expect(JSON.stringify(invocation)).not.toMatch(/credential|node.?token|bearer|secret/iu);

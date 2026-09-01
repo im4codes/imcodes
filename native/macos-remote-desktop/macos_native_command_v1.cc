@@ -97,6 +97,13 @@ bool SerializeNativeReadinessV1(const NativeReadinessV1& snapshot,
   return true;
 }
 
+bool NativeCleanupCapabilityV1(const NativeCleanupTarget* cleanup) noexcept {
+  // Mirrors the dispatch guard below exactly. Keep the two in step: if this
+  // ever says true where dispatch says `cleanup_unavailable`, the daemon would
+  // admit a route whose input could never be released.
+  return cleanup != nullptr;
+}
+
 NativeCommandResult RunNativeCommandV1(int argc,
                                        const char* const argv[],
                                        NativeReadinessProbe* probe,
@@ -161,6 +168,12 @@ NativeCommandResult RunNativeCommandV1(int argc,
       result.stderr_text = "macos_remote_desktop_readiness_probe_failed\n";
       return result;
     }
+    // Overwritten, not merged: the probe observes the machine, but only this
+    // function holds the cleanup target, so only this function can answer
+    // whether cleanup is serviceable. A probe that tried to guess is ignored.
+    const bool cleanup_capable = NativeCleanupCapabilityV1(cleanup);
+    snapshot.release_input = cleanup_capable;
+    snapshot.stop_capture = cleanup_capable;
     std::string encoded;
     if (!SerializeNativeReadinessV1(snapshot, &encoded)) {
       result.outcome = NativeCommandOutcome::kFailed;

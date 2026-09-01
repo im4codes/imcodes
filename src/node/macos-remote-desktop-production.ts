@@ -1,9 +1,9 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { Socket } from 'node:net';
 import { dirname, join } from 'node:path';
 import {
   assertMacosRemoteDesktopStoreTrusted,
   selectMacosRemoteDesktopArtifact,
+  type VerifiedMacosRemoteDesktopComponent,
   type VerifiedMacosRemoteDesktopArtifact,
 } from './macos-remote-desktop-artifact.js';
 import type {
@@ -23,8 +23,6 @@ import {
 } from './macos-remote-desktop-launch-agent.js';
 import { defaultCredentialPath } from './enrollment.js';
 import {
-  MACOS_LAUNCHCTL_PATH,
-  macosUserSessionLaunchctlArgs,
   resolveMacosUserSession,
   resolveMacosRemoteDesktopGraphicalSessionAuthority,
   type MacosRemoteDesktopGraphicalSessionAuthority,
@@ -52,6 +50,12 @@ import {
   startMacosVirtualDisplayAuthorityHost,
 } from './macos-virtual-display-authority-host.js';
 import { randomBytes } from 'node:crypto';
+import {
+  executeMacosRemoteDesktopResponsibleCommand,
+  macosRemoteDesktopResponsibleCommandInvocation,
+  type MacosRemoteDesktopResponsibleCommandOptions,
+  type MacosRemoteDesktopResponsibleCommandResult,
+} from './macos-remote-desktop-responsible-spawn.js';
 
 const COMMAND_TIMEOUT_MS = 5_000;
 const COMMAND_MAX_BUFFER_BYTES = 16 * 1024;
@@ -113,15 +117,19 @@ export interface MacosRemoteDesktopAuthorityReadinessOptions {
 
 export type MacosRemoteDesktopNativeCommandExecutor = (
   user: MacosUserSession,
-  executablePath: string,
+  component: VerifiedMacosRemoteDesktopComponent,
   args: readonly string[],
 ) => Promise<string>;
 
 export type MacosRemoteDesktopNativeCleanupLauncher = (
   user: MacosUserSession,
-  executablePath: string,
+  component: VerifiedMacosRemoteDesktopComponent,
   args: readonly string[],
-) => ChildProcess | void;
+) => Promise<void>;
+
+export type MacosRemoteDesktopResponsibleCommandRunner = (
+  options: MacosRemoteDesktopResponsibleCommandOptions,
+) => Promise<MacosRemoteDesktopResponsibleCommandResult>;
 
 export interface MacosRemoteDesktopProductionDependencies {
   platform?: NodeJS.Platform;
@@ -130,6 +138,8 @@ export interface MacosRemoteDesktopProductionDependencies {
   storeRoot?: string;
   selectArtifact?: typeof selectMacosRemoteDesktopArtifact;
   resolveUserSession?: typeof resolveMacosUserSession;
+  responsibleAppPath?: string;
+  executeResponsibleCommand?: MacosRemoteDesktopResponsibleCommandRunner;
   executeNativeCommand?: MacosRemoteDesktopNativeCommandExecutor;
   launchNativeCleanup?: MacosRemoteDesktopNativeCleanupLauncher;
   createGlobalBootstrapListener?: typeof createMacosRemoteDesktopProductionGlobalBootstrapListener;
@@ -166,12 +176,6 @@ export interface MacosRemoteDesktopProductionGlobalBootstrapOptions {
   prepareSocketPath?: MacosRemoteDesktopGlobalAgentBootstrapListenerOptions['prepareSocketPath'];
   secureSocketPath?: MacosRemoteDesktopGlobalAgentBootstrapListenerOptions['secureSocketPath'];
   onBackgroundError?: (error: unknown) => void;
-}
-
-export interface MacosRemoteDesktopNativeCommandInvocation {
-  executable: typeof MACOS_LAUNCHCTL_PATH;
-  args: readonly string[];
-  env: Readonly<Record<string, string>>;
 }
 
 const UNAVAILABLE_READINESS: NativeReadiness = Object.freeze({
@@ -719,61 +723,61 @@ export function defaultMacosRemoteDesktopArtifactStoreRoot(arch: 'arm64' | 'x64'
 
 export function macosRemoteDesktopNativeCommandInvocation(
   user: MacosUserSession,
-  executablePath: string,
+  appPath: string,
   args: readonly string[],
-): MacosRemoteDesktopNativeCommandInvocation {
-  return Object.freeze({
-    executable: MACOS_LAUNCHCTL_PATH,
-    args: Object.freeze(macosUserSessionLaunchctlArgs(user, {
-      executable: executablePath,
-      args,
-    })),
-    env: Object.freeze({}),
-  });
+  output: Readonly<{ stdout: string; stderr: string }>,
+) {
+  return macosRemoteDesktopResponsibleCommandInvocation(user, appPath, args, output);
 }
 
-function defaultExecuteNativeCommand(
+async function defaultExecuteNativeCommand(
   user: MacosUserSession,
-  executablePath: string,
+  component: VerifiedMacosRemoteDesktopComponent,
   args: readonly string[],
+  appPath?: string,
+  executeResponsibleCommand: MacosRemoteDesktopResponsibleCommandRunner =
+    executeMacosRemoteDesktopResponsibleCommand,
 ): Promise<string> {
-  const invocation = macosRemoteDesktopNativeCommandInvocation(user, executablePath, args);
-  return new Promise((resolve, reject) => {
-    execFile(invocation.executable, invocation.args, {
-      encoding: 'utf8',
-      timeout: COMMAND_TIMEOUT_MS,
-      maxBuffer: COMMAND_MAX_BUFFER_BYTES,
-      // The active-user command gets only HOME/TMPDIR from the explicit
-      // launchctl argv. Daemon credentials and ambient service secrets cannot
-      // cross this process boundary through the environment.
-      env: invocation.env,
-    }, (error, stdout) => {
-      if (error) {
-        reject(new Error('macos_remote_desktop_native_command_failed'));
-        return;
-      }
-      resolve(String(stdout).trim());
-    });
+  const result = await executeResponsibleCommand({
+    user,
+    component,
+    args,
+    appPath,
+    timeoutMs: COMMAND_TIMEOUT_MS,
+    maxBufferBytes: COMMAND_MAX_BUFFER_BYTES,
+  }).catch(() => {
+    throw new Error('macos_remote_desktop_native_command_failed');
   });
+  if (result.stderr.trim()) throw new Error('macos_remote_desktop_native_command_failed');
+  return result.stdout.trim();
 }
 
-function defaultLaunchNativeCleanup(
+async function defaultLaunchNativeCleanup(
   user: MacosUserSession,
-  executablePath: string,
+  component: VerifiedMacosRemoteDesktopComponent,
   args: readonly string[],
-): ChildProcess {
-  const invocation = macosRemoteDesktopNativeCommandInvocation(user, executablePath, args);
-  const child = spawn(
-    invocation.executable,
-    invocation.args,
-    {
-      detached: true,
-      stdio: 'ignore',
-      env: invocation.env,
-    },
-  );
-  child.unref();
-  return child;
+  appPath?: string,
+  executeResponsibleCommand: MacosRemoteDesktopResponsibleCommandRunner =
+    executeMacosRemoteDesktopResponsibleCommand,
+): Promise<void> {
+  const result = await executeResponsibleCommand({
+    user,
+    component,
+    args,
+    appPath,
+    timeoutMs: COMMAND_TIMEOUT_MS,
+    maxBufferBytes: COMMAND_MAX_BUFFER_BYTES,
+  }).catch(() => {
+    throw new Error('macos_remote_desktop_native_cleanup_failed');
+  });
+  const expected = args[0] === MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.releaseInput
+    ? 'macos_remote_desktop_release_input_ok'
+    : args[0] === MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.stopCapture
+      ? 'macos_remote_desktop_stop_capture_ok'
+      : '';
+  if (!expected || result.stderr.trim() || result.stdout.trim() !== expected) {
+    throw new Error('macos_remote_desktop_native_cleanup_failed');
+  }
 }
 
 async function selectVerifiedCurrentOrLastKnownGood(
@@ -841,20 +845,33 @@ export function createMacosRemoteDesktopProductionDependencies(
   const storeRoot = dependencies.storeRoot ?? defaultMacosRemoteDesktopArtifactStoreRoot(arch);
   const selectArtifact = dependencies.selectArtifact ?? selectMacosRemoteDesktopArtifact;
   const resolveUser = dependencies.resolveUserSession ?? resolveMacosUserSession;
-  const executeNativeCommand = dependencies.executeNativeCommand ?? defaultExecuteNativeCommand;
-  const launchNativeCleanup = dependencies.launchNativeCleanup ?? defaultLaunchNativeCleanup;
+  const executeNativeCommand = dependencies.executeNativeCommand
+    ?? ((user, component, args) => defaultExecuteNativeCommand(
+      user,
+      component,
+      args,
+      dependencies.responsibleAppPath,
+      dependencies.executeResponsibleCommand,
+    ));
+  const launchNativeCleanup = dependencies.launchNativeCleanup
+    ?? ((user, component, args) => defaultLaunchNativeCleanup(
+      user,
+      component,
+      args,
+      dependencies.responsibleAppPath,
+      dependencies.executeResponsibleCommand,
+    ));
   let activeArtifact: VerifiedMacosRemoteDesktopArtifact | null = null;
   let activeUser: MacosUserSession | null = null;
 
   /**
    * Run one cleanup command against an EXACT worker generation and resolve on
-   * the child's real exit status.
+   * the native command's exact completion receipt.
    *
-   * Spawn acceptance is not completion: the previous version returned as soon
-   * as the process was created, so teardown could stop the LaunchAgent and
-   * unlink its control socket before the command had connected. It also sent no
-   * generation at all, which the native side reads as "whatever is live" -- a
-   * delayed cleanup for generation N could then act on N+1.
+   * LaunchServices wait status only proves the app terminated, so the shared
+   * responsibility-safe runner captures the helper's bounded stdout/stderr and
+   * this seam accepts only the command-specific success receipt. It also sends
+   * the generation explicitly: a delayed cleanup for N cannot act on N+1.
    */
   const launchCleanup = async (
     command: string,
@@ -869,38 +886,16 @@ export function createMacosRemoteDesktopProductionDependencies(
       return { ok: false, error: new Error('macos_remote_desktop_cleanup_invalid_generation') };
     }
     try {
-      const child = launchNativeCleanup(
+      await launchNativeCleanup(
         user,
-        artifact.components.launchAgent.executablePath,
+        // The signed app dispatches the bounded --imcodes-* command family to
+        // its embedded worker. The old LaunchAgent executable was only a
+        // tail-exec wrapper for that same worker on this command path; binding
+        // and verifying the worker here covers the executable TCC evaluates.
+        artifact.components.worker,
         [command, MACOS_REMOTE_DESKTOP_NATIVE_GENERATION_ARGUMENT, String(workerGeneration)],
       );
-      if (!child) {
-        return { ok: false, error: new Error('macos_remote_desktop_cleanup_not_launched') };
-      }
-      return await new Promise<MacosRemoteDesktopHostCleanupOutcome>((resolve) => {
-        let done = false;
-        const settle = (outcome: MacosRemoteDesktopHostCleanupOutcome) => {
-          if (done) return;
-          done = true;
-          resolve(outcome);
-        };
-        child.once('error', (error) => {
-          dependencies.onBackgroundError?.(error);
-          settle({ ok: false, error });
-        });
-        child.once('exit', (code, signal) => {
-          if (code === 0) {
-            settle({ ok: true });
-            return;
-          }
-          settle({
-            ok: false,
-            error: new Error(
-              `macos_remote_desktop_cleanup_exit:${command}:${String(code ?? signal)}`,
-            ),
-          });
-        });
-      });
+      return { ok: true };
     } catch (error) {
       dependencies.onBackgroundError?.(error);
       return { ok: false, error };
@@ -993,7 +988,7 @@ export function createMacosRemoteDesktopProductionDependencies(
         });
         const encoded = await executeNativeCommand(
           user,
-          artifact.components.launchAgent.executablePath,
+          artifact.components.worker,
           [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.readiness],
         );
         return verifiedReadiness(parseMacosRemoteDesktopNativeReadiness(encoded), user);

@@ -5,7 +5,6 @@
 #include <cstring>
 #include <limits>
 #include <optional>
-#include <thread>
 #include <utility>
 
 #include "api/jsep.h"
@@ -138,6 +137,72 @@ bool SameTopology(const std::vector<DisplayInfo>& left,
          std::equal(left.begin(), left.end(), right.begin(), SameDisplay);
 }
 
+bool InputApplied(common::InputResult result) noexcept {
+  return result == common::InputResult::kApplied;
+}
+
+common::TransportTime CurrentTransportTime() noexcept {
+  return {
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count(),
+  };
+}
+
+common::DataChannelKind CommonChannelKind(const std::string& label) {
+  if (label == kControlChannel) return common::DataChannelKind::kControl;
+  if (label == kKeyboardChannel) return common::DataChannelKind::kKeyboard;
+  return common::DataChannelKind::kPointer;
+}
+
+const char* ChannelLabel(common::DataChannelKind channel) noexcept {
+  switch (channel) {
+    case common::DataChannelKind::kControl:
+      return kControlChannel;
+    case common::DataChannelKind::kKeyboard:
+      return kKeyboardChannel;
+    case common::DataChannelKind::kPointer:
+      return kPointerChannel;
+  }
+  return kControlChannel;
+}
+
+common::PeerConnectionState CommonPeerConnectionState(
+    webrtc::PeerConnectionInterface::PeerConnectionState state) noexcept {
+  using WebRtcState =
+      webrtc::PeerConnectionInterface::PeerConnectionState;
+  switch (state) {
+    case WebRtcState::kNew:
+      return common::PeerConnectionState::kNew;
+    case WebRtcState::kConnecting:
+      return common::PeerConnectionState::kConnecting;
+    case WebRtcState::kConnected:
+      return common::PeerConnectionState::kConnected;
+    case WebRtcState::kDisconnected:
+      return common::PeerConnectionState::kDisconnected;
+    case WebRtcState::kFailed:
+      return common::PeerConnectionState::kFailed;
+    case WebRtcState::kClosed:
+      return common::PeerConnectionState::kClosed;
+  }
+  return common::PeerConnectionState::kFailed;
+}
+
+common::DataChannelState CommonDataChannelState(
+    webrtc::DataChannelInterface::DataState state) noexcept {
+  switch (state) {
+    case webrtc::DataChannelInterface::kConnecting:
+      return common::DataChannelState::kConnecting;
+    case webrtc::DataChannelInterface::kOpen:
+      return common::DataChannelState::kOpen;
+    case webrtc::DataChannelInterface::kClosing:
+    case webrtc::DataChannelInterface::kClosed:
+      return common::DataChannelState::kClosed;
+  }
+  return common::DataChannelState::kFailed;
+}
+
 }  // namespace
 
 class PeerMediaStatsObserver : public webrtc::RTCStatsCollectorCallback {
@@ -187,6 +252,20 @@ void PeerDataObserver::OnMessage(const webrtc::DataBuffer& buffer) {
   if (auto session = session_.lock()) session->HandleData(label_, buffer);
 }
 
+common::QualitySelection PeerSession::WindowsQualityLadder::Select(
+    const common::QualityTarget& target) const noexcept {
+  const QualitySelection selected = SelectQuality(
+      target.bitrate_bps, static_cast<int>(target.source_pixels.width),
+      static_cast<int>(target.source_pixels.height));
+  return {
+      selected.id,
+      {static_cast<std::uint32_t>(selected.width),
+       static_cast<std::uint32_t>(selected.height)},
+      static_cast<std::uint32_t>(selected.fps),
+      selected.bitrate_bps,
+  };
+}
+
 std::shared_ptr<PeerSession> PeerSession::Create(
     Authority authority,
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory,
@@ -222,14 +301,21 @@ PeerSession::PeerSession(
     : authority_(std::move(authority)),
       factory_(std::move(factory)),
       displays_(std::move(displays)),
-      acquire_source_(std::move(acquire_source)),
-      release_source_(std::move(release_source)),
       input_(input),
-      clipboard_sequence_(std::move(clipboard_sequence)),
-      read_clipboard_text_(std::move(read_clipboard_text)),
       request_unlock_(std::move(request_unlock)),
       signaling_thread_(signaling_thread),
-      emit_(std::move(emit)) {
+      emit_(std::move(emit)),
+      transport_core_(*this, transport_quality_ladder_) {
+  capture_adapter_ = std::make_unique<WindowsDxgiCaptureTrackAdapter>(
+      std::move(acquire_source), std::move(release_source));
+  if (input_) {
+    clipboard_adapter_ = std::make_unique<WindowsClipboardAdapter>(
+        *input_, std::move(clipboard_sequence), std::move(read_clipboard_text),
+        authority_.session_id + ":clipboard");
+  }
+  display_adapter_ = std::make_unique<WindowsDisplayAdapter>(
+      [this]() -> const std::vector<DisplayInfo>& { return displays_; });
+  RefreshCommonTopology();
   const auto primary = std::find_if(displays_.begin(), displays_.end(),
                                     [](const DisplayInfo& display) {
                                       return display.primary;
@@ -240,6 +326,67 @@ PeerSession::PeerSession(
 
 PeerSession::~PeerSession() {
   Close("worker_failed", false);
+}
+
+common::RouteAuthorityIdentity PeerSession::CommonIdentity() const {
+  return {
+      authority_.request_id,
+      authority_.session_id,
+      authority_.capability,
+      static_cast<common::WorkerGeneration>(authority_.daemon_generation),
+      static_cast<std::uint64_t>(authority_.route_generation.value_or(1)),
+  };
+}
+
+common::RouteAuthority PeerSession::CommonAuthority(
+    const Authority& authority) const {
+  return {
+      {
+          authority.request_id,
+          authority.session_id,
+          authority.capability,
+          static_cast<common::WorkerGeneration>(authority.daemon_generation),
+          static_cast<std::uint64_t>(authority.route_generation.value_or(1)),
+      },
+      authority.expires_at_ms,
+      authority.lease_expires_at_ms,
+      authority.mode == kControlMode ? common::TransportSessionMode::kControl
+                                     : common::TransportSessionMode::kView,
+      static_cast<std::uint64_t>(authority.input_epoch),
+  };
+}
+
+common::TransportCallbackStamp PeerSession::CallbackStamp() const {
+  const common::RouteAuthorityIdentity identity = CommonIdentity();
+  return {identity.daemon_generation, identity.route_generation};
+}
+
+bool PeerSession::StartTransport(const common::RouteAuthority& authority) {
+  if (authority.identity.request_id != authority_.request_id ||
+      authority.identity.session_id != authority_.session_id ||
+      authority.identity.negotiated_capability_binding !=
+          authority_.capability) {
+    return false;
+  }
+  webrtc::PeerConnectionInterface::RTCConfiguration config;
+  config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  config.bundle_policy =
+      webrtc::PeerConnectionInterface::kBundlePolicyMaxBundle;
+  config.continual_gathering_policy =
+      webrtc::PeerConnectionInterface::GATHER_CONTINUALLY;
+  for (const IceServer& source : authority_.ice_servers) {
+    webrtc::PeerConnectionInterface::IceServer server;
+    server.urls = source.urls;
+    server.username = source.username;
+    server.password = source.credential;
+    config.servers.push_back(std::move(server));
+  }
+  webrtc::PeerConnectionDependencies dependencies(this);
+  auto result = factory_->CreatePeerConnectionOrError(
+      config, std::move(dependencies));
+  if (!result.ok()) return false;
+  peer_ = std::move(result.value());
+  return ApplyTransportBitratePolicy(false);
 }
 
 bool PeerSession::Initialize() {
@@ -272,29 +419,17 @@ bool PeerSession::Initialize() {
       if (!refreshed.empty()) displays_ = std::move(refreshed);
     }
   }
-  if (!factory_ || displays_.empty() || !input_ || !signaling_thread_ ||
-      !signaling_thread_->IsCurrent()) {
+  if (!factory_ || !capture_adapter_ ||
+      capture_adapter_->ProbeReadiness() != common::ReadinessState::kReady ||
+      displays_.empty() || !input_ || !signaling_thread_ ||
+      !signaling_thread_->IsCurrent() || !RefreshCommonTopology()) {
     return false;
   }
-  webrtc::PeerConnectionInterface::RTCConfiguration config;
-  config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-  config.bundle_policy =
-      webrtc::PeerConnectionInterface::kBundlePolicyMaxBundle;
-  config.continual_gathering_policy =
-      webrtc::PeerConnectionInterface::GATHER_CONTINUALLY;
-  for (const IceServer& source : authority_.ice_servers) {
-    webrtc::PeerConnectionInterface::IceServer server;
-    server.urls = source.urls;
-    server.username = source.username;
-    server.password = source.credential;
-    config.servers.push_back(std::move(server));
+  if (!transport_core_.Start(CommonAuthority(authority_),
+                             CurrentTransportTime()) ||
+      !transport_core_.SetLocalIceEmissionReady(CallbackStamp())) {
+    return false;
   }
-  webrtc::PeerConnectionDependencies dependencies(this);
-  auto result = factory_->CreatePeerConnectionOrError(
-      config, std::move(dependencies));
-  if (!result.ok()) return false;
-  peer_ = std::move(result.value());
-  if (!ApplyTransportBitratePolicy(false)) return false;
   // An IM.codes virtual display exists only after the real desktop failed its
   // bounded presentability gate. Prefer that exact adapter on the retry; never
   // select a similarly named third-party virtual adapter. Without it, retain
@@ -319,19 +454,23 @@ bool PeerSession::Initialize() {
     }
   }
   for (const size_t index : candidates) {
-    auto candidate = acquire_source_(displays_[index]);
+    auto candidate = capture_adapter_->Acquire(ToCommonDisplayTopology(
+        displays_[index], CommonIdentity().daemon_generation));
     if (!candidate) continue;
-    candidate->Start();
-    if (candidate->WaitForFirstFrame(
+    if (candidate->Start() && candidate->WaitForFirstFrame(
             std::chrono::milliseconds(kFirstPresentableFrameTimeoutMs))) {
       selected_display_ = index;
       source_ = std::move(candidate);
       break;
     }
-    if (release_source_) release_source_(candidate->display());
   }
   if (!source_) return false;
-  track_ = factory_->CreateVideoTrack(source_, "imcodes-remote-desktop");
+  webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> native_source(
+      source_->source());
+  if (!native_source) return false;
+  track_ = factory_->CreateVideoTrack(native_source,
+                                      "imcodes-remote-desktop");
+  if (!track_) return false;
   track_->set_content_hint(
       webrtc::VideoTrackInterface::ContentHint::kDetailed);
   const auto added = peer_->AddTrack(track_, {"imcodes-remote-desktop"});
@@ -355,6 +494,7 @@ bool PeerSession::Initialize() {
   initial["inputEpoch"] = authority_.input_epoch;
   initial["reason"] = "initial";
   emit_(initial);
+  emit_transport_terminal_ = true;
   return true;
 }
 
@@ -389,7 +529,6 @@ bool PeerSession::ApplyOffer(const std::string& sdp) {
       webrtc::CreateSessionDescription(webrtc::SdpType::kOffer, sdp, &error);
   if (!offer) return false;
   setting_remote_description_ = true;
-  remote_description_set_ = false;
   std::weak_ptr<PeerSession> weak = shared_from_this();
   peer_->SetRemoteDescription(
       std::move(offer),
@@ -402,12 +541,10 @@ bool PeerSession::ApplyOffer(const std::string& sdp) {
 void PeerSession::OnRemoteDescriptionSet(bool success) {
   setting_remote_description_ = false;
   if (!success) {
-    pending_remote_ice_.Clear();
     Close("peer_failed");
     return;
   }
-  remote_description_set_ = true;
-  if (!FlushPendingRemoteIce()) {
+  if (!transport_core_.SetRemoteDescriptionReady(CallbackStamp())) {
     Close("peer_failed");
     return;
   }
@@ -446,47 +583,30 @@ void PeerSession::SendAnswer(
 
 bool PeerSession::AddIce(const std::string& mid,
                          const std::string& candidate) {
-  if (closed_ || !peer_ || ++remote_ice_count_ > kMaxIceCandidates)
-    return false;
+  if (closed_ || !peer_) return false;
   webrtc::SdpParseError error;
   std::unique_ptr<webrtc::IceCandidate> parsed(
       webrtc::CreateIceCandidate(mid, 0, candidate, &error));
   if (!parsed) return false;
-  if (!remote_description_set_) {
-    return pending_remote_ice_.Push(mid, candidate);
-  }
-  return peer_->AddIceCandidate(parsed.get());
+  return transport_core_.AddRemoteIceCandidate(
+      CommonIdentity(), common::IceCandidate{mid, candidate});
 }
 
-bool PeerSession::FlushPendingRemoteIce() {
-  std::vector<PendingRemoteIceCandidate> pending =
-      pending_remote_ice_.TakeAll();
-  for (PendingRemoteIceCandidate& value : pending) {
-    webrtc::SdpParseError error;
-    std::unique_ptr<webrtc::IceCandidate> parsed(
-        webrtc::CreateIceCandidate(value.mid, 0, value.candidate, &error));
-    if (!parsed || !peer_->AddIceCandidate(parsed.get())) {
-      std::fill(value.mid.begin(), value.mid.end(), '\0');
-      std::fill(value.candidate.begin(), value.candidate.end(), '\0');
-      for (PendingRemoteIceCandidate& remaining : pending) {
-        std::fill(remaining.mid.begin(), remaining.mid.end(), '\0');
-        std::fill(remaining.candidate.begin(), remaining.candidate.end(), '\0');
-      }
-      return false;
-    }
-    std::fill(value.mid.begin(), value.mid.end(), '\0');
-    std::fill(value.candidate.begin(), value.candidate.end(), '\0');
-  }
-  return true;
+bool PeerSession::AddRemoteIceCandidate(
+    const common::IceCandidate& candidate) {
+  webrtc::SdpParseError error;
+  std::unique_ptr<webrtc::IceCandidate> parsed(
+      webrtc::CreateIceCandidate(candidate.media_id, 0,
+                                candidate.candidate, &error));
+  return parsed && peer_ && peer_->AddIceCandidate(parsed.get());
 }
 
 bool PeerSession::Renew(const Authority& renewal) {
   if (!Matches(renewal) ||
       renewal.daemon_generation != authority_.daemon_generation ||
       renewal.route_generation != authority_.route_generation ||
-      renewal.lease_expires_at_ms <= authority_.lease_expires_at_ms ||
-      renewal.input_epoch != authority_.input_epoch ||
-      renewal.mode != authority_.mode) {
+      !transport_core_.RenewLease(CommonAuthority(renewal),
+                                  CurrentTransportTime())) {
     return false;
   }
   authority_.lease_expires_at_ms = renewal.lease_expires_at_ms;
@@ -494,39 +614,34 @@ bool PeerSession::Renew(const Authority& renewal) {
 }
 
 bool PeerSession::SetMode(const Authority& update, const std::string& reason) {
-  const bool mode_changed = update.mode != authority_.mode;
   if (!Matches(update) ||
-      (mode_changed && update.input_epoch != authority_.input_epoch + 1) ||
-      (!mode_changed && update.input_epoch != authority_.input_epoch) ||
-      (update.mode != kViewMode && update.mode != kControlMode)) {
+      (update.mode != kViewMode && update.mode != kControlMode) ||
+      !transport_core_.UpdateMode(CommonAuthority(update),
+                                  CurrentTransportTime())) {
     return false;
   }
   // The input epoch moves with the mode, and every input frame is bound to it,
   // so a stale-mode packet is already refused without a separate counter.
-  if (mode_changed) ReleaseInput();
   authority_.mode = update.mode;
   authority_.input_epoch = update.input_epoch;
+  authority_.lease_expires_at_ms = update.lease_expires_at_ms;
   Json::Value response = BaseEnvelope(kModeStateType, authority_);
   response["mode"] = authority_.mode;
   response["inputEpoch"] = authority_.input_epoch;
   response["reason"] = reason == "initial" ? "initial" : "user_selected";
   emit_(response);
-  SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+  SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
   return true;
 }
 
-bool PeerSession::Expired(int64_t now_ms) const {
-  return closed_ || now_ms >= authority_.expires_at_ms ||
-         now_ms >= authority_.lease_expires_at_ms || IdleExpired();
-}
-
-bool PeerSession::IdleExpired() const {
-  return std::chrono::steady_clock::now() - last_activity_ >=
-         std::chrono::milliseconds(kIdleTimeoutMs);
+bool PeerSession::Tick(int64_t now_unix_ms) {
+  common::TransportTime now = CurrentTransportTime();
+  now.unix_ms = now_unix_ms;
+  return transport_core_.Tick(now);
 }
 
 void PeerSession::TouchActivity() {
-  last_activity_ = std::chrono::steady_clock::now();
+  transport_core_.RecordActivity(CommonIdentity(), CurrentTransportTime());
 }
 
 void PeerSession::CheckMediaProgress() {
@@ -571,57 +686,112 @@ void PeerSession::HandleMediaStats(uint64_t generation,
   if (closed_ || generation != media_stats_generation_) return;
   media_stats_in_flight_ = false;
   if (!has_outbound_video || !source_) return;
-  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count();
   const uint64_t source_frames = source_->captured_frames();
-  if (outbound_bytes > 0 && !media_started_) {
-    media_started_ = true;
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
-  }
-  if (!media_stats_initialized_ ||
-      outbound_bytes != last_outbound_video_bytes_) {
-    media_stats_initialized_ = true;
-    last_outbound_video_bytes_ = outbound_bytes;
-    source_frames_at_media_progress_ = source_frames;
-    last_media_progress_at_ms_ = now_ms;
-    return;
-  }
-  if (MediaProgressShouldFailover(
-          last_outbound_video_bytes_, outbound_bytes,
-          source_frames_at_media_progress_, source_frames,
-          now_ms - last_media_progress_at_ms_)) {
+  const bool media_started =
+      transport_core_.diagnostics().last_outbound_video_bytes > 0;
+  if (!transport_core_.RecordMediaProgress(
+          CallbackStamp(), source_frames, outbound_bytes,
+          CurrentTransportTime()) &&
+      transport_core_.terminal_reason() ==
+          common::TransportTerminalReason::kMediaStalled) {
     DisqualifyHardwareEncoderForProcess();
-    Close("peer_failed");
+  } else if (outbound_bytes > 0 && !media_started) {
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
   }
 }
 
 void PeerSession::ResetMediaProgressWatchdog() {
   ++media_stats_generation_;
   media_stats_in_flight_ = false;
-  media_stats_initialized_ = false;
-  last_outbound_video_bytes_ = 0;
-  source_frames_at_media_progress_ = source_ ? source_->captured_frames() : 0;
   media_stats_requested_at_ms_ = 0;
-  last_media_progress_at_ms_ = 0;
+  if (transport_core_.started() && !transport_core_.terminal()) {
+    transport_core_.ResetMediaProgress(CallbackStamp(),
+                                       CurrentTransportTime());
+  }
 }
 
 void PeerSession::Close(const char* terminal_reason, bool emit_terminal) {
-  if (closed_.exchange(true)) return;
-  ResetMediaProgressWatchdog();
-  ReleaseInput();
-  for (auto& [label, channel] : channels_) {
-    const auto observer = channel_observers_.find(label);
-    if (observer != channel_observers_.end()) channel->UnregisterObserver();
-    channel->Close();
+  if (closed_) return;
+  pending_terminal_reason_ = terminal_reason ? terminal_reason : "worker_failed";
+  emit_transport_terminal_ = emit_terminal;
+  common::TransportTerminalReason reason =
+      common::TransportTerminalReason::kAdapterFailure;
+  if (pending_terminal_reason_ == "stopped_by_controller") {
+    reason = common::TransportTerminalReason::kStopped;
+  } else if (pending_terminal_reason_ == "peer_failed") {
+    reason = common::TransportTerminalReason::kPeerFailed;
+  } else if (pending_terminal_reason_ == "protocol_error") {
+    reason = common::TransportTerminalReason::kProtocolViolation;
+  } else if (pending_terminal_reason_ == "idle_timeout") {
+    reason = common::TransportTerminalReason::kIdleTimeout;
   }
-  channel_observers_.clear();
-  channels_.clear();
-  // Detach the source before closing the peer.  On older Windows hardware
-  // encoders libwebrtc can otherwise retain queued full-resolution frames
-  // while asynchronous PeerConnection teardown is still draining.  A rapid
-  // reconnect would then overlap that queue with the replacement software
-  // encoder and hit the worker's bounded memory job before teardown finishes.
+  if (transport_core_.started() && !transport_core_.terminal()) {
+    transport_core_.Stop(reason);
+    return;
+  }
+  if (closed_.exchange(true)) return;
+  ReleaseInput();
+  for (const auto channel : {common::DataChannelKind::kControl,
+                             common::DataChannelKind::kKeyboard,
+                             common::DataChannelKind::kPointer}) {
+    CloseDataChannel(channel);
+  }
+  CloseTransport();
+  if (emit_terminal) emit_(TerminalEnvelope(authority_, pending_terminal_reason_.c_str()));
+  std::fill(authority_.capability.begin(), authority_.capability.end(), '\0');
+}
+
+bool PeerSession::EmitLocalIceCandidate(
+    const common::IceCandidate& candidate) {
+  if (closed_) return false;
+  Json::Value message = BaseEnvelope(kIceType, authority_);
+  message["candidate"] = candidate.candidate;
+  message["mid"] = candidate.media_id;
+  emit_(message);
+  return true;
+}
+
+bool PeerSession::ApplyQuality(const common::QualitySelection& selection) {
+  const MfH264RuntimeDiagnostics actual = GetMfH264RuntimeDiagnostics();
+  return actual.preset == selection.preset_id &&
+         actual.width == static_cast<int>(selection.encoded_pixels.width) &&
+         actual.height == static_cast<int>(selection.encoded_pixels.height) &&
+         actual.fps == static_cast<int>(selection.frame_rate) &&
+         actual.bitrate_bps == selection.bitrate_bps;
+}
+
+void PeerSession::ReleaseControlAuthority(
+    const common::RouteAuthorityIdentity& identity,
+    std::uint64_t input_epoch) noexcept {
+  if (identity.request_id == authority_.request_id &&
+      identity.session_id == authority_.session_id &&
+      input_epoch == static_cast<std::uint64_t>(authority_.input_epoch)) {
+    ReleaseInput();
+  }
+}
+
+void PeerSession::CloseDataChannel(
+    common::DataChannelKind channel_kind) noexcept {
+  const std::string label = ChannelLabel(channel_kind);
+  const auto channel = channels_.find(label);
+  if (channel == channels_.end()) return;
+  const auto observer = channel_observers_.find(label);
+  if (observer != channel_observers_.end()) {
+    channel->second->UnregisterObserver();
+    channel_observers_.erase(observer);
+  }
+  channel->second->Close();
+  channels_.erase(channel);
+}
+
+void PeerSession::CloseTransport() noexcept {
+  closed_ = true;
+  ++media_stats_generation_;
+  media_stats_in_flight_ = false;
+  media_stats_requested_at_ms_ = 0;
+  // Detach the source before closing the peer. On older Windows hardware
+  // encoders this prevents queued full-resolution frames from overlapping a
+  // rapid replacement session and exceeding the worker's bounded memory job.
   if (peer_) {
     for (const auto& sender : peer_->GetSenders()) {
       if (sender->track() && sender->track()->kind() ==
@@ -631,21 +801,65 @@ void PeerSession::Close(const char* terminal_reason, bool emit_terminal) {
     }
   }
   track_ = nullptr;
-  if (source_ && release_source_) release_source_(source_->display());
-  source_ = nullptr;
+  source_.reset();
   if (peer_) peer_->Close();
   peer_ = nullptr;
   answer_observer_ = nullptr;
   setting_remote_description_ = false;
-  remote_description_set_ = false;
-  pending_remote_ice_.Clear();
-  if (emit_terminal) emit_(TerminalEnvelope(authority_, terminal_reason));
+}
+
+void PeerSession::PublishDiagnostics(
+    const common::TransportDiagnostics& diagnostics) noexcept {
+  transport_diagnostics_ = diagnostics;
+}
+
+void PeerSession::OnTerminal(
+    common::TransportTerminalReason reason) noexcept {
+  const char* wire_reason = pending_terminal_reason_.empty()
+                                ? "peer_failed"
+                                : pending_terminal_reason_.c_str();
+  if (pending_terminal_reason_.empty()) {
+    switch (reason) {
+      case common::TransportTerminalReason::kStopped:
+        wire_reason = "stopped_by_controller";
+        break;
+      case common::TransportTerminalReason::kRouteExpired:
+        wire_reason = "route_expired";
+        break;
+      case common::TransportTerminalReason::kLeaseExpired:
+        wire_reason = "lease_expired";
+        break;
+      case common::TransportTerminalReason::kIdleTimeout:
+        wire_reason = "idle_timeout";
+        break;
+      case common::TransportTerminalReason::kProtocolViolation:
+      case common::TransportTerminalReason::kCandidateOverflow:
+        wire_reason = "protocol_error";
+        break;
+      case common::TransportTerminalReason::kNone:
+      case common::TransportTerminalReason::kMediaStalled:
+      case common::TransportTerminalReason::kPeerFailed:
+      case common::TransportTerminalReason::kChannelFailed:
+      case common::TransportTerminalReason::kAdapterFailure:
+        wire_reason = "peer_failed";
+        break;
+    }
+  }
+  if (emit_transport_terminal_) emit_(TerminalEnvelope(authority_, wire_reason));
   std::fill(authority_.capability.begin(), authority_.capability.end(), '\0');
+}
+
+bool PeerSession::IsRelayed() const noexcept {
+  return transport_core_.path() == common::TransportPath::kRelay;
 }
 
 bool PeerSession::controlling() const {
   return !closed_ && authority_.mode == kControlMode &&
          authority_.input_epoch > 0;
+}
+
+bool PeerSession::ReleaseInputForPlatformTransition() {
+  return ReleaseInput();
 }
 
 bool PeerSession::protected_content_masked() const {
@@ -660,9 +874,9 @@ bool PeerSession::RefreshDisplays(std::vector<DisplayInfo> displays) {
   // premature `media_unavailable` to the caller.
   if (displays.empty()) return true;
   if (SameTopology(displays_, displays)) return true;
-  const DisplayInfo previous = source_ ? source_->display()
-                                       : displays_[selected_display_];
-  const std::string previous_id = previous.id;
+  const std::string previous_id =
+      source_ ? std::string(source_->display_id())
+              : displays_[selected_display_].id;
   std::vector<DisplaySelectionCandidate> candidates;
   candidates.reserve(displays.size());
   for (const auto& display : displays) {
@@ -679,6 +893,7 @@ bool PeerSession::RefreshDisplays(std::vector<DisplayInfo> displays) {
     selected_display_ = 0;
     selection_required_ = true;
     ++layout_revision_;
+    if (!RefreshCommonTopology()) return false;
     last_sequence_by_channel_.clear();
     SendTopology();
     SendQuality();
@@ -692,8 +907,8 @@ bool PeerSession::RefreshDisplays(std::vector<DisplayInfo> displays) {
 
   ReleaseInput();
   layout_acknowledged_ = false;
-  const bool replace_source = !source_ ||
-      DisplaySourceKey(source_->display()) != DisplaySourceKey(*selected);
+  const bool replace_source =
+      !source_ || source_->source_identity() != DisplaySourceKey(*selected);
   if (replace_source) {
     webrtc::scoped_refptr<webrtc::RtpSenderInterface> video_sender;
     for (const auto& sender : peer_->GetSenders()) {
@@ -709,28 +924,32 @@ bool PeerSession::RefreshDisplays(std::vector<DisplayInfo> displays) {
     // Dropping it first turns a transient display change into a terminal
     // media_unavailable for the whole remote-control session.
     if (!video_sender) return true;
-    auto next_source = acquire_source_(*selected);
+    auto next_source = capture_adapter_->Acquire(ToCommonDisplayTopology(
+        *selected, CommonIdentity().daemon_generation));
     if (!next_source) return true;
-    next_source->Start();
-    auto next_track = factory_->CreateVideoTrack(next_source,
-                                                  "imcodes-remote-desktop");
+    if (!next_source->Start()) return true;
+    webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface>
+        next_native_source(next_source->source());
+    if (!next_native_source) return true;
+    auto next_track = factory_->CreateVideoTrack(next_native_source,
+                                                 "imcodes-remote-desktop");
+    if (!next_track) return true;
     const bool replaced = video_sender->SetTrack(next_track.get()) &&
                           video_sender->GenerateKeyFrame({}).ok();
     if (!replaced) {
-      if (release_source_) release_source_(next_source->display());
       return true;
     }
-    const std::optional<DisplayInfo> previous_display =
-        source_ ? std::optional<DisplayInfo>(source_->display()) : std::nullopt;
+    auto previous_source = std::move(source_);
     source_ = std::move(next_source);
     track_ = std::move(next_track);
-    if (previous_display && release_source_) release_source_(*previous_display);
+    previous_source.reset();
     ResetMediaProgressWatchdog();
   }
   selected_display_ = static_cast<size_t>(selected - displays.begin());
   selection_required_ = false;
   displays_ = std::move(displays);
   ++layout_revision_;
+  if (!RefreshCommonTopology()) return false;
   last_sequence_by_channel_.clear();
   SendTopology();
   SendQuality();
@@ -765,6 +984,9 @@ void PeerSession::OnDataChannel(
   channel->RegisterObserver(observer.get());
   channels_[label] = channel;
   channel_observers_[label] = std::move(observer);
+  transport_core_.OnDataChannelState(
+      CallbackStamp(), CommonChannelKind(label),
+      CommonDataChannelState(channel->state()));
 }
 
 void PeerSession::OnIceCandidate(const webrtc::IceCandidate* candidate) {
@@ -785,14 +1007,10 @@ void PeerSession::OnIceCandidate(const webrtc::IceCandidate* candidate) {
 }
 
 void PeerSession::EmitIceCandidate(std::string mid, std::string candidate) {
-  if (closed_ || ++local_ice_count_ > kMaxIceCandidates) {
-    if (local_ice_count_ > kMaxIceCandidates) Close("protocol_error");
-    return;
-  }
-  Json::Value message = BaseEnvelope(kIceType, authority_);
-  message["candidate"] = std::move(candidate);
-  message["mid"] = std::move(mid);
-  emit_(message);
+  if (closed_) return;
+  transport_core_.OnLocalIceCandidate(
+      CallbackStamp(), common::IceCandidate{std::move(mid),
+                                             std::move(candidate)});
 }
 
 void PeerSession::OnConnectionChange(
@@ -804,8 +1022,12 @@ void PeerSession::OnConnectionChange(
     });
     return;
   }
+  if (!transport_core_.OnPeerConnectionState(
+          CallbackStamp(), CommonPeerConnectionState(state),
+          CurrentTransportTime())) {
+    return;
+  }
   if (state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnected) {
-    peer_connected_ = true;
     // Start the bounded wait for the input channels here: a viewer that never
     // opens all three must still end up with a picture.
     if (video_gate_deadline_ms_ == 0) {
@@ -815,19 +1037,12 @@ void PeerSession::OnConnectionChange(
               .count() + kVideoGateTimeoutMs;
     }
     ActivateVideoIfReady();
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
   } else if (state ==
                  webrtc::PeerConnectionInterface::PeerConnectionState::kNew ||
              state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnecting ||
              state == webrtc::PeerConnectionInterface::PeerConnectionState::kDisconnected) {
-    peer_connected_ = false;
     SendStatus("connecting", false);
-  } else if (state ==
-                 webrtc::PeerConnectionInterface::PeerConnectionState::kFailed ||
-             state ==
-                 webrtc::PeerConnectionInterface::PeerConnectionState::kClosed) {
-    peer_connected_ = false;
-    Close("peer_failed");
   }
 }
 
@@ -840,8 +1055,12 @@ void PeerSession::OnIceSelectedCandidatePairChanged(
     std::weak_ptr<PeerSession> weak = weak_from_this();
     signaling_thread_->PostTask([weak, relayed] {
       if (auto session = weak.lock()) {
-        session->candidate_pair_selected_ = true;
-        session->relayed_ = relayed;
+        if (!session->transport_core_.OnTransportPath(
+                session->CallbackStamp(),
+                relayed ? common::TransportPath::kRelay
+                        : common::TransportPath::kDirect)) {
+          return;
+        }
         session->ApplyTransportBitratePolicy(!relayed);
         session->SendStatus(relayed ? "relayed" : "direct",
                             session->InputReady());
@@ -849,8 +1068,11 @@ void PeerSession::OnIceSelectedCandidatePairChanged(
     });
     return;
   }
-  candidate_pair_selected_ = true;
-  relayed_ = relayed;
+  if (!transport_core_.OnTransportPath(
+          CallbackStamp(), relayed ? common::TransportPath::kRelay
+                                   : common::TransportPath::kDirect)) {
+    return;
+  }
   ApplyTransportBitratePolicy(!relayed);
   SendStatus(relayed ? "relayed" : "direct", InputReady());
 }
@@ -865,6 +1087,11 @@ void PeerSession::HandleChannelState(const std::string& label) {
   }
   const auto found = channels_.find(label);
   if (found == channels_.end()) return;
+  if (!transport_core_.OnDataChannelState(
+          CallbackStamp(), CommonChannelKind(label),
+          CommonDataChannelState(found->second->state()))) {
+    return;
+  }
   if (found->second->state() == webrtc::DataChannelInterface::kOpen &&
       label == kControlChannel) {
     SendTopology();
@@ -874,10 +1101,7 @@ void PeerSession::HandleChannelState(const std::string& label) {
       ChannelsReady()) {
     // The channels are up, so the pipe is free for the picture now.
     ActivateVideoIfReady();
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
-  } else if (found->second->state() ==
-             webrtc::DataChannelInterface::kClosed) {
-    Close("peer_failed");
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
   }
 }
 
@@ -1005,7 +1229,12 @@ void PeerSession::HandleControl(const std::string& channel,
         root.isMember("acknowledgedSequence"))
       return;
   } else if (kind == "frame_presented") {
+    const common::DisplayTopology* presented =
+        common_topology_ && selected_display_ < displays_.size()
+            ? common_topology_->FindDisplay(displays_[selected_display_].id)
+            : nullptr;
     if (selection_required_ || selected_display_ >= displays_.size() ||
+        presented == nullptr ||
         !root["displayId"].isString() || !root["frameWidth"].isInt() ||
         !root["frameHeight"].isInt() || root.isMember("width") ||
         root.isMember("height") || root.isMember("dpiScalePercent") ||
@@ -1013,8 +1242,8 @@ void PeerSession::HandleControl(const std::string& channel,
         root["displayId"].asString() != displays_[selected_display_].id ||
         !PresentedFrameMatchesDisplay(
             root["frameWidth"].asInt(), root["frameHeight"].asInt(),
-            displays_[selected_display_].width,
-            displays_[selected_display_].height)) {
+            static_cast<int>(presented->encoded_pixels.width),
+            static_cast<int>(presented->encoded_pixels.height))) {
       return;
     }
     acknowledge_layout = true;
@@ -1101,7 +1330,7 @@ void PeerSession::HandleControl(const std::string& channel,
   TouchActivity();
   if (acknowledge_layout) {
     layout_acknowledged_ = true;
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
   }
 }
 
@@ -1126,14 +1355,24 @@ void PeerSession::HandlePointer(const std::string& channel,
   if (!ValidateInputBase(root, channel, true, &sequence) ||
       authority_.input_epoch <= 0) return;
   const std::string kind = root["kind"].asString();
+  const common::InputStamp stamp{
+      InputControllerId(channel),
+      static_cast<common::InputEpoch>(authority_.input_epoch),
+      static_cast<common::InputSequence>(sequence),
+      static_cast<common::TopologyRevision>(layout_revision_),
+  };
+  common::InputStamp pointer_stamp = stamp;
+  pointer_stamp.controller_id += ":position";
   bool accepted = false;
   if (kind == "move" && root["x"].isNumeric() && root["y"].isNumeric() &&
       !root.isMember("button") && !root.isMember("deltaX") &&
       !root.isMember("deltaY") && root["x"].asDouble() >= 0.0 &&
       root["x"].asDouble() <= 1.0 && root["y"].asDouble() >= 0.0 &&
       root["y"].asDouble() <= 1.0) {
-    accepted = input_->Move(displays_[selected_display_], root["x"].asDouble(),
-                            root["y"].asDouble());
+    accepted = InputApplied(input_->ApplyPointerStamped(
+        pointer_stamp, static_cast<common::TopologyRevision>(layout_revision_),
+        displays_[selected_display_], root["x"].asDouble(),
+        root["y"].asDouble()));
   } else if ((kind == "button_down" || kind == "button_up" ||
               kind == "button_click") &&
              root["button"].isString() && !root.isMember("deltaX") &&
@@ -1143,16 +1382,21 @@ void PeerSession::HandlePointer(const std::string& channel,
              (!root.isMember("y") || (root["y"].isNumeric() &&
               root["y"].asDouble() >= 0.0 && root["y"].asDouble() <= 1.0))) {
     if (root.isMember("x") && root.isMember("y") &&
-        !input_->Move(displays_[selected_display_], root["x"].asDouble(),
-                      root["y"].asDouble())) {
+        !InputApplied(input_->ApplyPointerStamped(
+            pointer_stamp,
+            static_cast<common::TopologyRevision>(layout_revision_),
+            displays_[selected_display_], root["x"].asDouble(),
+            root["y"].asDouble()))) {
       return;
     }
     if (kind == "button_down") {
-      accepted = input_->ButtonDown(authority_.session_id,
-                                    root["button"].asString());
+      accepted = InputApplied(input_->ApplyButtonStamped(
+          stamp, static_cast<common::TopologyRevision>(layout_revision_),
+          root["button"].asString(), true));
     } else if (kind == "button_up") {
-      accepted = input_->ButtonUp(authority_.session_id,
-                                  root["button"].asString());
+      accepted = InputApplied(input_->ApplyButtonStamped(
+          stamp, static_cast<common::TopologyRevision>(layout_revision_),
+          root["button"].asString(), false));
     } else {
       accepted = input_->Click(root["button"].asString());
     }
@@ -1167,12 +1411,16 @@ void PeerSession::HandlePointer(const std::string& channel,
              (!root.isMember("y") || (root["y"].isNumeric() &&
               root["y"].asDouble() >= 0.0 && root["y"].asDouble() <= 1.0))) {
     if (root.isMember("x") && root.isMember("y") &&
-        !input_->Move(displays_[selected_display_], root["x"].asDouble(),
-                      root["y"].asDouble())) {
+        !InputApplied(input_->ApplyPointerStamped(
+            pointer_stamp,
+            static_cast<common::TopologyRevision>(layout_revision_),
+            displays_[selected_display_], root["x"].asDouble(),
+            root["y"].asDouble()))) {
       return;
     }
-    accepted = input_->Wheel(root["deltaX"].asDouble(),
-                             root["deltaY"].asDouble());
+    accepted = InputApplied(input_->ApplyWheelStamped(
+        stamp, static_cast<common::TopologyRevision>(layout_revision_),
+        root["deltaX"].asDouble(), root["deltaY"].asDouble()));
   }
   if (accepted) {
     last_sequence_by_channel_[channel] = sequence;
@@ -1198,6 +1446,12 @@ void PeerSession::HandleKeyboard(const std::string& channel,
   if (!ValidateInputBase(root, channel, true, &sequence) ||
       authority_.input_epoch <= 0) return;
   const std::string kind = root["kind"].asString();
+  const common::InputStamp stamp{
+      InputControllerId(channel),
+      static_cast<common::InputEpoch>(authority_.input_epoch),
+      static_cast<common::InputSequence>(sequence),
+      static_cast<common::TopologyRevision>(layout_revision_),
+  };
   bool accepted = false;
   if ((kind == "key_down" || kind == "key_up") &&
       root["code"].isString() && root["key"].isString() &&
@@ -1212,11 +1466,14 @@ void PeerSession::HandleKeyboard(const std::string& channel,
          pressed_codes_.contains("AltRight"));
     if (secure_attention) return;
     if (kind == "key_down") {
-      accepted = input_->KeyDown(authority_.session_id, code,
-                                 root["repeat"].asBool());
+      accepted = InputApplied(input_->ApplyKeyStamped(
+          stamp, static_cast<common::TopologyRevision>(layout_revision_), code,
+          true, root["repeat"].asBool()));
       if (accepted) pressed_codes_.insert(code);
     } else {
-      accepted = input_->KeyUp(authority_.session_id, code);
+      accepted = InputApplied(input_->ApplyKeyStamped(
+          stamp, static_cast<common::TopologyRevision>(layout_revision_), code,
+          false));
       pressed_codes_.erase(code);
     }
   } else if (kind == "text" && root["text"].isString()) {
@@ -1224,8 +1481,9 @@ void PeerSession::HandleKeyboard(const std::string& channel,
         root.isMember("repeat") || root["text"].asString().size() > 4096) {
       return;
     }
-    const std::u16string text = Utf8ToUtf16(root["text"].asString());
-    accepted = !text.empty() && input_->Text(text);
+    accepted = InputApplied(input_->ApplyTextStamped(
+        stamp, static_cast<common::TopologyRevision>(layout_revision_),
+        root["text"].asString()));
   }
   if (accepted) {
     last_sequence_by_channel_[channel] = sequence;
@@ -1243,15 +1501,18 @@ void PeerSession::SendTopology() {
   root["layoutRevision"] = layout_revision_;
   Json::Value displays(Json::arrayValue);
   for (const DisplayInfo& display : displays_) {
+    const common::DisplayTopology* topology =
+        common_topology_ ? common_topology_->FindDisplay(display.id) : nullptr;
+    if (topology == nullptr) continue;
     Json::Value value(Json::objectValue);
     value["id"] = display.id;
     value["label"] = display.label;
     value["primary"] = display.primary;
     value["available"] = display.available;
-    value["width"] = display.width;
-    value["height"] = display.height;
-    value["dpiScale"] = display.dpi_scale;
-    value["rotation"] = display.rotation_degrees;
+    value["width"] = topology->encoded_pixels.width;
+    value["height"] = topology->encoded_pixels.height;
+    value["dpiScale"] = topology->scale;
+    value["rotation"] = static_cast<unsigned int>(topology->rotation);
     if (!display.modes.empty()) {
       // The resolutions this driver actually offers. Without them the browser
       // can only guess at a fixed set, and every guess the driver lacks is a
@@ -1276,6 +1537,15 @@ void PeerSession::SendTopology() {
 void PeerSession::SendQuality() {
   const MfH264RuntimeDiagnostics diagnostics =
       GetMfH264RuntimeDiagnostics();
+  if (diagnostics.initialized && source_) {
+    transport_core_.UpdateQualityTarget(
+        CallbackStamp(),
+        common::QualityTarget{
+            diagnostics.bitrate_bps,
+            source_->encoded_pixels(),
+        });
+    if (closed_) return;
+  }
   Json::Value root(Json::objectValue);
   root["type"] = kQualityType;
   root["protocolVersion"] = kProtocolVersion;
@@ -1306,18 +1576,15 @@ void PeerSession::SendInputAck(uint64_t acknowledged_sequence) {
 }
 
 bool PeerSession::CopySelection(const std::string& request_id) {
-  if (!clipboard_sequence_ || !read_clipboard_text_)
+  std::string text;
+  if (!clipboard_adapter_ || !clipboard_adapter_->CopySelection(&text)) {
     return SendClipboard(request_id, std::nullopt);
-  const DWORD previous_sequence = clipboard_sequence_();
-  const std::string owner = authority_.session_id + ":clipboard";
-  if (!input_->CopyShortcut(owner))
-    return SendClipboard(request_id, std::nullopt);
-  for (int attempt = 0; attempt < 6; ++attempt) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    const auto text = read_clipboard_text_(previous_sequence);
-    if (text) return SendClipboard(request_id, text);
   }
-  return SendClipboard(request_id, std::nullopt);
+  const std::u16string decoded = Utf8ToUtf16(text);
+  return SendClipboard(request_id,
+                       decoded.empty()
+                           ? std::optional<std::u16string>{}
+                           : std::optional<std::u16string>{decoded});
 }
 
 bool PeerSession::SendClipboard(
@@ -1342,18 +1609,24 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
   Json::Value root = BaseEnvelope(kStatusType, authority_);
   root["mode"] = authority_.mode;
   root["inputEpoch"] = authority_.input_epoch;
+  const common::TransportDiagnostics diagnostics =
+      transport_core_.diagnostics();
+  const bool peer_connected =
+      diagnostics.peer_state == common::PeerConnectionState::kConnected;
   const bool route_state = std::strcmp(state, "direct") == 0 ||
                            std::strcmp(state, "relayed") == 0;
-  // A selected direct pair is transport diagnostics, not PeerConnection
+  // A selected candidate pair is transport diagnostics, not PeerConnection
   // readiness. Until libwebrtc reports kConnected, keep the lifecycle state
   // truthful so the Server cannot clear its negotiation timeout early.
-  root["state"] = route_state && !peer_connected_ ? "connecting" : state;
-  if (candidate_pair_selected_) {
-    root["route"] = relayed_ ? "relay" : "direct";
+  root["state"] = route_state && !peer_connected ? "connecting" : state;
+  if (diagnostics.path != common::TransportPath::kUnknown) {
+    root["route"] = diagnostics.path == common::TransportPath::kRelay
+                        ? "relay"
+                        : "direct";
   }
-  root["peerConnected"] = peer_connected_;
-  root["dataChannelsReady"] = ChannelsReady();
-  root["mediaStarted"] = media_started_;
+  root["peerConnected"] = peer_connected;
+  root["dataChannelsReady"] = diagnostics.required_channels_ready;
+  root["mediaStarted"] = diagnostics.last_outbound_video_bytes > 0;
   root["firstFramePresented"] = layout_acknowledged_;
   if (!selection_required_ && selected_display_ < displays_.size()) {
     root["selectedDisplayId"] = displays_[selected_display_].id;
@@ -1380,7 +1653,7 @@ void PeerSession::SetSignInState(bool sign_in_screen, bool unlock_available) {
   }
   sign_in_screen_ = sign_in_screen;
   unlock_available_ = unlock_available;
-  SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+  SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
 }
 
 bool PeerSession::SendControlRejected(const char* kind,
@@ -1402,6 +1675,9 @@ bool PeerSession::SendControlRejected(const char* kind,
 }
 
 bool PeerSession::SelectDisplay(const std::string& id) {
+  if (!display_adapter_ || !display_adapter_->SelectDisplay(id)) {
+    return SendControlRejected("select_display", kRejectDisplayUnavailable, id);
+  }
   const auto found = std::find_if(displays_.begin(), displays_.end(),
                                   [&](const DisplayInfo& display) {
                                     return display.id == id && display.available;
@@ -1414,17 +1690,31 @@ bool PeerSession::SelectDisplay(const std::string& id) {
   ReleaseInput();
   const bool previous_layout_acknowledged = layout_acknowledged_;
   layout_acknowledged_ = false;
-  auto next_source = acquire_source_(*found);
+  auto next_source = capture_adapter_->Acquire(ToCommonDisplayTopology(
+      *found, CommonIdentity().daemon_generation));
   if (!next_source) {
     layout_acknowledged_ = previous_layout_acknowledged;
     SendTopology();
     SendQuality();
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
     return SendControlRejected("select_display", kRejectCaptureFailed, id);
   }
-  next_source->Start();
-  auto next_track = factory_->CreateVideoTrack(next_source,
-                                                "imcodes-remote-desktop");
+  if (!next_source->Start()) {
+    layout_acknowledged_ = previous_layout_acknowledged;
+    return SendControlRejected("select_display", kRejectCaptureFailed, id);
+  }
+  webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> next_native_source(
+      next_source->source());
+  if (!next_native_source) {
+    layout_acknowledged_ = previous_layout_acknowledged;
+    return SendControlRejected("select_display", kRejectCaptureFailed, id);
+  }
+  auto next_track = factory_->CreateVideoTrack(next_native_source,
+                                               "imcodes-remote-desktop");
+  if (!next_track) {
+    layout_acknowledged_ = previous_layout_acknowledged;
+    return SendControlRejected("select_display", kRejectCaptureFailed, id);
+  }
   bool replaced = false;
   for (const auto& sender : peer_->GetSenders()) {
     if (sender->track() && sender->track()->kind() ==
@@ -1435,22 +1725,21 @@ bool PeerSession::SelectDisplay(const std::string& id) {
     }
   }
   if (!replaced) {
-    if (release_source_) release_source_(next_source->display());
     layout_acknowledged_ = previous_layout_acknowledged;
     SendTopology();
     SendQuality();
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
     return SendControlRejected("select_display", kRejectCaptureFailed, id);
   }
-  const std::optional<DisplayInfo> previous_display =
-      source_ ? std::optional<DisplayInfo>(source_->display()) : std::nullopt;
+  auto previous_source = std::move(source_);
   selected_display_ = index;
   selection_required_ = false;
   source_ = std::move(next_source);
   track_ = std::move(next_track);
   ResetMediaProgressWatchdog();
-  if (previous_display && release_source_) release_source_(*previous_display);
+  previous_source.reset();
   ++layout_revision_;
+  if (!RefreshCommonTopology()) return false;
   last_sequence_by_channel_.clear();
   SendTopology();
   SendQuality();
@@ -1467,7 +1756,7 @@ bool PeerSession::SetDisplayMode(const std::string& id,
   const auto restore_current_status = [&](const char* reason) {
     SendTopology();
     SendQuality();
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
     return SendControlRejected("set_display_mode", reason, id);
   };
   const auto found = std::find_if(displays_.begin(), displays_.end(),
@@ -1478,7 +1767,7 @@ bool PeerSession::SetDisplayMode(const std::string& id,
     return restore_current_status(kRejectDisplayUnavailable);
   }
   if (found->width == width && found->height == height) {
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
     return true;
   }
 
@@ -1502,20 +1791,13 @@ bool PeerSession::SetDisplayMode(const std::string& id,
   ReleaseInput();
   const bool previous_layout_acknowledged = layout_acknowledged_;
   layout_acknowledged_ = false;
-  if (ChangeDisplaySettingsExW(found->device_name.c_str(), &mode, nullptr,
-                               CDS_UPDATEREGISTRY,
-                               nullptr) != DISP_CHANGE_SUCCESSFUL) {
+  if (!display_adapter_ ||
+      !display_adapter_->SetMode(
+          id, common::PixelSize{static_cast<std::uint32_t>(width),
+                                static_cast<std::uint32_t>(height)})) {
     layout_acknowledged_ = previous_layout_acknowledged;
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
     return SendControlRejected("set_display_mode", kRejectModeChangeFailed, id);
-  }
-  // Do not drive the undocumented per-monitor DPI packet while DXGI is still
-  // bound to the old mode. On the IM.codes display persist the paired readable
-  // scale; Initialize applies it on the next verified worker session before
-  // capture starts. Physical-display DPI remains an explicit user operation.
-  const int recommended_scale = RecommendedRemoteDisplayScale(width, height);
-  if (found->imcodes_virtual) {
-    SaveVirtualDisplayPreferences({width, height, recommended_scale});
   }
   SendStatus("switching_display", false);
   return true;
@@ -1535,24 +1817,23 @@ bool PeerSession::SetDisplayScale(const std::string& id, int percent) {
                                id);
   }
   if (std::lround(found->dpi_scale * 100.0) == percent) {
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
     return true;
   }
   ReleaseInput();
   const bool previous_layout_acknowledged = layout_acknowledged_;
   layout_acknowledged_ = false;
-  if (!SetDisplayDpiScale(*found, percent)) {
+  if (!display_adapter_ ||
+      !display_adapter_->SetScale(id, static_cast<double>(percent) / 100.0)) {
     layout_acknowledged_ = previous_layout_acknowledged;
     SendTopology();
-    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
     return SendControlRejected("set_display_scale", kRejectScaleChangeFailed,
                                id);
   }
   found->dpi_scale = static_cast<double>(percent) / 100.0;
-  if (found->imcodes_virtual) {
-    SaveVirtualDisplayPreferences({found->width, found->height, percent});
-  }
   ++layout_revision_;
+  if (!RefreshCommonTopology()) return false;
   last_sequence_by_channel_.clear();
   SendTopology();
   SendQuality();
@@ -1571,15 +1852,7 @@ bool PeerSession::SendControl(const Json::Value& value) {
 }
 
 bool PeerSession::ChannelsReady() const {
-  for (const char* label : {kControlChannel, kKeyboardChannel,
-                            kPointerChannel}) {
-    const auto found = channels_.find(label);
-    if (found == channels_.end() ||
-        found->second->state() != webrtc::DataChannelInterface::kOpen) {
-      return false;
-    }
-  }
-  return true;
+  return transport_core_.required_channels_ready();
 }
 
 void PeerSession::ActivateVideoIfReady() {
@@ -1612,7 +1885,7 @@ void PeerSession::PublishInputReadinessIfChanged() {
   const bool ready = InputReady();
   if (ready == reported_input_ready_) return;
   reported_input_ready_ = ready;
-  SendStatus(relayed_ ? "relayed" : "direct", ready);
+  SendStatus(IsRelayed() ? "relayed" : "direct", ready);
 }
 
 const char* PeerSession::InputBlockedReason() const {
@@ -1632,8 +1905,38 @@ bool PeerSession::InputReady() const {
          !selection_required_ && input_->Available();
 }
 
+bool PeerSession::RefreshCommonTopology() {
+  if (!display_adapter_) return false;
+  display_adapter_->SetTopologyVersion(
+      static_cast<common::WorkerGeneration>(
+          std::max(1, authority_.daemon_generation)),
+      static_cast<common::TopologyRevision>(std::max(1, layout_revision_)));
+  common_topology_ = display_adapter_->EnumerateTopology();
+  return common_topology_.has_value();
+}
+
+std::string PeerSession::InputControllerId(const std::string& channel) const {
+  const char* suffix = channel == kKeyboardChannel
+                           ? "k"
+                           : channel == kPointerChannel ? "p" : "c";
+  // Capability tokens are fixed at 43 URL-safe bytes, keeping the controller
+  // identity well below the common 128-byte bound even with a channel suffix.
+  return "rd:" + authority_.capability + ":" + suffix;
+}
+
 bool PeerSession::ReleaseInput() {
-  const bool released = input_->ReleaseOwner(authority_.session_id);
+  bool released = input_->ReleaseOwner(authority_.session_id);
+  released = input_->ReleaseOwner(authority_.session_id + ":clipboard") &&
+             released;
+  for (const char* channel : {kControlChannel, kKeyboardChannel,
+                              kPointerChannel}) {
+    const std::string controller = InputControllerId(channel);
+    released = InputApplied(input_->ReleaseControllerStamped(controller)) &&
+               released;
+    released = InputApplied(input_->ReleaseControllerStamped(
+                   controller + ":position")) &&
+               released;
+  }
   pressed_codes_.clear();
   return released;
 }

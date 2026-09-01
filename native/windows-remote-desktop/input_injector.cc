@@ -1,10 +1,13 @@
 #include "third_party/imcodes_remote_desktop/input_injector.h"
 
+#include "third_party/imcodes_remote_desktop/windows_platform_adapters.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -89,120 +92,195 @@ std::optional<KeyMapping> MapCode(const std::string& code) {
                                  : std::optional<KeyMapping>(found->second);
 }
 
+bool IsSupportedButton(std::string_view button) {
+  return button == "left" || button == "middle" || button == "right" ||
+         button == "back" || button == "forward";
+}
+
+std::optional<std::string> Utf16ToUtf8(const std::u16string& value) {
+  static_assert(sizeof(wchar_t) == sizeof(char16_t));
+  if (value.empty() || value.size() > 2048 ||
+      value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return std::nullopt;
+  }
+  const auto* wide = reinterpret_cast<const wchar_t*>(value.data());
+  const int length = static_cast<int>(value.size());
+  const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide,
+                                        length, nullptr, 0, nullptr, nullptr);
+  if (bytes <= 0) return std::nullopt;
+  std::string utf8(static_cast<std::size_t>(bytes), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, length,
+                          utf8.data(), bytes, nullptr, nullptr) != bytes) {
+    return std::nullopt;
+  }
+  return utf8;
+}
+
+std::optional<std::u16string> Utf8ToUtf16(std::string_view value) {
+  static_assert(sizeof(wchar_t) == sizeof(char16_t));
+  if (value.empty() ||
+      value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return std::nullopt;
+  }
+  const int bytes = static_cast<int>(value.size());
+  const int units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                        value.data(), bytes, nullptr, 0);
+  if (units <= 0) return std::nullopt;
+  std::u16string utf16(static_cast<std::size_t>(units), u'\0');
+  auto* wide = reinterpret_cast<wchar_t*>(utf16.data());
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), bytes,
+                          wide, units) != units) {
+    return std::nullopt;
+  }
+  return utf16;
+}
+
 }  // namespace
 
-InputArbiter::InputArbiter(SendInputFn send_input,
-                           InputAvailableFn input_available,
-                           MovePointerFn move_pointer)
+WindowsSendInputBackend::WindowsSendInputBackend(
+    WindowsSendInputFn send_input, WindowsInputAvailableFn input_available,
+    WindowsMovePointerFn move_pointer)
     : send_input_(send_input ? std::move(send_input)
-                             : SendInputFn([](UINT count, LPINPUT inputs,
-                                              int size) {
+                             : WindowsSendInputFn([](UINT count,
+                                                     LPINPUT inputs, int size) {
                                  return ::SendInput(count, inputs, size);
                                })),
-      input_available_(input_available ? std::move(input_available)
-                                       : InputAvailableFn([] { return true; })),
+      input_available_(input_available
+                           ? std::move(input_available)
+                           : WindowsInputAvailableFn([] { return true; })),
       move_pointer_(std::move(move_pointer)) {}
 
-bool InputArbiter::Available() const { return input_available_(); }
+WindowsSendInputBackend::~WindowsSendInputBackend() {
+  ReleaseAllEmittedState();
+}
 
-bool InputArbiter::KeyDown(const std::string& owner,
-                           const std::string& code,
-                           bool repeat) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto mapping = MapCode(code);
+common::ReadinessState WindowsSendInputBackend::ProbeReadiness() {
+  return input_available_() ? common::ReadinessState::kReady
+                            : common::ReadinessState::kUnavailable;
+}
+
+bool WindowsSendInputBackend::SupportsKey(std::string_view key) const {
+  return MapCode(std::string(key)).has_value();
+}
+
+bool WindowsSendInputBackend::SupportsButton(std::string_view button) const {
+  return IsSupportedButton(button);
+}
+
+bool WindowsSendInputBackend::Dispatch(INPUT* inputs, UINT count) {
+  if (count == 0) return false;
+  SetLastError(ERROR_SUCCESS);
+  const UINT accepted = send_input_(count, inputs, sizeof(INPUT));
+  if (accepted != count) {
+    std::fprintf(stderr,
+                 "imcodes-rd-input-dispatch-failed accepted=%u requested=%u "
+                 "error=%lu\n",
+                 accepted, count, static_cast<unsigned long>(GetLastError()));
+  }
+  return accepted == count;
+}
+
+bool WindowsSendInputBackend::SendKeyLocked(std::string_view key,
+                                            bool pressed) {
+  const auto mapping = MapCode(std::string(key));
   if (!mapping) return false;
-  const auto pending = key_owners_.find(code);
-  if (pending != key_owners_.end() && pending->second.empty()) {
-    if (!SendKey(code, false)) return false;
-    key_owners_.erase(pending);
-  }
-  auto& owners = key_owners_[code];
-  const bool already_owned = owners.contains(owner);
-  owners.insert(owner);
-  if ((already_owned && !repeat) || (!already_owned && owners.size() > 1))
-    return true;
-  if (SendKey(code, true)) return true;
-  if (!already_owned) {
-    owners.erase(owner);
-    if (owners.empty()) key_owners_.erase(code);
-  }
-  return false;
+  INPUT input{};
+  input.type = INPUT_KEYBOARD;
+  input.ki.wScan = static_cast<WORD>(MapVirtualKeyW(
+      mapping->virtual_key, MAPVK_VK_TO_VSC_EX));
+  input.ki.dwFlags = KEYEVENTF_SCANCODE |
+                     (mapping->extended ? KEYEVENTF_EXTENDEDKEY : 0) |
+                     (pressed ? 0 : KEYEVENTF_KEYUP);
+  return Dispatch(&input, 1);
 }
 
-bool InputArbiter::KeyUp(const std::string& owner, const std::string& code) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto found = key_owners_.find(code);
-  if (found == key_owners_.end() || found->second.erase(owner) == 0)
-    return true;
-  if (!found->second.empty()) return true;
-  if (SendKey(code, false)) {
-    key_owners_.erase(found);
-    return true;
-  }
-  // Keep ownership recorded so a later release-all/teardown can retry rather
-  // than forgetting a key that Windows may still consider pressed.
-  found->second.insert(owner);
-  return false;
-}
-
-bool InputArbiter::ButtonDown(const std::string& owner,
-                              const std::string& button) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto pending = button_owners_.find(button);
-  if (pending != button_owners_.end() && pending->second.empty()) {
-    if (!SendButton(button, false)) return false;
-    button_owners_.erase(pending);
-  }
-  auto& owners = button_owners_[button];
-  const bool inserted = owners.insert(owner).second;
-  if (!inserted || owners.size() > 1) return true;
-  if (SendButton(button, true)) return true;
-  owners.erase(owner);
-  if (owners.empty()) button_owners_.erase(button);
-  return false;
-}
-
-bool InputArbiter::ButtonUp(const std::string& owner,
-                            const std::string& button) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto found = button_owners_.find(button);
-  if (found == button_owners_.end() || found->second.erase(owner) == 0)
-    return true;
-  if (!found->second.empty()) return true;
-  if (SendButton(button, false)) {
-    button_owners_.erase(found);
-    return true;
-  }
-  found->second.insert(owner);
-  return false;
-}
-
-bool InputArbiter::Click(const std::string& button) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto pending = button_owners_.find(button);
-  if (pending != button_owners_.end()) {
-    if (!pending->second.empty() || !SendButton(button, false)) return false;
-    button_owners_.erase(pending);
-  }
-  return SendClick(button);
-}
-
-bool InputArbiter::Move(const DisplayInfo& display, double x, double y) {
-  if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 ||
-      y > 1) {
+bool WindowsSendInputBackend::SendButtonLocked(std::string_view button,
+                                               bool pressed) {
+  INPUT input{};
+  input.type = INPUT_MOUSE;
+  if (button == "left")
+    input.mi.dwFlags = pressed ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+  else if (button == "middle")
+    input.mi.dwFlags = pressed ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+  else if (button == "right")
+    input.mi.dwFlags = pressed ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+  else if (button == "back" || button == "forward") {
+    input.mi.dwFlags = pressed ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+    input.mi.mouseData = button == "back" ? XBUTTON1 : XBUTTON2;
+  } else {
     return false;
   }
-  const int pixel_x = display.desktop_rect.left +
-                      std::min(display.width - 1,
-                               static_cast<int>(x * display.width));
-  const int pixel_y = display.desktop_rect.top +
-                      std::min(display.height - 1,
-                               static_cast<int>(y * display.height));
-  // The interactive indicator owns the input desktop. Prefer an exact
-  // physical-pixel cursor move on that thread: SendInput's 0..65535 virtual
-  // desktop normalization introduces visible rounding/offset errors on 4K
-  // and mixed-origin multi-monitor layouts. Keep the normalized fallback for
-  // standalone tests and recovery callers that do not supply the UI bridge.
+  return Dispatch(&input, 1);
+}
+
+bool WindowsSendInputBackend::ReleaseKeyLocked(
+    const std::string& key) noexcept {
+  if (!emitted_keys_.contains(key)) {
+    pending_key_releases_.erase(key);
+    return true;
+  }
+  if (!SendKeyLocked(key, false)) {
+    pending_key_releases_.insert(key);
+    return false;
+  }
+  emitted_keys_.erase(key);
+  pending_key_releases_.erase(key);
+  return true;
+}
+
+bool WindowsSendInputBackend::ReleaseButtonLocked(
+    const std::string& button) noexcept {
+  if (!emitted_buttons_.contains(button)) {
+    pending_button_releases_.erase(button);
+    return true;
+  }
+  if (!SendButtonLocked(button, false)) {
+    pending_button_releases_.insert(button);
+    return false;
+  }
+  emitted_buttons_.erase(button);
+  pending_button_releases_.erase(button);
+  return true;
+}
+
+bool WindowsSendInputBackend::PrepareKeyDown(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::string token(key);
+  if (!SupportsKey(token)) return false;
+  if (pending_key_releases_.contains(token) && !ReleaseKeyLocked(token))
+    return false;
+  if (emitted_keys_.contains(token)) return true;
+  if (!SendKeyLocked(token, true)) return false;
+  emitted_keys_.insert(token);
+  return true;
+}
+
+bool WindowsSendInputBackend::PrepareButtonDown(std::string_view button) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::string token(button);
+  if (!SupportsButton(token)) return false;
+  if (pending_button_releases_.contains(token) &&
+      !ReleaseButtonLocked(token)) {
+    return false;
+  }
+  if (emitted_buttons_.contains(token)) return true;
+  if (!SendButtonLocked(token, true)) return false;
+  emitted_buttons_.insert(token);
+  return true;
+}
+
+bool WindowsSendInputBackend::MovePointer(
+    const common::LogicalPoint& point) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+      point.x < static_cast<double>(std::numeric_limits<int>::min()) ||
+      point.x > static_cast<double>(std::numeric_limits<int>::max()) ||
+      point.y < static_cast<double>(std::numeric_limits<int>::min()) ||
+      point.y > static_cast<double>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  const int pixel_x = static_cast<int>(std::llround(point.x));
+  const int pixel_y = static_cast<int>(std::llround(point.y));
   if (move_pointer_) return move_pointer_(pixel_x, pixel_y);
   const int virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
   const int virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -220,7 +298,41 @@ bool InputArbiter::Move(const DisplayInfo& display, double x, double y) {
   return Dispatch(&input, 1);
 }
 
-bool InputArbiter::Wheel(double delta_x, double delta_y) {
+bool WindowsSendInputBackend::EmitKey(std::string_view key, bool pressed) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::string token(key);
+  if (!SupportsKey(token)) return false;
+  if (pressed) {
+    if (pending_key_releases_.contains(token) && !ReleaseKeyLocked(token))
+      return false;
+    if (emitted_keys_.contains(token)) return true;
+    if (!SendKeyLocked(token, true)) return false;
+    emitted_keys_.insert(token);
+    return true;
+  }
+  return ReleaseKeyLocked(token);
+}
+
+bool WindowsSendInputBackend::EmitButton(std::string_view button,
+                                         bool pressed) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::string token(button);
+  if (!SupportsButton(token)) return false;
+  if (pressed) {
+    if (pending_button_releases_.contains(token) &&
+        !ReleaseButtonLocked(token)) {
+      return false;
+    }
+    if (emitted_buttons_.contains(token)) return true;
+    if (!SendButtonLocked(token, true)) return false;
+    emitted_buttons_.insert(token);
+    return true;
+  }
+  return ReleaseButtonLocked(token);
+}
+
+bool WindowsSendInputBackend::EmitWheel(double delta_x, double delta_y) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!std::isfinite(delta_x) || !std::isfinite(delta_y)) return false;
   std::array<INPUT, 2> inputs{};
   UINT count = 0;
@@ -241,11 +353,13 @@ bool InputArbiter::Wheel(double delta_x, double delta_y) {
   return count == 0 || Dispatch(inputs.data(), count);
 }
 
-bool InputArbiter::Text(const std::u16string& value) {
-  if (value.empty() || value.size() > 2048) return false;
+bool WindowsSendInputBackend::EmitText(std::string_view text) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto utf16 = Utf8ToUtf16(text);
+  if (!utf16 || utf16->empty() || utf16->size() > 2048) return false;
   std::vector<INPUT> inputs;
-  inputs.reserve(value.size() * 2);
-  for (char16_t code_unit : value) {
+  inputs.reserve(utf16->size() * 2);
+  for (char16_t code_unit : *utf16) {
     INPUT down{};
     down.type = INPUT_KEYBOARD;
     down.ki.wScan = static_cast<WORD>(code_unit);
@@ -256,6 +370,309 @@ bool InputArbiter::Text(const std::u16string& value) {
     inputs.push_back(up);
   }
   return Dispatch(inputs.data(), static_cast<UINT>(inputs.size()));
+}
+
+bool WindowsSendInputBackend::EmitKeyRepeat(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::string token(key);
+  return emitted_keys_.contains(token) && SendKeyLocked(token, true);
+}
+
+bool WindowsSendInputBackend::EmitClick(std::string_view button) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::string token(button);
+  if (!SupportsButton(token)) return false;
+  if (pending_button_releases_.contains(token) &&
+      !ReleaseButtonLocked(token)) {
+    return false;
+  }
+  if (emitted_buttons_.contains(token)) return false;
+
+  std::array<INPUT, 2> inputs{};
+  DWORD down = 0;
+  DWORD up = 0;
+  DWORD mouse_data = 0;
+  if (token == "left") {
+    down = MOUSEEVENTF_LEFTDOWN;
+    up = MOUSEEVENTF_LEFTUP;
+  } else if (token == "middle") {
+    down = MOUSEEVENTF_MIDDLEDOWN;
+    up = MOUSEEVENTF_MIDDLEUP;
+  } else if (token == "right") {
+    down = MOUSEEVENTF_RIGHTDOWN;
+    up = MOUSEEVENTF_RIGHTUP;
+  } else {
+    down = MOUSEEVENTF_XDOWN;
+    up = MOUSEEVENTF_XUP;
+    mouse_data = token == "back" ? XBUTTON1 : XBUTTON2;
+  }
+  inputs[0].type = INPUT_MOUSE;
+  inputs[0].mi.dwFlags = down;
+  inputs[0].mi.mouseData = mouse_data;
+  inputs[1].type = INPUT_MOUSE;
+  inputs[1].mi.dwFlags = up;
+  inputs[1].mi.mouseData = mouse_data;
+  return Dispatch(inputs.data(), static_cast<UINT>(inputs.size()));
+}
+
+void WindowsSendInputBackend::ReleaseAllEmittedState() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto current = emitted_keys_.begin(); current != emitted_keys_.end();) {
+    const std::string key = *current;
+    ++current;
+    ReleaseKeyLocked(key);
+  }
+  for (auto current = emitted_buttons_.begin();
+       current != emitted_buttons_.end();) {
+    const std::string button = *current;
+    ++current;
+    ReleaseButtonLocked(button);
+  }
+}
+
+bool WindowsSendInputBackend::RetryPendingReleases() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const std::string& key : std::vector<std::string>(
+           pending_key_releases_.begin(), pending_key_releases_.end())) {
+    ReleaseKeyLocked(key);
+  }
+  for (const std::string& button : std::vector<std::string>(
+           pending_button_releases_.begin(),
+           pending_button_releases_.end())) {
+    ReleaseButtonLocked(button);
+  }
+  return pending_key_releases_.empty() &&
+         pending_button_releases_.empty();
+}
+
+bool WindowsSendInputBackend::HasPendingReleases() const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return !pending_key_releases_.empty() ||
+         !pending_button_releases_.empty();
+}
+
+bool WindowsSendInputBackend::IsKeyEmitted(
+    std::string_view key) const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return emitted_keys_.contains(std::string(key));
+}
+
+bool WindowsSendInputBackend::IsButtonEmitted(
+    std::string_view button) const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return emitted_buttons_.contains(std::string(button));
+}
+
+InputArbiter::InputArbiter(SendInputFn send_input,
+                           InputAvailableFn input_available,
+                           MovePointerFn move_pointer)
+    : backend_(std::move(send_input), std::move(input_available),
+               std::move(move_pointer)),
+      ledger_(backend_) {}
+
+InputArbiter::~InputArbiter() { ReleaseAll(); }
+
+bool InputArbiter::Available() const {
+  return const_cast<WindowsSendInputBackend&>(backend_).ProbeReadiness() ==
+         common::ReadinessState::kReady;
+}
+
+common::InputStamp InputArbiter::NextLegacyStamp(const std::string& owner) {
+  LegacyStampState& state = legacy_stamps_[owner];
+  if (state.sequence == std::numeric_limits<common::InputSequence>::max()) {
+    ++state.epoch;
+    if (state.epoch == 0) state.epoch = 1;
+    state.sequence = 0;
+  }
+  ++state.sequence;
+  return common::InputStamp{owner, state.epoch, state.sequence, 1};
+}
+
+common::InputResult InputArbiter::ApplyKeyStampedLocked(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision, std::string_view code,
+    bool pressed, bool repeat) {
+  const bool emitted_before = backend_.IsKeyEmitted(code);
+  const common::InputResult result = ledger_.ApplyKey(
+      stamp, current_topology_revision, code, pressed);
+  if (result != common::InputResult::kApplied) {
+    if (result == common::InputResult::kAdapterFailure) {
+      // A platform failure is terminal for this controller's current epoch.
+      // The fixed common ledger has already consumed the transition, so drop
+      // the whole controller fail-closed rather than retaining stale ownership.
+      ledger_.ReleaseController(stamp.controller_id);
+    }
+    return result;
+  }
+  if (pressed && !backend_.IsKeyEmitted(code) &&
+      !backend_.PrepareKeyDown(code)) {
+    ledger_.ReleaseController(stamp.controller_id);
+    return common::InputResult::kAdapterFailure;
+  }
+  if (pressed && repeat && emitted_before && !backend_.EmitKeyRepeat(code)) {
+    return common::InputResult::kAdapterFailure;
+  }
+  return common::InputResult::kApplied;
+}
+
+common::InputResult InputArbiter::ApplyButtonStampedLocked(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision,
+    std::string_view button, bool pressed) {
+  const common::InputResult result = ledger_.ApplyButton(
+      stamp, current_topology_revision, button, pressed);
+  if (result != common::InputResult::kApplied) {
+    if (result == common::InputResult::kAdapterFailure)
+      ledger_.ReleaseController(stamp.controller_id);
+    return result;
+  }
+  if (pressed && !backend_.IsButtonEmitted(button) &&
+      !backend_.PrepareButtonDown(button)) {
+    ledger_.ReleaseController(stamp.controller_id);
+    return common::InputResult::kAdapterFailure;
+  }
+  return common::InputResult::kApplied;
+}
+
+common::InputResult InputArbiter::ApplyPointerStampedLocked(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision,
+    const DisplayInfo& display, double x, double y) {
+  const common::LogicalRect bounds = WindowsLogicalInputBounds(display);
+  if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 ||
+      y > 1 || !bounds.IsValid()) {
+    return common::InputResult::kInvalidInput;
+  }
+  common::LogicalPoint point = bounds.MapNormalized(x, y);
+  // Preserve the Windows v2 endpoint convention: normalized 1.0 addresses the
+  // last coordinate inside the selected logical desktop rectangle.
+  point.x = std::min(point.x, bounds.x + bounds.width - 1.0);
+  point.y = std::min(point.y, bounds.y + bounds.height - 1.0);
+  return ledger_.ApplyPointer(stamp, current_topology_revision, point);
+}
+
+common::InputResult InputArbiter::ApplyKeyStamped(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision, std::string_view code,
+    bool pressed, bool repeat) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ApplyKeyStampedLocked(stamp, current_topology_revision, code, pressed,
+                               repeat);
+}
+
+common::InputResult InputArbiter::ApplyButtonStamped(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision,
+    std::string_view button, bool pressed) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ApplyButtonStampedLocked(stamp, current_topology_revision, button,
+                                  pressed);
+}
+
+common::InputResult InputArbiter::ApplyPointerStamped(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision,
+    const DisplayInfo& display, double x, double y) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ApplyPointerStampedLocked(stamp, current_topology_revision, display, x,
+                                   y);
+}
+
+common::InputResult InputArbiter::ApplyWheelStamped(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision,
+    double delta_x, double delta_y) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledger_.ApplyWheel(stamp, current_topology_revision, delta_x, delta_y);
+}
+
+common::InputResult InputArbiter::ApplyTextStamped(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision,
+    std::string_view utf8_text) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledger_.ApplyText(stamp, current_topology_revision, utf8_text);
+}
+
+common::InputResult InputArbiter::ReleaseControllerStamped(
+    std::string_view controller_id) noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const common::InputResult result = ledger_.ReleaseController(controller_id);
+  if (result != common::InputResult::kApplied) return result;
+  return !backend_.HasPendingReleases() || backend_.RetryPendingReleases()
+             ? common::InputResult::kApplied
+             : common::InputResult::kAdapterFailure;
+}
+
+bool InputArbiter::KeyDown(const std::string& owner,
+                           const std::string& code, bool repeat) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (owner.empty() || !backend_.SupportsKey(code)) return false;
+  const bool already_emitted = backend_.IsKeyEmitted(code);
+  if (!backend_.PrepareKeyDown(code)) return false;
+  const common::InputResult result = ledger_.ApplyKey(
+      NextLegacyStamp(owner), 1, code, true);
+  if (result != common::InputResult::kApplied) {
+    if (!already_emitted) backend_.EmitKey(code, false);
+    return false;
+  }
+  return !repeat || !already_emitted || backend_.EmitKeyRepeat(code);
+}
+
+bool InputArbiter::KeyUp(const std::string& owner, const std::string& code) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (owner.empty() || !backend_.SupportsKey(code)) return false;
+  return ledger_.ApplyKey(NextLegacyStamp(owner), 1, code, false) ==
+         common::InputResult::kApplied;
+}
+
+bool InputArbiter::ButtonDown(const std::string& owner,
+                              const std::string& button) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (owner.empty() || !backend_.SupportsButton(button)) return false;
+  const bool already_emitted = backend_.IsButtonEmitted(button);
+  if (!backend_.PrepareButtonDown(button)) return false;
+  const common::InputResult result = ledger_.ApplyButton(
+      NextLegacyStamp(owner), 1, button, true);
+  if (result != common::InputResult::kApplied) {
+    if (!already_emitted) backend_.EmitButton(button, false);
+    return false;
+  }
+  return true;
+}
+
+bool InputArbiter::ButtonUp(const std::string& owner,
+                            const std::string& button) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (owner.empty() || !backend_.SupportsButton(button)) return false;
+  return ledger_.ApplyButton(NextLegacyStamp(owner), 1, button, false) ==
+         common::InputResult::kApplied;
+}
+
+bool InputArbiter::Click(const std::string& button) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return backend_.EmitClick(button);
+}
+
+bool InputArbiter::Move(const DisplayInfo& display, double x, double y) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ApplyPointerStampedLocked(NextLegacyStamp("legacy.pointer"), 1,
+                                   display, x, y) ==
+         common::InputResult::kApplied;
+}
+
+bool InputArbiter::Wheel(double delta_x, double delta_y) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledger_.ApplyWheel(NextLegacyStamp("legacy.wheel"), 1, delta_x,
+                            delta_y) == common::InputResult::kApplied;
+}
+
+bool InputArbiter::Text(const std::u16string& value) {
+  const auto utf8 = Utf16ToUtf8(value);
+  if (!utf8) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledger_.ApplyText(NextLegacyStamp("legacy.text"), 1, *utf8) ==
+         common::InputResult::kApplied;
 }
 
 bool InputArbiter::CopyShortcut(const std::string& owner) {
@@ -269,130 +686,21 @@ bool InputArbiter::CopyShortcut(const std::string& owner) {
 
 bool InputArbiter::ReleaseOwner(const std::string& owner) {
   std::lock_guard<std::mutex> lock(mutex_);
-  for (auto iterator = key_owners_.begin(); iterator != key_owners_.end();) {
-    iterator->second.erase(owner);
-    if (iterator->second.empty()) {
-      if (SendKey(iterator->first, false))
-        iterator = key_owners_.erase(iterator);
-      else
-        ++iterator;
-    } else {
-      ++iterator;
-    }
-  }
-  for (auto iterator = button_owners_.begin();
-       iterator != button_owners_.end();) {
-    iterator->second.erase(owner);
-    if (iterator->second.empty()) {
-      if (SendButton(iterator->first, false))
-        iterator = button_owners_.erase(iterator);
-      else
-        ++iterator;
-    } else {
-      ++iterator;
-    }
-  }
-  return std::none_of(key_owners_.begin(), key_owners_.end(),
-                      [](const auto& item) { return item.second.empty(); }) &&
-         std::none_of(button_owners_.begin(), button_owners_.end(),
-                      [](const auto& item) { return item.second.empty(); });
+  const common::InputResult result = ledger_.ReleaseController(owner);
+  legacy_stamps_.erase(owner);
+  if (result != common::InputResult::kApplied) return false;
+  return !backend_.HasPendingReleases() || backend_.RetryPendingReleases();
 }
 
 bool InputArbiter::RetryPendingReleases() {
   std::lock_guard<std::mutex> lock(mutex_);
-  for (auto current = key_owners_.begin(); current != key_owners_.end();) {
-    if (current->second.empty() && SendKey(current->first, false))
-      current = key_owners_.erase(current);
-    else
-      ++current;
-  }
-  for (auto current = button_owners_.begin();
-       current != button_owners_.end();) {
-    if (current->second.empty() && SendButton(current->first, false))
-      current = button_owners_.erase(current);
-    else
-      ++current;
-  }
-  return std::none_of(key_owners_.begin(), key_owners_.end(),
-                      [](const auto& item) { return item.second.empty(); }) &&
-         std::none_of(button_owners_.begin(), button_owners_.end(),
-                      [](const auto& item) { return item.second.empty(); });
+  return backend_.RetryPendingReleases();
 }
 
-bool InputArbiter::SendKey(const std::string& code, bool down) {
-  const auto mapping = MapCode(code);
-  if (!mapping) return false;
-  INPUT input{};
-  input.type = INPUT_KEYBOARD;
-  input.ki.wVk = mapping->virtual_key;
-  input.ki.wScan = static_cast<WORD>(MapVirtualKeyW(mapping->virtual_key,
-                                                    MAPVK_VK_TO_VSC_EX));
-  input.ki.dwFlags = KEYEVENTF_SCANCODE |
-                     (mapping->extended ? KEYEVENTF_EXTENDEDKEY : 0) |
-                     (down ? 0 : KEYEVENTF_KEYUP);
-  input.ki.wVk = 0;
-  return Dispatch(&input, 1);
-}
-
-bool InputArbiter::SendButton(const std::string& button, bool down) {
-  INPUT input{};
-  input.type = INPUT_MOUSE;
-  if (button == "left")
-    input.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-  else if (button == "middle")
-    input.mi.dwFlags = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
-  else if (button == "right")
-    input.mi.dwFlags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
-  else if (button == "back" || button == "forward") {
-    input.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
-    input.mi.mouseData = button == "back" ? XBUTTON1 : XBUTTON2;
-  } else {
-    return false;
-  }
-  return Dispatch(&input, 1);
-}
-
-bool InputArbiter::SendClick(const std::string& button) {
-  std::array<INPUT, 2> inputs{};
-  DWORD down = 0;
-  DWORD up = 0;
-  DWORD mouse_data = 0;
-  if (button == "left") {
-    down = MOUSEEVENTF_LEFTDOWN;
-    up = MOUSEEVENTF_LEFTUP;
-  } else if (button == "middle") {
-    down = MOUSEEVENTF_MIDDLEDOWN;
-    up = MOUSEEVENTF_MIDDLEUP;
-  } else if (button == "right") {
-    down = MOUSEEVENTF_RIGHTDOWN;
-    up = MOUSEEVENTF_RIGHTUP;
-  } else if (button == "back" || button == "forward") {
-    down = MOUSEEVENTF_XDOWN;
-    up = MOUSEEVENTF_XUP;
-    mouse_data = button == "back" ? XBUTTON1 : XBUTTON2;
-  } else {
-    return false;
-  }
-  inputs[0].type = INPUT_MOUSE;
-  inputs[0].mi.dwFlags = down;
-  inputs[0].mi.mouseData = mouse_data;
-  inputs[1].type = INPUT_MOUSE;
-  inputs[1].mi.dwFlags = up;
-  inputs[1].mi.mouseData = mouse_data;
-  return Dispatch(inputs.data(), static_cast<UINT>(inputs.size()));
-}
-
-bool InputArbiter::Dispatch(INPUT* inputs, UINT count) {
-  if (count == 0) return false;
-  SetLastError(ERROR_SUCCESS);
-  const UINT accepted = send_input_(count, inputs, sizeof(INPUT));
-  if (accepted != count) {
-    std::fprintf(stderr,
-                 "imcodes-rd-input-dispatch-failed accepted=%u requested=%u "
-                 "error=%lu\n",
-                 accepted, count, static_cast<unsigned long>(GetLastError()));
-  }
-  return accepted == count;
+void InputArbiter::ReleaseAll() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ledger_.ReleaseAll();
+  legacy_stamps_.clear();
 }
 
 bool ReleaseAllSupportedInput(InputArbiter::SendInputFn send_input) {

@@ -41,6 +41,16 @@ describe('macOS explicit NSPasteboard clipboard adapter', () => {
     );
   });
 
+  it('separates cold backend capability from route liveness and consent', () => {
+    expect(header).toContain('ProbeCapability() noexcept');
+    expect(implementation).toMatch(
+      /StartSession\(\)[\s\S]{0,260}!request_copy_[\s\S]{0,120}!request_paste_[\s\S]{0,220}ProbeCapability\(\)/u,
+    );
+    expect(implementation).toMatch(
+      /ProbeReadiness\(\)[\s\S]{0,180}!SessionActive\(\)[\s\S]{0,140}ProbeCapability\(\)/u,
+    );
+  });
+
   it('does not log, serialize or retain clipboard payloads in adapter state', async () => {
     expect(implementation).not.toMatch(
       /NSLog|os_log|fprintf|std::cerr|std::cout|writeToFile|NSUserDefaults|setObject:.*forKey:/,

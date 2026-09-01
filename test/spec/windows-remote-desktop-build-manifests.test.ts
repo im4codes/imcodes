@@ -24,9 +24,14 @@ import {
  * produces the signed artifact nodes actually upgrade to. Keep them in step.
  */
 const NATIVE = resolve(__dirname, '..', '..', 'native', 'windows-remote-desktop');
+const COMMON = resolve(__dirname, '..', '..', 'native', 'remote-desktop-common');
 
 function read(name: string): string {
   return readFileSync(resolve(NATIVE, name), 'utf8');
+}
+
+function readCommon(name: string): string {
+  return readFileSync(resolve(COMMON, name), 'utf8');
 }
 
 function gnTargetSources(gn: string, target: string): string[] {
@@ -53,6 +58,11 @@ describe('windows remote-desktop build manifests', () => {
   const testTargets = [...gn.matchAll(/rtc_test\("([^"]+)"\)/g)].map((match) => match[1]!);
   const productionSources = powershellList(sdk, '$ProductionSources = @(', '$Tests = [ordered]@{');
   const expectedSources = powershellList(overlay, '$ExpectedSources = @(', '\n)');
+  const expectedCommonSources = powershellList(
+    overlay,
+    '$ExpectedCommonSources = @(',
+    '\n)',
+  );
 
   it('compiles every worker translation unit in the SDK build too', () => {
     const missing = workerSources
@@ -77,6 +87,34 @@ describe('windows remote-desktop build manifests', () => {
     }
   });
 
+  it('links the common protocol, transport and quality implementation in both Windows builds', () => {
+    expect(gn).toContain('//third_party/imcodes_remote_desktop/common:remote_desktop_common');
+    for (const source of [
+      // ice_candidate_queue.cc is deliberately absent: the pre-SDP queue lives
+      // in transport_session_core.cc, and the standalone class it replaced had
+      // no production consumer left.
+      'common\\json_protocol.cc',
+      'common\\quality_ladder.cc',
+      'common\\transport_session_core.cc',
+    ]) {
+      expect(productionSources).toContain(source);
+    }
+    expect(sdk).toContain('$CommonSourceDirectory');
+    expect(sdk).toContain('$CommonOverlaySource');
+    expect(overlay).toContain('$ExpectedCommonSources');
+    expect(overlay).toContain('$CommonTargetDirectory');
+    const commonBuild = readCommon('BUILD.gn');
+    const declaredCommonSources = [...new Set([
+      ...commonBuild.matchAll(/"([^\"]+\.(?:cc|h))"/g),
+    ].map((match) => match[1]!))];
+    for (const source of declaredCommonSources) {
+      expect(expectedCommonSources, `${source} is copied into the common overlay`).toContain(source);
+    }
+    const commonFiles = readdirSync(COMMON).sort();
+    expect(expectedCommonSources.slice().sort()).toEqual(commonFiles);
+    expect(['BUILD.gn', ...declaredCommonSources].sort()).toEqual(commonFiles);
+  });
+
   it('has a unit-test target for every unit-test source on disk', () => {
     const onDisk = readdirSync(NATIVE).filter((name) => name.endsWith('_unittest.cc'));
     for (const source of onDisk) {
@@ -84,6 +122,114 @@ describe('windows remote-desktop build manifests', () => {
       expect(expectedSources, `${source} is copied into the checkout`).toContain(source);
     }
     expect(onDisk.length).toBe(testTargets.length);
+  });
+
+  it('builds and runs every rtc_test target, derived rather than restated', () => {
+    // THE GAP THIS CLOSES.
+    //
+    // build-worker.ps1 used to carry the suite names TWICE by hand -- once as
+    // ninja targets, once as executables to run -- with nothing forcing the two
+    // lists to agree with each other or with BUILD.gn. Both were missing
+    // windows_platform_adapters_unittests and pipe_ipc_unittests, so those two
+    // had rtc_test targets and sources checked in while never once being
+    // compiled or executed. The existing manifest checks did not catch it:
+    // they compare SOURCES against rtc_test, and both sources were present.
+    //
+    // The fix is to derive the list from $ExpectedSources, so this test asserts
+    // the derivation exists AND that what it yields is the exact rtc_test set.
+    const derived = expectedSources
+      .filter((source) => source.endsWith('_unittest.cc'))
+      .map((source) => source.replace(/_unittest\.cc$/u, '_unittests'))
+      .sort();
+
+    // Exact set equality in BOTH directions: a target deleted from BUILD.gn
+    // and a source deleted from $ExpectedSources each turn this red.
+    expect(derived).toEqual([...testTargets].sort());
+    expect(derived.length).toBe(9);
+    // Named explicitly, because these two are the ones that went unbuilt.
+    expect(derived).toContain('windows_platform_adapters_unittests');
+    expect(derived).toContain('pipe_ipc_unittests');
+
+    // The script must DERIVE, not restate. A hand-written list would satisfy
+    // the set comparison above on the day it was written and drift the next
+    // time a suite is added -- which is exactly what happened.
+    expect(overlay).toContain('$NativeTestSuites');
+    expect(overlay).toMatch(
+      /\$NativeTestSuites\s*=\s*@\(\s*\$ExpectedSources\s*\|/u,
+    );
+    // No suite name may appear as a literal in the build or run lists. The one
+    // permitted occurrence is the '_unittests' suffix used by the derivation.
+    for (const suite of derived) {
+      expect(overlay, `${suite} is restated as a literal`).not.toContain(`'${suite}'`);
+      expect(overlay, `${suite} is restated as a literal`).not.toContain(`"${suite}"`);
+    }
+
+    // Both the ninja targets and the executables come from the one list.
+    expect(overlay).toMatch(
+      /\$Targets \+= @\(\$NativeTestSuites \| ForEach-Object \{/u,
+    );
+    expect(overlay).toContain('foreach ($TestName in $NativeTestSuites)');
+  });
+
+  it('accounts for every native test outcome instead of trusting the exit code', () => {
+    // "4 ran, 2 passed, 0 failed" is not a pass: it is two tests whose outcome
+    // nobody looked at. Requiring ran == passed+failed+skipped turns a silently
+    // vanished test into a hard failure. Observed on real hardware --
+    // display_capture reports 4/2/0 with 2 skipped, and mf_h264_encoder 3/2/0
+    // with 1 skipped.
+    // Asserted as the ESCAPED form the script actually contains: these live
+    // inside PowerShell regex literals, so the source text carries the
+    // backslashes. Asserting the bare brackets would pass only if the script
+    // had stopped using a regex.
+    expect(overlay).toContain('tests? from \\d+ test (?:suite|case)s? ran');
+    expect(overlay).toContain('\\[  PASSED  \\] (\\d+)');
+    expect(overlay).toContain('\\[  FAILED  \\] (\\d+)');
+    expect(overlay).toContain('\\[  SKIPPED \\] (\\d+)');
+    expect(overlay).toContain('$Ran -ne ($Passed + $Failed + $Skipped)');
+    expect(overlay).toContain('Native test accounting does not close');
+    // A binary that never printed a summary is a crash, which an exit code
+    // alone cannot distinguish from a clean empty run.
+    expect(overlay).toContain('Native test produced no gtest summary');
+    // A suite that was asked for and produced no binary is a build gap.
+    expect(overlay).toContain('Native test binary missing');
+    // Exit code AND the failed count, not either alone.
+    expect(overlay).toContain('$TestExitCode -ne 0 -or $Failed -ne 0');
+  });
+
+  it('does not let a test diagnostic on stderr abort the run', () => {
+    // The script runs under $ErrorActionPreference = 'Stop', which turns a
+    // native command's stderr into a TERMINATING error. That aborted the whole
+    // run on input_injector_unittests, which writes
+    // "imcodes-rd-input-dispatch-failed accepted=0 requested=1" from a test
+    // that then passes and exits 0 -- a diagnostic reported as a build failure.
+    expect(overlay).toContain("$ErrorActionPreference = 'Stop'");
+    expect(overlay).toContain('$PreviousErrorAction = $ErrorActionPreference');
+    expect(overlay).toContain("$ErrorActionPreference = 'Continue'");
+    expect(overlay).toContain('$ErrorActionPreference = $PreviousErrorAction');
+    // Restored around the invocation, not left permissive for the rest of the
+    // script: the isolation must be scoped to the test call.
+    const relax = overlay.indexOf("$ErrorActionPreference = 'Continue'");
+    const restore = overlay.indexOf('$ErrorActionPreference = $PreviousErrorAction');
+    expect(relax).toBeGreaterThan(0);
+    expect(restore).toBeGreaterThan(relax);
+    // Output is captured rather than discarded, or none of the counts above
+    // could be parsed.
+    expect(overlay).toMatch(/& \$TestExecutable > \$TestLog 2>&1/u);
+  });
+
+  it('offers a compile/test-only Windows qualification path that cannot publish artifacts', () => {
+    expect(sdk).toContain('[switch]$CompileAndTestOnly');
+    expect(sdk).toMatch(/input_injector_unittests\s*=\s*@\([\s\S]*?'display_capture\.cc'[\s\S]*?'windows_platform_adapters\.cc'/u);
+    expect(sdk).toMatch(/windows_platform_adapters_unittests\s*=\s*@\([\s\S]*?'display_capture\.cc'[\s\S]*?'windows_platform_adapters\.cc'/u);
+    const qualification = sdk.indexOf('if ($CompileAndTestOnly) {');
+    const publication = sdk.indexOf(
+      "New-Item -ItemType Directory -Force -Path $ArtifactRoot",
+    );
+    expect(qualification).toBeGreaterThan(-1);
+    expect(publication).toBeGreaterThan(qualification);
+    expect(sdk.slice(qualification, publication)).toContain('return');
+    expect(sdk.slice(qualification, publication))
+      .toContain('compile-and-test-only worker=$Worker');
   });
 });
 
@@ -256,7 +402,7 @@ describe('consent IPC literals agree across the language boundary', () => {
   it('keeps consent frames out of the authenticated session union', () => {
     // Routing consent through Signal would mean forging a session or
     // weakening the check that protects real ones.
-    const signal = read('json_protocol.h');
+    const signal = readCommon('signaling_types.h');
     expect(signal).toContain('enum class Kind { kPrepare, kOffer, kIce, kLease, kMode, kStop }');
     for (const literal of Object.values(WORKER_CONSENT_FRAME)) {
       expect(signal).not.toContain(literal);
@@ -371,7 +517,7 @@ describe('windows remote-desktop privacy shield', () => {
 
 describe('privacy IPC literals agree across the language boundary', () => {
   it('keeps privacy frames out of the authenticated session union', () => {
-    const signal = read('json_protocol.h');
+    const signal = readCommon('json_protocol.h');
     for (const literal of Object.values(WORKER_PRIVACY_FRAME)) {
       expect(signal).not.toContain(literal);
     }
@@ -385,8 +531,8 @@ describe('privacy IPC literals agree across the language boundary', () => {
  */
 describe('windows remote-desktop privacy dispatcher', () => {
   const worker = read('worker_main.cc');
-  const protocolHeader = read('json_protocol.h');
-  const protocol = read('json_protocol.cc');
+  const protocolHeader = readCommon('signaling_types.h');
+  const protocol = readCommon('json_protocol.cc');
   const peerSession = read('peer_session.cc');
   const ipcHeader = read('privacy_ipc.h');
   const ipc = read('privacy_ipc.cc');
@@ -411,13 +557,17 @@ describe('windows remote-desktop privacy dispatcher', () => {
     // EngagePrivacyShield, not left to its caller.
     const engage = worker.slice(worker.indexOf('PrivacyShieldResult EngagePrivacyShield('));
     const body = engage.slice(0, engage.indexOf('\n  }'));
-    const releaseAt = body.indexOf('ReleaseAllSupportedInput()');
+    const releaseAt = body.indexOf('ReleaseAllInputOnSignaling()');
     const shieldAt = body.indexOf('source.source->EngagePrivacyShield()');
     expect(releaseAt).toBeGreaterThan(-1);
     expect(shieldAt).toBeGreaterThan(-1);
     expect(releaseAt).toBeLessThan(shieldAt);
     // The flag must be the real return value, never a constant.
-    expect(body).toContain('result.input_released = ReleaseAllSupportedInput();');
+    expect(body).toContain('result.input_released = ReleaseAllInputOnSignaling();');
+    const release = worker.slice(worker.indexOf('bool ReleaseAllInputOnSignaling()'));
+    const releaseBody = release.slice(0, release.indexOf('\n  }'));
+    expect(releaseBody).toContain('->ReleaseInputForPlatformTransition();');
+    expect(releaseBody).toContain('return ReleaseAllSupportedInput();');
   });
 
   it('does not acknowledge when input could not be released', () => {
@@ -466,7 +616,7 @@ describe('windows remote-desktop privacy dispatcher', () => {
   });
 
   it('uses an independent route generation and never daemon generation for privacy ACK', () => {
-    expect(protocolHeader).toContain('std::optional<int64_t> route_generation;');
+    expect(protocolHeader).toContain('std::optional<std::int64_t> route_generation;');
     expect(protocol).toContain('root.isMember("routeGeneration")');
     expect(protocol).toContain('{"routeGeneration", "reconnectAttempt"}');
     expect(protocol).toContain('{"routeGeneration"})');
@@ -496,7 +646,7 @@ describe('windows remote-desktop privacy dispatcher', () => {
     expect(worker).toContain('!result.route_generations_complete');
 
     const requirements = [
-      'std::optional<int64_t> route_generation;',
+      'std::optional<std::int64_t> route_generation;',
       'renewal.route_generation != authority_.route_generation',
       'result.route_generations_complete = false;',
       '!result.epoch_accepted || !result.input_released ||',

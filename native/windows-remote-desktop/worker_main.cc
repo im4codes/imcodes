@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +46,7 @@
 #include "third_party/imcodes_remote_desktop/unlock_secret.h"
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
 #include "third_party/imcodes_remote_desktop/virtual_display_controller.h"
+#include "third_party/imcodes_remote_desktop/windows_platform_adapters.h"
 
 namespace imcodes::rd {
 namespace {
@@ -473,6 +475,31 @@ class WorkerRuntime {
         factory_(std::move(factory)),
         writer_(writer),
         indicator_(indicator),
+        presentation_adapter_(
+            [this, indicator](WindowsEnvironmentSink sink) {
+              return indicator &&
+                     indicator->Start(
+                         [this] { RequestLocalStopAll(); }, std::move(sink));
+            },
+            [indicator](std::uint32_t viewers, std::uint32_t controllers) {
+              if (!indicator ||
+                  viewers > static_cast<std::uint32_t>(INT_MAX) ||
+                  controllers > static_cast<std::uint32_t>(INT_MAX)) {
+                return false;
+              }
+              indicator->Update(static_cast<int>(viewers),
+                                static_cast<int>(controllers));
+              return !indicator->BoundDesktop().empty();
+            },
+            [indicator] {
+              if (indicator) indicator->Update(0, 0);
+            },
+            [indicator] {
+              if (indicator) indicator->Stop();
+            },
+            [this](std::uint32_t event_mask) {
+              RequestEnvironmentChange(event_mask);
+            }),
         input_(
             [this, indicator](UINT count, LPINPUT inputs, int size) {
               if (privacy_active_.load() || !g_input_desktop_ready.load()) {
@@ -490,6 +517,15 @@ class WorkerRuntime {
                      indicator->MovePointer(x, y);
             }),
         dwm_process_id_(CurrentDwmProcessIdForCurrentSession()) {}
+
+  bool StartPlatformAdapters() {
+    return presentation_adapter_.Start(
+        [this](common::GraphicalSessionEvent event) {
+          RequestGraphicalSessionChange(event);
+        });
+  }
+
+  void StopPlatformAdapters() noexcept { presentation_adapter_.Stop(); }
 
   bool Handle(const Json::Value& root) {
     const int64_t now_ms = NowMs();
@@ -636,12 +672,8 @@ class WorkerRuntime {
         }
         if (!session->closed() && session->protected_content_masked()) {
           session->Close("protected_desktop");
-        } else if (!session->closed() && session->Expired(now_ms)) {
-          const char* reason = SessionExpiryReason(
-              now_ms, session->authority().expires_at_ms,
-              session->authority().lease_expires_at_ms,
-              session->IdleExpired());
-          session->Close(reason);
+        } else if (!session->closed()) {
+          session->Tick(now_ms);
         }
       }
       RemoveClosedOnSignaling();
@@ -655,6 +687,12 @@ class WorkerRuntime {
   }
 
   void RequestLocalStopAll() { local_stop_requested_ = true; }
+
+  void RequestGraphicalSessionChange(
+      common::GraphicalSessionEvent event) {
+    const std::uint32_t event_mask = WindowsEnvironmentMask(event);
+    if (event_mask != 0) RequestEnvironmentChange(event_mask);
+  }
 
   /**
    * Engage the management-privacy shield on every capture source.
@@ -687,9 +725,10 @@ class WorkerRuntime {
       privacy_revision_ = revision;
       g_input_desktop_ready.store(false);
       result.epoch_accepted = true;
-      // Real release, not an assertion: this is the call that actually lifts
-      // whatever keys and buttons remote viewers are holding.
-      result.input_released = ReleaseAllSupportedInput();
+      // Clear common-ledger ownership before the established OS-wide
+      // key/button-up fallback. The privacy gate is already closed, so no new
+      // input can race between those two operations.
+      result.input_released = ReleaseAllInputOnSignaling();
       for (int attempt = 0; attempt < 4 && !input_.RetryPendingReleases();
            ++attempt) {
         Sleep(10);
@@ -840,11 +879,18 @@ class WorkerRuntime {
       }
       // Show the native disclosure synchronously before AcquireSource starts
       // DXGI.  A failed initialization immediately restores the actual count.
-      indicator_->Update(static_cast<int>(sessions_.size()) + 1,
-                         pending_controllers);
+      if (!presentation_adapter_.Show(
+              static_cast<std::uint32_t>(sessions_.size()) + 1,
+              static_cast<std::uint32_t>(pending_controllers))) {
+        writer_->Emit(TerminalEnvelope(signal.authority,
+                                       "protected_desktop"));
+        return true;
+      }
       auto session = PeerSession::Create(
           signal.authority, factory_, std::move(displays),
-          [this](const DisplayInfo& display) { return AcquireSource(display); },
+          [this](const common::DisplayTopology& display) {
+            return AcquireSource(display);
+          },
           [this](const DisplayInfo& display) { ReleaseSource(display); },
           &input_,
           [this] {
@@ -914,7 +960,17 @@ class WorkerRuntime {
   }
 
   webrtc::scoped_refptr<DxgiDesktopSource> AcquireSource(
-      const DisplayInfo& display) {
+      const common::DisplayTopology& requested) {
+    const std::vector<DisplayInfo> current = EnumerateDisplays();
+    const auto resolved = std::find_if(
+        current.begin(), current.end(), [&](const DisplayInfo& display) {
+          const common::PixelSize pixels = WindowsEncodedPixels(display);
+          return display.available && display.id == requested.display_id &&
+                 pixels.width == requested.encoded_pixels.width &&
+                 pixels.height == requested.encoded_pixels.height;
+        });
+    if (resolved == current.end()) return nullptr;
+    const DisplayInfo& display = *resolved;
     const std::string key = DisplaySourceKey(display);
     auto found = sources_.find(key);
     if (found != sources_.end()) {
@@ -983,11 +1039,8 @@ class WorkerRuntime {
     if (input_desktop != indicator_->BoundDesktop()) {
       g_input_desktop_ready.store(false);
       ReleaseAllInputOnSignaling();
-      indicator_->Stop();
-      if (!indicator_->Start([this] { RequestLocalStopAll(); },
-                             [this](uint32_t event_mask) {
-                               RequestEnvironmentChange(event_mask);
-                             })) {
+      presentation_adapter_.Stop();
+      if (!StartPlatformAdapters()) {
         // Without the disclosure indicator there is no visible sign that the
         // desktop is being streamed, so stop rather than capture silently.
         StopAllOnSignaling("protected_desktop", true);
@@ -999,8 +1052,14 @@ class WorkerRuntime {
     ReconcileCaptureDesktopOnSignaling(input_desktop);
   }
 
-  void ReleaseAllInputOnSignaling() {
-    for (const auto& [id, session] : sessions_) input_.ReleaseOwner(id);
+  bool ReleaseAllInputOnSignaling() {
+    for (const auto& session_entry : sessions_) {
+      session_entry.second->ReleaseInputForPlatformTransition();
+    }
+    // A lock/privacy transition may already gate the adapter. Preserve the
+    // existing allowlisted OS release as physical truth; the calls above clear
+    // InputLedger ownership and each PeerSession's pressed-code mirror.
+    return ReleaseAllSupportedInput();
   }
 
   // Capture goes where input goes: Windows refuses a screen read from any
@@ -1154,13 +1213,20 @@ class WorkerRuntime {
     for (const auto& [id, session] : sessions_) {
       if (!session->closed() && session->controlling()) ++controllers;
     }
-    indicator_->Update(static_cast<int>(sessions_.size()), controllers);
+    if (sessions_.empty()) {
+      presentation_adapter_.Hide();
+    } else {
+      presentation_adapter_.Show(
+          static_cast<std::uint32_t>(sessions_.size()),
+          static_cast<std::uint32_t>(controllers));
+    }
   }
 
   webrtc::Thread* const signaling_thread_;
   const webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
   PipeWriter* const writer_;
   LocalIndicator* const indicator_;
+  WindowsDisclosureSessionAdapter presentation_adapter_;
   InputArbiter input_;
   std::atomic<bool> privacy_active_{false};
   // Signaling-thread only. The atomic above gates input callbacks running on
@@ -1576,8 +1642,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       webrtc::CreateBuiltinAudioEncoderFactory();
   dependencies.audio_decoder_factory =
       webrtc::CreateBuiltinAudioDecoderFactory();
-  dependencies.video_encoder_factory =
-      std::make_unique<MfH264EncoderFactory>();
+  WindowsWebRtcEncoderFactoryAdapter encoder_adapter(
+      std::make_unique<MfH264EncoderFactory>());
+  if (encoder_adapter.ProbeReadiness() != common::ReadinessState::kReady) {
+    pipe_channel.Close();
+    webrtc::CleanupSSL();
+    MFShutdown();
+    CoUninitialize();
+    return 20;
+  }
+  dependencies.video_encoder_factory = encoder_adapter.TakeFactory();
+  if (!dependencies.video_encoder_factory) {
+    pipe_channel.Close();
+    webrtc::CleanupSSL();
+    MFShutdown();
+    CoUninitialize();
+    return 20;
+  }
   dependencies.video_decoder_factory =
       webrtc::CreateBuiltinVideoDecoderFactory();
   webrtc::EnableMedia(dependencies);
@@ -1598,11 +1679,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   WorkerRuntime runtime(signaling_thread.get(), factory, &writer, &indicator);
   ConsentDispatcher consent(&writer);
   PrivacyDispatcher privacy(&writer, &runtime);
-  if (!indicator.Start(
-          [&runtime] { runtime.RequestLocalStopAll(); },
-          [&runtime](uint32_t event_mask) {
-            runtime.RequestEnvironmentChange(event_mask);
-          })) {
+  if (!runtime.StartPlatformAdapters()) {
     runtime.Shutdown();
     factory = nullptr;
     pipe_channel.Close();
@@ -1685,7 +1762,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   running = false;
   maintenance.join();
   runtime.Shutdown();
-  indicator.Stop();
+  runtime.StopPlatformAdapters();
   factory = nullptr;
   signaling_thread->Stop();
   worker_thread->Stop();

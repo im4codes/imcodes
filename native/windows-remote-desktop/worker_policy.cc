@@ -381,16 +381,6 @@ bool ShouldAttemptHardwareEncoder(bool prefer_hardware,
   return prefer_hardware && !hardware_disqualified;
 }
 
-bool MediaProgressShouldFailover(uint64_t previous_bytes,
-                                 uint64_t current_bytes,
-                                 uint64_t source_frames_at_progress,
-                                 uint64_t current_source_frames,
-                                 int64_t elapsed_ms) {
-  return current_bytes == previous_bytes &&
-         current_source_frames > source_frames_at_progress &&
-         elapsed_ms >= kMediaProgressTimeoutMs;
-}
-
 bool InputSequenceIsFresh(bool has_previous,
                           uint64_t previous_sequence,
                           uint64_t current_sequence) {

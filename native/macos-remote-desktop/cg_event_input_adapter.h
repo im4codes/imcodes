@@ -96,6 +96,12 @@ public:
   bool EmitButton(std::string_view button, bool pressed) override;
   bool EmitWheel(double delta_x, double delta_y) override;
   bool EmitText(std::string_view text) override;
+  // Emit one bounded Command-C/Command-V chord under the same topology,
+  // Accessibility, state-tracking and release guarantees as ordinary input.
+  // The absolute deadline comes from the clipboard operation that requested
+  // the explicit action.
+  bool EmitClipboardShortcut(std::string_view key,
+                             std::uint64_t deadline_monotonic_ms);
   void ReleaseAllEmittedState() noexcept override;
 
   // Session/authority owners call this on every named terminal boundary. It

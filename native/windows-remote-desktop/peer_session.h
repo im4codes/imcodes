@@ -16,24 +16,24 @@
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
 #include "rtc_base/thread.h"
+#include "third_party/imcodes_remote_desktop/common/transport_session_core.h"
 #include "third_party/imcodes_remote_desktop/display_capture.h"
 #include "third_party/imcodes_remote_desktop/input_injector.h"
-#include "third_party/imcodes_remote_desktop/ice_candidate_queue.h"
 #include "third_party/imcodes_remote_desktop/json_protocol.h"
+#include "third_party/imcodes_remote_desktop/windows_platform_adapters.h"
 
 namespace imcodes::rd {
 
 using EmitJson = std::function<void(const Json::Value&)>;
 using AcquireSource = std::function<webrtc::scoped_refptr<DxgiDesktopSource>(
-    const DisplayInfo&)>;
+    const common::DisplayTopology&)>;
 using ReleaseSource = std::function<void(const DisplayInfo&)>;
 // Runs the node's stored-secret unlock on the worker's signaling thread and
 // reports whether it was attempted. The secret itself never crosses this
 // boundary — only the request and the outcome do.
 using RequestUnlock = std::function<bool()>;
-using ClipboardSequence = std::function<DWORD()>;
-using ReadClipboardText =
-    std::function<std::optional<std::u16string>(DWORD)>;
+using ClipboardSequence = WindowsClipboardSequence;
+using ReadClipboardText = WindowsReadClipboardText;
 
 class PeerSession;
 
@@ -49,6 +49,7 @@ class PeerDataObserver final : public webrtc::DataChannelObserver {
 };
 
 class PeerSession final : public webrtc::PeerConnectionObserver,
+                          private common::TransportSessionAdapter,
                           public std::enable_shared_from_this<PeerSession> {
  public:
   static std::shared_ptr<PeerSession> Create(
@@ -71,8 +72,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool Renew(const Authority& renewal);
   bool SetMode(const Authority& update, const std::string& reason);
   bool RefreshDisplays(std::vector<DisplayInfo> displays);
-  bool Expired(int64_t now_ms) const;
-  bool IdleExpired() const;
+  bool Tick(int64_t now_unix_ms);
   void Close(const char* terminal_reason, bool emit_terminal = true);
   const Authority& authority() const { return authority_; }
   bool controlling() const;
@@ -93,6 +93,9 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
    * is one tick rather than one renewal interval.
    */
   void PublishInputReadinessIfChanged();
+  // Internal lifecycle seam: clear this session's stamped common controllers
+  // before Windows changes desktops or raises the privacy shield.
+  bool ReleaseInputForPlatformTransition();
   /** Let the video out once the input channels are up, or the wait expires. */
   void ActivateVideoIfReady();
   void HandleMediaStats(uint64_t generation,
@@ -161,7 +164,6 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
                            const char* reason,
                            const std::string& display_id = {});
   void EmitIceCandidate(std::string mid, std::string candidate);
-  bool FlushPendingRemoteIce();
   bool SelectDisplay(const std::string& id);
   bool SetDisplayMode(const std::string& id, int width, int height);
   bool SetDisplayScale(const std::string& id, int percent);
@@ -170,17 +172,41 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool InputReady() const;
   bool ApplyTransportBitratePolicy(bool direct);
   bool ReleaseInput();
+  bool RefreshCommonTopology();
+  std::string InputControllerId(const std::string& channel) const;
   void TouchActivity();
   void ResetMediaProgressWatchdog();
+
+  // common::TransportSessionAdapter. These are the only methods that touch
+  // libwebrtc transport objects; TransportSessionCore owns their state,
+  // fencing, deadlines and cleanup ordering.
+  bool StartTransport(const common::RouteAuthority& authority) override;
+  bool AddRemoteIceCandidate(
+      const common::IceCandidate& candidate) override;
+  bool EmitLocalIceCandidate(const common::IceCandidate& candidate) override;
+  bool ApplyQuality(const common::QualitySelection& selection) override;
+  void ReleaseControlAuthority(
+      const common::RouteAuthorityIdentity& identity,
+      std::uint64_t input_epoch) noexcept override;
+  void CloseDataChannel(common::DataChannelKind channel) noexcept override;
+  void CloseTransport() noexcept override;
+  void PublishDiagnostics(
+      const common::TransportDiagnostics& diagnostics) noexcept override;
+  void OnTerminal(common::TransportTerminalReason reason) noexcept override;
+
+  common::RouteAuthority CommonAuthority(const Authority& authority) const;
+  common::RouteAuthorityIdentity CommonIdentity() const;
+  common::TransportCallbackStamp CallbackStamp() const;
+  bool IsRelayed() const noexcept;
 
   Authority authority_;
   const webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
   std::vector<DisplayInfo> displays_;
-  const AcquireSource acquire_source_;
-  const ReleaseSource release_source_;
   InputArbiter* const input_;
-  const ClipboardSequence clipboard_sequence_;
-  const ReadClipboardText read_clipboard_text_;
+  std::unique_ptr<common::NativeCaptureAdapter> capture_adapter_;
+  std::unique_ptr<WindowsDisplayAdapter> display_adapter_;
+  std::unique_ptr<WindowsClipboardAdapter> clipboard_adapter_;
+  std::optional<common::DesktopTopology> common_topology_;
   const RequestUnlock request_unlock_;
   /**
    * Video is held back until the input channels are open. Their handshake is a
@@ -200,7 +226,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver>
       answer_observer_;
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> track_;
-  webrtc::scoped_refptr<DxgiDesktopSource> source_;
+  std::unique_ptr<common::NativeVideoSourceLease> source_;
   size_t selected_display_ = 0;
   bool selection_required_ = false;
   int layout_revision_ = 1;
@@ -215,27 +241,22 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
     int count = 0;
   };
   std::map<std::string, RateWindow> rate_windows_;
-  std::chrono::steady_clock::time_point last_activity_ =
-      std::chrono::steady_clock::now();
-  int remote_ice_count_ = 0;
-  int local_ice_count_ = 0;
-  PendingRemoteIceCandidates pending_remote_ice_{kMaxIceCandidates};
   bool setting_remote_description_ = false;
-  bool remote_description_set_ = false;
   bool layout_acknowledged_ = false;
   std::atomic<bool> closed_{false};
-  std::atomic<bool> relayed_{false};
-  bool candidate_pair_selected_ = false;
-  bool peer_connected_ = false;
-  bool media_started_ = false;
   std::optional<bool> direct_bitrate_policy_;
+  class WindowsQualityLadder final : public common::QualityLadder {
+   public:
+    common::QualitySelection Select(
+        const common::QualityTarget& target) const noexcept override;
+  } transport_quality_ladder_;
+  common::TransportSessionCore transport_core_;
+  std::optional<common::TransportDiagnostics> transport_diagnostics_;
+  std::string pending_terminal_reason_;
+  bool emit_transport_terminal_ = false;
   uint64_t media_stats_generation_ = 0;
-  uint64_t last_outbound_video_bytes_ = 0;
-  uint64_t source_frames_at_media_progress_ = 0;
   int64_t media_stats_requested_at_ms_ = 0;
-  int64_t last_media_progress_at_ms_ = 0;
   bool media_stats_in_flight_ = false;
-  bool media_stats_initialized_ = false;
 };
 
 }  // namespace imcodes::rd

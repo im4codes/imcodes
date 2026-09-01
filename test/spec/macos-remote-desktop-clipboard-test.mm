@@ -123,6 +123,37 @@ struct Fixture {
       {.max_text_bytes = 32, .operation_timeout_ms = 125}};
 };
 
+bool TestCapabilityIsNotRouteLivenessOrConsent() {
+  Fixture fixture;
+  if (!Check(fixture.adapter.ProbeCapability() ==
+                 common::ReadinessState::kReady,
+             "cold capability must reach the real backend predicate") ||
+      !Check(fixture.fake->readiness_calls == 1,
+             "capability must consult the backend exactly once") ||
+      !Check(fixture.adapter.ProbeReadiness() ==
+                 common::ReadinessState::kUnavailable,
+             "cold capability must not claim a live route") ||
+      !Check(fixture.copy_actions == 0 && fixture.paste_actions == 0,
+             "capability must not request clipboard consent actions")) {
+    return false;
+  }
+
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend* fake = backend.get();
+  clipboard::NSPasteboardClipboardAdapter no_consent(
+      std::move(backend), clipboard::ClipboardAction{},
+      clipboard::ClipboardAction{});
+  return Check(no_consent.ProbeCapability() ==
+                   common::ReadinessState::kReady,
+               "backend capability is independent from route callbacks") &&
+         Check(!no_consent.StartSession(),
+               "real session must still require explicit consent callbacks") &&
+         Check(!no_consent.SessionActive(),
+               "rejected consent callbacks must never create liveness") &&
+         Check(fake->readiness_calls == 1,
+               "missing callbacks must fail before a second backend probe");
+}
+
 bool TestExplicitPasteAndCopyCorrelation() {
   Fixture fixture;
   if (!Check(fixture.adapter.StartSession(), "session should start") ||
@@ -346,7 +377,8 @@ bool TestConfigurationCannotWidenProtocolBounds() {
 } // namespace
 
 int main() {
-  if (!TestExplicitPasteAndCopyCorrelation() || !TestStaleCopyIsUnavailable() ||
+  if (!TestCapabilityIsNotRouteLivenessOrConsent() ||
+      !TestExplicitPasteAndCopyCorrelation() || !TestStaleCopyIsUnavailable() ||
       !TestStalePasteIsUnavailable() || !TestTextBoundsAndUtf8() ||
       !TestTimeoutAndPermissionFailures() ||
       !TestSessionStopRejectsLateText() ||

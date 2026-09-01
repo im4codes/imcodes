@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -34,6 +35,13 @@ bool Contains(const common::LogicalRect &bounds,
          std::isfinite(maximum_x) && std::isfinite(maximum_y) &&
          point.x >= bounds.x && point.y >= bounds.y && point.x <= maximum_x &&
          point.y <= maximum_y;
+}
+
+std::uint64_t MonotonicMilliseconds() noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
 
 std::optional<CGKeyCode> MapKey(std::string_view code) {
@@ -349,6 +357,31 @@ public:
 
   bool EmitKey(std::string_view key, bool pressed) {
     std::lock_guard lock(mutex_);
+    return EmitKeyLocked(key, pressed);
+  }
+
+  bool EmitClipboardShortcut(std::string_view key,
+                             std::uint64_t deadline_monotonic_ms) {
+    std::lock_guard lock(mutex_);
+    if ((key != "KeyC" && key != "KeyV") ||
+        deadline_monotonic_ms <= MonotonicMilliseconds() ||
+        !ReadyForEmissionLocked()) {
+      return false;
+    }
+    const auto within_deadline = [deadline_monotonic_ms] {
+      return MonotonicMilliseconds() < deadline_monotonic_ms;
+    };
+    if (!EmitKeyLocked("MetaLeft", true) || !within_deadline() ||
+        !EmitKeyLocked(key, true) || !within_deadline() ||
+        !EmitKeyLocked(key, false) || !within_deadline() ||
+        !EmitKeyLocked("MetaLeft", false)) {
+      (void)ReleaseAllLocked();
+      return false;
+    }
+    return true;
+  }
+
+  bool EmitKeyLocked(std::string_view key, bool pressed) {
     if (!ReadyForEmissionLocked())
       return false;
     if (pressed && emitted_keys_.contains(std::string(key)))
@@ -584,6 +617,11 @@ bool CGEventInputAdapter::EmitWheel(double delta_x, double delta_y) {
 
 bool CGEventInputAdapter::EmitText(std::string_view text) {
   return impl_->EmitText(text);
+}
+
+bool CGEventInputAdapter::EmitClipboardShortcut(
+    std::string_view key, std::uint64_t deadline_monotonic_ms) {
+  return impl_->EmitClipboardShortcut(key, deadline_monotonic_ms);
 }
 
 void CGEventInputAdapter::ReleaseAllEmittedState() noexcept {

@@ -285,36 +285,37 @@ class WorkerReadinessProbe final : public macos::NativeReadinessProbe {
         encoder.ProbeReadiness() == rd::common::ReadinessState::kReady;
 
     // Same rule for the clipboard: NSPasteboard is unavailable outside an Aqua
-    // session, and View-only must stay distinguishable from unavailable.
-    // The two actions are never invoked by a readiness probe; they exist so
-    // the adapter is constructible. ProbeReadiness only inspects NSPasteboard.
+    // session, and View-only must stay distinguishable from unavailable. The
+    // false actions are never invoked by this cold capability probe; real
+    // copy/paste routes receive explicit callbacks when StartSession begins.
     macos::NSPasteboardClipboardAdapter clipboard(
         [](std::uint64_t) { return false; },
         [](std::uint64_t) { return false; });
+    // Cold admission asks only whether this Aqua process can reach the
+    // pasteboard backend. ProbeReadiness is route-liveness and intentionally
+    // remains false until StartSession has admitted real copy/paste callbacks;
+    // using it here made clipboard permanently unavailable. Operations still
+    // require StartSession, a live generation and explicit consent callbacks.
     out->clipboard =
-        clipboard.ProbeReadiness() == rd::common::ReadinessState::kReady;
+        clipboard.ProbeCapability() == rd::common::ReadinessState::kReady;
 
-    // These two are executable seams in this binary: both verbs are
-    // implemented and reachable over the per-user control socket, whose path
-    // this process can derive without any environment.
-    // REACHABILITY IS NOT PATH CONSTRUCTIBILITY.
-    //
-    // These used to be `BuildControlSocketPath(...) == true`, i.e. "a string
-    // could be assembled". That is true on every machine, running worker or
-    // not, so both were permanently advertised regardless of whether anything
-    // was listening. A control path that resolves to nothing answers no
-    // cleanup command.
+    // release_input / stop_capture are NOT set here, on purpose.
     //
     // This probe is a short-lived process that runs BEFORE any worker exists,
-    // so it cannot observe reachability at all -- and it must not invent it.
-    // The real evidence is post-start: the daemon issues generation-bound
-    // release/stop over the live control socket and observes the child's exit
-    // status, which is a round trip that either happened or did not.
-    std::string control_path;
-    (void)macos::BuildControlSocketPath(static_cast<std::uint32_t>(uid),
-                                        &control_path);
-    out->release_input = false;
-    out->stop_capture = false;
+    // so it can observe neither a live generation nor socket reachability, and
+    // it must not invent either. An earlier shape answered
+    // `BuildControlSocketPath(...) == true`, i.e. "a string could be
+    // assembled" -- true on every machine, running worker or not. Replacing
+    // that with a hard false was equally wrong in the other direction: the
+    // daemon gate maps either false to UNAVAILABLE, so nothing could ever
+    // start, and no generation could ever exist to make it true.
+    //
+    // The field the daemon actually needs is CAPABILITY: can this build service
+    // a cleanup command once a generation exists. Only RunNativeCommandV1 holds
+    // the cleanup target, so it answers via NativeCleanupCapabilityV1 and
+    // overwrites both fields after this returns. Liveness stays where it can be
+    // observed for real -- the generation-bound cleanup command itself, which
+    // reports failure when it cannot act.
 
     // Display control readiness is a SIDE-EFFECT-FREE query, and it asks the
     // HELPER, not the filesystem.

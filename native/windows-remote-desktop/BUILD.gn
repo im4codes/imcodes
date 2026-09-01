@@ -14,9 +14,6 @@ rtc_executable("imcodes_remote_desktop_worker") {
     "display_preferences.h",
     "input_injector.cc",
     "input_injector.h",
-    "ice_candidate_queue.cc",
-    "ice_candidate_queue.h",
-    "json_protocol.cc",
     "json_protocol.h",
     "brand_logo_generated.h",
     "consent_ipc.cc",
@@ -33,19 +30,21 @@ rtc_executable("imcodes_remote_desktop_worker") {
     "peer_session.h",
     "pipe_ipc.cc",
     "pipe_ipc.h",
-    "quality_ladder.cc",
     "quality_ladder.h",
     "unlock_secret.cc",
     "unlock_secret.h",
     "worker_policy.cc",
     "worker_policy.h",
+    "windows_platform_adapters.cc",
+    "windows_platform_adapters.h",
     "virtual_display_controller.cc",
     "virtual_display_controller.h",
     "worker_main.cc",
   ]
 
   defines = imcodes_remote_desktop_defines
-  deps = imcodes_remote_desktop_deps
+  deps = imcodes_remote_desktop_deps +
+         [ "//third_party/imcodes_remote_desktop/common:remote_desktop_common" ]
 
   libs = [
     "d3d11.lib",
@@ -106,43 +105,125 @@ if (rtc_include_tests) {
 
   rtc_test("quality_ladder_unittests") {
     sources = [
-      "quality_ladder.cc",
       "quality_ladder.h",
       "quality_ladder_unittest.cc",
     ]
-    deps = [ "//test:test_support" ]
+    deps = [
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
   }
 
   rtc_test("input_injector_unittests") {
     sources = [
+      "display_capture.cc",
       "display_capture.h",
+      "display_preferences.cc",
+      "display_preferences.h",
       "input_injector.cc",
       "input_injector.h",
       "input_injector_unittest.cc",
+      "windows_platform_adapters.cc",
+      "windows_platform_adapters.h",
+      "worker_policy.cc",
+      "worker_policy.h",
     ]
     defines = [
       "NOMINMAX",
       "WIN32_LEAN_AND_MEAN",
     ]
-    deps = [ "//test:test_support" ]
-    libs = [ "user32.lib" ]
+    # This target compiles display_capture.cc and windows_platform_adapters.cc,
+    # so it needs exactly what display_capture_unittests needs. Without libyuv
+    # in particular the build stops at
+    # `display_capture.cc: fatal error: 'libyuv/convert.h' file not found`,
+    # which is what a real `-RunNativeTests` run hits first.
+    deps = [
+      "//api:make_ref_counted",
+      "//api:media_stream_interface",
+      "//api/video:video_frame",
+      "//media:rtc_media_base",
+      "//pc:video_track_source",
+      "//rtc_base:logging",
+      "//system_wrappers",
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+      "//third_party/jsoncpp",
+      "//third_party/libyuv",
+    ]
+    # Same import libraries display_capture_unittests needs: this target
+    # compiles display_capture.cc and worker_policy.cc, whose DXGI and WTS
+    # calls are otherwise undefined at link
+    # (`lld-link: error: undefined symbol: WTSFreeMemory`).
+    libs = [
+      "d3d11.lib",
+      "dxgi.lib",
+      "gdi32.lib",
+      "shcore.lib",
+      "user32.lib",
+      "wtsapi32.lib",
+    ]
   }
 
   rtc_test("json_protocol_unittests") {
     sources = [
-      "json_protocol.cc",
       "json_protocol.h",
       "json_protocol_unittest.cc",
     ]
     deps = [
       "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
+  }
+
+  rtc_test("windows_platform_adapters_unittests") {
+    sources = [
+      "display_capture.cc",
+      "display_capture.h",
+      "display_preferences.cc",
+      "display_preferences.h",
+      "input_injector.cc",
+      "input_injector.h",
+      "windows_platform_adapters.cc",
+      "windows_platform_adapters.h",
+      "windows_platform_adapters_unittest.cc",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    # Compiles display_capture.cc, so it needs the same graph
+    # display_capture_unittests does; libyuv in particular.
+    deps = [
+      "//api:make_ref_counted",
+      "//api:media_stream_interface",
+      "//api/video:video_frame",
+      "//media:rtc_media_base",
+      "//pc:video_track_source",
+      "//rtc_base:logging",
+      "//system_wrappers",
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
       "//third_party/jsoncpp",
+      "//third_party/libyuv",
+    ]
+    # Same import libraries display_capture_unittests needs: this target
+    # compiles display_capture.cc and worker_policy.cc, whose DXGI and WTS
+    # calls are otherwise undefined at link
+    # (`lld-link: error: undefined symbol: WTSFreeMemory`).
+    libs = [
+      "d3d11.lib",
+      "dxgi.lib",
+      "gdi32.lib",
+      "shcore.lib",
+      "user32.lib",
+      "wtsapi32.lib",
     ]
   }
 
   rtc_test("privacy_ipc_unittests") {
     sources = [
-      "json_protocol.cc",
       "json_protocol.h",
       "privacy_ipc.cc",
       "privacy_ipc.h",
@@ -150,7 +231,7 @@ if (rtc_include_tests) {
     ]
     deps = [
       "//test:test_support",
-      "//third_party/jsoncpp",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
     ]
   }
 
@@ -163,15 +244,6 @@ if (rtc_include_tests) {
     defines = [
       "NOMINMAX",
       "WIN32_LEAN_AND_MEAN",
-    ]
-    deps = [ "//test:test_support" ]
-  }
-
-  rtc_test("ice_candidate_queue_unittests") {
-    sources = [
-      "ice_candidate_queue.cc",
-      "ice_candidate_queue.h",
-      "ice_candidate_queue_unittest.cc",
     ]
     deps = [ "//test:test_support" ]
   }
@@ -195,7 +267,6 @@ if (rtc_include_tests) {
       "mf_h264_encoder.cc",
       "mf_h264_encoder.h",
       "mf_h264_encoder_unittest.cc",
-      "quality_ladder.cc",
       "quality_ladder.h",
       "worker_policy.cc",
       "worker_policy.h",
@@ -215,6 +286,7 @@ if (rtc_include_tests) {
       "//modules/video_coding:video_codec_interface",
       "//rtc_base:logging",
       "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
       "//third_party/jsoncpp",
     ]
     libs = [

@@ -4,6 +4,7 @@
 #include <cwchar>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "test/gtest.h"
@@ -45,6 +46,89 @@ class RecordingInput {
   std::vector<INPUT> events;
   std::vector<UINT> batch_sizes;
 };
+
+common::InputStamp Stamp(std::string controller,
+                         common::InputSequence sequence,
+                         common::TopologyRevision revision = 7,
+                         common::InputEpoch epoch = 1) {
+  return common::InputStamp{std::move(controller), epoch, sequence, revision};
+}
+
+TEST(InputArbiterTest, CommonLedgerOwnsSharedControllersAndTargetedRelease) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "ControlLeft",
+                                  true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-b", 1), 7, "ControlLeft",
+                                  true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2), 7, "left", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-b", 2), 7, "left", true),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 2u);
+
+  EXPECT_EQ(input.ReleaseControllerStamped("peer-a"),
+            common::InputResult::kApplied);
+  EXPECT_EQ(recording.events.size(), 2u);
+  EXPECT_EQ(input.ReleaseControllerStamped("peer-b"),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 4u);
+  EXPECT_NE(recording.events[2].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(recording.events[3].mi.dwFlags & MOUSEEVENTF_LEFTUP, 0u);
+}
+
+TEST(InputArbiterTest, CommonLedgerRejectsStaleEpochSequenceAndTopology) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "KeyA", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 1), 7, "left", true),
+            common::InputResult::kStaleSequence);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2, 6, 2), 7, "left",
+                                     true),
+            common::InputResult::kStaleTopology);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2, 7, 2), 7, "left",
+                                     true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 3, 7, 1), 7, "KeyB", true),
+            common::InputResult::kStaleEpoch);
+  ASSERT_EQ(recording.events.size(), 3u);
+  EXPECT_NE(recording.events[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(recording.events[2].mi.dwFlags & MOUSEEVENTF_LEFTDOWN, 0u);
+}
+
+TEST(InputArbiterTest, BackendFailureFailsClosedAndTerminalReleaseIsIdempotent) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  recording.fail_next_ = true;
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("failed-peer", 1), 7, "KeyA", true),
+            common::InputResult::kAdapterFailure);
+  EXPECT_TRUE(recording.events.empty());
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "KeyA", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ApplyButtonStamped(Stamp("peer-a", 2), 7, "right", true),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 2u);
+
+  input.ReleaseAll();
+  ASSERT_EQ(recording.events.size(), 4u);
+  input.ReleaseAll();
+  EXPECT_EQ(recording.events.size(), 4u);
+  EXPECT_EQ(input.ReleaseControllerStamped("peer-a"),
+            common::InputResult::kApplied);
+}
 
 TEST(InputArbiterTest, KeepsConcurrentControllerKeyOwnershipIndependent) {
   RecordingInput recording;
@@ -103,6 +187,29 @@ TEST(InputArbiterTest, MovesPointerInExactSelectedDisplayPixels) {
   EXPECT_EQ(positions[1].x, -1);
   EXPECT_EQ(positions[1].y, 2259);
   EXPECT_TRUE(recording.events.empty());
+}
+
+TEST(InputArbiterTest, MapsPointerThroughLogicalBoundsNotEncodedPixels) {
+  std::vector<POINT> positions;
+  InputArbiter input(
+      [](UINT count, LPINPUT, int) { return count; }, [] { return true; },
+      [&](int x, int y) {
+        positions.push_back(POINT{x, y});
+        return true;
+      });
+  DisplayInfo display;
+  display.id = "retina-like-windows-display";
+  display.desktop_rect = RECT{100, 200, 2020, 1280};
+  // Encoded pixels deliberately differ from the logical SendInput rectangle.
+  display.width = 3840;
+  display.height = 2160;
+
+  const common::InputStamp stamp{"controller", 1, 1, 7};
+  EXPECT_EQ(input.ApplyPointerStamped(stamp, 7, display, 1.0, 1.0),
+            common::InputResult::kApplied);
+  ASSERT_EQ(positions.size(), 1u);
+  EXPECT_EQ(positions[0].x, 2019);
+  EXPECT_EQ(positions[0].y, 1279);
 }
 
 TEST(InputArbiterTest, RetriesFailedFinalKeyReleaseDuringTeardown) {

@@ -42,6 +42,21 @@ struct NativeReadinessV1 {
   bool clipboard = false;
   bool disclosure = false;
   bool lifecycle_observation = false;
+  // CAPABILITY, NOT LIVENESS. These answer "can this signed build release all
+  // input / stop capture when a generation exists", which is exactly what the
+  // daemon's readiness gate consumes. They deliberately do NOT mean "a
+  // generation is active right now".
+  //
+  // They used to mean the latter, and that was a deadlock: readiness runs as a
+  // short-lived process BEFORE any worker exists, so liveness is necessarily
+  // false there, the daemon gate mapped either false to UNAVAILABLE, and no
+  // generation could ever be created to make them true. Nothing on the machine
+  // could leave that state.
+  //
+  // RunNativeCommandV1 overwrites both from NativeCleanupCapabilityV1 after the
+  // probe returns, so a probe implementation cannot answer this at all. Whether
+  // a generation actually exists stays the cleanup command's business, and it
+  // still fails closed when it cannot act.
   bool release_input = false;
   bool stop_capture = false;
   // True only after a create/apply/online/destroy probe of the built-in
@@ -92,6 +107,19 @@ class NativeCleanupTarget {
       std::uint64_t generation) noexcept = 0;
   [[nodiscard]] virtual bool StopCapture(std::uint64_t generation) noexcept = 0;
 };
+
+// Whether this build can service the generation-bound cleanup verbs at all.
+//
+// This is the single source for the `releaseInput`/`stopCapture` readiness
+// fields, and it is deliberately the SAME condition RunNativeCommandV1 uses to
+// decide whether it can dispatch a cleanup command (see the
+// `macos_remote_desktop_cleanup_unavailable` branch). Readiness and dispatch
+// therefore cannot disagree: a build with no cleanup target advertises none and
+// refuses the commands, and a build that advertises them can be asked.
+//
+// It is NOT a statement that a generation exists. It never consults one.
+[[nodiscard]] bool NativeCleanupCapabilityV1(
+    const NativeCleanupTarget* cleanup) noexcept;
 
 enum class NativeCommandOutcome : std::uint8_t {
   kNotACommand,

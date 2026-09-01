@@ -15,6 +15,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $SourceDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $SourceDirectory)
+$CommonSourceDirectory = Join-Path $RepositoryRoot 'native\remote-desktop-common'
 $NativePins = & (Join-Path $SourceDirectory 'load-native-pins.ps1') -RepositoryRoot $RepositoryRoot
 $Revision = $NativePins.LibwebrtcRevision
 $DepotToolsRevision = $NativePins.DepotToolsRevision
@@ -23,6 +24,7 @@ $DepotToolsRevision = $NativePins.DepotToolsRevision
 $DepotTools = Join-Path $CheckoutRoot 'depot_tools'
 $WebRtcRoot = Join-Path $CheckoutRoot 'src'
 $TargetDirectory = Join-Path $WebRtcRoot 'third_party\imcodes_remote_desktop'
+$CommonTargetDirectory = Join-Path $TargetDirectory 'common'
 $BuildDirectory = Join-Path $WebRtcRoot 'out\imcodes_remote_desktop'
 $RestoredBuildCache = Join-Path $CheckoutRoot 'imcodes_remote_desktop.restored-build-cache'
 $RootBuildPath = Join-Path $WebRtcRoot 'BUILD.gn'
@@ -35,8 +37,6 @@ $ExpectedSources = @(
   'invoke-native-logged.ps1',
   'display_capture.cc', 'display_capture.h', 'display_capture_unittest.cc',
   'display_preferences.cc', 'display_preferences.h',
-  'ice_candidate_queue.cc', 'ice_candidate_queue.h',
-  'ice_candidate_queue_unittest.cc',
   'input_injector.cc', 'input_injector.h', 'input_injector_unittest.cc',
   'json_protocol.cc', 'json_protocol.h', 'json_protocol_unittest.cc',
   'brand_logo_generated.h',
@@ -51,8 +51,23 @@ $ExpectedSources = @(
   'quality_ladder.cc', 'quality_ladder.h', 'quality_ladder_unittest.cc',
   'unlock_secret.cc', 'unlock_secret.h',
   'worker_policy.cc', 'worker_policy.h', 'worker_policy_unittest.cc',
+  'windows_platform_adapters.cc', 'windows_platform_adapters.h',
+  'windows_platform_adapters_unittest.cc',
   'virtual_display_controller.cc', 'virtual_display_controller.h',
   'worker_main.cc'
+)
+$ExpectedCommonSources = @(
+  'BUILD.gn',
+  'data_channel_constants.h',
+  'data_channel_payload.cc', 'data_channel_payload.h',
+  'input_ledger.cc', 'input_ledger.h',
+  'json_protocol.cc', 'json_protocol.h',
+  'platform_interfaces.h', 'protocol_contracts.h',
+  'quality_ladder.cc', 'quality_ladder.h',
+  'session_core.cc', 'session_core.h',
+  'signaling_types.h',
+  'transport_session_core.cc', 'transport_session_core.h',
+  'value_types.cc', 'value_types.h'
 )
 
 # Qualification builds can be prepared by the SYSTEM node service and then
@@ -221,6 +236,18 @@ try {
       throw "Invalid native worker source: $Name"
     }
   }
+  New-Item -ItemType Directory -Force -Path $CommonTargetDirectory | Out-Null
+  foreach ($Name in $ExpectedCommonSources) {
+    $Source = Get-Item -LiteralPath (Join-Path $CommonSourceDirectory $Name)
+    if (-not $Source.PSIsContainer -and
+        -not ($Source.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      $TargetPath = Join-Path $CommonTargetDirectory $Name
+      Copy-Item -LiteralPath $Source.FullName -Destination $TargetPath -Force
+      [System.IO.File]::SetLastWriteTimeUtc($TargetPath, [DateTime]::UtcNow)
+    } else {
+      throw "Invalid common remote-desktop source: $Name"
+    }
+  }
   # The legacy full-checkout builder shares BUILD.gn with the SDK producer.
   # Supply its dependency-only anchor without making it part of the product
   # source inventory or compiled worker bytes.
@@ -275,35 +302,87 @@ try {
   ) -join ' '
   Invoke-NativeLogged -Command { & gn gen $BuildDirectory "--args=$GnArgs" } `
     -LogRoot $CheckoutRoot -Name 'worker-gn-gen'
+  # DERIVED, never restated. $ExpectedSources is this script's own inventory of
+  # what the overlay must contain, so a suite cannot exist as a source file and
+  # be absent from the build list.
+  #
+  # It used to be two hand-written lists -- one for the ninja targets, one for
+  # the executables to run -- with nothing forcing them to agree with each other
+  # or with BUILD.gn. Both were missing windows_platform_adapters_unittests and
+  # pipe_ipc_unittests, which therefore had rtc_test targets and source files
+  # checked into the tree while never once being compiled or executed by this
+  # script. Deriving removes the class of defect rather than the two instances.
+  $NativeTestSuites = @(
+    $ExpectedSources |
+      Where-Object { $_ -like '*_unittest.cc' } |
+      ForEach-Object { $_ -replace '_unittest\.cc$', '_unittests' } |
+      Sort-Object
+  )
+  if ($RunNativeTests -and $NativeTestSuites.Count -eq 0) {
+    throw 'No native test suites derived from $ExpectedSources.'
+  }
   $Targets = @(
     'third_party/imcodes_remote_desktop:imcodes_remote_desktop_worker'
   )
   if ($RunNativeTests) {
-    $Targets += @(
-      'third_party/imcodes_remote_desktop:display_capture_unittests',
-      'third_party/imcodes_remote_desktop:quality_ladder_unittests',
-      'third_party/imcodes_remote_desktop:input_injector_unittests',
-      'third_party/imcodes_remote_desktop:ice_candidate_queue_unittests',
-      'third_party/imcodes_remote_desktop:json_protocol_unittests',
-      'third_party/imcodes_remote_desktop:privacy_ipc_unittests',
-      'third_party/imcodes_remote_desktop:worker_policy_unittests',
-      'third_party/imcodes_remote_desktop:mf_h264_encoder_unittests'
-    )
+    $Targets += @($NativeTestSuites | ForEach-Object {
+      "third_party/imcodes_remote_desktop:$_"
+    })
   }
   Invoke-NativeLogged -Command { & autoninja -C $BuildDirectory -j $Jobs @Targets } `
     -LogRoot $CheckoutRoot -Name 'worker-autoninja'
   if ($RunNativeTests) {
-    foreach ($TestName in @(
-        'display_capture_unittests',
-        'quality_ladder_unittests',
-        'input_injector_unittests',
-        'ice_candidate_queue_unittests',
-        'json_protocol_unittests',
-        'privacy_ipc_unittests',
-        'worker_policy_unittests',
-        'mf_h264_encoder_unittests')) {
-      & (Join-Path $BuildDirectory "$TestName.exe")
-      if ($LASTEXITCODE -ne 0) { throw "Native test failed: $TestName" }
+    foreach ($TestName in $NativeTestSuites) {
+      $TestExecutable = Join-Path $BuildDirectory "$TestName.exe"
+      if (-not (Test-Path -LiteralPath $TestExecutable -PathType Leaf)) {
+        # A suite that was asked for and did not produce a binary is a build
+        # gap, not a pass. Without this the loop would skip it silently.
+        throw "Native test binary missing: $TestName"
+      }
+      $TestLog = Join-Path $CheckoutRoot "native-test-$TestName.log"
+
+      # A test writing to stderr must not be mistaken for a failed test. This
+      # script runs under $ErrorActionPreference = 'Stop', which turns a native
+      # command's stderr into a TERMINATING error -- so a suite that merely
+      # logged a diagnostic aborted the whole run. Observed on real hardware:
+      # input_injector_unittests emits "imcodes-rd-input-dispatch-failed
+      # accepted=0 requested=1" from a test that goes on to pass, and exits 0.
+      $PreviousErrorAction = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      & $TestExecutable > $TestLog 2>&1
+      $TestExitCode = $LASTEXITCODE
+      $ErrorActionPreference = $PreviousErrorAction
+
+      $TestOutput = Get-Content -LiteralPath $TestLog -Raw
+      if ($null -eq $TestOutput) { $TestOutput = '' }
+      $RanMatch = [regex]::Match(
+        $TestOutput, '(\d+) tests? from \d+ test (?:suite|case)s? ran')
+      if (-not $RanMatch.Success) {
+        # No gtest summary at all means the binary died before reporting.
+        # Exit code alone cannot tell that apart from a clean empty run.
+        throw "Native test produced no gtest summary: $TestName"
+      }
+      $PassedMatch = [regex]::Match($TestOutput, '\[  PASSED  \] (\d+)')
+      $FailedMatch = [regex]::Match($TestOutput, '\[  FAILED  \] (\d+)')
+      $SkippedMatch = [regex]::Match($TestOutput, '\[  SKIPPED \] (\d+)')
+      $Ran = [int]$RanMatch.Groups[1].Value
+      $Passed = if ($PassedMatch.Success) { [int]$PassedMatch.Groups[1].Value } else { 0 }
+      $Failed = if ($FailedMatch.Success) { [int]$FailedMatch.Groups[1].Value } else { 0 }
+      $Skipped = if ($SkippedMatch.Success) { [int]$SkippedMatch.Groups[1].Value } else { 0 }
+
+      # The accounting must CLOSE. "4 ran, 2 passed, 0 failed" is not a pass --
+      # it is two tests whose outcome nobody looked at. Requiring the sum makes
+      # a silently vanished test a hard failure instead of a quiet one.
+      if ($Ran -ne ($Passed + $Failed + $Skipped)) {
+        throw ("Native test accounting does not close: $TestName " +
+               "ran=$Ran passed=$Passed failed=$Failed skipped=$Skipped")
+      }
+      if ($TestExitCode -ne 0 -or $Failed -ne 0) {
+        throw ("Native test failed: $TestName exit=$TestExitCode " +
+               "ran=$Ran passed=$Passed failed=$Failed skipped=$Skipped")
+      }
+      Write-Host ("native-test $TestName exit=$TestExitCode ran=$Ran " +
+                  "passed=$Passed failed=$Failed skipped=$Skipped")
     }
   }
 

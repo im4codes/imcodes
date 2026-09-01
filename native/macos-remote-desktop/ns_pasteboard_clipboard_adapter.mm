@@ -258,7 +258,7 @@ public:
     StopSession();
     if (backend_ == nullptr || !request_copy_ || !request_paste_ ||
         options_.max_text_bytes == 0 || options_.operation_timeout_ms == 0 ||
-        backend_->ProbeReadiness() != common::ReadinessState::kReady) {
+        ProbeCapability() != common::ReadinessState::kReady) {
       SetError({ClipboardErrorCode::kPermissionUnavailable,
                 "clipboard unavailable in the active graphical session"});
       return false;
@@ -278,11 +278,16 @@ public:
     return active_.load(std::memory_order_acquire);
   }
 
+  common::ReadinessState ProbeCapability() noexcept {
+    return backend_ == nullptr ? common::ReadinessState::kUnavailable
+                               : backend_->ProbeReadiness();
+  }
+
   common::ReadinessState ProbeReadiness() {
-    if (!SessionActive() || backend_ == nullptr) {
+    if (!SessionActive()) {
       return common::ReadinessState::kUnavailable;
     }
-    return backend_->ProbeReadiness();
+    return ProbeCapability();
   }
 
   bool PasteText(std::string_view text) {
@@ -520,6 +525,10 @@ void NSPasteboardClipboardAdapter::StopSession() noexcept {
 
 bool NSPasteboardClipboardAdapter::SessionActive() const noexcept {
   return impl_->SessionActive();
+}
+
+common::ReadinessState NSPasteboardClipboardAdapter::ProbeCapability() noexcept {
+  return impl_->ProbeCapability();
 }
 
 common::ReadinessState NSPasteboardClipboardAdapter::ProbeReadiness() {

@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -23,6 +24,7 @@ bool Check(bool condition, std::string_view message) {
 struct Transition {
   std::string value;
   bool pressed = false;
+  bool operator==(const Transition&) const = default;
 };
 
 class FakeBackend final : public input::CGEventInputBackend {
@@ -190,6 +192,42 @@ bool TestLedgerOnlyOperationsAndLogicalGeometry() {
                "wheel and bounded text must reach the backend") &&
          Check(statistics.emitted_keys == 0 && statistics.emitted_buttons == 0,
                "released input must not remain in adapter bookkeeping");
+}
+
+bool TestClipboardShortcutsUseRealBoundInputAndReleaseEveryKey() {
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend* fake = backend.get();
+  input::CGEventInputAdapter adapter(42, std::move(backend));
+  const auto topology = Topology();
+  if (!Check(adapter.BindTopology(topology, topology.displays[0].display_id),
+             "clipboard shortcut needs the current real topology") ||
+      !Check(adapter.EmitClipboardShortcut(
+                 "KeyC", std::numeric_limits<std::uint64_t>::max()),
+             "Command-C must use the real input adapter") ||
+      !Check(adapter.EmitClipboardShortcut(
+                 "KeyV", std::numeric_limits<std::uint64_t>::max()),
+             "Command-V must use the real input adapter")) {
+    return false;
+  }
+  const std::vector<Transition> expected = {
+      {"MetaLeft", true}, {"KeyC", true}, {"KeyC", false},
+      {"MetaLeft", false}, {"MetaLeft", true}, {"KeyV", true},
+      {"KeyV", false}, {"MetaLeft", false},
+  };
+  if (!Check(fake->key_events == expected,
+             "clipboard callbacks must emit two bounded released chords") ||
+      !Check(adapter.Statistics().emitted_keys == 0,
+             "clipboard callbacks must never leave a held modifier")) {
+    return false;
+  }
+  const std::size_t before = fake->key_events.size();
+  return Check(!adapter.EmitClipboardShortcut("KeyC", 0),
+               "expired clipboard action must fail closed") &&
+         Check(!adapter.EmitClipboardShortcut(
+                   "KeyX", std::numeric_limits<std::uint64_t>::max()),
+               "only copy and paste shortcuts are admitted") &&
+         Check(fake->key_events.size() == before,
+               "rejected clipboard action must emit nothing");
 }
 
 bool TestTopologyAndSequenceFences() {
@@ -392,6 +430,7 @@ bool TestBoundedTextCounterfactual() {
 int main() {
   @autoreleasepool {
     return TestLedgerOnlyOperationsAndLogicalGeometry() &&
+                   TestClipboardShortcutsUseRealBoundInputAndReleaseEveryKey() &&
                    TestTopologyAndSequenceFences() &&
                    TestMultiControllerAndLifecycleRelease() &&
                    TestEveryLifecycleReasonReleasesOnlyEmittedState() &&

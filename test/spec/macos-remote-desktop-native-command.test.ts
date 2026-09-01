@@ -42,6 +42,32 @@ describe('macOS remote-desktop native command, IPC and disclosure seams', () => 
     }
   });
 
+  it('keeps cleanup readiness a build capability rather than a liveness claim', async () => {
+    // Readiness is collected by a cold, short-lived process that owns no
+    // generation. If the worker probe answered these fields as "a generation is
+    // live" they would be permanently false, the daemon gate would map that to
+    // UNAVAILABLE forever, and no generation could ever be created to change
+    // it. The dispatcher is therefore the ONLY writer, and it answers with the
+    // same predicate it uses to decide whether it can dispatch a cleanup verb.
+    const command = read('native/macos-remote-desktop/macos_native_command_v1.cc');
+    const worker = read('native/macos-remote-desktop/macos_remote_desktop_worker_main.mm');
+
+    expect(command).toContain('bool NativeCleanupCapabilityV1(');
+    expect(command).toMatch(/snapshot\.release_input\s*=\s*cleanup_capable;/);
+    expect(command).toMatch(/snapshot\.stop_capture\s*=\s*cleanup_capable;/);
+
+    // The probe must not write either field: a second writer could disagree
+    // with dispatch, which is exactly the drift this contract forbids.
+    expect(worker).not.toMatch(/out->release_input\s*=/);
+    expect(worker).not.toMatch(/out->stop_capture\s*=/);
+
+    // The mutation verbs stay generation-bound and fail closed. Capability
+    // never implies a live generation.
+    expect(command).toContain('macos_remote_desktop_release_input_no_active_');
+    expect(command).toContain('macos_remote_desktop_stop_capture_no_active_');
+    expect(command).toContain('macos_remote_desktop_cleanup_unavailable');
+  });
+
   it('declares each contract layer as its own build target', async () => {
     for (const target of [
       'macos_native_command_v1',

@@ -1383,8 +1383,16 @@ class OwnedProductionAdapters final {
             }),
         encoder_(configuration.encoder_policy, configuration.encoder_limits),
         input_(configuration.worker_generation),
-        clipboard_(std::move(configuration.request_copy),
-                   std::move(configuration.request_paste),
+        clipboard_(configuration.request_copy
+                       ? std::move(configuration.request_copy)
+                       : [this](std::uint64_t deadline) {
+                           return input_.EmitClipboardShortcut("KeyC", deadline);
+                         },
+                   configuration.request_paste
+                       ? std::move(configuration.request_paste)
+                       : [this](std::uint64_t deadline) {
+                           return input_.EmitClipboardShortcut("KeyV", deadline);
+                         },
                    configuration.clipboard_options),
         local_disclosure_(
             [stop_relay](std::uint64_t generation) {

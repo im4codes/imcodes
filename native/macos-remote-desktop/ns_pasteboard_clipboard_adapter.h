@@ -100,6 +100,10 @@ public:
   void StopSession() noexcept;
   [[nodiscard]] bool SessionActive() const noexcept;
 
+  // Side-effect-free capability probe for cold admission. This deliberately
+  // does not claim an active route; StartSession and every operation retain
+  // their callback, generation and liveness gates.
+  [[nodiscard]] common::ReadinessState ProbeCapability() noexcept;
   [[nodiscard]] common::ReadinessState ProbeReadiness() override;
   bool PasteText(std::string_view text) override;
   bool CopySelection(std::string *text) override;

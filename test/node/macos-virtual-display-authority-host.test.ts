@@ -163,11 +163,20 @@ describe('macOS two-phase virtual-display readiness', () => {
 
   it('stops claiming release/stop reachability from a constructible path', () => {
     // `BuildControlSocketPath` succeeding proves a string was assembled, which
-    // is true on every machine whether or not anything is listening.
-    expect(nativeProbe).toContain('out->release_input = false;');
-    expect(nativeProbe).toContain('out->stop_capture = false;');
-    expect(nativeProbe).not.toMatch(/out->release_input = control_reachable/u);
-    expect(nativeProbe).not.toMatch(/out->stop_capture = control_reachable/u);
+    // is true on every machine whether or not anything is listening. That guard
+    // still holds, and now holds in its strongest form: the probe does not
+    // answer these fields AT ALL.
+    //
+    // Answering them false was the other end of the same mistake. The daemon
+    // gate maps either false to UNAVAILABLE, and readiness is collected by a
+    // cold process that owns no generation, so a hard false made the gate
+    // permanently unsatisfiable -- no generation could ever exist to flip it.
+    // The field the daemon needs is CAPABILITY, which only the dispatcher can
+    // answer because only it holds the cleanup target. See
+    // macos_native_command_v1.cc: NativeCleanupCapabilityV1.
+    expect(nativeProbe).not.toMatch(/out->release_input\s*=/u);
+    expect(nativeProbe).not.toMatch(/out->stop_capture\s*=/u);
+    expect(nativeProbe).not.toMatch(/control_reachable/u);
   });
 });
 
