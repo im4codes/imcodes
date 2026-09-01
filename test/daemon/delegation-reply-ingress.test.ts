@@ -297,7 +297,7 @@ describe('delegation reply ingress', () => {
     );
   });
 
-  it('accepts one final peer audit after failed dispatch expires old authority and exact redelivery mints the sole current authority', async () => {
+  it('accepts one final peer audit when exact redelivery replaces the prior pending authority', async () => {
     const store = new DelegationReplyStore({ dbPath: ':memory:' });
     const taskId = 'tsk_redelivery';
     const assignmentId = 'asg_redelivery_auditor';
@@ -316,7 +316,6 @@ describe('delegation reply ingress', () => {
       assignmentId,
     } as const;
     const failed = store.create({ ...bound, dispatchId: 'dispatch-failed', now: 10 });
-    store.expire(failed.record.delegationId, 11);
     const redelivery = store.create({ ...bound, dispatchId: 'dispatch-redelivery', now: 12 });
     const auditorAssignments = [{
       assignmentId,

@@ -270,6 +270,47 @@ export class DelegationReplyStore {
     const now = input.now ?? Date.now();
     const delegationId = opaqueId();
     const notificationId = opaqueId();
+    // An exact audit redelivery replaces its previous transport authority.
+    // The registry assignment/attempt/revision remains the final authority;
+    // retaining two equivalent pending rows only makes a legitimate auditor
+    // fail with attempt_mismatch after a daemon/manual delivery recovery.
+    if (input.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+      && input.auditAttemptId && input.auditRevision
+      && input.taskId && input.assignmentId) {
+      this.#db.prepare(`
+        UPDATE delegation_replies
+        SET status = ?, updated_at = ?
+        WHERE purpose = ?
+          AND task_id = ?
+          AND assignment_id = ?
+          AND audit_attempt_id = ?
+          AND audit_revision = ?
+          AND origin_session_name = ?
+          AND origin_session_instance_id = ?
+          AND origin_runtime_epoch = ?
+          AND target_session_name = ?
+          AND target_session_instance_id = ?
+          AND target_runtime_epoch = ?
+          AND COALESCE(audited_session_name, '') = ?
+          AND status = ?
+      `).run(
+        AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+        now,
+        AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        input.taskId,
+        input.assignmentId,
+        input.auditAttemptId,
+        input.auditRevision,
+        input.origin.sessionName,
+        input.origin.sessionInstanceId,
+        input.origin.runtimeEpoch,
+        input.target.sessionName,
+        input.target.sessionInstanceId,
+        input.target.runtimeEpoch,
+        input.auditedSessionName ?? '',
+        AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+      );
+    }
     this.#db.prepare(`
       INSERT INTO delegation_replies (
         delegation_id, capability_hash,
@@ -504,8 +545,36 @@ export class DelegationReplyStore {
       input.sender.runtimeEpoch,
       AGENT_DELEGATION_REPLY_STATUSES.PENDING,
     ) as Array<{ delegationId?: unknown }>;
-    if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') return undefined;
-    const current = this.get(rows[0].delegationId);
+    if (rows.length === 0 || typeof rows[0]?.delegationId !== 'string') return undefined;
+    const records = rows
+      .map((row) => typeof row.delegationId === 'string' ? this.get(row.delegationId) : undefined)
+      .filter((record): record is DelegationReplyRecord => Boolean(record));
+    if (records.length !== rows.length) return undefined;
+    const current = records.reduce((latest, candidate) => (
+      candidate.createdAt > latest.createdAt
+        || (candidate.createdAt === latest.createdAt && candidate.delegationId > latest.delegationId)
+        ? candidate
+        : latest
+    ));
+    // Versions before exact-redelivery replacement could leave several
+    // equivalent pending rows. They are one logical authority only when every
+    // immutable origin/audited binding agrees; any disagreement stays closed.
+    if (records.some((candidate) => (
+      !identityMatches(candidate.origin, current.origin)
+      || candidate.auditedSessionName !== current.auditedSessionName
+    ))) return undefined;
+    for (const superseded of records) {
+      if (superseded.delegationId === current.delegationId) continue;
+      this.#db.prepare(`
+        UPDATE delegation_replies SET status = ?, updated_at = ?
+        WHERE delegation_id = ? AND status = ?
+      `).run(
+        AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+        input.now ?? Date.now(),
+        superseded.delegationId,
+        AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+      );
+    }
     return current
       && current.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
       && current.taskId === input.taskId

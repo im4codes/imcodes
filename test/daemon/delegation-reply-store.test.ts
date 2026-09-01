@@ -99,7 +99,7 @@ describe('DelegationReplyStore', () => {
     database.close();
   });
 
-  it('selects one exact current audit authority while expired and mismatched history remains non-authoritative', () => {
+  it('replaces exact audit redelivery authority while conflicting origin history remains non-authoritative', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });
     const exact = {
@@ -124,6 +124,7 @@ describe('DelegationReplyStore', () => {
       target: { ...target, runtimeEpoch: 'old-epoch' },
       now: 105,
     });
+    const priorCurrent = store.create({ ...exact, dispatchId: 'dispatch-before-redelivery', now: 105 });
     const current = store.create({ ...exact, dispatchId: 'dispatch-redelivery', now: 106 });
     const match = () => store.matchPendingAuditAuthority({
       taskId: exact.taskId,
@@ -135,7 +136,12 @@ describe('DelegationReplyStore', () => {
     });
 
     expect(store.get(expired.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
+    expect(store.get(priorCurrent.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
+    // Simulate two equivalent pending rows persisted by a pre-fix daemon.
+    database.prepare('UPDATE delegation_replies SET status = ? WHERE delegation_id = ?')
+      .run(AGENT_DELEGATION_REPLY_STATUSES.PENDING, priorCurrent.record.delegationId);
     expect(match()?.delegationId).toBe(current.record.delegationId);
+    expect(store.get(priorCurrent.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
     expect(match()?.messageId).toBe(exact.messageId);
     expect(store.matchPendingAuditAuthority({
       taskId: exact.taskId,
@@ -146,7 +152,12 @@ describe('DelegationReplyStore', () => {
       now: 107,
     })).toBeUndefined();
 
-    store.create({ ...exact, dispatchId: 'dispatch-conflicting-current', now: 108 });
+    store.create({
+      ...exact,
+      origin: { ...origin, runtimeEpoch: 'conflicting-origin-epoch' },
+      dispatchId: 'dispatch-conflicting-current',
+      now: 108,
+    });
     expect(match()).toBeUndefined();
     expect(store.get(expired.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
     store.close();
