@@ -189,6 +189,9 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('already-authorized devices/environments');
     expect(prompt).toContain('MUST NOT modify tracked source, commit, push, deploy, mutate production');
     expect(prompt).toContain('Inspect worktree state before and after');
+    expect(prompt).toContain('compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash');
+    expect(prompt).toContain('do not hide it with reset, clean, or assume-unchanged');
+    expect(prompt).toContain('If raw bytes differ from HEAD, keep the normal fail-closed contamination rule');
     expect(prompt).toContain('Report exact commands/tools/devices/environments and observed outcomes');
     expect(prompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(prompt).toContain('imcodes audit-reply --task-id supervision_task_1 --assignment-id supervision_assignment_1 --attempt-id attempt_1 --revision revision_1 --receipt-kind final');
