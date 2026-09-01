@@ -71,22 +71,6 @@ describe('exact MCP discovery fallback', () => {
             id: 'file-transfer-computer-use',
             selector: 'group:file-transfer-computer-use',
             tools: expected,
-            fallbackCalls: [
-              {
-                query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
-                fallbackCall: {
-                  name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
-                  arguments: { topic: 'workflow' },
-                },
-              },
-              expect.objectContaining({
-                query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-                fallbackCall: {
-                  name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-                  arguments: { machine: 'local', tool: 'list_apps', arguments: {}, timeoutMs: 5_000 },
-                },
-              }),
-            ],
             published: true,
           })],
         },
@@ -99,8 +83,8 @@ describe('exact MCP discovery fallback', () => {
     expect(preview).toMatchObject({
       structuredContent: { publishedGroups: [], published: [] },
     });
-    expect((preview.structuredContent as { groups: unknown[] }).groups).not.toEqual(expect.arrayContaining([
-      expect.objectContaining({ fallbackCalls: expect.anything() }),
+    expect((preview.structuredContent as { matches: unknown[] }).matches).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ fallbackContract: expect.anything() }),
     ]));
     expect(targets.every((tool) => tool.enabled === false)).toBe(true);
   });
@@ -124,12 +108,34 @@ describe('exact MCP discovery fallback', () => {
     });
     const { call, sendToolListChanged } = harness([target]);
 
+    await expect(call({ query: 'secure_exact_tool' })).resolves.toMatchObject({
+      structuredContent: {
+        matches: [expect.objectContaining({
+          name: 'secure_exact_tool',
+          fallbackContract: {
+            query: 'secure_exact_tool',
+            name: 'secure_exact_tool',
+            inputSchema: expect.objectContaining({
+              type: 'object',
+              properties: expect.objectContaining({ value: expect.objectContaining({ type: 'string' }) }),
+              required: ['value'],
+            }),
+          },
+        })],
+      },
+    });
+
+    const fuzzyPreview = await call({ query: 'secure exact' });
+    expect(fuzzyPreview.structuredContent.matches).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ fallbackContract: expect.anything() }),
+    ]));
+
     await expect(call({
       query: 'secure_exact_tool',
       fallbackCall: { name: 'secure_exact_tool', arguments: { value: 'approved' } },
     }, authority)).resolves.toMatchObject({ structuredContent: { ok: true } });
     expect(handler).toHaveBeenCalledWith({ value: 'approved' }, authority);
-    expect(sendToolListChanged).toHaveBeenCalledOnce();
+    expect(sendToolListChanged).toHaveBeenCalledTimes(2);
 
     const otherAuthority = { authInfo: { token: 'different-authority' }, requestId: 'request-2' };
     await expect(call({

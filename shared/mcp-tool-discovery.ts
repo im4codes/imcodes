@@ -24,12 +24,6 @@ export interface McpToolGroupDefinition {
   id: string;
   /** Exact user/model phrases that safely select this bounded group. */
   aliases?: readonly string[];
-  /** Bounded, copyable wrapper calls for hosts that miss live schema refresh. */
-  fallbackCalls?: readonly {
-    query: string;
-    fallbackCall: { name: string; arguments: Readonly<Record<string, unknown>> };
-    note?: string;
-  }[];
   summary: string;
   tools: readonly string[];
 }
@@ -94,23 +88,6 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
       'open computer use',
       'computer use',
       'computer control',
-    ]),
-    fallbackCalls: Object.freeze([
-      Object.freeze({
-        query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
-        fallbackCall: Object.freeze({
-          name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
-          arguments: Object.freeze({ topic: 'workflow' }),
-        }),
-      }),
-      Object.freeze({
-        query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-        fallbackCall: Object.freeze({
-          name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-          arguments: Object.freeze({ machine: 'local', tool: 'list_apps', arguments: {}, timeoutMs: 5_000 }),
-        }),
-        note: 'For a controlled machine replace local with its canonical 10-digit nodeId or complete ^^(nodeId) marker; then select the needed tool/arguments.',
-      }),
     ]),
     summary: 'Transfer explicit files and inspect or operate authorized remote computer-use sessions.',
     tools: Object.freeze([

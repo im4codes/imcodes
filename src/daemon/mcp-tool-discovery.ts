@@ -1,5 +1,6 @@
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { normalizeObjectSchema, safeParseAsync } from '@modelcontextprotocol/sdk/server/zod-compat.js';
+import { toJsonSchemaCompat } from '@modelcontextprotocol/sdk/server/zod-json-schema-compat.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import {
@@ -90,6 +91,16 @@ function compactDescription(value: string | undefined): string {
   if (!value) return '';
   const singleLine = value.replace(/\s+/g, ' ').trim();
   return singleLine.length <= 180 ? singleLine : `${singleLine.slice(0, 177)}...`;
+}
+
+function registeredInputSchema(tool: RegisteredTool): Record<string, unknown> {
+  if (!tool.inputSchema) {
+    return { type: 'object', properties: {}, additionalProperties: false };
+  }
+  const schema = normalizeObjectSchema(tool.inputSchema);
+  return schema
+    ? toJsonSchemaCompat(schema, { target: 'draft-2020-12', pipeStrategy: 'input' })
+    : { type: 'object', properties: {}, additionalProperties: false };
 }
 
 function matchScore(query: string, name: string, description: string): number {
@@ -260,6 +271,15 @@ export function registerMcpToolDiscovery(
         active: true,
         published: tools.get(match.name)?.enabled === true,
         direct: tools.get(match.name)?.enabled === true,
+        ...(match.name === exactToolName
+          ? {
+              fallbackContract: {
+                query: match.name,
+                name: match.name,
+                inputSchema: registeredInputSchema(tools.get(match.name)!),
+              },
+            }
+          : {}),
       })),
       groups: groupMatches.map(({ group }) => {
         const registeredTools = group.tools.filter((name) => tools.has(name));
@@ -270,9 +290,6 @@ export function registerMcpToolDiscovery(
           summary: group.summary,
           toolCount: registeredTools.length,
           tools: registeredTools,
-          ...(group === exactGroup && group.fallbackCalls
-            ? { fallbackCalls: group.fallbackCalls }
-            : {}),
           active: registeredTools.length > 0,
           published: registeredTools.length > 0
             && registeredTools.every((name) => tools.get(name)?.enabled === true),
