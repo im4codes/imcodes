@@ -71,6 +71,22 @@ describe('exact MCP discovery fallback', () => {
             id: 'file-transfer-computer-use',
             selector: 'group:file-transfer-computer-use',
             tools: expected,
+            fallbackCalls: [
+              {
+                query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+                fallbackCall: {
+                  name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+                  arguments: { topic: 'workflow' },
+                },
+              },
+              expect.objectContaining({
+                query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+                fallbackCall: {
+                  name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+                  arguments: { machine: 'local', tool: 'list_apps', arguments: {}, timeoutMs: 5_000 },
+                },
+              }),
+            ],
             published: true,
           })],
         },
@@ -79,9 +95,13 @@ describe('exact MCP discovery fallback', () => {
     }
     expect(sendToolListChanged).toHaveBeenCalledTimes(4);
 
-    await expect(call({ query: 'control the desktop please' })).resolves.toMatchObject({
+    const preview = await call({ query: 'control the desktop please' });
+    expect(preview).toMatchObject({
       structuredContent: { publishedGroups: [], published: [] },
     });
+    expect((preview.structuredContent as { groups: unknown[] }).groups).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ fallbackCalls: expect.anything() }),
+    ]));
     expect(targets.every((tool) => tool.enabled === false)).toBe(true);
   });
 

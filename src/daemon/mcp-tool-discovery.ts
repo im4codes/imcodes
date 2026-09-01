@@ -270,6 +270,9 @@ export function registerMcpToolDiscovery(
           summary: group.summary,
           toolCount: registeredTools.length,
           tools: registeredTools,
+          ...(group === exactGroup && group.fallbackCalls
+            ? { fallbackCalls: group.fallbackCalls }
+            : {}),
           active: registeredTools.length > 0,
           published: registeredTools.length > 0
             && registeredTools.every((name) => tools.get(name)?.enabled === true),

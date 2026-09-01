@@ -81,6 +81,7 @@ describe('shared MCP tool distribution contract', () => {
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('current model turn');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('fallbackCall { name, arguments }');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('search the exact alias ocu');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('copyable fallbackCalls');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('computer_use_docs or computer_use_call');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('never infer unavailability from the initial callable list');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('wildcard/prefix fallback');
