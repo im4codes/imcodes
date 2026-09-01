@@ -131,6 +131,7 @@ const CODEX_TURN_HEARTBEAT_START_GRACE_MS = 15_000;
 const CODEX_TURN_HEARTBEAT_PROVIDER_CAP = 2;
 const CODEX_TURN_HEARTBEAT_MAX_TURNS = 100;
 const CODEX_AUTH_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
@@ -3148,6 +3149,7 @@ export class CodexSdkProvider implements TransportProvider {
     payload: ProviderContextPayload,
     turnDispatchGeneration: number,
     authRecoveryRetriesRemaining: number,
+    activeWriterRecoveryRetriesRemaining = CODEX_ACTIVE_WRITER_RECOVERY_LIMIT,
   ): Promise<void> {
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
@@ -3221,6 +3223,31 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.cancelled) {
         this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
+      }
+      if (
+        activeWriterRecoveryRetriesRemaining > 0
+        && authReplaySafe
+        && /already has an active writer/i.test(error.message)
+      ) {
+        const conflictedThreadId = state.threadId;
+        if (conflictedThreadId) this.threadToSession.delete(conflictedThreadId);
+        state.threadId = undefined;
+        state.loaded = false;
+        state.currentText = '';
+        state.currentMessageId = null;
+        logger.warn(
+          { provider: this.id, sessionId, conflictedThreadId },
+          'Codex thread rejected a pre-accept turn because another writer is active; retrying once on a replacement thread',
+        );
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          authRecoveryRetriesRemaining,
+          activeWriterRecoveryRetriesRemaining - 1,
+        );
         return;
       }
       if (this.isCodexAuthError(error)) {

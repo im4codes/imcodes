@@ -32,14 +32,14 @@ describe('SessionControls Quick static migration guards', () => {
     expect(source).not.toContain("t('peerAuditQuick.iconLabel').slice(0, 1)");
   });
 
-  it('Peer Audit icon shares canQuickControlSupervision gate', () => {
-    // The Peer Audit icon button is wrapped in the same canQuickControlSupervision check.
+  it('keeps Quick Audit available independently from the Brain-only Auto gate', () => {
     const peerBtnIdx = source.indexOf('class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"');
     const autoBtnIdx = source.indexOf('class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}');
-    const peerGateIdx = source.lastIndexOf('{canQuickControlSupervision && (', peerBtnIdx);
-    // Both buttons must appear AFTER a canQuickControlSupervision && check.
+    const peerGateIdx = source.lastIndexOf('{canQuickPeerAudit && (', peerBtnIdx);
+    const autoGateIdx = source.lastIndexOf('{canQuickControlSupervision && <>', autoBtnIdx);
     expect(peerGateIdx).toBeLessThan(peerBtnIdx);
-    expect(peerGateIdx).toBeLessThan(autoBtnIdx);
+    expect(autoGateIdx).toBeGreaterThan(peerBtnIdx);
+    expect(autoGateIdx).toBeLessThan(autoBtnIdx);
   });
 
   it('does not reintroduce the old Quick peer-audit controller call', () => {
@@ -55,7 +55,7 @@ describe('SessionControls Quick static migration guards', () => {
     const beforePeer = source.slice(Math.max(0, peerBlockIdx - 400), peerBlockIdx);
     expect(beforePeer).toContain('shortcuts-model');
     expect(beforePeer).toContain('ref={autoRef}');
-    const afterPeer = source.slice(peerBlockIdx, peerBlockIdx + 1000);
+    const afterPeer = source.slice(peerBlockIdx, peerBlockIdx + 1400);
     expect(afterPeer.indexOf('shortcut-btn-auto')).toBeGreaterThan(0);
   });
 

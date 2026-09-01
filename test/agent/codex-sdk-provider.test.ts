@@ -614,6 +614,26 @@ describe('CodexSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('moves a pre-accept active-writer conflict to one replacement thread without surfacing an error', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    childProcessMock.enqueueTurnStartError('thread thread-1 already has an active writer');
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-active-writer-pre-accept', cwd: '/tmp/project' });
+    await provider.send('route-active-writer-pre-accept', 'safe active-writer replay');
+
+    const child = childProcessMock.children[0]!;
+    const threadStarts = child.requests.filter((req) => req.method === 'thread/start');
+    const turnStarts = child.requests.filter((req) => req.method === 'turn/start');
+    expect(threadStarts).toHaveLength(2);
+    expect(turnStarts).toHaveLength(2);
+    expect(turnStarts[1]?.params?.input).toEqual(turnStarts[0]?.params?.input);
+    expect(errors).toEqual([]);
+    await provider.disconnect();
+  });
+
   it('restarts Codex and replays one auth-failed turn when no output or tool side effect started', async () => {
     const provider = createCodexProvider();
     const errors: ProviderError[] = [];
