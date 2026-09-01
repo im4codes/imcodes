@@ -906,7 +906,7 @@ describe('sdk transport flow e2e', () => {
     });
   });
 
-  it('applies live sub-session transportConfig supervision updates without restart and re-syncs the sub-session', async () => {
+  it('rejects live sub-session automatic supervision updates without mutation or re-sync', async () => {
     const sessionName = 'deck_sub_live_supervision';
     mocks.store.set(sessionName, {
       name: sessionName,
@@ -946,7 +946,6 @@ describe('sdk transport flow e2e', () => {
       },
     }, serverLink);
     await flushAsync();
-    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'subsession.sync' && call[0]?.id === 'live_supervision'));
 
     const record = mocks.store.get(sessionName);
     expect(record).toMatchObject({
@@ -954,32 +953,12 @@ describe('sdk transport flow e2e', () => {
       providerId: 'codex-sdk',
       providerSessionId: sessionName,
       codexSessionId: 'thread-codex-live-sub',
-      transportConfig: {
-        supervision: {
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: 'gpt-5.3-codex-spark',
-          taskRunPromptVersion: 'task_run_status_v1',
-          auditMode: 'audit',
-          maxAuditLoops: 2,
-        },
-      },
     });
+    expect(record?.transportConfig).toBeUndefined();
 
-    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'subsession.sync',
-      id: 'live_supervision',
-      transportConfig: expect.objectContaining({
-        supervision: expect.objectContaining({
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: 'gpt-5.3-codex-spark',
-          taskRunPromptVersion: 'task_run_status_v1',
-          auditMode: 'audit',
-          maxAuditLoops: 2,
-        }),
-      }),
-    }));
+    expect(serverLink.send.mock.calls.some((call) => (
+      call[0]?.type === 'subsession.sync' && call[0]?.id === 'live_supervision'
+    ))).toBe(false);
   });
 
   it('syncs codex-sdk sub-session model changes back to the frontend', async () => {
