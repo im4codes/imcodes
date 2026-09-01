@@ -11,6 +11,8 @@ import {
   MCP_TOOL_DISCOVERY_NAME,
   MCP_TOOL_DISCOVERY_REASON,
   MCP_TOOL_DISCOVERY_STATUS,
+  MCP_TOOL_CATALOG_MODES,
+  type McpToolCatalogMode,
   isDefaultActiveMcpTool,
 } from '../../shared/mcp-tool-discovery.js';
 import logger from '../util/logger.js';
@@ -131,11 +133,13 @@ function normalizeGroupAlias(value: string): string {
 export function registerMcpToolDiscovery(
   server: McpServer,
   tools: RegisteredMcpToolCatalog,
+  options: { catalogMode?: McpToolCatalogMode } = {},
 ): RegisteredTool {
+  const staticFullCatalog = options.catalogMode === MCP_TOOL_CATALOG_MODES.STATIC_FULL;
   // Core schemas stay published so an agent that never calls mcp_tool_search
   // still works. Long-tail services are already active/registered; only their
   // per-connection schema publication starts hidden.
-  for (const [name, tool] of tools) tool.enabled = isDefaultActiveMcpTool(name);
+  for (const [name, tool] of tools) tool.enabled = staticFullCatalog || isDefaultActiveMcpTool(name);
   let catalogGeneration = 1;
 
   return server.registerTool(MCP_TOOL_DISCOVERY_NAME, {
@@ -215,7 +219,7 @@ export function registerMcpToolDiscovery(
         ? exactGroup.tools.filter((name) => tools.has(name))
         : [];
     const publishedGroupIds = exactGroup && publishedNames.length > 0 ? [exactGroup.id] : [];
-    if (shouldPublish) {
+    if (shouldPublish && !staticFullCatalog) {
       const nextPublished = new Set(publishedNames);
       for (const [name, tool] of tools) {
         // The legacy `activate` input replaces only this connection's

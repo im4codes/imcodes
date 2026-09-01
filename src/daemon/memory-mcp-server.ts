@@ -36,6 +36,8 @@ import { registerMcpToolDiscovery } from './mcp-tool-discovery.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
+import { parseMcpToolCatalogMode, type McpToolCatalogMode } from '../../shared/mcp-tool-discovery.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -45,6 +47,10 @@ export interface MemoryMcpServerOptions {
   supervisionToolDeps?: SupervisionMcpToolDeps;
 }
 
+export interface MemoryMcpServerCatalogOptions {
+  toolCatalogMode?: McpToolCatalogMode;
+}
+
 type ExactStoreMcpToolDeps = MessagePinMcpToolDeps & AliasMcpToolDeps;
 
 export function createMemoryMcpServer(
@@ -52,6 +58,7 @@ export function createMemoryMcpServer(
   toolDeps: MemoryMcpToolDeps = {},
   exactStoreToolDeps: ExactStoreMcpToolDeps = {},
   supervisionToolDeps: SupervisionMcpToolDeps = {},
+  catalogOptions: MemoryMcpServerCatalogOptions = {},
 ): McpServer {
   const server = new McpServer({
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
@@ -68,7 +75,7 @@ export function createMemoryMcpServer(
   // Supervision registry: exact server-backed operations, same separation as
   // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
   for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps)) registered.set(name, tool);
-  registerMcpToolDiscovery(server, registered);
+  registerMcpToolDiscovery(server, registered, { catalogMode: catalogOptions.toolCatalogMode });
   return server;
 }
 
@@ -310,7 +317,8 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
 }
 
 export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {}): McpServer {
-  const caller = parseMcpRuntimeCallerFromEnv(options.env ?? process.env, 'stdio');
+  const env = options.env ?? process.env;
+  const caller = parseMcpRuntimeCallerFromEnv(env, 'stdio');
   return createMemoryMcpServer(
     caller,
     mergeDefaultToolDeps(caller, options.toolDeps ?? {}),
@@ -318,6 +326,7 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
     // Fourth argument was MISSING, so supervisionToolDeps defaulted to {} and
     // every supervision tool reported `supervision registry not bound`.
     options.supervisionToolDeps ?? createSupervisionMcpToolDeps(),
+    { toolCatalogMode: parseMcpToolCatalogMode(env[MEMORY_MCP_ENV_KEYS.TOOL_CATALOG_MODE]) },
   );
 }
 

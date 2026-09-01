@@ -6335,6 +6335,8 @@ describe('buildCodexMcpThreadConfig — per-thread shell identity', () => {
     });
     // The pre-existing memory MCP config must still be present alongside it.
     expect(cfg?.mcp_servers).toBeDefined();
+    expect(cfg?.mcp_servers?.[IMCODES_MEMORY_MCP_SERVER_NAME]?.env?.IMCODES_MCP_TOOL_CATALOG_MODE)
+      .toBe('static_full');
   });
 
   it('falls back to the session name for the label and needs no explicit env', () => {

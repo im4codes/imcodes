@@ -5,6 +5,7 @@ export const IMCODES_DAEMON_PROJECT_NAME_ENV = 'IMCODES_DAEMON_PROJECT_NAME';
 export const IMCODES_DAEMON_PROJECT_ROOT_ENV = 'IMCODES_DAEMON_PROJECT_ROOT';
 export const IMCODES_DAEMON_SERVER_ID_ENV = 'IMCODES_DAEMON_SERVER_ID';
 export const IMCODES_DAEMON_PROVIDER_ID_ENV = 'IMCODES_DAEMON_PROVIDER_ID';
+export const IMCODES_MCP_TOOL_CATALOG_MODE_ENV = 'IMCODES_MCP_TOOL_CATALOG_MODE';
 
 export const MEMORY_MCP_ENV_KEYS = {
   USER_ID: IMCODES_DAEMON_USER_ID_ENV,
@@ -14,6 +15,7 @@ export const MEMORY_MCP_ENV_KEYS = {
   PROJECT_ROOT: IMCODES_DAEMON_PROJECT_ROOT_ENV,
   SERVER_ID: IMCODES_DAEMON_SERVER_ID_ENV,
   PROVIDER_ID: IMCODES_DAEMON_PROVIDER_ID_ENV,
+  TOOL_CATALOG_MODE: IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
 } as const;
 
 export const MEMORY_MCP_IDENTITY_ENV_KEYS = [
@@ -30,6 +32,7 @@ export type MemoryMcpIdentityEnvKey = typeof MEMORY_MCP_IDENTITY_ENV_KEYS[number
 export type MemoryMcpEnvSource = Record<string, string | undefined>;
 
 const SAFE_PASSTHROUGH_ENV_KEYS = ['PATH', 'HOME', 'NODE_OPTIONS'] as const;
+const MEMORY_MCP_CONFIG_ENV_KEYS = [IMCODES_MCP_TOOL_CATALOG_MODE_ENV] as const;
 
 export type MemoryMcpEnvInput = Partial<Record<MemoryMcpIdentityEnvKey, string | null | undefined>>;
 
@@ -54,5 +57,6 @@ export function buildMemoryMcpServerEnv(
 
 export function isMemoryMcpAllowedEnvKey(key: string): boolean {
   return (SAFE_PASSTHROUGH_ENV_KEYS as readonly string[]).includes(key)
+    || (MEMORY_MCP_CONFIG_ENV_KEYS as readonly string[]).includes(key)
     || (MEMORY_MCP_IDENTITY_ENV_KEYS as readonly string[]).includes(key);
 }

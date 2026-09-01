@@ -64,6 +64,8 @@ import { composeProviderSystemText, getProviderSystemTextParts } from '../provid
 import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { IMCODES_MCP_TOOL_CATALOG_MODE_ENV } from '../../../shared/memory-mcp-env.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -951,7 +953,14 @@ export function buildCodexMcpThreadConfig(config: SessionConfig): Record<string,
         [IMCODES_MEMORY_MCP_SERVER_NAME]: {
           command: server.command,
           args: server.args,
-          env: server.env,
+          // Codex 0.147 still logs tools/list_changed without invalidating its
+          // MCP tool cache. Give that host a complete initial standard
+          // tools/list; Codex can defer schemas internally without relying on
+          // a non-standard wrapper or a mid-turn notification refresh.
+          env: {
+            ...server.env,
+            [IMCODES_MCP_TOOL_CATALOG_MODE_ENV]: MCP_TOOL_CATALOG_MODES.STATIC_FULL,
+          },
         },
       },
     } : {}),

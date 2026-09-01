@@ -3,6 +3,7 @@ import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server
 import { z } from 'zod';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { registerMcpToolDiscovery } from '../../src/daemon/mcp-tool-discovery.js';
+import { MCP_TOOL_CATALOG_MODES, type McpToolCatalogMode } from '../../shared/mcp-tool-discovery.js';
 
 function registeredTool(input: {
   name: string;
@@ -25,7 +26,7 @@ function registeredTool(input: {
   } as RegisteredTool;
 }
 
-function harness(targets: RegisteredTool[]) {
+function harness(targets: RegisteredTool[], catalogMode?: McpToolCatalogMode) {
   let discovery: RegisteredTool | undefined;
   const sendToolListChanged = vi.fn();
   const server = {
@@ -36,7 +37,7 @@ function harness(targets: RegisteredTool[]) {
     sendToolListChanged,
   } as unknown as McpServer;
   const tools = new Map(targets.map((tool) => [tool.name, tool]));
-  registerMcpToolDiscovery(server, tools);
+  registerMcpToolDiscovery(server, tools, { catalogMode });
   return {
     sendToolListChanged,
     call: (args: Record<string, unknown>, extra: unknown = {}) => (
@@ -46,6 +47,21 @@ function harness(targets: RegisteredTool[]) {
 }
 
 describe('exact MCP discovery fallback', () => {
+  it('keeps every registered schema initially callable for static standard-MCP hosts', async () => {
+    const targets = ['core_visible', 'long_tail_one', 'long_tail_two'].map((name) => registeredTool({
+      name,
+      inputSchema: z.object({ value: z.string() }).strict(),
+      handler: vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'ok' }] })),
+    }));
+    const { call, sendToolListChanged } = harness(targets, MCP_TOOL_CATALOG_MODES.STATIC_FULL);
+
+    expect(targets.every((tool) => tool.enabled)).toBe(true);
+    await call({ query: 'long_tail_one' });
+    await call({ query: 'unrelated fuzzy preview' });
+    expect(targets.every((tool) => tool.enabled)).toBe(true);
+    expect(sendToolListChanged).not.toHaveBeenCalled();
+  });
+
   it('publishes only the bounded computer-use group for exact OCU aliases', async () => {
     const names = [
       MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,

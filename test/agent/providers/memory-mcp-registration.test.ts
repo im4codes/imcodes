@@ -176,6 +176,8 @@ describe('managed provider MCP registration helpers', () => {
     expect(serialized).not.toContain(IMCODES_DAEMON_NAMESPACE_ENV);
     expect(serialized).not.toContain('user-secret-ish');
     expect(serialized).not.toContain('github.com/acme/project');
+    expect(serialized).toContain('IMCODES_MCP_TOOL_CATALOG_MODE');
+    expect(serialized).toContain('static_full');
   });
 
   it('pins Gemini model-list probe as MCP-free', async () => {

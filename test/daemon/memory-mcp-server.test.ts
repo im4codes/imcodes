@@ -182,6 +182,23 @@ describe('memory MCP stdio server', () => {
     }
   });
 
+  it('honors the static-full host contract on the initial standard tools/list', async () => {
+    const env = mcpEnv('/tmp');
+    env[MEMORY_MCP_ENV_KEYS.TOOL_CATALOG_MODE] = 'static_full';
+    const server = createMemoryMcpServerFromEnv({ env });
+    const client = new Client({ name: 'static-full-host-test', version: '0.1.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      const names = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(names).toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
+      expect(names).toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+      expect(names).toContain(SUPERVISION_MCP_TOOLS.RECOVER);
+    } finally {
+      await client.close();
+    }
+  });
+
   it('lists the registered shared tools over stdio and does not leak secret env', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stdio-'));
     const serverConfigPath = join(dir, 'server.json');

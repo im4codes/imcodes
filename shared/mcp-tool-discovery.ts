@@ -12,6 +12,24 @@ export {
 export const MCP_TOOL_DISCOVERY_NAME = 'mcp_tool_search' as const;
 
 /**
+ * Host catalog behavior negotiated out-of-band when a known MCP client cannot
+ * consume the standard tools/list_changed invalidation during a live session.
+ * STATIC_FULL stays entirely inside standard MCP: the first tools/list already
+ * contains every registered schema, so no dynamic refresh is required.
+ */
+export const MCP_TOOL_CATALOG_MODES = Object.freeze({
+  DYNAMIC: 'dynamic',
+  STATIC_FULL: 'static_full',
+} as const);
+export type McpToolCatalogMode = typeof MCP_TOOL_CATALOG_MODES[keyof typeof MCP_TOOL_CATALOG_MODES];
+
+export function parseMcpToolCatalogMode(value: unknown): McpToolCatalogMode {
+  return value === MCP_TOOL_CATALOG_MODES.STATIC_FULL
+    ? MCP_TOOL_CATALOG_MODES.STATIC_FULL
+    : MCP_TOOL_CATALOG_MODES.DYNAMIC;
+}
+
+/**
  * One model-visible routing hint, attached to the discovery tool only.
  *
  * Do not publish this as MCP server instructions: some hosts compose server
