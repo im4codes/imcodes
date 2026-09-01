@@ -538,6 +538,13 @@ export const SUPERVISION_DELEGATION_ELIGIBILITY_POLICY = {
   requiredTargetFields: SUPERVISION_DELEGATION_ELIGIBILITY_REQUIRED_TARGET_FIELDS,
   decisions: SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS,
   taskListFields: SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS,
+  automaticAudit: {
+    target: 'live_started_authorized_transport',
+    require: ['same_project_pool', 'exact_identity', 'availability'] as const,
+    ignore: ['replyCapable', 'restartDurableDeliveryId'] as const,
+    order: ['ready', 'auto_provision', 'busy_fifo'] as const,
+    forbidRuntimeTypes: ['process'] as const,
+  },
 } as const;
 
 export const SUPERVISION_TASK_REGISTRY_VERSION = 1 as const;

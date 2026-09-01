@@ -20,6 +20,7 @@ import {
   buildAutomaticAuditTaskPrompt,
   buildPeerAuditBriefV1,
   buildReworkBriefPrompt,
+  buildSupervisionDelegationEligibilityPolicy,
   buildSupervisionContinuePrompt,
   buildSupervisionDecisionPrompt,
   buildSupervisionDecisionRepairPrompt,
@@ -54,7 +55,21 @@ describe('supervision prompts', () => {
       existingTask: 'append', busy: 'durable_fifo', queue: 'genuinely_new_work_only', replacementObject: false,
     });
     expect(messaging.peer_audit_reply).toMatchObject({ verdictChannel: 'only' });
+    expect(messaging.automaticAudit).toMatchObject({
+      target: 'live_started_authorized_transport',
+      eligibilityIgnores: ['replyCapable', 'restartDurableDeliveryId'],
+      order: ['ready', 'auto_provision', 'busy_fifo'],
+    });
     expect(messaging.heartbeat.substitutesReply).toBe(false);
+
+    const eligibility = JSON.parse(buildSupervisionDelegationEligibilityPolicy('en'));
+    expect(eligibility.independentAudit.automatic).toMatchObject({
+      target: 'live_started_authorized_transport',
+      require: ['same_project_pool', 'exact_identity', 'availability'],
+      ignore: ['replyCapable', 'restartDurableDeliveryId'],
+      order: ['ready', 'auto_provision', 'busy_fifo'],
+      forbidRuntimeTypes: ['process'],
+    });
   });
 
   it('significantly reduces stable contract and per-message instruction size', () => {

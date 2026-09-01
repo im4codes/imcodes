@@ -6,6 +6,7 @@ import {
   resolvePeerAuditCandidate,
   resolvePeerAuditCandidateList,
   revalidatePeerAuditCandidateSelection,
+  validateAutomaticAuditTransportRoute,
 } from '../../src/daemon/peer-audit-candidates.js';
 import { DELEGATION_AVAILABILITY } from '../../shared/delegation-availability.js';
 
@@ -59,6 +60,21 @@ describe('peer-audit candidate authority', () => {
         [cross.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'claude' }],
       ]),
     })).toEqual({ ok: true, auditRoutingReason: 'brain_selected_same_family' });
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability: new Map([
+        [same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' }],
+        [cross.name, { availability: DELEGATION_AVAILABILITY.BUSY, limitGroup: 'claude' }],
+      ]),
+      automaticSupervision: true,
+    })).toEqual({
+      ok: true,
+      auditRoutingReason: 'same_family_degraded',
+      degradedReason: 'cross_vendor_unavailable',
+    });
 
     expect(evaluateBrainAuditRoutePolicy({
       auditedSessionName: audited.name,
@@ -188,6 +204,58 @@ describe('peer-audit candidate authority', () => {
       eligible: true,
       dispositionCapability: 'sent_unrevocable',
     });
+  });
+
+  it('uses a transport-only automatic authority without the legacy reply-capable flag', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    const transport = session('deck_sub_transport', {
+      parentSession: main.name,
+      agentType: 'custom-transport-adapter',
+      runtimeType: 'transport',
+    });
+    const process = session('deck_sub_process', {
+      parentSession: main.name,
+      agentType: 'codex',
+      runtimeType: 'process',
+    });
+    const all = [main, audited, transport, process];
+
+    // Manual candidate compatibility remains unchanged: the unknown adapter
+    // is not in the product reply-capable catalog.
+    expect(candidate(audited.name, transport.name, all)).toMatchObject({
+      eligible: false,
+      reason: 'not_reply_capable',
+    });
+    expect(validateAutomaticAuditTransportRoute({
+      auditedSessionName: audited.name,
+      targetName: transport.name,
+      allSessions: all,
+    })).toEqual({ ok: true });
+    expect(validateAutomaticAuditTransportRoute({
+      auditedSessionName: audited.name,
+      targetName: process.name,
+      allSessions: all,
+    })).toMatchObject({ ok: false, refusal: 'target_ineligible' });
+  });
+
+  it('keeps automatic transport authority exact, live, direct-child, and non-self', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    const missingIdentity = session('deck_sub_missing', {
+      parentSession: main.name,
+      sessionInstanceId: undefined,
+    });
+    const offline = session('deck_sub_offline', { parentSession: main.name, state: 'stopped' });
+    const nested = session('deck_sub_nested', { parentSession: audited.name });
+    const all = [main, audited, missingIdentity, offline, nested];
+    for (const targetName of [audited.name, missingIdentity.name, offline.name, nested.name]) {
+      expect(validateAutomaticAuditTransportRoute({
+        auditedSessionName: audited.name,
+        targetName,
+        allSessions: all,
+      })).toMatchObject({ ok: false });
+    }
   });
 
   it('lists only ordinary direct siblings/children and orders them NEUTRALLY', () => {

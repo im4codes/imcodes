@@ -372,7 +372,7 @@ export type BrainAuditRoutePolicyResult =
   | { ok: false; detail: string; degradedReason: SupervisionAuditDegradedReason };
 
 function unavailableCrossVendorReason(
-  candidates: readonly PeerAuditCandidate[],
+  candidates: readonly { name: string }[],
   availability: ReadonlyMap<string, DelegationTargetAvailability>,
 ): SupervisionAuditDegradedReason {
   if (candidates.length === 0) return 'no_cross_vendor_configured';
@@ -380,6 +380,77 @@ function unavailableCrossVendorReason(
   if (states.every((state) => state === DELEGATION_AVAILABILITY.LIMITED)) return 'cross_vendor_limited';
   if (states.every((state) => state === DELEGATION_AVAILABILITY.OFFLINE)) return 'cross_vendor_offline';
   return 'cross_vendor_unavailable';
+}
+
+/**
+ * Automatic audit delivery has a narrower runtime boundary than manual peer
+ * audit selection, but it does not depend on the legacy `replyCapable` product
+ * flag. Every live, started transport adapter has the daemon-authenticated
+ * peer_audit_reply ingress. Process/CLI runtimes remain manual-only.
+ */
+function automaticAuditTransportCandidates(
+  audited: SessionRecord,
+  allSessions: readonly SessionRecord[],
+): SessionRecord[] {
+  const owningMain = resolveOwningMain(audited, allSessions);
+  if (!owningMain || audited.executionCloneMetadata) return [];
+  return allSessions.filter((target) => (
+    target.name !== audited.name
+    && target.parentSession === owningMain.name
+    && target.role !== 'brain'
+    && !target.executionCloneMetadata
+    && Boolean(target.sessionInstanceId?.trim())
+    && Boolean(target.runtimeEpoch?.trim())
+    && (target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport'
+    && target.state !== 'stopped'
+    && target.state !== 'error'
+  ));
+}
+
+/** Automatic-only authority check; manual exact routes retain their legacy
+ * reply-capability/process behavior through {@link validateBrainAuditRoute}. */
+export function validateAutomaticAuditTransportRoute(input: {
+  auditedSessionName: string | undefined | null;
+  targetName: string;
+  allSessions: readonly SessionRecord[];
+}): BrainAuditRouteResult {
+  const auditedSessionName = typeof input.auditedSessionName === 'string'
+    ? input.auditedSessionName.trim()
+    : '';
+  if (!auditedSessionName) {
+    return {
+      ok: false, refusal: 'missing_audited_session',
+      detail: 'audit.auditedSessionName is required and is never inferred',
+    };
+  }
+  if (auditedSessionName === input.targetName) {
+    return { ok: false, refusal: 'self_audit', detail: 'a session cannot audit itself' };
+  }
+  const audited = input.allSessions.find((session) => session.name === auditedSessionName);
+  if (!audited || !resolveOwningMain(audited, input.allSessions) || audited.executionCloneMetadata) {
+    return {
+      ok: false, refusal: 'audited_session_unresolvable',
+      detail: 'audit route rejected: audited_session_unavailable',
+    };
+  }
+  const target = input.allSessions.find((session) => session.name === input.targetName);
+  if (!target) {
+    return {
+      ok: false, refusal: 'target_not_candidate',
+      detail: 'audit target is not a peer-audit candidate for the audited session',
+    };
+  }
+  if (!automaticAuditTransportCandidates(audited, input.allSessions).some((candidate) => (
+    candidate.name === target.name
+    && candidate.sessionInstanceId === target.sessionInstanceId
+    && candidate.runtimeEpoch === target.runtimeEpoch
+  ))) {
+    return {
+      ok: false, refusal: 'target_ineligible',
+      detail: 'automatic audit target must be a live started authorized transport with exact identity',
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -394,6 +465,7 @@ export function evaluateBrainAuditRoutePolicy(input: {
   allSessions: readonly SessionRecord[];
   availability: ReadonlyMap<string, DelegationTargetAvailability>;
   strictCrossVendor?: boolean;
+  automaticSupervision?: boolean;
 }): BrainAuditRoutePolicyResult {
   const audited = input.allSessions.find((session) => session.name === input.auditedSessionName);
   const target = input.allSessions.find((session) => session.name === input.targetName);
@@ -405,16 +477,22 @@ export function evaluateBrainAuditRoutePolicy(input: {
     return { ok: true, auditRoutingReason: 'cross_vendor_preferred' };
   }
 
-  const listed = resolvePeerAuditCandidateList({ auditedSessionName: audited.name, allSessions: input.allSessions });
-  if (!listed.ok) {
+  const listed = input.automaticSupervision
+    ? undefined
+    : resolvePeerAuditCandidateList({ auditedSessionName: audited.name, allSessions: input.allSessions });
+  if (listed && !listed.ok) {
     return { ok: false, detail: 'audit candidate authority is unavailable', degradedReason: 'cross_vendor_unavailable' };
   }
-  const crossVendor = listed.list.candidates.filter((candidate) => (
-    candidate.eligible && candidate.providerFamily !== auditedFamily
-  ));
+  const crossVendor = input.automaticSupervision
+    ? automaticAuditTransportCandidates(audited, input.allSessions)
+      .filter((candidate) => resolvePeerAuditProviderFamily(candidate) !== auditedFamily)
+    : listed!.list.candidates.filter((candidate) => (
+      candidate.eligible && candidate.providerFamily !== auditedFamily
+    ));
   const usableCrossVendor = crossVendor.filter((candidate) => {
     const state = input.availability.get(candidate.name)?.availability;
-    return state === DELEGATION_AVAILABILITY.READY || state === DELEGATION_AVAILABILITY.BUSY;
+    return state === DELEGATION_AVAILABILITY.READY
+      || (!input.automaticSupervision && state === DELEGATION_AVAILABILITY.BUSY);
   });
   const degradedReason = unavailableCrossVendorReason(crossVendor, input.availability);
   if (input.strictCrossVendor) {

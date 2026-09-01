@@ -56,11 +56,13 @@ import {
 import {
   evaluateBrainAuditRoutePolicy,
   resolvePeerAuditProviderFamily,
+  validateAutomaticAuditTransportRoute,
   validateBrainAuditRoute as validateBrainAuditRouteAuthority,
 } from './peer-audit-candidates.js';
 import type {
   SupervisionAuditDegradedReason,
   SupervisionAuditRoutingReason,
+  SupervisionProvisionFailureReason,
   SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
 import type {
@@ -105,11 +107,6 @@ import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActo
 import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
 import { resolveSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
-import { getProvider } from '../agent/provider-registry.js';
-import {
-  hasRestartDurableDeliveryIdAcceptance,
-  type ProviderRestartDurableDeliveryIdCapability,
-} from '../agent/transport-provider.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -986,6 +983,7 @@ export async function dispatchSendMessage(
       idempotencyKey,
       auditedSessionName: input.audit?.auditedSessionName,
       strictCrossVendor: input.audit?.strictCrossVendor,
+      provenance: input.automaticSupervision ? 'automatic_supervision' : 'manual_explicit',
     });
     provisioning = provision.evidence;
     auditDegradedReason = provision.auditDegradedReason;
@@ -1075,7 +1073,9 @@ export async function dispatchSendMessage(
   const validateBrainAuditRoute = (auditTarget: SessionRecord):
     | { ok: true }
     | { ok: false; reason: typeof MCP_ERROR_REASONS.IDENTITY_REJECTED | typeof MCP_ERROR_REASONS.VALIDATION_FAILED; error: string } => {
-    const route = validateBrainAuditRouteAuthority({
+    const route = (input.automaticSupervision
+      ? validateAutomaticAuditTransportRoute
+      : validateBrainAuditRouteAuthority)({
       auditedSessionName: input.audit?.auditedSessionName,
       targetName: auditTarget.name,
       allSessions,
@@ -1106,6 +1106,7 @@ export async function dispatchSendMessage(
         allSessions,
         availability: gate.availability,
         strictCrossVendor: input.audit.strictCrossVendor,
+        automaticSupervision: input.automaticSupervision,
       });
       if (!policy.ok) {
         return {
@@ -1553,9 +1554,6 @@ export interface ReadyAuditDispatchDeps {
   listTargets?: typeof listSendTargets;
   dispatch?: typeof dispatchSendMessage;
   hasDeliveryEvidence?: (sessionName: string, messageId: SendMessageId) => boolean;
-  resolveRestartDurableDeliveryIdCapability?: (
-    session: SessionRecord,
-  ) => ProviderRestartDurableDeliveryIdCapability | undefined;
   /** Internal boot-sweep marker: prior-process handoffs are abandoned. */
   recoverRestartHandoffs?: boolean;
   now?: () => number;
@@ -1576,26 +1574,6 @@ function hasDurableDeliveryEvidence(sessionName: string, messageId: SendMessageI
   } catch {
     return false;
   }
-}
-
-function restartDurableDeliveryIdCapability(
-  session: SessionRecord,
-  deps: ReadyAuditDispatchDeps,
-): ProviderRestartDurableDeliveryIdCapability | undefined {
-  const injected = deps.resolveRestartDurableDeliveryIdCapability?.(session);
-  if (injected) return injected;
-  const providerId = session.providerId?.trim();
-  if (!providerId) return undefined;
-  return getProvider(providerId)?.capabilities.restartDurableDeliveryId;
-}
-
-function hasProvenAutomaticAuditDelivery(
-  session: SessionRecord,
-  deps: ReadyAuditDispatchDeps,
-): boolean {
-  return hasRestartDurableDeliveryIdAcceptance(
-    restartDurableDeliveryIdCapability(session, deps),
-  );
 }
 
 function recoverAutomaticAuditHandoff(
@@ -1631,30 +1609,34 @@ function exactLiveSessionForAssignment(
   ));
 }
 
-function eligibleAutomaticAuditTransportTarget(
+interface AutomaticAuditTransportTargets {
+  ready?: string;
+  busy?: string;
+}
+
+function eligibleAutomaticAuditTransportTargets(
   brain: SessionRecord,
   audited: PersistedSupervisionTaskAssignment,
   allowSameFamily: boolean,
   deps: ReadyAuditDispatchDeps,
-): string | undefined {
+): AutomaticAuditTransportTargets {
   const sessions = (deps.listSessions ?? listSessions)();
   const auditedSession = sessions.find(
     (session) => session.name === audited.identity.sessionName,
   );
-  if (!auditedSession) return undefined;
+  if (!auditedSession) return {};
   const listed = (deps.listTargets ?? listSendTargets)({
     userId: brain.name,
     sessionName: brain.name,
     projectName: brain.projectName ?? null,
     projectRoot: brain.projectDir,
   }, { executionPool: 'primary', limit: MAX_TARGET_LIST_LIMIT });
-  if (listed.status !== 'ok') return undefined;
+  if (listed.status !== 'ok') return {};
   const liveByName = new Map(sessions.map((session) => [session.name, session]));
   const auditedFamily = resolvePeerAuditProviderFamily(auditedSession);
   const eligible = listed.items
     .filter((item) => (
       item.target !== audited.identity.sessionName
-      && item.replyCapable
       && (item.dispatchMode === 'new_work' || item.dispatchMode === 'queue_only')
       && item.eligiblePools?.includes('primary')
       && (() => {
@@ -1662,13 +1644,33 @@ function eligibleAutomaticAuditTransportTarget(
         return Boolean(
           live
           && (live.runtimeType ?? getSessionRuntimeType(live.agentType)) === 'transport'
-          && hasProvenAutomaticAuditDelivery(live, deps),
+          && live.sessionInstanceId?.trim()
+          && live.runtimeEpoch?.trim(),
         );
       })()
     ))
     .sort((left, right) => left.target.localeCompare(right.target));
-  return eligible.find((item) => item.providerFamily !== auditedFamily)?.target
-    ?? (allowSameFamily ? eligible.find((item) => item.providerFamily === auditedFamily)?.target : undefined);
+  const pick = (items: typeof eligible): string | undefined => (
+    items.find((item) => item.providerFamily !== auditedFamily)?.target
+    ?? (allowSameFamily ? items.find((item) => item.providerFamily === auditedFamily)?.target : undefined)
+  );
+  return {
+    ready: pick(eligible.filter((item) => item.dispatchMode === 'new_work')),
+    busy: pick(eligible.filter((item) => item.dispatchMode === 'queue_only')),
+  };
+}
+
+const AUTOMATIC_AUDIT_BUSY_FALLBACK_REASONS = new Set<SupervisionProvisionFailureReason>([
+  'max_spawned',
+  'cooldown',
+  'launch_failed',
+  'readiness_timeout',
+]);
+
+function mayFallbackToBusyAfterProvision(result: SendMessageResult): boolean {
+  return result.status === 'error'
+    && Boolean(result.provisioning?.failureReason)
+    && AUTOMATIC_AUDIT_BUSY_FALLBACK_REASONS.has(result.provisioning!.failureReason!);
 }
 
 function boundedAuditBrief(task: SupervisionTaskSnapshot, revision: string): string {
@@ -1814,11 +1816,6 @@ export async function dispatchReadyAudit(
       const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
       return { status: 'blocked', reason, reported };
     }
-    if (!hasProvenAutomaticAuditDelivery(target, deps)) {
-      const reason = 'existing automatic auditor lacks proven restart-durable stable-delivery-id acceptance';
-      const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
-      return { status: 'blocked', reason, reported };
-    }
     const messageId = deterministicSendMessageId(`auto-audit:${existingAudit.assignmentId}:${attemptId}`);
     const recoveredHandoff = recoverAutomaticAuditHandoff(target.name, messageId, deps);
     if (!recoveredHandoff && (deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(target.name, messageId)) {
@@ -1832,28 +1829,22 @@ export async function dispatchReadyAudit(
   // remain valid for the existing Brain-controlled exact/manual audit path,
   // but plain tmux delivery has no recipient-side durable command-id boundary
   // and therefore cannot satisfy restart-safe exactly-once auto delivery.
-  const target = existingAudit
-    ? existingAudit.identity.sessionName
-    : eligibleAutomaticAuditTransportTarget(
+  const candidates: AutomaticAuditTransportTargets = existingAudit
+    ? {}
+    : eligibleAutomaticAuditTransportTargets(
       brain,
       implementer,
       task.auditPolicy === 'auto_allow_degraded',
       deps,
     );
-  if (!target) {
-    const reason = task.auditPolicy === 'auto_strict_cross_vendor'
-      ? 'automatic audit requires one live reply-capable cross-vendor transport target with proven restart-durable stable-delivery-id acceptance'
-      : 'automatic audit requires one live reply-capable transport target with proven restart-durable stable-delivery-id acceptance';
-    const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
-    return { status: 'blocked', reason, reported };
-  }
-  const result = await (deps.dispatch ?? dispatchSendMessage)({
+  const caller = {
     userId: brain.name,
     sessionName: brain.name,
     projectName: task.projectName,
     projectRoot: brain.projectDir,
-  }, {
-    target,
+  };
+  const buildInput = (target?: string, autoProvision = false): SendMessageInput => ({
+    ...(target ? { target } : {}),
     message: boundedAuditBrief(task, revision),
     reply: true,
     idempotencyKey: `auto-audit:${task.taskId}:${revision}`,
@@ -1873,8 +1864,19 @@ export async function dispatchReadyAudit(
       auditRevision: revision,
       auditAttemptId: attemptId,
       executionPool: 'primary',
+      ...(autoProvision ? { autoProvision: true } : {}),
     },
   });
+  const dispatch = deps.dispatch ?? dispatchSendMessage;
+  const directTarget = existingAudit?.identity.sessionName ?? candidates.ready;
+  // Mandatory routing order: an already-ready authorized transport wins. If
+  // none exists, the configured execution pool gets one deterministic spawn
+  // attempt. A busy transport is only the final durable-FIFO fallback after a
+  // concrete capacity/cooldown/launch/readiness refusal from that attempt.
+  let result = await dispatch(caller, buildInput(directTarget, !directTarget));
+  if (!directTarget && candidates.busy && mayFallbackToBusyAfterProvision(result)) {
+    result = await dispatch(caller, buildInput(candidates.busy));
+  }
   if (result.status !== 'accepted' || !result.assignmentId) {
     const reason = result.status === 'error' ? result.error : `automatic audit dispatch ${result.status}`;
     const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
