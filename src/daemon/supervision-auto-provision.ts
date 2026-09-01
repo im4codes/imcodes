@@ -14,6 +14,7 @@ import {
   type SupervisionProvisionPool,
   type SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
+import { resolvePeerAuditProviderFamily as resolveSharedPeerAuditProviderFamily } from '../../shared/peer-audit.js';
 import {
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   extractSessionSupervisionSnapshot,
@@ -97,6 +98,10 @@ function supportedConfigs(
   const supported = definition.configs.filter((config) => (
     config.runtimeType === 'transport'
     && isTransportSessionAgentType(config.agentType)
+    // The visible transport launcher selects its provider adapter by agentType.
+    // Reject a mismatched claimed family up front instead of spawning a child
+    // that can never satisfy the requested execution identity.
+    && resolveSharedPeerAuditProviderFamily({ providerId: config.agentType }) === config.providerFamily
   ));
   return request.requestedCapabilityId
     ? supported.filter((config) => config.capabilityId === request.requestedCapabilityId)

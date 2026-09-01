@@ -24,6 +24,11 @@ function config(agentType: string, providerFamily: string, model: string): Super
   return { ...value, capabilityId: buildSupervisionExecutionCapabilityId(value) };
 }
 
+function processConfig(agentType: string, providerFamily: string, model: string): SupervisionExecutionConfig {
+  const value = { agentType, providerFamily, runtimeType: 'process' as const, model };
+  return { ...value, capabilityId: buildSupervisionExecutionCapabilityId(value) };
+}
+
 function presetConfig(
   agentType: string,
   providerFamily: string,
@@ -89,7 +94,7 @@ function harness(initial: SessionRecord[], override: Partial<SupervisionAutoProv
       label: sub.label ?? undefined,
       agentType: sub.type,
       runtimeType: sub.runtimeType ?? 'transport',
-      providerId: sub.type === 'claude-code-sdk' ? 'anthropic' : 'openai',
+      providerId: sub.providerId ?? sub.type,
       activeModel: sub.requestedModel ?? undefined,
       ccPreset: sub.ccPreset ?? undefined,
       projectDir: sub.cwd ?? '/repo',
@@ -216,6 +221,95 @@ describe('supervision auto provisioning', () => {
       type: 'codex-sdk', requestedModel: 'gpt-5.6-sol', parentSession: brain.name, fresh: true,
     }));
     expect(result.ok && result.evidence.createdSessionName).toBe(result.ok && result.target.name);
+  });
+
+  it('reuses only the exact transport provider, agent, and model identity across vendors', async () => {
+    const google = config('gemini-sdk', 'google', 'gemini-3-pro');
+    const brain = parent([google]);
+    const wrongProvider = session('deck_sub_wrong_provider', {
+      parentSession: brain.name,
+      agentType: 'gemini-sdk',
+      providerId: 'openai',
+      activeModel: 'gemini-3-pro',
+    });
+    const wrongAgent = session('deck_sub_wrong_agent', {
+      parentSession: brain.name,
+      agentType: 'codex-sdk',
+      providerId: 'openai',
+      activeModel: 'gemini-3-pro',
+    });
+    const wrongModel = session('deck_sub_wrong_model', {
+      parentSession: brain.name,
+      agentType: 'gemini-sdk',
+      providerId: 'google',
+      activeModel: 'gemini-2.5-pro',
+    });
+    const exact = session('deck_sub_google_exact', {
+      parentSession: brain.name,
+      agentType: 'gemini-sdk',
+      providerId: 'google',
+      activeModel: 'gemini-3-pro',
+    });
+    const h = harness([brain, wrongProvider, wrongAgent, wrongModel, exact]);
+
+    const result = await provisionSupervisionTarget(request({ requestedCapabilityId: google.capabilityId }), h.deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      target: { name: exact.name },
+      evidence: { selectedConfig: google, origin: 'reused' },
+    });
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('spawns any configured transport provider with its exact adapter and model', async () => {
+    const qoder = config('qoder-sdk', 'qoder', 'qoder-model');
+    const brain = parent([qoder]);
+    const h = harness([brain]);
+
+    const result = await provisionSupervisionTarget(request({ requestedCapabilityId: qoder.capabilityId }), h.deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      target: {
+        parentSession: brain.name,
+        agentType: 'qoder-sdk',
+        runtimeType: 'transport',
+        providerId: 'qoder-sdk',
+        activeModel: 'qoder-model',
+        userCreated: true,
+      },
+      evidence: { selectedConfig: qoder, origin: 'spawned', createdSessionName: expect.any(String) },
+    });
+    expect(h.start).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'qoder-sdk',
+      runtimeType: 'transport',
+      providerId: 'qoder-sdk',
+      requestedModel: 'qoder-model',
+      parentSession: brain.name,
+      fresh: true,
+    }));
+    expect(h.start).toHaveBeenCalledWith(expect.not.objectContaining({ ccPreset: expect.anything() }));
+  });
+
+  it('fails closed for process/CLI and mismatched transport-provider configurations without launching', async () => {
+    const cli = processConfig('codex', 'openai', 'gpt-5.6-sol');
+    const mismatched = config('gemini-sdk', 'openai', 'gemini-3-pro');
+
+    for (const unsupported of [cli, mismatched]) {
+      const brain = parent([unsupported]);
+      let clock = NOW;
+      const h = harness([brain], {
+        now: () => clock,
+        wait: async (ms) => { clock += ms; },
+        readyTimeoutMs: 1,
+      });
+      await expect(provisionSupervisionTarget(request({
+        requestedCapabilityId: unsupported.capabilityId,
+        idempotencyKey: unsupported.capabilityId,
+      }), h.deps)).resolves.toMatchObject({ ok: false, reason: 'unsupported_config' });
+      expect(h.start).not.toHaveBeenCalled();
+    }
   });
 
   it('creates a visible child with the exact CC preset when no matching preset session is ready', async () => {
