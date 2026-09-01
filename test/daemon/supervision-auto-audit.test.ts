@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { normalizeSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import type { SendMessageId } from '../../shared/send-message-id.js';
@@ -206,6 +207,175 @@ describe('automatic supervision audit materialization', () => {
     expect(snapshot.auditPolicy).toBe('auto_allow_degraded');
     expect(snapshot.assignments.filter((item) => item.role === 'auditor')).toEqual([]);
     expect(snapshot.assignments.map((item) => item.role).sort()).toEqual(['coordinator', 'implementer']);
+  });
+
+  it('rejects an explicit Brain auditPolicy while session supervision is off', async () => {
+    const selected = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'off',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) }],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const worker = session('deck_alpha_worker', 'w1');
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: worker.name,
+      message: 'implement with explicit automatic audit',
+      idempotencyKey: 'explicit-policy-new-task',
+      task: {
+        classification: 'independent_top_level',
+        objective: 'explicit policy survives mode off',
+        auditPolicy: 'auto_allow_degraded',
+        executionPool: 'primary',
+      },
+    }, {
+      listSessions: () => [brain, worker],
+      dispatchMessage: vi.fn().mockResolvedValue('queued'),
+      ensureSupervisionAssignmentWorktree: async () => ({
+        ok: true, worktreePath: '/worktree/repo', baseRevision: 'a'.repeat(40), created: true,
+      }),
+    });
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: expect.stringContaining('requires supervised_audit mode'),
+    });
+    expect(getSupervisionTaskRegistry().list()).toEqual([]);
+  });
+
+  it('binds a missing policy only on an enabled exact Brain continuation and triggers the ready task once', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'explicit-policy-recovery', registry });
+    const selected = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        auditTargetSessionName: 'deck_alpha_auditor',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) }],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const worker = session('deck_alpha_worker', 'w1');
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'ignored', reason: 'test_hook' });
+    const dispatchMessage = vi.fn().mockResolvedValue('queued');
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: worker.name,
+      message: 'recover the same ready task',
+      idempotencyKey: 'explicit-policy-ready-recovery',
+      task: {
+        taskId: ready.taskId,
+        assignmentId: ready.worker.assignmentId,
+        currentRevision: ready.revision,
+        auditPolicy: 'auto_allow_degraded',
+        executionPool: 'primary',
+      },
+    }, {
+      listSessions: () => [brain, worker],
+      dispatchMessage,
+      dispatchReadyAudit,
+      ensureSupervisionAssignmentWorktree: async () => ({
+        ok: true, worktreePath: '/worktree/repo', baseRevision: 'a'.repeat(40), created: false,
+      }),
+    });
+    expect(result).toMatchObject({ status: 'accepted', taskId: ready.taskId, assignmentId: ready.worker.assignmentId });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledWith(ready.taskId);
+
+    const conflict = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: worker.name,
+      message: 'must not change the policy',
+      idempotencyKey: 'explicit-policy-conflict',
+      task: {
+        taskId: ready.taskId,
+        assignmentId: ready.worker.assignmentId,
+        currentRevision: ready.revision,
+        auditPolicy: 'auto_strict_cross_vendor',
+        executionPool: 'primary',
+      },
+    }, {
+      listSessions: () => [brain, worker],
+      dispatchMessage,
+    });
+    expect(conflict).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+  });
+
+  it('does not bind or dispatch a ready task policy after automatic audit is turned off', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'explicit-policy-off-recovery', registry });
+    const selected = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'off',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) }],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const worker = session('deck_alpha_worker', 'w1');
+    const dispatchReadyAudit = vi.fn();
+    const dispatchMessage = vi.fn();
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: worker.name,
+      message: 'must remain manual while automatic audit is off',
+      idempotencyKey: 'explicit-policy-off-ready-recovery',
+      task: {
+        taskId: ready.taskId,
+        assignmentId: ready.worker.assignmentId,
+        currentRevision: ready.revision,
+        auditPolicy: 'auto_allow_degraded',
+        executionPool: 'primary',
+      },
+    }, {
+      listSessions: () => [brain, worker],
+      dispatchMessage,
+      dispatchReadyAudit,
+    });
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: expect.stringContaining('requires supervised_audit mode'),
+    });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBeUndefined();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(dispatchReadyAudit).not.toHaveBeenCalled();
   });
 
   it('converges repeated post-open and boot sweep calls on one assignment/attempt/message', async () => {

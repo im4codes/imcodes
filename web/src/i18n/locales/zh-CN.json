@@ -810,6 +810,9 @@
       "invalidStoredConfig": "已保存的监督配置无效。修复并保存前，自动化将保持禁用。",
       "quickLabel": "自动",
       "quickAuditLabel": "审计",
+      "modeSaved": "自动监督已切换为{{mode}}。",
+      "modeSaveFailed": "自动监督同步失败，请重试。",
+      "brainOnly": "只有 Brain 会话可以开启自动监督或自动审计。",
       "quickTitle": "自动模式"
     },
     "approval": {

@@ -19,6 +19,11 @@ import logger from '../util/logger.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
+import {
+  extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
+  SUPERVISION_MODE,
+} from '../../../shared/supervision-config.js';
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 type SubSessionRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
@@ -223,6 +228,13 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   if ('activeModel' in body) fields.active_model = body.activeModel ?? null;
   if ('effort' in body) fields.effort = body.effort ?? null;
   if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
+  if (hasInvalidSessionSupervisionSnapshot(body.transportConfig ?? null)) {
+    return c.json({ error: 'invalid_supervision_config' }, 400);
+  }
+  const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
+  if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
+    return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
+  }
 
   await updateSubSession(c.env.DB, subId, serverId, fields);
 

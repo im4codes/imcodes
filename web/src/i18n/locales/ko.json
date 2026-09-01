@@ -810,6 +810,9 @@
       "invalidStoredConfig": "저장된 감독 설정이 잘못되었습니다. 수정하고 저장할 때까지 자동화는 비활성화됩니다.",
       "quickLabel": "자동",
       "quickAuditLabel": "감사",
+      "modeSaved": "자동 감독이 {{mode}} 모드로 전환되었습니다.",
+      "modeSaveFailed": "자동 감독을 동기화하지 못했습니다. 다시 시도하세요.",
+      "brainOnly": "Brain 세션만 자동 감독 또는 자동 감사를 활성화할 수 있습니다.",
       "quickTitle": "자동 모드"
     },
     "approval": {

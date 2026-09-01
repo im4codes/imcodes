@@ -64,7 +64,7 @@ import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
-import { patchSession, patchSessionSupervision, patchSubSession } from '../api.js';
+import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -109,7 +109,7 @@ import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
 import {
-  buildTransportConfigWithSupervision,
+  canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
@@ -1566,12 +1566,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [appendSuccessNotice, setAppendSuccessNotice] = useState<string | null>(null);
   const [deliveryModeNotice, setDeliveryModeNotice] = useState<{ append: boolean; message: string } | null>(null);
+  const [supervisionModeNotice, setSupervisionModeNotice] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
   const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const appendSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deliveryModeNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const supervisionModeNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
   // Keep external inputRef in sync so parent can call .focus()
@@ -1670,6 +1672,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setDeliveryModeNotice(null);
     }, 2200);
   }, [t]);
+  const showSupervisionModeNotice = useCallback((mode: SupervisionMode) => {
+    if (supervisionModeNoticeTimerRef.current) clearTimeout(supervisionModeNoticeTimerRef.current);
+    setSupervisionModeNotice(t('session.supervision.modeSaved', {
+      mode: t(`session.supervision.mode.${mode}`),
+    }));
+    supervisionModeNoticeTimerRef.current = setTimeout(() => {
+      supervisionModeNoticeTimerRef.current = null;
+      setSupervisionModeNotice(null);
+    }, 3500);
+  }, [t]);
   const transportQueueAppendFailedLabel = t('session.transport_queue_append_failed');
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
@@ -1720,6 +1732,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
     if (appendSuccessTimerRef.current) clearTimeout(appendSuccessTimerRef.current);
     if (deliveryModeNoticeTimerRef.current) clearTimeout(deliveryModeNoticeTimerRef.current);
+    if (supervisionModeNoticeTimerRef.current) clearTimeout(supervisionModeNoticeTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -1818,12 +1831,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     supervisionSnapshot?.auditTargetSessionName
     && supervisionSnapshot.auditTargetSessionName !== auditedSessionName,
   );
-  const canQuickControlSupervision = !!(
+  const canQuickPeerAudit = !!(
     activeSession
     && serverId
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
   );
+  const canQuickControlSupervision = canQuickPeerAudit
+    && canSessionRoleOwnAutomaticSupervision(activeSession?.role);
   const supervisorDefaultsPref = useSupervisorDefaults(
     canQuickControlSupervision,
     serverId && activeSession?.name ? { serverId, sessionName: activeSession.name } : null,
@@ -2527,22 +2542,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       ? t('session.supervision.quickAuditLabel')
       : t('session.supervision.quickLabel');
 
-  const persistTransportConfig = useCallback(async (
-    transportConfig: Record<string, unknown> | null,
-    supervision: Partial<SessionSupervisionSnapshot>,
-  ) => {
+  const persistTransportConfig = useCallback(async (supervision: Partial<SessionSupervisionSnapshot>) => {
     if (!serverId || !activeSession) return;
-    let persistedTransportConfig = transportConfig;
-    if (isShareScopedSession) {
-      persistedTransportConfig = await patchSessionSupervision(serverId, activeSession.name, supervision);
-    } else if (subSessionId) {
-      await patchSubSession(serverId, subSessionId, { transportConfig });
-    } else {
-      await patchSession(serverId, activeSession.name, { transportConfig });
-    }
+    const persistedTransportConfig = await patchSessionSupervision(serverId, activeSession.name, supervision);
     setLocalTransportConfig(persistedTransportConfig);
     onTransportConfigSaved?.(persistedTransportConfig);
-  }, [activeSession, isShareScopedSession, onTransportConfigSaved, serverId, subSessionId]);
+  }, [activeSession, onTransportConfigSaved, serverId]);
 
   const handleQuickSupervisionModeSelect = useCallback(async (nextMode: SupervisionMode) => {
     if (!activeSession || !serverId || !canQuickControlSupervision) return;
@@ -2561,15 +2566,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       const nextSnapshot = supervisionSnapshot
         ? { ...supervisionSnapshot, mode: SUPERVISION_MODE.OFF }
         : { mode: SUPERVISION_MODE.OFF };
-      const nextTransportConfig = buildTransportConfigWithSupervision(
-        currentTransportConfig,
-        nextSnapshot,
-      );
       try {
-        await persistTransportConfig(nextTransportConfig, nextSnapshot);
+        await persistTransportConfig(nextSnapshot);
         setAutoOpen(false);
+        showSupervisionModeNotice(nextMode);
       } catch {
-        showSendWarning(t('upload.upload_failed'));
+        showSendWarning(t('session.supervision.modeSaveFailed'));
       }
       return;
     }
@@ -2610,12 +2612,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       };
     }
 
-    const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, nextSnapshot);
     try {
-      await persistTransportConfig(nextTransportConfig, nextSnapshot);
+      await persistTransportConfig(nextSnapshot);
       setAutoOpen(false);
+      showSupervisionModeNotice(nextMode);
     } catch {
-      showSendWarning(t('upload.upload_failed'));
+      showSendWarning(t('session.supervision.modeSaveFailed'));
     }
   }, [
     activeSession,
@@ -2627,6 +2629,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     hasSavedAuditTarget,
     serverId,
     showSendWarning,
+    showSupervisionModeNotice,
     supervisionSnapshot,
     supervisorDefaultsPref.loaded,
     supervisorDefaultsPref.reload,
@@ -5058,6 +5061,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       </div>,
       document.body,
     )}
+    {supervisionModeNotice && typeof document !== 'undefined' && createPortal(
+      <div
+        class="queue-append-success-toast composer-supervision-mode-toast"
+        data-testid="supervision-mode-toast"
+        role="status"
+        aria-live="polite"
+      >
+        <span class="queue-append-success-toast-icon" aria-hidden="true">✓</span>
+        <span>{supervisionModeNotice}</span>
+      </div>,
+      document.body,
+    )}
     {mobileFileBrowserOpen && ws && activeSession && createPortal(
       <div class="mobile-fb-overlay" ref={swipeBackRef}>
         <div class="mobile-fb-header">
@@ -5239,7 +5254,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         {/* Quick peer delegation reuses the ordinary @agent orchestration path.
             It stays separate from automatic supervision state and remains
             visible while Auto is off. */}
-        {canQuickControlSupervision && (
+        {canQuickPeerAudit && (
           <div class="shortcuts-model shortcuts-model-supervision" ref={autoRef}>
             <button
               class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"
@@ -5265,6 +5280,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </svg>
               <span class="shortcut-btn-peer-audit-label">{t('peerAuditQuick.shortLabel')}</span>
             </button>
+            {canQuickControlSupervision && <>
             <button
               class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}
               onClick={() => setAutoOpen((open) => !open)}
@@ -5281,7 +5297,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <span class="shortcut-btn-auto-label">{quickSupervisionLabel}</span>
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
             </button>
-            {autoOpen && (
+            {canQuickControlSupervision && autoOpen && (
               <div class="menu-dropdown menu-dropdown-auto">
                 <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.OFF ? 'menu-item-active' : ''}`}
@@ -5317,6 +5333,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 )}
               </div>
             )}
+            </>}
           </div>
         )}
 

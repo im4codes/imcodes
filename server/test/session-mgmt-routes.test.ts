@@ -341,12 +341,25 @@ describe('session-mgmt persistence routes', () => {
   });
 
   it('PATCH /sessions/:name relays transport-config updates to the daemon without a restart', async () => {
+    const transportConfig = {
+      supervision: {
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.6-sol',
+        timeoutMs: 30_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        maxAutoContinueStreak: 2,
+        maxAutoContinueTotal: 0,
+      },
+    };
+    mockGetDbSessionByName.mockResolvedValue({ name: 'deck_proj_brain', role: 'brain' });
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        transportConfig: { supervision: { mode: 'supervised' } },
+        transportConfig,
       }),
     });
 
@@ -356,14 +369,42 @@ describe('session-mgmt persistence routes', () => {
       'srv-1',
       'deck_proj_brain',
       {
-        transport_config: { supervision: { mode: 'supervised' } },
+        transport_config: transportConfig,
       },
     );
     expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
       type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
       sessionName: 'deck_proj_brain',
-      transportConfig: { supervision: { mode: 'supervised' } },
+      transportConfig,
     });
+  });
+
+  it('PATCH /sessions/:name refuses automatic supervision for a non-Brain session', async () => {
+    mockGetDbSessionByName.mockResolvedValue({ name: 'deck_proj_worker', role: 'w1' });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_worker', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transportConfig: {
+          supervision: {
+            mode: 'supervised',
+            backend: 'codex-sdk',
+            model: 'gpt-5.6-sol',
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+            maxParseRetries: 1,
+            maxAutoContinueStreak: 2,
+            maxAutoContinueTotal: 0,
+          },
+        },
+      }),
+    });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'brain_session_required' });
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
   it('POST /session/cancel relays direct SDK cancel without /stop text', async () => {
@@ -508,6 +549,7 @@ describe('session-mgmt persistence routes', () => {
     });
     mockGetDbSessionByName.mockResolvedValue({
       name: 'deck_proj_brain',
+      role: 'brain',
       agent_type: 'codex-sdk',
       transport_config: {
         provider: { privateSetting: 'preserved' },
@@ -579,6 +621,37 @@ describe('session-mgmt persistence routes', () => {
     });
   });
 
+  it('PATCH /sessions/:name/supervision refuses enablement for a non-Brain session', async () => {
+    mockGetDbSessionByName.mockResolvedValue({
+      name: 'deck_proj_worker',
+      role: 'w1',
+      agent_type: 'codex-sdk',
+      transport_config: null,
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_worker/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+        },
+      }),
+    });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'brain_session_required' });
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
   it('PATCH /sessions/:name/supervision denies viewers and uncovered share actors before mutation', async () => {
     const app = await buildApp();
     for (const actor of [
@@ -625,6 +698,7 @@ describe('session-mgmt persistence routes', () => {
     });
     mockGetDbSessionByName.mockResolvedValue({
       name: 'deck_proj_brain',
+      role: 'brain',
       agent_type: 'codex-sdk',
       transport_config: {},
     });

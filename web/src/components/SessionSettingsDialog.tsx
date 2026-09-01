@@ -40,6 +40,7 @@ import {
   resolveSupervisionModelForBackend,
   SUPERVISION_PROMPT_VERSION,
   SUPERVISION_REPAIR_PROMPT_VERSION,
+  SUPERVISION_MODE,
   SUPERVISION_MODES,
   SUPERVISION_MIN_TIMEOUT_MS,
   TASK_RUN_PROMPT_VERSION,
@@ -86,6 +87,8 @@ interface Props {
   cwd: string;
   type: string;
   parentSession?: string | null;
+  /** UI hint only; Server/daemon remain the authority for automatic mode. */
+  canControlAutomaticSupervision?: boolean;
   transportConfig?: Record<string, unknown> | null;
   sessionInstanceId?: string;
   runtimeEpoch?: string;
@@ -784,6 +787,7 @@ export function SessionSettingsDialog({
   onAddPoolSession,
   poolSessionDialogOpen = false,
   parentSession,
+  canControlAutomaticSupervision = false,
   openIntent,
   ws,
   onClose,
@@ -799,6 +803,7 @@ export function SessionSettingsDialog({
     const persisted: SupervisionDraft = hasPersistedSupervision
       ? readSupervisionSnapshotFromTransportConfig(transportConfig)
       : { mode: 'off' as const };
+    if (!canControlAutomaticSupervision) return { ...persisted, mode: SUPERVISION_MODE.OFF };
     if (!openIntent?.supervisionMode) return persisted;
     if (openIntent.supervisionMode === 'off' || (persisted.backend && persisted.model)) {
       return { ...persisted, mode: openIntent.supervisionMode };
@@ -814,7 +819,7 @@ export function SessionSettingsDialog({
       ...persisted,
       mode: openIntent.supervisionMode,
     };
-  }, [hasPersistedSupervision, openIntent?.supervisionMode, transportConfig, type]);
+  }, [canControlAutomaticSupervision, hasPersistedSupervision, openIntent?.supervisionMode, transportConfig, type]);
 
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
@@ -1600,12 +1605,15 @@ export function SessionSettingsDialog({
             onInput={handleSessionModeSelect}
             onChange={handleSessionModeSelect}
             style={{ width: '100%' }}
-            disabled={saving}
+            disabled={saving || !canControlAutomaticSupervision}
           >
             {SUPERVISION_MODES.map((mode) => (
               <option key={mode} value={mode}>{t(`session.supervision.mode.${mode}`)}</option>
             ))}
           </select>
+          {!canControlAutomaticSupervision && (
+            <div class="session-settings-field-help">{t('session.supervision.brainOnly')}</div>
+          )}
         </div>
 
         {hasSupervision && (

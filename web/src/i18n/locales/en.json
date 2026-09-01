@@ -810,6 +810,9 @@
       "invalidStoredConfig": "Stored supervision config is invalid. Automation is disabled until you repair and save it.",
       "quickLabel": "Auto",
       "quickAuditLabel": "Audit",
+      "modeSaved": "Automatic supervision is now {{mode}}.",
+      "modeSaveFailed": "Automatic supervision could not be synchronized. Please retry.",
+      "brainOnly": "Only the Brain session can enable automatic supervision or automatic audit.",
       "quickTitle": "Auto mode"
     },
     "approval": {

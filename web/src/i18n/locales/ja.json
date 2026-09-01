@@ -810,6 +810,9 @@
       "invalidStoredConfig": "保存済みの監督設定が無効です。修正して保存するまで自動化は無効のままです。",
       "quickLabel": "自動",
       "quickAuditLabel": "監査",
+      "modeSaved": "自動監督を{{mode}}に切り替えました。",
+      "modeSaveFailed": "自動監督を同期できませんでした。もう一度お試しください。",
+      "brainOnly": "自動監督または自動監査を有効にできるのは Brain セッションだけです。",
       "quickTitle": "自動モード"
     },
     "approval": {

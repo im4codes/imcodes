@@ -532,6 +532,8 @@ export interface PersistedSupervisionAuditReceipt {
 export interface SupervisionTaskUpdateInput {
   taskId: string;
   status?: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus;
+  /** Internal Brain-authorized bind; an existing policy is immutable. */
+  auditPolicy?: SupervisionTaskAuditPolicy | null;
   /** Immutable Git base selected before an assignment worktree is delivered. */
   baseRevision?: string | null;
   currentRevision?: string | number | null;
@@ -1862,6 +1864,19 @@ export class SupervisionTaskRegistry {
     if (!isSupervisionTaskLifecycleStatus(nextStatus)) return { ok: false, reason: 'invalid' };
     if (!canTransitionSupervisionTaskStatus(existing.status, nextStatus)) return { ok: false, reason: 'invalid_transition' };
     const now = input.now ?? Date.now();
+    const requestedAuditPolicy = input.auditPolicy ?? undefined;
+    if (requestedAuditPolicy && !isSupervisionTaskAuditPolicy(requestedAuditPolicy)) {
+      return { ok: false, reason: 'invalid' };
+    }
+    if (requestedAuditPolicy && !isSupervisionTaskClassification(existing.classification)) {
+      return { ok: false, reason: 'invalid' };
+    }
+    if (requestedAuditPolicy && existing.classification === 'integration_slice') {
+      return { ok: false, reason: 'role_forbidden' };
+    }
+    if (requestedAuditPolicy && existing.auditPolicy && existing.auditPolicy !== requestedAuditPolicy) {
+      return { ok: false, reason: 'conflicting_replay' };
+    }
     const requestedBaseRevision = normalizeTaskString(input.baseRevision);
     if (requestedBaseRevision && existing.baseRevision && requestedBaseRevision !== existing.baseRevision) {
       return { ok: false, reason: 'conflicting_replay' };
@@ -1869,6 +1884,7 @@ export class SupervisionTaskRegistry {
     const record: PersistedSupervisionTaskRecord = {
       ...existing,
       status: nextStatus,
+      ...(requestedAuditPolicy ? { auditPolicy: requestedAuditPolicy } : {}),
       ...(requestedBaseRevision ? { baseRevision: requestedBaseRevision } : {}),
       ...(normalizeTaskString(input.currentRevision) ? { currentRevision: normalizeTaskString(input.currentRevision) } : {}),
       ...(normalizeTaskString(input.commitSha) ? { commitSha: normalizeTaskString(input.commitSha) } : {}),

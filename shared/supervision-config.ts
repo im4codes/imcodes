@@ -215,6 +215,14 @@ export const SUPERVISION_MODE = {
   SUPERVISED_AUDIT: 'supervised_audit',
 } as const;
 
+/** Daemon-authored status emitted after the audit-enabled snapshot is applied. */
+export const SUPERVISION_AUDIT_ENABLED_STATUS = 'supervision_audit_enabled' as const;
+export const SUPERVISION_AUTOMATION_OWNER_ROLE = 'brain' as const;
+
+export function canSessionRoleOwnAutomaticSupervision(role: unknown): boolean {
+  return role === SUPERVISION_AUTOMATION_OWNER_ROLE;
+}
+
 export const SUPERVISION_TRANSPORT_CONFIG_KEY = 'supervision' as const;
 export const SUPERVISION_USER_DEFAULT_PREF_KEY = 'supervision.user_default' as const;
 
@@ -624,6 +632,13 @@ export interface SupervisionTaskMetadata {
   currentRevision?: string | null;
   auditAttemptId?: string | null;
   auditRevision?: string | number | null;
+  /**
+   * Explicit Brain-owned automatic-audit intent for this task. When omitted,
+   * new tasks continue to snapshot the caller session's supervision mode.
+   * Existing tasks may only bind a previously-missing policy through the
+   * exact same-project Brain continuation path.
+   */
+  auditPolicy?: SupervisionTaskAuditPolicy | null;
   executionPool?: SupervisionExecutionPoolKind | null;
   /** Explicit Brain request to reuse/provision from the configured pool. */
   autoProvision?: boolean | null;

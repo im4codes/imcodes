@@ -296,7 +296,9 @@ import { detectRepo, parseRemotes } from '../repo/detector.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import {
   SUPERVISION_MODE,
+  canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
   isAutomaticSupervisionEnabled,
   isSupportedSupervisionTargetSessionType,
   normalizeSupervisionUiLocale,
@@ -892,6 +894,16 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
     return;
   }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    logger.warn({ sessionName }, 'session.update_transport_config: invalid supervision snapshot — ignoring');
+    return;
+  }
+  const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
+  if (isAutomaticSupervisionEnabled(nextSupervision)
+    && !canSessionRoleOwnAutomaticSupervision(record.role)) {
+    logger.warn({ sessionName, role: record.role }, 'session.update_transport_config: automatic supervision requires Brain session — ignoring');
+    return;
+  }
   const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
@@ -902,7 +914,7 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
   // The server persist callback is a no-op when not yet wired; the next `persistSessionToWorker`
   // loop in lifecycle will retry from the local store.
   persistSessionRecord(nextRecord, sessionName);
-  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  supervisionAutomation.applySnapshotUpdate(sessionName, nextSupervision);
   invalidateTransportListModelsCache('session_transport_config_update');
   await handleGetSessions(serverLink);
 }
@@ -923,6 +935,15 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
     return;
   }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: invalid supervision snapshot — ignoring');
+    return;
+  }
+  const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
+  if (isAutomaticSupervisionEnabled(nextSupervision)) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: automatic supervision requires Brain session — ignoring');
+    return;
+  }
   const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
@@ -930,7 +951,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   };
   upsertSession(nextRecord);
   persistSessionRecord(nextRecord, sessionName);
-  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  supervisionAutomation.applySnapshotUpdate(sessionName, nextSupervision);
   invalidateTransportListModelsCache('subsession_transport_config_update');
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
@@ -3944,6 +3965,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     ? { ...persistedSupervisionSnapshot, uiLocale: requestedUiLocale }
     : persistedSupervisionSnapshot;
   const shouldTrackSupervisionTaskRun = isAutomaticSupervisionEnabled(supervisionSnapshot)
+    && canSessionRoleOwnAutomaticSupervision(record?.role)
     && isEligibleSupervisionTaskText(displayText);
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,

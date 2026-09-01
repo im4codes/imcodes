@@ -159,6 +159,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickAuditLabel') return 'Audit';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
+      if (key === 'session.supervision.modeSaved') return `Automatic supervision is now ${String(opts?.mode ?? '')}.`;
+      if (key === 'session.supervision.modeSaveFailed') return 'Automatic supervision could not be synchronized. Please retry.';
       if (key === 'session.approval.pending') return 'Approval required';
       if (key === 'session.approval.allow') return 'Allow';
       if (key === 'session.approval.deny') return 'Deny';
@@ -562,7 +564,7 @@ afterEach(() => {
     getUserPrefMock.mockResolvedValue(null);
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
     patchSessionMock.mockResolvedValue(undefined);
-    patchSessionSupervisionMock.mockResolvedValue(null);
+    patchSessionSupervisionMock.mockImplementation(async (_serverId: unknown, _sessionName: unknown, supervision: unknown) => ({ supervision }));
     patchSubSessionMock.mockResolvedValue(undefined);
     sendSessionViaHttpMock.mockReset().mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
@@ -5761,6 +5763,7 @@ afterEach(() => {
         serverId="srv1"
         activeSession={makeTransportSession({
           name: 'codex-sdk-session',
+          role: 'brain',
           state: 'idle',
         })}
         onSettings={vi.fn()}
@@ -5779,14 +5782,10 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
 
     await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised',
-            backend: 'codex-sdk',
-            model: 'gpt-5.4',
-          }),
-        }),
+      expect(patchSessionSupervisionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
       }));
     });
     expect(onTransportConfigSaved).toHaveBeenCalledWith(expect.objectContaining({
@@ -5798,6 +5797,38 @@ afterEach(() => {
     expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);
     expect(autoBtn.textContent).toContain('supervised');
     expect(autoBtn.textContent).not.toContain('Auto');
+    expect(screen.getByTestId('supervision-mode-toast').textContent).toContain('Automatic supervision is now supervised.');
+  });
+
+  it('keeps the previous Auto mode and shows a specific synchronization error when saving fails', async () => {
+    const ws = makeWs();
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: 'gpt-5.4',
+      timeoutMs: 12000,
+      promptVersion: 'supervision_decision_v1',
+    });
+    patchSessionSupervisionMock.mockRejectedValueOnce(new Error('relay_failed'));
+    const onTransportConfigSaved = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'codex-sdk-session', role: 'brain', state: 'idle' })}
+        onSettings={vi.fn()}
+        onTransportConfigSaved={onTransportConfigSaved}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
+    fireEvent.click(autoBtn);
+    fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
+
+    await waitFor(() => expect(screen.getByText('Automatic supervision could not be synchronized. Please retry.')).toBeTruthy());
+    expect(autoBtn.classList.contains('shortcut-btn-auto-off')).toBe(true);
+    expect(onTransportConfigSaved).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('supervision-mode-toast')).toBeNull();
   });
 
   it('uses a distinct active visual mode for supervised audit', () => {
@@ -5869,6 +5900,26 @@ afterEach(() => {
     expect(peer.querySelector('.shortcut-btn-peer-audit-label')).not.toBeNull();
     expect(peer.querySelector('svg.shortcut-btn-peer-audit-icon')).not.toBeNull();
     expect(peer.parentElement?.classList.contains('shortcuts-model-supervision')).toBe(true);
+  });
+
+  it('keeps Quick Audit for a worker transport session but does not expose automatic mode', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_sub_worker',
+          role: 'w1',
+          parentSession: 'deck_proj_brain',
+          state: 'idle',
+          transportConfig: { supervision: { mode: 'off' } },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByTestId('peer-audit-icon')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^Auto$/ })).toBeNull();
   });
 
   it('quick audit reuses ordinary @agent orchestration without local state gating', () => {
@@ -6237,6 +6288,7 @@ afterEach(() => {
         serverId="srv1"
         activeSession={makeTransportSession({
           name: 'codex-sdk-session',
+          role: 'brain',
           state: 'idle',
           transportConfig: {
             supervision: {
@@ -6261,7 +6313,7 @@ afterEach(() => {
       supervisionMode: 'supervised_audit',
       focus: 'peer-audit-target',
     }));
-    expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
   });
 
   it('falls back to Settings when heavy mode snapshot is present but audit config is invalid', async () => {
@@ -6273,6 +6325,7 @@ afterEach(() => {
         serverId="srv1"
         activeSession={makeTransportSession({
           name: 'codex-sdk-session',
+          role: 'brain',
           state: 'idle',
           transportConfig: {
             supervision: {
@@ -6298,7 +6351,7 @@ afterEach(() => {
     await waitFor(() => {
       expect(onSettings).toHaveBeenCalled();
     });
-    expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
   });
 
   it('reuses a saved name-only auditor without local model or authority gating', async () => {
@@ -6330,17 +6383,10 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
-    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith(
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
       'srv1',
       'deck_proj_brain',
-      expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised_audit',
-            auditTargetSessionName: 'deck_sub_peer',
-          }),
-        }),
-      }),
+      expect.objectContaining({ mode: 'supervised_audit', auditTargetSessionName: 'deck_sub_peer' }),
     ));
     expect(onSettings).not.toHaveBeenCalled();
   });
@@ -6374,32 +6420,18 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /off$/i }));
-    await waitFor(() => expect(patchSessionMock).toHaveBeenLastCalledWith(
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenLastCalledWith(
       'srv1',
       'deck_proj_brain',
-      expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'off',
-            auditTargetSessionName: 'deck_sub_peer',
-          }),
-        }),
-      }),
+      expect.objectContaining({ mode: 'off', auditTargetSessionName: 'deck_sub_peer' }),
     ));
 
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
-    await waitFor(() => expect(patchSessionMock).toHaveBeenLastCalledWith(
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenLastCalledWith(
       'srv1',
       'deck_proj_brain',
-      expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised_audit',
-            auditTargetSessionName: 'deck_sub_peer',
-          }),
-        }),
-      }),
+      expect.objectContaining({ mode: 'supervised_audit', auditTargetSessionName: 'deck_sub_peer' }),
     ));
     expect(onSettings).not.toHaveBeenCalled();
   });
@@ -6453,14 +6485,10 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
-    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith(
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
       'srv1',
       'deck_proj_brain',
-      expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({ mode: 'supervised_audit' }),
-        }),
-      }),
+      expect.objectContaining({ mode: 'supervised_audit' }),
     ));
     expect(onSettings).not.toHaveBeenCalled();
   });
@@ -6472,6 +6500,7 @@ afterEach(() => {
         serverId="srv1"
         activeSession={makeTransportSession({
           name: 'codex-sdk-session',
+          role: 'brain',
           state: 'idle',
           transportConfig: {
             supervision: {
@@ -8547,7 +8576,7 @@ afterEach(() => {
     });
   });
 
-  it('lets a shared participant use models, Thinking, Quick Audit, Auto supervision, and Team', async () => {
+  it('lets a shared participant use models, Thinking, Quick Audit, and Team but not automatic supervision', async () => {
     const ws = makeWs();
     fetchSupervisorDefaultsMock.mockResolvedValue({
       backend: 'codex-sdk',
@@ -8628,15 +8657,8 @@ afterEach(() => {
     expect(screen.getByTestId('peer-audit-modal')).toBeDefined();
     fireEvent.click(screen.getByTestId('peer-audit-overlay'));
 
-    const autoButton = screen.getByRole('button', { name: /^Auto$/ }) as HTMLButtonElement;
-    expect(autoButton.disabled).toBe(false);
-    fireEvent.click(autoButton);
-    fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
-    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
-      'srv-shared',
-      'shared-copilot-session',
-      expect.objectContaining({ mode: 'supervised' }),
-    ));
+    expect(screen.queryByRole('button', { name: /^Auto$/ })).toBeNull();
+    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
     expect(patchSessionMock).not.toHaveBeenCalled();
     expect(patchSubSessionMock).not.toHaveBeenCalled();
 
@@ -8673,7 +8695,7 @@ afterEach(() => {
     }));
     expect((screen.getByRole('button', { name: /^medium$/i }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByTestId('peer-audit-icon') as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: /^Auto$/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: /^Auto$/ })).toBeNull();
     expect((screen.getByRole('button', { name: /^Team$/ }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: 'settings_button' }) as HTMLButtonElement).disabled).toBe(true);
     expect(document.querySelector('.menu-dropdown')).toBeFalsy();

@@ -1,4 +1,5 @@
 import {
+  SUPERVISION_AUDIT_ENABLED_STATUS,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
   normalizeSupervisionUiLocale,
@@ -29,6 +30,7 @@ type SupervisionDisplayCopy = {
 const COPY: Record<SupervisionUiLocale, SupervisionDisplayCopy> = {
   en: {
     status: {
+      [SUPERVISION_AUDIT_ENABLED_STATUS]: 'Supervised + audit is enabled.',
       supervision_waiting: 'Supervised: analyzing completion...', supervision_audit_waiting: 'Supervised: peer audit running; commit/push paused until the result.', supervision_complete: 'Supervised: task looks complete.', supervision_continue_sent: 'Supervised: sent a continue prompt.', supervision_post_audit_finalizing: 'Supervised: audit passed; running post-audit finalization.', supervision_needs_input: 'Supervised: returned control to you.', supervision_audit_pass: 'Supervised: audit passed.', supervision_rework: 'Supervised: audit requested rework; brief sent.', supervision_blocked: 'Supervised: stopped because the session is blocked.', supervision_parked: 'Supervised: parked until the pending reply arrives.',
     },
     note: {
@@ -37,6 +39,7 @@ const COPY: Record<SupervisionUiLocale, SupervisionDisplayCopy> = {
   },
   'zh-CN': {
     status: {
+      [SUPERVISION_AUDIT_ENABLED_STATUS]: '监督+审计已开启。',
       supervision_waiting: '监督：正在判断任务是否完成…', supervision_audit_waiting: '监督：同伴审计进行中；结果返回前暂停提交和推送。', supervision_complete: '监督：任务已完成。', supervision_continue_sent: '监督：已发送继续执行提示。', supervision_post_audit_finalizing: '监督：审计已通过，正在执行审计后收尾。', supervision_needs_input: '监督：已交还人工处理。', supervision_audit_pass: '监督：审计已通过。', supervision_rework: '监督：审计要求返工，已发送修复说明。', supervision_blocked: '监督：会话受阻，已停止。', supervision_parked: '监督：等待外部回执。',
     },
     note: {
@@ -45,6 +48,7 @@ const COPY: Record<SupervisionUiLocale, SupervisionDisplayCopy> = {
   },
   'zh-TW': {
     status: {
+      [SUPERVISION_AUDIT_ENABLED_STATUS]: '監督+稽核已開啟。',
       supervision_waiting: '監督：正在判斷任務是否完成…', supervision_audit_waiting: '監督：同伴審計進行中；結果回覆前暫停提交與推送。', supervision_complete: '監督：任務已完成。', supervision_continue_sent: '監督：已傳送繼續執行提示。', supervision_post_audit_finalizing: '監督：審計已通過，正在執行審計後收尾。', supervision_needs_input: '監督：已交還人工處理。', supervision_audit_pass: '監督：審計已通過。', supervision_rework: '監督：審計要求返工，已傳送修復說明。', supervision_blocked: '監督：工作階段受阻，已停止。', supervision_parked: '監督：等待外部回覆。',
     },
     note: {
@@ -53,6 +57,7 @@ const COPY: Record<SupervisionUiLocale, SupervisionDisplayCopy> = {
   },
   es: {
     status: {
+      [SUPERVISION_AUDIT_ENABLED_STATUS]: 'Supervisión + auditoría activadas.',
       supervision_waiting: 'Supervisión: comprobando si terminó…', supervision_audit_waiting: 'Supervisión: auditoría en curso; commit/push pausados.', supervision_complete: 'Supervisión: tarea completada.', supervision_continue_sent: 'Supervisión: continuación enviada.', supervision_post_audit_finalizing: 'Supervisión: auditoría aprobada; finalizando.', supervision_needs_input: 'Supervisión: control devuelto al usuario.', supervision_audit_pass: 'Supervisión: auditoría aprobada.', supervision_rework: 'Supervisión: se solicitó corrección.', supervision_blocked: 'Supervisión: sesión bloqueada.', supervision_parked: 'Supervisión: esperando respuesta externa.',
     },
     note: {
@@ -61,6 +66,7 @@ const COPY: Record<SupervisionUiLocale, SupervisionDisplayCopy> = {
   },
   ru: {
     status: {
+      [SUPERVISION_AUDIT_ENABLED_STATUS]: 'Надзор и аудит включены.',
       supervision_waiting: 'Надзор: проверка завершения…', supervision_audit_waiting: 'Надзор: аудит выполняется; commit/push приостановлены.', supervision_complete: 'Надзор: задача завершена.', supervision_continue_sent: 'Надзор: продолжение отправлено.', supervision_post_audit_finalizing: 'Надзор: аудит пройден; выполняется завершение.', supervision_needs_input: 'Надзор: управление возвращено пользователю.', supervision_audit_pass: 'Надзор: аудит пройден.', supervision_rework: 'Надзор: требуется доработка.', supervision_blocked: 'Надзор: сессия заблокирована.', supervision_parked: 'Надзор: ожидание внешнего ответа.',
     },
     note: {
@@ -69,6 +75,7 @@ const COPY: Record<SupervisionUiLocale, SupervisionDisplayCopy> = {
   },
   ja: {
     status: {
+      [SUPERVISION_AUDIT_ENABLED_STATUS]: '監督＋監査が有効です。',
       supervision_waiting: '監督：完了を確認中…', supervision_audit_waiting: '監督：監査中。結果まで commit/push を停止。', supervision_complete: '監督：タスク完了。', supervision_continue_sent: '監督：続行指示を送信。', supervision_post_audit_finalizing: '監督：監査 PASS。仕上げを実行中。', supervision_needs_input: '監督：ユーザーへ制御を返却。', supervision_audit_pass: '監督：監査 PASS。', supervision_rework: '監督：修正が必要。', supervision_blocked: '監督：セッションがブロック。', supervision_parked: '監督：外部返信を待機中。',
     },
     note: {
@@ -77,6 +84,7 @@ const COPY: Record<SupervisionUiLocale, SupervisionDisplayCopy> = {
   },
   ko: {
     status: {
+      [SUPERVISION_AUDIT_ENABLED_STATUS]: '감독+감사가 활성화되었습니다.',
       supervision_waiting: '감독: 완료 여부 확인 중…', supervision_audit_waiting: '감독: 감사 진행 중; 결과 전까지 commit/push 중지.', supervision_complete: '감독: 작업 완료.', supervision_continue_sent: '감독: 계속 지시 전송.', supervision_post_audit_finalizing: '감독: 감사 PASS; 마무리 진행 중.', supervision_needs_input: '감독: 사용자에게 제어 반환.', supervision_audit_pass: '감독: 감사 PASS.', supervision_rework: '감독: 수정 필요.', supervision_blocked: '감독: 세션 차단.', supervision_parked: '감독: 외부 회신 대기 중.',
     },
     note: {

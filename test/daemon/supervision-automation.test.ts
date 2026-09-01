@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {
   normalizeSessionSupervisionSnapshot,
+  SUPERVISION_AUDIT_ENABLED_STATUS,
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
@@ -2911,6 +2912,48 @@ describe('SupervisionAutomation', () => {
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
     expect(mockStartP2pRun).not.toHaveBeenCalled();
+  });
+
+  it('emits an authoritative daemon status when supervised audit is applied', async () => {
+    const snapshot = await seedSession('supervised_audit');
+
+    supervisionAutomation.init();
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', snapshot);
+
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: SUPERVISION_AUDIT_ENABLED_STATUS,
+          label: 'Supervised + audit is enabled.',
+        }),
+      }),
+    ]));
+  });
+
+  it('does not enable automatic supervision for a non-Brain session snapshot', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    const worker = getSession('deck_supervision_brain');
+    if (!worker) throw new Error('missing seeded session');
+    upsertSession({ ...worker, role: 'w1' });
+
+    supervisionAutomation.init();
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', snapshot);
+    const run = supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-worker-auto-denied',
+      'must remain manual',
+      snapshot,
+    );
+
+    expect(run).toBeNull();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({ status: SUPERVISION_AUDIT_ENABLED_STATUS }),
+      }),
+    ]));
   });
 
   it('picks up an in-flight task at idle when Auto is enabled after the user message was already sent', async () => {

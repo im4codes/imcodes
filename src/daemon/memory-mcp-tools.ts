@@ -96,9 +96,11 @@ import {
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
 import {
+  SUPERVISION_TASK_AUDIT_POLICIES,
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  isSupervisionTaskAuditPolicy,
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
 import {
@@ -570,7 +572,7 @@ function parseCloneArg(value: unknown): SendMessageCloneRequest | undefined | 'i
 const TASK_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set([
   'taskId', 'assignmentId', 'topLevelTaskId', 'sliceId', 'classification', 'objective', 'acceptance',
   'ownedFiles', 'sharedFiles', 'dependencies', 'integrationOwner', 'baseRevision',
-  'currentRevision', 'auditAttemptId', 'auditRevision', 'executionPool',
+  'currentRevision', 'auditAttemptId', 'auditRevision', 'auditPolicy', 'executionPool',
   'autoProvision', 'requestedExecutionType', 'economyPolicy',
 ]);
 
@@ -586,6 +588,7 @@ function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'in
   if (record.requestedExecutionType != null && !requestedExecutionType) return 'invalid';
   if (record.economyPolicy != null && !economyPolicy) return 'invalid';
   if (record.executionPool != null && record.executionPool !== 'primary' && record.executionPool !== 'economy') return 'invalid';
+  if (record.auditPolicy != null && !isSupervisionTaskAuditPolicy(record.auditPolicy)) return 'invalid';
   if (record.autoProvision !== undefined && record.autoProvision !== true) return 'invalid';
   return {
     taskId: stringField('taskId'),
@@ -603,6 +606,7 @@ function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'in
     currentRevision: stringField('currentRevision'),
     auditAttemptId: stringField('auditAttemptId'),
     auditRevision: stringField('auditRevision'),
+    auditPolicy: isSupervisionTaskAuditPolicy(record.auditPolicy) ? record.auditPolicy : undefined,
     executionPool: record.executionPool as 'primary' | 'economy' | undefined,
     autoProvision: record.autoProvision === true ? true : undefined,
     ...(requestedExecutionType ? { requestedExecutionType } : {}),
@@ -2139,6 +2143,7 @@ const schemas = {
       taskId: z.string().optional(), assignmentId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
       integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
+      auditPolicy: z.enum(SUPERVISION_TASK_AUDIT_POLICIES).optional(),
       executionPool: z.enum(['primary', 'economy']).optional(), autoProvision: z.literal(true).optional(),
       requestedExecutionType: z.object({
         capabilityId: z.string(),

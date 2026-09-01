@@ -810,6 +810,9 @@
       "invalidStoredConfig": "已儲存的監督設定無效。修復並儲存前，自動化會保持停用。",
       "quickLabel": "自動",
       "quickAuditLabel": "稽核",
+      "modeSaved": "自動監督已切換為{{mode}}。",
+      "modeSaveFailed": "自動監督同步失敗，請重試。",
+      "brainOnly": "只有 Brain 工作階段可以開啟自動監督或自動稽核。",
       "quickTitle": "自動模式"
     },
     "approval": {

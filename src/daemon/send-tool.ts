@@ -38,8 +38,10 @@ import {
   type AgentDelegationAuditRequest,
 } from '../../shared/agent-delegation.js';
 import {
+  SUPERVISION_MODE,
   SUPERVISION_CONTRACT_IDS,
   isAuditableSupervisionTaskClassification,
+  isSupervisionTaskAuditPolicy,
   readSupervisionSnapshotFromTransportConfig,
   supervisionTaskAuditPolicyFromSnapshot,
   type SupervisionTaskMetadata,
@@ -370,6 +372,8 @@ export interface SendToolDeps {
   exactTargetOnly?: boolean;
   /** Testable boundary for an already durably accepted supervised delivery. */
   hasDeliveryEvidence?: (sessionName: string, messageId: SendMessageId) => boolean;
+  /** Testable post-append recovery hook for an explicitly bound task policy. */
+  dispatchReadyAudit?: (taskId: string) => Promise<ReadyAuditDispatchResult>;
   /**
    * Whether the daemon currently advertises {@link EXECUTION_CLONE_CAPABILITY_V1}.
    * The clone send/destroy path is gated on this; defaults to `true` because the
@@ -836,6 +840,17 @@ function supervisionTaskIdentityForTarget(target: SessionRecord): PersistedSuper
   };
 }
 
+function supervisionIdentityMatches(
+  left: PersistedSupervisionTaskAssignmentIdentity,
+  right: PersistedSupervisionTaskAssignmentIdentity,
+): boolean {
+  return left.sessionName === right.sessionName
+    && left.sessionInstanceId === right.sessionInstanceId
+    && left.runtimeEpoch === right.runtimeEpoch
+    && left.agentType === right.agentType
+    && left.providerFamily === right.providerFamily;
+}
+
 export async function dispatchSendMessage(
   caller: SendRuntimeCaller,
   input: SendMessageInput,
@@ -1160,6 +1175,8 @@ export async function dispatchSendMessage(
   let supervisedWorktree: Extract<SupervisionWorktreeProvisionResult, { ok: true }> | undefined;
   let reusedContinuationAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
   let reusedAuditAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
+  let triggerReadyAuditAfterSend = false;
+  let pendingTaskAuditPolicy: NonNullable<SupervisionTaskMetadata['auditPolicy']> | undefined;
 
   if (input.task) {
     const targetRecord = dispatchable[0]!;
@@ -1170,9 +1187,10 @@ export async function dispatchSendMessage(
     // before touching the registry, claims, reply authority or transport.
     // Audit eligibility is an additional gate below, never a pool bypass.
     const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
+    const callerSupervisionSnapshot = readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig);
     const actual = supervisionObservedIdentityForTarget(targetRecord);
     const pool = input.task.executionPool ?? 'primary';
-    const pools = readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig).executionPools;
+    const pools = callerSupervisionSnapshot.executionPools;
     const checked = evaluateSupervisionExecutionBinding({
       pools,
       pool,
@@ -1230,6 +1248,63 @@ export async function dispatchSendMessage(
           reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
           error: 'integration_slice cannot register an audit; merge validated slices into one integration_task revision first',
         };
+      }
+      const explicitAuditPolicy = input.task.auditPolicy ?? undefined;
+      if (explicitAuditPolicy) {
+        if (input.audit) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: 'task auditPolicy must be bound by a task continuation before audit dispatch',
+          };
+        }
+        const callerIdentity = callerRecord && supervisionTaskIdentityForTarget(callerRecord);
+        const exactCoordinator = callerIdentity && existing.assignments.find((assignment) => (
+          assignment.role === 'coordinator'
+          && supervisionIdentityMatches(assignment.identity, callerIdentity)
+        ));
+        if (callerRecord?.role !== 'brain' || callerRecord.parentSession || !exactCoordinator) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+            error: 'task auditPolicy requires the exact authoritative project Brain coordinator',
+          };
+        }
+        if (callerSupervisionSnapshot.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: 'task auditPolicy requires supervised_audit mode on the authoritative project Brain',
+          };
+        }
+        if (!isAuditableSupervisionTaskClassification(existing.classification)) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: 'task auditPolicy requires an auditable task classification',
+          };
+        }
+        if (existing.auditPolicy && existing.auditPolicy !== explicitAuditPolicy) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: 'task auditPolicy conflicts with the immutable task policy',
+          };
+        }
+        const liveExactAuditors = existing.assignments.filter((assignment) => (
+          assignment.role === 'auditor'
+          && assignment.auditRevision === existing.currentRevision
+          && !['rework', 'cancelled', 'finalized'].includes(assignment.status)
+        ));
+        if (!existing.auditPolicy && liveExactAuditors.length > 0) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: 'task auditPolicy cannot be attached after an auditor exists for the exact revision',
+          };
+        }
+        if (!existing.auditPolicy) pendingTaskAuditPolicy = explicitAuditPolicy;
+        triggerReadyAuditAfterSend = existing.status === 'ready_for_audit';
       }
       if (input.audit) {
         const requestedAssignmentId = input.task.assignmentId?.trim();
@@ -1296,12 +1371,45 @@ export async function dispatchSendMessage(
           reusedContinuationAssignment = continuation;
         }
       }
+      if (pendingTaskAuditPolicy) {
+        const bound = registry.updateTask({ taskId: existing.taskId, auditPolicy: pendingTaskAuditPolicy, now });
+        if (!bound.ok) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: `task auditPolicy bind rejected: ${bound.reason}`,
+          };
+        }
+      }
       taskId = existing.taskId;
     } else {
       const classification = input.task.classification ?? 'integration_slice';
-      const taskAuditPolicy = isAuditableSupervisionTaskClassification(classification)
-        ? supervisionTaskAuditPolicyFromSnapshot(readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig))
-        : undefined;
+      const explicitAuditPolicy = input.task.auditPolicy ?? undefined;
+      if (explicitAuditPolicy && (!isSupervisionTaskAuditPolicy(explicitAuditPolicy)
+        || callerRecord?.role !== 'brain' || callerRecord.parentSession || !newTaskCoordinatorIdentity)) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+          error: 'task auditPolicy requires the exact authoritative project Brain coordinator',
+        };
+      }
+      if (explicitAuditPolicy && !isAuditableSupervisionTaskClassification(classification)) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: 'task auditPolicy requires an auditable task classification',
+        };
+      }
+      if (explicitAuditPolicy && callerSupervisionSnapshot.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: 'task auditPolicy requires supervised_audit mode on the authoritative project Brain',
+        };
+      }
+      const taskAuditPolicy = explicitAuditPolicy ?? (isAuditableSupervisionTaskClassification(classification)
+        ? supervisionTaskAuditPolicyFromSnapshot(callerSupervisionSnapshot)
+        : undefined);
       if (input.audit && !isAuditableSupervisionTaskClassification(classification)) {
         return {
           status: 'error',
@@ -1610,6 +1718,14 @@ export async function dispatchSendMessage(
     ...(failed > 0 ? { partial: true } : {}),
   };
   if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
+  if (triggerReadyAuditAfterSend && supervisedTaskId) {
+    try {
+      await (deps?.dispatchReadyAudit ?? dispatchReadyAudit)(supervisedTaskId);
+    } catch {
+      // The explicit policy bind is durable. The dispatcher owns its blocker
+      // report and the boot sweep retries a crash after this accepted append.
+    }
+  }
   return accepted;
 }
 

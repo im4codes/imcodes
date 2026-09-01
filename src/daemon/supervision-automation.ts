@@ -20,6 +20,7 @@ import {
 } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
+  SUPERVISION_AUDIT_ENABLED_STATUS,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
@@ -28,6 +29,7 @@ import {
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
+  canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
   isAutomaticSupervisionEnabled,
   normalizeSessionSupervisionSnapshot,
@@ -47,6 +49,7 @@ import {
   buildAuditTargetRecoveryPrompt,
   buildSupervisionWaitingHeartbeatPrompt,
 } from './supervision-prompts.js';
+
 import {
   getSupervisionStateStore,
   getSupervisionTaskRegistry,
@@ -87,6 +90,14 @@ import {
   localizeSupervisionAutomationNote,
   localizeSupervisionStatusLabel,
 } from './supervision-i18n.js';
+
+function isBrainOwnedAutomaticSupervision(
+  sessionName: string,
+  snapshot: SessionSupervisionSnapshot | null | undefined,
+): snapshot is SessionSupervisionSnapshot {
+  return canSessionRoleOwnAutomaticSupervision(getSession(sessionName)?.role)
+    && isAutomaticSupervisionEnabled(snapshot);
+}
 
 /**
  * Apply the daemon-cached global supervisor runtime to every session. Session
@@ -134,6 +145,7 @@ const SUPERVISION_REWORK_LABEL = 'Supervised: audit requested rework; brief sent
 const SUPERVISION_BLOCKED_LABEL = 'Supervised: stopped because the session is blocked.';
 const AUDIT_TARGET_RECOVERY_DELAY_MS = 1_500;
 const SUPERVISION_PARKED_LABEL = 'Supervised: parked until the pending reply arrives.';
+const SUPERVISION_AUDIT_ENABLED_LABEL = 'Supervised + audit is enabled.';
 /**
  * How long a parked run may sit before automation hands control back.
  *
@@ -1149,10 +1161,13 @@ class SupervisionAutomation {
         && Boolean(snapshot && snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
           && snapshot.auditTargetSessionName),
     );
-    if (!isAutomaticSupervisionEnabled(snapshot)) {
+    if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) {
       this.heartbeatPausedForNeedsInput.delete(sessionName);
       this.cancelSession(sessionName);
       return;
+    }
+    if (snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+      this.emitStatus(sessionName, SUPERVISION_AUDIT_ENABLED_STATUS, SUPERVISION_AUDIT_ENABLED_LABEL);
     }
     const active = this.activeRuns.get(sessionName);
     if (active) {
@@ -1441,7 +1456,7 @@ class SupervisionAutomation {
     sessionName: string,
     snapshot: SessionSupervisionSnapshot,
   ): boolean {
-    if (!isAutomaticSupervisionEnabled(snapshot)) return false;
+    if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) return false;
     const recovered = this.findRecoverableImplicitCompletion(sessionName);
     if (!recovered) return false;
     this.recentTaskCandidates.set(sessionName, recovered.candidate);
@@ -1511,7 +1526,7 @@ class SupervisionAutomation {
     sessionName: string,
     snapshot: SessionSupervisionSnapshot | null | undefined,
   ): void {
-    if (!isAutomaticSupervisionEnabled(snapshot)) return;
+    if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) return;
     const candidate = this.recentTaskCandidates.get(sessionName);
     if (!candidate) return;
     this.recentTaskCandidates.delete(sessionName);
@@ -1524,7 +1539,7 @@ class SupervisionAutomation {
     text: string,
     snapshot: SessionSupervisionSnapshot,
   ): void {
-    if (!isAutomaticSupervisionEnabled(snapshot)) return;
+    if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) return;
     this.cancelSession(sessionName);
     this.pendingTaskIntents.set(sessionName, { commandId, text, snapshot });
   }
@@ -1547,7 +1562,7 @@ class SupervisionAutomation {
     text: string,
     snapshot: SessionSupervisionSnapshot,
   ): ActiveTaskRunState | null {
-    if (!isAutomaticSupervisionEnabled(snapshot)) return null;
+    if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) return null;
     this.heartbeatPausedForNeedsInput.delete(sessionName);
     this.clearImplicitCompletionGrace(sessionName);
     this.recoverySuppressedUntilNextUser.delete(sessionName);
@@ -1693,7 +1708,7 @@ class SupervisionAutomation {
       const ownerRecord = getSession(persisted.owner.sessionName);
       const snapshot = normalizeSessionSupervisionSnapshot(persisted.snapshot);
       if (!persistedIdentityMatches(persisted.owner, ownerRecord)
-        || !isAutomaticSupervisionEnabled(snapshot)) {
+        || !isBrainOwnedAutomaticSupervision(persisted.owner.sessionName, snapshot)) {
         this.deletePersistedWaitState(persisted.owner.sessionName);
         continue;
       }

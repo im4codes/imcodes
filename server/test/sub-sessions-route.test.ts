@@ -306,7 +306,7 @@ describe('sub-session routes', () => {
     expect(updateSubSessionMock).not.toHaveBeenCalled();
   });
 
-  it('PATCH /sub-sessions/:id relays transport-config updates without a restart', async () => {
+  it('PATCH /sub-sessions/:id refuses automatic-supervision enablement', async () => {
     const { getSubSessionById } = await import('../src/db/queries.js');
     vi.mocked(getSubSessionById).mockResolvedValue({
       id: 'sub12345',
@@ -318,23 +318,24 @@ describe('sub-session routes', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        transportConfig: { supervision: { mode: 'supervised' } },
+        transportConfig: {
+          supervision: {
+            mode: 'supervised',
+            backend: 'codex-sdk',
+            model: 'gpt-5.6-sol',
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+            maxParseRetries: 1,
+            maxAutoContinueStreak: 2,
+            maxAutoContinueTotal: 0,
+          },
+        },
       }),
     });
 
-    expect(res.status).toBe(200);
-    expect(updateSubSessionMock).toHaveBeenCalledWith(
-      {},
-      'sub12345',
-      'srv1',
-      {
-        transport_config: { supervision: { mode: 'supervised' } },
-      },
-    );
-    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
-      type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
-      sessionName: 'deck_sub_sub12345',
-      transportConfig: { supervision: { mode: 'supervised' } },
-    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'forbidden', reason: 'brain_session_required' });
+    expect(updateSubSessionMock).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 });

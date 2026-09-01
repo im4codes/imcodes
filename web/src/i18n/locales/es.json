@@ -810,6 +810,9 @@
       "invalidStoredConfig": "La configuración guardada de supervisión no es válida. La automatización seguirá desactivada hasta que la repares y la guardes.",
       "quickLabel": "Auto",
       "quickAuditLabel": "Auditoría",
+      "modeSaved": "La supervisión automática ahora está en {{mode}}.",
+      "modeSaveFailed": "No se pudo sincronizar la supervisión automática. Inténtalo de nuevo.",
+      "brainOnly": "Solo la sesión Brain puede activar la supervisión o auditoría automáticas.",
       "quickTitle": "Modo automático"
     },
     "approval": {

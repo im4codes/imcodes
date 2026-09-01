@@ -4207,6 +4207,74 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('ignores automatic-supervision enablement for a non-Brain main session', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_worker',
+      projectName: 'transport',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: null,
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_transport_worker',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+        },
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSessionMock).not.toHaveBeenCalled();
+    expect(applySnapshotUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores automatic-supervision enablement for a sub-session', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_worker',
+      projectName: 'transport',
+      parentSession: 'deck_transport_brain',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: null,
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_sub_worker',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          auditTargetSessionName: 'deck_transport_auditor',
+        },
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSessionMock).not.toHaveBeenCalled();
+    expect(applySnapshotUpdateMock).not.toHaveBeenCalled();
+  });
+
   it('does not create a heavy-mode task run for slash commands', async () => {
     const transportSend = vi.fn(() => 'sent');
     getSessionMock.mockReturnValue({

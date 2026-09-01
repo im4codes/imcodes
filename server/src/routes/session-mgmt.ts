@@ -59,7 +59,9 @@ import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.j
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 import {
   buildTransportConfigWithSupervision,
+  canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
   normalizeSupervisorDefaultConfig,
   parseSupervisorDefaultConfig,
@@ -302,6 +304,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
 
   let row;
   let agentType: string;
+  let canOwnAutomaticSupervision = false;
   if (target.kind === 'subsession') {
     row = await getSubSessionById(c.env.DB, target.subSessionId, serverId);
     if (!row) return c.json({ error: 'not_found' }, 404);
@@ -310,6 +313,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     row = await getDbSessionByName(c.env.DB, serverId, target.sessionName);
     if (!row) return c.json({ error: 'not_found' }, 404);
     agentType = row.agent_type;
+    canOwnAutomaticSupervision = canSessionRoleOwnAutomaticSupervision(row.role);
   }
   if (!isSupportedSupervisionTargetSessionType(agentType)) {
     return c.json({ error: 'unsupported_session_type' }, 400);
@@ -320,6 +324,9 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   const nextSnapshot: SessionSupervisionSnapshot = existingSnapshot
     ? { ...existingSnapshot, mode: proposed.mode }
     : proposed;
+  if (nextSnapshot.mode !== SUPERVISION_MODE.OFF && !canOwnAutomaticSupervision) {
+    return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
+  }
   if (nextSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT && !nextSnapshot.auditTargetSessionName) {
     return c.json({ error: 'audit_target_required' }, 409);
   }
@@ -581,6 +588,17 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   if ('activeModel' in body) fields.active_model = body.activeModel ?? null;
   if ('effort' in body) fields.effort = body.effort ?? null;
   if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
+
+  if (hasInvalidSessionSupervisionSnapshot(body.transportConfig ?? null)) {
+    return c.json({ error: 'invalid_supervision_config' }, 400);
+  }
+  const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
+  if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
+    const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
+    if (!current || !canSessionRoleOwnAutomaticSupervision(current.role)) {
+      return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
+    }
+  }
 
   await updateSession(c.env.DB, serverId, sessionName, fields);
 

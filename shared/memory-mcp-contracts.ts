@@ -50,6 +50,7 @@ import {
   AGENT_DELEGATION_REPLY_RESULT_BYTES,
 } from './agent-delegation.js';
 import {
+  SUPERVISION_TASK_AUDIT_POLICIES,
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
 } from './supervision-config.js';
@@ -540,6 +541,11 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           currentRevision: stringSchema('Current revision.'),
           auditAttemptId: stringSchema('Matching audit attempt id.'),
           auditRevision: stringSchema('Matching audit revision.'),
+          auditPolicy: {
+            type: 'string',
+            enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+            description: 'Explicit Brain-owned automatic-audit policy. Omit to inherit the creating Brain session snapshot.',
+          },
           executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
           autoProvision: { type: 'boolean', description: 'When true, reuse or provision a pool-selected sub-session if target is omitted.' },
           requestedExecutionType: objectSchema({

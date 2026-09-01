@@ -14,6 +14,7 @@ import {
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
+import { SUPERVISION_TASK_AUDIT_POLICIES } from '../../shared/supervision-config.js';
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
@@ -891,6 +892,9 @@ describe('memory MCP tool schema firewall', () => {
       };
       expect(contractRequested.properties?.ccPresetId).toMatchObject({ type: 'string', minLength: 1 });
       expect(contractRequested.required).not.toContain('ccPresetId');
+      expect(contractTask.properties?.auditPolicy).toMatchObject({
+        type: 'string', enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+      });
 
       const advertised = (await client.listTools()).tools
         .find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
@@ -903,6 +907,9 @@ describe('memory MCP tool schema firewall', () => {
       };
       expect(advertisedRequested.properties?.ccPresetId).toMatchObject({ minLength: 1 });
       expect(advertisedRequested.required).not.toContain('ccPresetId');
+      expect(advertisedTask.properties?.auditPolicy).toMatchObject({
+        enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+      });
 
       const exact = await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
