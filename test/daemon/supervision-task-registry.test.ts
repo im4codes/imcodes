@@ -4364,7 +4364,7 @@ describe('SupervisionTaskRegistry', () => {
 
     expect(result).toMatchObject({
       delivered: [], queued: [],
-      errors: [expect.stringContaining('supervision binding does not match the live task, implementer, and target identity')],
+      errors: [expect.stringContaining('supervision binding does not match the live task, assignment, revision, and target identity')],
     });
     expect(ensure).not.toHaveBeenCalled();
     expect(dispatchMessage).not.toHaveBeenCalled();
@@ -4534,6 +4534,12 @@ describe('SupervisionTaskRegistry', () => {
       }),
     };
     const dispatchMessage = vi.fn(async () => undefined);
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: `/worktrees/${input.assignmentId}/repo`,
+      baseRevision: 'e'.repeat(40),
+      created: true,
+    }));
 
     const sent = await dispatchSendMessage(
       { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
@@ -4552,6 +4558,7 @@ describe('SupervisionTaskRegistry', () => {
         listSessions: () => sessions,
         dispatchMessage,
         exactTargetOnly: true,
+        ensureSupervisionAssignmentWorktree,
         provisionSupervisionTarget: async () => ({
           ok: true,
           target: reviewer,
@@ -4571,6 +4578,7 @@ describe('SupervisionTaskRegistry', () => {
       auditDegradedReason: 'cross_vendor_provision_failed',
       provisioning: { selectedPool: 'audit', failureReason: 'launch_failed' },
     });
+    expect(ensureSupervisionAssignmentWorktree).toHaveBeenCalledTimes(1);
     expect(dispatchMessage).toHaveBeenCalledWith(reviewer, expect.any(String), expect.any(Object));
     if (sent.status !== 'accepted' || !sent.assignmentId) throw new Error('expected degraded audit assignment');
     expect(getSupervisionTaskRegistry().getAssignment(sent.assignmentId)).toMatchObject({
