@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { registerMcpToolDiscovery } from '../../src/daemon/mcp-tool-discovery.js';
 
 function registeredTool(input: {
@@ -45,6 +46,45 @@ function harness(targets: RegisteredTool[]) {
 }
 
 describe('exact MCP discovery fallback', () => {
+  it('publishes only the bounded computer-use group for exact OCU aliases', async () => {
+    const names = [
+      MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+      'unrelated_hidden_tool',
+    ];
+    const targets = names.map((name) => registeredTool({
+      name,
+      handler: vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'ok' }] })),
+    }));
+    const { call, sendToolListChanged } = harness(targets);
+    const expected = names.slice(0, 4);
+
+    for (const query of ['ocu', 'Open Computer Use', 'computer-control', 'computer_use']) {
+      await expect(call({ query })).resolves.toMatchObject({
+        structuredContent: {
+          status: 'ok',
+          publishedGroups: ['file-transfer-computer-use'],
+          published: expected,
+          groups: [expect.objectContaining({
+            id: 'file-transfer-computer-use',
+            selector: 'group:file-transfer-computer-use',
+            tools: expected,
+            published: true,
+          })],
+        },
+      });
+      expect(targets.find((tool) => tool.name === 'unrelated_hidden_tool')?.enabled).toBe(false);
+    }
+    expect(sendToolListChanged).toHaveBeenCalledTimes(4);
+
+    await expect(call({ query: 'control the desktop please' })).resolves.toMatchObject({
+      structuredContent: { publishedGroups: [], published: [] },
+    });
+    expect(targets.every((tool) => tool.enabled === false)).toBe(true);
+  });
+
   it('uses the canonical target input/output schemas and passes the original authority context', async () => {
     const authority = { authInfo: { token: 'opaque-test-authority' }, requestId: 'request-1' };
     const handler = vi.fn(async (_args, extra) => extra === authority

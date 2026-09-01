@@ -22,6 +22,8 @@ export const MCP_TOOL_GROUP_QUERY_PREFIX = 'group:' as const;
 
 export interface McpToolGroupDefinition {
   id: string;
+  /** Exact user/model phrases that safely select this bounded group. */
+  aliases?: readonly string[];
   summary: string;
   tools: readonly string[];
 }
@@ -81,6 +83,12 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
   }),
   Object.freeze({
     id: 'file-transfer-computer-use',
+    aliases: Object.freeze([
+      'ocu',
+      'open computer use',
+      'computer use',
+      'computer control',
+    ]),
     summary: 'Transfer explicit files and inspect or operate authorized remote computer-use sessions.',
     tools: Object.freeze([
       MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE, MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,

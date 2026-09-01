@@ -98,6 +98,7 @@ export const MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS = [
   'notifications/tools/list_changed is invalidation only: a supporting host must force a complete paginated tools/list refetch on the same connection and atomically replace its callable catalog, including the current model turn.',
   'A fresh or resumed connection is callable-ready only after a validated complete tools/list generation; missing generation requires cold hydration before direct calls.',
   'If the exact selected tool is absent from the host schema, call mcp_tool_search again with that exact tool name and fallbackCall { name, arguments }; the wrapper invokes only that registered tool through its original validation and authority handler.',
+  'For OCU, Open Computer Use, computer use, or computer control requests, never infer unavailability from the initial callable list: search the exact alias ocu to publish the bounded file-transfer-computer-use group, then use computer_use_docs or computer_use_call; if either schema is still absent in the current turn, invoke that exact tool through mcp_tool_search fallbackCall.',
   'Unknown or unregistered names, caller-supplied schemas, wildcard/prefix fallback, and full long-tail publication must fail closed.',
 ].join(' ');
 

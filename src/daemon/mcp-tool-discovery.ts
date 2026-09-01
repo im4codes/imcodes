@@ -104,6 +104,10 @@ function matchScore(query: string, name: string, description: string): number {
   return matched.length === tokens.length ? 20 + matched.length : 0;
 }
 
+function normalizeGroupAlias(value: string): string {
+  return value.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
+}
+
 /**
  * Keep one tiny bootstrap surface visible while every registered tool remains
  * service-active. RegisteredTool.enabled is used only as this connection's
@@ -153,6 +157,12 @@ export function registerMcpToolDiscovery(
       };
       return { structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }], isError: true };
     }
+    const normalizedGroupAlias = normalizeGroupAlias(normalizedQuery);
+    const aliasedGroup = explicitGroupId === null
+      ? MCP_TOOL_GROUPS.find((group) => group.aliases?.some(
+          (alias) => normalizeGroupAlias(alias) === normalizedGroupAlias,
+        )) ?? null
+      : null;
 
     const candidates = tools.has(normalizedQuery)
       ? [[normalizedQuery, tools.get(normalizedQuery)!] as const]
@@ -172,18 +182,21 @@ export function registerMcpToolDiscovery(
         group,
         score: explicitGroupId === group.id
             ? 100
-            : matchScore(normalizedQuery, group.id, group.summary),
+            : group === aliasedGroup
+              ? 100
+              : matchScore(normalizedQuery, group.id, `${group.summary} ${(group.aliases ?? []).join(' ')}`),
       }))
       .filter((match) => match.score > 0)
       .sort((left, right) => right.score - left.score || left.group.id.localeCompare(right.group.id));
 
     const shouldPublish = activate !== false;
-    // Free-text discovery is preview-only. Schema publication is deliberately
-    // limited to one canonical exact tool or one explicit group selector; a
-    // phrase must never become an accidental wildcard over the long tail.
+    // Free-text discovery is preview-only except for an exact, predeclared
+    // group alias. Publication remains limited to one canonical exact tool or
+    // one bounded group; arbitrary phrases can never become a long-tail
+    // wildcard.
     const exactToolName = tools.has(normalizedQuery) ? normalizedQuery : null;
     const exactGroup = explicitGroupId === null
-      ? null
+      ? aliasedGroup
       : MCP_TOOL_GROUPS.find((group) => group.id === explicitGroupId) ?? null;
     const publishedNames = exactToolName
       ? [exactToolName]
@@ -253,6 +266,7 @@ export function registerMcpToolDiscovery(
         return {
           id: group.id,
           name: group.id,
+          selector: `${MCP_TOOL_GROUP_QUERY_PREFIX}${group.id}`,
           summary: group.summary,
           toolCount: registeredTools.length,
           tools: registeredTools,
