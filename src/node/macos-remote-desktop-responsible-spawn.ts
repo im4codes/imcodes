@@ -180,7 +180,11 @@ export function macosRemoteDesktopResponsibleCommandInvocation(
   appPath: string,
   args: readonly string[],
   output: Pick<CommandOutputPaths, 'stdout' | 'stderr'>,
-): Readonly<{ executable: typeof MACOS_LAUNCHCTL_PATH; args: readonly string[]; env: {} }> {
+): Readonly<{
+  executable: typeof MACOS_LAUNCHCTL_PATH;
+  args: readonly string[];
+  env: NodeJS.ProcessEnv;
+}> {
   return Object.freeze({
     executable: MACOS_LAUNCHCTL_PATH,
     args: Object.freeze(macosUserSessionLaunchctlArgs(user, {
