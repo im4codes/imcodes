@@ -61,6 +61,7 @@ import {
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import {
@@ -389,7 +390,11 @@ export class PiProvider implements TransportProvider {
   }
 
   private buildMemoryMcp(config: SessionConfig): PiSessionState['memoryMcp'] {
-    const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+    const server = getDefaultMcpServers(config, {
+      // Pi owns the complete paginated refresh + generation proof and can
+      // therefore consume standard tools/list_changed without stale schemas.
+      toolCatalogMode: MCP_TOOL_CATALOG_MODES.DYNAMIC,
+    })[IMCODES_MEMORY_MCP_SERVER_NAME];
     return server ? { command: server.command, args: server.args, env: server.env } : undefined;
   }
 

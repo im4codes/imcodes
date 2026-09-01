@@ -9,8 +9,13 @@ import {
   IMCODES_DAEMON_PROVIDER_ID_ENV,
   IMCODES_DAEMON_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
+  IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
 } from '../../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import {
+  MCP_TOOL_CATALOG_MODES,
+  type McpToolCatalogMode,
+} from '../../../shared/mcp-tool-discovery.js';
 import {
   LEGACY_DAEMON_LOCAL_USER_ID,
   normalizeDaemonLocalMemoryNamespace,
@@ -28,6 +33,15 @@ export interface DefaultMcpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+}
+
+export interface DefaultMcpServerOptions {
+  /**
+   * Managed providers default to a complete initial standard tools/list. A
+   * provider may opt into dynamic publication only when its client owns a
+   * proven tools/list_changed -> complete paginated tools/list refresh loop.
+   */
+  toolCatalogMode?: McpToolCatalogMode;
 }
 
 export interface AcpMcpServerConfig {
@@ -79,19 +93,29 @@ function buildIdentityEnv(config: SessionConfig): Record<string, string> {
   });
 }
 
-export function getDefaultMcpServers(config: SessionConfig): Record<string, DefaultMcpServerConfig> {
+export function getDefaultMcpServers(
+  config: SessionConfig,
+  options: DefaultMcpServerOptions = {},
+): Record<string, DefaultMcpServerConfig> {
+  const toolCatalogMode = options.toolCatalogMode ?? MCP_TOOL_CATALOG_MODES.STATIC_FULL;
   return {
     [IMCODES_MEMORY_MCP_SERVER_NAME]: {
       type: 'stdio',
       command: IMCODES_MEMORY_MCP_COMMAND,
       args: [...IMCODES_MEMORY_MCP_ARGS],
-      env: buildIdentityEnv(config),
+      env: {
+        ...buildIdentityEnv(config),
+        [IMCODES_MCP_TOOL_CATALOG_MODE_ENV]: toolCatalogMode,
+      },
     },
   };
 }
 
-export function getDefaultAcpMcpServers(config: SessionConfig): AcpMcpServerConfig[] {
-  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+export function getDefaultAcpMcpServers(
+  config: SessionConfig,
+  options: DefaultMcpServerOptions = {},
+): AcpMcpServerConfig[] {
+  const server = getDefaultMcpServers(config, options)[IMCODES_MEMORY_MCP_SERVER_NAME];
   return [{
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
     command: server.command,

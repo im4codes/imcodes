@@ -14,6 +14,7 @@ import {
   IMCODES_DAEMON_SERVER_ID_ENV,
   IMCODES_DAEMON_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
+  IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
   isMemoryMcpAllowedEnvKey,
 } from '../../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
@@ -26,6 +27,7 @@ import {
   getDefaultAcpMcpServers,
   getDefaultMcpServers,
 } from '../../../src/agent/providers/getDefaultMcpServers.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
 
 const sessionConfig = {
   sessionKey: 'route-1',
@@ -94,9 +96,18 @@ describe('managed provider MCP registration helpers', () => {
     expect(server.env[IMCODES_DAEMON_PROJECT_ROOT_ENV]).toBe('/tmp/project');
     expect(server.env[IMCODES_DAEMON_SERVER_ID_ENV]).toBe('srv-bound');
     expect(server.env[IMCODES_DAEMON_PROVIDER_ID_ENV]).toBe('codex-sdk');
+    expect(server.env[IMCODES_MCP_TOOL_CATALOG_MODE_ENV]).toBe(MCP_TOOL_CATALOG_MODES.STATIC_FULL);
     expect(server.env.IMCODES_SERVER_TOKEN).toBeUndefined();
     expect(server.env.OAUTH_TOKEN).toBeUndefined();
     expect(Object.keys(server.env).every(isMemoryMcpAllowedEnvKey)).toBe(true);
+  });
+
+  it('requires an explicit proven client opt-in before using dynamic publication', () => {
+    const server = getDefaultMcpServers(sessionConfig, {
+      toolCatalogMode: MCP_TOOL_CATALOG_MODES.DYNAMIC,
+    })[IMCODES_MEMORY_MCP_SERVER_NAME];
+
+    expect(server.env[IMCODES_MCP_TOOL_CATALOG_MODE_ENV]).toBe(MCP_TOOL_CATALOG_MODES.DYNAMIC);
   });
 
   it('fills daemon-local identity for local personal namespaces without user ids', () => {
@@ -146,6 +157,10 @@ describe('managed provider MCP registration helpers', () => {
     expect(server.command).toBe('imcodes');
     expect(server.args).toEqual(['memory', 'mcp']);
     expect(server.env).toContainEqual({ name: IMCODES_DAEMON_USER_ID_ENV, value: 'user-secret-ish' });
+    expect(server.env).toContainEqual({
+      name: IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
+      value: MCP_TOOL_CATALOG_MODES.STATIC_FULL,
+    });
     expect(server.env.some((entry) => entry.name === 'IMCODES_SERVER_TOKEN')).toBe(false);
   });
 
