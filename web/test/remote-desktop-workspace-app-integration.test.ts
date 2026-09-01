@@ -19,4 +19,8 @@ describe('remote desktop workspace App integration', () => {
     expect(appSource).toMatch(/if \(auth\) return;[\s\S]*remoteDesktopConnectionManager\.stopAll\(REMOTE_DESKTOP_STOP_ORIGIN\.APP_SIGN_OUT\);[\s\S]*setRemoteDesktopWorkspace\(createRemoteDesktopWorkspaceState\(\)\);/);
     expect(appSource).toContain('removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);');
   });
+
+  it('lets native foreground recovery revive only manager-owned exhausted connections', () => {
+    expect(appSource).toMatch(/installNativeAppResumeRefresh\(true, \(force\) => \{[\s\S]*ws\.resumeConnection\(force\);[\s\S]*remoteDesktopConnectionManager\.resumeExhaustedConnections\(\);[\s\S]*\}, App\)/);
+  });
 });

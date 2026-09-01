@@ -4545,7 +4545,10 @@ export function App() {
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
       void import('@capacitor/app')
-        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.resumeConnection(force), App))
+        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => {
+          ws.resumeConnection(force);
+          remoteDesktopConnectionManager.resumeExhaustedConnections();
+        }, App))
         .then((cleanup) => {
           removeAppStateListener = cleanup;
         })
@@ -4573,7 +4576,7 @@ export function App() {
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
-  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending, requestP2pStatusWithCachedRunConfirmation]);
+  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending, requestP2pStatusWithCachedRunConfirmation, remoteDesktopConnectionManager]);
 
   // Subscribe to terminal streams for process-backed sessions when connected.
   // Transport/SDK sessions have no PTY stream; their timeline updates are

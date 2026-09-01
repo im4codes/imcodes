@@ -733,6 +733,10 @@ describe('WsBridge', () => {
       } as unknown as import('../src/db/client.js').Database;
 
       const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      await flushAsync();
+      browserWs.sent = [];
       const ws = new MockWs();
       bridge.handleDaemonConnection(ws as never, db, {} as never);
 
@@ -763,6 +767,11 @@ describe('WsBridge', () => {
 
       expect(bridge.isAuthenticated).toBe(true);
       expect(ws.closed).toBe(false);
+      const browserTypes = browserWs.sentStrings.map((raw) => JSON.parse(raw).type as string);
+      const reconnectedIndex = browserTypes.indexOf(DAEMON_MSG.RECONNECTED);
+      const helloIndex = browserTypes.indexOf(P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(reconnectedIndex).toBeGreaterThanOrEqual(0);
+      expect(helloIndex).toBeGreaterThan(reconnectedIndex);
     });
 
     it('sends daemon.upgrade when daemon is older than server version', async () => {

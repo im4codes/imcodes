@@ -175,6 +175,21 @@ export class RemoteDesktopConnectionManager {
     for (const hostKey of [...this.entries.keys()]) this.stop(hostKey, origin);
   }
 
+  /**
+   * A native foreground transition is an explicit opportunity to recover an
+   * exhausted transient outage. It never replaces a live or still-budgeted
+   * connection, so repeated resume events cannot duplicate an active route.
+   */
+  resumeExhaustedConnections(): void {
+    for (const entry of this.entries.values()) {
+      if (entry.stopped
+        || entry.reconnectTimer
+        || entry.reconnectCount < REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS
+        || !this.isReconnectableFailure(entry.snapshot)) continue;
+      this.retry(entry);
+    }
+  }
+
   private createEntry(hostKey: string, serverId: string): ManagedEntry {
     const entry = {
       hostKey,
@@ -201,6 +216,7 @@ export class RemoteDesktopConnectionManager {
   private newClient(entry: ManagedEntry, generation: number): RemoteDesktopConnectionClient {
     return this.createClient(entry.serverId, {
       onSnapshot: (snapshot) => this.receiveSnapshot(entry, generation, snapshot),
+      onDaemonReconnected: () => this.receiveDaemonReconnected(entry, generation),
     });
   }
 
@@ -312,9 +328,7 @@ export class RemoteDesktopConnectionManager {
       }, REMOTE_DESKTOP_LIMITS.RECONNECT_STABILITY_RESET_MS);
     }
 
-    const reason = next.terminalReason ?? next.error;
-    const reconnectable = next.state === REMOTE_DESKTOP_STATE.FAILED
-      && Boolean(reason && RECONNECTABLE_FAILURES.has(reason));
+    const reconnectable = this.isReconnectableFailure(next);
     if (reconnectable && entry.reconnectTimer) return;
     if (reconnectable && entry.reconnectCount < REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS) {
       entry.reconnectCount += 1;
@@ -332,6 +346,32 @@ export class RemoteDesktopConnectionManager {
       return;
     }
     this.publish(entry, { ...next, reconnectCount: entry.reconnectCount });
+  }
+
+  private receiveDaemonReconnected(entry: ManagedEntry, generation: number): void {
+    if (entry.stopped || generation !== entry.clientGeneration) return;
+    // The signaling socket is attached to this exact server bridge, so its
+    // RECONNECTED broadcast is authoritative for this host. A connected route
+    // may be undergoing the server's shielded in-place renegotiation and must
+    // not be duplicated. Only an already-failed or backoff-waiting client is
+    // replaced; otherwise this event merely starts a fresh outage budget.
+    if (entry.reconnectTimer || this.isReconnectableFailure(entry.snapshot)) {
+      this.retry(entry);
+      return;
+    }
+    if (entry.reconnectCount === 0) return;
+    if (entry.reconnectStabilityTimer) {
+      clearTimeout(entry.reconnectStabilityTimer);
+      entry.reconnectStabilityTimer = null;
+    }
+    entry.reconnectCount = 0;
+    this.publish(entry, { ...entry.snapshot, reconnectCount: 0 });
+  }
+
+  private isReconnectableFailure(snapshot: RemoteDesktopSnapshot): boolean {
+    const reason = snapshot.terminalReason ?? snapshot.error;
+    return snapshot.state === REMOTE_DESKTOP_STATE.FAILED
+      && Boolean(reason && RECONNECTABLE_FAILURES.has(reason));
   }
 
   private retry(entry: ManagedEntry): void {

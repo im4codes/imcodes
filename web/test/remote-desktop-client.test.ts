@@ -15,6 +15,7 @@ import {
   REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '@shared/remote-desktop.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import {
   applyH264ReceiveCodecPreference,
   RemoteDesktopClient,
@@ -178,6 +179,31 @@ beforeEach(() => {
 });
 
 describe('RemoteDesktopClient', () => {
+  it('reports the exact signaling bridge daemon lifecycle without treating it as remote-desktop data', async () => {
+    let socket!: FakeSocket;
+    const onDaemonReconnected = vi.fn();
+    const onSnapshot = vi.fn();
+    const client = new RemoteDesktopClient('sticky-server', {
+      onSnapshot,
+      onDaemonReconnected,
+    }, {
+      fetchTicket: async () => 'ticket-1',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+    });
+    await client.start();
+    const snapshotsBefore = onSnapshot.mock.calls.length;
+
+    socket.receive({ type: DAEMON_MSG.RECONNECTED });
+
+    expect(onDaemonReconnected).toHaveBeenCalledOnce();
+    expect(onSnapshot).toHaveBeenCalledTimes(snapshotsBefore);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
   it('keeps guest bootstrap proof out of the URL and waits for redemption before START', async () => {
     let socket!: FakeSocket;
     let socketUrl = '';

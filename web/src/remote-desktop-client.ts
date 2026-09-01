@@ -33,6 +33,7 @@ import {
   type RemoteDesktopState,
   type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { PendingWebRtcCandidates, toWebRtcIceServers } from '@shared/webrtc-connectivity.js';
 import type { RemoteDesktopBootstrapProof } from '@shared/remote-desktop-access.js';
 import { apiFetch, getApiBaseUrl } from './api.js';
@@ -132,6 +133,8 @@ export interface RemoteDesktopSnapshot {
 
 export interface RemoteDesktopClientHooks {
   onSnapshot(snapshot: RemoteDesktopSnapshot): void;
+  /** The exact signaling bridge observed an authenticated replacement daemon. */
+  onDaemonReconnected?(): void;
 }
 
 export interface RemoteDesktopClientDependencies {
@@ -261,6 +264,7 @@ class RemoteDesktopSignalingSocket {
     serverId: string,
     onMessage: (value: unknown) => void,
     onClose: () => void,
+    onDaemonReconnected?: () => void,
   ): Promise<void> {
     const abort = new AbortController();
     this.ticketAbort = abort;
@@ -345,7 +349,15 @@ class RemoteDesktopSignalingSocket {
     });
     socket.addEventListener('message', (event) => {
       if (this.socket !== socket || typeof event.data !== 'string') return;
-      try { onMessage(JSON.parse(event.data)); } catch { /* strict parser below */ }
+      try {
+        const value = JSON.parse(event.data) as unknown;
+        if (value && typeof value === 'object' && !Array.isArray(value)
+          && (value as { type?: unknown }).type === DAEMON_MSG.RECONNECTED) {
+          onDaemonReconnected?.();
+          return;
+        }
+        onMessage(value);
+      } catch { /* strict parser below */ }
     });
     socket.addEventListener('close', () => {
       if (this.socket !== socket) return;
@@ -477,6 +489,7 @@ export class RemoteDesktopClient {
         });
       },
       () => this.fail(REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED),
+      this.hooks.onDaemonReconnected,
     );
     const requestId = randomRequestId();
     this.requestId = requestId;

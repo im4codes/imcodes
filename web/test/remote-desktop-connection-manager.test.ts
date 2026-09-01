@@ -5,6 +5,7 @@ import {
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_STOP_ORIGIN,
+  REMOTE_DESKTOP_TERMINAL_REASON,
   type RemoteDesktopAccessMode,
   type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
@@ -49,6 +50,7 @@ class FakeConnectionClient {
     this.value = snapshot({ ...this.value, ...patch });
     this.hooks.onSnapshot(this.value);
   }
+  daemonReconnected(): void { this.hooks.onDaemonReconnected?.(); }
   setMode(_mode: RemoteDesktopAccessMode): void {}
   selectDisplay(_displayId: string): boolean { return true; }
   setDisplayMode(_displayId: string, _width: number, _height: number): boolean { return true; }
@@ -235,6 +237,103 @@ describe('RemoteDesktopConnectionManager', () => {
     expect(observed.at(-1)?.state).toBe(REMOTE_DESKTOP_STATE.RECONNECTING);
     clients[2].emit({ state: REMOTE_DESKTOP_STATE.DIRECT });
     expect(observed.at(-1)?.state).toBe(REMOTE_DESKTOP_STATE.DIRECT);
+  });
+
+  it('starts a fresh bounded budget once when the exact signaling bridge reports a replacement daemon', async () => {
+    vi.useFakeTimers();
+    const { manager, clients } = setupManager();
+    const connection = manager.connection({ serverId: 'server-a' });
+    await connection.start();
+    const failed = {
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
+    } as const;
+
+    for (let attempt = 0; attempt < REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS; attempt++) {
+      clients.at(-1)!.emit(failed);
+      await vi.advanceTimersByTimeAsync(
+        REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS * (2 ** attempt),
+      );
+    }
+    clients.at(-1)!.emit(failed);
+    const exhaustedClient = clients.at(-1)!;
+    expect(connection.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      reconnectCount: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS,
+    });
+
+    exhaustedClient.daemonReconnected();
+
+    expect(clients).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 2);
+    expect(exhaustedClient.stopOrigins).toEqual([REMOTE_DESKTOP_STOP_ORIGIN.MANAGER_RECONNECT]);
+    expect(clients.at(-1)!.startAttempts).toEqual([1]);
+    expect(connection.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      reconnectCount: 0,
+    });
+
+    // A late duplicate from the replaced client is generation-stale. The
+    // current client's duplicate lifecycle frame is also a no-op while its
+    // fresh attempt is already running.
+    exhaustedClient.daemonReconnected();
+    clients.at(-1)!.daemonReconnected();
+    expect(clients).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 2);
+  });
+
+  it('preserves a live recovered route while resetting its old outage budget', async () => {
+    vi.useFakeTimers();
+    const { manager, clients } = setupManager();
+    const connection = manager.connection({ serverId: 'server-a' });
+    await connection.start();
+    clients[0].emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
+    });
+    await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS);
+    clients[1].emit({ state: REMOTE_DESKTOP_STATE.DIRECT, inputEnabled: true });
+    expect(connection.current().reconnectCount).toBe(1);
+
+    clients[1].daemonReconnected();
+
+    expect(clients).toHaveLength(2);
+    expect(clients[1].stopOrigins).toEqual([]);
+    expect(connection.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      reconnectCount: 0,
+    });
+  });
+
+  it('native resume revives only an exhausted reconnectable failure', async () => {
+    vi.useFakeTimers();
+    const { manager, clients } = setupManager();
+    const connection = manager.connection({ serverId: 'server-a' });
+    await connection.start();
+    for (let attempt = 0; attempt < REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS; attempt++) {
+      clients.at(-1)!.emit({
+        state: REMOTE_DESKTOP_STATE.FAILED,
+        terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+      });
+      await vi.advanceTimersByTimeAsync(
+        REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS * (2 ** attempt),
+      );
+    }
+    clients.at(-1)!.emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    });
+
+    manager.resumeExhaustedConnections();
+    manager.resumeExhaustedConnections();
+
+    expect(clients).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 2);
+    expect(clients.at(-1)!.startAttempts).toEqual([1]);
+
+    clients.at(-1)!.emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
+    });
+    manager.resumeExhaustedConnections();
+    expect(clients).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 2);
   });
 
   it('releases held input exactly before presentation ownership moves', () => {
