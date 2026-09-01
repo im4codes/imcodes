@@ -23,8 +23,11 @@ const SOURCE_PATHS = [
   'native/windows-remote-desktop/worker_policy.cc',
   'native/windows-remote-desktop/unlock_secret.cc',
   'native/windows-remote-desktop/worker_policy.h',
+  'native/windows-remote-desktop/windows_platform_adapters.cc',
   'native/windows-virtual-display/virtual_display_driver.cc',
   'native/windows-virtual-display/imcodes-virtual-display.inf',
+  'native/remote-desktop-common/quality_ladder.cc',
+  'native/remote-desktop-common/transport_session_core.cc',
   'src/node/remote-desktop-worker-host.ts',
   'src/node/remote-desktop-worker-host-core.ts',
   'src/node/self-upgrade.ts',
@@ -667,12 +670,12 @@ const contracts: Contract[] = [
         needle: 'if (winsock.error() != 0) return 14;',
       },
       {
-        path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'pending_remote_ice_.Push(mid, candidate)',
+        path: 'native/remote-desktop-common/transport_session_core.cc',
+        needle: 'pending_remote_ice_.push_back(std::move(candidate));',
       },
       {
-        path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'FlushPendingRemoteIce()',
+        path: 'native/remote-desktop-common/transport_session_core.cc',
+        needle: 'return FlushRemoteIce();',
       },
     ],
   },
@@ -697,7 +700,7 @@ const contracts: Contract[] = [
         minimum: 2,
       },
       {
-        path: 'native/windows-remote-desktop/quality_ladder.cc',
+        path: 'native/remote-desktop-common/quality_ladder.cc',
         needle: 'direct ? kInitialVideoBitrateBps : kInitialTransportBitrateBps',
       },
       {
@@ -748,7 +751,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'MediaProgressShouldFailover(',
+        needle: 'transport_core_.RecordMediaProgress(',
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
@@ -783,11 +786,11 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'if (source_ && release_source_) release_source_(source_->display());',
+        needle: 'source_.reset();',
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'if (previous_display && release_source_) release_source_(*previous_display);',
+        needle: 'previous_source.reset();',
       },
     ],
   },
@@ -867,8 +870,8 @@ const contracts: Contract[] = [
         needle: 'bool IsAllowedRemoteDisplayMode(int width, int height)',
       },
       {
-        path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'ChangeDisplaySettingsExW(found->device_name.c_str(), &mode, nullptr,',
+        path: 'native/windows-remote-desktop/windows_platform_adapters.cc',
+        needle: 'ChangeDisplaySettingsExW(display->device_name.c_str(), &mode, nullptr,',
         minimum: 2,
       },
       {
@@ -1427,8 +1430,8 @@ const mutations: Mutation[] = [
   {
     name: 'remove pre-SDP trickle ICE queueing',
     contract: 'Windows WebRTC socket and trickle ICE readiness',
-    path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'pending_remote_ice_.Push(mid, candidate)',
+    path: 'native/remote-desktop-common/transport_session_core.cc',
+    needle: 'pending_remote_ice_.push_back(std::move(candidate));',
   },
   {
     name: 'remove upstream desktop bitrate allocation',
@@ -1470,13 +1473,13 @@ const mutations: Mutation[] = [
     name: 'remove capture-source release on media teardown',
     contract: 'bounded native media teardown before reconnect',
     path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'if (source_ && release_source_) release_source_(source_->display());',
+    needle: 'source_.reset();',
   },
   {
     name: 'remove old capture-source release after successful replacement',
     contract: 'bounded native media teardown before reconnect',
     path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'if (previous_display && release_source_) release_source_(*previous_display);',
+    needle: 'previous_source.reset();',
   },
   {
     name: 'remove reviewed TURN conversion',

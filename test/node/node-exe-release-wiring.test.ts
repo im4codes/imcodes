@@ -123,6 +123,10 @@ describe('controlled-node executable release wiring', () => {
       'utf8',
     );
     const peerSession = readFileSync('native/windows-remote-desktop/peer_session.cc', 'utf8');
+    const windowsPlatformAdapters = readFileSync(
+      'native/windows-remote-desktop/windows_platform_adapters.cc',
+      'utf8',
+    );
     const virtualDisplayController = readFileSync(
       'native/windows-remote-desktop/virtual_display_controller.cc',
       'utf8',
@@ -130,14 +134,14 @@ describe('controlled-node executable release wiring', () => {
     expect(displayPreferences).toContain('schema != kPreferenceSchema');
     expect(displayPreferences).toContain('IsAllowedRemoteDisplayMode');
     expect(displayPreferences).toContain('IsAllowedRemoteDisplayScale');
-    expect(peerSession).toContain('CDS_UPDATEREGISTRY');
-    expect(peerSession).toContain('SaveVirtualDisplayPreferences');
+    expect(windowsPlatformAdapters).toContain('CDS_UPDATEREGISTRY');
+    expect(windowsPlatformAdapters).toContain('SaveVirtualDisplayPreferences');
     const setDisplayMode = peerSession.slice(
       peerSession.indexOf('bool PeerSession::SetDisplayMode('),
       peerSession.indexOf('bool PeerSession::SetDisplayScale('),
     );
     expect(setDisplayMode).not.toContain('SetDisplayDpiScale(');
-    expect(setDisplayMode).toContain('SaveVirtualDisplayPreferences');
+    expect(setDisplayMode).toContain('display_adapter_->SetMode(');
     expect(virtualDisplayController).toContain('LoadVirtualDisplayPreferences');
     expect(sdkConsumer.indexOf('$TestSdk,'))
       .toBeLessThan(sdkConsumer.lastIndexOf('$ProductionSdk,'));

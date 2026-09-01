@@ -90,7 +90,7 @@ describe('macOS remote-desktop production media composition', () => {
     expect(worker).toContain('macos::VideoToolboxH264Encoder encoder;');
     expect(worker).toContain('encoder.ProbeReadiness() == rd::common::ReadinessState::kReady');
     expect(worker).toContain('macos::NSPasteboardClipboardAdapter clipboard(');
-    expect(worker).toContain('clipboard.ProbeReadiness() == rd::common::ReadinessState::kReady');
+    expect(worker).toContain('clipboard.ProbeCapability() == rd::common::ReadinessState::kReady');
     expect(worker).not.toMatch(/out->encoder\s*=\s*true/);
     expect(worker).not.toMatch(/out->clipboard\s*=\s*true/);
     // Cleanup claims are tied to the executable seam actually being derivable.
