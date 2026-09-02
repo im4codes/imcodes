@@ -78,6 +78,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     recover: (input) => {
       return getSupervisionTaskRegistry().recoverTask(input);
     },
+    cancelStaleAuditorAsProjectBrain: (input) => getSupervisionTaskRegistry().cancelStaleAuditorAsProjectBrain(input),
     rebindAuditAssignment: (input) => getSupervisionTaskRegistry().rebindAuditAssignment(input),
     rebindTaskAssignmentRevision: (input) => {
       const registry = getSupervisionTaskRegistry();

@@ -539,6 +539,259 @@ describe('Hook server /send endpoint', () => {
   // ── Successful delivery ──────────────────────────────────────────────────
 
   describe('Successful delivery', () => {
+    /**
+     * Builds the exact-auditor production shape: a task whose revision is owned
+     * by an implementer, an auditor bound to that revision by an exact attempt,
+     * and three sibling implementer assignments on OTHER tasks that share the
+     * same target session and have no worktree on disk. Those siblings are what
+     * made the compatibility scan report an ambiguity for the whole target.
+     */
+    function setupExactAuditorScenario(opts: { role?: string; status?: string } = {}) {
+
+      // DEADLOCK A. An auditor identified by exact task+assignment+attempt+
+      // revision+identity could not be continued once it left `delegated`:
+      // the explicit binding was judged non-matching, the caller fell into the
+      // compatibility scan, and unrelated sibling assignments with missing
+      // worktrees made that scan report
+      // "ambiguous missing assignment worktrees for target (N)".
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-exact-auditor-'));
+      const source = join(temp, 'source');
+      const worktrees = join(temp, 'worktrees');
+      mkdirSync(source, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: source });
+      writeFileSync(join(source, 'fixture.txt'), 'base\n');
+      execFileSync('git', ['add', 'fixture.txt'], { cwd: source });
+      execFileSync('git', ['-c', 'user.name=IM.codes Test', '-c', 'user.email=test@im.codes', 'commit', '-qm', 'base'], { cwd: source });
+      const baseRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
+      const priorRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = worktrees;
+
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code', projectDir: source,
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const auditorSession = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Auditor', agentType: 'codex', projectDir: source,
+        sessionInstanceId: 'auditor-instance', runtimeEpoch: 'auditor-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === auditorSession.name ? auditorSession : null);
+      listSessionsMock.mockReturnValue([brain, auditorSession]);
+
+      const taskId = 'exact-auditor-task';
+      const auditorId = 'exact-auditor-assignment';
+      const revision = 'candidate-cc8-r1-abcdef01';
+      const attemptId = 'attempt-exact-1';
+      const registry = getSupervisionTaskRegistry();
+      const auditorIdentity = {
+        sessionName: auditorSession.name,
+        sessionInstanceId: auditorSession.sessionInstanceId,
+        runtimeEpoch: auditorSession.runtimeEpoch,
+        agentType: auditorSession.agentType,
+        providerFamily: 'openai',
+      };
+      expect(registry.createOrGet({
+        taskId, projectName: 'proj', classification: 'independent_top_level', objective: 'exact auditor continuation', baseRevision,
+      }).ok).toBe(true);
+      // The implementer owns the task revision; the auditor is bound to it.
+      const implId = `${taskId}-impl`;
+      const implIdentity = {
+        sessionName: brain.name,
+        sessionInstanceId: brain.sessionInstanceId,
+        runtimeEpoch: brain.runtimeEpoch,
+        agentType: brain.agentType,
+        providerFamily: 'anthropic',
+      };
+      expect(registry.createAssignment({
+        assignmentId: implId, taskId, role: 'implementer', scopeFiles: [], identity: implIdentity,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId: auditorId, taskId, role: opts.role ?? 'auditor', scopeFiles: [],
+        identity: auditorIdentity, auditAttemptId: attemptId, auditRevision: revision,
+      }).ok).toBe(true);
+      // Sibling assignments on the SAME target session but OTHER tasks, whose
+      // worktrees are absent. This is the production shape: the compatibility
+      // scan lists by project + owner session across tasks, so these made it
+      // report "ambiguous missing assignment worktrees for target (4)".
+      for (const sibling of ['sibling-a', 'sibling-b', 'sibling-c']) {
+        const siblingTask = `${taskId}-${sibling}`;
+        expect(registry.createOrGet({
+          taskId: siblingTask, projectName: 'proj', objective: `sibling ${sibling}`, baseRevision,
+        }).ok).toBe(true);
+        expect(registry.createAssignment({
+          assignmentId: `${siblingTask}-impl`, taskId: siblingTask, role: 'implementer', scopeFiles: [],
+          identity: auditorIdentity,
+        }).ok).toBe(true);
+      }
+      expect(registry.updateTask({ taskId, status: 'delegated' }).ok).toBe(true);
+      expect(registry.updateTask({ taskId, status: 'implementing' }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId: implId, identity: implIdentity, revision, auditRevision: revision,
+      }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId: auditorId, identity: auditorIdentity,
+        status: opts.status ?? 'auditing', auditAttemptId: attemptId, auditRevision: revision, revision,
+      }).ok).toBe(true);
+      // The auditor is past `delegated`, and the task revision matches exactly.
+      expect(registry.getAssignment(auditorId)!.status).not.toBe('delegated');
+      expect(registry.getTaskRecord(taskId)!.currentRevision).toBe(revision);
+
+      return {
+        brain, auditorSession, taskId, auditorId, revision, attemptId,
+        restore: () => {
+          if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+          else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
+          rmSync(temp, { recursive: true, force: true });
+        },
+      };
+    }
+
+    it('routes an exact auditor continuation past delegated instead of the ambiguity scan', async () => {
+      // DEADLOCK A1. An auditor identified by exact task+assignment+attempt+
+      // revision+identity could not be continued once it left `delegated`: the
+      // explicit binding was judged non-matching, the caller fell into the
+      // compatibility scan, and unrelated sibling assignments with missing
+      // worktrees made that scan report
+      // "ambiguous missing assignment worktrees for target (N)".
+      const scenario = setupExactAuditorScenario();
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'continue the audit',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true } });
+        // Routed to the exact assignment, never through the ambiguity scan.
+        expect(existsSync(resolveSupervisionAssignmentWorktree({
+          sessionName: scenario.auditorSession.name, assignmentId: scenario.auditorId,
+        }))).toBe(true);
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('routes an exact integration_owner continuation instead of rejecting it as a non-implementer', async () => {
+      // DEFECT 1 (reproduced live): the exact-binding predicate sent only
+      // `implementer` down the reuse path and its fallback hard-required
+      // `role === 'auditor'`. An integration_owner holding a valid
+      // task+assignment+identity+revision+attempt could therefore never be
+      // continued, and the caller fell into the ambiguity scan instead.
+      // `ready_for_integration` is TERMINAL for an auditor but is the WORKING
+      // state for an integration owner, so the two roles cannot share a set.
+      const scenario = setupExactAuditorScenario({ role: 'integration_owner', status: 'ready_for_integration' });
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'finalize the integration',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true } });
+        expect(existsSync(resolveSupervisionAssignmentWorktree({
+          sessionName: scenario.auditorSession.name, assignmentId: scenario.auditorId,
+        }))).toBe(true);
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('still refuses an exact continuation for a terminal integration_owner', async () => {
+      // Fail-closed boundary for DEFECT 1: widening the role set must not
+      // resurrect a terminal owner. `cancelled` is the exact state the stale
+      // integration owner was left in by the live coordination failure.
+      const scenario = setupExactAuditorScenario({ role: 'integration_owner', status: 'cancelled' });
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'finalize again',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res.status).toBe(500);
+        expect(JSON.stringify(res.body)).not.toContain('delivered\":true');
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('continues an exact auditor that already has non-final audit progress (tsk_4d0 shape)', async () => {
+      // tsk_4d0/asg_4dw: the auditor had recorded PROGRESS and had moved past
+      // `delegated`, so exact redelivery was refused, the assignment sat in
+      // `implementing` with an idle session, and Brain had no continue, cancel
+      // or replace path. Progress is precisely why the SAME auditor must stay
+      // reachable -- it owns this attempt. Only a FINAL verdict closes it.
+      const scenario = setupExactAuditorScenario();
+      const registry = getSupervisionTaskRegistry();
+      const progressReceipt = registry.appendMatchingAuditReceipt({
+        taskId: scenario.taskId, auditorAssignmentId: scenario.auditorId,
+        attemptId: scenario.attemptId, revision: scenario.revision,
+        receiptKind: 'progress', findings: 'still reviewing',
+        // Use the assignment's OWN persisted identity rather than
+        // reconstructing it, so the receipt cannot fail on owner_mismatch.
+        auditorIdentity: registry.getAssignment(scenario.auditorId)!.identity,
+        auditorSessionName: scenario.auditorSession.name,
+        validations: [],
+      });
+      // Load-bearing: without this the append can fail silently and the test
+      // would prove nothing about progress at all (a mutant survived exactly
+      // this way before the assertion was added).
+      expect(progressReceipt).toMatchObject({ ok: true });
+      expect(registry.listAuditReceipts(scenario.taskId).some((r) => (
+        r.assignmentId === scenario.auditorId && r.receiptKind === 'progress'
+      ))).toBe(true);
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'continue the audit',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true } });
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('rejects a stale audit revision with a safe detail instead of delivering or scanning', async () => {
+      // DEADLOCK A2. A binding whose revision no longer matches the current
+      // attempt must be named as stale immediately. It must not be delivered,
+      // must not create a worktree, and must not fall through to the
+      // compatibility scan, which would blame an unrelated ambiguity.
+      const scenario = setupExactAuditorScenario();
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'continue the audit',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: 'candidate-cc8-r2-99887766',
+          },
+        });
+        // 500 is the established status for a fully-failed send gate, the same
+        // one the ambiguity refusal above uses. What must change is the REASON.
+        expect(res.status).toBe(500);
+        const error = JSON.stringify(res.body);
+        expect(error).toContain('stale_audit_revision');
+        // Safe detail: control-plane state only, enough to see which side is stale.
+        expect(error).toContain('taskStatus=implementing');
+        expect(error).toContain('assignmentStatus=auditing');
+        expect(error).toContain(`expectedRevision=${scenario.revision}`);
+        expect(error).toContain('actualRevision=candidate-cc8-r2-99887766');
+        expect(error).toContain(`expectedAttemptId=${scenario.attemptId}`);
+        // Never reported as an ambiguity, and nothing was provisioned or sent.
+        expect(error).not.toContain('ambiguous');
+        expect(existsSync(resolveSupervisionAssignmentWorktree({
+          sessionName: scenario.auditorSession.name, assignmentId: scenario.auditorId,
+        }))).toBe(false);
+        expect(res.body).not.toMatchObject({ delivered: true });
+      } finally {
+        scenario.restore();
+      }
+    });
+
     it('provisions the unique missing implementer worktree at the live /send boundary before delivery', async () => {
       const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-worktree-'));
       const source = join(temp, 'source');

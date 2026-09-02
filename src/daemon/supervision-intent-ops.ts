@@ -48,7 +48,16 @@ export const SUPERVISION_INTENT_TRANSITIONS: Readonly<Record<SupervisionIntent, 
   from: readonly SupervisionTaskLifecycleStatus[];
   to: SupervisionTaskLifecycleStatus | null;
 }>> = Object.freeze({
-  start: { from: ['planned', 'delegated', 'rework'], to: 'implementing' },
+  // `recovered` and `blocked` are states the RECOVERY tool itself produces, so
+  // they must be resumable. Without them here a recovered assignment could
+  // only ever be cancelled: a pointer-target integration owner holding a PASS
+  // receipt, a pushed commit and green CI deadlocked, because finalize needs
+  // ready_for_integration and no intent could leave `recovered`. Resuming to
+  // `implementing` reaches ready_for_integration through the existing
+  // record_validation -> finish path, so preserved audit authority
+  // (verdict/attempt/revision/commit/CI) is carried forward and no new audit
+  // is opened.
+  start: { from: ['planned', 'delegated', 'rework', 'recovered', 'blocked'], to: 'implementing' },
   claim: { from: ['planned', 'delegated'], to: 'implementing' },
   heartbeat: { from: [...SUPERVISION_TASK_LIFECYCLE_STATUSES], to: null },
   // A passed validation is a lifecycle edge, not merely an annotation. The

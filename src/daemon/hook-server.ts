@@ -351,20 +351,26 @@ interface SendRequest {
   depth?: number;
   reply?: boolean;
   deliveryMode?: MemoryMcpSendDeliveryMode;
-  supervision?: { taskId: string; assignmentId: string };
+  supervision?: { taskId: string; assignmentId: string; auditAttemptId?: string; auditRevision?: string };
   messageId?: SendMessageId;
 }
+
+const SUPERVISION_SEND_BINDING_KEYS = new Set(['taskId', 'assignmentId', 'auditAttemptId', 'auditRevision']);
 
 function validSupervisionSendBinding(value: unknown): value is NonNullable<SendRequest['supervision']> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return Object.keys(record).length === 2
-    && typeof record.taskId === 'string'
-    && record.taskId.trim().length > 0
-    && Buffer.byteLength(record.taskId, 'utf8') <= 512
-    && typeof record.assignmentId === 'string'
-    && record.assignmentId.trim().length > 0
-    && Buffer.byteLength(record.assignmentId, 'utf8') <= 512;
+  // Strict allow-list: unknown keys are still rejected outright. `auditAttemptId`
+  // and `auditRevision` are optional and, when present, make the binding an exact
+  // four-tuple that the resolver matches instead of scanning for a candidate.
+  if (Object.keys(record).some((key) => !SUPERVISION_SEND_BINDING_KEYS.has(key))) return false;
+  const validBoundedString = (candidate: unknown): boolean => typeof candidate === 'string'
+    && candidate.trim().length > 0
+    && Buffer.byteLength(candidate, 'utf8') <= 512;
+  return validBoundedString(record.taskId)
+    && validBoundedString(record.assignmentId)
+    && (record.auditAttemptId === undefined || validBoundedString(record.auditAttemptId))
+    && (record.auditRevision === undefined || validBoundedString(record.auditRevision));
 }
 
 async function handleSend(body: SendRequest): Promise<{ status: number; body: Record<string, unknown> }> {

@@ -751,7 +751,7 @@ describe('delegation send gate', () => {
       task: { ...request.task, auditRevision: 'different-revision' },
     }, injected)).resolves.toMatchObject({
       status: 'error',
-      error: expect.stringContaining('exact pending assignment'),
+      error: expect.stringContaining('exact non-terminal assignment'),
     });
     expect(ensured).not.toHaveBeenCalled();
     expect(dispatchMessage).not.toHaveBeenCalled();
@@ -766,14 +766,30 @@ describe('delegation send gate', () => {
     expect(ensured).not.toHaveBeenCalled();
     expect(dispatchMessage).not.toHaveBeenCalled();
 
+    // CONTRACT CHANGE (tsk_4d0, Brain-directed): `auditing` is NON-TERMINAL, so
+    // an auditor that has already started and recorded progress MUST stay
+    // exactly reachable — that was the tsk_4d0 deadlock, where the assignment
+    // sat in `implementing` with an idle session and no continue/cancel path.
+    // The previous expectation here ("no audit progress" refusal) encoded the
+    // superseded contract. The fail-closed guarantee is NOT dropped: it moves
+    // to a TERMINAL status below, which must still refuse.
     expect(registry.updateAssignment({
       assignmentId,
       identity: registry.getAssignment(assignmentId)!.identity,
       status: 'auditing',
     }).ok).toBe(true);
     await expect(dispatchSendMessage(caller, request, injected)).resolves.toMatchObject({
+      status: 'accepted',
+    });
+
+    expect(registry.applyTaskIntent({
+      taskId: registry.getAssignment(assignmentId)!.taskId,
+      assignmentId, intent: 'cancel', toStatus: 'cancelled',
+    })).toMatchObject({ ok: true });
+    ensured.mockClear();
+    dispatchMessage.mockClear();
+    await expect(dispatchSendMessage(caller, request, injected)).resolves.toMatchObject({
       status: 'error',
-      error: expect.stringContaining('no audit progress'),
     });
     expect(ensured).not.toHaveBeenCalled();
     expect(dispatchMessage).not.toHaveBeenCalled();
@@ -1164,6 +1180,76 @@ describe('delegation send gate', () => {
       error: expect.stringContaining('no unique reusable implementer assignment'),
     });
     expect(registry.get(created.taskId)!.assignments).toHaveLength(beforeCount);
+    expect(dispatched).not.toHaveBeenCalled();
+  });
+
+  // R4 blocking P1, at the PUBLIC send_message boundary (not hook /send).
+  // send-tool.ts resolved every non-audit assignmentId ONLY from reusable
+  // implementers and rejected before the OWNER_CONTINUATION_ROLES logic could
+  // run, so an exact coordinator or integration_owner continuation was
+  // unreachable through the public tool even though the hook layer allowed it.
+  for (const role of ['coordinator', 'integration_owner'] as const) {
+    it(`continues an exact ${role} assignment through the public send_message boundary`, async () => {
+      const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
+      const brain = supervisedBrain([config]);
+      const worker = supervisedChild({
+        name: `deck_alpha_${role}_worker`, role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+      });
+      const sessions = [brain, worker];
+      const dispatched = vi.fn(async () => 'queued' as const);
+      const created = await dispatchSendMessage(caller, {
+        target: worker.name, message: 'initial assignment',
+        task: { classification: 'independent_top_level', objective: `${role} continuation`, executionPool: 'primary' },
+      }, deps(sessions, dispatched));
+      if (created.status !== 'accepted' || !created.taskId || !created.assignmentId) throw new Error('expected task');
+      const registry = getSupervisionTaskRegistry();
+      const implementer = registry.getAssignment(created.assignmentId)!;
+      const owner = registry.createAssignment({
+        taskId: created.taskId, role, identity: implementer.identity, scopeFiles: [],
+      });
+      if (!owner.ok) throw new Error(owner.reason);
+
+      dispatched.mockClear();
+      const continued = await dispatchSendMessage(caller, {
+        target: worker.name, message: `continue the exact ${role}`, deliveryMode: 'append',
+        task: { taskId: created.taskId, assignmentId: owner.value.assignmentId, executionPool: 'primary' },
+      }, deps(sessions, dispatched));
+      expect(continued).toMatchObject({
+        status: 'accepted', taskId: created.taskId, assignmentId: owner.value.assignmentId,
+      });
+      expect(dispatched).toHaveBeenCalled();
+    });
+  }
+
+  it('fails closed for a terminal exact non-implementer continuation at the public boundary', async () => {
+    const config = executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
+    const brain = supervisedBrain([config]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_terminal_owner_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const sessions = [brain, worker];
+    const dispatched = vi.fn(async () => 'queued' as const);
+    const created = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'initial assignment',
+      task: { classification: 'independent_top_level', objective: 'terminal owner', executionPool: 'primary' },
+    }, deps(sessions, dispatched));
+    if (created.status !== 'accepted' || !created.taskId || !created.assignmentId) throw new Error('expected task');
+    const registry = getSupervisionTaskRegistry();
+    const implementer = registry.getAssignment(created.assignmentId)!;
+    const owner = registry.createAssignment({
+      taskId: created.taskId, role: 'integration_owner', identity: implementer.identity, scopeFiles: [],
+    });
+    if (!owner.ok) throw new Error(owner.reason);
+    expect(registry.applyTaskIntent({
+      taskId: created.taskId, assignmentId: owner.value.assignmentId, intent: 'cancel', toStatus: 'cancelled',
+    })).toMatchObject({ ok: true });
+
+    dispatched.mockClear();
+    const rejected = await dispatchSendMessage(caller, {
+      target: worker.name, message: 'must not resurrect a cancelled owner', deliveryMode: 'append',
+      task: { taskId: created.taskId, assignmentId: owner.value.assignmentId, executionPool: 'primary' },
+    }, deps(sessions, dispatched));
+    expect(rejected).toMatchObject({ status: 'error', reason: 'identity_rejected' });
     expect(dispatched).not.toHaveBeenCalled();
   });
 

@@ -346,8 +346,16 @@ export interface HookSendDispatchInput {
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** This `/send` spawns work; see {@link SendMessageInput.newWorkload}. */
   newWorkload?: boolean;
-  /** Registry binding supplied by the managed MCP bridge for supervised work. */
-  supervision?: { taskId: string; assignmentId: string };
+  /**
+   * Registry binding supplied by the managed MCP bridge for supervised work.
+   *
+   * `auditAttemptId`/`auditRevision` make the binding an EXACT four-tuple. When
+   * present they are matched strictly: a mismatch is reported as a stale audit
+   * revision instead of silently falling back to the compatibility scan, where
+   * unrelated sibling assignments on the same target used to make the result
+   * ambiguous.
+   */
+  supervision?: { taskId: string; assignmentId: string; auditAttemptId?: string; auditRevision?: string };
   /** Stable supervised delivery id supplied by the managed MCP bridge. */
   messageId?: SendMessageId;
 }
@@ -569,6 +577,29 @@ const HOOK_WORKTREE_RECOVERY_STATUSES = new Set([
 ]);
 
 const AUDITOR_REDELIVERY_STATUS = 'delegated';
+/**
+ * Audit states that must never accept a redelivery. `passed` is included on
+ * purpose: a returned verdict is authority, and re-routing to it would let a
+ * closed audit be reopened by an ordinary send.
+ */
+const AUDITOR_TERMINAL_STATUSES = new Set<string>(['cancelled', 'finalized', 'passed', 'ready_for_integration']);
+
+/**
+ * Non-auditor roles that own long-lived work and must stay continuable by an
+ * exact task+assignment+identity binding. Routing used to send only
+ * `implementer` down the reuse path, so a coordinator or integration_owner
+ * with a perfectly valid binding fell through to the compatibility scan and
+ * was reported as an unrelated worktree ambiguity.
+ */
+const OWNER_CONTINUATION_ROLES = new Set<string>(['integration_owner', 'coordinator']);
+
+/**
+ * Terminal states for those owner roles. This is deliberately NOT the auditor
+ * set: `ready_for_integration` ends an audit but is the WORKING state of an
+ * integration owner, so sharing one set would make every owner unreachable
+ * exactly when it needs to be driven.
+ */
+const OWNER_TERMINAL_STATUSES = new Set<string>(['cancelled', 'finalized']);
 
 function assignmentMatchesLiveTargetBase(
   assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
@@ -592,33 +623,125 @@ function assignmentMatchesLiveTarget(
     && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target);
 }
 
+/** The exact five-field identity match shared by every exact-binding role. */
+function identityMatchesLiveTarget(
+  assignment: NonNullable<ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>>,
+  target: SessionRecord,
+): boolean {
+  return assignment.identity.sessionName === target.name
+    && assignment.identity.sessionInstanceId === target.sessionInstanceId
+    && assignment.identity.runtimeEpoch === target.runtimeEpoch
+    && assignment.identity.agentType === target.agentType
+    && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target);
+}
+
+/**
+ * THE single eligibility rule for an exact continuation, shared by the public
+ * send_message resolution AND the hook worktree gate so the two cannot drift.
+ * There is deliberately no second role set anywhere: both layers call this.
+ *
+ * `targetIdentity` is already-resolved identity, so callers holding a
+ * SessionRecord must map it (including resolvePeerAuditProviderFamily) first.
+ */
+export function isExactContinuationEligible(input: {
+  taskCurrentRevision?: string | undefined;
+  assignment: {
+    role: string; status: string; required?: boolean;
+    auditAttemptId?: string | undefined; auditRevision?: string | undefined;
+    identity: { sessionName: string; sessionInstanceId: string; runtimeEpoch: string; agentType: string; providerFamily: string };
+  };
+  targetIdentity: {
+    sessionName?: string | undefined; sessionInstanceId?: string | undefined;
+    runtimeEpoch?: string | undefined; agentType?: string | undefined; providerFamily?: string | undefined;
+  };
+}): boolean {
+  const { assignment, targetIdentity } = input;
+  // Fail closed on any missing identity field, so two `undefined`s can never
+  // be treated as a match.
+  if ([targetIdentity.sessionName, targetIdentity.sessionInstanceId, targetIdentity.runtimeEpoch,
+    targetIdentity.agentType, targetIdentity.providerFamily].some((value) => !value)) return false;
+  const identityMatches = assignment.identity.sessionName === targetIdentity.sessionName
+    && assignment.identity.sessionInstanceId === targetIdentity.sessionInstanceId
+    && assignment.identity.runtimeEpoch === targetIdentity.runtimeEpoch
+    && assignment.identity.agentType === targetIdentity.agentType
+    && assignment.identity.providerFamily === targetIdentity.providerFamily;
+  if (!identityMatches) return false;
+  if (assignment.role === 'implementer') {
+    return HOOK_WORKTREE_RECOVERY_STATUSES.has(assignment.status);
+  }
+  if (OWNER_CONTINUATION_ROLES.has(assignment.role)) {
+    if (OWNER_TERMINAL_STATUSES.has(assignment.status)) return false;
+    // A bound revision must still agree with the task, so a stale owner cannot
+    // be driven against a revision the task has moved past.
+    return !assignment.auditRevision || input.taskCurrentRevision === assignment.auditRevision;
+  }
+  if (assignment.role === 'auditor') {
+    return !AUDITOR_TERMINAL_STATUSES.has(assignment.status)
+      && Boolean(assignment.auditAttemptId)
+      && Boolean(assignment.auditRevision)
+      && input.taskCurrentRevision === assignment.auditRevision;
+  }
+  return false;
+}
+
 function explicitAssignmentMatchesLiveTarget(
   task: SupervisionTaskSnapshot | undefined,
   assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
   target: SessionRecord,
 ): boolean {
   if (!task || !assignment || assignment.taskId !== task.taskId) return false;
-  if (assignment.role === 'implementer') return assignmentMatchesLiveTarget(assignment, target);
-  return Boolean(
-    assignment.role === 'auditor'
-    && assignment.required
-    && assignment.status === AUDITOR_REDELIVERY_STATUS
-    && assignment.auditAttemptId
-    && assignment.auditRevision
-    && task.currentRevision === assignment.auditRevision
-    && assignment.identity.sessionName === target.name
-    && assignment.identity.sessionInstanceId === target.sessionInstanceId
-    && assignment.identity.runtimeEpoch === target.runtimeEpoch
-    && assignment.identity.agentType === target.agentType
-    && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target)
-  );
+  if (assignment.role === 'implementer' && !assignment.required) return false;
+  return isExactContinuationEligible({
+    taskCurrentRevision: task.currentRevision,
+    assignment: {
+      role: assignment.role,
+      status: assignment.status,
+      required: assignment.required,
+      auditAttemptId: assignment.auditAttemptId,
+      auditRevision: assignment.auditRevision,
+      identity: assignment.identity,
+    },
+    targetIdentity: {
+      sessionName: target.name,
+      sessionInstanceId: target.sessionInstanceId,
+      runtimeEpoch: target.runtimeEpoch,
+      agentType: target.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(target),
+    },
+  });
+}
+
+/**
+ * Renders a stale-binding rejection. Only control-plane state is included --
+ * statuses, revision names, and attempt ids -- so the caller can tell WHICH
+ * side is stale without any payload or credential material being echoed back.
+ */
+function formatStaleAuditBindingError(detail: {
+  taskStatus: string;
+  assignmentStatus: string;
+  expectedRevision?: string;
+  actualRevision?: string;
+  expectedAttemptId?: string;
+  actualAttemptId?: string;
+  taskRevision?: string;
+}): string {
+  const fields = [
+    `taskStatus=${detail.taskStatus}`,
+    `assignmentStatus=${detail.assignmentStatus}`,
+    `expectedRevision=${detail.expectedRevision ?? '<none>'}`,
+    `actualRevision=${detail.actualRevision ?? '<none>'}`,
+    `taskRevision=${detail.taskRevision ?? '<none>'}`,
+    `expectedAttemptId=${detail.expectedAttemptId ?? '<none>'}`,
+    `actualAttemptId=${detail.actualAttemptId ?? '<none>'}`,
+  ].join(', ');
+  return `stale_audit_revision: supervision binding no longer matches the current audit attempt (${fields})`;
 }
 
 async function ensureHookSupervisionAssignmentWorktree(input: {
   callerRecord?: SessionRecord;
   projectRoot?: string | null;
   target: SessionRecord;
-  binding?: { taskId: string; assignmentId: string };
+  binding?: { taskId: string; assignmentId: string; auditAttemptId?: string; auditRevision?: string };
   ensure?: SendToolDeps['ensureSupervisionAssignmentWorktree'];
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   const registry = getSupervisionTaskRegistry();
@@ -626,19 +749,48 @@ async function ensureHookSupervisionAssignmentWorktree(input: {
   let assignment = input.binding ? registry.getAssignment(input.binding.assignmentId) : undefined;
 
   if (input.binding) {
+    // An exact four-tuple binding is adjudicated BEFORE anything else. A stale
+    // revision must be reported as such and must not fall through to delivery,
+    // worktree creation, or the compatibility scan, where sibling assignments
+    // on the same target would report a misleading ambiguity instead.
+    if (task && assignment && assignment.taskId === task.taskId) {
+      const submittedRevision = input.binding.auditRevision;
+      const submittedAttempt = input.binding.auditAttemptId;
+      const revisionIsStale = submittedRevision !== undefined
+        && (submittedRevision !== assignment.auditRevision || submittedRevision !== task.currentRevision);
+      const attemptIsStale = submittedAttempt !== undefined && submittedAttempt !== assignment.auditAttemptId;
+      if (revisionIsStale || attemptIsStale) {
+        return {
+          ok: false,
+          error: formatStaleAuditBindingError({
+            taskStatus: task.status,
+            assignmentStatus: assignment.status,
+            expectedRevision: assignment.auditRevision,
+            actualRevision: submittedRevision,
+            expectedAttemptId: assignment.auditAttemptId,
+            actualAttemptId: submittedAttempt,
+            taskRevision: task.currentRevision,
+          }),
+        };
+      }
+    }
     if (!task || !assignment
       || assignment.taskId !== task.taskId
       || !explicitAssignmentMatchesLiveTarget(task, assignment, input.target)
       || (input.callerRecord?.projectName && task.projectName !== input.callerRecord.projectName)) {
       return { ok: false, error: 'supervision binding does not match the live task, assignment, revision, and target identity' };
     }
+    // Same tsk_4d0 rule at the worktree gate: PROGRESS does not close an
+    // auditor, only a FINAL verdict does. Blocking on any receipt made an
+    // in-progress auditor permanently unreachable.
     const boundAudit = assignment?.role === 'auditor' ? assignment : undefined;
     if (boundAudit && task && registry.listAuditReceipts(task.taskId).some((receipt) => (
       receipt.assignmentId === boundAudit.assignmentId
       && receipt.attemptId === boundAudit.auditAttemptId
       && receipt.revision === boundAudit.auditRevision
+      && receipt.receiptKind === 'final'
     ))) {
-      return { ok: false, error: 'supervision auditor binding already has audit progress' };
+      return { ok: false, error: 'supervision auditor binding already returned a final verdict' };
     }
     // An exact continuation owns this already-provisioned worktree. Its
     // implementation bytes may be dirty by design, so do not run the clean
@@ -1320,15 +1472,52 @@ export async function dispatchSendMessage(
           reusedAuditAssignment = candidate;
         }
       } else {
+        const requestedExactId = input.task.assignmentId?.trim();
+        if (requestedExactId) {
+          // R4: an EXACT assignmentId is resolved against every continuable
+          // role through the ONE canonical eligibility rule, not against
+          // implementers only. Previously this rejected before the owner-role
+          // logic could run, so an exact coordinator or integration_owner
+          // continuation was unreachable through the public tool even though
+          // the hook layer accepted it.
+          const exact = existing.assignments.find((assignment) => assignment.assignmentId === requestedExactId);
+          if (exact && exact.role !== 'implementer') {
+            if (!isExactContinuationEligible({
+              taskCurrentRevision: existing.currentRevision,
+              assignment: {
+                role: exact.role, status: exact.status, required: exact.required,
+                auditAttemptId: exact.auditAttemptId, auditRevision: exact.auditRevision,
+                identity: exact.identity,
+              },
+              targetIdentity,
+            })) {
+              return {
+                status: 'error',
+                reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+                error: 'task continuation assignmentId is not an exact continuable assignment for this target',
+              };
+            }
+            // Same stale-revision guard the implementer path applies.
+            if (input.task.currentRevision && existing.currentRevision
+              && input.task.currentRevision !== existing.currentRevision) {
+              return {
+                status: 'error',
+                reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+                error: 'task continuation revision does not match the authoritative task revision',
+              };
+            }
+            reusedContinuationAssignment = exact;
+          }
+        }
         const implementers = existing.assignments.filter((assignment) => assignment.role === 'implementer');
-        if (input.task.assignmentId?.trim() && implementers.length === 0) {
+        if (requestedExactId && implementers.length === 0 && !reusedContinuationAssignment) {
           return {
             status: 'error',
             reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
             error: 'task continuation assignmentId is not an exact reusable implementer assignment',
           };
         }
-        if (implementers.length > 0) {
+        if (implementers.length > 0 && !reusedContinuationAssignment) {
           const requestedAssignmentId = input.task.assignmentId?.trim();
           const reusableImplementers = implementers.filter((assignment) => (
             ['delegated', 'implementing', 'retrying_external_ci', 'rework', 'validated', 'ready_for_audit', 'recovered'] as const
@@ -1494,18 +1683,25 @@ export async function dispatchSendMessage(
         && assignment.value.identity.runtimeEpoch === targetIdentity.runtimeEpoch
         && assignment.value.identity.agentType === targetIdentity.agentType
         && assignment.value.identity.providerFamily === targetIdentity.providerFamily;
+      // tsk_4d0 shape: an auditor that had already started (status past
+      // `delegated`) and had recorded PROGRESS could not be continued, so the
+      // assignment sat in `implementing` with an idle session and Brain had no
+      // continue, cancel, or replace path. Existing progress is exactly why the
+      // SAME auditor must be reachable -- it owns this attempt. Only terminal
+      // audits and a returned final verdict stay closed.
+      const finalReceipt = receipts.some((receipt) => receipt.receiptKind === 'final');
       if (assignment.value.role !== 'auditor'
-        || assignment.value.status !== AUDITOR_REDELIVERY_STATUS
+        || AUDITOR_TERMINAL_STATUSES.has(assignment.value.status)
         || assignment.value.auditAttemptId !== requestedAttemptId
         || !requestedRevision
         || assignment.value.auditRevision !== requestedRevision
         || authoritativeTask?.currentRevision !== requestedRevision
         || !sameTarget
-        || receipts.length > 0) {
+        || finalReceipt) {
         return {
           status: 'error',
           reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
-          error: 'audit redelivery requires the exact pending assignment, target, attempt, revision, and identity with no audit progress',
+          error: 'audit redelivery requires the exact non-terminal assignment, target, attempt, revision and identity, and no final verdict',
         };
       }
       const messageId = deterministicSendMessageId(

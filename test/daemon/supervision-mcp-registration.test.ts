@@ -819,6 +819,10 @@ describe('administrative recover', () => {
         agentType: liveIdentity.agentType,
         providerFamily: liveIdentity.providerFamily,
       },
+      // Load-bearing: proves the task's project is threaded down to the
+      // registry, so the authority check cannot be bypassed by callers that
+      // reach the registry without going through this MCP entry point.
+      callerProjectName: 'codedeck',
       reason: 'authorized device replacement',
     }]);
   });

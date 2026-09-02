@@ -167,3 +167,50 @@ describe('published MCP schemas', () => {
     for (const e of found) expect(known, JSON.stringify(e)).toContain(JSON.stringify(e));
   });
 });
+
+describe('recovered must not be a lifecycle sink (tsk_4ft R2, live reproduction)', () => {
+  // LIVE RED. supervision_task_recover set an integration_owner pointer target
+  // to `recovered`, but no intent could leave that status and
+  // integration_finalize rejected invalid_transition. The task therefore
+  // deadlocked while already holding a PASS receipt, a pushed commit and a
+  // green CI run. A status the recovery tool can PRODUCE must have at least
+  // one legal, authority-preserving way OUT, or "recovery" strands the object.
+  it('offers a legal outgoing transition from recovered', () => {
+    const escapes = SUPERVISION_INTENTS.filter((intent) => {
+      const rule = SUPERVISION_INTENT_TRANSITIONS[intent];
+      // heartbeat/checkpoint are non-advancing (to === null): they observe the
+      // object without moving it. `cancel` DOES leave `recovered`, but only to
+      // `cancelled` -- that destroys the work rather than recovering it, so it
+      // must not count as an escape. Without this exclusion the assertion
+      // passes against the broken code.
+      return rule.to !== null && rule.to !== 'cancelled' && rule.from.includes('recovered');
+    });
+    expect(escapes, 'recovered can only be cancelled, never resumed').not.toHaveLength(0);
+  });
+
+  it('resumes a recovered assignment via start without reopening an audit', () => {
+    const outcome = resolveSupervisionIntent({
+      request: { intent: 'start' },
+      currentStatus: 'recovered',
+    });
+    expect(outcome.ok).toBe(true);
+    // Must land on a status the existing legal path can carry to
+    // ready_for_integration (record_validation -> finish), so preserved
+    // PASS/attempt/revision/commit/CI never need a fresh audit.
+    expect(outcome.ok && outcome.toStatus).toBe('implementing');
+    expect(SUPERVISION_INTENT_TRANSITIONS.record_validation.from).toContain('implementing');
+  });
+
+  it('every status the recovery tool can produce has an escape or is terminal', () => {
+    // Guards the general rule, not just the one status that bit us.
+    const TERMINAL = new Set(['finalized', 'cancelled']);
+    for (const produced of ['recovered', 'blocked'] as const) {
+      if (TERMINAL.has(produced)) continue;
+      const escapes = SUPERVISION_INTENTS.filter((intent) => {
+        const rule = SUPERVISION_INTENT_TRANSITIONS[intent];
+        return rule.to !== null && rule.to !== 'cancelled' && rule.from.includes(produced);
+      });
+      expect(escapes, `status "${produced}" can only be cancelled, not resumed`).not.toHaveLength(0);
+    }
+  });
+});

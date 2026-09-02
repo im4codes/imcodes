@@ -2279,7 +2279,13 @@ describe('SupervisionTaskRegistry', () => {
   it('fails closed on ambiguous, active-audit, PASS, lifecycle, scope, and evidence revision recovery shapes', () => {
     const cases = [
       { taskId: 'revision-recovery-ambiguous', options: { addAmbiguousImplementer: true }, expected: 'ambiguous_assignment' },
-      { taskId: 'revision-recovery-active-auditor', options: { keepAuditorActive: true }, expected: 'invalid_transition' },
+      // This active auditor carries verdict PASS (on r2), so it is protected by
+      // the strongest rule: an accepted PASS is authority and is NEVER
+      // supersedable. Recovery still fails closed; the diagnostic just sharpened
+      // from a generic invalid_transition to receipt_closed, which names why.
+      // Retiring a stale auditor is permitted ONLY when it is bound to the
+      // revision being superseded AND holds no accepted PASS.
+      { taskId: 'revision-recovery-active-auditor', options: { keepAuditorActive: true }, expected: 'receipt_closed' },
     ] as const;
     for (const testCase of cases) {
       const registry = makeRegistry();
@@ -2293,7 +2299,8 @@ describe('SupervisionTaskRegistry', () => {
         worktreeSnapshot: recoveryWorktreeSnapshot(shape.files, shape.evidenceManifestSha256),
         leaseAction: 'preserve', idempotencyKey: `${testCase.taskId}-refusal`,
         reason: 'must fail closed',
-      })).toEqual({ ok: false, reason: testCase.expected });
+      })).toMatchObject({ ok: false, reason: testCase.expected });
+      // Refusal must leave the object byte-identical: fail-closed, not partial.
       expect(registry.get(shape.taskId)).toEqual(before);
       expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
       registry.close();
@@ -2405,6 +2412,7 @@ describe('SupervisionTaskRegistry', () => {
       ]);
       expect(registry.rebindAuditAssignment({
         taskId, assignmentId: auditor.value.assignmentId, identity: reboundAuditorIdentity,
+        callerProjectName: 'alpha',
         reason: 'Brain-authorized device replacement', now: 105,
       })).toMatchObject({ ok: true, value: { identity: reboundAuditorIdentity, generation: 2 } });
       expect(registry.appendMatchingAuditReceipt({
@@ -3659,6 +3667,186 @@ describe('SupervisionTaskRegistry', () => {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('refuses a successor bind rather than silently cancelling authority', () => {
+    // Each case must FAIL the bind, not quietly retire the auditor. A passed
+    // audit is authority; a mismatched auditRevision means the predecessor was
+    // never what this owner thinks it was; a Git-finalized task is closed.
+    const setup = (name: string) => {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      const taskId = `task-refuse-${name}`;
+      const implId = `${taskId}-implementer`;
+      const auditorId = `${taskId}-auditor`;
+      const owner = identity(`deck_owner_${name}`);
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'refuse unsafe successor binds',
+      })).toMatchObject({ ok: true });
+      const impl = registry.createAssignment({
+        assignmentId: implId, taskId, role: 'implementer', identity: owner, auditRevision: 'r1',
+      });
+      if (!impl.ok) throw new Error(impl.reason);
+      const aud = registry.createAssignment({
+        assignmentId: auditorId, taskId, role: 'auditor', identity: identity(`deck_auditor_${name}`),
+        auditAttemptId: 'attempt-r1', auditRevision: 'r1',
+      });
+      if (!aud.ok) throw new Error(aud.reason);
+      expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      rewritePersistedAssignment(database, {
+        ...registry.getAssignment(implId)!, status: 'rework', updatedAt: 100,
+      });
+      return { database, registry, taskId, implId, auditorId, owner };
+    };
+
+    // (1) auditor already carries an accepted PASS -> receipt_closed
+    {
+      const ctx = setup('pass');
+      rewritePersistedAssignment(ctx.database, {
+        ...ctx.registry.getAssignment(ctx.auditorId)!, verdict: 'PASS', updatedAt: 101,
+      });
+      const before = ctx.registry.getAssignment(ctx.auditorId);
+      const result = ctx.registry.updateAssignment({
+        assignmentId: ctx.implId, identity: ctx.owner, revision: 'r2', auditRevision: 'r2',
+      });
+      expect(result).toMatchObject({ ok: false, reason: 'receipt_closed' });
+      expect(ctx.registry.getAssignment(ctx.auditorId)).toEqual(before);
+      ctx.registry.close(); ctx.database.close();
+    }
+
+    // (2) auditor bound to a different revision than the one being superseded
+    {
+      const ctx = setup('mismatch');
+      rewritePersistedAssignment(ctx.database, {
+        ...ctx.registry.getAssignment(ctx.auditorId)!, auditRevision: 'r0-other', updatedAt: 101,
+      });
+      const before = ctx.registry.getAssignment(ctx.auditorId);
+      const result = ctx.registry.updateAssignment({
+        assignmentId: ctx.implId, identity: ctx.owner, revision: 'r2', auditRevision: 'r2',
+      });
+      expect(result).toMatchObject({ ok: false, reason: 'stale_audit_revision' });
+      expect(result).toMatchObject({
+        detail: { expectedRevision: 'r1', actualRevision: 'r0-other' },
+      });
+      expect(ctx.registry.getAssignment(ctx.auditorId)).toEqual(before);
+      ctx.registry.close(); ctx.database.close();
+    }
+
+    // (3) Git-finalized task is closed to successor binds
+    {
+      const ctx = setup('finalized');
+      const before = ctx.registry.getAssignment(ctx.auditorId);
+      const task = ctx.registry.getTaskRecord(ctx.taskId)!;
+      rewritePersistedTask(ctx.database, { ...task, commitSha: 'a'.repeat(40), updatedAt: 101 });
+      const result = ctx.registry.updateAssignment({
+        assignmentId: ctx.implId, identity: ctx.owner, revision: 'r2', auditRevision: 'r2',
+      });
+      expect(result).toMatchObject({ ok: false, reason: 'invalid_transition' });
+      expect(ctx.registry.getAssignment(ctx.auditorId)).toEqual(before);
+      ctx.registry.close(); ctx.database.close();
+    }
+  });
+
+  it('supersedes the active predecessor auditor atomically when a successor revision binds', () => {
+    // DEADLOCK B, security half. tsk_4dd had an ACTIVE R1 auditor while an R2
+    // successor needed to bind. Two things must hold, and today neither is
+    // reachable because the successor bind itself is refused:
+    //   1. the R1 auditor must lose current authority the moment R2 binds, so
+    //      an R1-era receipt can never be counted toward R2;
+    //   2. a fresh R2 auditor must be able to materialize -- today an active
+    //      auditor makes createAssignment return duplicate_assignment, so the
+    //      task deadlocks with no auditor able to act.
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'task-supersede-auditor';
+    const implId = `${taskId}-implementer`;
+    const r1Auditor = `${taskId}-auditor-r1`;
+    const r1 = 'combined-cc8-r1-11111111';
+    const r2 = 'combined-cc8-r2-22222222';
+    const owner = identity('deck_owner_worker');
+    const auditor1 = identity('deck_auditor_one');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'supersede an active auditor when the successor binds',
+    })).toMatchObject({ ok: true });
+    const impl = registry.createAssignment({
+      assignmentId: implId, taskId, role: 'implementer', identity: owner, auditRevision: r1,
+    });
+    if (!impl.ok) throw new Error(impl.reason);
+    const aud = registry.createAssignment({
+      assignmentId: r1Auditor, taskId, role: 'auditor', identity: auditor1,
+      auditAttemptId: 'attempt-r1', auditRevision: r1,
+    });
+    if (!aud.ok) throw new Error(aud.reason);
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    rewritePersistedAssignment(database, {
+      ...registry.getAssignment(implId)!, status: 'rework', updatedAt: 100,
+    });
+
+    // The owner binds the R2 successor.
+    expect(registry.updateAssignment({
+      assignmentId: implId, identity: owner, revision: r2, auditRevision: r2,
+    })).toMatchObject({ ok: true });
+
+    // 1. The R1 auditor must no longer hold current authority.
+    const superseded = registry.getAssignment(r1Auditor)!;
+    expect(['cancelled', 'rework', 'finalized']).toContain(superseded.status);
+    expect(superseded.auditRevision).toBe(r1);
+
+    // 2. A fresh R2 auditor must be able to materialize.
+    expect(registry.createAssignment({
+      assignmentId: `${taskId}-auditor-r2`, taskId, role: 'auditor',
+      identity: identity('deck_auditor_two'),
+      auditAttemptId: 'attempt-r2', auditRevision: r2,
+    })).toMatchObject({ ok: true });
+
+    registry.close();
+    database.close();
+  });
+
+  it('lets an implementation owner bind a strictly-new hash-anchored successor revision', () => {
+    // DEADLOCK B, reproduced from production. An owner in implementing/rework
+    // that already carries an auditRevision from a previous round cannot bind
+    // ANY successor: every strictly-new, hash-anchored revision name is
+    // rejected as old_revision. The name is also wrong -- the revision is not
+    // old, it is different -- and the rejection carries no comparison fields,
+    // so the caller cannot see what was compared against what.
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'task-successor-binding';
+    const assignmentId = `${taskId}-implementer`;
+    const predecessor = 'feature-cc8-r1-aaaaaaaa';
+    const successor = 'feature-cc8-r2-bbbbbbbb';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'bind a successor revision after a prior audit round',
+    })).toMatchObject({ ok: true });
+    const owner = identity('deck_owner_worker');
+    const created = registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: owner,
+      auditRevision: predecessor,
+    });
+    if (!created.ok) throw new Error(created.reason);
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    rewritePersistedAssignment(database, {
+      ...registry.getAssignment(assignmentId)!, status: 'implementing', updatedAt: 100,
+    });
+
+    // The owner binds its next frozen candidate. This must be accepted.
+    expect(registry.updateAssignment({
+      assignmentId,
+      identity: owner,
+      revision: successor,
+      auditRevision: successor,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(assignmentId)).toMatchObject({ auditRevision: successor });
+
+    registry.close();
+    database.close();
   });
 
   it('fails closed when cancelled-task recovery lacks exact revision-bound PASS evidence', async () => {
@@ -5790,5 +5978,365 @@ describe('SupervisionTaskRegistry', () => {
     })).toMatchObject({ scanned: 2, hasMore: false });
     registry.close();
     database.close();
+  });
+});
+
+describe('tsk_4dd live RED: successor recovery blocked by a stale active auditor', () => {
+  // Exact reproduction. tsk_4dd sat at ready_for_audit on R1 with active
+  // auditor asg_4eo. Brain recovered task+implementer to rework, but the stale
+  // R1 auditor stayed non-terminal and holding a lease, and the R1->R3 revision
+  // recovery kept returning invalid_transition because `exactStaleShape`
+  // requires `!activeAuditor`. Brain could not clear that auditor either
+  // (task_recover -> role_forbidden, task_intent(cancel) -> not visible, exact
+  // redelivery -> audit progress exists, unbound delivery -> ambiguous), so the
+  // task was permanently wedged with no operator escape.
+  it('retires the stale auditor atomically and binds the successor revision', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-stale-auditor-successor-'));
+    const registry = new SupervisionTaskRegistry({ dbPath: join(dir, 'registry.sqlite') });
+    try {
+      const R1 = 'candidate-4dd-r1-aaaaaaaa';
+      const R3 = 'candidate-4dd-r3-cccccccc';
+      expect(registry.createOrGet({
+        projectName: 'alpha', taskId: 'tsk-4dd', objective: 'stale auditor',
+        classification: 'independent_top_level',
+      }).ok).toBe(true);
+
+      const impl = registry.createAssignment({
+        assignmentId: 'asg-4dd-impl', taskId: 'tsk-4dd', role: 'implementer',
+        identity: identity('deck_alpha_impl'), scopeFiles: ['src/a.ts'], claimMode: 'exclusive',
+      });
+      if (!impl.ok) throw new Error(impl.reason);
+      const auditor = registry.createAssignment({
+        assignmentId: 'asg-4eo', taskId: 'tsk-4dd', role: 'auditor',
+        identity: identity('deck_alpha_auditor'), scopeFiles: [],
+        auditAttemptId: 'attempt-4dd-r1', auditRevision: R1,
+      });
+      if (!auditor.ok) throw new Error(auditor.reason);
+
+      expect(registry.updateTask({ taskId: 'tsk-4dd', status: 'delegated' }).ok).toBe(true);
+      expect(registry.updateTask({ taskId: 'tsk-4dd', status: 'implementing' }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId: 'asg-4dd-impl', identity: identity('deck_alpha_impl'),
+        revision: R1, auditRevision: R1,
+      }).ok).toBe(true);
+      expect(registry.getTaskRecord('tsk-4dd')!.currentRevision).toBe(R1);
+
+      // The auditor is ACTIVE (non-terminal) on R1, exactly like asg_4eo.
+      expect(registry.updateAssignment({
+        assignmentId: 'asg-4eo', identity: identity('deck_alpha_auditor'),
+        status: 'implementing', auditAttemptId: 'attempt-4dd-r1', auditRevision: R1,
+      }).ok).toBe(true);
+      const staleBefore = registry.getAssignment('asg-4eo')!;
+      expect(['cancelled', 'finalized']).not.toContain(staleBefore.status);
+
+      // tsk_4dd's real shape: the task reached ready_for_audit on R1 while the
+      // auditor was live. Brain's successful step then moved it to rework.
+      expect(registry.updateTask({ taskId: 'tsk-4dd', status: 'ready_for_audit' }).ok).toBe(true);
+      expect(registry.updateTask({ taskId: 'tsk-4dd', status: 'auditing' }).ok).toBe(true);
+      expect(registry.updateTask({ taskId: 'tsk-4dd', status: 'rework' }).ok).toBe(true);
+
+      // The wedge: exact same-task successor recovery R1 -> R3.
+      const recovered = registry.rebindTaskAssignmentRevision({
+        taskId: 'tsk-4dd', assignmentId: 'asg-4dd-impl',
+        fromRevision: R1, toRevision: R3,
+        worktreeSnapshot: recoveryWorktreeSnapshot(['src/a.ts']),
+        leaseAction: 'preserve', idempotencyKey: 'idem-4dd-r3',
+        reason: 'brain successor recovery after material scope change',
+      });
+      expect(recovered).toMatchObject({ ok: true });
+      expect(registry.getTaskRecord('tsk-4dd')!.currentRevision).toBe(R3);
+
+      // The stale auditor is retired atomically, with R1 provenance preserved
+      // verbatim -- never rebound onto R3, never given a verdict.
+      const staleAfter = registry.getAssignment('asg-4eo')!;
+      expect(staleAfter.status).toBe('cancelled');
+      expect(staleAfter.auditRevision).toBe(R1);
+      expect(staleAfter.auditAttemptId).toBe('attempt-4dd-r1');
+      expect(staleAfter.identity.sessionName).toBe('deck_alpha_auditor');
+      expect(staleAfter.verdict ?? '').not.toMatch(/PASS/i);
+
+      // A fresh auditor for R3 is now permitted (duplicate guard must not fire).
+      expect(registry.createAssignment({
+        assignmentId: 'asg-4dd-auditor-r3', taskId: 'tsk-4dd', role: 'auditor',
+        identity: identity('deck_alpha_auditor2'), scopeFiles: [],
+        auditAttemptId: 'attempt-4dd-r3', auditRevision: R3,
+      }).ok).toBe(true);
+
+      // Idempotent replay: the same key must not retire the FRESH R3 auditor,
+      // re-cancel the old one, or double-write events. Retirement is scoped to
+      // the revision being superseded, so a replay after a new auditor exists
+      // must leave that new auditor untouched.
+      const eventsBeforeReplay = registry.listEvents('tsk-4dd').length;
+      const replay = registry.rebindTaskAssignmentRevision({
+        taskId: 'tsk-4dd', assignmentId: 'asg-4dd-impl',
+        fromRevision: R1, toRevision: R3,
+        worktreeSnapshot: recoveryWorktreeSnapshot(['src/a.ts']),
+        leaseAction: 'preserve', idempotencyKey: 'idem-4dd-r3',
+        reason: 'brain successor recovery after material scope change',
+      });
+      expect(replay).toMatchObject({ ok: true, replay: true });
+      expect(registry.getAssignment('asg-4dd-auditor-r3')!.status).not.toBe('cancelled');
+      expect(registry.getAssignment('asg-4eo')!.auditRevision).toBe(R1);
+      expect(registry.listEvents('tsk-4dd')).toHaveLength(eventsBeforeReplay);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('R3 P1-1: realistic ordinary successor shape', () => {
+  // AUDIT REWORK. The R1/R2 successor test left task.currentRevision UNSET, so
+  // it never reached the `bindsTaskRevision` gate that fires in production and
+  // therefore proved nothing about the real shape. The production shape is:
+  // task.currentRevision = R1 AND implementer.auditRevision = R1 AND
+  // implementer.status = implementing. In that shape the bind is rejected
+  // `old_revision` even though R2 is strictly newer -- verified live this
+  // session when binding candidate-cp-deadlock-r2-45b2cc90 on tsk_4ft itself.
+  it('binds R2 atomically with task.currentRevision set to R1', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      const taskId = 'task-realistic-successor';
+      const assignmentId = `${taskId}-implementer`;
+      const R1 = 'feature-cc8-r1-aaaaaaaa';
+      const R2 = 'feature-cc8-r2-bbbbbbbb';
+      const owner = identity('deck_owner_worker');
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'realistic successor bind',
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: owner, scopeFiles: ['src/a.ts'],
+      }).ok).toBe(true);
+      expect(registry.updateTask({ taskId, status: 'delegated' }).ok).toBe(true);
+      expect(registry.updateTask({ taskId, status: 'implementing' }).ok).toBe(true);
+      // Bind R1 the ordinary way, which ALSO sets task.currentRevision = R1.
+      expect(registry.updateAssignment({
+        assignmentId, identity: owner, status: 'implementing', revision: R1, auditRevision: R1,
+      }).ok).toBe(true);
+      expect(registry.getTaskRecord(taskId)!.currentRevision).toBe(R1);
+      expect(registry.getAssignment(assignmentId)!.status).toBe('implementing');
+
+      // The real production request: strictly-new hash-anchored successor.
+      const bound = registry.updateAssignment({
+        assignmentId, identity: owner, revision: R2, auditRevision: R2,
+      });
+      expect(bound).toMatchObject({ ok: true });
+      // Atomic: task and assignment both move, or neither does.
+      expect(registry.getTaskRecord(taskId)!.currentRevision).toBe(R2);
+      expect(registry.getAssignment(assignmentId)!.auditRevision).toBe(R2);
+    } finally {
+      registry.close();
+      database.close();
+    }
+  });
+});
+
+describe('tsk_4ft R3 — P1 #2/#3/#4 recovery authority', () => {
+  function auditTask(registry: SupervisionTaskRegistry, taskId: string, project = 'alpha') {
+    const R1 = `${taskId}-r1-aaaaaaaa`;
+    expect(registry.createOrGet({
+      taskId, projectName: project, classification: 'independent_top_level', objective: 'r3 authority',
+    }).ok).toBe(true);
+    const impl = registry.createAssignment({
+      assignmentId: `${taskId}-impl`, taskId, role: 'implementer',
+      identity: identity(`deck_${project}_impl`), scopeFiles: ['src/a.ts'],
+    });
+    if (!impl.ok) throw new Error(impl.reason);
+    expect(registry.updateTask({ taskId, status: 'delegated' }).ok).toBe(true);
+    expect(registry.updateTask({ taskId, status: 'implementing' }).ok).toBe(true);
+    expect(registry.updateAssignment({
+      assignmentId: `${taskId}-impl`, identity: identity(`deck_${project}_impl`),
+      revision: R1, auditRevision: R1,
+    }).ok).toBe(true);
+    return { R1 };
+  }
+
+  // P1 #3 — standalone Brain-authorized stale-auditor cancel. tsk_4dd wedged
+  // because there was NO exposed operation to retire a live auditor on the SAME
+  // revision; only the successor-revision path could do it.
+  it('cancels an exact stale auditor on the same revision, preserving provenance', () => {
+    const registry = makeRegistry();
+    const { R1 } = auditTask(registry, 'r3-cancel');
+    const auditor = registry.createAssignment({
+      assignmentId: 'r3-cancel-auditor', taskId: 'r3-cancel', role: 'auditor',
+      identity: identity('deck_alpha_auditor'), scopeFiles: [],
+      auditAttemptId: 'r3-attempt-1', auditRevision: R1,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: 'r3-cancel-auditor', identity: identity('deck_alpha_auditor'),
+      status: 'implementing', auditAttemptId: 'r3-attempt-1', auditRevision: R1,
+    }).ok).toBe(true);
+
+    const cancelled = registry.cancelStaleAuditorAsProjectBrain({
+      taskId: 'r3-cancel', auditorAssignmentId: 'r3-cancel-auditor',
+      callerProjectName: 'alpha', reason: 'same-revision deadlock; retire stale auditor',
+    });
+    expect(cancelled).toMatchObject({ ok: true });
+    const after = registry.getAssignment('r3-cancel-auditor')!;
+    expect(after.status).toBe('cancelled');
+    expect(after.leaseId).toBe('');                 // lease released
+    expect(after.auditAttemptId).toBe('r3-attempt-1'); // provenance preserved
+    expect(after.auditRevision).toBe(R1);
+    expect(after.identity.sessionName).toBe('deck_alpha_auditor');
+    expect(after.verdict ?? '').toBe('');            // NO verdict written
+    registry.close();
+  });
+
+  it('refuses to cancel an auditor holding an accepted PASS', () => {
+    const registry = makeRegistry();
+    const { R1 } = auditTask(registry, 'r3-pass');
+    const auditor = registry.createAssignment({
+      assignmentId: 'r3-pass-auditor', taskId: 'r3-pass', role: 'auditor',
+      identity: identity('deck_alpha_auditor'), scopeFiles: [],
+      auditAttemptId: 'r3-pass-attempt', auditRevision: R1,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: 'r3-pass-auditor', identity: identity('deck_alpha_auditor'),
+      status: 'implementing', auditAttemptId: 'r3-pass-attempt', auditRevision: R1,
+      verdict: 'PASS',
+    }).ok).toBe(true);
+    expect(registry.cancelStaleAuditorAsProjectBrain({
+      taskId: 'r3-pass', auditorAssignmentId: 'r3-pass-auditor',
+      callerProjectName: 'alpha', reason: 'attempt to retire a passed auditor',
+    })).toMatchObject({ ok: false, reason: 'receipt_closed' });
+    expect(registry.getAssignment('r3-pass-auditor')!.status).not.toBe('cancelled');
+    registry.close();
+  });
+
+  // P1 #4 — authority layer. The registry is the authority of record and is
+  // reachable from callers other than the MCP tool, so the project check must
+  // live HERE, not only at the MCP entry point.
+  it('denies cross-project stale-auditor cancel', () => {
+    const registry = makeRegistry();
+    const { R1 } = auditTask(registry, 'r3-xproj');
+    const auditor = registry.createAssignment({
+      assignmentId: 'r3-xproj-auditor', taskId: 'r3-xproj', role: 'auditor',
+      identity: identity('deck_alpha_auditor'), scopeFiles: [],
+      auditAttemptId: 'r3-xproj-attempt', auditRevision: R1,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.cancelStaleAuditorAsProjectBrain({
+      taskId: 'r3-xproj', auditorAssignmentId: 'r3-xproj-auditor',
+      callerProjectName: 'beta', reason: 'foreign project takeover attempt',
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.getAssignment('r3-xproj-auditor')!.status).not.toBe('cancelled');
+    registry.close();
+  });
+
+  it('denies cross-project audit identity rebind at the registry layer', () => {
+    const registry = makeRegistry();
+    const { R1 } = auditTask(registry, 'r3-rebind-xproj');
+    const auditor = registry.createAssignment({
+      assignmentId: 'r3-rebind-xproj-auditor', taskId: 'r3-rebind-xproj', role: 'auditor',
+      identity: identity('deck_alpha_auditor'), scopeFiles: [],
+      auditAttemptId: 'r3-rb-attempt', auditRevision: R1,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.rebindAuditAssignment({
+      taskId: 'r3-rebind-xproj', assignmentId: 'r3-rebind-xproj-auditor',
+      identity: identity('deck_beta_thief'), callerProjectName: 'beta',
+      reason: 'foreign project rebind attempt',
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.getAssignment('r3-rebind-xproj-auditor')!.identity.sessionName)
+      .toBe('deck_alpha_auditor');
+    registry.close();
+  });
+
+  // P1 #2 — restart / runtimeEpoch replacement for NON-auditor exact roles.
+  it('rebinds an integration_owner across a runtimeEpoch change, preserving provenance', () => {
+    const registry = makeRegistry();
+    const { R1 } = auditTask(registry, 'r3-epoch');
+    const owner = registry.createAssignment({
+      assignmentId: 'r3-epoch-owner', taskId: 'r3-epoch', role: 'integration_owner',
+      identity: identity('deck_alpha_owner'), scopeFiles: [],
+      auditAttemptId: 'r3-epoch-attempt', auditRevision: R1,
+    });
+    if (!owner.ok) throw new Error(owner.reason);
+    const replaced = { ...identity('deck_alpha_owner'), runtimeEpoch: 'epoch-after-restart' };
+    const rebound = registry.rebindAuditAssignment({
+      taskId: 'r3-epoch', assignmentId: 'r3-epoch-owner',
+      identity: replaced, callerProjectName: 'alpha',
+      reason: 'daemon restart replaced the runtime epoch',
+    });
+    expect(rebound).toMatchObject({ ok: true });
+    const after = registry.getAssignment('r3-epoch-owner')!;
+    expect(after.identity.runtimeEpoch).toBe('epoch-after-restart');
+    expect(after.auditAttemptId).toBe('r3-epoch-attempt'); // provenance preserved
+    expect(after.auditRevision).toBe(R1);
+    expect(after.role).toBe('integration_owner');
+    registry.close();
+  });
+});
+
+describe('tsk_4iu live sequence: REWORK auditor stuck implementing blocks successor', () => {
+  // tsk_4iu/asg_4ix: the R1 auditor recorded a FINAL REWORK verdict, but
+  // task_finish returned old_audit_attempt, so asg_4mu stayed `implementing`
+  // holding lease lse_4mu with verdict REWORK. That single orphaned auditor
+  // then blocked R1->R2 successor binding (invalid_transition), and Brain could
+  // not retire it (task_recover -> role_forbidden, task_intent cancel -> not
+  // visible). A project Brain must be able to retire an exact stale auditor
+  // even AFTER a final NON-PASS verdict, without destroying its history.
+  it('retires a final-REWORK auditor, preserves its receipt, and unblocks the successor', () => {
+    const registry = makeRegistry();
+    const R1 = 'tsk-4iu-r1-aaaaaaaa';
+    expect(registry.createOrGet({
+      taskId: 'tsk-4iu', projectName: 'alpha', classification: 'independent_top_level', objective: 'stuck rework auditor',
+    }).ok).toBe(true);
+    const impl = registry.createAssignment({
+      assignmentId: 'asg-4ix', taskId: 'tsk-4iu', role: 'implementer',
+      identity: identity('deck_alpha_impl'), scopeFiles: ['src/a.ts'],
+    });
+    if (!impl.ok) throw new Error(impl.reason);
+    const auditor = registry.createAssignment({
+      assignmentId: 'asg-4mu', taskId: 'tsk-4iu', role: 'auditor',
+      identity: identity('deck_alpha_auditor'), scopeFiles: [],
+      auditAttemptId: 'attempt-4iu-r1', auditRevision: R1,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateTask({ taskId: 'tsk-4iu', status: 'delegated' }).ok).toBe(true);
+    expect(registry.updateTask({ taskId: 'tsk-4iu', status: 'implementing' }).ok).toBe(true);
+    expect(registry.updateAssignment({
+      assignmentId: 'asg-4ix', identity: identity('deck_alpha_impl'), revision: R1, auditRevision: R1,
+    }).ok).toBe(true);
+
+    // Real tsk_4iu ordering: the auditor was already working (non-terminal)
+    // when its FINAL REWORK verdict landed, and task_finish then failed with
+    // old_audit_attempt, so it was never moved to a terminal state.
+    expect(registry.updateAssignment({
+      assignmentId: 'asg-4mu', identity: identity('deck_alpha_auditor'),
+      status: 'implementing', auditAttemptId: 'attempt-4iu-r1', auditRevision: R1,
+    }).ok).toBe(true);
+    const receipt = registry.appendMatchingAuditReceipt({
+      taskId: 'tsk-4iu', auditorAssignmentId: 'asg-4mu',
+      attemptId: 'attempt-4iu-r1', revision: R1, receiptKind: 'final', verdict: 'REWORK',
+      findings: 'R1 findings that must survive retirement',
+      auditorIdentity: registry.getAssignment('asg-4mu')!.identity,
+      auditorSessionName: 'deck_alpha_auditor', validations: [],
+    });
+    expect(receipt).toMatchObject({ ok: true });
+    const stuck = registry.getAssignment('asg-4mu')!;
+    expect(['cancelled', 'finalized']).not.toContain(stuck.status);
+
+    // Brain retires it on the SAME object.
+    expect(registry.cancelStaleAuditorAsProjectBrain({
+      taskId: 'tsk-4iu', auditorAssignmentId: 'asg-4mu',
+      callerProjectName: 'alpha', reason: 'final REWORK recorded but auditor left non-terminal',
+    })).toMatchObject({ ok: true });
+    const retired = registry.getAssignment('asg-4mu')!;
+    expect(retired.status).toBe('cancelled');
+    expect(retired.leaseId).toBe('');
+    expect(retired.auditAttemptId).toBe('attempt-4iu-r1');
+    expect(retired.auditRevision).toBe(R1);
+    expect(retired.verdict ?? 'REWORK').toBe('REWORK'); // no PASS is ever synthesised
+    // The append-only receipt and its findings survive retirement.
+    const receipts = registry.listAuditReceipts('tsk-4iu');
+    expect(receipts.some((r) => r.assignmentId === 'asg-4mu'
+      && r.receiptKind === 'final' && r.verdict === 'REWORK'
+      && r.findings === 'R1 findings that must survive retirement')).toBe(true);
+    registry.close();
   });
 });

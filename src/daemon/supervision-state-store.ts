@@ -63,6 +63,9 @@ export const SUPERVISION_STATE_VERSION = 1;
  * SQLite file: migrations can add projection tables to an empty database, but
  * they cannot conjure the authoritative task/assignment rows into it.
  */
+/** Exact roles whose identity may be rebound on the same object after a restart. */
+const SUPERVISION_REBINDABLE_EXACT_ROLES = new Set<string>(['auditor', 'coordinator', 'integration_owner']);
+
 export function resolveSupervisionTaskRegistryDbPath(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
@@ -647,9 +650,27 @@ export interface SupervisionHousekeepingResult {
   applyAuthorized: boolean;
 }
 
+/**
+ * Why a revision/attempt comparison failed, in terms the caller can act on.
+ *
+ * A bare reason string forced every caller to guess what was compared against
+ * what; a whole session of `old_revision` rejections could not be diagnosed
+ * from the response at all. These fields carry ONLY control-plane identifiers
+ * and lifecycle status. Capabilities, tokens, evidence bytes and worktree paths
+ * are deliberately absent: a rejection is not an oracle.
+ */
+export interface SupervisionTaskRegistryRejectDetail {
+  taskStatus?: string;
+  assignmentStatus?: string;
+  expectedRevision?: string;
+  actualRevision?: string;
+  expectedAttemptId?: string;
+  actualAttemptId?: string;
+}
+
 export type SupervisionTaskRegistryResult<T> =
   | { ok: true; value: T; replay?: boolean }
-  | { ok: false; reason: 'invalid' | 'duplicate_task' | 'duplicate_assignment' | 'not_found' | 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'old_audit_attempt' | 'manifest_mismatch' | 'role_forbidden' | 'ambiguous_assignment' | 'economy_requires_primary_review' | 'receipt_closed' | 'conflicting_replay' };
+  | { ok: false; reason: 'invalid' | 'duplicate_task' | 'duplicate_assignment' | 'not_found' | 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'stale_audit_revision' | 'old_audit_attempt' | 'manifest_mismatch' | 'role_forbidden' | 'ambiguous_assignment' | 'economy_requires_primary_review' | 'receipt_closed' | 'conflicting_replay'; detail?: SupervisionTaskRegistryRejectDetail };
 
 const COMPACT_ID_COLLISION_ATTEMPTS = 8;
 
@@ -1955,13 +1976,90 @@ export class SupervisionTaskRegistry {
       return { ok: false, reason: 'old_revision' };
     }
     if (!isNewAuditAfterRework && input.auditAttemptId && existing.auditAttemptId && input.auditAttemptId !== existing.auditAttemptId) return { ok: false, reason: 'old_audit_attempt' };
-    if (!isNewAuditAfterRework && requestedRevision && existing.auditRevision && requestedRevision !== existing.auditRevision) return { ok: false, reason: 'old_revision' };
+    // SUCCESSOR BIND. An owner that already carries an auditRevision from a
+    // previous round must be able to bind its next frozen candidate. The old
+    // rule rejected ANY revision differing from the stored one, so a strictly
+    // new hash-anchored successor was indistinguishable from a stale replay and
+    // the task deadlocked: the owner could not move forward, and the active
+    // auditor could not reach a terminal state, so no fresh auditor could be
+    // created either.
+    //
+    // A successor bind is allowed only for an implementation owner in an
+    // implementation state. Auditors never rebind their own revision, and a
+    // task that already carries Git/finalization authority is never rewritten
+    // here.
+    const bindsSuccessorRevision = existing.role !== 'auditor'
+      && Boolean(requestedRevision)
+      && Boolean(existing.auditRevision)
+      && requestedRevision !== existing.auditRevision
+      && (existing.status === 'implementing' || existing.status === 'rework');
+    if (!isNewAuditAfterRework && !bindsSuccessorRevision
+      && requestedRevision && existing.auditRevision && requestedRevision !== existing.auditRevision) {
+      return {
+        ok: false,
+        reason: 'old_revision',
+        detail: {
+          taskStatus: task.status,
+          assignmentStatus: existing.status,
+          expectedRevision: existing.auditRevision,
+          actualRevision: requestedRevision,
+        },
+      };
+    }
+    // Predecessor auditors that must lose current authority when the successor
+    // binds. Eligibility is deliberately narrow: still active, bound to exactly
+    // the revision being superseded, and never carrying an accepted final PASS.
+    // Anything outside that set makes the bind FAIL rather than be cancelled
+    // silently -- a passed audit is authority, not noise.
+    const supersededAuditors: PersistedSupervisionTaskAssignment[] = [];
+    if (bindsSuccessorRevision) {
+      if (task.finalization || task.commitSha
+        || ['committed', 'pushed', 'finalized'].includes(task.status)) {
+        return {
+          ok: false,
+          reason: 'invalid_transition',
+          detail: {
+            taskStatus: task.status,
+            assignmentStatus: existing.status,
+            expectedRevision: existing.auditRevision,
+            actualRevision: requestedRevision,
+          },
+        };
+      }
+      const selection = this.#selectSupersedableAuditors({
+        taskId: existing.taskId,
+        taskStatus: task.status,
+        supersededRevision: existing.auditRevision,
+        successorRevision: requestedRevision,
+      });
+      if (!selection.ok) return selection;
+      supersededAuditors.push(...selection.superseded);
+    }
     const bindsImplementationRevision = existing.role !== 'auditor' && Boolean(requestedRevision);
     // A slice/top-level implementer owns the task revision directly. An
     // integration_task may contain several implementer slice revisions, so its
     // combined task revision remains owned by the integration handoff.
     const bindsTaskRevision = bindsImplementationRevision && task.classification !== 'integration_task';
-    if (bindsTaskRevision && task.currentRevision && task.currentRevision !== requestedRevision) {
+    // A legal successor bind is EXACTLY the case where task.currentRevision is
+    // set and differs, so this gate cannot be evaluated before it. Previously it
+    // rejected every real successor as `old_revision` -- the R1/R2 tests only
+    // passed because they left task.currentRevision unset, which is not the
+    // production shape. `bindsSuccessorRevision` has already enforced the
+    // fail-closed boundary above (no Git/finalized authority, no accepted PASS,
+    // owner in implementing/rework), so reaching here means the successor is
+    // authorized and the task revision must move with it, atomically.
+    // ONE definition of the conflict rule. It was previously written twice --
+    // here and again inside the write-lock transaction below -- so exempting
+    // only this copy silently left the authoritative copy rejecting every real
+    // successor. A legal successor bind is EXACTLY "currentRevision is set and
+    // differs", so the exemption must live with the rule, not beside it.
+    const taskRevisionConflicts = (currentRevision: string | undefined): boolean => (
+      bindsTaskRevision
+      && !bindsSuccessorRevision
+      && Boolean(currentRevision)
+      && currentRevision !== requestedRevision
+    );
+    if (taskRevisionConflicts(task.currentRevision)) {
       return { ok: false, reason: 'old_revision' };
     }
     const now = input.now ?? Date.now();
@@ -1990,7 +2088,7 @@ export class SupervisionTaskRegistry {
     try {
       if (bindsTaskRevision) {
         const lockedTask = this.getTaskRecord(existing.taskId);
-        if (!lockedTask || (lockedTask.currentRevision && lockedTask.currentRevision !== requestedRevision)) {
+        if (!lockedTask || taskRevisionConflicts(lockedTask.currentRevision)) {
           this.#db.exec('ROLLBACK');
           return { ok: false, reason: lockedTask ? 'old_revision' : 'not_found' };
         }
@@ -2002,6 +2100,32 @@ export class SupervisionTaskRegistry {
             revision: requestedRevision,
           });
         }
+      }
+      // Atomic with the successor bind: either the owner moves to the new
+      // revision AND every superseded auditor reaches `cancelled`, or neither
+      // does. A partial commit would leave an auditor holding authority over a
+      // revision nobody is implementing.
+      //
+      // The old assignment keeps its identity, auditAttemptId, auditRevision
+      // and receipts EXACTLY as they were. It is retired, not rewritten:
+      // re-pointing it at the successor would silently transfer authority
+      // earned against different bytes.
+      for (const superseded of supersededAuditors) {
+        this.#writeAssignment({
+          ...superseded,
+          status: 'cancelled',
+          blocker: JSON.stringify({
+            supersededBySuccessorRevision: true,
+            supersededRevision: superseded.auditRevision,
+            supersededAttemptId: superseded.auditAttemptId,
+            successorRevision: requestedRevision,
+          }),
+          updatedAt: now,
+        }, 'cancelled', {
+          source: 'assignment_update',
+          supersededBySuccessorRevision: true,
+          successorRevision: requestedRevision,
+        });
       }
       this.#writeAssignment(record, eventType as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, {
         source: 'assignment_update',
@@ -2759,21 +2883,105 @@ export class SupervisionTaskRegistry {
   }
 
   /** Brain-authorized audit-device recovery; preserves attempt/revision/history. */
+  /**
+   * Standalone Brain-authorized retirement of ONE exact stale auditor on the
+   * CURRENT revision. Before this existed the only way to retire a live auditor
+   * was to bind a successor revision, so a same-revision deadlock had no exit
+   * (tsk_4dd). Audit history is append-only and untouched, no verdict is ever
+   * written, and an accepted PASS is never cancellable.
+   */
+  cancelStaleAuditorAsProjectBrain(input: {
+    taskId: string;
+    auditorAssignmentId: string;
+    callerProjectName: string;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const task = this.getTaskRecord(normalizeTaskString(input.taskId) ?? '');
+    const auditor = this.getAssignment(normalizeTaskString(input.auditorAssignmentId) ?? '');
+    const callerProjectName = normalizeTaskString(input.callerProjectName);
+    const reason = normalizeTaskString(input.reason);
+    if (!task || !auditor || auditor.taskId !== task.taskId) return { ok: false, reason: 'not_found' };
+    if (!callerProjectName || task.projectName !== callerProjectName) return { ok: false, reason: 'owner_mismatch' };
+    if (auditor.role !== 'auditor' || !reason) return { ok: false, reason: 'role_forbidden' };
+    if (['cancelled', 'finalized'].includes(auditor.status)) {
+      return { ok: false, reason: 'invalid_transition', detail: { taskStatus: task.status, assignmentStatus: auditor.status } };
+    }
+    if (task.commitSha || task.pushRemoteRef || task.finalization || task.archivedAt) {
+      return { ok: false, reason: 'invalid_transition', detail: { taskStatus: task.status, assignmentStatus: auditor.status } };
+    }
+    const acceptedPass = auditor.verdict?.trim().toUpperCase() === 'PASS'
+      || this.listAuditReceipts(task.taskId).some((receipt) => receipt.assignmentId === auditor.assignmentId
+        && receipt.receiptKind === 'final'
+        && receipt.verdict?.trim().toUpperCase() === 'PASS');
+    if (acceptedPass) {
+      return {
+        ok: false,
+        reason: 'receipt_closed',
+        detail: {
+          taskStatus: task.status,
+          assignmentStatus: auditor.status,
+          expectedRevision: auditor.auditRevision,
+          expectedAttemptId: auditor.auditAttemptId,
+        },
+      };
+    }
+    const now = input.now ?? Date.now();
+    const cancelled: PersistedSupervisionTaskAssignment = {
+      ...auditor,
+      status: 'cancelled',
+      leaseId: '',
+      blocker: JSON.stringify({ brainAuthorizedStaleAuditorCancel: true, reason, revision: auditor.auditRevision, attemptId: auditor.auditAttemptId }),
+      updatedAt: now,
+    };
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#writeAssignment(cancelled, 'cancelled', {
+        source: 'brain_authorized_stale_auditor_cancel',
+        reason,
+        attemptId: auditor.auditAttemptId,
+        revision: auditor.auditRevision,
+      });
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+    return { ok: true, value: cancelled };
+  }
+
   rebindAuditAssignment(input: {
     taskId: string;
     assignmentId: string;
     identity: PersistedSupervisionTaskAssignmentIdentity;
+    /**
+     * Authority layer. The registry is the authority of record and is reachable
+     * from callers other than the MCP tool, so the project check lives HERE and
+     * not only at that entry point. Without it a foreign project could rebind
+     * another project's assignment straight through the port.
+     */
+    callerProjectName: string;
     reason: string;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const task = this.getTaskRecord(input.taskId);
     const assignment = this.getAssignment(input.assignmentId);
     const reason = input.reason.trim();
+    const callerProjectName = normalizeTaskString(input.callerProjectName);
     if (!task || !assignment || assignment.taskId !== task.taskId) return { ok: false, reason: 'not_found' };
-    if (assignment.role !== 'auditor' || !assignment.auditAttemptId || !assignment.auditRevision || !reason) {
+    if (!callerProjectName || task.projectName !== callerProjectName) return { ok: false, reason: 'owner_mismatch' };
+    // A daemon restart or runtime-epoch replacement strands the exact owner of
+    // ANY long-lived role, not just auditors. Coordinator and integration_owner
+    // are rebindable on the same object; attempt/revision provenance is
+    // required for auditors, where it is the audit's identity.
+    if (!SUPERVISION_REBINDABLE_EXACT_ROLES.has(assignment.role) || !reason) {
       return { ok: false, reason: 'role_forbidden' };
     }
-    if (task.currentRevision && task.currentRevision !== assignment.auditRevision) return { ok: false, reason: 'old_revision' };
+    if (assignment.role === 'auditor' && (!assignment.auditAttemptId || !assignment.auditRevision)) {
+      return { ok: false, reason: 'role_forbidden' };
+    }
+    if (assignment.auditRevision && task.currentRevision
+      && task.currentRevision !== assignment.auditRevision) return { ok: false, reason: 'old_revision' };
     if (['finalized', 'cancelled', 'committed', 'pushed'].includes(assignment.status)
       || ['committed', 'pushed', 'finalized'].includes(task.status)) {
       return { ok: false, reason: 'receipt_closed' };
@@ -2801,6 +3009,64 @@ export class SupervisionTaskRegistry {
    * and required implementer assignment. Historical audit rows and events are
    * append-only; only the live revision binding is cleared and rebound.
    */
+  /**
+   * Selects the stale auditors a successor-revision bind is allowed to retire.
+   *
+   * Single definition shared by the ordinary successor bind and by Brain's
+   * revision recovery, so the two can never drift into different notions of
+   * "stale". Only auditors bound to the revision being superseded are eligible,
+   * and an auditor that already returned an accepted PASS is never eligible --
+   * that verdict is authority. Audit progress alone does NOT protect an
+   * auditor: a stale in-progress audit of a superseded revision is exactly what
+   * has to be retired, otherwise the task wedges with no operator escape.
+   */
+  #selectSupersedableAuditors(input: {
+    taskId: string;
+    taskStatus: string;
+    supersededRevision: string | undefined;
+    successorRevision?: string | undefined;
+  }): { ok: true; superseded: PersistedSupervisionTaskAssignment[] }
+    | { ok: false; reason: 'receipt_closed' | 'stale_audit_revision'; detail: SupervisionTaskRegistryRejectDetail } {
+    const superseded: PersistedSupervisionTaskAssignment[] = [];
+    const receipts = this.listAuditReceipts(input.taskId);
+    for (const candidate of this.listAssignments(input.taskId)) {
+      if (candidate.role !== 'auditor') continue;
+      if (['cancelled', 'finalized', 'rework'].includes(candidate.status)) continue;
+      const acceptedPass = candidate.verdict?.trim().toUpperCase() === 'PASS'
+        || receipts.some((receipt) => receipt.assignmentId === candidate.assignmentId
+          && receipt.receiptKind === 'final'
+          && receipt.verdict?.trim().toUpperCase() === 'PASS');
+      if (acceptedPass) {
+        return {
+          ok: false,
+          reason: 'receipt_closed',
+          detail: {
+            taskStatus: input.taskStatus,
+            assignmentStatus: candidate.status,
+            expectedRevision: candidate.auditRevision,
+            actualRevision: input.successorRevision,
+            expectedAttemptId: candidate.auditAttemptId,
+          },
+        };
+      }
+      if (candidate.auditRevision !== input.supersededRevision) {
+        return {
+          ok: false,
+          reason: 'stale_audit_revision',
+          detail: {
+            taskStatus: input.taskStatus,
+            assignmentStatus: candidate.status,
+            expectedRevision: input.supersededRevision,
+            actualRevision: candidate.auditRevision,
+            expectedAttemptId: candidate.auditAttemptId,
+          },
+        };
+      }
+      superseded.push(candidate);
+    }
+    return { ok: true, superseded };
+  }
+
   rebindTaskAssignmentRevision(input: {
     taskId: string;
     assignmentId: string;
@@ -2898,10 +3164,29 @@ export class SupervisionTaskRegistry {
         && candidate.role === 'implementer'
         && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
       ));
+      // A stale auditor bound to the revision being superseded is RETIRED by
+      // this recovery, not a reason to refuse it. Refusing was the tsk_4dd
+      // deadlock: the auditor could not be cancelled by any exposed path, so
+      // the task wedged permanently. Only an auditor that is NOT supersedable
+      // (accepted PASS, or bound to some other revision) still blocks.
+      const auditorSelection = this.#selectSupersedableAuditors({
+        taskId: task.taskId,
+        taskStatus: task.status,
+        supersededRevision: fromRevision ?? task.currentRevision,
+        successorRevision: toRevision,
+      });
+      const supersedableAuditorIds = new Set(
+        auditorSelection.ok ? auditorSelection.superseded.map((candidate) => candidate.assignmentId) : [],
+      );
       const activeAuditor = assignments.some((candidate) => (
         candidate.role === 'auditor'
         && !['cancelled', 'finalized'].includes(candidate.status)
+        && !supersedableAuditorIds.has(candidate.assignmentId)
       ));
+      if (!auditorSelection.ok) {
+        this.#db.exec('ROLLBACK');
+        return auditorSelection;
+      }
       const protectedRevisions = new Set([
         fromRevision, task.currentRevision, assignment.auditRevision, toRevision,
       ].filter((value): value is string => Boolean(value)));
@@ -3079,6 +3364,29 @@ export class SupervisionTaskRegistry {
         blocker: undefined,
         updatedAt: now,
       };
+      // Atomic with the successor bind: retire each stale auditor in the SAME
+      // transaction. Provenance is preserved exactly -- auditAttemptId,
+      // auditRevision and identity are untouched, the assignment is never
+      // rebound onto the successor revision, and no verdict is written. On
+      // rollback every one of them keeps its original status and authority.
+      for (const staleAuditor of (auditorSelection.ok ? auditorSelection.superseded : [])) {
+        this.#writeAssignment({
+          ...staleAuditor,
+          status: 'cancelled',
+          leaseId: '',
+          blocker: JSON.stringify({
+            supersededBySuccessorRevision: true,
+            supersededRevision: staleAuditor.auditRevision,
+            supersededAttemptId: staleAuditor.auditAttemptId,
+            successorRevision: toRevision,
+          }),
+          updatedAt: now,
+        }, 'cancelled', {
+          source: 'brain_authorized_revision_rebind',
+          supersededBySuccessorRevision: true,
+          successorRevision: toRevision,
+        });
+      }
       this.#writeAssignment(reboundAssignment, 'recovered', payload);
       this.#writeTask(reboundTask, 'recovered', { ...payload, assignmentId });
       this.#db.exec('COMMIT');

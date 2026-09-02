@@ -141,6 +141,9 @@ export interface SupervisionRegistryPort {
     | void
     | { ok: true; value?: { status?: string }; replay?: boolean }
     | { ok: false; reason: string };
+  cancelStaleAuditorAsProjectBrain?(input: {
+    taskId: string; auditorAssignmentId: string; callerProjectName: string; reason: string;
+  }): { ok: true; value?: unknown } | { ok: false; reason: string };
   rebindAuditAssignment?(input: {
     taskId: string;
     assignmentId: string;
@@ -148,6 +151,7 @@ export interface SupervisionRegistryPort {
       sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
       agentType: string; providerFamily: string;
     };
+    callerProjectName: string;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   rebindTaskAssignmentRevision?(input: {
@@ -602,6 +606,26 @@ export function createSupervisionMcpToolHandlers(
         if (!coordinated.ok) return err(coordinated.reason, `coordination override rejected: ${coordinated.reason}`);
         return ok({ taskId, assignmentId, replay: coordinated.replay === true });
       }
+      // tsk_4iu: a project Brain must be able to retire an exact stale auditor
+      // from the PUBLIC path even after a final NON-PASS verdict. Previously
+      // task_recover returned role_forbidden and task_intent cancel reported
+      // the assignment as not visible, so one orphaned auditor blocked
+      // successor binding with no operator exit.
+      if (assignmentId && !rebindSessionName && String(input.toStatus ?? '') === 'cancelled') {
+        if (!reason) return err('validation_failed', 'stale auditor cancellation requires a reason');
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        if (!task || !caller.projectName || caller.projectName !== taskProjectName
+          || (!isAdmin(caller) && !isProjectBrain(caller))) {
+          return err('forbidden', 'stale auditor cancellation requires the authoritative project Brain or administrator');
+        }
+        const cancelled = reg.cancelStaleAuditorAsProjectBrain?.({
+          taskId, auditorAssignmentId: assignmentId, callerProjectName: taskProjectName, reason,
+        });
+        if (!cancelled) return err('unavailable', 'stale auditor cancellation is not bound');
+        if (!cancelled.ok) return err(cancelled.reason, `stale auditor cancellation rejected: ${cancelled.reason}`);
+        return ok({ taskId, assignmentId, status: 'cancelled' });
+      }
       if (assignmentId || rebindSessionName) {
         if (!assignmentId || !rebindSessionName || !reason) return err('validation_failed', 'audit rebind requires assignmentId, rebindSessionName and reason');
         const task = reg.get(taskId);
@@ -625,6 +649,7 @@ export function createSupervisionMcpToolHandlers(
             agentType: identity.agentType,
             providerFamily: identity.providerFamily,
           },
+          callerProjectName: taskProjectName,
           reason,
         });
         if (!rebound) return err('unavailable', 'audit identity rebind is not bound');
