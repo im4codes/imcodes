@@ -90,6 +90,30 @@ bool UsingHardwareEncoder(VTCompressionSessionRef session,
   const OSStatus status = VTSessionCopyProperty(
       session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
       kCFAllocatorDefault, &value);
+  // NOT SUPPORTED IS AN ANSWER, NOT AN ERROR.
+  //
+  // Measured on a Mac Pro 6,1 running macOS 12.7.6: a software-only H.264
+  // session creates successfully (status 0) but this property returns
+  // kVTPropertyNotSupportedErr (-12900) with no value. VideoToolbox only
+  // publishes the key when it has something to report.
+  //
+  // Treating that as a failure rejected every software session on that host,
+  // so `encoder` stayed false and the runtime profile resolved to
+  // `unavailable` on a machine that encodes fine. An absent key means
+  // VideoToolbox is NOT claiming hardware acceleration, which is exactly
+  // `using_hardware = false`.
+  //
+  // This stays fail-closed for hardware: the caller demands an AFFIRMATIVE
+  // true before it will accept a hardware session, so an unsupported property
+  // still rejects the hardware kind. Only the software kind, which requires
+  // `using_hardware` to be false, is unblocked.
+  if (status == kVTPropertyNotSupportedErr) {
+    if (value != nullptr) {
+      CFRelease(value);
+    }
+    *using_hardware = false;
+    return true;
+  }
   if (status != noErr || value == nullptr ||
       CFGetTypeID(value) != CFBooleanGetTypeID()) {
     if (value != nullptr) {
@@ -102,9 +126,34 @@ bool UsingHardwareEncoder(VTCompressionSessionRef session,
   return true;
 }
 
+// Constrained profiles the Apple SOFTWARE encoder rejects, and the plain
+// profile that is spec-equivalent for our purposes.
+//
+// Measured on macOS 12.7.6 (Intel): the software H.264 encoder returns
+// kVTParameterErr (-12902) for ConstrainedBaseline_AutoLevel and
+// ConstrainedHigh_AutoLevel while accepting Baseline/Main/High.
+//
+// Falling back is only sound because the emitted bitstream was INSPECTED, not
+// assumed. Encoding a real 640x480 frame with Baseline_AutoLevel on that host
+// produced an SPS of profile_idc=66, profile_iop=0xe0 (constraint_set0=1,
+// constraint_set1=1, constraint_set2=1), level_idc=30, i.e.
+// profile-level-id 42e01e. profile_idc 66 with constraint_set1 set IS
+// Constrained Baseline, so the stream remains compatible with the negotiated
+// 42e01f offer; only the level differs, and 3.0 is within the advertised 3.1.
+// ConstrainedBaseline is the ONLY constrained profile ProfileLevel() can
+// produce, so it is the only one mapped here. A ConstrainedHigh branch would be
+// unreachable surface that no test could exercise and no measurement covers.
+CFStringRef PlainProfileForRejectedConstrained(CFStringRef requested) {
+  if (requested == kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel) {
+    return kVTProfileLevel_H264_Baseline_AutoLevel;
+  }
+  return nullptr;
+}
+
 bool ConfigureLowLatencyProperties(
     VTCompressionSessionRef session,
     const common::EncoderConfiguration& configuration,
+    VideoToolboxEncoderKind kind,
     VideoToolboxEncoderError* error) {
   if (!SetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue,
                    error) ||
@@ -114,10 +163,30 @@ bool ConfigureLowLatencyProperties(
   }
 
   CFStringRef profile_level = ProfileLevel(configuration.profile);
-  if (profile_level == nullptr ||
-      !SetProperty(session, kVTCompressionPropertyKey_ProfileLevel,
-                   profile_level, error)) {
+  if (profile_level == nullptr) {
     return false;
+  }
+  const OSStatus profile_status = VTSessionSetProperty(
+      session, kVTCompressionPropertyKey_ProfileLevel, profile_level);
+  if (profile_status != noErr) {
+    // Retry is gated on ALL THREE of: the software kind, an exact constrained
+    // mapping, and the exact measured status kVTParameterErr (-12902). Hardware
+    // keeps the exact requested profile, and any other status fails closed --
+    // an unexpected failure must not be laundered into a different profile.
+    CFStringRef plain =
+        (kind == VideoToolboxEncoderKind::kQualifiedAppleSoftware &&
+         profile_status == kVTParameterErr)
+            ? PlainProfileForRejectedConstrained(profile_level)
+            : nullptr;
+    if (plain == nullptr ||
+        !SetProperty(session, kVTCompressionPropertyKey_ProfileLevel, plain,
+                     error)) {
+      if (error != nullptr) {
+        *error = {VideoToolboxEncoderErrorCode::kInvalidConfiguration,
+                  "VideoToolbox rejected the requested H.264 profile level"};
+      }
+      return false;
+    }
   }
 
   CFNumberRef frame_rate = Number(configuration.frame_rate);
@@ -522,7 +591,7 @@ VTCompressionSessionRef CreateCompressionSession(
     return nullptr;
   }
 
-  if (!ConfigureLowLatencyProperties(session, configuration, error)) {
+  if (!ConfigureLowLatencyProperties(session, configuration, kind, error)) {
     VTCompressionSessionInvalidate(session);
     CFRelease(session);
     return nullptr;

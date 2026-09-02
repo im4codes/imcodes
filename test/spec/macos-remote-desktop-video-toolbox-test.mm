@@ -341,6 +341,90 @@ bool TestSoftwareFallbackRequiresQualification() {
              "preference");
 }
 
+// Default policy must ship software fallback ENABLED and QUALIFIED.
+//
+// The counterexample that forced this: on a Mac Pro 6,1 the hardware probe
+// returns -12903 (kVTVideoEncoderNotAvailableNow) while a software-only
+// VTCompressionSession creates successfully. With fallback defaulted off, the
+// cold readiness probe reported encoder=false and the runtime profile resolved
+// to `unavailable`, so the host advertised nothing even though it could encode.
+// A hardware-spec inference is not a capability probe.
+//
+// Hardware preference is unchanged, the real software-session probe is still
+// required, and explicit opt-out still fails closed.
+bool TestSoftwareFallbackDefaultsOnAndQualified() {
+  {
+    // DEFAULT-CONSTRUCTED policy, hardware missing, software present.
+    auto backend = std::make_unique<FakeBackend>();
+    FakeBackend* fake = backend.get();
+    fake->hardware_available = false;
+    encoder::VideoToolboxH264Encoder adapter(std::move(backend));
+    if (!Check(adapter.ProbeReadiness() == common::ReadinessState::kReady,
+               "default policy must advertise ready when only software encodes") ||
+        !Check(adapter.Configure(Configuration(), [](common::H264AccessUnit) {}),
+               "default policy must configure the software encoder") ||
+        !Check(adapter.ActiveEncoderKind() ==
+                   encoder::VideoToolboxEncoderKind::kQualifiedAppleSoftware,
+               "default policy must land on the qualified software kind")) {
+      return false;
+    }
+  }
+  {
+    // The software probe stays load-bearing: no software session, no readiness.
+    auto backend = std::make_unique<FakeBackend>();
+    FakeBackend* fake = backend.get();
+    fake->hardware_available = false;
+    fake->software_available = false;
+    encoder::VideoToolboxH264Encoder adapter(std::move(backend));
+    if (!Check(adapter.ProbeReadiness() == common::ReadinessState::kUnavailable,
+               "default policy must not advertise ready without a software session")) {
+      return false;
+    }
+  }
+  {
+    // Hardware still wins when present; software is never attempted first.
+    auto backend = std::make_unique<FakeBackend>();
+    FakeBackend* fake = backend.get();
+    fake->hardware_available = true;
+    encoder::VideoToolboxH264Encoder adapter(std::move(backend));
+    if (!Check(adapter.Configure(Configuration(), [](common::H264AccessUnit) {}),
+               "hardware-first configure must succeed") ||
+        !Check(fake->configured_kinds.size() == 1 &&
+                   fake->configured_kinds[0] ==
+                       encoder::VideoToolboxEncoderKind::kHardware,
+               "hardware present must not attempt software fallback")) {
+      return false;
+    }
+  }
+  {
+    // EXPLICIT opt-out must still fail closed, on either key.
+    auto disabled = std::make_unique<FakeBackend>();
+    FakeBackend* fake_disabled = disabled.get();
+    fake_disabled->hardware_available = false;
+    encoder::VideoToolboxH264Encoder off(
+        std::move(disabled), {.allow_apple_software_fallback = false,
+                              .apple_software_fallback_qualified = true});
+    if (!Check(off.ProbeReadiness() == common::ReadinessState::kUnavailable,
+               "explicit allow=false must fail closed") ||
+        !Check(!off.Configure(Configuration(), [](common::H264AccessUnit) {}),
+               "explicit allow=false must not configure") ||
+        !Check(fake_disabled->configured_kinds.empty(),
+               "explicit allow=false must not attempt software")) {
+      return false;
+    }
+    auto unqualified = std::make_unique<FakeBackend>();
+    unqualified->hardware_available = false;
+    encoder::VideoToolboxH264Encoder unq(
+        std::move(unqualified), {.allow_apple_software_fallback = true,
+                                 .apple_software_fallback_qualified = false});
+    if (!Check(unq.ProbeReadiness() == common::ReadinessState::kUnavailable,
+               "explicit qualified=false must fail closed")) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool TestQualityReconfigureAndAsyncFailure() {
   auto backend = std::make_unique<FakeBackend>();
   FakeBackend* fake = backend.get();
@@ -411,6 +495,7 @@ int main() {
                    TestBoundedAvccToAnnexBContract() &&
                    TestHardwarePreferenceKeyframesAndQueueBound() &&
                    TestSoftwareFallbackRequiresQualification() &&
+                   TestSoftwareFallbackDefaultsOnAndQualified() &&
                    TestQualityReconfigureAndAsyncFailure() &&
                    TestStopIgnoresLateOutput()
                ? 0

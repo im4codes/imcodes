@@ -47,13 +47,40 @@ struct VideoToolboxEncoderError {
   }
 };
 
-// Software fallback is deliberately two-keyed. Product/release qualification
-// must opt in, and the Apple backend must prove that a software-only
-// VideoToolbox H.264 session can actually be created. A failed hardware probe
-// alone never silently enables software encoding.
+// Apple software H.264 fallback is ENABLED and QUALIFIED BY DEFAULT.
+//
+// It used to default off, and that was wrong in a way real hardware exposed: on
+// a Mac Pro 6,1 the hardware probe returns -12903
+// (kVTVideoEncoderNotAvailableNow) while a software-only VideoToolbox
+// compression session creates successfully and encodes. With the fallback
+// defaulted off, cold
+// readiness reported encoder=false, the runtime profile resolved to
+// `unavailable`, and the host advertised nothing at all -- on a machine that
+// could encode perfectly well. Defaulting off did not make anything safer; it
+// made a working capability invisible.
+//
+// What the default does NOT change:
+//   * Hardware stays strictly preferred. Readiness answers ready from hardware
+//     without consulting software, and Configure only reaches software after a
+//     hardware attempt fails.
+//   * The software path is still proven, never assumed. Readiness requires
+//     AppleSoftwareEncoderAvailable(), which creates and tears down a real
+//     software-only VideoToolbox compression session. No session, no
+//     readiness.
+//   * Opt-out remains explicit and fails closed on EITHER key. Setting
+//     allow_apple_software_fallback=false or
+//     apple_software_fallback_qualified=false returns kUnavailable and never
+//     even attempts a software configure.
+//
+// Both keys are kept so a release can still disable or de-qualify the fallback
+// deliberately; only their defaults changed.
+//
+// This struct is the single source of that default. The cold readiness probe in
+// worker_main and the production session both default-construct it, so the two
+// cannot drift apart.
 struct VideoToolboxEncoderPolicy {
-  bool allow_apple_software_fallback = false;
-  bool apple_software_fallback_qualified = false;
+  bool allow_apple_software_fallback = true;
+  bool apple_software_fallback_qualified = true;
 };
 
 struct VideoToolboxEncoderLimits {
