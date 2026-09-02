@@ -581,7 +581,7 @@ describe('RemoteDesktopRouter', () => {
     expect(serializedAudits).not.toContain('KeyA');
   });
 
-  it('permits one lease-revalidated ICE restart and rejects a second restart', async () => {
+  it('permits eight lease-revalidated ICE restarts and rejects the ninth', async () => {
     const f = fixture();
     const authority = await authorize(f);
     const offer = {
@@ -596,30 +596,38 @@ describe('RemoteDesktopRouter', () => {
       sdp: 'v=0\r\na=ice-ufrag:answer-first',
     }, 7)).toBe(true);
 
-    await f.router.handleBrowser(f.browserA, 'owner-user', {
-      ...offer,
-      sdp: 'v=0\r\na=ice-ufrag:restart-one',
-    });
-    expect(f.daemonMessages.at(-1)).toMatchObject({
-      type: REMOTE_DESKTOP_MSG.OFFER,
-      sdp: expect.stringContaining('restart-one'),
-    });
+    for (let attempt = 1; attempt <= REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS; attempt++) {
+      await f.router.handleBrowser(f.browserA, 'owner-user', {
+        ...offer,
+        sdp: `v=0\r\na=ice-ufrag:restart-${attempt}`,
+      });
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        sdp: expect.stringContaining(`restart-${attempt}`),
+      });
+      expect(f.daemonMessages.at(-2)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.MODE_STATE,
+        inputEpoch: 1 + attempt,
+      });
+      expect(f.router.handleDaemon({
+        type: REMOTE_DESKTOP_MSG.ANSWER,
+        ...authority,
+        sdp: `v=0\r\na=ice-ufrag:answer-restart-${attempt}`,
+      }, 7)).toBe(true);
+    }
     expect(f.audits).toEqual(expect.arrayContaining([
       expect.objectContaining({
         event: REMOTE_DESKTOP_AUDIT_EVENT.RECONNECTING,
-        fields: expect.objectContaining({ iceRestartAttempt: 1 }),
+        fields: expect.objectContaining({
+          iceRestartAttempt: REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS,
+        }),
       }),
     ]));
-    expect(f.router.handleDaemon({
-      type: REMOTE_DESKTOP_MSG.ANSWER,
-      ...authority,
-      sdp: 'v=0\r\na=ice-ufrag:answer-restart',
-    }, 7)).toBe(true);
 
     const daemonCount = f.daemonMessages.length;
     await f.router.handleBrowser(f.browserA, 'owner-user', {
       ...offer,
-      sdp: 'v=0\r\na=ice-ufrag:restart-two',
+      sdp: 'v=0\r\na=ice-ufrag:restart-over-budget',
     });
     expect(f.daemonMessages).toHaveLength(daemonCount);
     expect(f.messages(f.browserA).at(-1)).toMatchObject({
@@ -1258,7 +1266,7 @@ describe('RemoteDesktopRouter', () => {
     }
   });
 
-  it('suspends on daemon replacement and still tears down browser close/malformed frames', async () => {
+  it('suspends on daemon replacement and still tears down malformed frames', async () => {
     const replaced = fixture();
     const firstAuthority = await authorize(replaced);
     replaced.setGeneration(8);
@@ -1279,12 +1287,6 @@ describe('RemoteDesktopRouter', () => {
       reason: REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
     });
 
-    const disconnected = fixture();
-    const secondAuthority = await authorize(disconnected);
-    disconnected.router.dropSocket(disconnected.browserA);
-    expect(disconnected.daemonMessages.at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.STOP, ...secondAuthority });
-    expect(disconnected.router.stats().active).toBe(0);
-
     const malformed = fixture();
     const thirdAuthority = await authorize(malformed);
     malformed.router.handleDaemon({
@@ -1301,6 +1303,137 @@ describe('RemoteDesktopRouter', () => {
       ...thirdAuthority,
       reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
     });
+  });
+
+  it('keeps a dropped browser route inert and resumes it on the exact authority', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const f = fixture({ access: validAccess(Date.now()) });
+      const authority = await authorize(f);
+      const daemonBeforeDrop = f.daemonMessages.length;
+
+      f.router.dropSocket(f.browserA);
+
+      expect(f.router.stats().active).toBe(1);
+      expect(f.router.stats().controlling).toBe(0);
+      expect(f.daemonMessages).toHaveLength(daemonBeforeDrop + 1);
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.MODE_STATE,
+        ...authority,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 2,
+      });
+      expect(f.daemonMessages.at(-1)?.type).not.toBe(REMOTE_DESKTOP_MSG.STOP);
+
+      await f.router.handleBrowser(f.browserB, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ...authority,
+      });
+
+      expect(f.messages(f.browserB).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.RESUMED,
+        ...authority,
+        daemonGeneration: 7,
+        inputEpoch: 2,
+      });
+      expect(f.router.stats().active).toBe(1);
+      expect(f.router.stats().controlling).toBe(1);
+
+      const browserC = {} as WebSocket;
+      await f.router.handleBrowser(browserC, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ...authority,
+      });
+      expect(f.messages(browserC).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.ERROR,
+        error: REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY,
+      });
+
+      const daemonBeforeOldSocket = f.daemonMessages.length;
+      await f.router.handleBrowser(f.browserA, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        ...authority,
+        sdp: 'v=0\r\na=stale-old-socket',
+      });
+      expect(f.daemonMessages).toHaveLength(daemonBeforeOldSocket);
+
+      await f.router.handleBrowser(f.browserB, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        ...authority,
+        sdp: 'v=0\r\na=resume-ice-restart',
+      });
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        sdp: expect.stringContaining('resume-ice-restart'),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('expires an unresumed browser route after the bounded signaling grace', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const f = fixture({
+        // Keep presence independently fresh so this test isolates the browser
+        // signaling grace rather than the shorter host-heartbeat policy.
+        access: validAccess(Date.now() + REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS),
+      });
+      const authority = await authorize(f);
+      expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS).toBe(5 * 60_000);
+      f.router.handleDaemon({
+        type: REMOTE_DESKTOP_MSG.STATUS,
+        ...authority,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
+        inputEnabled: true,
+      }, 7);
+
+      f.router.dropSocket(f.browserA);
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS - 1);
+      expect(f.router.stats().active).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(f.router.stats().active).toBe(0);
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.STOP,
+        ...authority,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses resume when durable account authority was revoked during the outage', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    f.router.dropSocket(f.browserA);
+    f.setAccess(null);
+
+    await f.router.handleBrowser(f.browserB, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      ...authority,
+    });
+
+    expect(f.router.stats().active).toBe(0);
+    expect(f.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      ...authority,
+    });
+    expect(f.messages(f.browserB).some((message) => (
+      message.type === REMOTE_DESKTOP_MSG.RESUMED
+    ))).toBe(false);
   });
 
   it('enforces bounded ICE candidates and idempotent client Stop', async () => {

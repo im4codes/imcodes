@@ -272,6 +272,34 @@ int main() {
   {
     FakeTransportAdapter adapter;
     common::TransportSessionCore core(adapter, ladder, Limits());
+    Require(core.Start(Authority(), At(0, 0)) &&
+                core.OnPeerConnectionState(
+                    Stamp(), common::PeerConnectionState::kConnected,
+                    At(1, 1)),
+            "recoverable failure transport starts connected");
+    Require(core.OnPeerConnectionState(
+                Stamp(), common::PeerConnectionState::kFailed, At(2, 2)) &&
+                !core.terminal() && adapter.close_transport_count == 0 &&
+                adapter.released_epochs == std::vector<std::uint64_t>{7},
+            "failed peer releases input but stays alive for ICE restart");
+    Require(core.OnPeerConnectionState(
+                Stamp(), common::PeerConnectionState::kConnecting,
+                At(3, 3)) &&
+                core.OnPeerConnectionState(
+                    Stamp(), common::PeerConnectionState::kConnected,
+                    At(4, 4)) &&
+                !core.terminal(),
+            "failed peer can recover in place through connecting");
+    Require(!core.OnPeerConnectionState(
+                Stamp(), common::PeerConnectionState::kClosed, At(5, 5)) &&
+                core.terminal_reason() ==
+                    common::TransportTerminalReason::kPeerFailed,
+            "an explicit peer close remains terminal after recovery");
+  }
+
+  {
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
     Require(core.Start(Authority(), At(0, 0)), "ICE test transport starts");
     Require(
         core.AddRemoteIceCandidate(Authority().identity, Candidate("r1")) &&
@@ -396,6 +424,31 @@ int main() {
     core.Stop();
     Require(adapter.released_epochs.size() == 1,
             "terminal cleanup does not double-release a downgraded epoch");
+  }
+
+  {
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
+    const common::RouteAuthority control = Authority(
+        common::TransportSessionMode::kControl, 7, 10'000, 20'000);
+    Require(core.Start(control, At(0, 0)),
+            "control transport starts before same-mode rekey");
+    common::RouteAuthority rekeyed = control;
+    rekeyed.input_epoch = 8;
+    Require(core.UpdateMode(rekeyed, At(10, 10)) &&
+                adapter.released_epochs == std::vector<std::uint64_t>{7},
+            "same-mode rekey releases every input owned by the old epoch");
+    Require(core.UpdateMode(rekeyed, At(11, 11)) &&
+                adapter.released_epochs == std::vector<std::uint64_t>{7},
+            "duplicate rekey is idempotent and does not release twice");
+    common::RouteAuthority skipped = rekeyed;
+    skipped.input_epoch = 10;
+    Require(!core.UpdateMode(skipped, At(12, 12)) &&
+                adapter.released_epochs == std::vector<std::uint64_t>{7},
+            "same-mode rekey cannot skip an input authority generation");
+    core.Stop();
+    Require(adapter.released_epochs == std::vector<std::uint64_t>{7, 8},
+            "terminal cleanup releases only the replacement epoch");
   }
 
   {

@@ -60,6 +60,12 @@ bool PeerTransitionAllowed(PeerConnectionState previous,
              next == PeerConnectionState::kFailed ||
              next == PeerConnectionState::kClosed;
     case PeerConnectionState::kFailed:
+      // libwebrtc permits an in-place ICE restart after failure. The route is
+      // still bounded by its renewable lease and the server's restart budget;
+      // only an explicit close is terminal here.
+      return next == PeerConnectionState::kConnecting ||
+             next == PeerConnectionState::kConnected ||
+             next == PeerConnectionState::kClosed;
     case PeerConnectionState::kClosed:
       return false;
   }
@@ -187,15 +193,20 @@ bool TransportSessionCore::UpdateMode(const RouteAuthority& update,
   }
 
   const bool changed = update.mode != authority_.mode;
-  if ((!changed && update.input_epoch != authority_.input_epoch) ||
-      (changed &&
-       (authority_.input_epoch == std::numeric_limits<std::uint64_t>::max() ||
-        update.input_epoch != authority_.input_epoch + 1))) {
+  const bool epoch_unchanged = update.input_epoch == authority_.input_epoch;
+  const bool epoch_advanced =
+      authority_.input_epoch != std::numeric_limits<std::uint64_t>::max() &&
+      update.input_epoch == authority_.input_epoch + 1;
+  if ((changed && !epoch_advanced) ||
+      (!changed && !epoch_unchanged && !epoch_advanced)) {
     return false;
   }
 
+  // A same-mode epoch advance is the signaling-resume fence: release every
+  // key/button owned by the old browser before accepting the replacement
+  // browser's frames. Idempotent same-epoch updates do not release twice.
   if (authority_.mode == TransportSessionMode::kControl &&
-      update.mode == TransportSessionMode::kView) {
+      (update.mode == TransportSessionMode::kView || epoch_advanced)) {
     ReleaseControlAuthority();
   }
   authority_ = update;
@@ -335,10 +346,15 @@ bool TransportSessionCore::OnPeerConnectionState(
     return false;
   }
   peer_state_ = state;
-  if (state == PeerConnectionState::kFailed ||
-      state == PeerConnectionState::kClosed) {
+  if (state == PeerConnectionState::kClosed) {
     Terminate(TransportTerminalReason::kPeerFailed);
     return false;
+  }
+  if (state == PeerConnectionState::kFailed) {
+    // Release keys/buttons immediately, but keep the transport available for
+    // the server-authorized ICE restart. The restart offer rekeys input before
+    // it is forwarded, so delayed frames from this failed path stay fenced.
+    ReleaseControlAuthority();
   }
   if (state == PeerConnectionState::kConnected &&
       previous != PeerConnectionState::kConnected) {

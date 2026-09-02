@@ -1041,7 +1041,8 @@ void PeerSession::OnConnectionChange(
   } else if (state ==
                  webrtc::PeerConnectionInterface::PeerConnectionState::kNew ||
              state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnecting ||
-             state == webrtc::PeerConnectionInterface::PeerConnectionState::kDisconnected) {
+             state == webrtc::PeerConnectionInterface::PeerConnectionState::kDisconnected ||
+             state == webrtc::PeerConnectionInterface::PeerConnectionState::kFailed) {
     SendStatus("connecting", false);
   }
 }

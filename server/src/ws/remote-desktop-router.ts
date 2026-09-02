@@ -27,6 +27,7 @@ import {
   validateRemoteDesktopDaemonMessage,
   type RemoteDesktopBrowserMessage,
   type RemoteDesktopAccessMode,
+  type RemoteDesktopResume,
   type RemoteDesktopStart,
   type RemoteDesktopTerminalReason,
   type RemoteDesktopRoute as RemoteDesktopConnectionRoute,
@@ -212,6 +213,7 @@ interface RemoteDesktopRoute {
   accessRole?: MachineAccessRole;
   daemonGeneration: number;
   daemonSuspended: boolean;
+  browserDetached: boolean;
   capabilityHash: Buffer;
   createdAt: number;
   expiresAt: number;
@@ -234,13 +236,14 @@ interface RemoteDesktopRoute {
   modeWindowCount: number;
   offerCount: number;
   answerCount: number;
-  revalidationInFlight: boolean;
+  revalidationPromise: Promise<void> | null;
   registryIdentity: RemoteDesktopRouteRegistryIdentity;
   registryCloseStarted: boolean;
   negotiationTimer: ReturnType<typeof setTimeout>;
   absoluteTimer: ReturnType<typeof setTimeout>;
   leaseTimer: ReturnType<typeof setTimeout>;
   renewalTimer: ReturnType<typeof setInterval>;
+  browserReconnectTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface PendingGuestAdmission {
@@ -339,7 +342,7 @@ export class RemoteDesktopRouter {
     return {
       active: this.routesBySession.size,
       controlling: [...this.routesBySession.values()].filter((route) => (
-        route.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL
+        !route.browserDetached && route.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL
       )).length,
       ...this.counters,
     };
@@ -362,6 +365,11 @@ export class RemoteDesktopRouter {
       const operation = this.admissionQueue.then(() => this.authorize(socket, userId, parsed.value as RemoteDesktopStart));
       this.admissionQueue = operation.catch(() => {});
       await operation;
+      return true;
+    }
+
+    if (parsed.value.type === REMOTE_DESKTOP_MSG.RESUME) {
+      await this.resumeRoute(socket, `account:${userId}`, parsed.value);
       return true;
     }
 
@@ -420,8 +428,25 @@ export class RemoteDesktopRouter {
       await operation;
       return true;
     }
+    if (parsed.value.type === REMOTE_DESKTOP_MSG.RESUME) {
+      const route = this.routesBySession.get(parsed.value.sessionId);
+      if (!route || route.actor.source === REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT) return true;
+      this.guestPrincipalBySocket.set(socket, route.principalId);
+      await this.resumeRoute(socket, route.principalId, parsed.value);
+      return true;
+    }
     await this.forwardBrowserSignal(socket, this.guestPrincipalBySocket.get(socket) ?? '', parsed.value);
     return true;
+  }
+
+  /** First-frame guest resume for a ticket-less replacement signaling socket. */
+  async resumeGuestBrowser(socket: WebSocket, message: unknown): Promise<boolean> {
+    const parsed = validateRemoteDesktopBrowserMessage(message);
+    if (!parsed.ok || parsed.value.type !== REMOTE_DESKTOP_MSG.RESUME) return false;
+    const route = this.routesBySession.get(parsed.value.sessionId);
+    if (!route || route.actor.source === REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT) return false;
+    this.guestPrincipalBySocket.set(socket, route.principalId);
+    return this.resumeRoute(socket, route.principalId, parsed.value);
   }
 
   handleDaemon(message: unknown, daemonGeneration: number): boolean {
@@ -496,7 +521,7 @@ export class RemoteDesktopRouter {
         ? REMOTE_DESKTOP_STATE.CONNECTING
         : parsed.value.state;
       route.statusReceived = true;
-      route.workerInputEnabled = parsed.value.inputEnabled;
+      route.workerInputEnabled = !route.browserDetached && parsed.value.inputEnabled;
       route.connectionRoute = parsed.value.route;
       if (parsed.value.selectedDisplayId !== undefined
         && parsed.value.layoutRevision !== undefined) {
@@ -513,7 +538,7 @@ export class RemoteDesktopRouter {
         }
       }
       const effectiveInputEnabled = route.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL
-        && parsed.value.inputEnabled;
+        && route.workerInputEnabled;
       if (effectiveInputEnabled !== route.auditedInputEnabled) {
         route.auditedInputEnabled = effectiveInputEnabled;
         this.audit(REMOTE_DESKTOP_AUDIT_EVENT.INPUT_ENABLED, route, {
@@ -549,7 +574,7 @@ export class RemoteDesktopRouter {
       }
     }
 
-    this.hooks.sendBrowser(route.socket, outbound);
+    if (!route.browserDetached) this.hooks.sendBrowser(route.socket, outbound);
     if (parsed.value.type === REMOTE_DESKTOP_MSG.STATUS) {
       this.publishCollaborationCounts(route.sessionId);
     }
@@ -765,6 +790,100 @@ export class RemoteDesktopRouter {
     return recovered;
   }
 
+  private async resumeRoute(
+    socket: WebSocket,
+    principalId: string,
+    message: RemoteDesktopResume,
+  ): Promise<boolean> {
+    const route = this.routesBySession.get(message.sessionId);
+    const exact = route
+      && route.requestId === message.requestId
+      && route.principalId === principalId
+      && capabilityMatches(route, message.capability)
+      && route.expiresAt > this.now()
+      && route.leaseExpiresAt > this.now()
+      && !route.daemonSuspended
+      && route.daemonGeneration === this.hooks.daemonGeneration()
+      && this.hooks.daemonAvailable()
+      && this.hooks.daemonSupportsRemoteDesktop();
+    if (!exact || (!route.browserDetached && route.socket !== socket)) {
+      this.counters.dropped++;
+      this.sendError(socket, message.requestId, REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY, false);
+      return false;
+    }
+
+    // Re-check durable account/share authority before moving the process-local
+    // socket. A capability proves continuity, never continued permission.
+    await this.renewLease(route);
+    if (this.routesBySession.get(route.sessionId) !== route
+      || route.leaseExpiresAt <= this.now()
+      || route.daemonSuspended) return false;
+
+    let iceAuthority: TurnIceServerAuthority;
+    try {
+      iceAuthority = this.hooks.iceServers(route.userId ?? route.actor.auditId);
+    } catch {
+      this.sendError(socket, message.requestId, REMOTE_DESKTOP_ERROR.INTERNAL_ERROR, true);
+      return false;
+    }
+
+    if (route.browserReconnectTimer) clearTimeout(route.browserReconnectTimer);
+    route.browserReconnectTimer = null;
+    route.socket = socket;
+    route.browserDetached = false;
+    this.hooks.sendBrowser(socket, {
+      type: REMOTE_DESKTOP_MSG.RESUMED,
+      requestId: route.requestId,
+      sessionId: route.sessionId,
+      capability: this.deriveCapability(route.requestId, route.sessionId),
+      expiresAt: route.expiresAt,
+      leaseExpiresAt: route.leaseExpiresAt,
+      daemonGeneration: route.daemonGeneration,
+      mode: route.mode,
+      inputEpoch: route.inputEpoch,
+      iceServers: iceAuthority.iceServers,
+    });
+    this.audit(REMOTE_DESKTOP_AUDIT_EVENT.RECONNECTING, route, {
+      signalingResumed: true,
+      reconnectAttempt: route.reconnectAttempt,
+    });
+    this.publishCollaborationCounts(route.sessionId);
+    return true;
+  }
+
+  private detachRoute(route: RemoteDesktopRoute, socket: WebSocket): void {
+    if (this.routesBySession.get(route.sessionId) !== route
+      || route.socket !== socket
+      || route.browserDetached) return;
+    route.browserDetached = true;
+    // Fence every input frame already queued by the disconnected browser.
+    // The resumed browser learns the new epoch only after durable authority is
+    // revalidated, and must re-acknowledge the current frame before Control.
+    route.inputEpoch += 1;
+    route.workerInputEnabled = false;
+    route.auditedInputEnabled = false;
+    if (!this.hooks.sendDaemon(this.modeState(route), route.daemonGeneration)) {
+      this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+      return;
+    }
+    this.audit(REMOTE_DESKTOP_AUDIT_EVENT.RECONNECTING, route, {
+      browserDisconnected: true,
+      inputEpoch: route.inputEpoch,
+    });
+    this.publishCollaborationCounts(route.sessionId);
+    route.browserReconnectTimer = this.timer(() => {
+      route.browserReconnectTimer = null;
+      if (this.routesBySession.get(route.sessionId) === route && route.browserDetached) {
+        this.stopDaemon(route);
+        this.audit(REMOTE_DESKTOP_AUDIT_EVENT.STOPPED, route, {
+          browserDisconnected: true,
+          reconnectGraceExpired: true,
+        });
+        this.deleteRoute(route);
+      }
+    }, REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS);
+  }
+
   dropSocket(socket: WebSocket): void {
     this.startsBySocket.delete(socket);
     this.guestPrincipalBySocket.delete(socket);
@@ -775,9 +894,7 @@ export class RemoteDesktopRouter {
     }
     for (const route of [...this.routesBySession.values()]) {
       if (route.socket === socket) {
-        this.stopDaemon(route);
-        this.audit(REMOTE_DESKTOP_AUDIT_EVENT.STOPPED, route, { browserDisconnected: true });
-        this.deleteRoute(route);
+        this.detachRoute(route, socket);
       }
     }
   }
@@ -1428,8 +1545,20 @@ export class RemoteDesktopRouter {
           || route.daemonGeneration !== this.hooks.daemonGeneration()) {
           return;
         }
+        if (route.inputEpoch === Number.MAX_SAFE_INTEGER) {
+          this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR, true);
+          return;
+        }
+        route.inputEpoch += 1;
+        route.workerInputEnabled = false;
+        route.auditedInputEnabled = false;
+        if (!this.hooks.sendDaemon(this.modeState(route), route.daemonGeneration)) {
+          this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+          return;
+        }
         this.audit(REMOTE_DESKTOP_AUDIT_EVENT.RECONNECTING, route, {
           iceRestartAttempt,
+          inputEpoch: route.inputEpoch,
         });
       }
       route.state = REMOTE_DESKTOP_STATE.CONNECTING;
@@ -1468,6 +1597,7 @@ export class RemoteDesktopRouter {
       ...input,
       capabilityHash: hashCapability(input.capability),
       daemonSuspended: false,
+      browserDetached: false,
       state: REMOTE_DESKTOP_STATE.PREPARING,
       browserIceCandidates: 0,
       daemonIceCandidates: 0,
@@ -1477,12 +1607,13 @@ export class RemoteDesktopRouter {
       modeWindowCount: 0,
       offerCount: 0,
       answerCount: 0,
-      revalidationInFlight: false,
+      revalidationPromise: null,
       statusReceived: false,
       workerInputEnabled: false,
       auditedInputEnabled: false,
       connectionRoute: undefined,
       registryCloseStarted: false,
+      browserReconnectTimer: null,
     });
     route.negotiationTimer = this.timer(() => {
       if (this.routesBySession.get(route.sessionId) === route) {
@@ -1501,7 +1632,21 @@ export class RemoteDesktopRouter {
   }
 
   private async renewLease(route: RemoteDesktopRoute): Promise<void> {
-    if (this.routesBySession.get(route.sessionId) !== route || route.revalidationInFlight) return;
+    if (this.routesBySession.get(route.sessionId) !== route) return;
+    if (route.revalidationPromise) {
+      await route.revalidationPromise;
+      return;
+    }
+    const operation = this.renewLeaseExclusive(route);
+    route.revalidationPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (route.revalidationPromise === operation) route.revalidationPromise = null;
+    }
+  }
+
+  private async renewLeaseExclusive(route: RemoteDesktopRoute): Promise<void> {
     if (route.daemonSuspended) return;
     if (this.hooks.featureEnabled?.() === false) {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE, true);
@@ -1518,7 +1663,6 @@ export class RemoteDesktopRouter {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED, true);
       return;
     }
-    route.revalidationInFlight = true;
     if (route.actor.source === REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT) {
       let access: ControlledMachineAccessRow | null = null;
       try {
@@ -1530,8 +1674,6 @@ export class RemoteDesktopRouter {
         );
       } catch {
         // Fail closed below.
-      } finally {
-        route.revalidationInFlight = false;
       }
       if (this.routesBySession.get(route.sessionId) !== route) return;
       const terminalReason = this.revalidationFailure(access);
@@ -1543,11 +1685,7 @@ export class RemoteDesktopRouter {
       let current: RemoteDesktopActor | null = null;
       try {
         current = await this.hooks.resolveGuestActor?.(route.actor, this.now()) ?? null;
-      } catch {
-        current = null;
-      } finally {
-        route.revalidationInFlight = false;
-      }
+      } catch { current = null; }
       if (this.routesBySession.get(route.sessionId) !== route) return;
       if (!current || current.endpointGeneration !== route.daemonGeneration
         || !isRemoteDesktopActorRenewable(route.actor, current, this.now())) {
@@ -1745,6 +1883,8 @@ export class RemoteDesktopRouter {
 
   private deleteRoute(route: RemoteDesktopRoute): void {
     this.closeRegisteredRoute(route);
+    if (route.browserReconnectTimer) clearTimeout(route.browserReconnectTimer);
+    route.browserReconnectTimer = null;
     clearTimeout(route.negotiationTimer);
     clearTimeout(route.absoluteTimer);
     clearTimeout(route.leaseTimer);
@@ -1782,7 +1922,7 @@ export class RemoteDesktopRouter {
   private publishCollaborationCounts(excludeSessionId?: string): void {
     const stats = this.stats();
     for (const route of this.routesBySession.values()) {
-      if (!route.statusReceived || route.sessionId === excludeSessionId) continue;
+      if (route.browserDetached || !route.statusReceived || route.sessionId === excludeSessionId) continue;
       this.hooks.sendBrowser(route.socket, {
         type: REMOTE_DESKTOP_MSG.STATUS,
         requestId: route.requestId,

@@ -37,7 +37,9 @@ export type RemoteDesktopState = typeof REMOTE_DESKTOP_STATE[keyof typeof REMOTE
 export const REMOTE_DESKTOP_MSG = {
   BOOTSTRAP_REDEEMED: 'remote_desktop.bootstrap_redeemed',
   START: 'remote_desktop.start',
+  RESUME: 'remote_desktop.resume',
   AUTHORIZED: 'remote_desktop.authorized',
+  RESUMED: 'remote_desktop.resumed',
   PREPARE: 'remote_desktop.prepare',
   OFFER: 'remote_desktop.offer',
   ANSWER: 'remote_desktop.answer',
@@ -383,6 +385,16 @@ export const REMOTE_DESKTOP_LIMITS = {
   MAX_STARTS_PER_USER_PER_MINUTE: 20,
   MAX_STARTS_PER_MACHINE_PER_MINUTE: 40,
   MAX_AUDITS_PER_MACHINE_PER_MINUTE: 120,
+  /**
+   * Keep an already-authorized route alive while only its signaling socket is
+   * unavailable. Media stays peer-to-peer; the server fences the old browser
+   * input epoch immediately and destroys the route when this bound expires.
+   */
+  SIGNALING_RECONNECT_GRACE_MS: 5 * 60_000,
+  SIGNALING_RECONNECT_BACKOFF_MS: 250,
+  SIGNALING_RECONNECT_MAX_BACKOFF_MS: 5_000,
+  SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS: 5_000,
+  MAX_SIGNALING_RECONNECT_ATTEMPTS: 64,
   MAX_RECONNECT_ATTEMPTS: 3,
   // Old Windows hardware MFTs can take roughly three seconds to release their
   // final queued surfaces after PeerConnection teardown. Keep a bounded
@@ -393,7 +405,7 @@ export const REMOTE_DESKTOP_LIMITS = {
   // this window earns a fresh retry budget, so a later transient drop does not
   // permanently strand a long-running remote-control panel.
   RECONNECT_STABILITY_RESET_MS: 30_000,
-  MAX_ICE_RESTARTS: 1,
+  MAX_ICE_RESTARTS: 8,
   MAX_MODE_CHANGES_PER_MINUTE: 30,
   MAX_POINTER_EVENTS_PER_SECOND: 240,
   MAX_KEYBOARD_EVENTS_PER_SECOND: 120,
@@ -425,6 +437,17 @@ export interface RemoteDesktopStart {
   reconnectAttempt?: number;
 }
 
+/** Browser proof that a replacement signaling socket owns the exact live
+ * route. The capability is already a route-scoped bearer secret; no new grant
+ * or lifetime is minted by resume. */
+export interface RemoteDesktopResume {
+  type: typeof REMOTE_DESKTOP_MSG.RESUME;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+}
+
 /** Server acknowledgement that the anonymous socket's sole bootstrap frame
  * was atomically redeemed. The browser MUST wait for this content-free frame
  * before sending START or any other signaling message. */
@@ -446,6 +469,11 @@ export interface RemoteDesktopAuthority {
 
 export interface RemoteDesktopAuthorized extends RemoteDesktopAuthority {
   type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED;
+}
+
+/** Server acknowledgement for an exact same-route signaling rebind. */
+export interface RemoteDesktopResumed extends RemoteDesktopAuthority {
+  type: typeof REMOTE_DESKTOP_MSG.RESUMED;
 }
 
 export interface RemoteDesktopPrepare extends RemoteDesktopAuthority {
@@ -745,10 +773,10 @@ export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
   type: typeof REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL;
 }
 
-export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopModeSet | RemoteDesktopCancel | RemoteDesktopStop;
+export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopResume | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopModeSet | RemoteDesktopCancel | RemoteDesktopStop;
 export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopDaemonStop;
 export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
-export type RemoteDesktopServerMessage = RemoteDesktopBootstrapRedeemed | RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
+export type RemoteDesktopServerMessage = RemoteDesktopBootstrapRedeemed | RemoteDesktopAuthorized | RemoteDesktopResumed | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
 export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopControlRejected;
 
 export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
@@ -888,6 +916,12 @@ export function validateRemoteDesktopBrowserMessage(value: unknown): RemoteDeskt
           || value.reconnectAttempt > REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS))) return invalid();
     return { ok: true, value: value as unknown as RemoteDesktopStart };
   }
+  if (value.type === REMOTE_DESKTOP_MSG.RESUME) {
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'requestId', 'sessionId', 'capability'])
+      || value.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+      || !hasSessionCorrelation(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopResume };
+  }
   if (value.type === REMOTE_DESKTOP_MSG.OFFER) {
     if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'sdp']) || !validateSdp(value)) return invalid();
     return { ok: true, value: value as unknown as RemoteDesktopOffer };
@@ -958,6 +992,7 @@ export function validateRemoteDesktopDaemonCommand(value: unknown): RemoteDeskto
   const browser = validateRemoteDesktopBrowserMessage(value);
   if (browser.ok
     && browser.value.type !== REMOTE_DESKTOP_MSG.START
+    && browser.value.type !== REMOTE_DESKTOP_MSG.RESUME
     && browser.value.type !== REMOTE_DESKTOP_MSG.MODE_SET) {
     return { ok: true, value: browser.value };
   }
@@ -1037,6 +1072,14 @@ export function validateRemoteDesktopAuthorized(value: unknown): RemoteDesktopVa
   return { ok: true, value: value as unknown as RemoteDesktopAuthorized };
 }
 
+export function validateRemoteDesktopResumed(value: unknown): RemoteDesktopValidationResult<RemoteDesktopResumed> {
+  if (!isRecord(value)
+    || value.type !== REMOTE_DESKTOP_MSG.RESUMED
+    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'])
+    || !validateAuthority(value)) return invalid();
+  return { ok: true, value: value as unknown as RemoteDesktopResumed };
+}
+
 export function validateRemoteDesktopServerMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopServerMessage> {
   if (isRecord(value)
     && value.type === REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED
@@ -1045,6 +1088,8 @@ export function validateRemoteDesktopServerMessage(value: unknown): RemoteDeskto
   }
   const authorized = validateRemoteDesktopAuthorized(value);
   if (authorized.ok) return authorized;
+  const resumed = validateRemoteDesktopResumed(value);
+  if (resumed.ok) return resumed;
   const daemon = validateRemoteDesktopDaemonMessage(value);
   if (daemon.ok) return daemon;
   const command = validateRemoteDesktopDaemonCommand(value);

@@ -113,6 +113,7 @@ import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  validateRemoteDesktopBrowserMessage,
   type RemoteDesktopAccessMode,
   type RemoteDesktopTerminalReason,
 } from '../../../shared/remote-desktop.js';
@@ -5049,8 +5050,9 @@ export class WsBridge {
   /**
    * Anonymous remote-desktop signaling socket. It has no browser/session
    * subscriptions and cannot reach any ordinary bridge command. The sole
-   * bounded first frame is the shared bootstrap proof; only after atomic
-   * redemption can standard remote-desktop signaling enter the Router.
+   * bounded first frame is the shared bootstrap proof, or an exact route-
+   * scoped RESUME after a transient socket loss; only after either authority
+   * check can standard remote-desktop signaling enter the Router.
    */
   handleGuestRemoteDesktopConnection(ws: WebSocket, db: Database, clientIp = '0.0.0.0'): void {
     this.db = db;
@@ -5081,6 +5083,19 @@ export class WsBridge {
         }
         let value: unknown;
         try { value = JSON.parse(raw); } catch { closeUniformly(); return; }
+        const resume = validateRemoteDesktopBrowserMessage(value);
+        if (resume.ok && resume.value.type === REMOTE_DESKTOP_MSG.RESUME) {
+          state = 'verifying';
+          const resumed = await this.remoteDesktopRouter.resumeGuestBrowser(ws, resume.value);
+          if (!resumed || (state as string) === 'closed') {
+            closeUniformly();
+            return;
+          }
+          state = 'admitted';
+          if (quarantineTimer) clearTimeout(quarantineTimer);
+          quarantineTimer = null;
+          return;
+        }
         const proof = validateRemoteDesktopBootstrapProof(value);
         if (!proof.ok) { closeUniformly(); return; }
         state = 'verifying';

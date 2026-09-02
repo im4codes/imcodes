@@ -76,7 +76,12 @@ import {
   REMOTE_DESKTOP_NODE_CONTEXT_MSG,
   type RemoteDesktopConsentRequest,
 } from '../../shared/remote-desktop-access.js';
-import { REMOTE_DESKTOP_ACCESS_MODE, REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_ACCESS_MODE,
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_PROTOCOL_VERSION,
+} from '../../shared/remote-desktop.js';
 import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
@@ -485,6 +490,64 @@ describe('WsBridge', () => {
     await flushAsync();
     expect(handleGuestBrowser).toHaveBeenCalledOnce();
     expect(ws.closed).toBe(false);
+  });
+
+  it('admits an exact route resume as the sole first guest frame', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const resumeGuestBrowser = vi.fn(async () => true);
+    const handleGuestBrowser = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        resumeGuestBrowser,
+        redeemGuestBootstrap: vi.fn(),
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+    const resume = {
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId: 'guest_request_123456',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    };
+
+    ws.emit('message', Buffer.from(JSON.stringify(resume)));
+    await flushAsync();
+
+    expect(resumeGuestBrowser).toHaveBeenCalledWith(ws, resume);
+    expect(ws.closed).toBe(false);
+    expect(handleGuestBrowser).not.toHaveBeenCalled();
+  });
+
+  it('closes a first-frame guest resume whose exact live authority is absent', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const dropSocket = vi.fn();
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        resumeGuestBrowser: vi.fn(async () => false),
+        redeemGuestBootstrap: vi.fn(),
+        handleGuestBrowser: vi.fn(),
+        dropSocket,
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId: 'guest_request_123456',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    })));
+    await flushAsync();
+
+    expect(ws.closed).toBe(true);
+    expect(ws.closeCode).toBe(1008);
+    expect(dropSocket).toHaveBeenCalledWith(ws);
   });
 
   it('closes an anonymous socket that never supplies its bounded first proof', async () => {

@@ -537,6 +537,14 @@ describe('windows remote-desktop privacy dispatcher', () => {
   const ipcHeader = read('privacy_ipc.h');
   const ipc = read('privacy_ipc.cc');
 
+  it('reports a failed peer as reconnecting instead of terminal before ICE recovery', () => {
+    const callback = peerSession.slice(peerSession.indexOf('void PeerSession::OnConnectionChange('));
+    const body = callback.slice(0, callback.indexOf('\nvoid PeerSession::OnIceSelectedCandidatePairChanged('));
+    expect(body).toContain('PeerConnectionState::kFailed) {');
+    expect(body).toContain('SendStatus("connecting", false);');
+    expect(body).not.toContain('SendStatus("failed"');
+  });
+
   it('keeps the concurrent ConsentDispatcher and adds privacy beside it', () => {
     expect(worker).toContain('class ConsentDispatcher');
     expect(worker).toContain('class PrivacyDispatcher');

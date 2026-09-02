@@ -137,6 +137,7 @@ class FakePeer extends EventTarget {
   failRemoteDescription = false;
   stats: Array<Record<string, unknown>> = [];
   offerOptions: Array<RTCOfferOptions | undefined> = [];
+  configuration: RTCConfiguration = {};
 
   addTransceiver(): RTCRtpTransceiver {
     return { setCodecPreferences: vi.fn() } as unknown as RTCRtpTransceiver;
@@ -167,6 +168,8 @@ class FakePeer extends EventTarget {
       },
     } as unknown as RTCStatsReport;
   }
+  getConfiguration(): RTCConfiguration { return this.configuration; }
+  setConfiguration(configuration: RTCConfiguration): void { this.configuration = configuration; }
   connect(): void {
     this.connectionState = 'connected';
     this.dispatchEvent(new Event('connectionstatechange'));
@@ -179,6 +182,163 @@ beforeEach(() => {
 });
 
 describe('RemoteDesktopClient', () => {
+  it('retries a weak signaling path and resumes the same peer without remounting its stream', async () => {
+    vi.useFakeTimers();
+    try {
+      const sockets: FakeSocket[] = [];
+      const peers: FakePeer[] = [];
+      const snapshots: Array<ReturnType<RemoteDesktopClient['current']>> = [];
+      const client = new RemoteDesktopClient('controlled-win', {
+        onSnapshot: (snapshot) => snapshots.push({ ...snapshot }),
+      }, {
+        fetchTicket: async () => `ticket-${sockets.length + 1}`,
+        createSocket: () => {
+          const socket = new FakeSocket();
+          sockets.push(socket);
+          // The first connection succeeds, two reconnect attempts die before
+          // opening, and the fourth socket finally reaches the server.
+          queueMicrotask(() => (sockets.length === 2 || sockets.length === 3
+            ? socket.close()
+            : socket.open()));
+          return socket as unknown as WebSocket;
+        },
+        createPeer: () => {
+          const peer = new FakePeer();
+          peers.push(peer);
+          return peer as unknown as RTCPeerConnection;
+        },
+      });
+
+      await client.start();
+      const startMessage = JSON.parse(sockets[0]!.sent[0]!) as { requestId: string };
+      const authority = {
+        requestId: startMessage.requestId,
+        sessionId: 'session_12345678',
+        capability: 'a'.repeat(43),
+        expiresAt: Date.now() + 60_000,
+        leaseExpiresAt: Date.now() + 15_000,
+        daemonGeneration: 7,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        iceServers: ['stun:stun.example.test:3478'],
+      } as const;
+      sockets[0]!.receive({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority });
+      await vi.waitFor(() => expect(peers).toHaveLength(1));
+      await vi.waitFor(() => expect(client.current().state)
+        .toBe(REMOTE_DESKTOP_STATE.CONNECTING));
+      const stream = { id: 'preserved-stream' } as unknown as MediaStream;
+      snapshots.push({ ...client.current(), stream });
+      (client as unknown as { snapshot: ReturnType<RemoteDesktopClient['current']> }).snapshot = {
+        ...client.current(),
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        stream,
+        inputEnabled: true,
+      };
+
+      sockets[0]!.close();
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_BACKOFF_MS);
+      await vi.waitFor(() => expect(sockets).toHaveLength(2));
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_BACKOFF_MS * 2);
+      await vi.waitFor(() => expect(sockets).toHaveLength(3));
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_BACKOFF_MS * 4);
+      await vi.waitFor(() => expect(sockets).toHaveLength(4));
+
+      expect(peers).toHaveLength(1);
+      expect(client.current()).toMatchObject({
+        state: REMOTE_DESKTOP_STATE.RECONNECTING,
+        stream,
+        inputEnabled: false,
+      });
+      expect(JSON.parse(sockets[3]!.sent[0]!)).toEqual({
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        requestId: authority.requestId,
+        sessionId: authority.sessionId,
+        capability: authority.capability,
+      });
+
+      sockets[3]!.receive({
+        type: REMOTE_DESKTOP_MSG.RESUMED,
+        ...authority,
+        inputEpoch: 2,
+        leaseExpiresAt: Date.now() + 15_000,
+      });
+      await vi.waitFor(() => expect(sockets[3]!.sent.map((raw) => JSON.parse(raw).type))
+        .toContain(REMOTE_DESKTOP_MSG.OFFER));
+
+      expect(peers).toHaveLength(1);
+      expect(peers[0]!.offerOptions.at(-1)).toEqual({ iceRestart: true });
+      expect(peers[0]!.configuration.iceServers).toEqual([{
+        urls: 'stun:stun.example.test:3478',
+      }]);
+      expect(client.current().stream).toBe(stream);
+      expect(client.current().inputEpoch).toBe(2);
+      expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.FAILED)).toBe(false);
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails closed only after the full five-minute signaling recovery budget', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const sockets: FakeSocket[] = [];
+      const peers: FakePeer[] = [];
+      const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+        fetchTicket: async () => `ticket-${sockets.length + 1}`,
+        createSocket: () => {
+          const socket = new FakeSocket();
+          sockets.push(socket);
+          queueMicrotask(() => socket.open());
+          return socket as unknown as WebSocket;
+        },
+        createPeer: () => {
+          const peer = new FakePeer();
+          peers.push(peer);
+          return peer as unknown as RTCPeerConnection;
+        },
+      });
+
+      await client.start();
+      const startMessage = JSON.parse(sockets[0]!.sent[0]!) as { requestId: string };
+      sockets[0]!.receive({
+        type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+        requestId: startMessage.requestId,
+        sessionId: 'session_12345678',
+        capability: 'a'.repeat(43),
+        expiresAt: Date.now() + 10 * 60_000,
+        leaseExpiresAt: Date.now() + 10 * 60_000,
+        daemonGeneration: 7,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        iceServers: ['stun:stun.example.test:3478'],
+      });
+      await vi.waitFor(() => expect(peers).toHaveLength(1));
+      await vi.waitFor(() => expect(client.current().state)
+        .toBe(REMOTE_DESKTOP_STATE.CONNECTING));
+
+      sockets[0]!.close();
+      await vi.advanceTimersByTimeAsync(
+        REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS - 1,
+      );
+      expect(client.current().state).toBe(REMOTE_DESKTOP_STATE.RECONNECTING);
+      expect(peers).toHaveLength(1);
+      expect(peers[0]!.connectionState).not.toBe('closed');
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(client.current()).toMatchObject({
+        state: REMOTE_DESKTOP_STATE.FAILED,
+        terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED,
+        inputEnabled: false,
+      });
+      expect(peers[0]!.connectionState).toBe('closed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reports the exact signaling bridge daemon lifecycle without treating it as remote-desktop data', async () => {
     let socket!: FakeSocket;
     const onDaemonReconnected = vi.fn();
@@ -1010,7 +1170,7 @@ describe('RemoteDesktopClient', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
-  it('fails a foreground media stall but pauses the watchdog while the page is hidden', async () => {
+  it('ICE-restarts a foreground media stall but pauses the watchdog while hidden', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;
     let peer!: FakePeer;
@@ -1081,14 +1241,18 @@ describe('RemoteDesktopClient', () => {
     now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS;
     statsTick();
     await vi.waitFor(() => expect(client.current()).toMatchObject({
-      state: REMOTE_DESKTOP_STATE.FAILED,
-      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
       inputEnabled: false,
+    }));
+    expect(peer.offerOptions.at(-1)).toEqual({ iceRestart: true });
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      sessionId: 'session_watchdog1',
     }));
     intervalSpy.mockRestore();
   });
 
-  it('waits out a slow first frame instead of failing a peer that never started', async () => {
+  it('waits out a slow first frame then recovers an established stream in place', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;
     let peer!: FakePeer;
@@ -1164,13 +1328,16 @@ describe('RemoteDesktopClient', () => {
     await vi.waitFor(() => expect(client.current().quality?.bitrateBps).toBeGreaterThan(0));
     expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
 
-    // Once started, a stall is still a failure — the old rule keeps its job.
+    // Once started, a stall is a weak-network recovery signal rather than a
+    // reason to discard the peer and make the user start the whole flow over.
     now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 1_000;
     statsTick();
     await vi.waitFor(() => expect(client.current()).toMatchObject({
-      state: REMOTE_DESKTOP_STATE.FAILED,
-      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      inputEnabled: false,
     }));
+    expect(peer.offerOptions.at(-1)).toEqual({ iceRestart: true });
+    expect(client.current().terminalReason).toBeUndefined();
     intervalSpy.mockRestore();
   });
 

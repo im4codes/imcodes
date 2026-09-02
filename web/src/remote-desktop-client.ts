@@ -257,24 +257,43 @@ export function chunkRemoteDesktopText(value: string): string[] | null {
 class RemoteDesktopSignalingSocket {
   private socket: WebSocket | null = null;
   private ticketAbort: AbortController | null = null;
+  private readonly guest: boolean;
 
-  constructor(private readonly deps: RemoteDesktopClientDependencies) {}
+  constructor(private readonly deps: RemoteDesktopClientDependencies) {
+    this.guest = deps.guestBootstrapProof !== undefined;
+  }
 
   async connect(
     serverId: string,
     onMessage: (value: unknown) => void,
     onClose: () => void,
     onDaemonReconnected?: () => void,
+    resume = false,
   ): Promise<void> {
     const abort = new AbortController();
     this.ticketAbort = abort;
-    const guestBootstrapProof = this.deps.guestBootstrapProof;
-    const socketUrl = guestBootstrapProof
+    const guestBootstrapProof = resume ? undefined : this.deps.guestBootstrapProof;
+    const fetchTicket = this.deps.fetchTicket ?? defaultFetchTicket;
+    let ticket = '';
+    if (!this.guest) {
+      if (resume) {
+        ticket = await new Promise<string>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            abort.abort();
+            reject(new Error('remote_desktop_ticket_timeout'));
+          }, REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS);
+          void fetchTicket(serverId, abort.signal).then(
+            (value) => { clearTimeout(timer); resolve(value); },
+            (error: unknown) => { clearTimeout(timer); reject(error); },
+          );
+        });
+      } else {
+        ticket = await fetchTicket(serverId, abort.signal);
+      }
+    }
+    const socketUrl = this.guest
       ? defaultGuestSocketUrl(serverId)
-      : defaultSocketUrl(
-        serverId,
-        await (this.deps.fetchTicket ?? defaultFetchTicket)(serverId, abort.signal),
-      );
+      : defaultSocketUrl(serverId, ticket);
     if (abort.signal.aborted) throw new Error('remote_desktop_canceled');
     const socket = (this.deps.createSocket ?? ((url) => new WebSocket(url)))(socketUrl);
     this.socket = socket;
@@ -303,7 +322,9 @@ class RemoteDesktopSignalingSocket {
       const timer = setTimeout(() => {
         socket.close(4000, 'remote_desktop_open_timeout');
         fail(new Error('remote_desktop_open_timeout'));
-      }, START_TIMEOUT_MS);
+      }, resume
+        ? REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS
+        : START_TIMEOUT_MS);
       const redeemed = (event: MessageEvent) => {
         if (typeof event.data !== 'string') {
           socket.close(4000, 'remote_desktop_bootstrap_failed');
@@ -374,6 +395,10 @@ class RemoteDesktopSignalingSocket {
     return true;
   }
 
+  isOpen(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN;
+  }
+
   close(): void {
     this.ticketAbort?.abort();
     this.ticketAbort = null;
@@ -413,7 +438,13 @@ export class RemoteDesktopClient {
   private statsInFlight = false;
   private iceRestartCount = 0;
   private iceRestartInFlight = false;
+  private pendingIceRestart = false;
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private signalingReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private signalingReconnectAttempts = 0;
+  private signalingReconnectInFlight = false;
+  private signalingStableState: RemoteDesktopState | null = null;
+  private signalingDisconnectedAt: number | null = null;
   private awaitingAnswer = false;
   private previousInboundStats: { bytes: number; timestamp: number } | null = null;
   private lastMediaBytesReceived: number | null = null;
@@ -488,7 +519,7 @@ export class RemoteDesktopClient {
           this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);
         });
       },
-      () => this.fail(REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED),
+      () => this.handleSignalingClose(),
       this.hooks.onDaemonReconnected,
     );
     const requestId = randomRequestId();
@@ -918,6 +949,54 @@ export class RemoteDesktopClient {
       if (this.sessionId || !validateRemoteDesktopAuthorized(message).ok) return;
       this.authorized = message;
       await this.preparePeer(message);
+      return;
+    }
+    if (message.type === REMOTE_DESKTOP_MSG.RESUMED) {
+      if (!this.matchesAuthority(message) || !this.peer) return;
+      this.authorized = { ...message, type: REMOTE_DESKTOP_MSG.AUTHORIZED };
+      this.daemonGeneration = message.daemonGeneration;
+      this.expiresAt = message.expiresAt;
+      this.signalingReconnectAttempts = 0;
+      this.signalingReconnectInFlight = false;
+      this.signalingDisconnectedAt = null;
+      this.clearSignalingReconnectTimer();
+      this.clearStartTimer();
+      this.workerInputEnabled = false;
+      this.clearInputAck();
+      this.requirePresentedFrameForCurrentTopology();
+      const peerState = this.peer.connectionState;
+      try {
+        this.peer.setConfiguration({ iceServers: toWebRtcIceServers(message.iceServers) });
+      } catch {
+        // A connected direct path does not need fresh TURN credentials yet.
+        // If recovery needs ICE now, however, continuing with credentials that
+        // may have expired during the outage would only manufacture a doomed
+        // restart and hide the real failure.
+        if (this.pendingIceRestart || peerState === 'disconnected' || peerState === 'failed') {
+          this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+          return;
+        }
+      }
+      this.publish({
+        state: peerState === 'connected' && this.signalingStableState
+          ? this.signalingStableState
+          : REMOTE_DESKTOP_STATE.RECONNECTING,
+        mode: message.mode,
+        inputEpoch: message.inputEpoch,
+        inputEnabled: false,
+      });
+      this.signalingStableState = null;
+      if (isOpen(this.controlChannel)) {
+        this.sendControl({
+          type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+          ...this.inputBase(),
+          kind: REMOTE_DESKTOP_CONTROL_KIND.HELLO,
+        });
+      }
+      if (this.pendingIceRestart || peerState === 'disconnected' || peerState === 'failed') {
+        this.pendingIceRestart = false;
+        await this.restartIce(this.peer);
+      }
       return;
     }
     if (!this.matchesAuthority(message)) return;
@@ -1351,7 +1430,12 @@ export class RemoteDesktopClient {
           this.lastMediaProgressAt = now;
         } else if (now - this.lastMediaProgressAt
           >= REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS) {
-          this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+          // Some weak paths keep ICE nominally "connected" after media has
+          // stopped flowing. Give that black-holed path the same bounded,
+          // in-place recovery as an explicit connection-state failure instead
+          // of discarding the mounted stream and starting the whole flow over.
+          this.lastMediaProgressAt = now;
+          await this.restartIce(peer);
           return;
         }
         this.aggregateBytesReceived = Math.max(this.aggregateBytesReceived, inbound.bytesReceived);
@@ -1392,6 +1476,13 @@ export class RemoteDesktopClient {
 
   private async restartIce(peer: RTCPeerConnection): Promise<void> {
     if (this.iceRestartInFlight) return;
+    if (!this.signaling.isOpen()) {
+      this.pendingIceRestart = true;
+      this.releaseAll();
+      this.workerInputEnabled = false;
+      this.publish({ state: REMOTE_DESKTOP_STATE.RECONNECTING, inputEnabled: false });
+      return;
+    }
     if (this.stopped || this.peer !== peer || !this.authorityReady()
       || this.iceRestartCount >= REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS
       || this.expiresAt <= (this.deps.now?.() ?? Date.now())) {
@@ -1426,6 +1517,102 @@ export class RemoteDesktopClient {
       );
     } catch {
       this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+    }
+  }
+
+  private handleSignalingClose(): void {
+    if (this.stopped) return;
+    // A socket can close after connect() resolved but before RESUMED arrives.
+    // Release the in-flight latch so that close itself schedules the next
+    // bounded attempt rather than stranding the session in reconnecting.
+    this.signalingReconnectInFlight = false;
+    if (!this.authorityReady() || !this.peer) {
+      this.fail(REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED);
+      return;
+    }
+    const now = this.deps.now?.() ?? Date.now();
+    this.signalingDisconnectedAt ??= now;
+    if (this.snapshot.state === REMOTE_DESKTOP_STATE.DIRECT
+      || this.snapshot.state === REMOTE_DESKTOP_STATE.RELAYED) {
+      this.signalingStableState = this.snapshot.state;
+    }
+    this.clearStartTimer();
+    this.releaseAll();
+    this.workerInputEnabled = false;
+    this.clearInputAck();
+    if (this.peer.connectionState !== 'connected') this.pendingIceRestart = true;
+    this.publish({
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      inputEnabled: false,
+      reconnectCount: this.signalingReconnectAttempts + 1,
+    });
+    this.scheduleSignalingReconnect();
+  }
+
+  private scheduleSignalingReconnect(): void {
+    if (this.stopped || this.signalingReconnectTimer || this.signalingReconnectInFlight) return;
+    const now = this.deps.now?.() ?? Date.now();
+    const disconnectedAt = this.signalingDisconnectedAt ?? now;
+    const elapsed = now - disconnectedAt;
+    if (elapsed >= REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS
+      || this.signalingReconnectAttempts >= REMOTE_DESKTOP_LIMITS.MAX_SIGNALING_RECONNECT_ATTEMPTS
+      || this.expiresAt <= now) {
+      this.fail(REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED);
+      return;
+    }
+    const backoff = REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_BACKOFF_MS
+      * (2 ** this.signalingReconnectAttempts);
+    const remaining = REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS - elapsed;
+    this.signalingReconnectTimer = setTimeout(() => {
+      this.signalingReconnectTimer = null;
+      void this.resumeSignaling();
+    }, Math.min(
+      backoff,
+      REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_MAX_BACKOFF_MS,
+      remaining,
+    ));
+  }
+
+  private async resumeSignaling(): Promise<void> {
+    if (this.stopped || this.signalingReconnectInFlight || !this.authorityReady()) return;
+    this.signalingReconnectInFlight = true;
+    this.signalingReconnectAttempts += 1;
+    try {
+      await this.signaling.connect(
+        this.serverId,
+        (value) => {
+          void this.handleServer(value).catch(() => {
+            this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);
+          });
+        },
+        () => this.handleSignalingClose(),
+        this.hooks.onDaemonReconnected,
+        true,
+      );
+      if (!this.signaling.send({
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ...this.authorityFields(),
+      })) throw new Error('resume_signal_failed');
+      this.signalingReconnectInFlight = false;
+      const now = this.deps.now?.() ?? Date.now();
+      const elapsed = now - (this.signalingDisconnectedAt ?? now);
+      this.clearStartTimer();
+      this.startTimer = setTimeout(
+        () => {
+          this.startTimer = null;
+          this.signaling.close();
+          this.signalingReconnectInFlight = false;
+          this.scheduleSignalingReconnect();
+        },
+        Math.max(1, Math.min(
+          REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS,
+          REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS - elapsed,
+        )),
+      );
+    } catch {
+      this.signalingReconnectInFlight = false;
+      this.scheduleSignalingReconnect();
     }
   }
 
@@ -1541,6 +1728,10 @@ export class RemoteDesktopClient {
     if (this.stopped) return;
     this.stopped = true;
     this.clearStartTimer();
+    this.clearSignalingReconnectTimer();
+    this.signalingReconnectInFlight = false;
+    this.signalingDisconnectedAt = null;
+    this.pendingIceRestart = false;
     this.releaseAll();
     try { this.controlChannel?.close(); } catch { /* closed */ }
     try { this.keyboardChannel?.close(); } catch { /* closed */ }
@@ -1591,6 +1782,11 @@ export class RemoteDesktopClient {
   private clearDisconnectTimer(): void {
     if (this.disconnectTimer) clearTimeout(this.disconnectTimer);
     this.disconnectTimer = null;
+  }
+
+  private clearSignalingReconnectTimer(): void {
+    if (this.signalingReconnectTimer) clearTimeout(this.signalingReconnectTimer);
+    this.signalingReconnectTimer = null;
   }
 
   private beginLayoutTransition(): void {

@@ -164,6 +164,9 @@ describe('remote desktop production contract', () => {
   });
 
   it('strictly validates start and authority envelopes', () => {
+    expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS).toBe(5 * 60_000);
+    expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_MAX_BACKOFF_MS).toBe(5_000);
+    expect(REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS).toBe(8);
     expect(validateRemoteDesktopBrowserMessage({
       type: REMOTE_DESKTOP_MSG.START,
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
@@ -175,6 +178,21 @@ describe('remote desktop production contract', () => {
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
       requestId,
       reconnectAttempt: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 1,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId,
+      sessionId,
+      capability,
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId,
+      sessionId,
+      capability,
+      reconnectAttempt: 1,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopBrowserMessage({
       type: REMOTE_DESKTOP_MSG.STOP,
@@ -197,6 +215,10 @@ describe('remote desktop production contract', () => {
       serverId: 'must-be-query-scoped',
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopAuthorized({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopServerMessage({
+      type: REMOTE_DESKTOP_MSG.RESUMED,
+      ...authority,
+    })).toMatchObject({ ok: true });
     expect(validateRemoteDesktopAuthorized({
       type: REMOTE_DESKTOP_MSG.AUTHORIZED,
       ...authority,
