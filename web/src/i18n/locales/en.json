@@ -3306,7 +3306,13 @@
     "no_assignments": "No assignments",
     "events": "Recent live events",
     "no_events": "No live deltas received since this snapshot.",
-    "event_op": { "task_upsert": "Task updated", "task_remove": "Task removed", "assignment_upsert": "Assignment updated", "assignment_remove": "Assignment removed", "pools_update": "Pools updated" },
+    "event_op": {
+      "task_upsert": "Task updated",
+      "task_remove": "Task removed",
+      "assignment_upsert": "Assignment updated",
+      "assignment_remove": "Assignment removed",
+      "pools_update": "Pools updated"
+    },
     "task_id": "Task ID",
     "top_level_task": "Top-level task",
     "projection": "Projection {{version}}",
@@ -3316,14 +3322,44 @@
     "error": "The live task stream is unavailable.",
     "empty": "No supervised tasks yet.",
     "unsupported": "Unsupported task status. Resynchronizing safely.",
-    "group": { "active": "Active", "audit": "Audit", "rework": "Rework", "integration": "Integration", "final": "Final" },
-    "pool_kind": { "primary": "Primary", "economy": "Economy" },
-    "validation_state": { "unknown": "Unknown", "pending": "Pending", "passed": "Passed", "failed": "Failed", "unavailable": "Unavailable" },
+    "group": {
+      "active": "Active",
+      "audit": "Audit",
+      "rework": "Rework",
+      "integration": "Integration",
+      "final": "Final"
+    },
+    "pool_kind": {
+      "primary": "Primary",
+      "economy": "Economy"
+    },
+    "validation_state": {
+      "unknown": "Unknown",
+      "pending": "Pending",
+      "passed": "Passed",
+      "failed": "Failed",
+      "unavailable": "Unavailable"
+    },
     "status": {
-      "planned": "Planned", "delegated": "Delegated", "implementing": "Implementing", "retrying_external_ci": "Retrying CI", "validated": "Validated",
-      "ready_for_audit": "Ready for audit", "auditing": "Auditing", "rework": "Rework", "passed": "Passed",
-      "ready_for_integration": "Ready for integration", "integrating": "Integrating", "final_audit": "Final audit", "finalizing": "Finalizing", "committed": "Committed",
-      "pushed": "Pushed", "recovered": "Recovered", "finalized": "Finalized", "blocked": "Blocked", "cancelled": "Cancelled"
+      "planned": "Planned",
+      "delegated": "Delegated",
+      "implementing": "Implementing",
+      "retrying_external_ci": "Retrying CI",
+      "validated": "Validated",
+      "ready_for_audit": "Ready for audit",
+      "auditing": "Auditing",
+      "rework": "Rework",
+      "passed": "Passed",
+      "ready_for_integration": "Ready for integration",
+      "integrating": "Integrating",
+      "final_audit": "Final audit",
+      "finalizing": "Finalizing",
+      "committed": "Committed",
+      "pushed": "Pushed",
+      "recovered": "Recovered",
+      "finalized": "Finalized",
+      "blocked": "Blocked",
+      "cancelled": "Cancelled"
     },
     "tabs_label": "Task views",
     "tab_active": "Active",
@@ -3337,7 +3373,21 @@
     "implementer": "Implementer",
     "auditor": "Auditor",
     "copy_task_id": "Copy",
-    "session_state": {"running": "Running","idle": "Idle","needs_input": "Needs input","offline": "Offline","unknown": "Unknown"}
+    "session_state": {
+      "running": "Running",
+      "idle": "Idle",
+      "needs_input": "Needs input",
+      "offline": "Offline",
+      "unknown": "Unknown"
+    },
+    "execution_health": {
+      "live": "Running",
+      "stale": "No recent beat",
+      "released": "Not running",
+      "unknown": "Not observed"
+    },
+    "awaiting_external_ci": "Waiting on CI",
+    "work_state": "Work state"
   },
   "remote_desktop": {
     "open": "Remote Desktop",

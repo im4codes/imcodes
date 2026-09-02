@@ -347,6 +347,8 @@ export interface PersistedSupervisionIntegrationFinalization {
 }
 
 export interface PersistedSupervisionTaskRecord {
+  /** Last recorded validation outcome for the task aggregate. */
+  validationState?: string;
   version: typeof SUPERVISION_TASK_REGISTRY_DB_VERSION;
   taskId: string;
   /** Authoritative project audience. Legacy rows are deliberately unscoped. */
@@ -384,6 +386,12 @@ export interface PersistedSupervisionTaskAssignment {
   scopeFiles: string[];
   required: boolean;
   status: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus;
+  /** Last durable liveness beat, ms epoch. Distinct from updatedAt: a beat
+   *  proves the runtime is alive without claiming substantive progress. */
+  heartbeatAt?: number;
+  /** Last recorded validation outcome. The console projects this directly;
+   *  leaving it unwritten makes every row read 'unknown'. */
+  validationState?: string;
   leaseId: string;
   generation: number;
   auditAttemptId?: string;
@@ -916,6 +924,7 @@ export class SupervisionTaskRegistry {
         project_name TEXT,
         top_level_task_id TEXT NOT NULL,
         classification TEXT NOT NULL,
+        validation_state TEXT,
         status TEXT NOT NULL,
         current_revision TEXT,
         commit_sha TEXT,
@@ -938,6 +947,8 @@ export class SupervisionTaskRegistry {
         provider_family TEXT NOT NULL,
         lease_id TEXT NOT NULL,
         generation INTEGER NOT NULL,
+        heartbeat_at INTEGER,
+        validation_state TEXT,
         audit_attempt_id TEXT,
         audit_revision TEXT,
         verdict TEXT,
@@ -1196,13 +1207,13 @@ export class SupervisionTaskRegistry {
 
   #writeTask(record: PersistedSupervisionTaskRecord, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
     this.#db.prepare(`
-      INSERT INTO supervision_tasks (task_id, project_name, top_level_task_id, classification, status, current_revision, commit_sha, push_remote_ref, blocker, payload_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO supervision_tasks (task_id, project_name, top_level_task_id, classification, status, current_revision, commit_sha, push_remote_ref, blocker, validation_state, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         project_name=excluded.project_name, top_level_task_id=excluded.top_level_task_id, classification=excluded.classification, status=excluded.status,
         current_revision=excluded.current_revision, commit_sha=excluded.commit_sha, push_remote_ref=excluded.push_remote_ref,
-        blocker=excluded.blocker, payload_json=excluded.payload_json, updated_at=excluded.updated_at
-    `).run(record.taskId, record.projectName, record.topLevelTaskId, record.classification, record.status, record.currentRevision ?? null, record.commitSha ?? null, record.pushRemoteRef ?? null, record.blocker ?? null, JSON.stringify(record), record.createdAt, record.updatedAt);
+        blocker=excluded.blocker, validation_state=excluded.validation_state, payload_json=excluded.payload_json, updated_at=excluded.updated_at
+    `).run(record.taskId, record.projectName, record.topLevelTaskId, record.classification, record.status, record.currentRevision ?? null, record.commitSha ?? null, record.pushRemoteRef ?? null, record.blocker ?? null, record.validationState ?? null, JSON.stringify(record), record.createdAt, record.updatedAt);
     this.#appendEvent(record.taskId, undefined, eventType, record.status, payload, record.updatedAt);
     if (['implementation_finished', 'committed', 'pushed', 'recovered', 'finalized', 'cancelled'].includes(eventType)) {
       this.#requestHousekeeping(record.projectName, record.updatedAt);
@@ -1212,15 +1223,15 @@ export class SupervisionTaskRegistry {
   #writeAssignment(record: PersistedSupervisionTaskAssignment, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
     const identity = record.identity;
     this.#db.prepare(`
-      INSERT INTO supervision_task_assignments (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, lease_id, generation, audit_attempt_id, audit_revision, verdict, blocker, payload_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO supervision_task_assignments (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, lease_id, generation, validation_state, audit_attempt_id, audit_revision, verdict, blocker, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(assignment_id) DO UPDATE SET
         role=excluded.role, status=excluded.status, session_name=excluded.session_name, session_instance_id=excluded.session_instance_id,
         runtime_epoch=excluded.runtime_epoch, agent_type=excluded.agent_type, provider_family=excluded.provider_family,
-        lease_id=excluded.lease_id, generation=excluded.generation, audit_attempt_id=excluded.audit_attempt_id,
+        lease_id=excluded.lease_id, generation=excluded.generation, validation_state=excluded.validation_state, audit_attempt_id=excluded.audit_attempt_id,
         audit_revision=excluded.audit_revision, verdict=excluded.verdict, blocker=excluded.blocker,
         payload_json=excluded.payload_json, updated_at=excluded.updated_at
-    `).run(record.assignmentId, record.taskId, record.role, record.status, identity.sessionName, identity.sessionInstanceId, identity.runtimeEpoch, identity.agentType, identity.providerFamily, record.leaseId, record.generation, record.auditAttemptId ?? null, record.auditRevision ?? null, record.verdict ?? null, record.blocker ?? null, JSON.stringify(record), record.createdAt, record.updatedAt);
+    `).run(record.assignmentId, record.taskId, record.role, record.status, identity.sessionName, identity.sessionInstanceId, identity.runtimeEpoch, identity.agentType, identity.providerFamily, record.leaseId, record.generation, record.validationState ?? null, record.auditAttemptId ?? null, record.auditRevision ?? null, record.verdict ?? null, record.blocker ?? null, JSON.stringify(record), record.createdAt, record.updatedAt);
     this.#appendEvent(record.taskId, record.assignmentId, eventType, record.status, payload, record.updatedAt);
     if (['implementation_finished', 'committed', 'pushed', 'recovered', 'finalized', 'cancelled'].includes(eventType)) {
       const projectName = this.getTaskRecord(record.taskId)?.projectName;
@@ -1656,6 +1667,23 @@ export class SupervisionTaskRegistry {
    * reminder itself is implementation progress. The event is the durable
    * de-duplication/cooldown receipt used after SQLite reopen.
    */
+  /**
+   * Persist a liveness beat without moving the substantive progress clock.
+   *
+   * `updated_at` is the progress clock and must not move, but the console
+   * projects `heartbeatAt` from `heartbeat_at`; leaving that column unwritten
+   * is why an abandoned assignment could still look alive on lease presence
+   * alone. Both the column and the payload copy are updated so a reopened
+   * registry reports the same beat.
+   */
+  #recordAssignmentHeartbeat(assignment: PersistedSupervisionTaskAssignment, now: number): void {
+    if (this.#closed) return;
+    const next: PersistedSupervisionTaskAssignment = { ...assignment, heartbeatAt: now };
+    this.#db.prepare(
+      'UPDATE supervision_task_assignments SET heartbeat_at = ?, payload_json = ? WHERE assignment_id = ?',
+    ).run(now, JSON.stringify(next), assignment.assignmentId);
+  }
+
   recordImplementationHeartbeat(input: {
     assignmentId: string;
     now?: number;
@@ -1674,6 +1702,7 @@ export class SupervisionTaskRegistry {
       reminderNumber: input.reminderNumber,
       clientMessageId: input.clientMessageId,
     }, now);
+    this.#recordAssignmentHeartbeat(assignment, now);
     const event = this.listEvents(assignment.taskId).at(-1);
     return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
   }
@@ -3805,6 +3834,7 @@ export class SupervisionTaskRegistry {
           substantiveProgress: false,
           ...(input.note ? { note: input.note } : {}),
         }, now);
+        this.#recordAssignmentHeartbeat(assignment, now);
       }
       return { ok: true, value: task };
     }
@@ -3812,7 +3842,16 @@ export class SupervisionTaskRegistry {
     const assignmentChanges = Boolean(assignment && assignmentTarget && assignmentTarget !== assignment.status);
     // Heartbeat/checkpoint and an already-applied synchronized intent are true
     // idempotent no-ops.
-    if (!taskChanges && !assignmentChanges) return { ok: true, value: task, replay: true };
+    // A recorded validation outcome is durable evidence in its own right.
+    // `failed` and `unavailable` do not advance status, so without this they
+    // would fall into the "nothing changed" replay path and persist nothing,
+    // leaving the console reporting 'unknown' despite a real recorded result.
+    const validationOutcome = input.intent === 'record_validation' && input.validationState
+      ? input.validationState
+      : undefined;
+    if (!taskChanges && !assignmentChanges && !validationOutcome) {
+      return { ok: true, value: task, replay: true };
+    }
 
     if (assignment && assignmentTarget && assignmentTarget !== assignment.status) {
       const staleRepair = assignment.status === 'delegated'
@@ -3829,10 +3868,21 @@ export class SupervisionTaskRegistry {
       : task;
     this.#db.exec('BEGIN IMMEDIATE');
     try {
-      if (assignment && assignmentTarget && assignmentTarget !== assignment.status) {
+      if (assignment && ((assignmentTarget && assignmentTarget !== assignment.status) || validationOutcome)) {
         this.#writeAssignment(
-          { ...assignment, status: assignmentTarget, updatedAt: now },
-          input.intent === 'open_audit' ? 'implementation_finished' : this.#taskEventFor(assignmentTarget),
+          {
+            ...assignment,
+            ...(assignmentTarget ? { status: assignmentTarget } : {}),
+            // Persist the outcome, not just the event payload, so the console
+            // can project a real validation state instead of 'unknown'.
+            ...(input.validationState ? { validationState: input.validationState } : {}),
+            updatedAt: now,
+          },
+            input.intent === 'open_audit'
+              ? 'implementation_finished'
+              // No status transition means this write exists only to record the
+              // validation outcome, so the canonical validated event is honest here.
+              : (assignmentTarget ? this.#taskEventFor(assignmentTarget) : 'validated'),
           {
             source: 'task_intent_assignment_sync',
             intent: input.intent,
@@ -3844,8 +3894,9 @@ export class SupervisionTaskRegistry {
           },
         );
       }
-      if (taskChanges) {
-        this.#writeTask(record, this.#taskEventFor(input.toStatus!), {
+      if (taskChanges || validationOutcome) {
+        this.#writeTask({ ...record, ...(validationOutcome ? { validationState: validationOutcome } : {}) },
+          taskChanges ? this.#taskEventFor(input.toStatus!) : 'validated', {
           source: 'task_intent',
           intent: input.intent,
           status: input.toStatus,

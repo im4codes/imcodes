@@ -11,6 +11,7 @@ import {
 } from '../../src/daemon/supervision-store-migrations.js';
 import { resolveMissingSupervisionSessionPresentation } from '../../src/daemon/lifecycle.js';
 import type { SupervisionTaskConsoleDelta } from '../../shared/supervision-task-console.js';
+import { SUPERVISION_CONSOLE_HEARTBEAT_STALE_MS } from '../../shared/supervision-task-console.js';
 import type { SupervisionAuditReceipt } from '../../shared/supervision-audit-handoff.js';
 
 const SCOPE = { projectName: 'codedeck', coordinatorSessionName: 'deck_cd_brain' };
@@ -235,6 +236,48 @@ describe('assignment, pool and validation projections', () => {
       observedModel: 'gpt-5.6-sol', observedProvider: 'openai', validationState: 'passed',
       heartbeatAt: 555,
     });
+  });
+
+  it('projects execution health as a server-derived fact, not raw timestamps', () => {
+    // The browser is forbidden from inferring liveness (a source guard test
+    // pins that), so the projection must answer "is it actually running?"
+    // itself. Lease presence alone cannot: it stays true for a dead reroute.
+    seedTask('implementing');
+    const fresh = Date.now();
+    db.prepare('UPDATE supervision_task_assignments SET heartbeat_at=? WHERE assignment_id=?')
+      .run(fresh, 'asg_console');
+    expect(producer().readAssignmentRows(SCOPE.projectName)[0]).toMatchObject({
+      leaseActive: true, executionHealth: 'live',
+    });
+
+    db.prepare('UPDATE supervision_task_assignments SET heartbeat_at=? WHERE assignment_id=?')
+      .run(fresh - SUPERVISION_CONSOLE_HEARTBEAT_STALE_MS - 60_000, 'asg_console');
+    expect(producer().readAssignmentRows(SCOPE.projectName)[0]!.executionHealth).toBe('stale');
+
+    db.prepare("UPDATE supervision_task_assignments SET lease_id='' WHERE assignment_id=?")
+      .run('asg_console');
+    expect(producer().readAssignmentRows(SCOPE.projectName)[0]!.executionHealth).toBe('released');
+  });
+
+  it('reports unknown health for a leased assignment that never beat', () => {
+    seedTask('implementing');
+    db.prepare('UPDATE supervision_task_assignments SET heartbeat_at=NULL WHERE assignment_id=?')
+      .run('asg_console');
+    expect(producer().readAssignmentRows(SCOPE.projectName)[0]!.executionHealth).toBe('unknown');
+  });
+
+  it('separates waiting on external CI from the other three axes', () => {
+    // External-CI wait is its own axis: the row must say so explicitly rather
+    // than making the UI pattern-match a lifecycle status string.
+    seedTask('implementing');
+    expect(producer().readAssignmentRows(SCOPE.projectName)[0]!.awaitingExternalCi).toBe(false);
+    db.prepare("UPDATE supervision_task_assignments SET status='retrying_external_ci' WHERE assignment_id=?")
+      .run('asg_console');
+    const row = producer().readAssignmentRows(SCOPE.projectName)[0]!;
+    expect(row.awaitingExternalCi).toBe(true);
+    // ...and it does not disturb the other axes.
+    expect(row.status).toBe('retrying_external_ci');
+    expect(row.leaseActive).toBe(true);
   });
 
   it('projects only lease presence and never exposes the durable lease id', () => {

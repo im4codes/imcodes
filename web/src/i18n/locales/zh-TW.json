@@ -3306,7 +3306,13 @@
     "no_assignments": "暫無任務指派",
     "events": "近期即時事件",
     "no_events": "本次快照後尚未收到即時增量。",
-    "event_op": { "task_upsert": "任務已更新", "task_remove": "任務已移除", "assignment_upsert": "指派已更新", "assignment_remove": "指派已移除", "pools_update": "執行池已更新" },
+    "event_op": {
+      "task_upsert": "任務已更新",
+      "task_remove": "任務已移除",
+      "assignment_upsert": "指派已更新",
+      "assignment_remove": "指派已移除",
+      "pools_update": "執行池已更新"
+    },
     "task_id": "任務 ID",
     "top_level_task": "頂層任務",
     "projection": "投影版本 {{version}}",
@@ -3316,14 +3322,44 @@
     "error": "即時任務串流暫不可用。",
     "empty": "暫無監督任務。",
     "unsupported": "任務狀態不受支援，正在安全重新同步。",
-    "group": { "active": "進行中", "audit": "稽核", "rework": "返工", "integration": "整合", "final": "已結束" },
-    "pool_kind": { "primary": "主要執行池", "economy": "經濟執行池" },
-    "validation_state": { "unknown": "未知", "pending": "待驗證", "passed": "已通過", "failed": "失敗", "unavailable": "不可用" },
+    "group": {
+      "active": "進行中",
+      "audit": "稽核",
+      "rework": "返工",
+      "integration": "整合",
+      "final": "已結束"
+    },
+    "pool_kind": {
+      "primary": "主要執行池",
+      "economy": "經濟執行池"
+    },
+    "validation_state": {
+      "unknown": "未知",
+      "pending": "待驗證",
+      "passed": "已通過",
+      "failed": "失敗",
+      "unavailable": "不可用"
+    },
     "status": {
-      "planned": "已規劃", "delegated": "已派發", "implementing": "實作中", "retrying_external_ci": "重試外部 CI", "validated": "已驗證",
-      "ready_for_audit": "可稽核", "auditing": "稽核中", "rework": "返工", "passed": "已通過",
-      "ready_for_integration": "可整合", "integrating": "整合中", "final_audit": "最終稽核", "finalizing": "最終化中", "committed": "已提交",
-      "pushed": "已推送", "recovered": "已復原", "finalized": "已完成", "blocked": "已阻塞", "cancelled": "已取消"
+      "planned": "已規劃",
+      "delegated": "已派發",
+      "implementing": "實作中",
+      "retrying_external_ci": "重試外部 CI",
+      "validated": "已驗證",
+      "ready_for_audit": "可稽核",
+      "auditing": "稽核中",
+      "rework": "返工",
+      "passed": "已通過",
+      "ready_for_integration": "可整合",
+      "integrating": "整合中",
+      "final_audit": "最終稽核",
+      "finalizing": "最終化中",
+      "committed": "已提交",
+      "pushed": "已推送",
+      "recovered": "已復原",
+      "finalized": "已完成",
+      "blocked": "已阻塞",
+      "cancelled": "已取消"
     },
     "tabs_label": "任務檢視",
     "tab_active": "進行中",
@@ -3337,7 +3373,21 @@
     "implementer": "實作者",
     "auditor": "稽核者",
     "copy_task_id": "複製",
-    "session_state": {"running": "執行中","idle": "閒置","needs_input": "等待輸入","offline": "離線","unknown": "未知"}
+    "session_state": {
+      "running": "執行中",
+      "idle": "閒置",
+      "needs_input": "等待輸入",
+      "offline": "離線",
+      "unknown": "未知"
+    },
+    "execution_health": {
+      "live": "執行中",
+      "stale": "長時間無心跳",
+      "released": "未執行",
+      "unknown": "未觀測"
+    },
+    "awaiting_external_ci": "等待 CI",
+    "work_state": "工作狀態"
   },
   "remote_desktop": {
     "open": "遠端桌面",

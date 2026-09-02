@@ -26,6 +26,7 @@ import {
   type SupervisionConsoleSessionState,
   type SupervisionConsoleSessionStateSource,
   SUPERVISION_CONSOLE_VALIDATION_STATES,
+  supervisionConsoleExecutionHealth,
 } from '../../shared/supervision-task-console.js';
 import {
   DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS,
@@ -299,6 +300,8 @@ export class SupervisionConsoleProducer {
        WHERE t.project_name = ? ORDER BY a.assignment_id ASC`,
     ).all(projectName) as Array<Record<string, unknown>>;
     const out: SupervisionTaskConsoleAssignmentRow[] = [];
+    // One clock for the whole pass so rows in a snapshot cannot disagree.
+    const now = Date.now();
     for (const row of rows) {
       if (!visibleTaskIds.has(String(row.task_id))) continue;
       const status = String(row.status ?? '');
@@ -315,6 +318,9 @@ export class SupervisionConsoleProducer {
       const presentation = ownerSessionName
         ? this.#resolveSessionPresentation?.(ownerSessionName, durableObservedAt)
         : undefined;
+      const leaseActive = typeof row.lease_id === 'string' && row.lease_id.trim().length > 0;
+      const heartbeatAt = row.heartbeat_at === null || row.heartbeat_at === undefined
+        ? undefined : Number(row.heartbeat_at);
       out.push({
         assignmentId: String(row.assignment_id),
         taskId: String(row.task_id),
@@ -322,7 +328,11 @@ export class SupervisionConsoleProducer {
         phase: supervisionConsoleStatusGroup(status),
         role: row.role ? String(row.role) : undefined,
         required,
-        leaseActive: typeof row.lease_id === 'string' && row.lease_id.trim().length > 0,
+        leaseActive,
+        // Derived once, server-side, so the browser renders a fact instead of
+        // guessing liveness from a raw timestamp it is forbidden to read.
+        executionHealth: supervisionConsoleExecutionHealth({ leaseActive, heartbeatAt, now }),
+        awaitingExternalCi: status === 'retrying_external_ci',
         ownerSessionName,
         ownerSessionLabel: presentation?.label,
         ownerAgentType: row.agent_type ? String(row.agent_type) : undefined,
@@ -340,8 +350,7 @@ export class SupervisionConsoleProducer {
         nextAction: row.next_action ? String(row.next_action) : undefined,
         recoveryState: row.recovery_state ? String(row.recovery_state) : undefined,
         recoveryReason: row.recovery_reason ? String(row.recovery_reason) : undefined,
-        heartbeatAt: row.heartbeat_at === null || row.heartbeat_at === undefined
-          ? undefined : Number(row.heartbeat_at),
+        heartbeatAt,
         updatedAt: Number(row.updated_at ?? 0),
         lastEventId: Number(row.last_durable_event_id ?? 0),
       });

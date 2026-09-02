@@ -23,6 +23,11 @@ import {
   supervisionConsoleTabForTask,
   type SupervisionTaskConsoleCursorState,
   type SupervisionTaskConsoleTaskRow,
+  SUPERVISION_CONSOLE_EXECUTION_HEALTH,
+  SUPERVISION_CONSOLE_HEARTBEAT_STALE_MS,
+  supervisionConsoleExecutionHealth,
+  SUPERVISION_CONSOLE_CARD_ACTIVITY,
+  supervisionConsoleCardActivity,
 } from '../../shared/supervision-task-console.js';
 import {
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
@@ -313,5 +318,116 @@ describe('supervision console audience scoping', () => {
   it('admits only a recorded participant', () => {
     expect(isSupervisionConsoleAudienceMember({ coordinatorSessionName: 'deck_cd_brain', participantSessionNames: ['deck_cd_brain', 'deck_cd_w1'] })).toBe(true);
     expect(isSupervisionConsoleAudienceMember({ coordinatorSessionName: 'deck_other_brain', participantSessionNames: ['deck_cd_brain'] })).toBe(false);
+  });
+});
+
+describe('execution health derivation', () => {
+  const T0 = 1_000_000_000;
+  const health = (input: Parameters<typeof supervisionConsoleExecutionHealth>[0]) =>
+    supervisionConsoleExecutionHealth(input);
+
+  it('reports released when no lease is held', () => {
+    // A released lease is the one unambiguous signal that nothing is running.
+    expect(health({ leaseActive: false, heartbeatAt: T0, now: T0 })).toBe('released');
+    expect(health({ heartbeatAt: T0, now: T0 })).toBe('released');
+  });
+
+  it('reports unknown when a lease is held but no beat was ever observed', () => {
+    // Never-observed is NOT the same as dead; the UI must not claim either.
+    expect(health({ leaseActive: true, now: T0 })).toBe('unknown');
+  });
+
+  it('reports live for a recent beat', () => {
+    expect(health({ leaseActive: true, heartbeatAt: T0, now: T0 })).toBe('live');
+    expect(health({ leaseActive: true, heartbeatAt: T0, now: T0 + 60_000 })).toBe('live');
+  });
+
+  it('tolerates the maximum legitimate reminder backoff before calling anything stale', () => {
+    // Implementation reminders back off to 60 minutes, so a healthy assignment
+    // can genuinely be quiet that long. A threshold at or below the backoff
+    // would libel working sessions as stale.
+    expect(SUPERVISION_CONSOLE_HEARTBEAT_STALE_MS).toBeGreaterThan(60 * 60_000);
+    expect(health({ leaseActive: true, heartbeatAt: T0, now: T0 + 60 * 60_000 })).toBe('live');
+  });
+
+  it('reports stale once the beat is older than the canonical threshold', () => {
+    const past = T0 - SUPERVISION_CONSOLE_HEARTBEAT_STALE_MS - 1;
+    expect(health({ leaseActive: true, heartbeatAt: past, now: T0 })).toBe('stale');
+  });
+
+  it('never infers health from the clock alone', () => {
+    // A lease-held row with a fresh beat is live regardless of how old the row
+    // itself is; staleness must come from the beat, not from updatedAt.
+    expect(health({ leaseActive: true, heartbeatAt: T0, now: T0 + 1 })).toBe('live');
+  });
+
+  it('exposes exactly the four canonical health values', () => {
+    expect([...SUPERVISION_CONSOLE_EXECUTION_HEALTH].sort())
+      .toEqual(['live', 'released', 'stale', 'unknown']);
+  });
+});
+
+describe('card activity derivation', () => {
+  const impl = (over = {}) => ({ role: 'implementer', sessionState: 'idle', ...over } as never);
+  const aud = (over = {}) => ({ role: 'auditor', sessionState: 'idle', ...over } as never);
+
+  it('reports terminal for the history tab', () => {
+    expect(supervisionConsoleCardActivity({ tab: 'history', taskStatus: 'finalized', assignments: [] }))
+      .toBe('terminal');
+  });
+
+  it('reports needs_input only for the real blocked STATUS, never for blocker prose', () => {
+    // The old client heuristic treated any free-text blocker note as equivalent
+    // to status==='blocked', so an actively running task with an informational
+    // note rendered as if it needed a human.
+    expect(supervisionConsoleCardActivity({
+      tab: 'active', taskStatus: 'blocked', assignments: [],
+    })).toBe('needs_input');
+    expect(supervisionConsoleCardActivity({
+      tab: 'active', taskStatus: 'implementing', blocker: 'waiting on a slow download',
+      assignments: [impl({ sessionState: 'running' })],
+    })).toBe('running');
+  });
+
+  it('prefers a running implementer over a running auditor', () => {
+    expect(supervisionConsoleCardActivity({
+      tab: 'active', taskStatus: 'implementing',
+      assignments: [impl({ sessionState: 'running' }), aud({ sessionState: 'running' })],
+    })).toBe('running');
+    expect(supervisionConsoleCardActivity({
+      tab: 'active', taskStatus: 'auditing',
+      assignments: [impl({ sessionState: 'idle' }), aud({ sessionState: 'running' })],
+    })).toBe('audit-running');
+  });
+
+  it('keeps the pending tab isolated from live runtime appearance', () => {
+    // A stale aggregate must never animate as Active just because an old
+    // runtime is still running, so the tab outranks session state here.
+    expect(supervisionConsoleCardActivity({
+      tab: 'pending', taskStatus: 'delegated', assignments: [impl()],
+    })).toBe('pending');
+    expect(supervisionConsoleCardActivity({
+      tab: 'pending', taskStatus: 'delegated',
+      assignments: [impl({ sessionState: 'running' }), aud({ sessionState: 'running' })],
+    })).toBe('pending');
+  });
+
+  it('falls back to the implementer runtime state, then the auditor, then unknown', () => {
+    // Flattening idle and offline into one token would hide a real difference.
+    expect(supervisionConsoleCardActivity({
+      tab: 'active', taskStatus: 'implementing', assignments: [impl({ sessionState: 'idle' })],
+    })).toBe('idle');
+    expect(supervisionConsoleCardActivity({
+      tab: 'active', taskStatus: 'implementing', assignments: [aud({ sessionState: 'offline' })],
+    })).toBe('offline');
+    expect(supervisionConsoleCardActivity({ tab: 'active', taskStatus: 'implementing', assignments: [] }))
+      .toBe('unknown');
+  });
+
+  it('exposes a closed set of activity tokens', () => {
+    expect([...SUPERVISION_CONSOLE_CARD_ACTIVITY].sort()).toEqual([
+      'audit-running', 'idle', 'needs_input', 'offline', 'pending', 'running',
+      'terminal', 'unknown',
+    ]);
   });
 });

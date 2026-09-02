@@ -623,6 +623,73 @@ beforeEach(() => {
 });
 
 describe('SupervisionTaskRegistry', () => {
+
+  it('durably persists every record_validation outcome on BOTH task and assignment', () => {
+    // The R1 audit caught two real defects here:
+    //  * supervision_tasks had no validation_state column in its upsert, so the
+    //    task-side outcome was silently dropped;
+    //  * failed/unavailable do not advance status, so the intent hit the
+    //    "nothing changed" replay short-circuit and persisted nothing at all.
+    // Both are asserted against raw SQLite, not through a convenience getter.
+    const identityValue = identity('deck_alpha_worker');
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-validation-'));
+    const dbPath = join(dir, 'state.sqlite');
+    try {
+      for (const [outcome, taskId] of [
+        ['passed', 'val-passed'], ['failed', 'val-failed'], ['unavailable', 'val-unavailable'],
+      ] as const) {
+        let registry = new SupervisionTaskRegistry({ dbPath });
+        expect(registry.createOrGet({
+          taskId, projectName: 'alpha', classification: 'independent_top_level',
+          objective: 'validation persistence', now: 1_000,
+        }).ok).toBe(true);
+        const assignment = registry.createAssignment({
+          assignmentId: `${taskId}-asg`, taskId, role: 'implementer',
+          identity: identityValue, scopeFiles: ['src/a.ts'], now: 2_000,
+        });
+        if (!assignment.ok) throw new Error(assignment.reason);
+        expect(registry.updateTask({ taskId, status: 'implementing', now: 3_000 }).ok).toBe(true);
+        expect(registry.updateAssignment({
+          assignmentId: assignment.value.assignmentId, identity: identityValue,
+          status: 'implementing', now: 3_000,
+        }).ok).toBe(true);
+
+        const result = registry.applyTaskIntent({
+          taskId, assignmentId: assignment.value.assignmentId,
+          intent: 'record_validation', validationState: outcome,
+          ...(outcome === 'passed' ? { toStatus: 'validated' as const } : {}),
+          now: 4_000,
+        } as never);
+        expect(result.ok, `${outcome} intent must be accepted`).toBe(true);
+        // A non-advancing outcome must NOT be reported as an idempotent replay.
+        expect((result as { replay?: boolean }).replay, `${outcome} must not no-op`).not.toBe(true);
+        registry.close();
+
+        // Exact SQLite counterexample: read the durable columns directly.
+        const db = new DatabaseSync(dbPath);
+        const taskRow = db.prepare('SELECT validation_state AS v FROM supervision_tasks WHERE task_id = ?')
+          .get(taskId) as { v?: string } | undefined;
+        const asgRow = db.prepare('SELECT validation_state AS v FROM supervision_task_assignments WHERE assignment_id = ?')
+          .get(assignment.value.assignmentId) as { v?: string } | undefined;
+        expect(taskRow?.v, `task validation_state for ${outcome}`).toBe(outcome);
+        expect(asgRow?.v, `assignment validation_state for ${outcome}`).toBe(outcome);
+        const events = db.prepare(
+          "SELECT COUNT(*) AS n FROM supervision_task_events WHERE task_id = ? AND event_type LIKE '%validat%'",
+        ).get(taskId) as { n: number };
+        expect(events.n, `canonical validation event for ${outcome}`).toBeGreaterThan(0);
+        db.close();
+
+        // Restart readback: the outcome survives a fresh registry instance.
+        registry = new SupervisionTaskRegistry({ dbPath });
+        expect(registry.getAssignment(assignment.value.assignmentId)?.validationState).toBe(outcome);
+        expect(registry.getTaskRecord(taskId)?.validationState).toBe(outcome);
+        registry.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('atomically finalizes one exact integration through the production MCP and keeps legacy history queryable', async () => {
     const registry = getSupervisionTaskRegistry();
     const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-production');
@@ -3386,6 +3453,13 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.getAssignment(assignment.value.assignmentId)).toMatchObject({
         updatedAt: progressClock, status: 'implementing',
       });
+      // The heartbeat must leave a DURABLE liveness beat, not just an event
+      // row. The console projects `heartbeatAt` from this column, so if the
+      // heartbeat never writes it the UI can only fall back to lease presence
+      // -- which stays true for an abandoned assignment forever.
+      expect(registry.getAssignment(assignment.value.assignmentId)?.heartbeatAt).toBe(10_000);
+      // ...and it still must NOT move the substantive progress clock.
+      expect(registry.getAssignment(assignment.value.assignmentId)?.updatedAt).toBe(progressClock);
       expect(registry.getAssignment(assignment.value.assignmentId)?.verdict).toBeUndefined();
       registry.close();
 
@@ -3402,6 +3476,8 @@ describe('SupervisionTaskRegistry', () => {
         })],
       });
       expect(registry.getAssignment(assignment.value.assignmentId)?.verdict).toBeUndefined();
+      // Survives a reopen: liveness is durable, not in-memory.
+      expect(registry.getAssignment(assignment.value.assignmentId)?.heartbeatAt).toBe(10_000);
       registry.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -4731,6 +4807,10 @@ describe('SupervisionTaskRegistry', () => {
       status: 'validated',
       assignments: expect.arrayContaining([expect.objectContaining({ assignmentId: implementer.value.assignmentId, status: 'validated' })]),
     });
+      // record_validation must leave a DURABLE validation_state, not only an
+      // event payload. The console projects validationState from that column,
+      // so an unwritten column makes every row read 'unknown' forever.
+      expect(registry.getAssignment(implementer.value.assignmentId)?.validationState).toBe('passed');
     expect(await ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'open_audit', taskId: 'matching-pass-close', assignmentId: implementer.value.assignmentId,
     })).toMatchObject({ status: 'ok', fromStatus: 'validated', toStatus: 'ready_for_audit' });

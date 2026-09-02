@@ -9,6 +9,7 @@ import {
   type SupervisionConsoleSessionState,
   type SupervisionTaskConsoleAssignmentRow,
   type SupervisionTaskConsoleTaskRow,
+  supervisionConsoleCardActivity,
 } from '@shared/supervision-task-console.js';
 import { isSupervisionTaskLifecycleStatus } from '@shared/supervision-config.js';
 import type { WsClient } from '../ws-client.js';
@@ -192,10 +193,20 @@ function SessionButton(props: {
   const { assignment } = props;
   const name = assignment.ownerSessionName;
   const state = assignment.sessionState ?? 'unknown';
+  // Four separate facts, never folded together:
+  //  1. task lifecycle  -> rendered by the card's status pill
+  //  2. assignment work state -> assignment.status, shown here in its own right
+  //  3. execution health -> server-derived; the browser must not infer liveness
+  //  4. external CI wait -> its own flag
+  // Previously this slot printed the TASK status whenever the tab was not
+  // active, which made a terminal assignment under a live task indistinguishable
+  // from a running one.
   const showRuntimeState = props.taskTab === 'active';
+  const workStateLabel = t(displayStatusKey(assignment.status));
+  const healthLabel = t(`supervision_task_console.execution_health.${assignment.executionHealth ?? 'unknown'}`);
   const stateLabel = showRuntimeState
     ? t(`supervision_task_console.session_state.${state}`)
-    : t(displayStatusKey(props.taskStatus));
+    : workStateLabel;
   if (!name) return null;
   return (
     <button
@@ -214,6 +225,15 @@ function SessionButton(props: {
         {props.lane === 'auditor' && (assignment.auditAttemptId || assignment.auditVerdict) && <small>{assignment.auditAttemptId || '—'} · {assignment.auditVerdict || '—'}</small>}
       </span>
       <span class="supervision-task-console-session-state">{stateLabel}{showRuntimeState ? ` · ${assignment.sessionStateSource ?? 'registry'}` : ''}</span>
+      <span
+        class={`supervision-task-console-session-health health-${assignment.executionHealth ?? 'unknown'}`}
+        data-execution-health={assignment.executionHealth ?? 'unknown'}
+      >{t('supervision_task_console.work_state')}: {workStateLabel} · {healthLabel}</span>
+      {assignment.awaitingExternalCi === true && (
+        <span class="supervision-task-console-session-ci" data-awaiting-external-ci="true">
+          {t('supervision_task_console.awaiting_external_ci')}
+        </span>
+      )}
     </button>
   );
 }
@@ -231,17 +251,15 @@ function TaskCard(props: {
   const implementer = props.assignments.find(isImplementerAssignment);
   const auditor = props.assignments.find(isAuditAssignment);
   const taskTab = supervisionConsoleTabForTask(props.task, props.assignments);
-  const dominantState = taskTab === 'history'
-    ? 'terminal'
-    : taskTab === 'pending'
-      ? (props.task.status === 'blocked' || props.task.blocker ? 'needs_input' : 'pending')
-      : props.task.blocker
-      ? 'needs_input'
-      : implementer?.sessionState === 'running'
-        ? 'running'
-        : auditor?.sessionState === 'running'
-          ? 'audit-running'
-          : implementer?.sessionState ?? auditor?.sessionState ?? 'unknown';
+  // Derived by the shared canonical function, not locally: the browser renders
+  // truth, it does not compute it. Blocker prose no longer masquerades as the
+  // blocked status, and two assignments are no longer blended into one value.
+  const dominantState = supervisionConsoleCardActivity({
+    tab: taskTab,
+    taskStatus: props.task.status,
+    blocker: props.task.blocker,
+    assignments: props.assignments,
+  });
   const activityAt = authoritativeActivityAt(props.task, props.assignments);
   const activityAssignment = taskTab === 'active'
     ? taskRoleAssignments(props.assignments).sort((left, right) =>

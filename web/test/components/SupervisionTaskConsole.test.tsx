@@ -204,6 +204,51 @@ describe('SupervisionTaskConsole', () => {
     expect(clampSupervisionConsoleWidth(400, 400)).toBe(368);
   });
 
+  it('renders task lifecycle, assignment work state and execution health as separate facts', () => {
+    // The console previously printed the TASK status in the session-runtime
+    // slot and never rendered the assignment's own work state at all, so a
+    // terminal assignment under a live task looked identical to a running one.
+    const base = state();
+    render(
+      <SupervisionTaskConsoleView
+        state={{
+          ...base,
+          assignments: {
+            ...base.assignments,
+            'assignment-primary': {
+              ...base.assignments['assignment-primary']!,
+              status: 'validated',
+              executionHealth: 'stale',
+              awaitingExternalCi: true,
+            },
+          },
+        }}
+        mobile={false}
+        now={NOW}
+        width={720}
+        maxWidth={920}
+        onResizeKeyDown={() => {}}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    // Assignment work state is shown in its own right...
+    expect(screen.getAllByText(/supervision_task_console\.status\.validated/).length)
+      .toBeGreaterThan(0);
+    // ...execution health is a rendered server fact, not an inferred one...
+    const health = document.querySelector('[data-execution-health]');
+    expect(health?.getAttribute('data-execution-health')).toBe('stale');
+    // ...and the external-CI wait is its own indicator.
+    expect(document.querySelector('[data-awaiting-external-ci="true"]')).not.toBeNull();
+  });
+
+  it('still never reads a raw heartbeat in the component source', () => {
+    // Liveness stays server-derived: adding executionHealth must not smuggle
+    // client-side heartbeat inference back in.
+    expect(readFileSync(resolve(import.meta.dirname, '../../src/components/SupervisionTaskConsole.tsx'), 'utf8'))
+      .not.toMatch(/heartbeat/i);
+  });
+
   it('publishes the split bounds to assistive tech', () => {
     render(
       <SupervisionTaskConsoleView
