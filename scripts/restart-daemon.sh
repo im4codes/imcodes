@@ -19,8 +19,9 @@ npm link --force
 
 PROJECT_ROOT="$PROJECT_ROOT" node --input-type=module <<'NODE'
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const projectRoot = process.env.PROJECT_ROOT;
 const localManifestPath = join(projectRoot, 'dist/.build-manifest.json');
@@ -29,27 +30,9 @@ if (!existsSync(localManifestPath)) {
 }
 const imcodesBin = execFileSync('bash', ['-lc', 'command -v imcodes'], { encoding: 'utf8' }).trim();
 if (!imcodesBin) throw new Error('imcodes is not on PATH after npm link');
-
-let dir = dirname(realpathSync(imcodesBin));
-let linkedRoot = '';
-for (let i = 0; i < 8; i += 1) {
-  const packageJsonPath = join(dir, 'package.json');
-  if (existsSync(packageJsonPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-      if (pkg.name === 'imcodes') {
-        linkedRoot = dir;
-        break;
-      }
-    } catch {
-      // Keep walking upward.
-    }
-  }
-  const next = dirname(dir);
-  if (next === dir) break;
-  dir = next;
-}
-if (!linkedRoot) throw new Error(`could not locate linked imcodes package root from ${imcodesBin}`);
+const resolverUrl = pathToFileURL(join(projectRoot, 'scripts/resolve-linked-imcodes-root.mjs')).href;
+const { resolveLinkedImcodesPackageRoot } = await import(resolverUrl);
+const linkedRoot = resolveLinkedImcodesPackageRoot(imcodesBin);
 
 const linkedManifestPath = join(linkedRoot, 'dist/.build-manifest.json');
 if (!existsSync(linkedManifestPath)) {
