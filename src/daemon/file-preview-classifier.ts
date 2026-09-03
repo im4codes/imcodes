@@ -2,6 +2,14 @@ import * as path from 'node:path';
 import { FS_READ_PREVIEW_REASONS, type FsReadPreviewReason } from '../../shared/fs-read-error-codes.js';
 
 export const FS_READ_SIZE_LIMIT = 100 * 1024 * 1024;
+/**
+ * Buffered previews (image/office/text) are read whole and, for image/office,
+ * base64-encoded synchronously before being sent. A large file therefore blocks
+ * the event loop long enough to miss ServerLink heartbeats, which drops the
+ * daemon WebSocket and shows the daemon as offline in the UI. Streamed kinds
+ * (video/audio) do not buffer and keep the larger FS_READ_SIZE_LIMIT.
+ */
+export const FS_READ_INLINE_SIZE_LIMIT = 2 * 1024 * 1024;
 export const BINARY_DETECTION_SAMPLE_BYTES = 8192;
 export const MISSING_FILE_SIGNATURE = 'missing';
 
@@ -125,26 +133,7 @@ export function classifyPreviewByPath(filePath: string, size: number): FilePrevi
   const textMime = TEXT_MIME_BY_EXTENSION[extension as keyof typeof TEXT_MIME_BY_EXTENSION];
   const mimeType = imageMime ?? officeMime ?? videoMime ?? audioMime ?? textMime;
 
-  if (size > FS_READ_SIZE_LIMIT) {
-    return {
-      previewType: 'too_large',
-      previewKind: 'too_large',
-      extension,
-      size,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
-      mimeType,
-      previewReason: FS_READ_PREVIEW_REASONS.TOO_LARGE,
-    };
-  }
-
-  if (imageMime) {
-    return { previewType: 'image', previewKind: 'image', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: imageMime };
-  }
-
-  if (officeMime) {
-    return { previewType: 'office', previewKind: 'office', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: officeMime };
-  }
-
+  // Streamed kinds never buffer the whole file: check them before the inline cap.
   if (videoMime) {
     return { previewType: 'video', previewKind: 'video', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: videoMime, previewMode: 'stream' };
   }
@@ -153,7 +142,27 @@ export function classifyPreviewByPath(filePath: string, size: number): FilePrevi
     return { previewType: 'audio', previewKind: 'audio', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: audioMime, previewMode: 'stream' };
   }
 
-  return { previewType: 'text', previewKind: 'text', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: textMime };
+  if (size > FS_READ_INLINE_SIZE_LIMIT) {
+    return {
+      previewType: 'too_large',
+      previewKind: 'too_large',
+      extension,
+      size,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
+      mimeType,
+      previewReason: FS_READ_PREVIEW_REASONS.TOO_LARGE,
+    };
+  }
+
+  if (imageMime) {
+    return { previewType: 'image', previewKind: 'image', extension, size, sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT, mimeType: imageMime };
+  }
+
+  if (officeMime) {
+    return { previewType: 'office', previewKind: 'office', extension, size, sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT, mimeType: officeMime };
+  }
+
+  return { previewType: 'text', previewKind: 'text', extension, size, sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT, mimeType: textMime };
 }
 
 export function classifyFile(input: { realPath: string; size: number; mtimeMs?: number }): FilePreviewClassification {

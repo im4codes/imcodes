@@ -3,6 +3,7 @@ import { FS_READ_PREVIEW_REASONS } from '../../shared/fs-read-error-codes.js';
 import {
   BINARY_DETECTION_SAMPLE_BYTES,
   FS_READ_SIZE_LIMIT,
+  FS_READ_INLINE_SIZE_LIMIT,
   MISSING_FILE_SIGNATURE,
   areFileSignaturesEqual,
   bytesContainNulByte,
@@ -25,7 +26,7 @@ describe('file preview classifier', () => {
       previewKind: 'text',
       extension: 'md',
       size: 42,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
       mimeType: 'text/markdown',
     });
   });
@@ -36,7 +37,7 @@ describe('file preview classifier', () => {
       previewKind: 'image',
       extension: 'png',
       size: 10,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
       mimeType: 'image/png',
     });
   });
@@ -82,12 +83,12 @@ describe('file preview classifier', () => {
   });
 
   it('classifies too-large files before inline preview type', () => {
-    expect(classifyPreviewByPath('/repo/huge.png', FS_READ_SIZE_LIMIT + 1)).toMatchObject({
+    expect(classifyPreviewByPath('/repo/huge.png', FS_READ_INLINE_SIZE_LIMIT + 1)).toMatchObject({
       previewType: 'too_large',
       previewKind: 'too_large',
       extension: 'png',
-      size: FS_READ_SIZE_LIMIT + 1,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+      size: FS_READ_INLINE_SIZE_LIMIT + 1,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
       mimeType: 'image/png',
       previewReason: FS_READ_PREVIEW_REASONS.TOO_LARGE,
     });
@@ -99,10 +100,29 @@ describe('file preview classifier', () => {
       previewKind: 'text',
       extension: 'unknownext',
       size: 10,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
       mimeType: undefined,
     });
     expect(lookupPreviewMimeByExtension('unknownext')).toBeUndefined();
+  });
+
+  it('refuses to inline-preview a large office document so the event loop is not blocked', () => {
+    // Regression: a 31MB .docx was classified as 'office', then read whole and
+    // base64-encoded synchronously, stalling the event loop for seconds. That
+    // missed ServerLink heartbeats and dropped the daemon WS (UI showed the
+    // daemon offline), which also broke P2P downloads that need WS signalling.
+    const thirtyOneMb = 31 * 1024 * 1024;
+    expect(classifyPreviewByPath('/case/final.docx', thirtyOneMb)).toMatchObject({
+      previewType: 'too_large',
+      previewKind: 'too_large',
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
+    });
+    // Streamed media must NOT regress: it never buffers the whole file.
+    expect(classifyPreviewByPath('/case/clip.mp4', thirtyOneMb)).toMatchObject({
+      previewType: 'video',
+      previewMode: 'stream',
+      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+    });
   });
 
   it('looks up MIME types and extensions consistently', () => {
