@@ -3011,6 +3011,13 @@
     "expand": "Развернуть"
   },
   "delegation": {
+    "claim": {
+      "none": "В этом ходе не было авторизованных отправок",
+      "dispatch_count": "Авторизованных отправок: {{total}}",
+      "dispatch_id": "ID отправки",
+      "task_id": "ID задачи",
+      "assignment_id": "ID назначения"
+    },
     "picker": {
       "agents": "Агенты",
       "delegate_to_agent": "Делегировать задачу одному агенту"

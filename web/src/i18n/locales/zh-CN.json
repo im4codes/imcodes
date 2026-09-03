@@ -3012,6 +3012,13 @@
     "expand": "展开"
   },
   "delegation": {
+    "claim": {
+      "none": "本轮没有已授权的派发",
+      "dispatch_count": "已授权派发：{{total}}",
+      "dispatch_id": "派发 ID",
+      "task_id": "任务 ID",
+      "assignment_id": "分配 ID"
+    },
     "picker": {
       "agents": "智能体",
       "delegate_to_agent": "将任务委派给一个智能体"

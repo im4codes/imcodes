@@ -154,6 +154,11 @@ export interface ProviderContextPayload {
   deliveryId?: string;
   /** Runtime-minted transport activity generation for lifecycle attribution. */
   activityGeneration?: ActivityGeneration;
+  /**
+   * Authoritative session role from the session record. Providers gate
+   * Brain-only behaviour on this; it is never inferred from a session name.
+   */
+  sessionRole?: 'brain' | `w${number}`;
   sessionSystemText?: string;
   turnSystemText?: string;
   /**

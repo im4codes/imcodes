@@ -562,6 +562,22 @@ describe('supervision prompt entrypoint registry', () => {
    * makes the declaration load-bearing, so drift is a failure rather than a lie
    * a future reader trusts.
    */
+  it('keeps the audit lifecycle in the broker decision channel, not in the per-turn baseline', () => {
+    // Pairs with test/agent/transport-runtime-assembly.test.ts, which asserts
+    // the PERMANENT BASELINE layer (turnSystemText) carries the delegation
+    // contract and never the audit ones. That alone would be satisfied by an
+    // implementation that lost the audit lifecycle entirely, so this is the
+    // other half: the decision channel still renders finalization/registry
+    // contracts. Audit contracts belong here and must not migrate into the
+    // per-turn baseline to satisfy the delegation matrix.
+    const decision = buildSupervisionDecisionPrompt({
+      snapshot: { mode: SUPERVISION_MODE.SUPERVISED_AUDIT, maxAuditLoops: 2 },
+    } as never);
+    expect(decision).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(decision).toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
+    expect(decision).toContain(SUPERVISION_CONTRACT_IDS.TASK_REGISTRY);
+  });
+
   const CONTRACT_FLAGS: ReadonlyArray<readonly [string, string]> = [
     ['includesOrchestratorContext', SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT],
     ['includesTaskFinalizationContract', SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION],

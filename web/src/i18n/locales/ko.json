@@ -3011,6 +3011,13 @@
     "expand": "펼치기"
   },
   "delegation": {
+    "claim": {
+      "none": "이번 턴에는 승인된 전달이 없습니다",
+      "dispatch_count": "승인된 전달: {{total}}",
+      "dispatch_id": "전달 ID",
+      "task_id": "작업 ID",
+      "assignment_id": "할당 ID"
+    },
     "picker": {
       "agents": "에이전트",
       "delegate_to_agent": "한 에이전트에게 작업 위임"

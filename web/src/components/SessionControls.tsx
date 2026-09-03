@@ -136,7 +136,6 @@ import {
   type QuickAgentDelegationPreset,
 } from '@shared/agent-delegation.js';
 import {
-  SESSION_SETTINGS_FOCUS,
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
 
@@ -2558,7 +2557,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       onSettings?.(nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT
         ? {
             supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
-            focus: SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET,
           }
         : undefined);
     };

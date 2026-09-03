@@ -2673,7 +2673,7 @@ export async function restoreTransportSessions(
       const latestSessionInfo = getLatestSessionInfo();
       if (currentForFinalize.description) runtime.setDescription(currentForFinalize.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
-      runtime.setSessionIdentity(s.name, currentForFinalize.label);
+      runtime.setSessionIdentity(s.name, currentForFinalize.label, currentForFinalize.role);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
       if (currentForFinalize.effort) runtime.setEffort(currentForFinalize.effort);
       transportRuntimes.set(s.name, runtime);

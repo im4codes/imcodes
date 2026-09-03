@@ -730,6 +730,27 @@ export class TransportQueueStore {
     }
   }
 
+  /**
+   * Is this entry inside a LIVE handoff lease right now?
+   *
+   * The UI projection deliberately does not carry lease internals, but deleting
+   * an entry that is genuinely mid-delivery is a different failure from deleting
+   * a stale one: the provider may already hold the text. The authority answers
+   * this, so callers can distinguish "reclaimable" from "too late" instead of
+   * guessing from a status string.
+   */
+  hasLiveHandoff(sessionNameInput: string, clientMessageIdInput: string, now = Date.now()): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const clientMessageId = clientMessageIdInput.trim();
+    if (!clientMessageId) return false;
+    const row = this.db.prepare(`
+      SELECT handoff_expires_at AS expiresAt FROM queue_entries
+      WHERE session_name = ? AND client_message_id = ? AND status = 'handoff_inflight'
+    `).get(sessionName, clientMessageId) as { expiresAt?: number | null } | undefined;
+    const expiresAt = typeof row?.expiresAt === 'number' ? row.expiresAt : undefined;
+    return expiresAt !== undefined && expiresAt > now;
+  }
+
   drop(sessionNameInput: string, clientMessageIdInput: string, dropReason: QueueDropReason, now = Date.now()): QueueSnapshot {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');

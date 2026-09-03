@@ -21,6 +21,7 @@ import {
   type ProviderUsageUpdate,
 } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
+import { readDelegationClaim } from '../../shared/delegation-claim.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -465,9 +466,15 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     // terminal state separately, and a coalesced "Thinking (N tokens)" landing
     // after it would pin the UI to a status the turn already left.
     clearPendingStatusUpdate(sessionName);
+    // Authoritative delegation projection for this turn, forwarded verbatim.
+    // The UI renders assigned/queued/recovered from THIS fact or not at all;
+    // reading it back off metadata keeps the daemon the single source and
+    // leaves the assistant's prose untouched.
+    const delegationClaim = readDelegationClaim(message.metadata);
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: finalText,
       streaming: false,
+      ...(delegationClaim ? { delegationClaim } : {}),
     }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
 
     const usage = message.metadata?.usage as {

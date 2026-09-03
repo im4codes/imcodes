@@ -5014,9 +5014,33 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     // Treat the entry as deletable whenever it is a live `queued` row in the
     // store, independent of runtime membership; `drop` itself is idempotent.
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'undo_queued_message_before');
-    const queuedInStore = queueSnapshot.pendingMessageEntries.some(
-      (entry) => entry.clientMessageId === clientMessageId && entry.status === 'queued',
+    // Deletability is a property of the ROW EXISTING in the authority, not of one
+    // particular status value. The previous fix here only counted `queued`, so a
+    // row parked in `handoff_inflight` (its lease long expired) plus an empty
+    // runtime made BOTH `removed` and this flag false: the handler took the
+    // "already absent" success path, never called drop, and the next snapshot
+    // resurrected the bubble the user had just deleted. Field case: an entry
+    // whose handoff lease expired two days earlier and had no delivery tombstone.
+    const storeEntry = queueSnapshot.pendingMessageEntries.find(
+      (entry) => entry.clientMessageId === clientMessageId,
     );
+    const queuedInStore = storeEntry !== undefined;
+    // ...but an ACTIVE handoff is genuinely mid-delivery. Dropping it would be
+    // the opposite failure: the provider may already have the text while the UI
+    // reports a successful delete. Only an EXPIRED lease is reclaimable here;
+    // a live one is reported as too_late so the caller sees the truth instead of
+    // a false success or a UI-only tombstone.
+    const handoffStillLive = storeEntry?.status === 'handoff_inflight'
+      && getTransportQueueStore().hasLiveHandoff(sessionName, clientMessageId);
+    if (handoffStillLive) {
+      timelineEmitter.emit(sessionName, 'command.ack', {
+        commandId, status: 'error', error: 'too_late: message is already being delivered',
+      });
+      emitCommandAckReliable(serverLink, {
+        commandId, sessionName, status: 'error', error: 'too_late: message is already being delivered',
+      });
+      return;
+    }
     if (!removed && !queuedInStore) {
       // Deleting a queued message is IDEMPOTENT: if it is already gone the goal
       // is met, so ack success. The frontend now always sends the undo — even for

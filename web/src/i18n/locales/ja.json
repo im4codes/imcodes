@@ -3011,6 +3011,13 @@
     "expand": "展開"
   },
   "delegation": {
+    "claim": {
+      "none": "このターンに承認済みの送信はありません",
+      "dispatch_count": "承認済みの送信: {{total}}",
+      "dispatch_id": "送信 ID",
+      "task_id": "タスク ID",
+      "assignment_id": "アサインメント ID"
+    },
     "picker": {
       "agents": "エージェント",
       "delegate_to_agent": "1つのエージェントにタスクを委任"

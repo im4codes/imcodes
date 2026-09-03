@@ -25,6 +25,11 @@ import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { buildFilePathReportingPrompt, buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
 import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
 import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
+import {
+  buildBrainSupervisedWorkDelegationContract,
+  buildBrainWorkDelegationContractRef,
+} from '../daemon/supervision-prompts.js';
+import type { SessionRecord } from '../store/session-store.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
@@ -36,6 +41,13 @@ export interface TransportRuntimeAssemblyInput {
   suppressAgentProgressGuidance?: boolean;
   suppressFilePathReportingGuidance?: boolean;
   messagePreamble?: string;
+  /**
+   * True once the full Brain work-delegation contract body has already been
+   * registered for this thread. Later turns then re-assert it by reference
+   * instead of resending the body; the body is registered again after a
+   * thread start/resume or a compaction, which is when the prior text is gone.
+   */
+  brainContractRegistered?: boolean;
   attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
   namespaceDiagnostics?: string[];
@@ -63,7 +75,12 @@ export interface TransportRuntimeAssemblyInput {
    * `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE` — outside the user-authored
    * 300-char cap. See p2p audit 37bfbb85-430 N-A.
    */
-  sessionIdentity?: { sessionName: string; label?: string | null };
+  /**
+   * Authoritative session identity. `role` comes from the session record, never
+   * from parsing sessionName/label and never from model or client free text: a
+   * session that could impersonate a Brain would inherit delegation authority.
+   */
+  sessionIdentity?: { sessionName: string; label?: string | null; role?: SessionRecord['role'] };
   /** Runtime-minted lifecycle generation for provider active-work attribution. */
   activityGeneration?: ActivityGeneration;
 }
@@ -242,6 +259,7 @@ export function buildProviderContextPayload(
     ...(input.activityGeneration ? { activityGeneration: input.activityGeneration } : {}),
     sessionSystemText: compiledContext.sessionSystemText,
     turnSystemText: compiledContext.turnSystemText,
+    ...(input.sessionIdentity?.role ? { sessionRole: input.sessionIdentity.role } : {}),
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,
@@ -384,7 +402,27 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     memorySearchGuidance,
     agentProgressGuidance,
   ].filter(Boolean).join('\n\n') || undefined;
-  const turnSystemText = renderedAuthoredSystemText;
+  // Baseline delegation/messaging contract for a Brain, re-asserted EVERY turn
+  // and deliberately independent of supervision.mode: with supervision off the
+  // Brain still must delegate through IM.codes send_message (it simply attaches
+  // no auditPolicy and runs no audit lifecycle). Audit/finalization contracts
+  // stay mode-conditional and are NOT added here.
+  //
+  // This rides the existing turnSystemText assembly on purpose. sessionSystemText
+  // becomes baseInstructions, which is sent once per thread/start|resume, so it
+  // cannot survive a compaction -- the exact failure this fixes. No parallel
+  // preamble and no persisted copy.
+  // Re-asserted every turn, but by REFERENCE once registered: repeating the
+  // full body each turn spends the per-turn budget on text the Brain already
+  // holds. The body still returns after a thread start/resume or compaction,
+  // because that is exactly when the earlier registration is gone.
+  const brainDelegationContract = input.sessionIdentity?.role === 'brain'
+    ? (input.brainContractRegistered
+      ? buildBrainWorkDelegationContractRef()
+      : buildBrainSupervisedWorkDelegationContract())
+    : undefined;
+  const turnSystemText = [brainDelegationContract, renderedAuthoredSystemText]
+    .filter(Boolean).join('\n\n') || undefined;
   return {
     sessionSystemText,
     turnSystemText,

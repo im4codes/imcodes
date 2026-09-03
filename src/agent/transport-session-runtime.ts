@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { SessionRecord } from '../store/session-store.js';
 import type { AliasSendAudit } from '../../shared/alias-types.js';
 import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
@@ -489,7 +490,13 @@ export class TransportSessionRuntime implements SessionRuntime {
    * `USER_SESSION_TEXT_MAX_CHARS` cap that bounds user-authored
    * `_description` / `_systemPrompt`. See p2p audit 37bfbb85-430 N-A.
    */
-  private _sessionIdentity: { sessionName: string; label: string | null } | undefined;
+  private _sessionIdentity: { sessionName: string; label: string | null; role?: SessionRecord['role'] } | undefined;
+  /**
+   * Whether the full Brain work-delegation contract body has been registered on
+   * the CURRENT thread. Reset on thread (re)creation and on compaction, because
+   * those are exactly the points where the registered text no longer exists.
+   */
+  private _brainContractRegistered = false;
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -699,6 +706,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
           this._lastInjectedSupervisionContractSignature = null;
+          // Compaction discards the registered contract body, so the next turn
+          // must register it again rather than reference text that is gone.
+          this._brainContractRegistered = false;
         }
         this.clearStalePendingCancelFallbackTimer();
         this._sending = false;
@@ -951,10 +961,20 @@ export class TransportSessionRuntime implements SessionRuntime {
    * transport turn's `sessionSystemText`. Daemon-injected and NOT subject
    * to `USER_SESSION_TEXT_MAX_CHARS` — see p2p audit 37bfbb85-430 N-A.
    */
-  setSessionIdentity(sessionName: string, label: string | null | undefined): void {
+  setSessionIdentity(
+    sessionName: string,
+    label: string | null | undefined,
+    role?: SessionRecord['role'],
+  ): void {
     const exact = sessionName.trim();
     if (!exact) return;
-    this._sessionIdentity = { sessionName: exact, label: label?.trim() || null };
+    // `role` is the authoritative session-record value. It gates the per-turn
+    // Brain delegation contract, so it must never be derived from sessionName.
+    this._sessionIdentity = {
+      sessionName: exact,
+      label: label?.trim() || null,
+      ...(role ? { role } : {}),
+    };
   }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
@@ -1822,6 +1842,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
     try {
       this._providerSessionId = await this.provider.createSession(config);
+      this._brainContractRegistered = false;
     } finally {
       this._initializingProviderSessionId = null;
     }
@@ -3211,6 +3232,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
+        brainContractRegistered: this._brainContractRegistered,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {
@@ -3246,6 +3268,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.scheduleActiveAppendFlush(dispatchId);
       }
       this._recoverableDispatchRetries = 0;
+      // The contract body reached the provider on this turn, so later turns on
+      // the same thread re-assert it by reference instead of resending it.
+      this._brainContractRegistered = true;
       this.markSdkTurnLostReplacementProviderAccepted(dispatchId);
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);

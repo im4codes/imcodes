@@ -3012,6 +3012,13 @@
     "expand": "Expand"
   },
   "delegation": {
+    "claim": {
+      "none": "No authorized dispatch in this turn",
+      "dispatch_count": "Authorized dispatches: {{total}}",
+      "dispatch_id": "Dispatch ID",
+      "task_id": "Task ID",
+      "assignment_id": "Assignment ID"
+    },
     "picker": {
       "agents": "Agents",
       "delegate_to_agent": "Delegate a task to one agent"

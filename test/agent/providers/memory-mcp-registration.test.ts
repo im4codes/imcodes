@@ -22,7 +22,7 @@ import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_PROVIDER_IDS,
 } from '../../../shared/memory-ws.js';
-import { getDefaultCodexMcpArgs } from '../../../src/agent/providers/getDefaultCodexMcpArgs.js';
+import { getDefaultCodexMcpArgs, getCodexAppServerArgs } from '../../../src/agent/providers/getDefaultCodexMcpArgs.js';
 import {
   getDefaultAcpMcpServers,
   getDefaultMcpServers,
@@ -191,6 +191,25 @@ describe('managed provider MCP registration helpers', () => {
     expect(serialized).not.toContain(IMCODES_DAEMON_NAMESPACE_ENV);
     expect(serialized).not.toContain('user-secret-ish');
     expect(serialized).not.toContain('github.com/acme/project');
+    expect(serialized).toContain('IMCODES_MCP_TOOL_CATALOG_MODE');
+    expect(serialized).toContain('static_full');
+  });
+
+  it('disables native multi-agent collaboration at app-server process start', () => {
+    // The only pre-execution capability removal this CLI supports. Thread-level
+    // multiAgentMode is deprecated/ignored and collaborationMode only selects an
+    // instruction preset, so neither can veto a call; handleRawResponseItem sees
+    // the item only after the tool already ran. Verified on codex-cli 0.152.1:
+    // with --disable multi_agent a turn explicitly asked to call spawn_agent
+    // returns NATIVE_COLLAB_UNAVAILABLE and emits no collaboration item at all.
+    const args = getCodexAppServerArgs();
+    const disableAt = args.indexOf('--disable');
+    expect(disableAt, 'app-server must start with native multi-agent removed').toBeGreaterThan(-1);
+    expect(args[disableAt + 1]).toBe('multi_agent');
+    // Order the CLI accepts: global flags precede the subcommand.
+    expect(disableAt).toBeLessThan(args.indexOf('app-server'));
+    // The IM MCP catalog must stay intact so send_message/supervision still work.
+    const serialized = JSON.stringify(args);
     expect(serialized).toContain('IMCODES_MCP_TOOL_CATALOG_MODE');
     expect(serialized).toContain('static_full');
   });

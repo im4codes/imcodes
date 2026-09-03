@@ -9,6 +9,7 @@ import type { TransportMemoryRecallArtifact } from '../../shared/context-types.j
 import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
 import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
+import { SUPERVISION_CONTRACT_IDS } from '../../shared/supervision-config.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -87,6 +88,130 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('At key boundaries only');
     expect(payload.systemText).toContain('full absolute filesystem path');
     expect(payload.systemText).toContain('not a bare filename or relative path');
+  });
+
+  // A Brain's delegation duty does not depend on supervision being enabled, and
+  // it must survive restart/resume and compaction. Field incident: the contract
+  // last appeared far earlier in the rollout, was never re-injected after
+  // compaction, and the session carried no supervision binding at all -- so the
+  // Brain fell back to provider-native collaboration with no IM authority.
+  // turnSystemText is the only per-turn channel (sessionSystemText rides
+  // baseInstructions, sent once per thread/start|resume).
+  // Compact contract re-assertion. Once the full contract body has been
+  // registered for the thread, later turns must re-assert it BY REFERENCE
+  // (contractRefs + binding + delta) rather than resending the ~830-char body.
+  // `contractId` vs `contractRef` is the mechanical distinction the prompt
+  // module already uses: carrying the contract vs referencing it.
+  it('registers the full Brain contract once, then re-asserts it by reference', () => {
+    const build = (brainContractRegistered: boolean) => buildProviderContextPayload(
+      makeProvider('compact-contract-reassertion'),
+      {
+        userMessage: 'assign these to sub-windows',
+        sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        brainContractRegistered,
+      },
+    );
+
+    const first = build(false).turnSystemText ?? '';
+    expect(first, 'the first turn must register the full contract body').toContain('"contractId"');
+    expect(first).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+
+    const later = build(true).turnSystemText ?? '';
+    expect(
+      later,
+      'a registered contract must never be resent as a full body',
+    ).not.toContain('"contractId"');
+    expect(later, 'the later turn must still bind the contract by reference')
+      .toContain('"contractRef"');
+    expect(later).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(
+      later.length,
+      'the compact re-assertion must be materially smaller than the body',
+    ).toBeLessThan(first.length);
+  });
+
+  it('does not re-assert any contract for a non-Brain session', () => {
+    const payload = buildProviderContextPayload(
+      makeProvider('compact-contract-non-brain'),
+      {
+        userMessage: 'do the work',
+        sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        brainContractRegistered: true,
+      },
+    );
+    const text = payload.turnSystemText ?? '';
+    expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+  });
+
+  for (const supervisionMode of ['off', 'manual', 'supervised_audit'] as const) {
+    it(`injects the baseline delegation contract every turn for a Brain (supervision ${supervisionMode})`, () => {
+      const build = () => buildProviderContextPayload(
+        makeProvider('full-normalized-context-injection'),
+        {
+          userMessage: 'assign these to sub-windows',
+          sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
+          namespace: { scope: 'personal', projectId: 'repo-1' },
+        },
+      );
+
+      // Turn 1, and turn 2 of the SAME session: both must carry it.
+      for (const turn of [1, 2]) {
+        const payload = build();
+        expect(
+          payload.turnSystemText,
+          `turn ${turn} must carry the delegation contract per turn`,
+        ).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+      }
+
+      // First turn after restart/resume, and the turn after a compaction, are
+      // just fresh assemblies -- they must be identical in this respect.
+      const afterRestart = build();
+      expect(afterRestart.turnSystemText).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+      const afterCompact = build();
+      expect(afterCompact.turnSystemText).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    });
+  }
+
+  // E (mode dimension) -- SCOPE OF THIS ASSERTION, stated precisely:
+  //
+  // This proves only that the PERMANENT BASELINE LAYER (turnSystemText) carries
+  // the same delegation contract for every mode and never smuggles audit or
+  // finalization contracts into it. It does NOT prove that supervised_audit has
+  // no audit lifecycle -- that lifecycle lives in the supervision broker's
+  // decision/continuation channel, where it remains mode-conditional and is
+  // covered by test/daemon/supervision-prompts.test.ts. Audit contracts must
+  // NOT be moved into turnSystemText to satisfy this matrix.
+  for (const mode of ['off', 'manual', 'supervised_audit'] as const) {
+    it(`keeps the baseline layer identical and audit-free for supervision ${mode}`, () => {
+      const payload = buildProviderContextPayload(
+        makeProvider('full-normalized-context-injection'),
+        {
+          userMessage: 'assign these to sub-windows',
+          sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
+          namespace: { scope: 'personal', projectId: `mode-${mode}` },
+        },
+      );
+      expect(payload.turnSystemText).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+      // Delegation authority does not drag the audit lifecycle in with it.
+      expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
+      expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT);
+    });
+  }
+
+  it('never injects Brain delegation authority into a non-Brain session', () => {
+    // Control: proves the assertion above is about the ROLE, not about every
+    // session getting the contract.
+    const payload = buildProviderContextPayload(
+      makeProvider('full-normalized-context-injection'),
+      {
+        userMessage: 'do the work',
+        sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      },
+    );
+    expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
   it('adds shared system guidance for every managed SDK provider id', () => {

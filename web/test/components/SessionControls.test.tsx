@@ -6335,9 +6335,10 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
+    // Auto now opens supervision settings with the mode only: the manual
+    // auditor picker is retired, so there is no focus target to request.
     await waitFor(() => expect(onSettings).toHaveBeenCalledWith({
       supervisionMode: 'supervised_audit',
-      focus: 'peer-audit-target',
     }));
     expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
   });

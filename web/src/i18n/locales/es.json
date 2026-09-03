@@ -3012,6 +3012,13 @@
     "expand": "Expandir"
   },
   "delegation": {
+    "claim": {
+      "none": "Sin envío autorizado en este turno",
+      "dispatch_count": "Envíos autorizados: {{total}}",
+      "dispatch_id": "ID de envío",
+      "task_id": "ID de tarea",
+      "assignment_id": "ID de asignación"
+    },
     "picker": {
       "agents": "Agentes",
       "delegate_to_agent": "Delegar una tarea a un agente"

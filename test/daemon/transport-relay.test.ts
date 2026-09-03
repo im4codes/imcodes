@@ -267,6 +267,46 @@ describe('transport-relay (timeline-emitter based)', () => {
       vi.useRealTimers();
     });
 
+    it('forwards the delegation-claim projection onto the finalized assistant.text event', () => {
+      // Without this the projection stops at the daemon: the relay reads
+      // metadata only for usage/model, so the UI would have no authority fact
+      // to render and would be left with the prose alone -- the exact gap.
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const claim = { status: 'unsubstantiated', dispatches: [] };
+      fireComplete('sess-claim', {
+        id: 'msg-claim', sessionId: 'sess-claim', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: claim },
+      } as AgentMessage);
+
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(
+        finalized[0].delegationClaim,
+        'the authority projection must reach the timeline payload',
+      ).toEqual(claim);
+    });
+
+    it('omits the delegation-claim key entirely when the turn carried no projection', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-noclaim', {
+        id: 'msg-noclaim', sessionId: 'sess-noclaim', kind: 'text', role: 'assistant',
+        content: 'hi', timestamp: Date.now(), status: 'complete',
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(Object.keys(finalized[0])).not.toContain('delegationClaim');
+    });
+
     it('finalizes the previous message (full text, streaming:false) when messageId changes', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));

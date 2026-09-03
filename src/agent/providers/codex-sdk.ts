@@ -1,4 +1,10 @@
 import { createHash } from 'node:crypto';
+import {
+  readDelegationDispatchFact,
+  projectDelegationClaim,
+  DELEGATION_CLAIM_METADATA_FIELD,
+  type DelegationDispatchFact,
+} from '../../../shared/delegation-claim.js';
 import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
@@ -61,7 +67,7 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
 import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
-import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
+import { getCodexAppServerArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
@@ -175,6 +181,40 @@ const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'runtimesubagentnotification',
 ]);
 const CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES = new Set(['spawn_agent', 'spawnAgent']);
+
+/**
+ * Native collaboration calls other than spawn. These are projected for
+ * OBSERVABILITY ONLY -- the hard gate is `--disable multi_agent` at app-server
+ * start, because an adapter sees an item only after the tool already ran.
+ *
+ * They were previously dropped on the floor, which is how a Brain could really
+ * call list_agents + followup_task and leave no tool.call in the timeline at
+ * all; the resulting blank window was then mistaken for a fabricated claim.
+ */
+const CODEX_NATIVE_COLLAB_FUNCTION_NAMES = new Set([
+  'list_agents', 'listAgents',
+  'followup_task', 'followupTask',
+  'send_message', 'sendMessage',
+  'wait_agent', 'waitAgent',
+  'interrupt_agent', 'interruptAgent',
+]);
+
+/** Native collaboration carries no IM.codes task authority. */
+const CODEX_NATIVE_COLLAB_DURABILITY = 'non_durable';
+
+/** Exact IM MCP server and the tools a Brain needs to delegate authoritatively. */
+const IMCODES_DELEGATION_MCP_SERVER = 'imcodes-memory';
+const IMCODES_DELEGATION_REQUIRED_TOOLS = ['send_list_targets', 'send_message'] as const;
+/** Bounded pagination: this is one authoritative snapshot per turn, not polling. */
+const MCP_STATUS_PAGE_LIMIT = 20;
+
+export class ImcodesDelegationUnavailableError extends Error {
+  constructor() {
+    // Deliberately opaque: never leak server errors or private MCP config.
+    super('authoritative IM delegation unavailable');
+    this.name = 'ImcodesDelegationUnavailableError';
+  }
+}
 const CODEX_RAW_CHECKLIST_FUNCTION_NAMES = new Set([
   'todowrite',
   'todo_write',
@@ -801,6 +841,12 @@ export interface CodexDiscoveredModel {
 
 interface CodexSdkSessionState {
   routeId: string;
+  /**
+   * Authorized IM.codes dispatch facts observed in the CURRENT turn. This is
+   * the only evidence a delegation claim is ever built from; it is reset at
+   * turn start so a prior turn's dispatch can never substantiate a later one.
+   */
+  turnDelegationDispatches?: DelegationDispatchFact[];
   imcodesSessionName?: string;
   cwd: string;
   env?: Record<string, string>;
@@ -2342,6 +2388,7 @@ export class CodexSdkProvider implements TransportProvider {
   private appServerAuthFingerprint: string | null = null;
   private appServerRestart: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
+  private rawNativeCollabCalls = new Map<string, { sessionId: string; name: string }>();
   private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
   private nextActiveTurnLeaseId = 1;
   private heartbeatInFlightCount = 0;
@@ -2910,11 +2957,64 @@ export class CodexSdkProvider implements TransportProvider {
     }
     this.threadToSession.clear();
     this.rawSpawnAgentCalls.clear();
+    this.rawNativeCollabCalls.clear();
     this.trackedSubagentThreads.clear();
     this.appServerAuthFingerprint = null;
     if (options.clearSessions) {
       this.sessions.clear();
       this.config = null;
+    }
+  }
+
+  /**
+   * Authoritative, thread-scoped proof that IM delegation is actually usable.
+   *
+   * The `mcpServer/startupStatus/updated` notification is NOT sufficient: a
+   * stale `ready` can survive a restart, a config change, or a tools-list
+   * invalidation. Only a COMPLETE `mcpServerStatus/list` snapshot is authority,
+   * so this re-verifies on every Brain turn.
+   *
+   * Anything short of "exact server connected with the exact delegation tools"
+   * fails closed. There is no native fallback to degrade into -- native
+   * multi-agent is removed at app-server start by `--disable multi_agent`.
+   */
+  private async assertImcodesDelegationReady(threadId: string): Promise<void> {
+    const servers: Array<Record<string, unknown>> = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    let completed = false;
+    for (let page = 0; page < MCP_STATUS_PAGE_LIMIT; page++) {
+      let result: Record<string, unknown> | undefined;
+      try {
+        result = await this.request('mcpServerStatus/list', {
+          threadId,
+          detail: 'toolsAndAuthOnly',
+          ...(cursor ? { cursor } : {}),
+        }) as Record<string, unknown> | undefined;
+      } catch {
+        throw new ImcodesDelegationUnavailableError();
+      }
+      const data = Array.isArray(result?.data) ? result.data : undefined;
+      if (!data) throw new ImcodesDelegationUnavailableError();
+      for (const entry of data) if (isRecord(entry)) servers.push(entry);
+      const next = meaningfulString(result?.nextCursor);
+      if (!next) { completed = true; break; }
+      // A repeated cursor means the inventory never terminates: fail closed
+      // rather than accept a partial view as if it were complete.
+      if (seenCursors.has(next)) throw new ImcodesDelegationUnavailableError();
+      seenCursors.add(next);
+      cursor = next;
+    }
+    if (!completed) throw new ImcodesDelegationUnavailableError();
+
+    const server = servers.find((entry) => meaningfulString(entry.name) === IMCODES_DELEGATION_MCP_SERVER);
+    if (!server || meaningfulString(server.runtimeStatus) !== 'connected') {
+      throw new ImcodesDelegationUnavailableError();
+    }
+    const tools = isRecord(server.tools) ? server.tools : undefined;
+    if (!tools) throw new ImcodesDelegationUnavailableError();
+    for (const tool of IMCODES_DELEGATION_REQUIRED_TOOLS) {
+      if (!(tool in tools)) throw new ImcodesDelegationUnavailableError();
     }
   }
 
@@ -2927,7 +3027,7 @@ export class CodexSdkProvider implements TransportProvider {
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
     const resolved = resolveExecutableForSpawn(binaryPath);
-    const args = [...resolved.prependArgs, ...getDefaultCodexMcpArgs(), 'app-server'];
+    const args = [...resolved.prependArgs, ...getCodexAppServerArgs()];
     const spawnEnv = this.buildSpawnEnv(config);
     const authFingerprint = await readCodexAuthFingerprint(spawnEnv);
     const child = spawn(resolved.executable, args, {
@@ -3151,6 +3251,15 @@ export class CodexSdkProvider implements TransportProvider {
     authRecoveryRetriesRemaining: number,
     activeWriterRecoveryRetriesRemaining = CODEX_ACTIVE_WRITER_RECOVERY_LIMIT,
   ): Promise<void> {
+    // Unconditionally establish an empty delegation scope for the new turn.
+    //
+    // Unconditional on purpose: no branch, no "only if absent". However the
+    // previous turn ended -- completed, cancelled, timed out, disconnected, or
+    // failed before it ever reached a terminal handler -- this turn begins with
+    // no inherited evidence. This is the load-bearing half of the invariant for
+    // currently observable behaviour, and it is what the cancel/error-A then
+    // zero-dispatch-B regressions actually hold.
+    state.turnDelegationDispatches = [];
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
       const shouldInjectStableUpdate = !!(
@@ -3160,6 +3269,14 @@ export class CodexSdkProvider implements TransportProvider {
         && state.lastInjectedSessionSystemText !== desiredSessionSystemText
       );
       await this.ensureThreadLoaded(sessionId, state, payload);
+      // A Brain must not begin a turn unless IM delegation is authoritatively
+      // usable: with native multi-agent removed at process start there is no
+      // fallback, so starting anyway would strand the user's delegation. The
+      // snapshot is re-verified per Brain turn -- a cached `ready` can outlive a
+      // restart, config change or tools-list invalidation.
+      if (payload.sessionRole === 'brain' && state.threadId) {
+        await this.assertImcodesDelegationReady(state.threadId);
+      }
       await this.prepareGeneratedImageTracking(sessionId, state);
       const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
       if (shouldInjectStableUpdate) {
@@ -3210,6 +3327,13 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
+      // Delegation readiness is a PRECONDITION, not a turn failure: it must not
+      // be absorbed into turn-recovery status, or the caller would see a normal
+      // resolved send while the user's delegation silently never happened.
+      if (err instanceof ImcodesDelegationUnavailableError) {
+        state.turnStartInFlight = false;
+        throw err;
+      }
       const authReplaySafe = this.isCodexAuthReplaySafe(state);
       this.rememberTerminatedTurn(state, state.runningTurnId);
       this.clearActiveTurnLease(state);
@@ -4114,6 +4238,23 @@ export class CodexSdkProvider implements TransportProvider {
         for (const cb of this.toolCallCallbacks) cb(sessionId, checklistTool);
         return true;
       }
+      if (name && CODEX_NATIVE_COLLAB_FUNCTION_NAMES.has(name)) {
+        const collabCallId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+        if (!collabCallId) return true;
+        this.rawNativeCollabCalls.set(collabCallId, { sessionId, name });
+        this.emitTrackedProviderToolCall(sessionId, state, {
+          id: collabCallId,
+          name,
+          status: 'running',
+          detail: {
+            kind: 'nativeCollaboration',
+            summary: name,
+            meta: { callId: collabCallId, durability: CODEX_NATIVE_COLLAB_DURABILITY },
+            raw: item,
+          },
+        });
+        return true;
+      }
       if (!name || !CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES.has(name)) return false;
       const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
       if (!callId) return true;
@@ -4129,6 +4270,32 @@ export class CodexSdkProvider implements TransportProvider {
     if (item.type !== 'function_call_output') return false;
     const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
     if (!callId) return false;
+    const collab = this.rawNativeCollabCalls.get(callId);
+    if (collab) {
+      this.rawNativeCollabCalls.delete(callId);
+      const collabState = this.sessions.get(collab.sessionId);
+      if (!collabState) return true;
+      const rawOutput = meaningfulString(item.output);
+      // An empty output proves the call was ACCEPTED, not that anything was
+      // delivered. Reporting success here is what let "已分配/已排队" look
+      // confirmed when nothing durable existed.
+      this.emitTrackedProviderToolCall(collab.sessionId, collabState, {
+        id: callId,
+        name: collab.name,
+        status: 'complete',
+        detail: {
+          kind: 'nativeCollaboration',
+          summary: collab.name,
+          meta: {
+            callId,
+            durability: CODEX_NATIVE_COLLAB_DURABILITY,
+            outcome: rawOutput ? 'accepted' : 'accepted_unknown',
+          },
+          raw: item,
+        },
+      });
+      return true;
+    }
     const call = this.rawSpawnAgentCalls.get(callId);
     if (!call) return false;
     this.rawSpawnAgentCalls.delete(callId);
@@ -4508,6 +4675,22 @@ export class CodexSdkProvider implements TransportProvider {
         this.emitTrackedProviderToolCall(sessionId, state, tool);
       }
 
+      // Authoritative delegation evidence. Read from the MCP result itself --
+      // exact server + tool + dispatchId + delivery legs -- never from the
+      // assistant's prose. A native collaboration `send_message` shares the
+      // short name but is not this server, so it cannot substantiate a claim.
+      if (method === 'item/completed') {
+        const dispatchFact = readDelegationDispatchFact(
+          item.server,
+          item.tool,
+          item.arguments,
+          item.result?.structuredContent ?? item.result?.content,
+        );
+        if (dispatchFact) {
+          (state.turnDelegationDispatches ??= []).push(dispatchFact);
+        }
+      }
+
       if (item.type === 'agentMessage') {
         if (method === 'item/completed') this.clearIdleSettleTimer(state);
         // A new agentMessage item begins: clear the accumulator so its stream
@@ -4716,6 +4899,16 @@ export class CodexSdkProvider implements TransportProvider {
     turnId?: string,
     terminalReason: ToolTerminalReason = 'app_server_completed',
   ): Promise<void> {
+    // Snapshot the turn's authorized dispatches BEFORE any cleanup, and consume
+    // ONLY this snapshot below.
+    //
+    // The lease clear further down is the shared terminal seam and empties
+    // state.turnDelegationDispatches. Reading the live field after it would
+    // report every turn as unsubstantiated. Reading the snapshot is also what
+    // makes the ordering safe in the other direction: this completion reports
+    // exactly the dispatches that belonged to ITS turn, and the clear that runs
+    // in between cannot add to or subtract from what is reported here.
+    const turnDelegationDispatches = state.turnDelegationDispatches ?? [];
     this.clearIdleSettleTimer(state);
     this.clearCompactTimers(state);
     state.runningCompact = false;
@@ -4770,6 +4963,11 @@ export class CodexSdkProvider implements TransportProvider {
         ...(usage ? { usage } : {}),
         ...(model ? { model } : {}),
         ...(resumeId ? { resumeId } : {}),
+        // Every completed turn states its delegation authority explicitly.
+        // With no dispatches this is `unsubstantiated` with an empty list, so a
+        // consumer has no data it could render as assigned/queued/recovered --
+        // the absence of authority is represented, not left for prose to imply.
+        [DELEGATION_CLAIM_METADATA_FIELD]: projectDelegationClaim(turnDelegationDispatches),
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, completed);
@@ -4796,6 +4994,26 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRolloutSettlePoll(state);
     this.disarmRolloutAuthorityWatch(state);
     state.activeTurnLease = undefined;
+    // Terminal-seam clear: explicit defense-in-depth, and prompt release.
+    //
+    // Authorized dispatches are evidence about ONE turn. Every terminal path --
+    // completion, cancel, watchdog, disconnect, turn/start and emit failures --
+    // funnels through here, so residue from a cancelled or failed turn is
+    // dropped at the moment that turn ends rather than lingering in memory until
+    // the next one begins. After cancel/error nothing survives that any public
+    // completion, message metadata or read path could surface.
+    //
+    // KNOWINGLY REDUNDANT TODAY, and recorded as such in the revision gates:
+    // startTurn() already establishes an empty scope unconditionally, so with
+    // both halves present a mutant that removes THIS line changes no observable
+    // behaviour and survives. It is kept deliberately, not for a mutant score.
+    // Should a future completion path ever emit without a preceding startTurn,
+    // this clear is what keeps that path fail-closed instead of letting a stale
+    // dispatch substantiate a claim.
+    //
+    // The completion path snapshots the facts before calling this and reports
+    // only that snapshot, so clearing here never blanks a legitimate turn.
+    state.turnDelegationDispatches = [];
   }
 
   private refreshActiveTurnLease(

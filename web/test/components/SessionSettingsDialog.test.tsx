@@ -285,13 +285,69 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
-  it('saves a selected session name immediately without identity refresh or a candidate RPC', async () => {
-    const sent: Array<Record<string, unknown>> = [];
-    const ws = {
-      connected: true,
-      send(message: Record<string, unknown>) { sent.push(message); },
-      onMessage: () => () => undefined,
-    } as any;
+  it('quick-opens supervised_audit settings without showing or requiring a manual auditor', async () => {
+    // Was: "seeds a quick-open audit draft immediately instead of leaving Save
+    // disabled" -- it asserted the Settings picker appeared and had to be
+    // satisfied. The picker is retired; quick-open must still land in
+    // supervised_audit and Save must be reachable with no auditor chosen.
+    render(
+      <SessionSettingsDialog
+        canControlAutomaticSupervision serverId="srv-1" sessionName="deck_proj_brain"
+        label="Brain" description="desc" cwd="/proj" type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        sessionInstanceId="brain-instance-1" runtimeEpoch="brain-runtime-1"
+        ws={{ connected: true, send() {}, onMessage: () => () => undefined } as any}
+        peerAuditSessions={[makePeerAuditSession({ sessionInstanceId: 'peer-1', runtimeEpoch: 'peer-epoch-1' })]}
+        openIntent={{ supervisionMode: 'supervised_audit' }}
+        transportConfig={{}}
+        onClose={vi.fn()} onSaved={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId('session-supervision-peer-target-section')).toBeNull();
+    expect(screen.queryByTestId('peer-audit-chooser-row')).toBeNull();
+    expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  for (const [label, candidates] of [
+    ['with eligible candidates', [makePeerAuditSession({ sessionInstanceId: 'peer-1', runtimeEpoch: 'peer-epoch-1' })]],
+    ['with zero candidates', []],
+  ] as const) {
+    it(`retires the manual auditor picker from supervised_audit settings ${label}`, () => {
+      // The auditor is routed from auditPolicy + the live pool. The legacy
+      // picker is gone from Settings entirely -- including the eligible-candidate
+      // case, which is what makes this non-vacuous. Real Quick delegation lives
+      // in the independent QuickAgentDelegationDialog and is covered by its own
+      // suite, which is the control for "non-supervision delegation preserved".
+      render(
+        <SessionSettingsDialog
+          canControlAutomaticSupervision serverId="srv-1" sessionName="deck_proj_brain"
+          label="Brain" description="desc" cwd="/proj" type="codex-sdk"
+          activeModel={CODEX_MODEL_IDS[0]}
+          sessionInstanceId="brain-instance-1" runtimeEpoch="brain-runtime-1"
+          ws={{ connected: true, send() {}, onMessage: () => () => undefined } as any}
+          peerAuditSessions={candidates as never}
+          transportConfig={{ supervision: {
+            mode: 'supervised_audit', backend: 'codex-sdk', model: CODEX_MODEL_IDS[0],
+            timeoutMs: 12_000, promptVersion: 'supervision_decision_v1', maxAuditLoops: 2,
+          } }}
+          onClose={vi.fn()} onSaved={vi.fn()}
+        />,
+      );
+      expect(screen.queryByTestId('peer-audit-chooser-row')).toBeNull();
+      expect(screen.queryByTestId('session-supervision-peer-target-section')).toBeNull();
+      expect(
+        (screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled,
+        'an absent manual auditor must never gate Save',
+      ).toBe(false);
+    });
+  }
+
+  it('hides the legacy manual auditor block, saves with zero candidates, and strips legacy target fields', async () => {
+    // Supervision/auto-audit routes the auditor from auditPolicy + the live pool.
+    // The legacy "delegate recent work" manual picker is meaningless there: it
+    // must not render, must not gate Save (supervisionValid), and must not leave
+    // auditTargetSessionName / auditTargetFingerprint / peerAuditPromptVersion in
+    // the saved payload.
     render(
       <SessionSettingsDialog
         canControlAutomaticSupervision
@@ -304,8 +360,8 @@ describe('SessionSettingsDialog supervision', () => {
         activeModel={CODEX_MODEL_IDS[0]}
         sessionInstanceId="brain-instance-1"
         runtimeEpoch="brain-runtime-1"
-        ws={ws}
-        peerAuditSessions={[makePeerAuditSession({ sessionInstanceId: null, runtimeEpoch: null })]}
+        ws={{ connected: true, send() {}, onMessage: () => () => undefined } as any}
+        peerAuditSessions={[]}
         transportConfig={{
           supervision: {
             mode: 'supervised_audit',
@@ -314,6 +370,8 @@ describe('SessionSettingsDialog supervision', () => {
             timeoutMs: 12_000,
             promptVersion: 'supervision_decision_v1',
             maxAuditLoops: 2,
+            auditTargetSessionName: 'deck_sub_legacy_peer',
+            peerAuditPromptVersion: 'peer_audit_v1',
           },
         }}
         onClose={vi.fn()}
@@ -321,62 +379,24 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
-    expect(screen.queryByTestId('peer-audit-chooser-empty')).toBeNull();
-    fireEvent.click(screen.getByTestId('peer-audit-chooser-row'));
-    expect(screen.queryByTestId('peer-audit-candidate-waiting-authority')).toBeNull();
-    expect(screen.queryByTestId('peer-audit-candidate-loading')).toBeNull();
-    expect(sent.some((message) => message.type === 'peer_audit.list_candidates')).toBe(false);
-    expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(false);
+    // 1. hidden in supervision/audit mode
+    expect(
+      screen.queryByTestId('peer-audit-chooser-row'),
+      'the legacy manual auditor block must not render in audit mode',
+    ).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            auditTargetSessionName: 'deck_sub_peer',
-          }),
-        }),
-      }));
-    });
+    // 2. no eligible candidate must NOT block Save
+    const save = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    expect(save.disabled, 'an absent manual auditor must not gate Save').toBe(false);
+
+    // 3. legacy target fields are stripped from the payload
+    fireEvent.click(save);
+    await waitFor(() => { expect(patchSessionMock).toHaveBeenCalled(); });
     const saved = patchSessionMock.mock.calls.at(-1)?.[2] as { transportConfig?: { supervision?: Record<string, unknown> } };
-    expect(saved.transportConfig?.supervision).not.toHaveProperty('auditTargetFingerprint');
-  });
-
-  it('seeds a quick-open audit draft immediately instead of leaving Save disabled', async () => {
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'codex-sdk',
-      model: CODEX_MODEL_IDS[0],
-      timeoutMs: 12_000,
-      promptVersion: 'supervision_decision_v1',
-      maxAutoContinueStreak: 3,
-      maxAutoContinueTotal: 0,
-    });
-    render(
-      <SessionSettingsDialog
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        activeModel={CODEX_MODEL_IDS[0]}
-        peerAuditSessions={[makePeerAuditSession({ sessionInstanceId: null, runtimeEpoch: null })]}
-        transportConfig={null}
-        openIntent={{ supervisionMode: 'supervised_audit', focus: 'peer-audit-target' }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByTestId('peer-audit-chooser-row'));
-
-    await waitFor(() => {
-      expect(screen.queryByText('backendRequired')).toBeNull();
-      expect(screen.getByText(`summaryBackendModel:codex_sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`)).toBeDefined();
-      expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(false);
-    });
+    const supervision = saved.transportConfig?.supervision ?? {};
+    expect(supervision, 'legacy auditor target must not be persisted').not.toHaveProperty('auditTargetSessionName');
+    expect(supervision).not.toHaveProperty('auditTargetFingerprint');
+    expect(supervision).not.toHaveProperty('peerAuditPromptVersion');
   });
 
   it('persists the default Brain model to account defaults without another pool interaction', async () => {
@@ -856,229 +876,6 @@ describe('SessionSettingsDialog supervision', () => {
     const close = screen.getByRole('button', { name: /^close$/i });
     expect(close.classList.contains('session-settings-close')).toBe(true);
     expect(close.textContent).toContain('×');
-  });
-
-  it('only offers reply-capable sessions from the audited session group', () => {
-    render(
-      <SessionSettingsDialog
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        peerAuditSessions={[
-          makePeerAuditSession(),
-          makePeerAuditSession({ sessionName: 'deck_sub_other', parentSession: 'deck_other_brain', label: 'Other project' }),
-          makePeerAuditSession({ sessionName: 'deck_sub_shell', type: 'shell', label: 'Shell' }),
-          makePeerAuditSession({ sessionName: 'deck_proj_brain', label: 'Self' }),
-        ]}
-        transportConfig={{
-          supervision: {
-            mode: 'supervised_audit',
-            backend: 'codex-sdk',
-            model: CODEX_MODEL_IDS[0],
-            timeoutMs: 12_000,
-            promptVersion: 'supervision_decision_v1',
-            maxAuditLoops: 2,
-          },
-        }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    expect(screen.getAllByTestId('peer-audit-chooser-row')).toHaveLength(1);
-    expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
-    expect(document.body.textContent).not.toContain('Other project');
-    expect(document.body.textContent).not.toContain('Shell');
-  });
-
-  it('shows the remembered auditor picker and persists only the selected session name', async () => {
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'claude-code-sdk',
-      model: CLAUDE_CODE_MODEL_IDS[0],
-      timeoutMs: 12_000,
-      promptVersion: 'supervision_decision_v1',
-    });
-    render(
-      <SessionSettingsDialog
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="claude-code-sdk"
-        peerAuditSessions={[makePeerAuditSession()]}
-        sessionInstanceId="brain-instance-1"
-        runtimeEpoch="brain-runtime-1"
-        transportConfig={{
-          supervision: {
-            mode: 'supervised',
-            backend: 'claude-code-sdk',
-            model: CLAUDE_CODE_MODEL_IDS[0],
-            timeoutMs: 12_000,
-            promptVersion: 'supervision_decision_v1',
-            auditTargetSessionName: 'deck_sub_peer',
-            auditTargetFingerprint: {
-              sessionInstanceId: 'peer-instance-1',
-              normalizedModelId: 'gpt-5.6',
-              providerFamily: 'openai',
-            },
-            peerAuditPromptVersion: 'supervision_peer_audit_v1',
-          },
-        }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    changeSupervisionMode('supervised_audit');
-    await waitFor(() => {
-      expect(screen.getByTestId('peer-audit-settings-selected').textContent).toContain('Peer');
-    });
-    expect(screen.getByText('maxAuditLoops')).toBeDefined();
-
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised_audit',
-            auditTargetSessionName: 'deck_sub_peer',
-            peerAuditPromptVersion: 'supervision_peer_audit_v1',
-          }),
-        }),
-      }));
-    });
-    const saved = patchSessionMock.mock.calls.at(-1)?.[2] as { transportConfig?: { supervision?: Record<string, unknown> } };
-    expect(saved.transportConfig?.supervision).not.toHaveProperty('auditTargetFingerprint');
-  });
-
-  it('remembers the current session auditor when saving supervised mode', async () => {
-    render(
-      <SessionSettingsDialog
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="codex-sdk"
-        peerAuditSessions={[makePeerAuditSession()]}
-        transportConfig={{
-          supervision: {
-            mode: 'supervised_audit',
-            backend: 'codex-sdk',
-            model: CODEX_MODEL_IDS[0],
-            timeoutMs: 12_000,
-            promptVersion: 'supervision_decision_v1',
-            auditTargetSessionName: 'deck_sub_peer',
-            peerAuditPromptVersion: 'supervision_peer_audit_v1',
-            maxAuditLoops: 2,
-          },
-        }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    changeSupervisionMode('supervised');
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised',
-            auditTargetSessionName: 'deck_sub_peer',
-            peerAuditPromptVersion: 'supervision_peer_audit_v1',
-          }),
-        }),
-      }));
-    });
-  });
-
-  it('opens directly in audit mode and focuses the auditor picker when requested from Auto', async () => {
-    render(
-      <SessionSettingsDialog
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="claude-code-sdk"
-        peerAuditSessions={[makePeerAuditSession()]}
-        sessionInstanceId="brain-instance-1"
-        runtimeEpoch="brain-runtime-1"
-        transportConfig={{
-          supervision: {
-            mode: 'supervised',
-            backend: 'claude-code-sdk',
-            model: CLAUDE_CODE_MODEL_IDS[0],
-            timeoutMs: 12_000,
-            promptVersion: 'supervision_decision_v1',
-          },
-        }}
-        openIntent={{ supervisionMode: 'supervised_audit', focus: 'peer-audit-target' }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    const modeSelect = screen.getByLabelText('supervision-session:mode') as HTMLSelectElement;
-    expect(modeSelect.value).toBe('supervised_audit');
-    const targetSection = screen.getByTestId('session-supervision-peer-target-section');
-    await waitFor(() => expect(document.activeElement).toBe(targetSection));
-    await waitFor(() => expect(screen.getByTestId('peer-audit-chooser-row')).toBeDefined());
-  });
-
-  it('shows current candidate metadata without requiring fingerprint confirmation', async () => {
-    fetchSupervisorDefaultsMock.mockResolvedValue({
-      backend: 'claude-code-sdk',
-      model: CLAUDE_CODE_MODEL_IDS[0],
-      timeoutMs: 12_000,
-      promptVersion: 'supervision_decision_v1',
-    });
-    render(
-      <SessionSettingsDialog
-        canControlAutomaticSupervision
-        serverId="srv-1"
-        sessionName="deck_proj_brain"
-        label="Brain"
-        description="desc"
-        cwd="/proj"
-        type="claude-code-sdk"
-        peerAuditSessions={[makePeerAuditSession({ activeModel: 'gpt-5.7' })]}
-        sessionInstanceId="brain-instance-1"
-        runtimeEpoch="brain-runtime-1"
-        transportConfig={{
-          supervision: {
-            mode: 'supervised_audit',
-            backend: 'claude-code-sdk',
-            model: CLAUDE_CODE_MODEL_IDS[0],
-            timeoutMs: 12_000,
-            promptVersion: 'supervision_decision_v1',
-            auditTargetSessionName: 'deck_sub_peer',
-            auditTargetFingerprint: {
-              sessionInstanceId: 'peer-instance-1',
-              normalizedModelId: 'gpt-5.6',
-              providerFamily: 'openai',
-            },
-            peerAuditPromptVersion: 'supervision_peer_audit_v1',
-          },
-        }}
-        onClose={vi.fn()}
-        onSaved={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => expect(screen.getByTestId('peer-audit-settings-selected').textContent).toContain('gpt-5.7'));
-    expect(screen.queryByTestId('peer-audit-settings-confirm')).toBeNull();
   });
 
   it('prefills from saved supervisor defaults when available', async () => {

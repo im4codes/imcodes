@@ -1134,6 +1134,93 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(stillPresent).toBe(false);
   });
 
+  it('undo_queued_message deletes an EXPIRED handoff_inflight row that the runtime no longer knows', async () => {
+    // Field defect (172.16.253.217): client_message_id 535f388c-…, status
+    // handoff_inflight, handoff_started_at 1788246218272, expires_at
+    // 1788246278272 — expired two days earlier — still sitting in queue_entries
+    // with no delivery tombstone. The handler only counted `status === 'queued'`
+    // as present in the store, so with an empty runtime BOTH removed and
+    // queuedInStore were false. It took the "already absent" success path, never
+    // called store.drop, and the authoritative row survived — so the next
+    // snapshot resurrected the bubble the user had just deleted.
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-expired-handoff',
+      commandId: 'msg-expired-handoff',
+      text: '要时刻关注服务器CPU和内存变化',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-expired-handoff', secret: 'private-material' }),
+    });
+    // Claim it, then let the lease expire (started two days ago, 60s lease).
+    const startedAt = 1788246218272;
+    store.markHandoffInFlight('deck_transport_brain', ['msg-expired-handoff'], 60_000, startedAt);
+    const claimed = store.readSnapshot('deck_transport_brain').pendingMessageEntries
+      .find((e) => e.clientMessageId === 'msg-expired-handoff');
+    expect(claimed?.status, 'fixture must reproduce the field status').toBe('handoff_inflight');
+
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null), // restarted daemon: nothing in memory
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-expired-handoff', commandId: 'cmd-undo-expired' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-expired', status: 'accepted' }),
+    );
+    const survivors = store.readSnapshot('deck_transport_brain').pendingMessageEntries
+      .filter((e) => e.clientMessageId === 'msg-expired-handoff');
+    expect(
+      survivors.length,
+      'the authoritative row must be gone, or the next snapshot resurrects it',
+    ).toBe(0);
+  });
+
+  it('undo_queued_message refuses too_late for a LIVE handoff instead of faking a delete', async () => {
+    // The opposite failure from the stale case: an entry inside a live handoff
+    // lease may already be at the provider. Dropping it would ack a successful
+    // delete for a message that still gets delivered. The race must be explicit.
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-live-handoff',
+      commandId: 'msg-live-handoff',
+      text: 'in flight right now',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-live-handoff' }),
+    });
+    store.markHandoffInFlight('deck_transport_brain', ['msg-live-handoff'], 60_000, Date.now());
+
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-live-handoff', commandId: 'cmd-undo-live' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'cmd-undo-live', status: 'error' }),
+    );
+    expect(serverLink.send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'cmd-undo-live', status: 'accepted' }),
+    );
+    // The authoritative row survives: it is genuinely being delivered.
+    const survivors = store.readSnapshot('deck_transport_brain').pendingMessageEntries
+      .filter((e) => e.clientMessageId === 'msg-live-handoff');
+    expect(survivors.length, 'a live handoff must not be silently dropped').toBe(1);
+  });
+
   it('undo_queued_message acks accepted (idempotent) when neither the runtime nor the store has the id', async () => {
     // Deleting a queued message is idempotent: if it is already absent, the goal
     // is met. The frontend now ALWAYS sends the undo (even for an entry that only

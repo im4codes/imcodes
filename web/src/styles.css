@@ -4386,6 +4386,17 @@ html.native-ios-mac .chat-dl-btn {
   border-top-right-radius: 0;
 }
 .chat-assistant-automation { background: #101a19; box-shadow: inset 2px 0 #10b981; }
+
+/* Delegation authority badge — rendered only from the structured
+   delegation-claim projection, never from assistant prose. Deliberately quiet:
+   it states a fact about the turn, it is not a status banner. */
+.delegation-claim { margin-top: 6px; font-size: 11px; line-height: 1.5; color: #94a3b8; }
+.delegation-claim-unsubstantiated { opacity: 0.75; }
+.delegation-claim-substantiated { color: #cbd5e1; }
+.delegation-claim-count { display: block; font-weight: 600; }
+.delegation-claim-dispatches { list-style: none; margin: 2px 0 0; padding: 0; }
+.delegation-claim-dispatch { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 2px 0; }
+.delegation-claim-id code { font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; color: #e2e8f0; }
 .chat-rich-text { white-space: pre-wrap; }
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }

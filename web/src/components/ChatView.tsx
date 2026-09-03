@@ -37,6 +37,7 @@ import {
   type ChatLocalWebPreviewOpenHandler,
 } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
+import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
   CHAT_MOUNT_SETTLE_TICK_MS,
@@ -156,6 +157,10 @@ interface ViewItem {
   /** Source event ids represented by an assistant block (for old-pin locate). */
   eventIds?: string[];
   assistantAutomation?: boolean;
+  /** Metadata record of the block's completed assistant message, when it
+   *  carries the structured delegation-claim projection. Passed through by
+   *  reference so the memoized AssistantBlock keeps a stable prop identity. */
+  delegationMetadata?: Record<string, unknown>;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
@@ -172,6 +177,9 @@ interface AssistantBlockProps {
   text: string;
   automation?: boolean;
   ts: number;
+  /** Completed assistant message metadata carrying the delegation-claim
+   *  projection, when the runtime attached one. */
+  delegationMetadata?: Record<string, unknown>;
   /** Stable identifier for this merged block. Wired through to a
    *  `data-event-id` attribute so the mobile double-tap detector can pair
    *  taps by event id instead of HTMLElement reference — DOM nodes are
@@ -1168,6 +1176,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingKey = '';
   let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
+  let pendingDelegationMetadata: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
@@ -1179,12 +1188,14 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         text: pendingText.join('\n'),
         eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
+        ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
       pendingEventIds = [];
       pendingAssistantAutomation = false;
+      pendingDelegationMetadata = undefined;
     }
   };
 
@@ -1230,6 +1241,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
       }
+      // Only the turn's completed message carries the delegation-claim
+      // projection, so the newest event that has one wins for the block.
+      const delegationMetadata = readDelegationClaimMetadata(event.payload);
+      if (delegationMetadata) pendingDelegationMetadata = delegationMetadata;
       pendingLastTs = event.ts;
       pendingText.push(text);
       pendingEventIds.push(event.eventId);
@@ -3563,6 +3578,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   eventId={item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
+                  delegationMetadata={item.delegationMetadata}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
                   onUrlClick={urlClickHandler}
@@ -4356,6 +4372,7 @@ const AssistantBlock = memo(function AssistantBlock({
   automation,
   ts,
   eventId,
+  delegationMetadata,
   onPathClick,
   onUrlClick,
   onDownload,
@@ -4369,6 +4386,7 @@ const AssistantBlock = memo(function AssistantBlock({
       data-event-id={eventId}
     >
       <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
+      <DelegationClaimBadge metadata={delegationMetadata} />
       <ChatTime ts={ts} />
     </div>
   );

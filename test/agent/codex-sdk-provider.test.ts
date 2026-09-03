@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readDelegationClaim } from '../../shared/delegation-claim.js';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -10,6 +11,7 @@ import { PassThrough, Writable } from 'node:stream';
 // fake timers. Rollout checks perform real filesystem I/O, which must get a
 // chance to complete while virtual provider timers are advanced.
 const realSetImmediate = setImmediate;
+let mcpStatusPages: Array<Record<string, unknown>> = [];
 const realSetTimeout = setTimeout;
 
 const loggerMock = vi.hoisted(() => ({
@@ -104,6 +106,14 @@ const childProcessMock = vi.hoisted(() => {
                 id: msg.id,
                 result: { thread: { id: msg.params?.threadId } },
               });
+            }
+          }
+          if (msg.method === 'mcpServerStatus/list' && typeof msg.id === 'number') {
+            const next = mcpStatusPages.shift();
+            if (next === undefined) {
+              childRecord.emits({ id: msg.id, error: { message: 'no inventory' } });
+            } else {
+              childRecord.emits({ id: msg.id, result: next });
             }
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
@@ -419,6 +429,7 @@ function expectCodexSubagentDetail(
 
 describe('CodexSdkProvider', () => {
   beforeEach(() => {
+    mcpStatusPages = [];
     vi.useRealTimers();
     childProcessMock.spawn.mockClear();
     childProcessMock.execFile.mockClear();
@@ -2176,6 +2187,247 @@ describe('CodexSdkProvider', () => {
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
+  });
+
+  // C1: authoritative, thread-scoped delegation readiness. The startup
+  // notification is not authority -- a stale `ready` can outlive a restart,
+  // config change or tools-list invalidation -- so a COMPLETE
+  // mcpServerStatus/list snapshot is re-verified before every Brain turn.
+  // With native multi-agent removed at process start there is no fallback, so
+  // anything short of "exact server connected with the exact tools" must fail
+  // closed WITHOUT sending turn/start.
+  function brainPayload(projectId: string): ProviderContextPayload {
+    return {
+      userMessage: 'assign these tasks',
+      assembledMessage: 'assign these tasks',
+      sessionRole: 'brain',
+      systemText: 'Normalized system text',
+      messagePreamble: '',
+      attachments: [],
+      context: {
+        systemText: 'Normalized system text',
+        messagePreamble: '',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+  }
+
+  const connectedPage = {
+    data: [{
+      name: 'imcodes-memory',
+      runtimeStatus: 'connected',
+      tools: { send_list_targets: {}, send_message: {}, supervision_task_start: {} },
+    }],
+    nextCursor: null,
+  };
+
+  for (const [label, pages] of [
+    ['starting', [{ data: [{ name: 'imcodes-memory', runtimeStatus: 'starting', tools: {} }], nextCursor: null }]],
+    ['failed', [{ data: [{ name: 'imcodes-memory', runtimeStatus: 'failed', tools: {} }], nextCursor: null }]],
+    ['missing-send-message', [{ data: [{ name: 'imcodes-memory', runtimeStatus: 'connected', tools: { send_list_targets: {} } }], nextCursor: null }]],
+    ['repeated-cursor', [{ data: [], nextCursor: 'c1' }, { data: [], nextCursor: 'c1' }]],
+  ] as const) {
+    it(`refuses a Brain turn when IM delegation is unavailable (${label})`, async () => {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: `c1-${label}`, cwd: '/tmp/project' });
+      mcpStatusPages = [...pages] as Array<Record<string, unknown>>;
+
+      await expect(provider.send(`c1-${label}`, brainPayload(`c1-${label}`)))
+        .rejects.toThrow(/authoritative IM delegation unavailable/);
+
+      const child = childProcessMock.children[0];
+      const methods = child.requests.map((req) => req.method);
+      // Load-bearing preconditions: the turn really did reach the gate.
+      expect(methods, 'the thread must have loaded before the gate').toContain('thread/start');
+      expect(methods, 'the gate must consult the authoritative inventory').toContain('mcpServerStatus/list');
+      expect(methods, 'a refused Brain turn must never reach turn/start').not.toContain('turn/start');
+    });
+  }
+
+  it('refuses a Brain turn when the inventory never finishes paginating', async () => {
+    // Distinct from the repeated-cursor case: here every page advances a NEW
+    // cursor and simply never returns nextCursor=null. The repeated-cursor test
+    // trips the dedup guard first, so without this case the completeness
+    // requirement itself is unverified -- a mutant that accepts a partial
+    // inventory would pass.
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'c1-endless', cwd: '/tmp/project' });
+    // The FIRST page already carries a fully valid connected server, so a
+    // mutant that accepts a partial inventory would wrongly admit the turn.
+    // That is what makes this test discriminate the completeness rule itself
+    // rather than failing for a missing server.
+    mcpStatusPages = Array.from({ length: 40 }, (_, index) => ({
+      data: index === 0 ? connectedPage.data : [],
+      nextCursor: `cursor-${index}`,
+    }));
+
+    await expect(provider.send('c1-endless', brainPayload('c1-endless')))
+      .rejects.toThrow(/authoritative IM delegation unavailable/);
+
+    const child = childProcessMock.children[0];
+    const methods = child.requests.map((req) => req.method);
+    expect(methods).toContain('mcpServerStatus/list');
+    expect(methods, 'an incomplete inventory must never reach turn/start').not.toContain('turn/start');
+  });
+
+  it('starts exactly one Brain turn when the authoritative inventory is connected with the exact tools', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'c1-ok', cwd: '/tmp/project' });
+    mcpStatusPages = [connectedPage];
+
+    await provider.send('c1-ok', brainPayload('c1-ok'));
+
+    const child = childProcessMock.children[0];
+    const methods = child.requests.map((req) => req.method);
+    expect(methods).toContain('mcpServerStatus/list');
+    expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
+  });
+
+  it('does not consult the delegation inventory for a non-Brain session', async () => {
+    // Control: the gate is scoped to Brains, so a worker turn must not pay for
+    // it -- and this proves the assertions above are about the role.
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'c1-worker', cwd: '/tmp/project' });
+    mcpStatusPages = [connectedPage];
+
+    const payload = { ...brainPayload('c1-worker'), sessionRole: 'w1' as const };
+    await provider.send('c1-worker', payload);
+
+    const child = childProcessMock.children[0];
+    const methods = child.requests.map((req) => req.method);
+    expect(methods, 'a non-Brain turn must not consult the inventory').not.toContain('mcpServerStatus/list');
+    expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
+  });
+
+  // E: model-agnostic matrix.
+  //
+  // Model naming, stated exactly:
+  //   * `gpt-5.6-sol` IS a real catalog id (DEFAULT_CODEX_SESSION_MODEL), so the
+  //     auditor-side model is exercised directly here.
+  //   * `gpt-5.6-terra` from the field incident is NOT present anywhere in
+  //     src/ or shared/ -- it is a deployment variant with no catalog id and no
+  //     provider/config branch of its own. It is therefore covered only
+  //     STRUCTURALLY: it shares the gpt-5.6 provider path exercised below. This
+  //     is not a direct runtime validation of the `terra` name, and none is
+  //     invented here. If a variant ever gains its own provider/config branch,
+  //     it needs a real fixture of its own.
+  // What this matrix proves is that the delegation authority path does not
+  // branch on model id.
+  for (const model of ['gpt-5.6-sol', 'gpt-5.6'] as const) {
+    it(`enforces the same delegation authority path for model ${model}`, async () => {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: `e-${model}`, cwd: '/tmp/project', agentId: model });
+      mcpStatusPages = [connectedPage];
+
+      await provider.send(`e-${model}`, brainPayload(`e-${model}`));
+
+      const child = childProcessMock.children[0];
+      const methods = child.requests.map((req) => req.method);
+      // Same authoritative readiness, then exactly one turn, for every model.
+      expect(methods, `${model} must consult the authoritative inventory`).toContain('mcpServerStatus/list');
+      expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
+      // The app-server this model runs on has native multi-agent removed, and
+      // still publishes the full IM MCP catalog.
+      const argv = (childProcessMock.spawn.mock.calls.at(-1)?.[1] ?? []) as string[];
+      const serialized = JSON.stringify(argv);
+      expect(serialized, `${model} app-server must disable native multi-agent`).toContain('multi_agent');
+      expect(serialized, `${model} must keep the IM MCP catalog`).toContain('static_full');
+    });
+
+    it(`refuses a Brain turn for model ${model} when delegation is unavailable`, async () => {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: `e-fail-${model}`, cwd: '/tmp/project', agentId: model });
+      mcpStatusPages = [{ data: [{ name: 'imcodes-memory', runtimeStatus: 'starting', tools: {} }], nextCursor: null }];
+
+      await expect(provider.send(`e-fail-${model}`, brainPayload(`e-fail-${model}`)))
+        .rejects.toThrow(/authoritative IM delegation unavailable/);
+
+      const methods = childProcessMock.children[0].requests.map((req) => req.method);
+      expect(methods, `${model} must not fall back to a native turn`).not.toContain('turn/start');
+    });
+  }
+
+  it('projects every native collaboration call, marks it non-durable, and never claims delivery on empty output', async () => {
+    // Field incident (172.16.253.217): at 04:42 the Brain really did call
+    // list_agents and followup_task x3, but handleRawResponseItem only forwarded
+    // checklist and spawn_agent, so timeline had NO tool.call and the UI showed
+    // nothing. That absence was then mistaken for "the model fabricated it".
+    // These calls are observability only -- the hard gate is --disable
+    // multi_agent at app-server start -- so they must be projected honestly:
+    // labelled non-durable, and an EMPTY function_call_output must terminate the
+    // card as accepted/unknown, never as a successful delivery.
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-projection', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-projection', 'recover all tasks');
+    const child = childProcessMock.children[0];
+
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: { type: 'function_call', name: 'list_agents', call_id: 'call-list-1', arguments: '{}' },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: {
+          type: 'function_call', name: 'followup_task', call_id: 'call-follow-1',
+          arguments: JSON.stringify({ agent_path: '/root/cx1_lighting_risk_v2', message: 'continue' }),
+        },
+      },
+    });
+    // The field case: output arrives EMPTY.
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: { type: 'function_call_output', call_id: 'call-follow-1', output: '' },
+      },
+    });
+    await flush();
+
+    const names = tools.map((tool) => tool.name);
+    expect(names, 'list_agents must reach the timeline').toContain('list_agents');
+    expect(names, 'followup_task must reach the timeline').toContain('followup_task');
+
+    const followUps = tools.filter((tool) => tool.name === 'followup_task');
+    const settled = followUps.at(-1);
+    expect(settled, 'the empty output must still terminate the card').toBeDefined();
+    // Assert the DELIVERY CLAIM itself, not the card's lifecycle status: the
+    // card completes either way, so checking `status` cannot distinguish
+    // "accepted" from "delivered" and would pass vacuously.
+    const meta = (settled?.detail as { meta?: Record<string, unknown> } | undefined)?.meta ?? {};
+    expect(
+      meta.outcome,
+      'an empty collaboration output must be accepted_unknown, never a delivery claim',
+    ).toBe('accepted_unknown');
+    expect(meta.durability, 'native collaboration must be labelled non-durable').toBe('non_durable');
   });
 
   it('emits backgrounded SDK sub-agent snapshots for raw spawn_agent response items', async () => {
@@ -6312,6 +6564,289 @@ describe('CodexSdkProvider', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(errors.some((error) => error.details?.reason === 'sdk_turn_lost')).toBe(false);
+  });
+
+  describe('delegation dispatch facts are strictly per-turn (R3)', () => {
+    const acceptedDispatch = {
+      status: 'accepted',
+      dispatchId: 'send_dispatch_r3',
+      deliveries: [{ target: 'deck_sub_w1', status: 'delivered' }],
+    };
+
+    const dispatchOn = (child: { emits: (e: unknown) => void }, turnId: string) => {
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId,
+          item: {
+            id: `mcp-${turnId}`, type: 'mcpToolCall', status: 'completed',
+            server: 'imcodes-memory', tool: 'send_message',
+            arguments: { task: { taskId: 'tsk_5gi', assignmentId: 'asg_5gl' }, message: 'go' },
+            result: { structuredContent: acceptedDispatch },
+          },
+        },
+      });
+    };
+
+    const completeOn = (child: { emits: (e: unknown) => void }, turnId: string, text: string) => {
+      child.emits({
+        method: 'item/completed',
+        params: { threadId: 'thread-1', turnId, item: { id: `msg-${turnId}`, type: 'agentMessage', text } },
+      });
+      child.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: turnId, status: 'completed', error: null } },
+      });
+    };
+
+    it('does not carry a cancelled turn\'s dispatch into the next turn', async () => {
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-r3-cancel', cwd: '/tmp/project' });
+      await provider.send('route-r3-cancel', 'delegate');
+      const child = childProcessMock.children.at(-1)!;
+
+      dispatchOn(child, 'turn-1');
+      await provider.cancel('route-r3-cancel');
+      // The app-server settles an interrupted turn with a terminal event; without
+      // it the session stays busy and the next send is refused.
+      child.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'aborted', error: null } },
+      });
+      await flush();
+
+      await provider.send('route-r3-cancel', 'now just talk');
+      completeOn(child, 'turn-2', '\u5df2\u5206\u914d\u5b8c\u6bd5\u3002');
+      await waitForCondition(() => completions.some((m) => m.content === '\u5df2\u5206\u914d\u5b8c\u6bd5\u3002'));
+
+      const claim = readDelegationClaim(
+        completions.find((m) => m.content === '\u5df2\u5206\u914d\u5b8c\u6bd5\u3002')?.metadata,
+      );
+      expect(claim?.status, 'a cancelled turn must not substantiate the NEXT turn')
+        .toBe('unsubstantiated');
+      expect(claim?.dispatches).toEqual([]);
+
+      // No residue on ANY public surface: every completion emitted from the
+      // cancel onward must carry an empty dispatch list, not merely the one we
+      // happened to inspect.
+      for (const message of completions) {
+        expect(
+          readDelegationClaim(message.metadata)?.dispatches ?? [],
+          `completion ${message.id} leaked a cancelled turn's dispatch`,
+        ).toEqual([]);
+      }
+    });
+
+    it('does not carry a dispatch across a disconnect', async () => {
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-r3-disconnect', cwd: '/tmp/project' });
+      await provider.send('route-r3-disconnect', 'delegate');
+      const child = childProcessMock.children.at(-1)!;
+
+      dispatchOn(child, 'turn-1');
+      child.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'failed', error: { message: 'stream closed' } } },
+      });
+      await flush();
+
+      await provider.send('route-r3-disconnect', 'second');
+      const next = childProcessMock.children.at(-1)!;
+      completeOn(next, 'turn-2', 'done');
+      await waitForCondition(() => completions.some((m) => m.content === 'done'));
+
+      const claim = readDelegationClaim(completions.find((m) => m.content === 'done')?.metadata);
+      expect(claim?.status, 'a failed/disconnected turn must not substantiate a later turn')
+        .toBe('unsubstantiated');
+      expect(claim?.dispatches).toEqual([]);
+    });
+
+    it('still substantiates the turn that actually dispatched (control)', async () => {
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-r3-control', cwd: '/tmp/project' });
+      await provider.send('route-r3-control', 'delegate');
+      const child = childProcessMock.children.at(-1)!;
+
+      dispatchOn(child, 'turn-1');
+      completeOn(child, 'turn-1', 'Delegated.');
+      await waitForCondition(() => completions.length > 0);
+
+      const claim = readDelegationClaim(completions.at(-1)?.metadata);
+      expect(claim?.status, 'the dispatching turn itself must still be substantiated')
+        .toBe('substantiated');
+      expect(claim?.dispatches[0]).toMatchObject({
+        dispatchId: 'send_dispatch_r3', taskId: 'tsk_5gi', assignmentId: 'asg_5gl',
+      });
+    });
+  });
+
+  describe('authoritative delegation-claim projection', () => {
+    const acceptedDispatch = {
+      status: 'accepted',
+      dispatchId: 'send_dispatch_806104d8',
+      messageId: 'send_message_4772bca6',
+      deliveries: [{ target: 'deck_sub_w1', messageId: 'send_message_4772bca6', status: 'delivered' }],
+    };
+
+    const completeTurn = (child: { emits: (e: unknown) => void }, text: string) => {
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: { id: 'msg-1', type: 'agentMessage', text },
+        },
+      });
+      child.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+      });
+    };
+
+    it('marks a turn unsubstantiated when it dispatched nothing, whatever the prose says', async () => {
+      // The exact field failure: a healthy catalog, zero authorized IM calls, and
+      // a confident success sentence. The projection must carry no dispatch data,
+      // so no consumer can render this as assigned/queued/recovered. The text
+      // itself is preserved verbatim -- this boundary is structural, not censorship.
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-claim-none', cwd: '/tmp/project' });
+      await provider.send('route-claim-none', 'recover all tasks');
+      const child = childProcessMock.children.at(-1)!;
+
+      completeTurn(child, '已分配 12 个子任务，已排队并已恢复。');
+      await waitForCondition(() => completions.length > 0);
+
+      const completed = completions.at(-1);
+      expect(completed?.content, 'legitimate assistant text must survive unchanged')
+        .toBe('已分配 12 个子任务，已排队并已恢复。');
+      const claim = readDelegationClaim(completed?.metadata);
+      expect(claim, 'every completed turn must carry an authority projection').not.toBeNull();
+      expect(claim?.status).toBe('unsubstantiated');
+      expect(claim?.dispatches, 'there must be no dispatch a UI could show').toEqual([]);
+    });
+
+    it('marks a turn substantiated and binds the exact authority ids after a real dispatch', async () => {
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-claim-real', cwd: '/tmp/project' });
+      await provider.send('route-claim-real', 'delegate the slice');
+      const child = childProcessMock.children.at(-1)!;
+
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: {
+            id: 'mcp-1', type: 'mcpToolCall', status: 'completed',
+            server: 'imcodes-memory', tool: 'send_message',
+            arguments: { task: { taskId: 'tsk_5gi', assignmentId: 'asg_5gl' }, message: 'go' },
+            result: { structuredContent: acceptedDispatch },
+          },
+        },
+      });
+      completeTurn(child, 'Delegated.');
+      await waitForCondition(() => completions.length > 0);
+
+      const claim = readDelegationClaim(completions.at(-1)?.metadata);
+      expect(claim?.status).toBe('substantiated');
+      expect(claim?.dispatches).toHaveLength(1);
+      expect(claim?.dispatches[0]).toMatchObject({
+        dispatchId: 'send_dispatch_806104d8',
+        taskId: 'tsk_5gi',
+        assignmentId: 'asg_5gl',
+      });
+    });
+
+    it('does not let a native collaboration send_message substantiate a claim', async () => {
+      // Native collab shares the short name but carries no IM.codes authority.
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-claim-native', cwd: '/tmp/project' });
+      await provider.send('route-claim-native', 'message the agents');
+      const child = childProcessMock.children.at(-1)!;
+
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: { type: 'function_call', name: 'send_message', call_id: 'call-native-1', arguments: '{}' },
+        },
+      });
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: { type: 'function_call_output', call_id: 'call-native-1', output: JSON.stringify(acceptedDispatch) },
+        },
+      });
+      completeTurn(child, 'Messaged everyone.');
+      await waitForCondition(() => completions.length > 0);
+
+      const claim = readDelegationClaim(completions.at(-1)?.metadata);
+      expect(claim?.status, 'native collaboration is non-durable, not IM.codes authority')
+        .toBe('unsubstantiated');
+      expect(claim?.dispatches).toEqual([]);
+    });
+
+    it('does not carry dispatch facts from a previous turn into the next one', async () => {
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-claim-reset', cwd: '/tmp/project' });
+      await provider.send('route-claim-reset', 'delegate once');
+      const child = childProcessMock.children.at(-1)!;
+
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: {
+            id: 'mcp-1', type: 'mcpToolCall', status: 'completed',
+            server: 'imcodes-memory', tool: 'send_message',
+            arguments: { task: { taskId: 'tsk_5gi', assignmentId: 'asg_5gl' } },
+            result: { structuredContent: acceptedDispatch },
+          },
+        },
+      });
+      completeTurn(child, 'Delegated.');
+      await waitForCondition(() => completions.length > 0);
+      expect(readDelegationClaim(completions.at(-1)?.metadata)?.status).toBe('substantiated');
+
+      await provider.send('route-claim-reset', 'now just chat');
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-2',
+          item: { id: 'msg-2', type: 'agentMessage', text: '已全部恢复。' },
+        },
+      });
+      child.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-2', status: 'completed', error: null } },
+      });
+      await waitForCondition(() => completions.length > 1);
+
+      const second = readDelegationClaim(completions.at(-1)?.metadata);
+      expect(second?.status, 'a prior turn dispatch must not substantiate this one')
+        .toBe('unsubstantiated');
+      expect(second?.dispatches).toEqual([]);
+    });
   });
 });
 

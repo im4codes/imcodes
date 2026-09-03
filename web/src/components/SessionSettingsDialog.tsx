@@ -63,10 +63,8 @@ import {
   resolvePeerAuditProviderFamily,
   type PeerAuditCandidate,
 } from '@shared/peer-audit.js';
-import { PeerAuditCandidatePicker } from '../peerAudit/PeerAuditAuditorChooser.js';
 import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from '../peerAudit/types.js';
 import {
-  SESSION_SETTINGS_FOCUS,
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
 import {
@@ -830,7 +828,6 @@ export function SessionSettingsDialog({
   const [peerAuditTargetName, setPeerAuditTargetName] = useState<string | null>(
     initialSupervision.auditTargetSessionName ?? null,
   );
-  const peerAuditTargetRef = useRef<HTMLDivElement>(null);
   const ccPresetListRequestIdRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
@@ -856,13 +853,6 @@ export function SessionSettingsDialog({
     sessionName,
   });
 
-  useEffect(() => {
-    if (openIntent?.focus !== SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET || !isAuditMode) return;
-    const target = peerAuditTargetRef.current;
-    if (!target) return;
-    target.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
-    target.focus({ preventScroll: true });
-  }, [isAuditMode, openIntent?.focus]);
 
   // Subscribe to `cc.presets.list_response` for as long as the dialog is
   // mounted with a valid `ws`. We fire the list request once on mount and
@@ -1027,10 +1017,6 @@ export function SessionSettingsDialog({
       selectedPeerAuditCandidate.normalizedModelId,
     ].filter(Boolean).join(' · ')
     : null;
-  const auditedPeerModel = resolvePeerAuditNormalizedModelId({ activeModel, requestedModel });
-  const selectedPeerIsSameModel = Boolean(selectedPeerAuditCandidate
-    && auditedPeerModel !== 'unknown'
-    && selectedPeerAuditCandidate.normalizedModelId === auditedPeerModel);
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
   const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
   const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
@@ -1147,7 +1133,10 @@ export function SessionSettingsDialog({
     maxAutoContinueTotal: supervisionAutoContinueTotal,
     // Remember the auditor on this session even while audit mode is not
     // selected, so switching back to audit can reuse it without prompting.
-    ...((selectedPeerAuditCandidate?.name ?? peerAuditTargetName)
+    // Legacy manual-auditor fields are never persisted from supervision mode:
+    // the auditor comes from auditPolicy + the live pool. Any inherited value is
+    // stripped so a stale target cannot survive a save.
+    ...(!hasSupervision && (selectedPeerAuditCandidate?.name ?? peerAuditTargetName)
       ? {
           auditTargetSessionName: selectedPeerAuditCandidate?.name ?? peerAuditTargetName ?? undefined,
           peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
@@ -1727,39 +1716,6 @@ export function SessionSettingsDialog({
                   />
                 </div>
 
-                <div
-                  ref={peerAuditTargetRef}
-                  tabIndex={-1}
-                  data-testid="session-supervision-peer-target-section"
-                >
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
-                    {t('peerAuditQuick.chooserTitle')}
-                  </div>
-                  <div data-testid="session-supervision-peer-picker">
-                    <PeerAuditCandidatePicker
-                      candidates={peerAuditCandidates}
-                      selectedSessionInstanceId={selectedPeerAuditCandidate?.sessionInstanceId}
-                      onSelect={(candidate) => {
-                        setPeerAuditTargetName(candidate.name);
-                      }}
-                    />
-                  </div>
-                  {selectedPeerIsSameModel && (
-                    <div style={{ color: '#fbbf24', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-same-model-warning">
-                      {t('peerAuditQuick.chooserReason.same_model_remembered')}
-                    </div>
-                  )}
-                  {selectedPeerAuditCandidate?.dispositionCapability === 'sent_unrevocable' && (
-                    <div style={{ color: '#fbbf24', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-process-warning">
-                      {t('peerAuditQuick.disposition.sent_unrevocable')}
-                    </div>
-                  )}
-                  {selectedPeerAuditCandidate && (
-                    <div style={{ color: '#34d399', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-settings-selected">
-                      {selectedPeerAuditVisibleIdentity}
-                    </div>
-                  )}
-                </div>
               </div>
             )}
 
@@ -1845,7 +1801,10 @@ export function SessionSettingsDialog({
     if (!hasSupervision) return true;
     if (!globalDefaultsValid) return false;
     if (isAuditMode) {
-      if (!peerAuditTargetName || !selectedPeerAuditCandidate?.eligible) return false;
+      // The auditor is routed from auditPolicy + the live pool, so the legacy
+      // manual picker is not a precondition for a valid supervision config.
+      // Requiring an eligible candidate here made Save unreachable whenever no
+      // peer session happened to be open.
       if (supervisionAuditLoops < 0) return false;
     }
     return true;
