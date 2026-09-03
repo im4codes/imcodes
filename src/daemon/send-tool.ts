@@ -30,6 +30,10 @@ import {
   type DelegationRefusal,
 } from './delegation-admission.js';
 import { resolveDelegationTargets } from '../../shared/delegation-availability.js';
+import {
+  buildSupervisionExecutionSummary,
+  type SupervisionExecutionSummary,
+} from '../../shared/supervision-execution-summary.js';
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   AGENT_DELEGATION_PURPOSES,
@@ -275,6 +279,15 @@ export interface SendMessageDelivery {
   assignmentId?: string;
   status: 'delivered' | 'queued' | 'failed';
   error?: string;
+  /**
+   * Who actually runs this, resolved at dispatch time.
+   *
+   * Without it a receipt is three opaque ids, and answering "which session,
+   * which model, which provider, which pool" costs a second round trip for a
+   * large task object plus a model turn to read it -- per id, every time.
+   * Absent when the executor cannot be established without guessing.
+   */
+  execution?: SupervisionExecutionSummary;
 }
 
 export type SendMessageResult =
@@ -1880,6 +1893,7 @@ export async function dispatchSendMessage(
           : {}),
         ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
       });
+      const execution = resolveDeliveryExecution(target, supervisedAssignmentId);
       deliveries.push({
         target: target.name,
         messageId,
@@ -1887,6 +1901,7 @@ export async function dispatchSendMessage(
         ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
         ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
         status: dispatchResult === 'queued' ? 'queued' : 'delivered',
+        ...(execution ? { execution } : {}),
       });
     } catch (err) {
       if (replyAuthority && createdReplyAuthority) expireDelegationReplyAuthority(replyAuthority.record.delegationId);
@@ -2947,6 +2962,48 @@ export async function dispatchCronSend(input: CronSendDispatchInput, deps?: Send
 function optionalModelField(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+/**
+ * Resolve the executor for one delivery: durable binding first, live second.
+ *
+ * The persisted binding is the identity the work was admitted under, so it wins
+ * over the live record even when the same name now reports something else. The
+ * live path is used for ordinary sends and for assignments minted before
+ * bindings were persisted; it reads the exact record being dispatched to, so
+ * there is no name lookup to be ambiguous about. Pool is omitted there because
+ * an unbound send genuinely has no lane, and a guessed one would be worse than
+ * none. One O(1) registry read, no inference.
+ */
+function resolveDeliveryExecution(
+  target: SessionRecord,
+  assignmentId?: string,
+): SupervisionExecutionSummary | null {
+  let binding: SupervisionExecutionBinding | undefined;
+  let assignmentStatus: string | undefined;
+  if (assignmentId) {
+    try {
+      const assignment = getSupervisionTaskRegistry().getAssignment(assignmentId);
+      binding = assignment?.executionBinding;
+      assignmentStatus = assignment?.status;
+    } catch {
+      // A registry that cannot answer must not fail the send it is annotating.
+      binding = undefined;
+    }
+  }
+  return buildSupervisionExecutionSummary({
+    ...(binding ? { binding } : {}),
+    ...(assignmentStatus ? { assignmentStatus } : {}),
+    sessionName: target.name,
+    candidates: [{
+      sessionName: target.name,
+      label: target.label ?? null,
+      agentType: target.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(target),
+      model: resolveEffectiveSessionModel(target),
+      status: target.state,
+    }],
+  });
 }
 
 function toTargetInfo(

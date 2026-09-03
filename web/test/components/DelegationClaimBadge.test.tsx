@@ -154,6 +154,59 @@ describe('DelegationClaimBadge', () => {
     expect(text).toMatch(/1/);
   });
 
+  it('names the executor on one line so an id row is readable without a lookup', () => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp_9f21',
+          taskId: 'task_4410',
+          assignmentId: 'asg_5gl',
+          deliveries: [{
+            target: 'deck_imcodes_w1',
+            status: 'delivered',
+            execution: {
+              sessionName: 'deck_imcodes_w1',
+              label: 'Coder',
+              agentType: 'claude-code-sdk',
+              providerFamily: 'anthropic',
+              model: 'claude-opus-5',
+              pool: 'primary',
+              assignmentStatus: 'delegated',
+              source: 'assignment',
+            },
+          }],
+        }],
+      }),
+    }));
+
+    const line = container.querySelector('[data-delegation-field="execution"]');
+    const text = line?.textContent ?? '';
+    // Facts, in the order a reader scans them: who, what it runs, which lane.
+    expect(text).toContain('Coder (deck_imcodes_w1)');
+    expect(text).toContain('claude-code-sdk/anthropic');
+    expect(text).toContain('claude-opus-5');
+    expect(text).toContain('primary');
+    expect(text).toContain('delegated');
+  });
+
+  it('renders no executor line when the facts do not name one', () => {
+    // Silence beats an empty label: a dispatch whose legs state no executor is
+    // exactly the case where a rendered blank would read as "nowhere".
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp_9f21',
+          taskId: 'task_4410',
+          assignmentId: 'asg_5gl',
+          deliveries: [{ target: 'deck_imcodes_w1', status: 'delivered' }],
+        }],
+      }),
+    }));
+    expect(container.querySelector('[data-delegation-field="execution"]')).toBeNull();
+  });
+
   it('omits id rows the facts do not carry', () => {
     const { container } = render(h(DelegationClaimBadge, {
       metadata: withClaim({

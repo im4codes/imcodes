@@ -3016,7 +3016,8 @@
       "dispatch_count": "승인된 전달: {{total}}",
       "dispatch_id": "전달 ID",
       "task_id": "작업 ID",
-      "assignment_id": "할당 ID"
+      "assignment_id": "할당 ID",
+      "execution": "실행 위치"
     },
     "picker": {
       "agents": "에이전트",

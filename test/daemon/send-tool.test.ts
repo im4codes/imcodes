@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
@@ -12,6 +16,10 @@ import {
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
 
 function session(overrides: Partial<SessionRecord> & Pick<SessionRecord, 'name' | 'projectName' | 'role'>): SessionRecord {
   return {
@@ -161,6 +169,203 @@ describe('send-tool', () => {
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
     expect(dispatchMessage.mock.calls[0][1]).toBe('hello');
     expect(dispatchMessage.mock.calls[0][2]).toMatchObject({ deliveryMode: 'append' });
+  });
+
+  it('names the executor on the receipt so a dispatch id needs no second lookup', async () => {
+    // The whole point: a caller holding `send_dispatch_…` should be able to say
+    // which session, model and provider ran it without fetching a task object
+    // and reasoning over it.
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    const result = await dispatchSendMessage(caller, { target: 'Coder', message: 'hello' }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({
+          name: 'deck_alpha_w1',
+          projectName: 'alpha',
+          role: 'w1',
+          label: 'Coder',
+          agentType: 'claude-code-sdk',
+          activeModel: 'claude-opus-5',
+        }),
+      ],
+      dispatchMessage,
+    });
+
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(result.deliveries[0]?.execution).toMatchObject({
+      sessionName: 'deck_alpha_w1',
+      label: 'Coder',
+      agentType: 'claude-code-sdk',
+      model: 'claude-opus-5',
+      source: 'live',
+    });
+    // An unbound send has no lane, and a guessed one would be worse than none.
+    expect(result.deliveries[0]?.execution).not.toHaveProperty('pool');
+  });
+
+  it('lets the persisted binding outrank a same-name live runtime that now reports otherwise', async () => {
+    // The failure this pins is production-only: the pure resolver can rank the
+    // binding first and the wiring can still hand it the live record and never
+    // read the registry at all. A session re-created under the same name on a
+    // different provider must not be able to relabel work already dispatched,
+    // so the receipt has to state what the work was ADMITTED under.
+    resetSupervisionTaskRegistryForTests();
+    // Assignment provisioning realpaths the project, so this needs a real dir.
+    const projectRoot = await realpath(await mkdtemp(join(tmpdir(), 'imcodes-send-exec-')));
+    execFileSync('git', ['init', '-q'], { cwd: projectRoot });
+    execFileSync('git', ['commit', '-q', '--allow-empty', '-m', 'base'], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 't@e',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 't@e',
+      },
+    });
+    const registry = getSupervisionTaskRegistry();
+    const target = session({
+      name: 'deck_alpha_w1',
+      projectName: 'alpha',
+      role: 'w1',
+      label: 'Coder',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      activeModel: 'gpt-5.6-live',
+      projectDir: projectRoot,
+    } as never);
+    // The pool gate admits the target on its LIVE identity; the binding below
+    // records something else, which is exactly the drift under test.
+    const brain = session({
+      name: 'deck_alpha_brain',
+      projectName: 'alpha',
+      role: 'brain',
+      projectDir: projectRoot,
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk',
+                providerFamily: 'openai',
+                runtimeType: 'transport',
+                model: 'gpt-5.6-live',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-live',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const taskId = 'tsk_binding_precedence';
+    const assignmentId = 'asg_binding_precedence';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', objective: 'binding outranks live', classification: 'independent_top_level',
+    }).ok).toBe(true);
+    // The caller must authoritatively participate; project + role is not
+    // ownership. This is the coordinator side of the same task.
+    expect(registry.createAssignment({
+      assignmentId: `${assignmentId}-coordinator`,
+      taskId,
+      role: 'coordinator',
+      scopeFiles: [],
+      identity: {
+        sessionName: brain.name,
+        sessionInstanceId: brain.sessionInstanceId,
+        runtimeEpoch: brain.runtimeEpoch,
+        agentType: brain.agentType,
+        providerFamily: 'openai',
+      },
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      assignmentId,
+      taskId,
+      role: 'implementer',
+      scopeFiles: [],
+      identity: {
+        sessionName: target.name,
+        sessionInstanceId: target.sessionInstanceId,
+        runtimeEpoch: target.runtimeEpoch,
+        agentType: target.agentType,
+        providerFamily: 'openai',
+      },
+      executionBinding: {
+        pool: 'primary',
+        origin: 'configured',
+        requested: {
+          capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:opus',
+          agentType: 'claude-code-sdk',
+          providerFamily: 'anthropic',
+          runtimeType: 'transport',
+          model: 'opus',
+        },
+        actual: {
+          sessionName: target.name,
+          sessionInstanceId: target.sessionInstanceId,
+          runtimeEpoch: target.runtimeEpoch,
+          agentType: 'claude-code-sdk',
+          providerFamily: 'anthropic',
+          runtimeType: 'transport',
+          model: 'claude-opus-5-admitted',
+        },
+      },
+    }).ok).toBe(true);
+
+    const result = await dispatchSendMessage({ ...caller, projectRoot }, {
+      target: 'Coder',
+      message: 'continue',
+      task: { taskId, assignmentId, executionPool: 'primary' },
+    }, {
+      listSessions: () => [brain, target],
+      dispatchMessage: vi.fn().mockResolvedValue('delivered'),
+    });
+
+    if (result.status !== 'accepted') throw new Error(`expected accepted, got ${JSON.stringify(result)}`);
+    const execution = result.deliveries[0]?.execution;
+    // Every discriminating field comes from the binding, none from the live row.
+    expect(execution).toMatchObject({
+      sessionName: 'deck_alpha_w1',
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      model: 'claude-opus-5-admitted',
+      pool: 'primary',
+      source: 'assignment',
+    });
+    expect(execution?.model).not.toBe('gpt-5.6-live');
+    expect(execution?.agentType).not.toBe('codex-sdk');
+    resetSupervisionTaskRegistryForTests();
+  });
+
+  it('carries the executor on a queued delivery too, not just an accepted one', async () => {
+    // A message parked behind a busy turn is exactly when the caller most wants
+    // to know who it is waiting on.
+    const dispatchMessage = vi.fn().mockResolvedValue('queued');
+    const result = await dispatchSendMessage(caller, {
+      target: 'Coder',
+      message: 'wait your turn',
+      deliveryMode: 'queue',
+    }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+      ],
+      dispatchMessage,
+    });
+
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(result.deliveries[0]).toMatchObject({
+      status: 'queued',
+      execution: { sessionName: 'deck_alpha_w1', source: 'live' },
+    });
   });
 
   it('honors explicit queue delivery without attempting active-turn append', async () => {

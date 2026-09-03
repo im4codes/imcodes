@@ -3017,7 +3017,8 @@
       "dispatch_count": "Authorized dispatches: {{total}}",
       "dispatch_id": "Dispatch ID",
       "task_id": "Task ID",
-      "assignment_id": "Assignment ID"
+      "assignment_id": "Assignment ID",
+      "execution": "Runs on"
     },
     "picker": {
       "agents": "Agents",

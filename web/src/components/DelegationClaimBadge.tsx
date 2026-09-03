@@ -16,6 +16,7 @@
 
 import { useTranslation } from 'react-i18next';
 import { readDelegationClaim } from '@shared/delegation-claim.js';
+import type { SupervisionExecutionSummary } from '@shared/supervision-execution-summary.js';
 
 export interface DelegationClaimBadgeProps {
   /** Metadata record of a completed assistant message. */
@@ -44,6 +45,35 @@ export const readDelegationClaimMetadata = (
   const nested = payload.metadata;
   if (isRecord(nested) && readDelegationClaim(nested)) return nested;
   return readDelegationClaim(payload) ? payload : undefined;
+};
+
+
+/**
+ * The executor stated by this dispatch's own delivery legs.
+ *
+ * Every leg of one dispatch runs on the same target today, so the first leg
+ * that states an executor is the dispatch's executor. A dispatch whose legs
+ * state nothing renders no line at all, rather than an empty label.
+ */
+const executionOf = (dispatch: { deliveries?: { execution?: SupervisionExecutionSummary }[] }) =>
+  (dispatch.deliveries ?? []).find((delivery) => delivery.execution)?.execution;
+
+/**
+ * One line, facts only, in the order a reader scans them: who, then what it
+ * runs, then which lane. Absent facts are skipped rather than padded, so the
+ * line never claims precision it does not have.
+ */
+export const formatExecutionSummary = (execution: SupervisionExecutionSummary): string => {
+  const runtime = [execution.agentType, execution.providerFamily].filter(Boolean).join('/');
+  return [
+    execution.label && execution.label !== execution.sessionName
+      ? `${execution.label} (${execution.sessionName})`
+      : execution.sessionName,
+    runtime || undefined,
+    execution.model,
+    execution.pool,
+    execution.assignmentStatus,
+  ].filter(Boolean).join(' · ');
 };
 
 export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
@@ -103,6 +133,13 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
                 {t('delegation.claim.assignment_id', 'Assignment ID')}
                 {': '}
                 <code>{dispatch.assignmentId}</code>
+              </span>
+            ) : null}
+            {executionOf(dispatch) ? (
+              <span class="delegation-claim-execution" data-delegation-field="execution">
+                {t('delegation.claim.execution', 'Runs on')}
+                {': '}
+                <code>{formatExecutionSummary(executionOf(dispatch)!)}</code>
               </span>
             ) : null}
           </li>

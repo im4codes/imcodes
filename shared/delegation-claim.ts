@@ -15,6 +15,11 @@
  */
 
 /** The only MCP server that carries IM.codes delegation authority. */
+import {
+  readSupervisionExecutionSummary,
+  type SupervisionExecutionSummary,
+} from './supervision-execution-summary.js';
+
 export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
 
 /**
@@ -45,6 +50,8 @@ export interface DelegationDeliveryFact {
   target: string;
   status: string;
   messageId?: string;
+  /** Who ran it, so the ids above do not need a second lookup to be read. */
+  execution?: SupervisionExecutionSummary;
 }
 
 /** One authorized dispatch, bound to its exact authority ids. */
@@ -94,7 +101,13 @@ const readDeliveries = (output: Record<string, unknown>): DelegationDeliveryFact
     if (!target || !status) continue;
     if (!(DELEGATION_REACHED_DELIVERY_STATUSES as readonly string[]).includes(status)) continue;
     const messageId = asMeaningfulString(record.messageId);
-    deliveries.push({ target, status, ...(messageId ? { messageId } : {}) });
+    const execution = readSupervisionExecutionSummary(record.execution);
+    deliveries.push({
+      target,
+      status,
+      ...(messageId ? { messageId } : {}),
+      ...(execution ? { execution } : {}),
+    });
   }
   return deliveries;
 };

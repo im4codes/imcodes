@@ -158,3 +158,59 @@ describe('delegation claim projection', () => {
     expect(readDelegationClaim({ other: 1 })).toBeNull();
   });
 });
+
+describe('execution summary on delivery facts', () => {
+  const ARGS = { task: { taskId: 'tsk_1', assignmentId: 'asg_1' } };
+  const dispatchOutput = (execution: unknown) => ({
+    status: 'accepted',
+    dispatchId: 'send_dispatch_1',
+    deliveries: [{ target: 'deck_a_w1', status: 'delivered', execution }],
+  });
+
+  it('carries a well-formed executor through to the projection', () => {
+    // This is the whole point of the field: the id and the executor travel
+    // together, so reading the receipt does not require a second lookup.
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'send_message',
+      ARGS,
+      dispatchOutput({
+        sessionName: 'deck_a_w1',
+        label: 'Coder',
+        agentType: 'claude-code-sdk',
+        providerFamily: 'anthropic',
+        model: 'claude-opus-5',
+        pool: 'primary',
+        assignmentStatus: 'delegated',
+        source: 'assignment',
+      }),
+    );
+    expect(fact?.deliveries[0]?.execution).toMatchObject({
+      sessionName: 'deck_a_w1',
+      pool: 'primary',
+      source: 'assignment',
+    });
+  });
+
+  it('drops a relayed executor that cannot name a session or its provenance', () => {
+    // The projection crosses a relay, so junk must not reach the renderer
+    // wearing the same shape as a fact.
+    for (const bad of [
+      { label: 'Coder', source: 'assignment' },
+      { sessionName: 'deck_a_w1' },
+      { sessionName: 'deck_a_w1', source: 'guessed' },
+      'deck_a_w1',
+      null,
+    ]) {
+      const fact = readDelegationDispatchFact(
+        DELEGATION_AUTHORITY_MCP_SERVER,
+        'send_message',
+        ARGS,
+        dispatchOutput(bad),
+      );
+      // The delivery itself still counts; only the unusable executor is dropped.
+      expect(fact?.deliveries[0]).toBeDefined();
+      expect(fact?.deliveries[0]).not.toHaveProperty('execution');
+    }
+  });
+});

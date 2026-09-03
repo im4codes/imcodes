@@ -3016,7 +3016,8 @@
       "dispatch_count": "承認済みの送信: {{total}}",
       "dispatch_id": "送信 ID",
       "task_id": "タスク ID",
-      "assignment_id": "アサインメント ID"
+      "assignment_id": "アサインメント ID",
+      "execution": "実行先"
     },
     "picker": {
       "agents": "エージェント",

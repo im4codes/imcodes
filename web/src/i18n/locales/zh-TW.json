@@ -3017,7 +3017,8 @@
       "dispatch_count": "已授權派發：{{total}}",
       "dispatch_id": "派發 ID",
       "task_id": "任務 ID",
-      "assignment_id": "指派 ID"
+      "assignment_id": "指派 ID",
+      "execution": "執行於"
     },
     "picker": {
       "agents": "智能體",
