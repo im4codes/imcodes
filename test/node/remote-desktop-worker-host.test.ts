@@ -902,6 +902,141 @@ describe('remote desktop worker artifact and IPC host', () => {
     ]));
   });
 
+  it('reaps the worker process when the worker itself declares a terminal', async () => {
+    // REGRESSION, observed on a real Windows node (2026-09-02, dev.4297):
+    // a worker sent its own TERMINAL, the host logged
+    // cleanupReason="worker_terminal" at ~15s, and then the worker PROCESS
+    // stayed alive for 60.7 minutes holding the session. Every retry in that
+    // hour failed as protocol_error, and remote desktop only recovered when
+    // the wedged process finally exited on its own and a fresh worker spawned.
+    //
+    // The watchdog-timeout path already terminates the pid. The
+    // worker-declared terminal path did not, so a worker that says "I am done"
+    // but does not exit was never reaped. Ending a session must not depend on
+    // the worker's goodwill.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-terminal-reap-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const helpers: net.Socket[] = [];
+    const terminated: number[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      terminateProcess: (pid) => terminated.push(pid),
+      launch: (_executable, argsLine) => {
+        if (argsLine.includes('--release-all-input')) return;
+        const nonce = quotedArgs(argsLine)[3]!;
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 4242,
+          })}\n`);
+        });
+        helpers.push(helper);
+      },
+    });
+    cleanup.push(() => { host.close(); helpers.forEach((helper) => helper.destroy()); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(1));
+
+    // The worker declares its own terminal and then, like the real wedged
+    // worker, does NOT exit: the helper socket stays open.
+    helpers[0]!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId,
+      sessionId,
+      capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })}\n`);
+
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      sessionId,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })), { timeout: 1_000 });
+
+    // The process must be reaped even though it never closed its own pipe.
+    await vi.waitFor(() => expect(terminated).toEqual([4242]), { timeout: 1_000 });
+  });
+
+  it('does not reap on a controller stop, so a graceful worker exits on its own', async () => {
+    // Boundary counter-test for the reap above. Without this, reaping on EVERY
+    // cleanup reason passes the suite equally, and nothing stops the guard
+    // being widened later. A controller stop is an orderly end: the worker is
+    // told to stop and is expected to exit itself. Signalling it there would
+    // race a graceful shutdown for no evidenced benefit -- the observed wedge
+    // was specifically the worker-declared terminal path.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-stop-noreap-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const helpers: net.Socket[] = [];
+    const terminated: number[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      terminateProcess: (pid) => terminated.push(pid),
+      launch: (_executable, argsLine) => {
+        if (argsLine.includes('--release-all-input')) return;
+        const nonce = quotedArgs(argsLine)[3]!;
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 5150,
+          })}\n`);
+        });
+        helpers.push(helper);
+      },
+    });
+    cleanup.push(() => { host.close(); helpers.forEach((helper) => helper.destroy()); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(1));
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).resolves.toBe(true);
+
+    expect(terminated).toEqual([]);
+  });
+
   it('replaces a worker that answers PREPARE with protected_desktop, exactly once', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-desktop-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));

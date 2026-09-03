@@ -52,6 +52,7 @@ import {
   REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT,
   RemoteDesktopWorkerDiagnostics,
   type RemoteDesktopWorkerDiagnosticEvent,
+  REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON,
 } from './remote-desktop-worker-diagnostics.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import {
@@ -1210,7 +1211,7 @@ export class RemoteDesktopWorkerHost {
           void this.retryOnOtherDesktop(event.value, tracked);
           continue;
         }
-        this.untrack(event.value.sessionId, 'worker_terminal');
+        this.untrack(event.value.sessionId, REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON);
       }
       this.onMessage(event.value);
     }
@@ -1286,8 +1287,35 @@ export class RemoteDesktopWorkerHost {
         connection?.workerPid,
         { cleanupReason },
       );
+      // A worker that DECLARES a terminal is not thereby gone. Observed on a
+      // real Windows node: the host logged cleanupReason="worker_terminal" and
+      // the worker process then held the session for 60.7 minutes, failing
+      // every retry as protocol_error until it happened to exit on its own.
+      //
+      // The watchdog-timeout path already reaps the pid for exactly this
+      // reason. Ending a session must not depend on the worker's goodwill, so
+      // the self-declared terminal is reaped the same way. Other cleanup
+      // reasons keep the existing behaviour: a controller stop lets the worker
+      // exit on its own, and a pipe that already closed proves it is gone.
+      if (cleanupReason === REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON) {
+        this.reapWorkerProcess(connection?.workerPid);
+      }
     }
     this.core.untrack(sessionId);
+  }
+
+  /**
+   * Terminate a worker pid that has outlived its session. Never throws: the
+   * process may legitimately have exited between the terminal and this call,
+   * and a failed reap must not break session teardown.
+   */
+  private reapWorkerProcess(workerPid: number | undefined): void {
+    if (!workerPid || workerPid <= 0) return;
+    try {
+      (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(workerPid);
+    } catch {
+      // Already exited, or not ours to signal. Teardown continues either way.
+    }
   }
 
   private untrackForInternalRecovery(sessionId: string): void {

@@ -62,6 +62,13 @@ const SIGNALS = new Set<unknown>([
   'SIGKILL',
   'SIGTERM',
 ]);
+/**
+ * The worker declared its own terminal. This module owns the cleanup-reason
+ * vocabulary, so the literal lives here once and callers import it rather than
+ * re-spelling it; a second copy could drift out of the validated set below.
+ */
+export const REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON = 'worker_terminal' as const;
+
 const CLEANUP_REASONS = new Set<unknown>([
   'authority_removed',
   'controller_cancel',
@@ -69,7 +76,7 @@ const CLEANUP_REASONS = new Set<unknown>([
   'daemon_replaced',
   'watchdog_timeout',
   'worker_failed',
-  'worker_terminal',
+  REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON,
 ]);
 
 export interface RemoteDesktopWorkerDiagnosticEvent {
