@@ -530,7 +530,9 @@ export async function readEnrollmentBlobWithRange(executablePath = process.execP
   let source: VerifiedEnrollmentSource | null = null;
   try {
     source = await openVerifiedEnrollmentSource(executablePath);
-    return source.readEnrollmentBlobWithRange();
+    // `await` before returning, or `finally` closes the handle while the read
+    // is still in flight and the call dies with EBADF "file closed".
+    return await source.readEnrollmentBlobWithRange();
   } catch {
     return null;
   } finally {

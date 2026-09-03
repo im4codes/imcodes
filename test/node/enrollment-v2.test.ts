@@ -14,6 +14,7 @@ import {
   openVerifiedEnrollmentSource,
   parseEnrollmentBlob,
   persistInstallIdentity,
+  readEnrollmentBlob,
   readExactly,
   redeemEnrollmentV2,
   writeExactly,
@@ -185,6 +186,34 @@ describe('controlled node enrollment v2', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('readEnrollmentBlob', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'imcodes-read-blob-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('reads the trailer before releasing the handle', async () => {
+    // The helper opened the source, returned the read promise WITHOUT awaiting
+    // it, and let `finally` close the handle underneath the in-flight read, so
+    // every call died with EBADF "file closed". Nothing exercised it until the
+    // installer started reading its own trailer to name the server, and then it
+    // crashed the install outright.
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const source = join(dir, 'installer.bin');
+    await writeFile(source, Buffer.concat([Buffer.alloc(128, 0x42), blob]));
+
+    await expect(readEnrollmentBlob(source)).resolves.toMatchObject({
+      serverUrl: 'https://im.example',
+      enrollToken: 'once',
+    });
+  });
+
+  it('reports no trailer rather than throwing for an ordinary file', async () => {
+    const plain = join(dir, 'plain.bin');
+    await writeFile(plain, Buffer.alloc(64, 0x11));
+    await expect(readEnrollmentBlob(plain)).resolves.toBeNull();
   });
 });
 
