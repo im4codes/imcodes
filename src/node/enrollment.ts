@@ -1,8 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants as fsConstants, type Stats } from 'node:fs';
-import { chmod, chown, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { chmod, chown, lstat, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import os from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
   NODE_ROLE,
   ENROLLMENT_REDEEM_VERSION_V2,
@@ -114,6 +114,7 @@ export interface EnrollmentStagingFs {
   openDestination(path: string, flags: string, mode: number): Promise<StagingFileHandle>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
+  readdir(path: string): Promise<string[]>;
   lstat(path: string): Promise<Stats>;
   fsyncParentDirectory(path: string): Promise<void>;
   openSourceWritable(path: string): Promise<NodeFileHandle>;
@@ -125,6 +126,7 @@ const DEFAULT_ENROLLMENT_STAGING_FS: EnrollmentStagingFs = {
   openDestination: (path, flags, mode) => open(path, flags, mode),
   rename,
   unlink,
+  readdir,
   lstat,
   fsyncParentDirectory,
   openSourceWritable: (path) => openNoFollow(path, true),
@@ -338,6 +340,12 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
     } catch (error) {
       if (process.platform !== 'win32' || !isLockedDestinationError(error)) throw error;
     }
+    // Sweep what earlier runs had to leave behind. The image displaced by THIS
+    // run is still executing, so Windows will refuse to delete it below; by the
+    // next install the service has restarted onto the new copy and the old one
+    // finally goes. Without this each re-install strands another ~80MB copy in
+    // the protected directory forever.
+    await this.removeDisplacedPredecessors(destPath);
     const displaced = `${destPath}.replaced-${randomUUID()}`;
     await this.stagingFs.rename(destPath, displaced);
     try {
@@ -347,6 +355,17 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
       throw error;
     }
     await this.stagingFs.unlink(displaced).catch(() => {});
+  }
+
+  /** Delete displaced copies from earlier installs; a running one simply stays. */
+  private async removeDisplacedPredecessors(destPath: string): Promise<void> {
+    const directory = dirname(destPath);
+    const prefix = `${basename(destPath)}.replaced-`;
+    const entries = await this.stagingFs.readdir(directory).catch(() => [] as string[]);
+    for (const entry of entries) {
+      if (!entry.startsWith(prefix)) continue;
+      await this.stagingFs.unlink(join(directory, entry)).catch(() => {});
+    }
   }
 
   async cleanupEnrollmentSource(trailerStart: number, trailerLength: number): Promise<SourceCleanupStatus> {
