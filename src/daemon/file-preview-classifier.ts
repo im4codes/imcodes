@@ -133,7 +133,10 @@ export function classifyPreviewByPath(filePath: string, size: number): FilePrevi
   const textMime = TEXT_MIME_BY_EXTENSION[extension as keyof typeof TEXT_MIME_BY_EXTENSION];
   const mimeType = imageMime ?? officeMime ?? videoMime ?? audioMime ?? textMime;
 
-  // Streamed kinds never buffer the whole file: check them before the inline cap.
+  // Streamed kinds never buffer the whole file into a WebSocket frame: the
+  // daemon only sends metadata + a download handle, and the browser pulls the
+  // bytes over the chunked HTTP download channel. They are therefore exempt
+  // from the inline cap and may be arbitrarily large.
   if (videoMime) {
     return { previewType: 'video', previewKind: 'video', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: videoMime, previewMode: 'stream' };
   }
@@ -142,6 +145,16 @@ export function classifyPreviewByPath(filePath: string, size: number): FilePrevi
     return { previewType: 'audio', previewKind: 'audio', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: audioMime, previewMode: 'stream' };
   }
 
+  if (imageMime) {
+    return { previewType: 'image', previewKind: 'image', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: imageMime, previewMode: 'stream' };
+  }
+
+  if (officeMime) {
+    return { previewType: 'office', previewKind: 'office', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: officeMime, previewMode: 'stream' };
+  }
+
+  // Text is still delivered inline because the editor needs the decoded source,
+  // so it keeps the smaller inline cap.
   if (size > FS_READ_INLINE_SIZE_LIMIT) {
     return {
       previewType: 'too_large',
@@ -152,14 +165,6 @@ export function classifyPreviewByPath(filePath: string, size: number): FilePrevi
       mimeType,
       previewReason: FS_READ_PREVIEW_REASONS.TOO_LARGE,
     };
-  }
-
-  if (imageMime) {
-    return { previewType: 'image', previewKind: 'image', extension, size, sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT, mimeType: imageMime };
-  }
-
-  if (officeMime) {
-    return { previewType: 'office', previewKind: 'office', extension, size, sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT, mimeType: officeMime };
   }
 
   return { previewType: 'text', previewKind: 'text', extension, size, sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT, mimeType: textMime };

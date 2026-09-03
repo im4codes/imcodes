@@ -4,6 +4,15 @@
 import { cleanup, render, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+/** OfficePreview fetches its bytes from the chunked download URL. */
+function installFetchStub(bytes = new Uint8Array([0, 0]).buffer): void {
+  vi.stubGlobal('fetch', vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    arrayBuffer: async () => bytes,
+  })));
+}
+
 const pdfjsApi = vi.hoisted(() => ({
   GlobalWorkerOptions: { workerSrc: '' },
   getDocument: vi.fn(),
@@ -107,6 +116,7 @@ describe('OfficePreview PDF worker setup', () => {
   });
 
   it('uses an inline blob URL for the pdf.js worker so preview does not depend on deployed asset chunks', async () => {
+    installFetchStub();
     const createObjectURL = vi.fn(() => 'blob:imcodes-pdf-worker');
     installCreateObjectURL(createObjectURL);
     const { getPdfWorkerSrc } = await import('../../src/components/OfficePreview.js');
@@ -118,6 +128,7 @@ describe('OfficePreview PDF worker setup', () => {
   });
 
   it('reports an explicit setup error when Blob URLs are unavailable', async () => {
+    installFetchStub();
     installCreateObjectURL(undefined);
     const { getPdfWorkerSrc } = await import('../../src/components/OfficePreview.js');
 
@@ -125,18 +136,20 @@ describe('OfficePreview PDF worker setup', () => {
   });
 
   it('configures PDF previews with the inline worker before opening the document', async () => {
+    installFetchStub();
     installCreateObjectURL(vi.fn(() => 'blob:preview-worker'));
     installResizeObserver(320);
     const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
 
-    render(<OfficePreview data="AA==" mimeType="application/pdf" path="/tmp/file.pdf" />);
+    render(<OfficePreview srcUrl="https://example.test/doc" mimeType="application/pdf" path="/tmp/file.pdf" />);
 
     await waitFor(() => expect(pdfjsApi.getDocument).toHaveBeenCalled());
     expect(pdfjsApi.GlobalWorkerOptions.workerSrc).toBe('blob:preview-worker');
-    expect(pdfjsApi.getDocument.mock.calls[0]?.[0]).toMatchObject({ data: expect.any(ArrayBuffer) });
+    expect(pdfjsApi.getDocument.mock.calls[0]?.[0]).toMatchObject({ data: expect.any(Uint8Array) });
   });
 
   it('cancels stale overlapping PDF renders so resized previews do not duplicate later pages', async () => {
+    installFetchStub();
     installCreateObjectURL(vi.fn(() => 'blob:preview-worker'));
     const resize = installControllableResizeObserver(320);
     HTMLCanvasElement.prototype.getContext = vi.fn(() => ({})) as unknown as typeof HTMLCanvasElement.prototype.getContext;
@@ -160,7 +173,7 @@ describe('OfficePreview PDF worker setup', () => {
     });
     const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
 
-    const { container } = render(<OfficePreview data="AA==" mimeType="application/pdf" path="/tmp/file.pdf" />);
+    const { container } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType="application/pdf" path="/tmp/file.pdf" />);
     await waitFor(() => expect(getPage).toHaveBeenCalledTimes(2));
     expect(container.querySelectorAll('canvas')).toHaveLength(1);
 
@@ -185,10 +198,11 @@ describe('OfficePreview — XLSX sanitization', () => {
   afterEach(() => { cleanup(); });
 
   it('strips scripts and event handlers from spreadsheet-derived markup', async () => {
+    installFetchStub();
     xlsxApi.html = '<table><tr><td><script>window.__pwned = true;</script>'
       + '<img src=x onerror="window.__pwned = true">cell</td></tr></table>';
     const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
-    const { container } = render(<OfficePreview data="" mimeType={XLSX_MIME} path="/tmp/a.xlsx" />);
+    const { container } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType={XLSX_MIME} path="/tmp/a.xlsx" />);
 
     await waitFor(() => expect(container.querySelector('table')).not.toBeNull());
     // A spreadsheet is attacker-controlled input rendered through
@@ -199,9 +213,10 @@ describe('OfficePreview — XLSX sanitization', () => {
   });
 
   it('keeps ordinary table content intact', async () => {
+    installFetchStub();
     xlsxApi.html = '<table><tr><td>hello</td><td>42</td></tr></table>';
     const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
-    const { container } = render(<OfficePreview data="" mimeType={XLSX_MIME} path="/tmp/a.xlsx" />);
+    const { container } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType={XLSX_MIME} path="/tmp/a.xlsx" />);
 
     await waitFor(() => expect(container.textContent).toContain('hello'));
     expect(container.textContent).toContain('42');

@@ -128,7 +128,7 @@ describe('file preview read worker', () => {
     });
   });
 
-  it('snapshots text, base64 image, stream media metadata, too-large, and binary responses', async () => {
+  it('snapshots text inline, streams image/media metadata, too-large, and binary responses', async () => {
     const text = await handlePreviewReadWorkerRequest(snapshotRequest('/real/file.txt'), deps());
     expect(text).toMatchObject({ phase: 'snapshot', kind: 'success', payload: { mode: 'text', content: 'hello world' } });
 
@@ -138,7 +138,9 @@ describe('file preview read worker', () => {
       stat: vi.fn(async () => ({ mtimeMs: 1000, size: 4, isFile: () => true })),
       readFile: vi.fn(async () => Buffer.from([1, 2, 3, 4])),
     }));
-    expect(image).toMatchObject({ payload: { mode: 'base64', encoding: 'base64', mimeType: 'image/png' } });
+    // Images now stream: the worker returns metadata + handle and never reads
+    // the file, so no inline payload can monopolise the WebSocket.
+    expect(image).toMatchObject({ payload: { mode: 'stream', previewMode: 'stream', mimeType: 'image/png' } });
 
     const videoReq = snapshotRequest('/real/movie.mp4');
     videoReq.classification = classifyFile({ realPath: videoReq.realPath, size: 11, mtimeMs: 1000 });

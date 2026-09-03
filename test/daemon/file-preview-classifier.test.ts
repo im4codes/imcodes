@@ -35,9 +35,10 @@ describe('file preview classifier', () => {
     expect(classifyPreviewByPath('/repo/image.PNG', 10)).toMatchObject({
       previewType: 'image',
       previewKind: 'image',
+      previewMode: 'stream',
       extension: 'png',
       size: 10,
-      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
+      sizeLimitBytes: FS_READ_SIZE_LIMIT,
       mimeType: 'image/png',
     });
   });
@@ -83,14 +84,19 @@ describe('file preview classifier', () => {
   });
 
   it('classifies too-large files before inline preview type', () => {
-    expect(classifyPreviewByPath('/repo/huge.png', FS_READ_INLINE_SIZE_LIMIT + 1)).toMatchObject({
+    // Inline (text) kinds are the only ones still bounded by the inline cap.
+    expect(classifyPreviewByPath('/repo/huge.txt', FS_READ_INLINE_SIZE_LIMIT + 1)).toMatchObject({
       previewType: 'too_large',
       previewKind: 'too_large',
-      extension: 'png',
+      extension: 'txt',
       size: FS_READ_INLINE_SIZE_LIMIT + 1,
       sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
-      mimeType: 'image/png',
       previewReason: FS_READ_PREVIEW_REASONS.TOO_LARGE,
+    });
+    // A large image is NOT rejected: it streams over the download channel.
+    expect(classifyPreviewByPath('/repo/huge.png', FS_READ_INLINE_SIZE_LIMIT + 1)).toMatchObject({
+      previewType: 'image',
+      previewMode: 'stream',
     });
   });
 
@@ -106,16 +112,22 @@ describe('file preview classifier', () => {
     expect(lookupPreviewMimeByExtension('unknownext')).toBeUndefined();
   });
 
-  it('refuses to inline-preview a large office document so the event loop is not blocked', () => {
+  it('streams large office/image previews instead of inlining them into a WS frame', () => {
     // Regression: a 31MB .docx was classified as 'office', then read whole and
     // base64-encoded synchronously, stalling the event loop for seconds. That
     // missed ServerLink heartbeats and dropped the daemon WS (UI showed the
     // daemon offline), which also broke P2P downloads that need WS signalling.
     const thirtyOneMb = 31 * 1024 * 1024;
+    // It must NOT be inlined (that stalled the loop and dropped the WS), and it
+    // must NOT be refused either: it streams over the chunked download channel.
     expect(classifyPreviewByPath('/case/final.docx', thirtyOneMb)).toMatchObject({
-      previewType: 'too_large',
-      previewKind: 'too_large',
-      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
+      previewType: 'office',
+      previewKind: 'office',
+      previewMode: 'stream',
+    });
+    expect(classifyPreviewByPath('/case/scan.png', thirtyOneMb)).toMatchObject({
+      previewType: 'image',
+      previewMode: 'stream',
     });
     // Streamed media must NOT regress: it never buffers the whole file.
     expect(classifyPreviewByPath('/case/clip.mp4', thirtyOneMb)).toMatchObject({

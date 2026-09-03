@@ -281,8 +281,9 @@ export type FileBrowserPreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
+  /** `dataUrl` holds the chunked HTTP download URL (no inline data: payload). */
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
-  | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
+  | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string }
   | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'audio'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
@@ -971,17 +972,47 @@ export function FileBrowser({
           return;
         }
 
-        // Office document preview (PDF, DOCX, XLSX) — check before image
+        // Office/image preview — same stream contract as video/audio: the daemon
+        // sends metadata only and the bytes come over the chunked HTTP download
+        // channel, so a large file can never monopolise the WebSocket.
         const officeType = getOfficeType(filePath);
-        if (officeType && msg.encoding === 'base64') {
-          setPreview({ status: 'office', path: filePath, data: msg.content ?? '', mimeType: officeType, downloadId: dlId });
+        if (officeType && (msg as { previewMode?: string }).previewMode === 'stream' && dlId && serverId) {
+          const mimeType = (msg.mimeType as string | undefined) ?? officeType;
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType, downloadId: dlId });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+            });
           return;
         }
 
-        // Image files: render as <img> from base64
-        if (msg.encoding === 'base64' && msg.mimeType) {
-          const dataUrl = `data:${msg.mimeType};base64,${msg.content ?? ''}`;
-          setPreview({ status: 'image', path: filePath, dataUrl, downloadId: dlId });
+        if (
+          (msg as { previewMode?: string }).previewMode === 'stream'
+          && msg.mimeType
+          && dlId
+          && serverId
+        ) {
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'image', path: filePath, dataUrl: streamUrl, downloadId: dlId });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+            });
           return;
         }
 
@@ -2027,7 +2058,7 @@ export function FileBrowser({
         )}
         {preview.status === 'office' && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
-            <OfficePreview data={preview.data} mimeType={preview.mimeType} path={preview.path} />
+            <OfficePreview srcUrl={preview.srcUrl} mimeType={preview.mimeType} path={preview.path} />
           </Suspense>
         )}
         {preview.status === 'video' && (

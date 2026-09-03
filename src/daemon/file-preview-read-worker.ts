@@ -186,7 +186,17 @@ async function handleSnapshot(
     };
   }
 
-  if ((classification.previewKind === 'video' || classification.previewKind === 'audio') && mimeType) {
+  // Streamed kinds are answered with metadata + a download handle only. The
+  // file is never read here, so no inline payload can stall the event loop or
+  // monopolise the WebSocket; the browser pulls bytes over the chunked HTTP
+  // download channel instead.
+  if (
+    (classification.previewKind === 'video'
+      || classification.previewKind === 'audio'
+      || classification.previewKind === 'image'
+      || classification.previewKind === 'office')
+    && mimeType
+  ) {
     const endStats = await deps.stat(message.realPath);
     return {
       ...baseResult(message),
@@ -211,27 +221,6 @@ async function handleSnapshot(
   const buffer = toBuffer(await deps.readFile(message.realPath));
   const endStats = await deps.stat(message.realPath);
   const endSignature = deps.signatureForStat?.(endStats) ?? statSignature(endStats);
-
-  if ((classification.previewKind === 'image' || classification.previewKind === 'office') && mimeType) {
-    return {
-      ...baseResult(message),
-      phase: 'snapshot',
-      kind: 'success',
-      realPath: message.realPath,
-      startSignature: message.startSignature,
-      endSignature,
-      size: endStats.size,
-      mtimeMs: endStats.mtimeMs,
-      fileName: message.fileName,
-      classification,
-      payload: {
-        mode: 'base64',
-        content: buffer.toString('base64'),
-        encoding: 'base64',
-        mimeType,
-      },
-    };
-  }
 
   const isBinary = deps.isBinaryBuffer ? deps.isBinaryBuffer(buffer) : hasNulByte(buffer);
   if (isBinary) {

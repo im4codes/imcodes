@@ -406,12 +406,15 @@ describe('low-coverage page and component surfaces', () => {
   });
 
   it('OfficePreview renders unsupported and spreadsheet previews', async () => {
-    const { rerender } = render(<OfficePreview data="" mimeType="text/plain" path="/tmp/readme.txt" />);
-    expect(screen.getByText('Unsupported format: readme.txt')).toBeTruthy();
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0, 0]).buffer })));
+    const { rerender } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType="text/plain" path="/tmp/readme.txt" />);
+    // Bytes now arrive over the chunked download URL, so the component renders
+    // a placeholder until the fetch resolves.
+    expect(await screen.findByText('Unsupported format: readme.txt')).toBeTruthy();
 
-    rerender(<OfficePreview data="AA==" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" path="/tmp/book.xlsx" />);
+    rerender(<OfficePreview srcUrl="https://example.test/doc2" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" path="/tmp/book.xlsx" />);
     expect(await screen.findByText('Total')).toBeTruthy();
-    expect(xlsxApi.read).toHaveBeenCalledWith('AA==', { type: 'base64' });
+    expect(xlsxApi.read).toHaveBeenCalledWith(expect.any(ArrayBuffer), { type: 'array' });
   });
 
   it('AdminPage loads users, approves a pending user, and toggles settings', async () => {
