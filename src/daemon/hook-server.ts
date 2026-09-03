@@ -204,6 +204,31 @@ function resolveSenderRecord(from: string, allSessions: SessionRecord[]): Sessio
  *   `imcodes send "deck_proj_brain" ...` without enabling global
  *   label/type/broadcast fan-out.
  */
+/**
+ * THE sibling-scope predicate. Defined once and used by every resolution path.
+ *
+ * A sub-session belongs to exactly ONE owning main. Scoping a main's siblings by
+ * shared `projectName` therefore let a DIFFERENT main in the same project
+ * address and control it -- with 94 unparented mains in one live project, every
+ * main was a sibling of every other main's sub-sessions. A main now sees sibling
+ * MAINS plus its OWN subtree, never another main's children.
+ *
+ * The owner comparison uses `fromRecord.name`, never the raw `from` request
+ * field: `from` may be a label, and a label is not an identity.
+ */
+export function isSiblingSessionOf(candidate: SessionRecord, fromRecord: SessionRecord): boolean {
+  if (candidate.name === fromRecord.name) return false;
+  if (candidate.state === 'stopped') return false;
+  if (fromRecord.parentSession) {
+    // Sub-session: its owning main and that main's other children.
+    return candidate.parentSession === fromRecord.parentSession
+      || candidate.name === fromRecord.parentSession;
+  }
+  // Main session: sibling mains in the same project, plus its own children only.
+  return (candidate.projectName === fromRecord.projectName && !candidate.parentSession)
+    || candidate.parentSession === fromRecord.name;
+}
+
 export function resolveTarget(from: string, to: string): ResolveResult {
   const allSessions = listSessions();
   const fromRecord = resolveSenderRecord(from, allSessions);
@@ -230,16 +255,7 @@ export function resolveTarget(from: string, to: string): ResolveResult {
   }
 
   // Determine siblings: sessions sharing the same parent or project (exclude stopped)
-  const allSiblings = allSessions.filter((s) => {
-    if (s.name === fromRecord.name) return false; // exclude self
-    if (s.state === 'stopped') return false; // exclude stopped sessions
-    // Sub-sessions: match by parentSession
-    if (fromRecord.parentSession) {
-      return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
-    }
-    // Main sessions: match by projectName
-    return s.projectName === fromRecord.projectName || s.parentSession === from;
-  });
+  const allSiblings = allSessions.filter((s) => isSiblingSessionOf(s, fromRecord));
   // Target discovery and every ordinary send mode must mirror what users can
   // identify. Raw legacy workers hidden by the frontend are internal sessions,
   // not user-addressable conversation targets.
@@ -714,14 +730,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const fromRecord = from ? getSession(from) : null;
         const allSess = listSessions();
         const siblings = (fromRecord
-          ? allSess.filter((s) => {
-              if (s.name === from) return false;
-              if (s.state === 'stopped') return false;
-              if (fromRecord.parentSession) {
-                return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
-              }
-              return s.projectName === fromRecord.projectName || s.parentSession === from;
-            })
+          ? allSess.filter((s) => isSiblingSessionOf(s, fromRecord))
           : allSess.filter((s) => s.state !== 'stopped'))
           .filter(isDiscoverableInterAgentSession);
         const sessions = siblings.map((s) => ({

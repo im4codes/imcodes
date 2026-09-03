@@ -79,6 +79,7 @@ import { createCapabilitySyncRuntime } from '../capability/capability-sync-runti
 import { CapabilitySyncFrameHandler } from '../capability/capability-sync-handler.js';
 import { CapabilitySourceConvergenceStore } from '../capability/capability-source-convergence.js';
 import { cleanupAbandonedCapabilityQuarantine } from '../capability/skill-acquisition.js';
+import { clearResend } from './transport-resend-queue.js';
 import {
   createProductionSupervisionConsoleBinding,
   isAuthorizedSupervisionConsoleScope,
@@ -289,6 +290,9 @@ async function dropLocalSession(session: SessionRecord): Promise<void> {
     await killSession(session.name).catch(() => {});
   }
 
+  // ONE removal boundary: durable queue work must never outlive its session
+  // and become deliverable to a later same-named instance.
+  clearResend(session.name, 'session_removed');
   removeSession(session.name);
 }
 

@@ -435,3 +435,240 @@ describe('TransportQueueStore', () => {
     ]);
   });
 });
+
+// A queue row is addressed to a RUNTIME, not to a reusable session name. Before
+// this, session_name was the sole recipient key in all four tables and no drain
+// path compared identity at all, so a same-named successor drained the previous
+// instance's work.
+describe('durable queue is bound to the recipient runtime identity', () => {
+  const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+  const B = { sessionInstanceId: 'instance-B', runtimeEpoch: 'epoch-B' };
+  const NAME = 'deck_shared_name';
+
+  function queueForA() {
+    store.enqueue({ sessionName: NAME, recipient: A, clientMessageId: 'm1', text: 'for A', now: 10 });
+  }
+
+  it('retains A\'s work while A is offline', () => {
+    queueForA();
+    expect(store.readSnapshot(NAME).pendingMessageEntries).toHaveLength(1);
+    expect(store.queueBelongsTo(NAME, A)).toBe(true);
+  });
+
+  it('refuses a same-name NEW instance: B cannot consume A\'s queue', () => {
+    queueForA();
+    expect(store.queueBelongsTo(NAME, B)).toBe(false);
+    expect(
+      store.markHandoffInFlight(NAME, ['m1'], 60_000, 20, B),
+      'B must lease nothing, so its drain aborts',
+    ).toEqual([]);
+    // Untouched and still A's.
+    expect(store.readSnapshot(NAME).pendingMessageEntries).toHaveLength(1);
+    expect(store.queueBelongsTo(NAME, A)).toBe(true);
+  });
+
+  it('lets A itself consume after coming back', () => {
+    queueForA();
+    expect(store.markHandoffInFlight(NAME, ['m1'], 60_000, 20, A)).toHaveLength(1);
+  });
+
+  it('refuses an unusable caller identity outright', () => {
+    queueForA();
+    for (const bad of [undefined, null, { sessionInstanceId: '', runtimeEpoch: 'epoch-A' }, { sessionInstanceId: 'instance-A', runtimeEpoch: '' }]) {
+      expect(store.queueBelongsTo(NAME, bad as never)).toBe(false);
+      expect(store.markHandoffInFlight(NAME, ['m1'], 60_000, 20, bad as never)).toEqual([]);
+    }
+  });
+
+  it('quarantines legacy rows that carry no identity', () => {
+    // A row written before identity binding existed.
+    store.enqueue({ sessionName: 'legacy-name', clientMessageId: 'old', text: 'legacy', now: 10 });
+    expect(store.readSnapshot('legacy-name').pendingMessageEntries).toHaveLength(1);
+    // Nobody who proves an identity may claim it.
+    expect(store.queueBelongsTo('legacy-name', A)).toBe(false);
+    expect(store.markHandoffInFlight('legacy-name', ['old'], 60_000, 20, A)).toEqual([]);
+  });
+
+  it('survives a store reopen with the binding intact (restart)', () => {
+    queueForA();
+    const dbPath = join(dir, 'queue.sqlite');
+    store.close();
+    store = new TransportQueueStore({ dbPath });
+    expect(store.queueBelongsTo(NAME, A)).toBe(true);
+    expect(store.queueBelongsTo(NAME, B)).toBe(false);
+    expect(store.markHandoffInFlight(NAME, ['m1'], 60_000, 30, B)).toEqual([]);
+  });
+
+  it('migrates a pre-identity database without delivering its rows to a new instance', () => {
+    // Build a database with the OLD shape, then open it with the current store.
+    const legacyPath = join(dir, 'legacy.sqlite');
+    const legacy = new DatabaseSync(legacyPath);
+    legacy.exec(`
+      CREATE TABLE queue_meta (
+        session_name TEXT PRIMARY KEY, queue_epoch TEXT NOT NULL, queue_authority_id TEXT NOT NULL,
+        pending_message_version INTEGER NOT NULL DEFAULT 0, next_ordinal INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO queue_meta VALUES ('old-session', 'epoch-1', 'authority-1', 1, 1, 1);
+    `);
+    legacy.close();
+    const migrated = new TransportQueueStore({ dbPath: legacyPath });
+    try {
+      // The migration added the columns rather than failing to open...
+      expect(migrated.readSnapshot('old-session').queueEpoch).toBe('epoch-1');
+      // ...and the unidentifiable legacy queue is claimed by nobody.
+      expect(migrated.queueBelongsTo('old-session', A)).toBe(false);
+      expect(migrated.queueBelongsTo('old-session', B)).toBe(false);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it('scopes delivery tombstones to the queue epoch', () => {
+    queueForA();
+    const leased = store.markHandoffInFlight(NAME, ['m1'], 60_000, 20, A);
+    expect(leased).toHaveLength(1);
+    store.finalizeSentBatch(NAME, ['m1'], 'frame-1', 30, A);
+    expect(store.hasDeliveryTombstone(NAME, 'm1')).toBe(true);
+    // A reset mints a new epoch; a tombstone from the previous epoch must not
+    // suppress a legitimately re-queued id.
+    store.reset(NAME, 'user_clear', 40);
+    expect(store.hasDeliveryTombstone(NAME, 'm1')).toBe(false);
+  });
+
+  it('is idempotent: re-leasing the same id does not double-deliver', () => {
+    queueForA();
+    expect(store.markHandoffInFlight(NAME, ['m1'], 60_000, 20, A)).toHaveLength(1);
+    // Already in flight, so a second lease returns nothing rather than a copy.
+    expect(store.markHandoffInFlight(NAME, ['m1'], 60_000, 21, A)).toEqual([]);
+  });
+});
+
+// The tombstone primary key includes queue_epoch, but the lookup omitted it, so
+// a tombstone written under a PREVIOUS epoch suppressed a legitimately re-queued
+// id. Passing an explicit epoch is what makes the filter observable.
+describe('delivery tombstones are epoch-scoped', () => {
+  const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+
+  it('does not let a previous epoch tombstone suppress the current one', () => {
+    const NAME = 'epoch-scoped-tombstone';
+    store.enqueue({ sessionName: NAME, recipient: A, clientMessageId: 'm1', text: 'first', now: 10 });
+    const firstEpoch = store.readSnapshot(NAME).queueEpoch;
+    expect(store.markHandoffInFlight(NAME, ['m1'], 60_000, 20, A)).toHaveLength(1);
+    store.finalizeSentBatch(NAME, ['m1'], 'frame-1', 30, A);
+    expect(store.hasDeliveryTombstone(NAME, 'm1', firstEpoch)).toBe(true);
+
+    // New epoch, same client id re-queued and delivered again.
+    store.reset(NAME, 'user_clear', 40);
+    const secondEpoch = store.readSnapshot(NAME).queueEpoch;
+    expect(secondEpoch).not.toBe(firstEpoch);
+    store.enqueue({ sessionName: NAME, recipient: A, clientMessageId: 'm1', text: 'second', now: 50 });
+    expect(store.markHandoffInFlight(NAME, ['m1'], 60_000, 60, A)).toHaveLength(1);
+    store.finalizeSentBatch(NAME, ['m1'], 'frame-2', 70, A);
+
+    // Each epoch answers for itself.
+    expect(store.hasDeliveryTombstone(NAME, 'm1', secondEpoch)).toBe(true);
+    expect(
+      store.hasDeliveryTombstone(NAME, 'm1', firstEpoch),
+      'a superseded epoch must not answer for the current one',
+    ).toBe(false);
+  });
+});
+
+// The live incident: rows sat in `handoff_inflight` with handoff_expires_at
+// ~6,397s in the past because the lease was taken before a daemon restart and
+// nothing on a generic path ever restored it.
+describe('expired handoff leases survive restart and stay recoverable', () => {
+  const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+  const NAME = 'stale-handoff-session';
+
+  it('recovers an expired lease taken before a restart, and leaves an active one alone', () => {
+    store.enqueue({ sessionName: NAME, recipient: A, clientMessageId: 'stale', text: 'stale', now: 10 });
+    store.enqueue({ sessionName: NAME, recipient: A, clientMessageId: 'live', text: 'live', now: 11 });
+    // 'stale' leased long ago with a tiny TTL; 'live' leased with a long one.
+    expect(store.markHandoffInFlight(NAME, ['stale'], 1, 1_000, A)).toHaveLength(1);
+    expect(store.markHandoffInFlight(NAME, ['live'], 600_000, 2_000, A)).toHaveLength(1);
+
+    // Daemon restart: reopen the same database file.
+    const dbPath = join(dir, 'queue.sqlite');
+    store.close();
+    store = new TransportQueueStore({ dbPath });
+
+    const statusesBefore = new Map(
+      store.readSnapshot(NAME).pendingMessageEntries.map((e) => [e.clientMessageId, e.status]),
+    );
+    expect(statusesBefore.get('stale')).toBe('handoff_inflight');
+    expect(statusesBefore.get('live')).toBe('handoff_inflight');
+
+    store.restoreExpiredHandoffs(NAME, 100_000);
+
+    const statusesAfter = new Map(
+      store.readSnapshot(NAME).pendingMessageEntries.map((e) => [e.clientMessageId, e.status]),
+    );
+    expect(statusesAfter.get('stale'), 'an expired lease must be recoverable').toBe('queued');
+    expect(statusesAfter.get('live'), 'an active lease must not be yanked back').toBe('handoff_inflight');
+  });
+
+  it('is idempotent: repeating the recovery changes nothing further', () => {
+    store.enqueue({ sessionName: NAME, recipient: A, clientMessageId: 'stale', text: 'stale', now: 10 });
+    store.markHandoffInFlight(NAME, ['stale'], 1, 1_000, A);
+    store.restoreExpiredHandoffs(NAME, 100_000);
+    const first = store.readSnapshot(NAME).pendingMessageEntries.map((e) => [e.clientMessageId, e.status]);
+    store.restoreExpiredHandoffs(NAME, 100_001);
+    expect(store.readSnapshot(NAME).pendingMessageEntries.map((e) => [e.clientMessageId, e.status])).toEqual(first);
+  });
+});
+
+// Every recipient-sensitive read/write must compare the CALLER's proven identity
+// against the row, and fail closed when it is missing or different. Leaving drop
+// / finalize / private-material ungated let a same-named successor destroy or
+// read another instance's queued work even though it could not drain it.
+describe('recipient-sensitive store operations are identity-gated', () => {
+  const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+  const B = { sessionInstanceId: 'instance-B', runtimeEpoch: 'epoch-B' };
+  const NAME = 'gated-ops-session';
+
+  function queueForA() {
+    store.enqueue({
+      sessionName: NAME, recipient: A, clientMessageId: 'm-a', text: 'for A', now: 10,
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'm-a', text: 'for A' }),
+    });
+  }
+  const pending = () => store.readSnapshot(NAME).pendingMessageEntries;
+
+  it('B cannot drop A\'s row', () => {
+    queueForA();
+    store.drop(NAME, 'm-a', 'user_cleared', 20, B);
+    expect(pending(), 'a same-name successor must not destroy A\'s queued work').toHaveLength(1);
+  });
+
+  it('a caller proving no identity cannot drop an identity-bound row', () => {
+    queueForA();
+    store.drop(NAME, 'm-a', 'user_cleared', 20);
+    expect(pending()).toHaveLength(1);
+  });
+
+  it('A can drop its own row', () => {
+    queueForA();
+    store.drop(NAME, 'm-a', 'user_cleared', 20, A);
+    expect(pending()).toHaveLength(0);
+  });
+
+  it('B cannot read A\'s private dispatch material', () => {
+    queueForA();
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', B)).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', A)).toBeTypeOf('string');
+  });
+
+  it('B cannot finalize A\'s row as delivered', () => {
+    queueForA();
+    expect(store.markHandoffInFlight(NAME, ['m-a'], 60_000, 20, A)).toHaveLength(1);
+    store.finalizeSentBatch(NAME, ['m-a'], 'frame-B', 30, B);
+    // Still present and NOT tombstoned by the wrong runtime.
+    expect(pending()).toHaveLength(1);
+    expect(store.hasDeliveryTombstone(NAME, 'm-a')).toBe(false);
+    // A finalizes its own.
+    store.finalizeSentBatch(NAME, ['m-a'], 'frame-A', 40, A);
+    expect(store.hasDeliveryTombstone(NAME, 'm-a')).toBe(true);
+  });
+});

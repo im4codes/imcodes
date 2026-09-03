@@ -23,6 +23,7 @@ import { getAgentVersion } from '../agent/agent-version.js';
 import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../agent/session-close.js';
 import { emitSessionInlineError } from './session-error.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
+import { clearResend } from './transport-resend-queue.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -416,6 +417,7 @@ export async function stopSubSession(
       if (serverLink && id !== sessionName) {
         serverLink.send({ type: 'subsession.closed', id, sessionName });
       }
+      clearResend(sessionName, 'session_removed');
       removeSession(sessionName);
       timelineEmitter.forgetSession(sessionName);
     },

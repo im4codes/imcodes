@@ -9,7 +9,27 @@
  *
  * These tests therefore go through the REAL construction path.
  */
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+
+// Supervision authority now resolves the caller's LIVE identity from the daemon
+// session store. These tests exercise the PRODUCTION entry point, so the caller
+// must exist as a live session; the real store is the user's sessions.json and
+// must never be written by a test.
+const LIVE_CALLER = vi.hoisted(() => ({
+  name: 'deck_alpha_brain',
+  role: 'w1' as const,
+  projectName: 'alpha',
+  agentType: 'codex-sdk',
+  sessionInstanceId: 'instance-deck_alpha_brain',
+  runtimeEpoch: 'epoch-deck_alpha_brain',
+  state: 'idle',
+  projectDir: '/work/alpha',
+}));
+vi.mock('../../src/store/session-store.js', () => ({
+  listSessions: () => [LIVE_CALLER],
+  getSession: (name: string) => (name === LIVE_CALLER.name ? LIVE_CALLER : undefined),
+  upsertSession: () => {},
+}));
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
@@ -17,6 +37,7 @@ import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
 import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
+import { resolvePeerAuditProviderFamily } from '../../src/daemon/peer-audit-candidates.js';
 import {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
@@ -62,11 +83,11 @@ function seedTaskOwnedByCaller(taskKey: string, scopeFiles: string[] = []): stri
     taskId: task.value.taskId,
     role: 'implementer',
     identity: {
-      sessionName: SESSION,
-      sessionInstanceId: `instance-${SESSION}`,
-      runtimeEpoch: `epoch-${SESSION}`,
-      agentType: 'codex-sdk',
-      providerFamily: 'codex',
+      sessionName: LIVE_CALLER.name,
+      sessionInstanceId: LIVE_CALLER.sessionInstanceId,
+      runtimeEpoch: LIVE_CALLER.runtimeEpoch,
+      agentType: LIVE_CALLER.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(LIVE_CALLER as never),
     },
     scopeFiles,
     idempotencyKey: taskKey,

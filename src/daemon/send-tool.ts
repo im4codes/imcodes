@@ -1339,6 +1339,10 @@ export async function dispatchSendMessage(
 
   let supervisedTaskId: string | undefined;
   let supervisedAssignmentId: string | undefined;
+  /** The task's ORIGINAL coordinator assignment, stamped onto the durable return
+   *  authority so the reply is bound to that assignment rather than to whoever
+   *  later holds the origin session name. */
+  let supervisedCoordinatorAssignmentId: string | undefined;
   let supervisedExecutionBinding: SupervisionExecutionBinding | undefined;
   let supervisedWorktree: Extract<SupervisionWorktreeProvisionResult, { ok: true }> | undefined;
   let reusedContinuationAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
@@ -1403,7 +1407,10 @@ export async function dispatchSendMessage(
       // its exact session identity.
       if (!existing
         || existing.projectName !== callerProjectName
-        || !supervisionCallerParticipates(existing, caller.sessionName)) {
+        || !supervisionCallerParticipates(
+          existing,
+          callerRecord ? supervisionTaskIdentityForTarget(callerRecord) : undefined,
+        )) {
         return {
           status: 'error',
           reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -1683,6 +1690,19 @@ export async function dispatchSendMessage(
 
     supervisedTaskId = taskId;
     supervisedAssignmentId = assignment.value.assignmentId;
+    // Resolve the task's coordinator assignment ONCE, from the registry, and by
+    // exact identity where the caller is that coordinator. This is the authority
+    // a pending return may later be advanced under.
+    {
+      const boundTask = registry.get(taskId);
+      const callerCoordinatorIdentity = callerRecord && supervisionTaskIdentityForTarget(callerRecord);
+      const coordinators = (boundTask?.assignments ?? []).filter((candidate) => candidate.role === 'coordinator');
+      const exact = callerCoordinatorIdentity
+        ? coordinators.find((candidate) => supervisionIdentityMatches(candidate.identity, callerCoordinatorIdentity))
+        : undefined;
+      supervisedCoordinatorAssignmentId = (exact ?? (coordinators.length === 1 ? coordinators[0] : undefined))
+        ?.assignmentId;
+    }
     if (input.audit && assignment.replay) {
       const authoritativeTask = registry.get(taskId);
       const requestedAttemptId = input.task.auditAttemptId?.trim() || input.audit.attemptId;
@@ -1826,6 +1846,9 @@ export async function dispatchSendMessage(
             : {}),
           ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
           ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
+          ...(supervisedCoordinatorAssignmentId
+            ? { coordinatorAssignmentId: supervisedCoordinatorAssignmentId }
+            : {}),
           now,
         });
       createdReplyAuthority = Boolean(replyAuthority);
@@ -2419,18 +2442,22 @@ export async function runSupervisionConvergenceTick(
   }
 }
 
-/** One bounded startup recovery pass; no interval worker or new state machine. */
+/**
+ * One bounded startup recovery pass; no interval worker or new state machine.
+ *
+ * It runs the SAME convergence the periodic tick runs, rather than a narrower
+ * copy of it. Two rules had drifted apart: the boot pass selected only tasks
+ * carrying an `auditPolicy` (missing the legacy explicit-audit recovery set the
+ * tick includes) and it never ran `convergeLifecycle` at all, so after a
+ * restart a stale coordinator epoch, an unprojected revision, a passed
+ * validation or an already-recorded audit receipt sat untouched until the first
+ * 60s watchdog tick. Delegating keeps ONE selection rule and one bounded pass;
+ * the tick's re-entrancy guard also stops a boot sweep from racing a tick into
+ * a double dispatch.
+ */
 export async function dispatchReadyAuditSweep(deps: ReadyAuditDispatchDeps = {}): Promise<ReadyAuditDispatchResult[]> {
-  const registry = deps.registry ?? getSupervisionTaskRegistry();
-  const ready = registry.list({ status: 'ready_for_audit' })
-    .filter((task) => Boolean(task.auditPolicy));
-  const results: ReadyAuditDispatchResult[] = [];
-  for (const task of ready) results.push(await dispatchReadyAudit(task.taskId, {
-    ...deps,
-    registry,
-    recoverRestartHandoffs: true,
-  }));
-  return results;
+  const { audits } = await runSupervisionConvergenceTick({ ...deps, recoverRestartHandoffs: true });
+  return audits;
 }
 
 /**

@@ -283,3 +283,202 @@ describe('DelegationReplyStore', () => {
     database.close();
   });
 });
+
+// A pending task-bound return is addressed to the ORIGINAL coordinator
+// assignment. When that coordinator's runtime legitimately rotates, the reply
+// must move WITH the authorization -- not be lost, and not silently delivered to
+// whoever now holds the session name.
+describe('authorized coordinator origin rebind', () => {
+  const A = { sessionName: 'deck_alpha_brain', sessionInstanceId: 'origin-instance', runtimeEpoch: 'origin-epoch' };
+  const T = { sessionName: 'deck_sub_worker', sessionInstanceId: 'target-instance', runtimeEpoch: 'target-epoch' };
+
+  const COORD = 'asg_coordinator_r4';
+  function seed() {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin: A, target: T, dispatchId: 'd-1', messageId: 'm-1',
+      taskId: 'task-1', assignmentId: 'assignment-1',
+      coordinatorAssignmentId: COORD, now: 100,
+    });
+    return { database, store, created };
+  }
+
+  it('advances the pending reply onto the re-authorized origin without losing it', () => {
+    const { database, store, created } = seed();
+    const rotated = { ...A, sessionInstanceId: 'origin-instance-2', runtimeEpoch: 'origin-epoch-2' };
+    const rebound = store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId,
+      taskId: 'task-1', assignmentId: 'assignment-1', coordinatorAssignmentId: COORD, origin: rotated,
+    });
+    expect(rebound?.origin).toEqual(rotated);
+    // The record itself survives the rebind: same delegation, same result path.
+    expect(store.get(created.record.delegationId)?.delegationId).toBe(created.record.delegationId);
+    store.close(); database.close();
+  });
+
+  it('refuses a rebind that does not carry the exact task+assignment authority', () => {
+    const { database, store, created } = seed();
+    const rotated = { ...A, sessionInstanceId: 'origin-instance-2', runtimeEpoch: 'origin-epoch-2' };
+    expect(store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'wrong-task', assignmentId: 'assignment-1', coordinatorAssignmentId: COORD, origin: rotated,
+    })).toBeUndefined();
+    expect(store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'task-1', assignmentId: 'wrong-assignment', coordinatorAssignmentId: COORD, origin: rotated,
+    })).toBeUndefined();
+    expect(store.get(created.record.delegationId)?.origin).toEqual(A);
+    store.close(); database.close();
+  });
+
+  it('never adopts a DIFFERENT coordinator session name', () => {
+    const { database, store, created } = seed();
+    expect(store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'task-1', assignmentId: 'assignment-1',
+      coordinatorAssignmentId: COORD,
+      origin: { sessionName: 'deck_alpha_clone_brain', sessionInstanceId: 'x', runtimeEpoch: 'y' },
+    }), 'a different name is a different coordinator, not a rotation').toBeUndefined();
+    expect(store.get(created.record.delegationId)?.origin).toEqual(A);
+    store.close(); database.close();
+  });
+
+  it('is idempotent: repeating the same rebind changes nothing further', () => {
+    const { database, store, created } = seed();
+    const rotated = { ...A, sessionInstanceId: 'origin-instance-2', runtimeEpoch: 'origin-epoch-2' };
+    const first = store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'task-1', assignmentId: 'assignment-1', coordinatorAssignmentId: COORD, origin: rotated,
+    });
+    const second = store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'task-1', assignmentId: 'assignment-1', coordinatorAssignmentId: COORD, origin: rotated,
+    });
+    expect(second?.origin).toEqual(first?.origin);
+    store.close(); database.close();
+  });
+});
+
+// R4 gap, self-reported: the durable return authority carried taskId +
+// assignmentId (the worker/auditor) but NOT the ORIGINAL coordinator assignment.
+// These assertions are deliberately round-trip based -- they read the value back
+// out of SQLite -- so they cannot be satisfied by an inert excess property on a
+// record literal, which is exactly how the R4 test fooled itself.
+describe('coordinatorAssignmentId is a persisted, load-bearing authority field', () => {
+  const A = { sessionName: 'deck_alpha_brain', sessionInstanceId: 'origin-instance', runtimeEpoch: 'origin-epoch' };
+  const T = { sessionName: 'deck_sub_worker', sessionInstanceId: 'target-instance', runtimeEpoch: 'target-epoch' };
+  const COORD = 'asg_coordinator_1';
+
+  function seed(coordinatorAssignmentId: string | null = COORD) {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin: A, target: T, dispatchId: 'd-1', messageId: 'm-1',
+      taskId: 'task-1', assignmentId: 'assignment-1',
+      ...(coordinatorAssignmentId != null ? { coordinatorAssignmentId } : {}),
+      now: 100,
+    });
+    return { database, store, created };
+  }
+
+  it('persists the coordinator assignment and reads it back across a store reopen', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin: A, target: T, dispatchId: 'd-1', messageId: 'm-1',
+      taskId: 'task-1', assignmentId: 'assignment-1', coordinatorAssignmentId: COORD, now: 100,
+    });
+    // Round-trip through SQLite, not the in-memory literal.
+    expect(store.get(created.record.delegationId)?.coordinatorAssignmentId).toBe(COORD);
+    store.close();
+    const reopened = new DelegationReplyStore({ database });
+    expect(
+      reopened.get(created.record.delegationId)?.coordinatorAssignmentId,
+      'the authority must survive a daemon restart',
+    ).toBe(COORD);
+    reopened.close(); database.close();
+  });
+
+  it('refuses an origin rebind that names the WRONG coordinator assignment', () => {
+    const { database, store, created } = seed();
+    const rotated = { ...A, sessionInstanceId: 'origin-instance-2', runtimeEpoch: 'origin-epoch-2' };
+    expect(store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'task-1', assignmentId: 'assignment-1',
+      coordinatorAssignmentId: 'asg_some_other_coordinator', origin: rotated,
+    }), 'only the task\'s original coordinator assignment may advance its return').toBeUndefined();
+    expect(store.get(created.record.delegationId)?.origin).toEqual(A);
+    store.close(); database.close();
+  });
+
+  it('accepts an origin rebind that carries the exact coordinator assignment', () => {
+    const { database, store, created } = seed();
+    const rotated = { ...A, sessionInstanceId: 'origin-instance-2', runtimeEpoch: 'origin-epoch-2' };
+    expect(store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'task-1', assignmentId: 'assignment-1',
+      coordinatorAssignmentId: COORD, origin: rotated,
+    })?.origin).toEqual(rotated);
+    store.close(); database.close();
+  });
+
+  it('fails closed when the record carries no coordinator assignment at all', () => {
+    const { database, store, created } = seed(null);
+    const rotated = { ...A, sessionInstanceId: 'origin-instance-2', runtimeEpoch: 'origin-epoch-2' };
+    expect(store.rebindAuthorizedOrigin({
+      delegationId: created.record.delegationId, taskId: 'task-1', assignmentId: 'assignment-1',
+      coordinatorAssignmentId: COORD, origin: rotated,
+    }), 'an unbound legacy record must not be adoptable by any coordinator').toBeUndefined();
+    expect(store.get(created.record.delegationId)?.origin).toEqual(A);
+    store.close(); database.close();
+  });
+});
+
+// R5 gap found by the cross-vendor auditor: rebindAuthorizedOrigin existed but
+// had ZERO production callers. The capability was tested in isolation and never
+// connected to the authoritative coordinator rebind, so a real rebind still
+// stranded the pending reply. Connecting it needs a query for the returns a
+// given coordinator assignment owns.
+describe('pending returns are discoverable by their owning coordinator assignment', () => {
+  const A = { sessionName: 'deck_alpha_brain', sessionInstanceId: 'origin-instance', runtimeEpoch: 'origin-epoch' };
+  const T = { sessionName: 'deck_sub_worker', sessionInstanceId: 'target-instance', runtimeEpoch: 'target-epoch' };
+  const COORD = 'asg_coordinator_1';
+
+  function seed(database: InstanceType<typeof DatabaseSync>) {
+    const store = new DelegationReplyStore({ database });
+    const mine = store.create({
+      origin: A, target: T, dispatchId: 'd-1', messageId: 'm-1',
+      taskId: 'task-1', assignmentId: 'assignment-1', coordinatorAssignmentId: COORD, now: 100,
+    });
+    const otherCoordinator = store.create({
+      origin: A, target: T, dispatchId: 'd-2', messageId: 'm-2',
+      taskId: 'task-1', assignmentId: 'assignment-2', coordinatorAssignmentId: 'asg_other', now: 101,
+    });
+    const otherTask = store.create({
+      origin: A, target: T, dispatchId: 'd-3', messageId: 'm-3',
+      taskId: 'task-2', assignmentId: 'assignment-3', coordinatorAssignmentId: COORD, now: 102,
+    });
+    return { store, mine, otherCoordinator, otherTask };
+  }
+
+  it('lists only the returns owned by that exact task + coordinator assignment', () => {
+    const database = new DatabaseSync(':memory:');
+    const { store, mine } = seed(database);
+    const found = store.listPendingByCoordinator({ taskId: 'task-1', coordinatorAssignmentId: COORD });
+    expect(found.map((record) => record.delegationId)).toEqual([mine.record.delegationId]);
+    store.close(); database.close();
+  });
+
+  it('returns nothing for a coordinator that owns no returns on that task', () => {
+    const database = new DatabaseSync(':memory:');
+    const { store } = seed(database);
+    expect(store.listPendingByCoordinator({ taskId: 'task-1', coordinatorAssignmentId: 'asg_unknown' })).toEqual([]);
+    store.close(); database.close();
+  });
+
+  it('survives a reopen so a restart can still find what to advance', () => {
+    const database = new DatabaseSync(':memory:');
+    const { store, mine } = seed(database);
+    store.close();
+    const reopened = new DelegationReplyStore({ database });
+    expect(
+      reopened.listPendingByCoordinator({ taskId: 'task-1', coordinatorAssignmentId: COORD })
+        .map((record) => record.delegationId),
+    ).toEqual([mine.record.delegationId]);
+    reopened.close(); database.close();
+  });
+});

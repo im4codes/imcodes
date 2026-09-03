@@ -4,6 +4,10 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import type { PeerAuditReceiptKind, PeerAuditValidationItem, PeerAuditVerdict } from '../../shared/peer-audit.js';
+import {
+  supervisionIdentityMatches,
+  isSupervisionTaskCoordinator,
+} from '../../shared/supervision-participant-authority.js';
 import { SUPERVISION_ID_PREFIXES } from '../../shared/supervision-durable-identity.js';
 
 import {
@@ -977,13 +981,9 @@ function parseEventRow(row: Record<string, unknown>): PersistedSupervisionTaskEv
   };
 }
 
-function identityMatches(left: PersistedSupervisionTaskAssignmentIdentity, right: PersistedSupervisionTaskAssignmentIdentity): boolean {
-  return left.sessionName === right.sessionName
-    && left.sessionInstanceId === right.sessionInstanceId
-    && left.runtimeEpoch === right.runtimeEpoch
-    && left.agentType === right.agentType
-    && left.providerFamily === right.providerFamily;
-}
+/** Re-exported from the ONE shared participant-authority boundary. Defining a
+ *  second copy here is what let the task-visibility gate drift to name-only. */
+const identityMatches = supervisionIdentityMatches;
 
 const HOUSEKEEPING_ASSIGNMENT_TERMINAL = new Set<SupervisionTaskLifecycleStatus>([
   'passed', 'ready_for_integration', 'committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled',
@@ -2134,6 +2134,59 @@ export class SupervisionTaskRegistry {
     // An integration_task is exempt because it keeps its combined revision with
     // the integration handoff: an assignment-only lineage bind there does not
     // move the task revision and needs no pointer authority.
+    // A NEWLY AUTHORIZED successor owner is reporting the first revision it has
+    // ever carried, so it has no auditRevision and `bindsSuccessorRevision`
+    // cannot fire for it. `taskRevisionConflicts` then rejected that first
+    // revision as `old_revision`, and the finalization guards below refuse any
+    // successor bind on an aggregate that carries finalization/Git authority.
+    // Combined, a finalized task could never record another round at all: Brain
+    // could authorize the next implementer, and that implementer could never
+    // report what it built.
+    //
+    // Projecting FORWARD past a closed round is not a rewrite OF that round.
+    // The authority anchor is the recorded finalization evidence itself:
+    // task.currentRevision must be EXACTLY the revision that finalization
+    // covers. That is what makes this safe -- the predecessor round is closed by
+    // real commit/push/CI evidence, so no in-flight audit or unconsumed
+    // projection can be stolen, and the finalization record itself is carried
+    // through untouched (the task row is spread, never rebuilt).
+    const attemptsAdvancePastFinalizedRevision = existing.role !== 'auditor'
+      && Boolean(requestedRevision)
+      && !existing.auditRevision
+      && (existing.status === 'implementing' || existing.status === 'rework')
+      && task.classification !== 'integration_task'
+      && Boolean(task.currentRevision)
+      && task.currentRevision !== requestedRevision
+      && Boolean(task.finalization)
+      && task.finalization?.revision === task.currentRevision;
+    const activeFinalizedSuccessors = attemptsAdvancePastFinalizedRevision
+      ? this.listAssignments(existing.taskId).filter((candidate) => (
+        candidate.required
+        && (candidate.role === 'implementer' || candidate.role === 'integration_owner')
+        && !isTerminalSupervisionTaskStatus(candidate.status)
+        && !this.#assignmentConsumedByFinalization(task, candidate)
+      ))
+      : [];
+    const isFinalizedPointerOwner = task.integrationOwnerAssignmentId === existing.assignmentId;
+    if (attemptsAdvancePastFinalizedRevision && !existing.required && !isFinalizedPointerOwner) {
+      return {
+        ok: false,
+        reason: 'owner_mismatch',
+        detail: { taskStatus: task.status, assignmentStatus: existing.status },
+      };
+    }
+    if (attemptsAdvancePastFinalizedRevision
+      && (activeFinalizedSuccessors.length !== 1
+        || activeFinalizedSuccessors[0]?.assignmentId !== existing.assignmentId)) {
+      return {
+        ok: false,
+        reason: 'ambiguous_assignment',
+        detail: { taskStatus: task.status, assignmentStatus: existing.status },
+      };
+    }
+    const advancesPastFinalizedRevision = attemptsAdvancePastFinalizedRevision
+      && activeFinalizedSuccessors.length === 1
+      && activeFinalizedSuccessors[0]?.assignmentId === existing.assignmentId;
     const movesTaskRevisionToSuccessor = (bindsSuccessorRevision || completesSuccessorRevision)
       && task.classification !== 'integration_task'
       && Boolean(requestedRevision)
@@ -2166,6 +2219,39 @@ export class SupervisionTaskRegistry {
       // 4. Downgrade, decided from existing object relations: the requested
       //    revision already carries accepted audit authority, so the task has
       //    moved past it.
+      if (this.#revisionHasAcceptedAudit(existing.taskId, requestedRevision!)) {
+        return {
+          ok: false,
+          reason: 'old_revision',
+          detail: { ...rejectDetail, expectedRevision: task.currentRevision, actualRevision: requestedRevision },
+        };
+      }
+    }
+    if (advancesPastFinalizedRevision) {
+      const rejectDetail = { taskStatus: task.status, assignmentStatus: existing.status };
+      // Same preconditions as any other revision advance: implementation role,
+      // real ownership, a task that is not blocked/cancelled, and a revision
+      // that has not already been audited.
+      if (existing.role !== 'implementer' && existing.role !== 'integration_owner') {
+        return { ok: false, reason: 'role_forbidden', detail: rejectDetail };
+      }
+      // The integration-owner pointer still belongs to the FINALIZED round. It
+      // keeps its veto only while that owner is itself non-terminal; once the
+      // round it owned is closed it cannot gate the next one, or the aggregate
+      // would be permanently frozen behind a finished assignment. A pointer
+      // that is still live remains exclusive, and a non-required assignment
+      // that is not the pointer owns nothing either way.
+      const pointer = task.integrationOwnerAssignmentId
+        ? this.getAssignment(task.integrationOwnerAssignmentId)
+        : undefined;
+      const isPointerOwner = task.integrationOwnerAssignmentId === existing.assignmentId;
+      if (!isPointerOwner
+        && (!existing.required || (pointer && !isTerminalSupervisionTaskStatus(pointer.status)))) {
+        return { ok: false, reason: 'owner_mismatch', detail: rejectDetail };
+      }
+      if (['blocked', 'cancelled'].includes(task.status)) {
+        return { ok: false, reason: 'invalid_transition', detail: rejectDetail };
+      }
       if (this.#revisionHasAcceptedAudit(existing.taskId, requestedRevision!)) {
         return {
           ok: false,
@@ -2223,6 +2309,7 @@ export class SupervisionTaskRegistry {
       bindsTaskRevision
       && !bindsSuccessorRevision
       && !completesSuccessorRevision
+      && !advancesPastFinalizedRevision
       && Boolean(currentRevision)
       && currentRevision !== requestedRevision
     );
@@ -2698,6 +2785,13 @@ export class SupervisionTaskRegistry {
   finishAssignmentAsProjectBrain(input: {
     assignmentId: string;
     callerProjectName: string;
+    /**
+     * The caller's EXACT live identity. Project + brain role is not ownership:
+     * a second unparented Brain in the same project (a cloned session group, a
+     * replacement window) would otherwise inherit authority over a task it
+     * never dispatched.
+     */
+    callerIdentity: PersistedSupervisionTaskAssignmentIdentity;
     rebindIdentity?: PersistedSupervisionTaskAssignmentIdentity;
     rebindProjectName?: string;
     now?: number;
@@ -2710,6 +2804,19 @@ export class SupervisionTaskRegistry {
     const task = this.getTaskRecord(assignment.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
     if (task.projectName !== callerProjectName) return { ok: false, reason: 'owner_mismatch' };
+    // Authority is the coordinator assignment bound to THIS task, matched on the
+    // full persistent identity -- never "some available Brain in the project".
+    // A same-named replacement runtime is a different identity and inherits
+    // nothing; only an explicit authorized rebind may move the coordinator.
+    //
+    // An unusable identity FAILS CLOSED rather than throwing: an authority gate
+    // that raises on malformed input is a gate that can be crashed past.
+    const callerIdentity = input.callerIdentity;
+    if (!callerIdentity?.sessionName || !callerIdentity.sessionInstanceId || !callerIdentity.runtimeEpoch) {
+      return { ok: false, reason: 'owner_mismatch' };
+    }
+    const coordinatorBound = isSupervisionTaskCoordinator(this.listAssignments(task.taskId), callerIdentity);
+    if (!coordinatorBound) return { ok: false, reason: 'owner_mismatch' };
 
     if (assignment.role === 'auditor') {
       if (input.rebindIdentity) return { ok: false, reason: 'role_forbidden' };
@@ -3257,6 +3364,32 @@ export class SupervisionTaskRegistry {
     return attestation?.ok === 1;
   }
 
+  /**
+   * True only when this assignment's PASS was already consumed by the task's
+   * immutable integration finalization. Such a row is historical provenance,
+   * not a second live owner of a later successor revision.
+   *
+   * The exact attempt + revision + PASS tuple matters: merely being old or
+   * ready_for_integration is not enough, and an unconsumed peer therefore
+   * remains an ambiguity that recovery must refuse.
+   */
+  #assignmentConsumedByFinalization(
+    task: PersistedSupervisionTaskRecord,
+    assignment: PersistedSupervisionTaskAssignment,
+  ): boolean {
+    const finalization = task.finalization;
+    return Boolean(
+      finalization
+      && assignment.required
+      && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+      && ['ready_for_integration', 'committed', 'pushed', 'finalized'].includes(assignment.status)
+      && assignment.auditAttemptId === finalization.auditAttemptId
+      && assignment.auditRevision === finalization.revision
+      && assignment.verdict?.trim().toUpperCase() === 'PASS'
+      && assignment.crossVendorAuditPassed === true
+    );
+  }
+
   #selectSupersedableAuditors(input: {
     taskId: string;
     taskStatus: string;
@@ -3400,6 +3533,10 @@ export class SupervisionTaskRegistry {
         candidate.required
         && candidate.role === 'implementer'
         && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+        // A ready_for_integration PASS whose exact attempt/revision has already
+        // been consumed by immutable finalization is history, not an active
+        // competitor to the explicitly selected successor.
+        && !this.#assignmentConsumedByFinalization(task, candidate)
       ));
       // A stale auditor bound to the revision being superseded is RETIRED by
       // this recovery, not a reason to refuse it. Refusing was the tsk_4dd
@@ -3434,6 +3571,7 @@ export class SupervisionTaskRegistry {
       const conflictingTargetPassAssignment = targetPassAssignments.length > 0;
       const conflictingLivePassAssignment = assignments.some((candidate) => (
         !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+        && !this.#assignmentConsumedByFinalization(task, candidate)
         && (candidate.verdict?.trim().toUpperCase() === 'PASS'
           || candidate.primaryReviewPassed === true
           || candidate.crossVendorAuditPassed === true)
@@ -3520,8 +3658,20 @@ export class SupervisionTaskRegistry {
         || Boolean(fromRevision
           && task.currentRevision === fromRevision
           && assignment.auditRevision === toRevision);
+      const carriesConsistentHistoricalFinalization = Boolean(
+        task.finalization
+        && task.commitSha === task.finalization.commitSha
+        && task.pushRemoteRef === task.finalization.pushRemoteRef
+        && task.finalization.auditRevision === task.finalization.revision
+        // Finalization authorizes exactly one edge away from the revision it
+        // closed. Once currentRevision has advanced, the historical R4 record
+        // cannot be reused as standing authority for R5 -> R6 -> ... rewrites.
+        && task.currentRevision === task.finalization.revision
+        && !this.#assignmentConsumedByFinalization(task, assignment)
+      );
       const exactStaleShape = Boolean(
-        !HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(task.status)
+        (!HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(task.status)
+          || carriesConsistentHistoricalFinalization)
         && !HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(assignment.status)
         && sourceBindingMatches(task.currentRevision)
         && assignmentBindingMatches
@@ -3542,16 +3692,20 @@ export class SupervisionTaskRegistry {
           && input.leaseAction === 'preserve'
         ))
         && !conflictingLivePassAssignment
-        && !task.commitSha
-        && !task.pushRemoteRef
-        && !task.finalization
-        && !task.archivedAt
+        && (carriesConsistentHistoricalFinalization || (
+          !task.commitSha
+          && !task.pushRemoteRef
+          && !task.finalization
+          && !task.archivedAt
+        ))
       );
       if (!exactStaleShape) {
         this.#db.exec('ROLLBACK');
         return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
           : activeAuditor ? { ok: false, reason: 'invalid_transition' }
-            : !sourceBindingMatches(task.currentRevision) || !assignmentBindingMatches
+            : task.finalization && task.currentRevision !== task.finalization.revision
+              ? { ok: false, reason: 'old_revision' }
+              : !sourceBindingMatches(task.currentRevision) || !assignmentBindingMatches
                 ? { ok: false, reason: 'old_revision' }
                 : { ok: false, reason: 'invalid_transition' };
       }
@@ -3690,7 +3844,47 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'not_found' };
       }
-      if (task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt) {
+      const assignments = this.listAssignments(taskId);
+      const consumedByFinalization = this.#assignmentConsumedByFinalization(task, assignment);
+      const openSuccessorImplementers = assignments.filter((candidate) => (
+        candidate.required
+        && candidate.role === 'implementer'
+        && !isTerminalSupervisionTaskStatus(candidate.status)
+        && !this.#assignmentConsumedByFinalization(task, candidate)
+      ));
+      const openCoordinators = assignments.filter((candidate) => (
+        candidate.role === 'coordinator'
+        && !isTerminalSupervisionTaskStatus(candidate.status)
+      ));
+      const exactActiveSuccessor = assignment.role === 'implementer'
+        && assignment.required
+        && openSuccessorImplementers.length === 1
+        && openSuccessorImplementers[0]?.assignmentId === assignmentId;
+      const exactActiveCoordinator = assignment.role === 'coordinator'
+        && openCoordinators.length === 1
+        && openCoordinators[0]?.assignmentId === assignmentId;
+      const closedEvidencePresent = Boolean(
+        task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt,
+      );
+      const consistentFinalizationAnchor = Boolean(
+        task.finalization
+        && task.currentRevision === task.finalization.revision
+        && task.commitSha === task.finalization.commitSha
+        && task.pushRemoteRef === task.finalization.pushRemoteRef
+        && task.finalization.auditRevision === task.finalization.revision,
+      );
+      if (closedEvidencePresent && assignment.role === 'implementer'
+        && !consumedByFinalization && openSuccessorImplementers.length > 1) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'ambiguous_assignment' };
+      }
+      // Finalization closes the evidence it names; it does not close the task's
+      // control plane forever. Brain may repair exactly one active successor or
+      // coordinator while every receipt/finalization/Git/CI byte remains
+      // untouched. Historical consumed owners and genuine ambiguity remain
+      // fail-closed.
+      if (closedEvidencePresent
+        && (!consistentFinalizationAnchor || (!exactActiveSuccessor && !exactActiveCoordinator))) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'receipt_closed' };
       }

@@ -97,6 +97,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
+import type { QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
 import type { QueueDeliveryFact, QueueSnapshot } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 import {
@@ -633,6 +634,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   constructor(
     private readonly provider: TransportProvider,
     private readonly sessionKey: string,
+    /**
+     * The identity of the instance THIS runtime serves, captured at construction.
+     * It is deliberately not looked up later: after a same-named session takes
+     * over, a late lookup would return the successor and hand it the previous
+     * instance's durable queue.
+     */
+    private readonly queueRecipient?: QueueRecipientIdentity,
   ) {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
@@ -1192,9 +1200,16 @@ export class TransportSessionRuntime implements SessionRuntime {
    *     `readSnapshot`). Does NOT itself dispatch; the caller kicks a drain.
    * Returns the number of entries recovered into `_pendingMessages`.
    */
+  /** The identity of the instance this runtime serves, captured at construction. */
+  get recipientIdentity(): QueueRecipientIdentity | undefined { return this.queueRecipient; }
+
   rehydratePendingFromStore(): number {
     if (!this._providerSessionId) return 0; // not bound yet — caller retries post-initialize
     const store = getTransportQueueStore();
+    // The durable queue under this NAME may belong to a previous instance. A
+    // same-named successor must not recover it; legacy rows carrying no identity
+    // are quarantined by the same gate.
+    if (this.queueRecipient && !store.queueBelongsTo(this.sessionKey, this.queueRecipient)) return 0;
     // Peer-audit capabilities and controller state are intentionally daemon-memory
     // only. After restart no attempt can still own a queued audit brief, so scrub
     // those rows before ordinary queue rehydration while preserving user traffic.
@@ -1227,7 +1242,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       } catch { /* treat missing tombstone table as "no tombstone" */ }
       let entry: PendingTransportMessage | null = null;
       try {
-        const materialJson = store.readPrivateDispatchMaterial(this.sessionKey, clientMessageId);
+        const materialJson = store.readPrivateDispatchMaterial(this.sessionKey, clientMessageId, this.queueRecipient ?? null);
         if (materialJson) {
           const material = JSON.parse(materialJson) as {
             text?: unknown;
@@ -1953,6 +1968,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       try {
         getTransportQueueStore().enqueue({
           sessionName: this.sessionKey,
+          ...(this.queueRecipient ? { recipient: this.queueRecipient } : {}),
           clientMessageId: entry.clientMessageId,
           commandId: entry.clientMessageId,
           text: entry.text,
@@ -2231,7 +2247,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     const store = getTransportQueueStore();
-    const handoffs = store.markHandoffInFlight(this.sessionKey, selected.map((entry) => entry.clientMessageId));
+    const handoffs = store.markHandoffInFlight(
+      this.sessionKey, selected.map((entry) => entry.clientMessageId), undefined, undefined,
+      this.queueRecipient ?? null,
+    );
     if (handoffs.length !== selected.length) {
       const handoffId = handoffs[0]?.handoffId;
       if (handoffId) store.releaseHandoff(this.sessionKey, handoffId, handoffs.map((entry) => entry.entry.clientMessageId));
@@ -2307,13 +2326,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     const selectedIds = selected.map((entry) => entry.clientMessageId);
     let finalized: { snapshot: QueueSnapshot; deliveryFacts: QueueDeliveryFact[] };
     try {
-      finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+      finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId, undefined, this.queueRecipient ?? null);
     } catch (firstError) {
       try {
         // The transaction is idempotent (replace tombstone + delete by id), so
         // one bounded retry safely repairs transient SQLite failures and the
         // ambiguous "commit succeeded, snapshot read failed" case.
-        finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+        finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId, undefined, this.queueRecipient ?? null);
       } catch (error) {
         // Provider admission is irreversible. Once the provider accepts the
         // text, a bookkeeping failure must not be reported as delivery
@@ -2411,7 +2430,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (index < 0) return null;
     const [removed] = this._pendingMessages.splice(index, 1);
     try {
-      getTransportQueueStore().drop(this.sessionKey, clientMessageId, 'user_cleared');
+      getTransportQueueStore().drop(this.sessionKey, clientMessageId, 'user_cleared', undefined, this.queueRecipient ?? null);
     } catch (err) {
       logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite drop failed; preserving runtime-local removal');
     }
@@ -3539,6 +3558,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.sessionKey,
         messages.map((entry) => entry.clientMessageId),
         randomUUID(),
+        undefined,
+        this.queueRecipient ?? null,
       );
       for (const fact of queueResult.deliveryFacts) {
         timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {

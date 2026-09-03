@@ -31,7 +31,7 @@ import { getSession as getStoredSession, type SessionRecord } from '../store/ses
 import { drainTransportResendQueueForDispatch, ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
-import { enqueueResend } from './transport-resend-queue.js';
+import { enqueueResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
@@ -179,6 +179,8 @@ export async function dispatchSessionMessage(
     const runtime = getTransportRuntime(target.name);
     if (options.durableQueue) {
       const queued = enqueueResend(target.name, {
+        // Bind the durable row to the live runtime, not to the reusable name.
+        ...(recipientFromSessionRecord(target) ? { recipient: recipientFromSessionRecord(target) } : {}),
         text: message,
         commandId: options.messageId,
         clientMessageId: options.messageId,
@@ -199,6 +201,8 @@ export async function dispatchSessionMessage(
     }
     if (!runtime?.providerSessionId) {
       const queued = enqueueResend(target.name, {
+        // Bind the durable row to the live runtime, not to the reusable name.
+        ...(recipientFromSessionRecord(target) ? { recipient: recipientFromSessionRecord(target) } : {}),
         text: message,
         commandId: options.messageId,
         clientMessageId: options.messageId,

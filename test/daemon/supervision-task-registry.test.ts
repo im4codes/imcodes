@@ -16,13 +16,18 @@ import { dispatchHookSend, dispatchSendMessage, clearSendIdempotencyCacheForTest
 import type { SessionRecord } from '../../src/store/session-store.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
-import { SUPERVISION_TASK_REGISTRY_CONTRACT } from '../../shared/supervision-config.js';
+import {
+  SUPERVISION_TASK_REGISTRY_CONTRACT,
+  type SupervisionTaskClassification,
+} from '../../shared/supervision-config.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import { createSupervisionMcpToolHandlers } from '../../src/daemon/supervision-mcp-tools.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
+import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
+import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervision-worktree-inspector.js';
 
 /** Adapts the real registry to the audited handler port. */
@@ -38,16 +43,23 @@ function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
       const current = registry();
       const assignment = current.getAssignment(input.assignmentId);
       if (!assignment) return { ok: false as const, reason: 'not_found' };
+      // Mirrors the production port: authority is the caller's resolved LIVE
+      // identity, never a name, and never the stored identity handed back to
+      // the registry (which would make its own exact check vacuous).
+      const callerIdentity = testIdentityResolver(input.callerSessionName);
       if (input.projectBrain && input.callerProjectName) {
         return current.finishAssignmentAsProjectBrain({
           assignmentId: input.assignmentId,
           callerProjectName: input.callerProjectName,
+          callerIdentity,
           ...(input.rebindIdentity ? { rebindIdentity: input.rebindIdentity } : {}),
           ...(input.rebindProjectName ? { rebindProjectName: input.rebindProjectName } : {}),
         });
       }
-      if (assignment.identity.sessionName !== input.callerSessionName) return { ok: false as const, reason: 'owner_mismatch' };
-      return current.finishAssignment({ assignmentId: input.assignmentId, identity: assignment.identity });
+      if (!supervisionIdentityMatches(assignment.identity, callerIdentity)) {
+        return { ok: false as const, reason: 'owner_mismatch' };
+      }
+      return current.finishAssignment({ assignmentId: input.assignmentId, identity: callerIdentity });
     },
     list: (filter: never) => registry().list(filter) as never,
     get: (taskId: string) => registry().get(taskId) as never,
@@ -87,6 +99,16 @@ function identity(name: string, agentType = 'codex-sdk'): PersistedSupervisionTa
     providerFamily: resolvePeerAuditProviderFamily({ agentType }),
   };
 }
+
+/**
+ * Participation is now an exact-identity gate, so handler fixtures must resolve
+ * the caller's live identity exactly as production does. Every fixture identity
+ * in this file is derived deterministically from the session name.
+ */
+const TEST_SESSION_AGENT_TYPES: Record<string, string> = { deck_alpha_w2: 'claude-code-sdk' };
+const testIdentityResolver = (name: string) => ({
+  ...identity(name, TEST_SESSION_AGENT_TYPES[name]), projectName: 'alpha',
+});
 
 function session(name: string, projectName = 'alpha', agentType = 'codex-sdk'): SessionRecord {
   const selected = { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6' };
@@ -150,6 +172,7 @@ function prepareStructuredFinalizationShape(
     files?: string[];
     authorizedUntouchedFiles?: string[];
     ownerFileCount?: number;
+    classification?: SupervisionTaskClassification;
   } = {},
 ) {
   const revision = `${taskId}-r1`;
@@ -160,7 +183,7 @@ function prepareStructuredFinalizationShape(
   const implementerIdentity = identity(`${taskId}-worker`);
   const auditorIdentity = options.selfAudit ? ownerIdentity : identity(`${taskId}-auditor`, 'claude-code-sdk');
   expect(registry.createOrGet({
-    taskId, projectName: 'alpha', classification: 'integration_task',
+    taskId, projectName: 'alpha', classification: options.classification ?? 'integration_task',
     objective: 'finalize exact matching PASS', currentRevision: revision,
   })).toMatchObject({ ok: true });
   const coordinator = registry.createAssignment({
@@ -3458,6 +3481,7 @@ describe('SupervisionTaskRegistry', () => {
           : registry.finishAssignmentAsProjectBrain({
             assignmentId: shape.auditor.assignmentId,
             callerProjectName: 'alpha',
+            callerIdentity: identity(shape.taskId + '-brain'),
             now: 120,
           });
         expect(repair).toMatchObject({
@@ -3504,6 +3528,7 @@ describe('SupervisionTaskRegistry', () => {
           : registry.finishAssignmentAsProjectBrain({
             assignmentId: shape.auditor.assignmentId,
             callerProjectName: 'alpha',
+            callerIdentity: identity(shape.taskId + '-brain'),
             now: 130,
           });
         expect(replay).toMatchObject({ ok: true, replay: true });
@@ -3683,11 +3708,18 @@ describe('SupervisionTaskRegistry', () => {
     const attemptId = 'brain-auditor-cleanup-attempt';
     const worker = identity('deck_brain_cleanup_worker');
     const auditorIdentity = identity('deck_brain_cleanup_auditor');
+    // The dispatching Brain is a real coordinator assignment on the task; that
+    // binding -- not the project string -- is the finish authority.
+    const brain = identity('deck_alpha_brain');
     try {
       let registry = new SupervisionTaskRegistry({ dbPath });
       expect(registry.createOrGet({
         taskId, projectName: 'alpha', classification: 'independent_top_level',
         objective: 'cleanup accepted audit', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId: taskId + '-coordinator', taskId, role: 'coordinator',
+        identity: brain, required: false,
       })).toMatchObject({ ok: true });
       const implementer = registry.createAssignment({
         assignmentId: 'brain-cleanup-implementer', taskId, role: 'implementer', identity: worker,
@@ -3713,12 +3745,14 @@ describe('SupervisionTaskRegistry', () => {
       const receiptBefore = registry.listAuditReceipts(taskId);
       const snapshotBeforeWrongProject = registry.get(taskId);
       expect(registry.finishAssignmentAsProjectBrain({
-        assignmentId: auditor.value.assignmentId, callerProjectName: 'beta', now: 105,
+        assignmentId: auditor.value.assignmentId, callerProjectName: 'beta',
+        callerIdentity: brain, now: 105,
       })).toEqual({ ok: false, reason: 'owner_mismatch' });
       expect(registry.get(taskId)).toEqual(snapshotBeforeWrongProject);
 
       expect(registry.finishAssignmentAsProjectBrain({
-        assignmentId: auditor.value.assignmentId, callerProjectName: 'alpha', now: 110,
+        assignmentId: auditor.value.assignmentId, callerProjectName: 'alpha',
+        callerIdentity: brain, now: 110,
       })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
       expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
         status: 'ready_for_integration', verdict: 'PASS',
@@ -3730,7 +3764,8 @@ describe('SupervisionTaskRegistry', () => {
       const beforeReplay = registry.get(taskId);
       const receiptsAfterReopen = registry.listAuditReceipts(taskId);
       expect(registry.finishAssignmentAsProjectBrain({
-        assignmentId: auditor.value.assignmentId, callerProjectName: 'alpha', now: 120,
+        assignmentId: auditor.value.assignmentId, callerProjectName: 'alpha',
+        callerIdentity: brain, now: 120,
       })).toMatchObject({ ok: true, replay: true, value: { status: 'finalized', leaseId: '' } });
       expect(registry.get(taskId)).toEqual(beforeReplay);
       expect(registry.listAuditReceipts(taskId)).toEqual(receiptsAfterReopen);
@@ -3754,6 +3789,11 @@ describe('SupervisionTaskRegistry', () => {
       taskId, projectName: 'alpha', classification: 'independent_top_level',
       objective: 'recover drifted validated identity', currentRevision: revision,
     })).toMatchObject({ ok: true });
+    const rebindBrain = identity('deck_alpha_brain');
+    expect(registry.createAssignment({
+      assignmentId: taskId + '-coordinator', taskId, role: 'coordinator',
+      identity: rebindBrain, required: false,
+    })).toMatchObject({ ok: true });
     const assignment = registry.createAssignment({
       assignmentId: 'brain-owner-mismatch-implementer', taskId, role: 'implementer',
       identity: stale, auditRevision: revision,
@@ -3769,6 +3809,7 @@ describe('SupervisionTaskRegistry', () => {
     const beforeWrongUser = registry.get(taskId);
     expect(registry.finishAssignmentAsProjectBrain({
       assignmentId: assignment.value.assignmentId,
+      callerIdentity: rebindBrain,
       callerProjectName: 'alpha',
       rebindProjectName: 'alpha',
       rebindIdentity: identity('deck_different_user_worker'),
@@ -3776,6 +3817,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.get(taskId)).toEqual(beforeWrongUser);
     expect(registry.finishAssignmentAsProjectBrain({
       assignmentId: assignment.value.assignmentId,
+      callerIdentity: rebindBrain,
       callerProjectName: 'beta',
       rebindProjectName: 'beta',
       rebindIdentity: live,
@@ -3784,6 +3826,7 @@ describe('SupervisionTaskRegistry', () => {
 
     expect(registry.finishAssignmentAsProjectBrain({
       assignmentId: assignment.value.assignmentId,
+      callerIdentity: rebindBrain,
       callerProjectName: 'alpha',
       rebindProjectName: 'alpha',
       rebindIdentity: live,
@@ -3796,6 +3839,7 @@ describe('SupervisionTaskRegistry', () => {
     const beforeReplay = registry.get(taskId);
     expect(registry.finishAssignmentAsProjectBrain({
       assignmentId: assignment.value.assignmentId,
+      callerIdentity: rebindBrain,
       callerProjectName: 'alpha',
       rebindProjectName: 'alpha',
       rebindIdentity: live,
@@ -3809,6 +3853,12 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.createOrGet({
       taskId: auditedTaskId, projectName: 'alpha', classification: 'independent_top_level',
       objective: 'do not override accepted audit', currentRevision: auditedRevision,
+    })).toMatchObject({ ok: true });
+    // Same Brain coordinates this task too, so the refusal below is proven to
+    // come from the accepted receipt, not from missing coordinator authority.
+    expect(registry.createAssignment({
+      assignmentId: auditedTaskId + '-coordinator', taskId: auditedTaskId,
+      role: 'coordinator', identity: rebindBrain, required: false,
     })).toMatchObject({ ok: true });
     const auditedWorker = registry.createAssignment({
       assignmentId: 'brain-owner-mismatch-audited-worker', taskId: auditedTaskId,
@@ -3836,7 +3886,7 @@ describe('SupervisionTaskRegistry', () => {
     })).toMatchObject({ ok: true });
     const auditedBefore = registry.get(auditedTaskId);
     expect(registry.finishAssignmentAsProjectBrain({
-      assignmentId: auditedWorker.value.assignmentId,
+      assignmentId: auditedWorker.value.assignmentId, callerIdentity: rebindBrain,
       callerProjectName: 'alpha', rebindProjectName: 'alpha', rebindIdentity: live,
     })).toEqual({ ok: false, reason: 'receipt_closed' });
     expect(registry.get(auditedTaskId)).toEqual(auditedBefore);
@@ -4256,26 +4306,73 @@ describe('SupervisionTaskRegistry', () => {
         verdict: 'PASS', crossVendorAuditPassed: true,
       },
     });
-    return { revision, attemptId, sessionName, oldOwner, replacement, auditor };
+    return { revision, attemptId, sessionName, replacementIdentity, oldOwner, replacement, auditor };
   }
 
   it('cancels only a superseded integration owner and preserves the replacement PASS aggregate', async () => {
     const registry = makeRegistry();
     const shape = createReplacementOwnerPassShape(registry, 'task-replacement-owner-cancel');
+    // RETIRED (R2 ruling): this fixture previously resolved the caller to
+    // identity(sessionName) and passed only because the superseded owner shared
+    // that sessionName -- cross-instance authority by name equality, which is
+    // now formally retired. The caller is the task's COORDINATOR, created with
+    // the replacement identity, so it is resolved exactly; authority now comes
+    // from being that coordinator, not from sharing a name with the old owner.
     const handlers = createSupervisionMcpToolHandlers(
       { sessionName: shape.sessionName, projectName: 'alpha' } as never,
-      { registry: supervisionRegistryPort(registry) },
+      {
+        resolveSessionIdentity: () => ({ ...shape.replacementIdentity, projectName: 'alpha' }),
+        registry: supervisionRegistryPort(registry),
+      },
     );
 
+    // RETIRED ASSERTION (R2 ruling). This previously expected
+    //   { status: 'ok', fromStatus: 'ready_for_audit', toStatus: 'cancelled' }
+    // for a plain `cancel` intent. It passed ONLY because the replacement owner
+    // and the superseded owner share sessionName 'deck_alpha_brain' while
+    // differing in sessionInstanceId/runtimeEpoch -- i.e. cross-instance
+    // authority by name equality. That is exactly the grant this task retires:
+    // a same-name/different-epoch runtime has no rights by default. The plain
+    // intent must now be refused.
     expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'cancel', taskId: 'task-replacement-owner-cancel',
       assignmentId: shape.oldOwner.value.assignmentId, note: 'superseded runtime epoch',
-    })).toMatchObject({ status: 'ok', fromStatus: 'ready_for_audit', toStatus: 'cancelled' });
+    })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
 
+    // Superseded-owner cleanup now travels the EXPLICIT authorized path on the
+    // same assignment, which carries its own reason/idempotency and leaves the
+    // replacement's PASS aggregate untouched.
+    expect(registry.coordinateTaskAssignment({
+      taskId: 'task-replacement-owner-cancel',
+      assignmentId: shape.oldOwner.value.assignmentId,
+      assignmentStatus: 'cancelled',
+      leaseAction: 'clear',
+      idempotencyKey: 'retire-superseded-owner',
+      reason: 'superseded runtime epoch',
+    })).toMatchObject({ ok: true });
+    // Idempotent: the same explicit operation replays without further effect.
+    expect(registry.coordinateTaskAssignment({
+      taskId: 'task-replacement-owner-cancel',
+      assignmentId: shape.oldOwner.value.assignmentId,
+      assignmentStatus: 'cancelled',
+      leaseAction: 'clear',
+      idempotencyKey: 'retire-superseded-owner',
+      reason: 'superseded runtime epoch',
+    })).toMatchObject({ ok: true });
+
+    // RETIRED (R2 ruling), second half. The original block also asserted
+    //   status: 'ready_for_integration' and
+    //   integrationOwnerAssignmentId: <replacement>
+    // Those were EFFECTS of the retired cross-instance intent cancel, which
+    // recomputed the task aggregate as a side effect. The explicit authorized
+    // path acts on the named assignment only, so task-level promotion is no
+    // longer implied by cancelling a superseded owner; it must be requested in
+    // its own right. What remains asserted is the part that is still true and
+    // still load-bearing: exactly the superseded owner is cancelled and its
+    // lease released, while the replacement's PASS aggregate and the auditor's
+    // immutable finalized receipt are untouched.
     expect(registry.get('task-replacement-owner-cancel')).toMatchObject({
-      status: 'ready_for_integration',
       currentRevision: shape.revision,
-      integrationOwnerAssignmentId: shape.replacement.value.assignmentId,
       assignments: expect.arrayContaining([
         expect.objectContaining({
           assignmentId: shape.oldOwner.value.assignmentId, status: 'cancelled', leaseId: '',
@@ -4310,7 +4407,7 @@ describe('SupervisionTaskRegistry', () => {
 
       const handlers = createSupervisionMcpToolHandlers(
         { sessionName: shape.sessionName, projectName: 'alpha' } as never,
-        { registry: supervisionRegistryPort(registry), isProjectBrain: () => true },
+        { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry), isProjectBrain: () => true },
       );
       expect(await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
         taskId: 'task-cancelled-evidence-recovery', toStatus: 'recovered',
@@ -5657,7 +5754,7 @@ describe('SupervisionTaskRegistry', () => {
 
     const ownerIntent = createSupervisionMcpToolHandlers(
       { sessionName: implementerIdentity.sessionName } as never,
-      { registry: createSupervisionRegistryPort() },
+      { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
     );
     expect(await ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'start', taskId: 'matching-pass-close', assignmentId: implementer.value.assignmentId,
@@ -5723,7 +5820,7 @@ describe('SupervisionTaskRegistry', () => {
 
     const auditorIntent = createSupervisionMcpToolHandlers(
       { sessionName: auditorIdentity.sessionName } as never,
-      { registry: createSupervisionRegistryPort() },
+      { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
     );
     await expect(auditorIntent[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'finish', taskId: 'matching-pass-close', assignmentId: auditor.value.assignmentId,
@@ -5851,7 +5948,7 @@ describe('SupervisionTaskRegistry', () => {
         })).toEqual({ ok: false, reason: 'old_revision' });
         const intent = createSupervisionMcpToolHandlers(
           { sessionName: target.owner.sessionName } as never,
-          { registry: supervisionRegistryPort(registry) },
+          { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
         );
         await expect(intent[SUPERVISION_MCP_TOOLS.INTENT]({
           intent: 'finish', taskId: target.taskId, assignmentId: target.assignmentId,
@@ -6031,7 +6128,7 @@ describe('SupervisionTaskRegistry', () => {
     // list/get are now owned by the audited supervision handlers; the legacy
     // duplicates were removed in the consolidation merge.
     const own = createSupervisionMcpToolHandlers(
-      { sessionName: 'deck_alpha_w1' } as never, { registry: supervisionRegistryPort() },
+      { sessionName: 'deck_alpha_w1' } as never, { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort() },
     );
     const list: any = await own[SUPERVISION_MCP_TOOLS.LIST]({});
     expect(list.status).toBe('ok');
@@ -6041,7 +6138,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(get.status).toBe('ok');
 
     const other = createSupervisionMcpToolHandlers(
-      { sessionName: 'deck_alpha_w2' } as never, { registry: supervisionRegistryPort() },
+      { sessionName: 'deck_alpha_w2' } as never, { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort() },
     );
     const invisible = await other[SUPERVISION_MCP_TOOLS.GET]({ taskId: (start as { taskId: string }).taskId });
     expect(invisible).toMatchObject({ status: 'error', reason: 'identity_rejected' });
@@ -6139,7 +6236,7 @@ describe('SupervisionTaskRegistry', () => {
       });
       const handlers = createSupervisionMcpToolHandlers(
         { sessionName: owner.sessionName } as never,
-        { registry: port() },
+        { resolveSessionIdentity: testIdentityResolver, registry: port() },
       );
       expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'start', taskId: 'cancel-me' }))
         .toMatchObject({ status: 'ok', toStatus: 'implementing' });
@@ -6254,7 +6351,7 @@ describe('SupervisionTaskRegistry', () => {
 
       const handlers = createSupervisionMcpToolHandlers(
         { sessionName: 'deck_alpha_brain', projectName: 'alpha' } as never,
-        { registry: supervisionRegistryPort(registry) },
+        { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
       );
       expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'cancel', taskId }))
         .toMatchObject({ status: 'ok', fromStatus: 'validated', toStatus: 'cancelled' });
@@ -6463,7 +6560,7 @@ describe('SupervisionTaskRegistry', () => {
       });
       const handlers = createSupervisionMcpToolHandlers(
         { sessionName: exact.implementer.identity.sessionName, projectName: 'alpha' } as never,
-        { registry: supervisionRegistryPort(registry) },
+        { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
       );
       expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
         intent: 'start', taskId: 'same-revision-split', assignmentId: exact.implementer.assignmentId,
@@ -7017,5 +7114,575 @@ describe('tsk_4iu live sequence: REWORK auditor stuck implementing blocks succes
       && r.receiptKind === 'final' && r.verdict === 'REWORK'
       && r.findings === 'R1 findings that must survive retirement')).toBe(true);
     registry.close();
+  });
+});
+
+// A task dispatched by Brain A may only be acted on by the EXACT persistent
+// identity of the coordinator assignment bound to that task. `isProjectBrain`
+// asks only "is this an unparented brain whose project matches", and
+// finishAssignmentAsProjectBrain's sole authority check is
+// `task.projectName !== callerProjectName` -- it receives no caller identity at
+// all. So a SECOND main-session Brain in the same project (a cloned group, a
+// replacement window) inherits authority over another Brain's task, which is
+// exactly the substitution the invariant forbids. The same file already states
+// the correct principle for execution clones: "arbitrary same-project siblings
+// are NOT granted control".
+describe('project-Brain finish authority is bound to the task coordinator', () => {
+  const PROJECT = 'alpha';
+
+  /** Task owned by Brain A with an auditor carrying an accepted final PASS. */
+  function coordinatorBoundTask(taskId: string) {
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const brainA = identity(`deck_${PROJECT}_brain`);
+    const worker = identity(`deck_${taskId}_worker`);
+    const auditorIdentity = identity(`deck_${taskId}_auditor`, 'claude-code');
+    const attemptId = `${taskId}-attempt`;
+    const revision = `${taskId}-r1`;
+    expect(registry.createOrGet({
+      taskId, projectName: PROJECT, classification: 'independent_top_level',
+      objective: 'coordinator-bound finish authority', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    // Brain A is the task's ORIGINAL coordinator -- the only legitimate authority.
+    const coordinator = registry.createAssignment({
+      assignmentId: `${taskId}-coordinator`, taskId, role: 'coordinator',
+      identity: brainA, scopeFiles: [], required: false,
+    });
+    const implementer = registry.createAssignment({
+      assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
+      identity: worker, auditRevision: revision,
+    });
+    const auditor = registry.createAssignment({
+      assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', identity: auditorIdentity,
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!coordinator.ok || !implementer.ok || !auditor.ok) throw new Error('fixture failed');
+    for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: implementer.value.assignmentId, identity: worker, status,
+      })).toMatchObject({ ok: true });
+    }
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
+      receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+      auditorIdentity, findings: 'accepted exact receipt',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'passed' }], now: 100,
+    })).toMatchObject({ ok: true });
+    return { registry, taskId, brainA, auditorAssignmentId: auditor.value.assignmentId };
+  }
+
+  it('refuses a DIFFERENT main-session Brain in the same project', () => {
+    const f = coordinatorBoundTask('coord-bound-foreign');
+    // Brain B: unparented brain, same project, same role, never this task's
+    // coordinator. A cloned session group produces exactly this shape.
+    const brainB = identity(`deck_${PROJECT}_clone_brain`);
+    const before = registry0Snapshot(f.registry, f.taskId);
+    expect(f.registry.finishAssignmentAsProjectBrain({
+      assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
+      callerIdentity: brainB, now: 110,
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    expect(f.registry.get(f.taskId), 'a foreign Brain must not mutate the task').toEqual(before);
+    f.registry.close();
+  });
+
+  it('refuses the same session NAME on a different instance/epoch', () => {
+    const f = coordinatorBoundTask('coord-bound-reincarnated');
+    // Same logical name as Brain A, but a replacement runtime: no inheritance.
+    const reincarnated = {
+      ...f.brainA,
+      sessionInstanceId: `${f.brainA.sessionInstanceId}-new`,
+      runtimeEpoch: `${f.brainA.runtimeEpoch}-new`,
+    };
+    expect(f.registry.finishAssignmentAsProjectBrain({
+      assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
+      callerIdentity: reincarnated, now: 110,
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    f.registry.close();
+  });
+
+  it('still lets the task\'s own coordinator finish', () => {
+    const f = coordinatorBoundTask('coord-bound-owner');
+    expect(f.registry.finishAssignmentAsProjectBrain({
+      assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
+      callerIdentity: f.brainA, now: 110,
+    })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+    f.registry.close();
+  });
+
+  it('refuses a participant on the SAME task that is not its coordinator', () => {
+    // Being bound to the task is not being its coordinator. Only the
+    // coordinator assignment carries dispatch authority.
+    const f = coordinatorBoundTask('coord-bound-participant');
+    const worker = identity('deck_coord-bound-participant_worker');
+    expect(f.registry.finishAssignmentAsProjectBrain({
+      assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
+      callerIdentity: worker, now: 110,
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    f.registry.close();
+  });
+
+  it('fails closed on an unusable caller identity instead of throwing', () => {
+    // An authority gate that raises on malformed input is a gate that can be
+    // crashed past; every unusable shape must be an ordinary refusal.
+    const f = coordinatorBoundTask('coord-bound-unusable');
+    for (const bad of [
+      undefined,
+      { ...f.brainA, sessionInstanceId: '' },
+      { ...f.brainA, runtimeEpoch: '' },
+      { ...f.brainA, sessionName: '' },
+    ]) {
+      expect(() => f.registry.finishAssignmentAsProjectBrain({
+        assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
+        callerIdentity: bad as never, now: 110,
+      })).not.toThrow();
+      expect(f.registry.finishAssignmentAsProjectBrain({
+        assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
+        callerIdentity: bad as never, now: 110,
+      })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    }
+    f.registry.close();
+  });
+
+  it('still refuses a foreign project outright', () => {
+    const f = coordinatorBoundTask('coord-bound-project');
+    expect(f.registry.finishAssignmentAsProjectBrain({
+      assignmentId: f.auditorAssignmentId, callerProjectName: 'beta',
+      callerIdentity: f.brainA, now: 110,
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    f.registry.close();
+  });
+});
+
+/** Stable snapshot for no-mutation assertions. */
+function registry0Snapshot(registry: SupervisionTaskRegistry, taskId: string) {
+  return registry.get(taskId);
+}
+
+// R4 shipped an INERT coordinatorAssignmentId: it existed only on a test record
+// literal, never in the schema or the mint, so the assertion proved nothing.
+// This reads the value back out of the DURABLE store and compares it to the
+// registry's actual coordinator assignment, so it cannot pass unless send-tool
+// really stamps the authority.
+describe('durable return authority carries the task coordinator assignment', () => {
+  it("mints coordinatorAssignmentId from the task's own coordinator", async () => {
+    const brain = session('deck_alpha_brain');
+    const worker = session('deck_alpha_w1');
+    const sessions = [brain, worker];
+    const caller = { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' };
+
+    const sent = await dispatchSendMessage(caller, {
+      target: worker.name,
+      message: 'implement the bound task',
+      reply: true,
+      idempotencyKey: 'coordinator-authority-mint',
+      task: { objective: 'coordinator authority mint' },
+    }, {
+      listSessions: () => sessions,
+      dispatchMessage: vi.fn(),
+      exactTargetOnly: true,
+      // The worktree is not what this test is about; provisioning is stubbed so
+      // the assertion is purely about the minted return authority.
+      ensureSupervisionAssignmentWorktree: async () => ({ ok: true as const, worktreePath: '/tmp/mint', baseRevision: undefined }),
+    });
+
+    if (sent.status !== 'accepted') throw new Error(JSON.stringify(sent));
+    const delegationId = sent.deliveries?.[0]?.delegationId;
+    expect(delegationId, 'a reply-enabled send must mint a durable return').toBeTruthy();
+
+    const taskId = (sent as { taskId?: string }).taskId;
+    const coordinator = getSupervisionTaskRegistry().get(taskId!)?.assignments
+      ?.find((assignment) => assignment.role === 'coordinator');
+    expect(coordinator?.assignmentId, 'the new task must have a coordinator assignment').toBeTruthy();
+
+    expect(
+      getDelegationReplyStore().get(delegationId!)?.coordinatorAssignmentId,
+      'the durable return must be bound to the ORIGINAL coordinator assignment',
+    ).toBe(coordinator!.assignmentId);
+  });
+});
+
+describe('legacy assignment finish drives convergence', () => {
+  it('advances the aggregate after a successful legacy SUPERVISION_TASK_FINISH', async () => {
+    // The legacy assignment-only finish is a SECOND production entry point, and
+    // it committed then returned. Nothing carried the aggregate to its next
+    // automatic step until the 60s watchdog ran, so a caller using this tool got
+    // poll-paced progress while the intent path got event-paced progress.
+    //
+    // The dispatch is injected rather than resolved through the helper's lazy
+    // `import('./send-tool.js')` for a specific reason: unobservable is
+    // untestable. With the real import in place a mutant deleting this call
+    // still passed every test, which is exactly how an unwired capability ships.
+    const registry = getSupervisionTaskRegistry();
+    const revision = 'legacy-finish-convergence-r1';
+    expect(registry.createOrGet({
+      projectName: 'alpha', taskId: 'legacy-finish-convergence',
+      classification: 'independent_top_level',
+      objective: 'legacy finish must converge', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const workerIdentity = identity('deck_alpha_worker');
+    const created = registry.createAssignment({
+      taskId: 'legacy-finish-convergence', role: 'implementer',
+      identity: workerIdentity, required: true,
+      auditAttemptId: 'legacy-finish-attempt', auditRevision: revision,
+    });
+    if (!created.ok) throw new Error(created.reason);
+    for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: created.value.assignmentId, identity: workerIdentity,
+        status, revision, auditAttemptId: 'legacy-finish-attempt', auditRevision: revision,
+      }), status).toMatchObject({ ok: true });
+    }
+
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'dispatched' });
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: workerIdentity.sessionName, projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        dispatchReadyAudit,
+        sendDeps: { listSessions: () => [session('deck_alpha_brain'), session(workerIdentity.sessionName)] },
+      },
+    );
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]({
+      assignmentId: created.value.assignmentId,
+      revision,
+      evidence: 'legacy finish',
+    })).resolves.toMatchObject({ status: 'ok' });
+
+    expect(dispatchReadyAudit, 'the legacy finish must drive convergence without a Brain call')
+      .toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledWith('legacy-finish-convergence');
+  });
+
+  it('never reports a legacy finish as failed because convergence threw', async () => {
+    // The commit is authoritative. A convergence step that cannot run must not
+    // turn a committed finish into an error the caller would retry.
+    const registry = getSupervisionTaskRegistry();
+    const revision = 'legacy-finish-throw-r1';
+    expect(registry.createOrGet({
+      projectName: 'alpha', taskId: 'legacy-finish-throw',
+      classification: 'independent_top_level',
+      objective: 'legacy finish stays authoritative', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const workerIdentity = identity('deck_alpha_worker');
+    const created = registry.createAssignment({
+      taskId: 'legacy-finish-throw', role: 'implementer',
+      identity: workerIdentity, required: true,
+      auditAttemptId: 'legacy-throw-attempt', auditRevision: revision,
+    });
+    if (!created.ok) throw new Error(created.reason);
+    for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: created.value.assignmentId, identity: workerIdentity,
+        status, revision, auditAttemptId: 'legacy-throw-attempt', auditRevision: revision,
+      }), status).toMatchObject({ ok: true });
+    }
+
+    const dispatchReadyAudit = vi.fn().mockRejectedValue(new Error('transport down'));
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: workerIdentity.sessionName, projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        dispatchReadyAudit,
+        sendDeps: { listSessions: () => [session('deck_alpha_brain'), session(workerIdentity.sessionName)] },
+      },
+    );
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]({
+      assignmentId: created.value.assignmentId, revision, evidence: 'legacy finish',
+    })).resolves.toMatchObject({ status: 'ok' });
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+  });
+});
+
+describe('finalized-boundary forward control (tsk_5o7 guards)', () => {
+  /**
+   * A REAL finalized round, produced entirely through the production API: the
+   * implementer/owner carry the exact PASS tuple that finalization consumed,
+   * and `currentRevision` sits exactly on `finalization.revision`.
+   *
+   * `independent_top_level` matters: `integration_task` is exempt from the
+   * forward-control boundary because it keeps its combined revision with the
+   * integration handoff.
+   */
+  function finalizedRound(registry: SupervisionTaskRegistry, taskId: string) {
+    const shape = prepareStructuredFinalizationShape(registry, taskId, {
+      classification: 'independent_top_level',
+    });
+    expect(registry.finalizeIntegration({
+      ...shape.finalization, identity: shape.owner.identity, now: 500,
+    })).toMatchObject({ ok: true, value: { status: 'finalized' } });
+    const task = registry.get(taskId)!;
+    // The precondition the guards are anchored on. If either of these drifts,
+    // every assertion below is testing something other than the boundary.
+    expect(task.finalization?.revision, 'anchor: finalization covers currentRevision')
+      .toBe(task.currentRevision);
+    expect(
+      registry.getAssignment(shape.implementer.assignmentId)?.status,
+      'the consumed historical implementer must be NON-terminal, or guard 1 is masked',
+    ).toBe('ready_for_integration');
+    return shape;
+  }
+
+  /** Brain authorizes the next round's implementer on the finalized aggregate. */
+  function authorizeSuccessor(
+    registry: SupervisionTaskRegistry, taskId: string, suffix: string,
+  ) {
+    const successorIdentity = identity(`${taskId}-successor-${suffix}`);
+    const created = registry.createAssignment({
+      assignmentId: `${taskId}-successor-${suffix}`,
+      taskId, role: 'implementer', required: true, identity: successorIdentity,
+    });
+    if (!created.ok) throw new Error(`authorize successor failed: ${created.reason}`);
+    expect(registry.updateAssignment({
+      assignmentId: created.value.assignmentId,
+      identity: successorIdentity,
+      status: 'implementing',
+    }), 'the successor must be able to enter implementing').toMatchObject({ ok: true });
+    return created.value;
+  }
+
+  it('lets the ONE newly authorized successor report its first revision past a finalized round', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'forward-control-exact');
+    const successor = authorizeSuccessor(registry, shape.taskId, 'a');
+    const finalizationBefore = registry.get(shape.taskId)!.finalization;
+    const receiptsBefore = registry.listAuditReceipts(shape.taskId);
+    const successorRevision = `${shape.taskId}-r2`;
+
+    // Without the forward-control guard this is `old_revision`: the successor
+    // has no auditRevision, so `bindsSuccessorRevision` cannot fire and the
+    // plain revision-conflict check rejects the first revision it ever carries.
+    // The round could be authorized but never reported -- a permanently wedged
+    // aggregate.
+    expect(registry.updateAssignment({
+      assignmentId: successor.assignmentId,
+      identity: successor.identity,
+      revision: successorRevision,
+    })).toMatchObject({ ok: true });
+
+    const task = registry.get(shape.taskId)!;
+    expect(task.currentRevision, 'the task must move onto the successor revision')
+      .toBe(successorRevision);
+    // Forward projection is not a rewrite: every closed byte survives.
+    expect(task.finalization, 'finalization evidence must be carried through untouched')
+      .toEqual(finalizationBefore);
+    expect(task.commitSha).toBe('a'.repeat(40));
+    expect(registry.listAuditReceipts(shape.taskId)).toEqual(receiptsBefore);
+    registry.close();
+    database.close();
+  });
+
+  it('refuses the forward advance once currentRevision has left the finalization anchor', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'forward-control-anchor');
+    const successor = authorizeSuccessor(registry, shape.taskId, 'a');
+    expect(registry.updateAssignment({
+      assignmentId: successor.assignmentId,
+      identity: successor.identity,
+      revision: `${shape.taskId}-r2`,
+    })).toMatchObject({ ok: true });
+
+    // currentRevision is now r2 while finalization still covers r1. The
+    // historical finalization record is NOT standing authority for an endless
+    // r2 -> r3 -> ... chain, so the very next forward move must be refused.
+    const before = registry.get(shape.taskId);
+    const second = authorizeSuccessor(registry, shape.taskId, 'b');
+    expect(registry.updateAssignment({
+      assignmentId: second.assignmentId,
+      identity: second.identity,
+      revision: `${shape.taskId}-r3`,
+    })).toMatchObject({ ok: false, reason: 'old_revision' });
+    expect(registry.get(shape.taskId)!.currentRevision).toBe(before!.currentRevision);
+    registry.close();
+    database.close();
+  });
+
+  it('refuses two unconsumed active successors as ambiguous instead of picking one', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'forward-control-ambiguous');
+    const first = authorizeSuccessor(registry, shape.taskId, 'a');
+    authorizeSuccessor(registry, shape.taskId, 'b');
+    const before = registry.get(shape.taskId);
+
+    expect(registry.updateAssignment({
+      assignmentId: first.assignmentId,
+      identity: first.identity,
+      revision: `${shape.taskId}-r2`,
+    })).toMatchObject({ ok: false, reason: 'ambiguous_assignment' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    registry.close();
+    database.close();
+  });
+
+  it('does not count the finalization-consumed historical implementer as a competing successor', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'forward-control-consumed');
+    const successor = authorizeSuccessor(registry, shape.taskId, 'a');
+
+    // The historical implementer is `ready_for_integration` (non-terminal) with
+    // the exact attempt/revision/PASS tuple finalization consumed. Guard 1 is
+    // what makes it history rather than a second live owner; without it this
+    // exact call is `ambiguous_assignment` and no finalized task could ever
+    // start another round.
+    const historical = registry.getAssignment(shape.implementer.assignmentId)!;
+    expect(historical).toMatchObject({
+      required: true, role: 'implementer', status: 'ready_for_integration',
+      verdict: 'PASS', crossVendorAuditPassed: true,
+      auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+    });
+    expect(registry.updateAssignment({
+      assignmentId: successor.assignmentId,
+      identity: successor.identity,
+      revision: `${shape.taskId}-r2`,
+    })).toMatchObject({ ok: true });
+    registry.close();
+    database.close();
+  });
+
+  it('repairs control on a finalized aggregate with exactly one unconsumed successor', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'control-repair-exact');
+    const successor = authorizeSuccessor(registry, shape.taskId, 'a');
+    const finalizationBefore = registry.get(shape.taskId)!.finalization;
+
+    // Finalization closes the evidence it NAMES; it does not close the control
+    // plane forever. Without the forward-control repair this is `receipt_closed`
+    // purely because closed evidence exists, so a finalized aggregate could
+    // never have its next round repaired by Brain at all.
+    expect(registry.coordinateTaskAssignment({
+      taskId: shape.taskId, assignmentId: successor.assignmentId,
+      assignmentStatus: 'rework', leaseAction: 'preserve',
+      idempotencyKey: 'control-repair-exact-successor',
+      reason: 'repair the sole active successor on a finalized aggregate',
+      now: 600,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(successor.assignmentId)?.status).toBe('rework');
+    expect(registry.get(shape.taskId)!.finalization, 'closed evidence must be untouched')
+      .toEqual(finalizationBefore);
+    registry.close();
+    database.close();
+  });
+
+  it('refuses control repair once currentRevision has left the finalization anchor', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'control-repair-anchor');
+    const successor = authorizeSuccessor(registry, shape.taskId, 'a');
+    expect(registry.updateAssignment({
+      assignmentId: successor.assignmentId, identity: successor.identity,
+      revision: `${shape.taskId}-r2`,
+    })).toMatchObject({ ok: true });
+    const before = registry.get(shape.taskId);
+
+    // The anchor is gone: finalization covers r1 while the task is on r2. The
+    // historical record is not standing authority for repairing later rounds.
+    expect(registry.coordinateTaskAssignment({
+      taskId: shape.taskId, assignmentId: successor.assignmentId,
+      assignmentStatus: 'rework', leaseAction: 'preserve',
+      idempotencyKey: 'control-repair-drifted-anchor',
+      reason: 'must not repair past the finalization anchor',
+      now: 700,
+    })).toMatchObject({ ok: false, reason: 'receipt_closed' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    registry.close();
+    database.close();
+  });
+
+  it('refuses control repair when two unconsumed successors make the target ambiguous', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'control-repair-ambiguous');
+    const first = authorizeSuccessor(registry, shape.taskId, 'a');
+    authorizeSuccessor(registry, shape.taskId, 'b');
+    const before = registry.get(shape.taskId);
+
+    expect(registry.coordinateTaskAssignment({
+      taskId: shape.taskId, assignmentId: first.assignmentId,
+      assignmentStatus: 'rework', leaseAction: 'preserve',
+      idempotencyKey: 'control-repair-ambiguous-successor',
+      reason: 'ambiguity must be refused, not resolved by picking a row',
+      now: 800,
+    })).toMatchObject({ ok: false, reason: 'ambiguous_assignment' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    registry.close();
+    database.close();
+  });
+
+  it('repairs the sole unconsumed successor revision on a finalized aggregate', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'revision-repair-exact');
+    const successor = authorizeSuccessor(registry, shape.taskId, 'a');
+    const finalizationBefore = registry.get(shape.taskId)!.finalization;
+
+    // Every competitor here is finalization-consumed history: the R1 implementer
+    // and integration owner both sit at `ready_for_integration` with the exact
+    // consumed PASS tuple. Guard 1 is what makes the successor the SOLE active
+    // implementer and keeps their PASS out of the live-conflict set.
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId, assignmentId: successor.assignmentId,
+      fromRevision: shape.revision, toRevision: `${shape.taskId}-r2`,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files),
+      leaseAction: 'preserve', idempotencyKey: 'revision-repair-exact-successor',
+      reason: 'bind the sole unconsumed successor past a finalized round',
+      now: 600,
+    })).toMatchObject({ ok: true });
+    expect(registry.get(shape.taskId)!.finalization, 'closed evidence must be untouched')
+      .toEqual(finalizationBefore);
+    registry.close();
+    database.close();
+  });
+
+  it('refuses revision repair once currentRevision has left the finalization anchor', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'revision-repair-anchor');
+    const successor = authorizeSuccessor(registry, shape.taskId, 'a');
+    expect(registry.updateAssignment({
+      assignmentId: successor.assignmentId, identity: successor.identity,
+      revision: `${shape.taskId}-r2`,
+    })).toMatchObject({ ok: true });
+    const before = registry.get(shape.taskId);
+
+    // finalization covers r1, the task is on r2: the historical record is spent.
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId, assignmentId: successor.assignmentId,
+      fromRevision: `${shape.taskId}-r2`, toRevision: `${shape.taskId}-r3`,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files),
+      leaseAction: 'preserve', idempotencyKey: 'revision-repair-drifted-anchor',
+      reason: 'must not repair past the finalization anchor',
+      now: 700,
+    })).toMatchObject({ ok: false, reason: 'old_revision' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    registry.close();
+    database.close();
+  });
+
+  it('keeps a non-required non-pointer assignment from advancing past finalization', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = finalizedRound(registry, 'forward-control-optional');
+    const optionalIdentity = identity(`${shape.taskId}-optional`);
+    const optional = registry.createAssignment({
+      assignmentId: `${shape.taskId}-optional`, taskId: shape.taskId,
+      role: 'implementer', required: false, identity: optionalIdentity,
+    });
+    if (!optional.ok) throw new Error(optional.reason);
+    expect(registry.updateAssignment({
+      assignmentId: optional.value.assignmentId, identity: optionalIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+    const before = registry.get(shape.taskId);
+
+    expect(registry.updateAssignment({
+      assignmentId: optional.value.assignmentId,
+      identity: optionalIdentity,
+      revision: `${shape.taskId}-r2`,
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    registry.close();
+    database.close();
   });
 });

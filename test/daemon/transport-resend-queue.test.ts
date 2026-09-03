@@ -264,3 +264,107 @@ describe('transport-resend-queue', () => {
     expect(dispatch).not.toHaveBeenCalled();
   });
 });
+
+// `clearResend` wrote to SQLite ONLY when the in-memory map still held the
+// session. Rows written by the runtime path, rows left after a drain, and every
+// row after a daemon restart are therefore invisible to it -- so "clear" left
+// durable work that a later same-named session could drain. `clearAllResend`
+// had the same hole outside VITEST.
+describe('clear is atomic across memory AND the durable store', () => {
+  it('clears SQLite even when the in-memory queue is empty', () => {
+    const store = getTransportQueueStore();
+    // Durable row with no memory mirror: exactly what the runtime path and a
+    // daemon restart leave behind.
+    store.enqueue({
+      sessionName: 'sqlite-only', clientMessageId: 'm1', text: 'orphan', queuedAt: 10,
+    } as never);
+    expect(store.readSnapshot('sqlite-only').pendingMessageEntries).toHaveLength(1);
+    expect(getResendCount('sqlite-only')).toBe(0); // memory genuinely empty
+
+    clearResend('sqlite-only', 'session_removed');
+
+    expect(
+      store.readSnapshot('sqlite-only').pendingMessageEntries,
+      'a removed session must not leave durable work behind',
+    ).toEqual([]);
+  });
+
+  it('session_removed does not let a new same-named session inherit the old authority', () => {
+    const store = getTransportQueueStore();
+    enqueueResend('reused-name', { text: 'old work', commandId: 'c-old', clientMessageId: 'm-old', queuedAt: 10 });
+    const before = store.readSnapshot('reused-name').queueEpoch;
+
+    clearResend('reused-name', 'session_removed');
+
+    const after = store.readSnapshot('reused-name');
+    expect(after.pendingMessageEntries).toEqual([]);
+    expect(
+      after.queueEpoch,
+      'a new same-named session must not inherit the removed session queue epoch',
+    ).not.toBe(before);
+  });
+
+  it('clearAllResend clears the durable store too', () => {
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'all-clear', clientMessageId: 'm2', text: 'orphan', queuedAt: 10,
+    } as never);
+    clearAllResend();
+    // Re-fetch: under VITEST clearAllResend also recycles the store singleton.
+    expect(getTransportQueueStore().readSnapshot('all-clear').pendingMessageEntries).toEqual([]);
+  });
+});
+
+// R2 P1 (found by the cross-vendor auditor): drainResend proved the recipient by
+// reading it OFF THE QUEUED ROW -- `freshEntries.find(e => e.recipient)?.recipient`.
+// That is circular: the row authorises itself, so a same-named successor
+// presented the previous instance's identity simply by draining its rows. The
+// authorising identity must come from the LIVE runtime and be compared against
+// the row, never derived from it.
+describe('drain authority comes from the live runtime, not the queued row', () => {
+  const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+  const B = { sessionInstanceId: 'instance-B', runtimeEpoch: 'epoch-B' };
+  const NAME = 'drain-authority-session';
+
+  function queueForA() {
+    enqueueResend(NAME, {
+      recipient: A, text: 'for A', commandId: 'c-a', clientMessageId: 'm-a', queuedAt: Date.now(),
+    });
+  }
+
+  it('a same-name NEW instance drains nothing and dispatches nothing', async () => {
+    queueForA();
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); }, undefined, undefined, undefined, B);
+    expect(dispatched, 'B must never receive work queued for A').toEqual([]);
+    expect(count).toBe(0);
+    // A's work is preserved, not consumed or destroyed.
+    expect(getTransportQueueStore().readSnapshot(NAME).pendingMessageEntries).toHaveLength(1);
+  });
+
+  it('a caller that proves NO identity cannot drain identity-bound work', async () => {
+    queueForA();
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); });
+    expect(dispatched).toEqual([]);
+    expect(count).toBe(0);
+    expect(getTransportQueueStore().readSnapshot(NAME).pendingMessageEntries).toHaveLength(1);
+  });
+
+  it('the exact live owner A drains its own work', async () => {
+    queueForA();
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); }, undefined, undefined, undefined, A);
+    expect(dispatched).toEqual(['for A']);
+    expect(count).toBe(1);
+  });
+
+  it('is idempotent: a second drain by A delivers nothing further', async () => {
+    queueForA();
+    await drainResend(NAME, () => {}, undefined, undefined, undefined, A);
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); }, undefined, undefined, undefined, A);
+    expect(dispatched).toEqual([]);
+    expect(count).toBe(0);
+  });
+});

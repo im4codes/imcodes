@@ -20,6 +20,13 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 
 vi.mock('../../src/daemon/transport-resend-queue.js', () => ({
   enqueueResend: (...args: unknown[]) => enqueueResendMock(...args),
+  // Durable queue rows are now addressed to a runtime identity, so the dispatch
+  // path derives one from the live SessionRecord before enqueueing.
+  recipientFromSessionRecord: (record: { sessionInstanceId?: string; runtimeEpoch?: string } | undefined) => (
+    record?.sessionInstanceId && record?.runtimeEpoch
+      ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
+      : undefined
+  ),
 }));
 
 vi.mock('../../src/daemon/command-handler.js', () => ({

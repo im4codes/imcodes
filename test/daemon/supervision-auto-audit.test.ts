@@ -1173,6 +1173,54 @@ describe('periodic supervision convergence tick', () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
+  it('runs the SAME convergence at boot as the periodic tick', async () => {
+    // The boot pass and the tick had drifted into two selection rules: boot
+    // selected only `auditPolicy` tasks and never ran `convergeLifecycle` at
+    // all, so after a restart a stale coordinator epoch, an unprojected
+    // revision, a passed validation or an already-recorded receipt sat
+    // untouched until the first 60s watchdog. Restart must converge the same
+    // set the tick converges, or daemon restart becomes a manual progress gate.
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    const converge = vi.spyOn(registry, 'convergeLifecycle');
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidence = false;
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId,
+        auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000000' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId: created.value.assignmentId,
+      };
+    });
+
+    await expect(dispatchReadyAuditSweep({
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => evidence,
+    })).resolves.toEqual([
+      expect.objectContaining({ status: 'dispatched', attemptId: automaticAttempt(taskId, revision) }),
+    ]);
+    expect(converge, 'the boot pass must run lifecycle convergence, not only dispatch')
+      .toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
   it('stays idempotent across repeated ticks and never reuses the older revision attempt', async () => {
     __resetSupervisionConvergenceTickForTests();
     const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });

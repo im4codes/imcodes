@@ -34,7 +34,14 @@ import {
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
+import {
+  isSupervisionTaskParticipant,
+  isSupervisionTaskCoordinator,
+  supervisionIdentityMatches,
+  type SupervisionPersistentIdentity,
+} from '../../shared/supervision-participant-authority.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
+import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 
 type ToolResult = Record<string, unknown>;
 
@@ -70,19 +77,19 @@ export interface SupervisionVisibilityItem {
  * Absence of an assignment list is NOT read as "open to everyone" -- it yields
  * an empty participant set, so the caller is refused.
  */
-export function supervisionTaskParticipants(item: SupervisionVisibilityItem | undefined): string[] {
-  if (!item || !Array.isArray(item.assignments)) return [];
-  return item.assignments
-    .map((assignment) => assignment?.identity?.sessionName)
-    .filter((name): name is string => typeof name === 'string' && name.length > 0);
-}
-
+/**
+ * Participation is an IDENTITY, not a name.
+ *
+ * This previously mapped assignments to `identity.sessionName` and did a string
+ * `.includes()`, so a stale instance, a cloned session group, or any same-name /
+ * different-epoch runtime passed every visibility and continuation gate. An
+ * unresolvable caller identity fails closed: no identity, no participation.
+ */
 export function supervisionCallerParticipates(
   item: SupervisionVisibilityItem | undefined,
-  callerSessionName: string,
+  callerIdentity: Partial<SupervisionPersistentIdentity> | undefined,
 ): boolean {
-  if (!callerSessionName) return false;
-  return supervisionTaskParticipants(item).includes(callerSessionName);
+  return isSupervisionTaskParticipant(item?.assignments as never, callerIdentity);
 }
 
 export type SupervisionOwnerScope =
@@ -190,6 +197,12 @@ export interface SupervisionMcpToolDeps {
   isAdmin?: (caller: McpRuntimeCaller) => boolean;
   /** Live daemon identity gate; caller fields alone never establish Brain authority. */
   isProjectBrain?: (caller: McpRuntimeCaller) => boolean;
+  /** Connects an authorized coordinator rebind to the returns it owns. */
+  advancePendingRepliesForReboundCoordinator?: (input: {
+    taskId: string;
+    coordinatorAssignmentId: string;
+    origin: { sessionName: string; sessionInstanceId: string; runtimeEpoch: string };
+  }) => number;
   resolveSessionIdentity?: (sessionName: string) => {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
     agentType: string; providerFamily: string; projectName: string;
@@ -281,6 +294,12 @@ export function createSupervisionMcpToolHandlers(
   const callerSession = typeof (caller as { sessionName?: unknown })?.sessionName === 'string'
     ? (caller as { sessionName: string }).sessionName
     : '';
+  // The caller's LIVE identity, resolved from the daemon session store. Caller
+  // fields alone never establish authority, and an unresolvable caller fails
+  // closed at every participant gate below.
+  const callerIdentity = (): SupervisionPersistentIdentity | undefined => (
+    callerSession ? deps.resolveSessionIdentity?.(callerSession) : undefined
+  );
   const need = (): SupervisionRegistryPort | undefined => registry;
 
   return {
@@ -293,21 +312,24 @@ export function createSupervisionMcpToolHandlers(
       const requestedAssignmentId = input.assignmentId === undefined ? undefined : String(input.assignmentId);
       const intent = String(input.intent ?? '');
       const callerAssignments = (task?.assignments ?? []).filter(
-        (assignment) => assignment.identity?.sessionName === callerSession && assignment.assignmentId,
+        (assignment) => supervisionIdentityMatches(assignment.identity, callerIdentity()) && assignment.assignmentId,
       );
       const callerBoundAssignmentId = requestedAssignmentId
         ? callerAssignments.find((assignment) => assignment.assignmentId === requestedAssignmentId)?.assignmentId
         : callerAssignments.length === 1 ? callerAssignments[0]?.assignmentId : undefined;
-      const projectBrainMayFinish = Boolean(
+      // Coordination authority is the task's OWN coordinator assignment, matched
+      // on exact identity. "Any project Brain" let a second main-session Brain --
+      // a cloned group, a replacement window -- drive assignments on a task it
+      // never dispatched, which is the substitution this boundary forbids.
+      const coordinatorMayAct = Boolean(
         requestedAssignmentId
-        && intent === 'finish'
         && task?.projectName
         && caller.projectName === task.projectName
-        && isProjectBrain(caller)
+        && isSupervisionTaskCoordinator(task.assignments as never, callerIdentity())
         && task.assignments?.some((assignment) => assignment.assignmentId === requestedAssignmentId),
       );
       const boundAssignmentId = callerBoundAssignmentId
-        ?? (projectBrainMayFinish ? requestedAssignmentId : undefined);
+        ?? (coordinatorMayAct ? requestedAssignmentId : undefined);
       if (requestedAssignmentId && !boundAssignmentId) {
         return err('identity_rejected', 'assignment is not visible to this caller');
       }
@@ -342,8 +364,8 @@ export function createSupervisionMcpToolHandlers(
         }
         const rebindSessionName = input.rebindSessionName === undefined
           ? undefined : String(input.rebindSessionName).trim();
-        if (rebindSessionName && !projectBrainMayFinish) {
-          return err('identity_rejected', 'only the same-project Brain may rebind a drifted implementation assignment');
+        if (rebindSessionName && !coordinatorMayAct) {
+          return err('identity_rejected', "only the task's own coordinator may rebind a drifted implementation assignment");
         }
         const rebind = rebindSessionName ? deps.resolveSessionIdentity?.(rebindSessionName) : undefined;
         if (rebindSessionName && (!rebind || rebind.projectName !== task?.projectName)) {
@@ -353,7 +375,7 @@ export function createSupervisionMcpToolHandlers(
           assignmentId: boundAssignmentId,
           callerSessionName: callerSession,
           ...(caller.projectName ? { callerProjectName: caller.projectName } : {}),
-          ...(projectBrainMayFinish ? { projectBrain: true } : {}),
+          ...(coordinatorMayAct ? { projectBrain: true } : {}),
           ...(rebind ? {
             rebindIdentity: {
               sessionName: rebind.sessionName,
@@ -365,9 +387,12 @@ export function createSupervisionMcpToolHandlers(
             rebindProjectName: rebind.projectName,
           } : {}),
         });
-        return finished.ok
-          ? ok({ intent: 'finish', fromStatus: task?.status ?? reg.getStatus(taskId), toStatus: (finished.value as { status?: unknown }).status ?? null, item: finished.value, idempotentReplay: finished.replay === true })
-          : err(finished.reason, `task finish rejected: ${finished.reason}`);
+        if (!finished.ok) return err(finished.reason, `task finish rejected: ${finished.reason}`);
+        // The finish that just committed is the EVENT that can leave this
+        // aggregate ready for its next automatic step. Without this wire the
+        // only thing carrying it forward was the 60s watchdog tick.
+        await advanceSupervisionTaskAfterFinish(taskId, deps.dispatchReadyAudit);
+        return ok({ intent: 'finish', fromStatus: task?.status ?? reg.getStatus(taskId), toStatus: (finished.value as { status?: unknown }).status ?? null, item: finished.value, idempotentReplay: finished.replay === true });
       }
       // Delegates to the audited pure state machine; the status-rejection and
       // transition table live there, not restated here.
@@ -477,7 +502,8 @@ export function createSupervisionMcpToolHandlers(
       });
       // Post-filter: an explicit owner filter must never widen visibility beyond
       // the tasks this caller actually participates in.
-      const tasks = rows.filter((row) => supervisionCallerParticipates(row, callerSession));
+      const identity = callerIdentity();
+      const tasks = rows.filter((row) => supervisionCallerParticipates(row, identity));
       return ok({
         tasks,
         count: tasks.length,
@@ -498,7 +524,7 @@ export function createSupervisionMcpToolHandlers(
         : '';
       const brainMayRead = Boolean(task && caller.projectName && isProjectBrain(caller)
         && taskProjectName === caller.projectName);
-      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, callerSession))) {
+      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, callerIdentity()))) {
         return err('identity_rejected', 'task is not visible to this caller');
       }
       return ok({ task });
@@ -604,7 +630,35 @@ export function createSupervisionMcpToolHandlers(
         });
         if (!coordinated) return err('unavailable', 'coordination override is not bound');
         if (!coordinated.ok) return err(coordinated.reason, `coordination override rejected: ${coordinated.reason}`);
-        return ok({ taskId, assignmentId, replay: coordinated.replay === true });
+        // THE WIRE. An authorized rebind of a COORDINATOR assignment must carry
+        // that coordinator's pending returns with it. Without this the rebind
+        // succeeded while every reply stayed addressed to the retired runtime --
+        // the capability existed but nothing invoked it.
+        let advancedReturns = 0;
+        if (reboundIdentity) {
+          const reboundAssignment = reg.get?.(taskId) as {
+            assignments?: Array<{ assignmentId?: string; role?: string }>;
+          } | undefined;
+          const isCoordinator = reboundAssignment?.assignments
+            ?.some((candidate) => candidate.assignmentId === assignmentId && candidate.role === 'coordinator');
+          if (isCoordinator) {
+            advancedReturns = deps.advancePendingRepliesForReboundCoordinator?.({
+              taskId,
+              coordinatorAssignmentId: assignmentId,
+              origin: {
+                sessionName: reboundIdentity.sessionName,
+                sessionInstanceId: reboundIdentity.sessionInstanceId,
+                runtimeEpoch: reboundIdentity.runtimeEpoch,
+              },
+            }) ?? 0;
+          }
+        }
+        // Surface the count only when returns actually moved, so the ordinary
+        // coordination-override response shape is unchanged.
+        return ok({
+          taskId, assignmentId, replay: coordinated.replay === true,
+          ...(advancedReturns > 0 ? { advancedReturns } : {}),
+        });
       }
       // tsk_4iu: a project Brain must be able to retire an exact stale auditor
       // from the PUBLIC path even after a final NON-PASS verdict. Previously

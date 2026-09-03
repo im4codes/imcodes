@@ -1,5 +1,6 @@
 import type { PendingTransportMessage, TransportSessionRuntime } from '../agent/transport-session-runtime.js';
-import { enqueueResend, getResendCount, getResendEntries } from './transport-resend-queue.js';
+import { enqueueResend, getResendCount, getResendEntries, recipientFromSessionRecord } from './transport-resend-queue.js';
+import { getSession } from '../store/session-store.js';
 
 export interface TransportRuntimeQueuePreservationResult {
   beforeCount: number;
@@ -18,6 +19,8 @@ function preserveEntries(
   for (const entry of entries) {
     if (seenCommandIds.has(entry.clientMessageId)) continue;
     enqueueResend(sessionName, {
+      // Preserved work stays addressed to the instance it was queued for.
+      ...(recipientFromSessionRecord(getSession(sessionName)) ? { recipient: recipientFromSessionRecord(getSession(sessionName)) } : {}),
       text: entry.text,
       ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
       ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),

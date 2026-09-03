@@ -69,6 +69,7 @@ import {
   submitPeerAuditReply,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 import { onDelegationReplyDelivered } from '../../src/daemon/delegation-reply-events.js';
+import { advancePendingRepliesForReboundCoordinator } from '../../src/daemon/delegation-reply-ingress.js';
 import { DelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import { ensureTransportRuntimeAvailable } from '../../src/agent/session-manager.js';
 
@@ -126,6 +127,8 @@ describe('delegation reply ingress', () => {
     mocks.store.receive.mockReset().mockReturnValue({ ok: true, record, replay: false });
     mocks.store.matchPendingAuditAuthority.mockReset();
     mocks.store.rebindAssignmentTarget.mockReset();
+    mocks.store.listPendingByCoordinator = vi.fn(() => []);
+    mocks.store.rebindAuthorizedOrigin = vi.fn(() => undefined);
     mocks.store.markDelivered.mockReset().mockReturnValue(true);
     mocks.store.expire.mockReset();
     mocks.store.get.mockReset();
@@ -659,6 +662,119 @@ describe('delegation reply ingress', () => {
     expect(mocks.store.markDelivered).not.toHaveBeenCalled();
   });
 
+  // R3 P1 (cross-vendor auditor): a durable TASK-BOUND return must be bound to
+  // taskId + the original coordinator assignment + the exact persistent origin
+  // target. Two holes: (a) a same-name origin replacement EXPIRED the record, so
+  // B's mere existence destroyed A's pending reply; (b) after the identity gate,
+  // the runtime was fetched by NAME (getTransportRuntime(record.origin.sessionName))
+  // with no identity re-verification, so the notification could still be projected
+  // onto a reusable session name.
+  describe('durable task-return authority is bound to the original coordinator', () => {
+    const taskBound = {
+      ...record,
+      taskId: 'tsk_5oc',
+      assignmentId: 'asg_5of',
+      coordinatorAssignmentId: 'asg_5od',
+    };
+
+    it('does NOT destroy a task-bound pending reply when a same-name replacement appears', async () => {
+      mocks.store.receive.mockReturnValue({ ok: true, record: taskBound, replay: false });
+      // B: same session NAME, rotated instance/epoch.
+      mocks.sessions.set(origin.sessionName, {
+        ...session(origin),
+        sessionInstanceId: 'replacement-instance',
+        runtimeEpoch: 'replacement-epoch',
+      });
+
+      const result = await submitDelegationReply({
+        rawBody: envelope,
+        senderSessionName: target.sessionName,
+      });
+
+      expect(
+        mocks.store.expire,
+        "A's pending reply must survive B; expiring it loses the return permanently",
+      ).not.toHaveBeenCalled();
+      expect(mocks.runtime?.deliverDelegationNotification, 'B must get no provider notification').not.toHaveBeenCalled();
+      expect(mocks.store.markDelivered).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ ok: true, delivered: false, pending: true });
+    });
+
+    it('does not emit any timeline projection to a same-name replacement', async () => {
+      mocks.store.receive.mockReturnValue({ ok: true, record: taskBound, replay: false });
+      mocks.sessions.set(origin.sessionName, {
+        ...session(origin),
+        sessionInstanceId: 'replacement-instance',
+        runtimeEpoch: 'replacement-epoch',
+      });
+
+      await submitDelegationReply({ rawBody: envelope, senderSessionName: target.sessionName });
+
+      const toReplacement = mocks.timelineEmit.mock.calls.filter((call) => call[0] === origin.sessionName);
+      expect(toReplacement, 'B must receive neither timeline nor provider notification').toEqual([]);
+    });
+
+    it('refuses to deliver through a live runtime whose identity is not the bound origin', async () => {
+      mocks.store.receive.mockReturnValue({ ok: true, record: taskBound, replay: false });
+      // The session RECORD still matches A, but the runtime registered under that
+      // name belongs to a different instance. A name lookup would hand A's reply
+      // to it.
+      mocks.runtime = {
+        recipientIdentity: { sessionInstanceId: 'replacement-instance', runtimeEpoch: 'replacement-epoch' },
+        deliverDelegationNotification: vi.fn(async () => AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED),
+      };
+
+      const result = await submitDelegationReply({
+        rawBody: envelope,
+        senderSessionName: target.sessionName,
+      });
+
+      expect(mocks.runtime.deliverDelegationNotification).not.toHaveBeenCalled();
+      expect(mocks.store.markDelivered).not.toHaveBeenCalled();
+      expect(mocks.store.expire).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ ok: true, delivered: false, pending: true });
+    });
+
+    it('validates origin for a taskId-only record instead of skipping it', async () => {
+      // The removed skip keyed on taskId ALONE. A record carrying taskId but no
+      // assignmentId is not a bound task return, so a rotated origin must still
+      // fail closed rather than sail past validation.
+      mocks.store.receive.mockReturnValue({
+        ok: true,
+        record: { ...record, taskId: 'tsk_5oc' },
+        replay: false,
+      });
+      mocks.sessions.set(origin.sessionName, {
+        ...session(origin),
+        sessionInstanceId: 'replacement-instance',
+        runtimeEpoch: 'replacement-epoch',
+      });
+
+      await expect(submitDelegationReply({
+        rawBody: envelope,
+        senderSessionName: target.sessionName,
+      })).resolves.toEqual({ ok: false, error: 'identity_mismatch' });
+      expect(mocks.runtime?.deliverDelegationNotification).not.toHaveBeenCalled();
+      expect(mocks.timelineEmit.mock.calls.filter((c) => c[0] === origin.sessionName)).toEqual([]);
+    });
+
+    it('still delivers to the exact bound origin runtime (positive control)', async () => {
+      mocks.store.receive.mockReturnValue({ ok: true, record: taskBound, replay: false });
+      mocks.runtime = {
+        recipientIdentity: { sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch },
+        deliverDelegationNotification: vi.fn(async () => AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED),
+      };
+
+      const result = await submitDelegationReply({
+        rawBody: envelope,
+        senderSessionName: target.sessionName,
+      });
+
+      expect(mocks.runtime.deliverDelegationNotification).toHaveBeenCalled();
+      expect(result).toMatchObject({ ok: true });
+    });
+  });
+
   it('rejects a sender whose live logical identity does not match the authority target', async () => {
     mocks.store.receive.mockReturnValue({ ok: false, reason: 'identity' });
 
@@ -669,5 +785,59 @@ describe('delegation reply ingress', () => {
 
     expect(mocks.runtime?.deliverDelegationNotification).not.toHaveBeenCalled();
     expect(mocks.store.markDelivered).not.toHaveBeenCalled();
+  });
+});
+
+// The advance function's BODY had no direct coverage: the wiring test mocks it
+// out entirely. These exercise it against the mocked store so its authority
+// tuple, its skip-on-refusal behaviour and its delivery scheduling are real.
+describe('advancePendingRepliesForReboundCoordinator', () => {
+  const rotated = { sessionName: origin.sessionName, sessionInstanceId: 'origin-2', runtimeEpoch: 'epoch-2' };
+  const owned = {
+    ...record, taskId: 'tsk_5oc', assignmentId: 'asg_worker',
+    coordinatorAssignmentId: 'asg_coord', status: 'received' as const,
+  };
+
+  it('rebinds each owned return with the exact authority tuple', () => {
+    mocks.store.listPendingByCoordinator = vi.fn(() => [owned]);
+    mocks.store.rebindAuthorizedOrigin = vi.fn(() => ({ ...owned, origin: rotated }));
+
+    const advanced = advancePendingRepliesForReboundCoordinator({
+      taskId: 'tsk_5oc', coordinatorAssignmentId: 'asg_coord', origin: rotated,
+    });
+
+    expect(advanced).toBe(1);
+    expect(mocks.store.rebindAuthorizedOrigin).toHaveBeenCalledWith({
+      delegationId: owned.delegationId,
+      taskId: 'tsk_5oc',
+      assignmentId: 'asg_worker',
+      coordinatorAssignmentId: 'asg_coord',
+      origin: rotated,
+    });
+  });
+
+  it('skips a record the store refuses to rebind instead of force-advancing it', () => {
+    mocks.store.listPendingByCoordinator = vi.fn(() => [owned]);
+    mocks.store.rebindAuthorizedOrigin = vi.fn(() => undefined); // unauthorized
+    expect(advancePendingRepliesForReboundCoordinator({
+      taskId: 'tsk_5oc', coordinatorAssignmentId: 'asg_coord', origin: rotated,
+    })).toBe(0);
+  });
+
+  it('skips a record carrying no worker/auditor assignment', () => {
+    mocks.store.listPendingByCoordinator = vi.fn(() => [{ ...owned, assignmentId: undefined }]);
+    const rebind = vi.fn(() => ({ ...owned, origin: rotated }));
+    mocks.store.rebindAuthorizedOrigin = rebind;
+    expect(advancePendingRepliesForReboundCoordinator({
+      taskId: 'tsk_5oc', coordinatorAssignmentId: 'asg_coord', origin: rotated,
+    })).toBe(0);
+    expect(rebind).not.toHaveBeenCalled();
+  });
+
+  it('advances nothing when the coordinator owns no returns', () => {
+    mocks.store.listPendingByCoordinator = vi.fn(() => []);
+    expect(advancePendingRepliesForReboundCoordinator({
+      taskId: 'tsk_5oc', coordinatorAssignmentId: 'asg_coord', origin: rotated,
+    })).toBe(0);
   });
 });

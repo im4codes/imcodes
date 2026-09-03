@@ -88,7 +88,7 @@ import {
   type P2pRun,
 } from './p2p-orchestrator.js';
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
-import { enqueueResend, removeResendEntries } from './transport-resend-queue.js';
+import { enqueueResend, removeResendEntries, recipientFromSessionRecord } from './transport-resend-queue.js';
 import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js';
 
 /**
@@ -425,6 +425,7 @@ function queueAutoDeliverPromptForTransportResend(
 ): AutoDeliverPromptSendMode {
   if (isOpenSpecAutoDeliverTerminalStage(run.status)) return 'skipped_terminal';
   const enqueueResult = enqueueResend(run.targetImplementationSessionName, {
+    ...(recipientFromSessionRecord(getSession(run.targetImplementationSessionName)) ? { recipient: recipientFromSessionRecord(getSession(run.targetImplementationSessionName)) } : {}),
     text: prompt,
     commandId,
     clientMessageId: `auto-deliver:${randomUUID()}`,

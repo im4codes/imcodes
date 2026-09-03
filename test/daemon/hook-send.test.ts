@@ -410,6 +410,36 @@ describe('Hook server /send endpoint', () => {
     const w2 = makeSession({ name: 'deck_proj_w2', role: 'w2', agentType: 'gemini', label: 'Reviewer' });
     const w3 = makeSession({ name: 'deck_proj_w3', role: 'w1', agentType: 'codex', label: 'Coder2' });
 
+    // A sub-session belongs to exactly ONE owning main. Scoping a main's
+    // siblings by shared projectName let a DIFFERENT main in the same project
+    // address and control it -- live shape: project `cd` has 94 unparented
+    // mains and 20 subs, so every main was a sibling of every main's subs.
+    const otherMain = makeSession({ name: 'deck_proj_other', role: 'brain', agentType: 'claude-code', label: 'Other' });
+    const foreignSub = makeSession({
+      name: 'deck_sub_foreign', role: 'w1', agentType: 'codex', label: 'Foreign',
+      parentSession: 'deck_proj_other',
+    });
+
+    it('refuses a main addressing a sub-session owned by a DIFFERENT main', () => {
+      getSessionMock.mockImplementation((n: string) => [brain, otherMain, foreignSub].find((s) => s.name === n));
+      listSessionsMock.mockReturnValue([brain, otherMain, foreignSub]);
+      expect(resolveTarget('deck_proj_brain', 'deck_sub_foreign').ok).toBe(false);
+    });
+
+    it('refuses that foreign sub-session by LABEL too', () => {
+      getSessionMock.mockImplementation((n: string) => [brain, otherMain, foreignSub].find((s) => s.name === n));
+      listSessionsMock.mockReturnValue([brain, otherMain, foreignSub]);
+      expect(resolveTarget('deck_proj_brain', 'Foreign').ok).toBe(false);
+    });
+
+    it('still lets the OWNING main address its own sub-session', () => {
+      getSessionMock.mockImplementation((n: string) => [brain, otherMain, foreignSub].find((s) => s.name === n));
+      listSessionsMock.mockReturnValue([brain, otherMain, foreignSub]);
+      const result = resolveTarget('deck_proj_other', 'deck_sub_foreign');
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.targets[0].name).toBe('deck_sub_foreign');
+    });
+
     it('resolves by label (case-insensitive)', () => {
       getSessionMock.mockReturnValue(brain);
       listSessionsMock.mockReturnValue([brain, w1, w2]);

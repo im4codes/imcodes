@@ -11,6 +11,7 @@
 import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
+import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
 import type {
   SupervisionMcpToolDeps,
   SupervisionRegistryPort,
@@ -18,6 +19,7 @@ import type {
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { runSupervisionWorktreeGc } from './supervision-worktree-gc.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
+import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-ingress.js';
 
 /**
  * One live-session authority check shared by the MCP project list and the Web
@@ -46,6 +48,27 @@ export function isAuthorizedSupervisionProjectBrain(
  * strictly worse than the unbound error, because it fails silently. Looking it
  * up on each call means the tools always speak to the current binding.
  */
+/**
+ * The caller's exact live identity, or undefined when it cannot be established.
+ *
+ * Supervision authority is an identity, never a name: a replacement runtime
+ * reuses the session name but is a different `sessionInstanceId`/`runtimeEpoch`
+ * and inherits nothing. Callers that cannot be resolved fail closed.
+ */
+function liveCallerIdentity(callerSessionName: string | undefined) {
+  const name = callerSessionName?.trim();
+  if (!name) return undefined;
+  const session = listSessions().find((candidate) => candidate.name === name);
+  if (!session?.sessionInstanceId || !session.runtimeEpoch) return undefined;
+  return {
+    sessionName: session.name,
+    sessionInstanceId: session.sessionInstanceId,
+    runtimeEpoch: session.runtimeEpoch,
+    agentType: session.agentType,
+    providerFamily: resolvePeerAuditProviderFamily(session),
+  };
+}
+
 export function createSupervisionRegistryPort(): SupervisionRegistryPort {
   return {
     getStatus: (taskId) => getSupervisionTaskRegistry().get(taskId)?.status,
@@ -58,19 +81,28 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       const assignment = registry.getAssignment(assignmentId);
       if (!assignment) return { ok: false, reason: 'not_found' };
       if (projectBrain && callerProjectName) {
+        const callerIdentity = liveCallerIdentity(callerSessionName);
+        if (!callerIdentity) return { ok: false, reason: 'owner_mismatch' };
         return registry.finishAssignmentAsProjectBrain({
           assignmentId,
           callerProjectName,
+          callerIdentity,
           ...(rebindIdentity ? { rebindIdentity } : {}),
           ...(rebindProjectName ? { rebindProjectName } : {}),
         });
       }
-      if (assignment.identity.sessionName !== callerSessionName) {
+      // The owner path must resolve the caller's LIVE identity and prove it is
+      // the bound owner. Comparing sessionName and then handing the registry the
+      // STORED identity made the registry's own exact check compare the stored
+      // identity against itself -- vacuously true -- so a replacement runtime
+      // reusing the name finished another instance's assignment.
+      const callerIdentity = liveCallerIdentity(callerSessionName);
+      if (!callerIdentity || !supervisionIdentityMatches(assignment.identity, callerIdentity)) {
         return { ok: false, reason: 'owner_mismatch' };
       }
       return registry.finishAssignment({
         assignmentId,
-        identity: assignment.identity,
+        identity: callerIdentity,
       });
     },
     list: (filter) => getSupervisionTaskRegistry().list(filter as never) as never,
@@ -109,6 +141,10 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         coordinatorSessionName: sessionName,
       }, sessions);
     },
+    // Production wiring for the coordinator-rebind -> pending-return connection.
+    advancePendingRepliesForReboundCoordinator: (input) => (
+      advancePendingRepliesForReboundCoordinator(input)
+    ),
     resolveSessionIdentity: (sessionName) => {
       const sessions = listSessions();
       const session = sessions.find((candidate) => candidate.name === sessionName);

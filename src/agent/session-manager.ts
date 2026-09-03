@@ -80,7 +80,7 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
-import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
+import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues, recipientFromSessionRecord } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { deliverTransportResendEntry } from './transport-resend-delivery.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
@@ -1466,6 +1466,10 @@ async function drainTransportResendQueueIntoRuntime(
           });
         }
       },
+      // The LIVE runtime's own identity, captured when it was constructed.
+      // Never read off the queued rows: that let a row authorise itself, so a
+      // same-named successor could drain the previous instance's work.
+      runtime.recipientIdentity ?? null,
     );
     timelineEmitter.emit(
       sessionName,
@@ -2492,7 +2496,7 @@ export async function restoreTransportSessions(
         // the SDK rejected it ("model (fable) may not exist"). Idempotent for ids.
         requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
       }
-      const runtime = new TransportSessionRuntime(provider, s.name);
+      const runtime = new TransportSessionRuntime(provider, s.name, recipientFromSessionRecord(s));
       // initialize emits provider-ready before returning. A restore has not
       // won its final authority check at that point, so defer resend drain
       // until the runtime is committed below.
@@ -2900,7 +2904,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
 
   const provider = await ensureProviderConnected(agentType, {});
 
-  const runtime = new TransportSessionRuntime(provider, name);
+  const runtime = new TransportSessionRuntime(provider, name, recipientFromSessionRecord(getSession(name)));
   wireTransportCallbacks(runtime, name);
   const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType);
   let effectiveSessionKey = name;

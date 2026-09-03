@@ -133,6 +133,7 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
+import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
   registerMemoryShortRef,
@@ -262,6 +263,14 @@ export interface MemoryMcpToolDeps {
     updatedByUserId?: string;
   }) => Promise<ProcessedContextProjection | null> | ProcessedContextProjection | null;
   recordMemoryHits?: (ids: string[]) => Promise<void> | void;
+  /**
+   * Convergence dispatch used after a successful legacy assignment finish.
+   * Injected so the post-finish wire is OBSERVABLE: the shared helper
+   * otherwise resolves it through a lazy `import('./send-tool.js')`, which no
+   * test can see, so deleting the call here produced no failing test. Same
+   * dep name and shape as the supervision MCP intent handler.
+   */
+  dispatchReadyAudit?: (taskId: string) => Promise<unknown>;
   sendDeps?: SendToolDeps;
   cronOptions?: CronMcpClientOptions;
   cronCreate?: typeof cronMcpCreate;
@@ -1502,7 +1511,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (requestedTaskId && (
         !existing
         || existing.projectName !== projectName
-        || !supervisionCallerParticipates(existing, identity.sessionName)
+        || !supervisionCallerParticipates(existing, identity)
       )) {
         return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
       }
@@ -1598,7 +1607,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         revision: mapped.metadata.revision,
         evidence: mapped.metadata.evidence,
       });
-      return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);
+      if (!updated.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);
+      // Same event, same single wire as the intent path: a legacy
+      // assignment-only finish must not need a Brain call or the next poll to
+      // carry the aggregate to its next automatic step.
+      await advanceSupervisionTaskAfterFinish(existing.taskId, deps.dispatchReadyAudit);
+      return { status: 'ok', item: updated.value };
     },
     [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: async (input) => {
       const parsed = integrationFinalizationSchema.safeParse(input);

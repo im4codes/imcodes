@@ -36,11 +36,12 @@ import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport }
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
-import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
+import { enqueueResend, getResendEntries, clearResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from './transport-queue-projection.js';
 import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import type { QueueRecipientIdentity } from './transport-queue-store.js';
 import {
   startSubSession,
   stopSubSession,
@@ -2254,6 +2255,9 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
 
     if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
+      // The fresh session starts under the SAME name, so its predecessor's
+      // durable queue must be cleared and its authority rotated first.
+      clearResend(`deck_${project}_brain`, 'session_removed');
       removeSession(`deck_${project}_brain`);
     }
     const config: ProjectConfig = {
@@ -4026,6 +4030,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport session has no runtime — queuing for resend after reconnect',
     );
     const enqueueResult = enqueueResend(sessionName, {
+      ...(recipientFromSessionRecord(record) ? { recipient: recipientFromSessionRecord(record) } : {}),
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       // The anchor travels with the expansion it describes. Without it an
@@ -4118,6 +4123,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
     );
     const enqueueResultMissingSid = enqueueResend(sessionName, {
+      ...(recipientFromSessionRecord(record) ? { recipient: recipientFromSessionRecord(record) } : {}),
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       // Same reason as the no-runtime branch above: the anchor must accompany
@@ -5013,6 +5019,18 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     // undeletable ("daemon queue is empty but the frontend can't delete it").
     // Treat the entry as deletable whenever it is a live `queued` row in the
     // store, independent of runtime membership; `drop` itself is idempotent.
+    // Bounded, idempotent recovery at the AUTHORITATIVE entry point.
+    // `restoreExpiredHandoffs` already existed but its only caller was the
+    // automatic-audit path, so a lease that expired while the daemon was down
+    // stayed `handoff_inflight` forever. Because the check below counts only
+    // `queued` rows, such a row was invisible to delete: the ack claimed success
+    // while the row survived and the UI bubble came back. Healing here (rather
+    // than in the UI) also means a daemon restart recovers it on first touch.
+    try {
+      getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
+    } catch (err) {
+      logger.warn({ err, sessionName, clientMessageId }, 'expired handoff recovery failed before undo');
+    }
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'undo_queued_message_before');
     // Deletability is a property of the ROW EXISTING in the authority, not of one
     // particular status value. The previous fix here only counted `queued`, so a
@@ -5054,7 +5072,13 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
     peerAuditService.invalidateQueuedEdit(sessionName);
     try {
-      queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
+      // Prove the LIVE runtime identity. Without it nobody can delete an
+      // identity-bound row (not even its owner); with the WRONG one a same-named
+      // successor could destroy work it was never able to drain.
+      queueSnapshot = getTransportQueueStore().drop(
+        sessionName, clientMessageId, 'user_cleared', undefined,
+        (runtime as { recipientIdentity?: QueueRecipientIdentity }).recipientIdentity ?? null,
+      );
     } catch (err) {
       // The SQLite row is the queue authority. If the drop threw, the row is
       // STILL THERE — the delete did NOT happen — so we must NOT ack success
@@ -5110,6 +5134,17 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
 
   const release = await getMutex(sessionName).acquire();
   try {
+    // Same bounded recovery boundary as the delete path: append reads the
+    // runtime's pending list, so a row stranded in an EXPIRED handoff (or one
+    // that only survives in SQLite after a restart) was unreachable here too.
+    // Recovering first makes it `queued` again and rehydrate brings it into the
+    // runtime; a still-ACTIVE handoff stays out and is correctly not appended.
+    try {
+      getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
+      runtime.rehydratePendingFromStore?.();
+    } catch (err) {
+      logger.warn({ err, sessionName }, 'expired handoff recovery failed before append');
+    }
     const result = await runtime.appendPendingMessagesToActiveTurn(clientMessageIds, commandId);
     if (result.status !== 'delivered') {
       const error = result.status === 'unsupported'

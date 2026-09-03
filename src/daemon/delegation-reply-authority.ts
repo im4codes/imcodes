@@ -30,6 +30,8 @@ export function createDelegationReplyAuthority(input: {
   auditRevision?: string;
   taskId?: string;
   assignmentId?: string;
+  /** The task's ORIGINAL coordinator assignment; the durable return's authority. */
+  coordinatorAssignmentId?: string;
   now?: number;
 }): (CreatedDelegationReply & { authority: AgentDelegationReplyAuthority }) | null {
   const origin = input.origin ? boundIdentity(input.origin) : null;
@@ -42,6 +44,7 @@ export function createDelegationReplyAuthority(input: {
     messageId: input.messageId,
     ...(input.taskId ? { taskId: input.taskId } : {}),
     ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+    ...(input.coordinatorAssignmentId ? { coordinatorAssignmentId: input.coordinatorAssignmentId } : {}),
     ...(input.audit ? {
       purpose: input.audit.kind,
       auditAttemptId: input.audit.attemptId,
@@ -58,6 +61,8 @@ export function createDelegationReplyAuthority(input: {
         ...input.audit,
         ...(input.taskId ? { taskId: input.taskId } : {}),
         ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+        ...(input.coordinatorAssignmentId ? { coordinatorAssignmentId: input.coordinatorAssignmentId } : {}),
+    ...(input.coordinatorAssignmentId ? { coordinatorAssignmentId: input.coordinatorAssignmentId } : {}),
         ...(input.auditRevision ? { revision: input.auditRevision } : {}),
       } } : {}),
     },

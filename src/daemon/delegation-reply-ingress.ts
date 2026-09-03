@@ -104,6 +104,13 @@ function notificationText(record: DelegationReplyRecord): string {
 }
 
 function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
+  // The timeline is projected onto a session NAME, and this ran at three call
+  // sites BEFORE any origin verification. A same-named replacement therefore saw
+  // another coordinator's return rendered into its own timeline even when the
+  // delivery gate later refused it. Verify the live session under that name IS
+  // the bound origin first; if it is not, project nothing — the record stays
+  // pending and is projected when it reaches the exact origin.
+  if (!identityMatches(record.origin, boundIdentity(getSession(record.origin.sessionName)))) return;
   const targetSession = getSession(record.target.sessionName);
   timelineEmitter.emit(
     record.origin.sessionName,
@@ -307,7 +314,26 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
     }
     const currentOrigin = boundIdentity(getSession(record.origin.sessionName));
     const currentTarget = boundIdentity(getSession(record.target.sessionName));
-    if (!identityMatches(record.origin, currentOrigin) || !identityMatches(record.target, currentTarget)) {
+    const originMatches = identityMatches(record.origin, currentOrigin);
+    const targetMatches = identityMatches(record.target, currentTarget);
+    // A task-bound return belongs to the ORIGINAL coordinator assignment
+    // (taskId + assignmentId), not to a reusable session name.
+    const taskBound = Boolean(record.taskId && record.assignmentId);
+    if (!originMatches || !targetMatches) {
+      // Expiring on an origin mismatch DESTROYED the reply the moment a
+      // same-named replacement appeared: B's mere existence lost A's return.
+      // A task-bound reply instead stays durable and pending, addressed to the
+      // original coordinator, until that exact origin comes back or an
+      // authorized rebind of the same coordinator assignment advances it.
+      if (taskBound && !originMatches && targetMatches) {
+        scheduleRetry(record.delegationId, record.notificationId, 5_000);
+        return {
+          ok: true,
+          delivered: false,
+          pending: true,
+          reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+        };
+      }
       getDelegationReplyStore().expire(record.delegationId);
       return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH };
     }
@@ -342,6 +368,32 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
         pending: true,
         reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
       };
+    }
+
+    // The runtime was resolved BY NAME. Verifying the session record is not
+    // enough: the runtime registered under that name may belong to a different
+    // instance, which is exactly the reusable-name projection this forbids. For a
+    // task-bound return the runtime must prove it IS the bound origin; an absent
+    // or different identity keeps the reply pending rather than mis-delivering it.
+    if (taskBound) {
+      const runtimeIdentity = (runtime as { recipientIdentity?: { sessionInstanceId?: string; runtimeEpoch?: string } })
+        .recipientIdentity;
+      const runtimeIsBoundOrigin = Boolean(runtimeIdentity)
+        && runtimeIdentity!.sessionInstanceId === record.origin.sessionInstanceId
+        && runtimeIdentity!.runtimeEpoch === record.origin.runtimeEpoch;
+      if (!runtimeIsBoundOrigin) {
+        logger.warn({
+          delegationId: record.delegationId,
+          sessionName: record.origin.sessionName,
+        }, 'delegation reply origin runtime is not the bound coordinator origin; keeping reply pending');
+        scheduleRetry(record.delegationId, record.notificationId, 5_000);
+        return {
+          ok: true,
+          delivered: false,
+          pending: true,
+          reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+        };
+      }
     }
 
     let result;
@@ -448,11 +500,24 @@ export async function submitDelegationReply(input: {
   }
   const currentOrigin = boundIdentity(getSession(received.record.origin.sessionName));
   const currentTarget = boundIdentity(getSession(received.record.target.sessionName));
-  if ((!received.record.assignmentId && !identityMatches(received.record.target, currentTarget))
-    || (!received.record.taskId && !identityMatches(received.record.origin, currentOrigin))) {
+  // Origin is now validated for EVERY record. It used to be skipped outright
+  // whenever `taskId` was present -- exactly the hole through which a task-bound
+  // return reached a same-named replacement before any exact gate ran.
+  const originMatchesAtIngress = identityMatches(received.record.origin, currentOrigin);
+  const targetMatchesAtIngress = identityMatches(received.record.target, currentTarget);
+  const ingressTaskBound = Boolean(received.record.taskId && received.record.assignmentId);
+  if (!received.record.assignmentId && !targetMatchesAtIngress) {
     getDelegationReplyStore().expire(received.record.delegationId);
     return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH };
   }
+  if (!originMatchesAtIngress && !ingressTaskBound) {
+    getDelegationReplyStore().expire(received.record.delegationId);
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH };
+  }
+  // A task-bound return whose origin has rotated is NEITHER expired NOR
+  // projected: the receipt stays durable and addressed to the original
+  // coordinator assignment, and delivery remains pending until that exact origin
+  // returns or an authorized coordinator rebind advances it.
   // Receipt is the durable boundary. Do NOT make the delegate's MCP tool wait
   // for provider admission: a wedged turn/steer used to keep delegation_reply
   // running until the user pressed Stop. Timeline visibility is immediate and
@@ -468,6 +533,52 @@ export async function submitDelegationReply(input: {
     pending: true,
     reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
   };
+}
+
+/**
+ * Connect an AUTHORIZED coordinator rebind to the returns that coordinator owns.
+ *
+ * `rebindAuthorizedOrigin` existed but had no production caller, so a real
+ * same-assignment coordinator rebind still stranded every pending reply: the
+ * capability was proven in isolation and never wired to the path that triggers
+ * it. This is that wire.
+ *
+ * Authority is the full tuple the return was minted under -- taskId, the
+ * worker/auditor assignmentId on the record, the coordinatorAssignmentId, and
+ * the same logical coordinator session name (enforced inside the store). A
+ * record the rebind does not authorize is skipped, never force-advanced, so a
+ * same-name B can neither claim nor consume it. Advancing is idempotent: a
+ * record already on the new origin rebinds to the same value and is delivered
+ * exactly once by the existing notificationId dedup.
+ */
+export function advancePendingRepliesForReboundCoordinator(input: {
+  taskId: string;
+  coordinatorAssignmentId: string;
+  origin: DelegationReplyBoundIdentity;
+}): number {
+  const store = getDelegationReplyStore();
+  let advanced = 0;
+  for (const record of store.listPendingByCoordinator({
+    taskId: input.taskId,
+    coordinatorAssignmentId: input.coordinatorAssignmentId,
+  })) {
+    if (!record.assignmentId) continue;
+    const rebound = store.rebindAuthorizedOrigin({
+      delegationId: record.delegationId,
+      taskId: input.taskId,
+      assignmentId: record.assignmentId,
+      coordinatorAssignmentId: input.coordinatorAssignmentId,
+      origin: input.origin,
+    });
+    if (!rebound) continue;
+    advanced += 1;
+    // Only a return that already carries a result has something to deliver; a
+    // still-pending dispatch simply keeps the corrected origin for later.
+    if (rebound.notificationId && rebound.status === AGENT_DELEGATION_REPLY_STATUSES.RECEIVED) {
+      scheduleRetry(rebound.delegationId, rebound.notificationId, 0);
+    }
+  }
+  return advanced;
 }
 
 export function resumePendingDelegationReplies(): void {

@@ -31,6 +31,21 @@ const CALLER = {
   sessionName: 'deck_cd_brain', transport: 'stdio',
 } as unknown as McpRuntimeCaller;
 
+/**
+ * Participation is an exact 5-field identity now, so the fake registry's rows and
+ * the injected resolver must agree on the SAME identity for a given name.
+ */
+const testIdentity = (sessionName: string) => ({
+  sessionName,
+  sessionInstanceId: `instance-${sessionName}`,
+  runtimeEpoch: `epoch-${sessionName}`,
+  agentType: 'codex-sdk',
+  providerFamily: 'openai',
+});
+const testResolveSessionIdentity = (sessionName: string) => ({
+  ...testIdentity(sessionName), projectName: 'codedeck',
+});
+
 /** Records what the production dispatch actually reached. */
 class FakeRegistry implements SupervisionRegistryPort {
   statuses = new Map<string, string>([['tsk_a', 'planned'], ['tsk_other', 'planned']]);
@@ -42,7 +57,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   ]);
   assignmentStates = new Map<string, Array<{
     assignmentId: string; role: string; status: string; leaseId: string; auditAttemptId?: string;
-    identity: { sessionName: string };
+    identity: { sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; agentType?: string; providerFamily?: string };
   }>>();
   applied: any[] = [];
   recovered: any[] = [];
@@ -62,7 +77,7 @@ class FakeRegistry implements SupervisionRegistryPort {
       assignments: explicit ?? (this.participants.get(taskId) ?? []).map((sessionName, index) => ({
         assignmentId: `${taskId}-assignment-${index}`,
         role: 'implementer', status: this.statuses.get(taskId) ?? 'planned', leaseId: 'lease',
-        identity: { sessionName },
+        identity: testIdentity(sessionName),
       })),
     };
   }
@@ -106,8 +121,7 @@ let worktreeGcCalls: Array<Record<string, unknown>>;
 async function connect(isAdmin = true) {
   registry = new FakeRegistry();
   worktreeGcCalls = [];
-  const server = createMemoryMcpServer(CALLER, {}, {}, {
-    registry,
+  const server = createMemoryMcpServer(CALLER, {}, {}, { resolveSessionIdentity: testResolveSessionIdentity, registry,
     isAdmin: () => isAdmin,
     worktreeGc: async (input) => {
       worktreeGcCalls.push(input);
@@ -159,7 +173,7 @@ describe('production MCP registration', () => {
   it('a duplicate legacy registration would CRASH server construction', () => {
     // Guards the collision that made this merge necessary: two registrations of
     // the same tool name throw at construction rather than silently shadowing.
-    const server = createMemoryMcpServer(CALLER, {}, {}, { registry, isAdmin: () => true });
+    const server = createMemoryMcpServer(CALLER, {}, {}, { resolveSessionIdentity: testResolveSessionIdentity, registry, isAdmin: () => true });
     expect(() => (server as any).registerTool(
       SUPERVISION_MCP_TOOLS.LIST, { description: 'dup', inputSchema: {} }, async () => ({} as never),
     )).toThrow(/already registered/);
@@ -180,7 +194,7 @@ describe('production MCP registration', () => {
     // Handler-level, not dispatch-level: the name is still owned by the legacy
     // registration, so this proves the audited implementation is ready without
     // pretending it is currently the production route.
-    const handlers = createSupervisionMcpToolHandlers(CALLER, { registry, isAdmin: () => true });
+    const handlers = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isAdmin: () => true });
     expect(typeof handlers[SUPERVISION_MCP_TOOLS.LIST]).toBe('function');
     expect(typeof handlers[SUPERVISION_MCP_TOOLS.GET]).toBe('function');
   });
@@ -203,7 +217,7 @@ describe('production MCP registration', () => {
   it('REJECTS a model-supplied status at the handler (layer 2: defence in depth)', async () => {
     // If a future schema change or a direct handler caller lets `status`
     // through, the audited state machine refuses it before any other check.
-    const handlers = createSupervisionMcpToolHandlers(CALLER, { registry, isAdmin: () => true });
+    const handlers = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isAdmin: () => true });
     const out = await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'start', taskId: 'tsk_a', status: 'finalized',
     });
@@ -223,7 +237,7 @@ describe('production MCP registration', () => {
     registry.statuses.set('tsk_a', 'ready_for_audit');
     registry.assignmentStates.set('tsk_a', [{
       assignmentId: 'rework-owner', role: 'integration_owner', status: 'rework', leaseId: '',
-      identity: { sessionName: 'deck_cd_brain' },
+      identity: testIdentity('deck_cd_brain'),
     }]);
 
     const validation = await call(SUPERVISION_MCP_TOOLS.INTENT, {
@@ -241,7 +255,7 @@ describe('production MCP registration', () => {
     registry.statuses.set('tsk_a', 'ready_for_audit');
     registry.assignmentStates.set('tsk_a', [{
       assignmentId: 'rework-owner', role: 'integration_owner', status: 'validated', leaseId: '',
-      identity: { sessionName: 'deck_cd_brain' },
+      identity: testIdentity('deck_cd_brain'),
     }]);
     const audit = await call(SUPERVISION_MCP_TOOLS.INTENT, {
       intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'rework-owner',
@@ -256,10 +270,12 @@ describe('production MCP registration', () => {
     directRegistry.statuses.set('tsk_a', 'validated');
     directRegistry.assignmentStates.set('tsk_a', [{
       assignmentId: 'worker-a', role: 'implementer', status: 'validated', leaseId: 'lease-a',
-      identity: { sessionName: 'deck_cd_brain' },
+      identity: testIdentity('deck_cd_brain'),
     }]);
     const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'dispatched' });
     const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      resolveSessionIdentity: testResolveSessionIdentity,
       registry: directRegistry,
       dispatchReadyAudit,
     });
@@ -274,11 +290,63 @@ describe('production MCP registration', () => {
     directRegistry.statuses.set('tsk_a', 'finalized');
     directRegistry.assignmentStates.set('tsk_a', [{
       assignmentId: 'worker-a', role: 'implementer', status: 'finalized', leaseId: '',
-      identity: { sessionName: 'deck_cd_brain' },
+      identity: testIdentity('deck_cd_brain'),
     }]);
     await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'worker-a',
     })).resolves.toMatchObject({ status: 'error' });
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+  });
+
+  it('carries the aggregate forward automatically after a successful implementer finish', async () => {
+    // The finish COMMIT is the event that can leave a task ready for its next
+    // automatic step. Both finish paths used to return immediately, so nothing
+    // advanced the aggregate until the 60s implementation watchdog ran -- and a
+    // restart in between widened that to the next boot sweep. Progress must be
+    // driven by the event, not by polling. Deleting the wire fails this test.
+    const directRegistry = new FakeRegistry();
+    directRegistry.statuses.set('tsk_a', 'auditing');
+    directRegistry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'worker-a', role: 'implementer', status: 'auditing', leaseId: 'lease-a',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'dispatched' });
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry: directRegistry,
+      dispatchReadyAudit,
+    });
+
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId: 'tsk_a', assignmentId: 'worker-a',
+    })).resolves.toMatchObject({ status: 'ok', intent: 'finish' });
+    expect(directRegistry.finished, 'the finish itself must still commit').toHaveLength(1);
+    expect(dispatchReadyAudit, 'finish must drive convergence without a Brain call')
+      .toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledWith('tsk_a');
+  });
+
+  it('never reports a finish as failed because downstream convergence threw', async () => {
+    // The commit is authoritative. A convergence step that cannot run is the
+    // dispatcher's problem (it owns a durable blocker report and the boot sweep
+    // retries); it must never turn a committed finish into an error the caller
+    // would retry into a second attempt.
+    const directRegistry = new FakeRegistry();
+    directRegistry.statuses.set('tsk_a', 'auditing');
+    directRegistry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'worker-a', role: 'implementer', status: 'auditing', leaseId: 'lease-a',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    const dispatchReadyAudit = vi.fn().mockRejectedValue(new Error('transport down'));
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry: directRegistry,
+      dispatchReadyAudit,
+    });
+
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId: 'tsk_a', assignmentId: 'worker-a',
+    })).resolves.toMatchObject({ status: 'ok', intent: 'finish' });
     expect(dispatchReadyAudit).toHaveBeenCalledOnce();
   });
 
@@ -287,7 +355,7 @@ describe('production MCP registration', () => {
     registry.statuses.set('tsk_a', 'validated');
     registry.assignmentStates.set('tsk_a', [{
       assignmentId: 'slice-worker', role: 'implementer', status: 'validated', leaseId: 'slice-lease',
-      identity: { sessionName: 'deck_cd_brain' },
+      identity: testIdentity('deck_cd_brain'),
     }]);
     const out = await call(SUPERVISION_MCP_TOOLS.INTENT, {
       intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'slice-worker',
@@ -303,11 +371,11 @@ describe('production MCP registration', () => {
     registry.assignmentStates.set('tsk_a', [
       {
         assignmentId: 'slice-worker', role: 'implementer', status: 'validated', leaseId: 'slice-lease',
-        identity: { sessionName: 'deck_cd_brain' },
+        identity: testIdentity('deck_cd_brain'),
       },
       {
         assignmentId: 'historical-auditor', role: 'auditor', status: 'auditing', leaseId: 'audit-lease',
-        auditAttemptId: 'historical-attempt', identity: { sessionName: 'deck_historical_auditor' },
+        auditAttemptId: 'historical-attempt', identity: testIdentity('deck_historical_auditor'),
       },
     ]);
     const out = await call(SUPERVISION_MCP_TOOLS.INTENT, {
@@ -323,15 +391,15 @@ describe('production MCP registration', () => {
     registry.assignmentStates.set('tsk_a', [
       {
         assignmentId: 'brain-coordinator', role: 'coordinator', status: 'delegated', leaseId: 'brain-lease',
-        identity: { sessionName: 'deck_cd_brain' },
+        identity: testIdentity('deck_cd_brain'),
       },
       {
         assignmentId: 'drifted-worker', role: 'implementer', status: 'validated', leaseId: 'worker-lease',
-        identity: { sessionName: 'deck_same_worker' },
+        identity: testIdentity('deck_same_worker'),
       },
       {
         assignmentId: 'accepted-auditor', role: 'auditor', status: 'passed', leaseId: 'audit-lease',
-        auditAttemptId: 'accepted-attempt', identity: { sessionName: 'deck_auditor' },
+        auditAttemptId: 'accepted-attempt', identity: testIdentity('deck_auditor'),
       },
     ]);
     const live = {
@@ -341,7 +409,10 @@ describe('production MCP registration', () => {
     const brain = createSupervisionMcpToolHandlers(CALLER, {
       registry,
       isProjectBrain: () => true,
-      resolveSessionIdentity: (name) => name === live.sessionName ? live : undefined,
+      // The rebind target resolves to the LIVE replacement; every other name --
+      // including the caller, who must be provably this task's coordinator --
+      // resolves through the shared fixture resolver.
+      resolveSessionIdentity: (name) => (name === live.sessionName ? live : testResolveSessionIdentity(name)),
     });
     expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'finish', taskId: 'tsk_a', assignmentId: 'drifted-worker',
@@ -384,10 +455,9 @@ describe('replacement implementer recovery through the real MCP server', () => {
     const dbPath = join(dir, 'supervision-state.sqlite');
     const taskId = 'replacement-same-logical-task';
     const replacementId = 'replacement-implementer';
-    const owner = {
-      sessionName: CALLER.sessionName!, sessionInstanceId: 'replacement-instance', runtimeEpoch: 'replacement-epoch',
-      agentType: 'codex-sdk', providerFamily: 'openai',
-    };
+    // The caller must BE this identity to act on it now, so the fixture uses the
+    // same deterministic identity the injected resolver returns for that name.
+    const owner = testIdentity(CALLER.sessionName!);
     try {
       let actual = new SupervisionTaskRegistry({ dbPath });
       expect(actual.createOrGet({
@@ -429,7 +499,7 @@ describe('replacement implementer recovery through the real MCP server', () => {
         get: (id) => actual.get(id) as never,
         recover: (input) => actual.recoverTask(input),
       };
-      const server = createMemoryMcpServer(CALLER, {}, {}, { registry: port, isAdmin: () => true });
+      const server = createMemoryMcpServer(CALLER, {}, {}, { resolveSessionIdentity: testResolveSessionIdentity, registry: port, isAdmin: () => true });
       const mcpClient = new Client({ name: 'replacement-implementer-test', version: '1' });
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       await Promise.all([server.connect(serverTransport), mcpClient.connect(clientTransport)]);
@@ -477,8 +547,7 @@ describe('list/get visibility guards', () => {
   });
 
   it('gives the live project Brain the project-wide authority used by the console snapshot', async () => {
-    const brain = createSupervisionMcpToolHandlers(CALLER, {
-      registry,
+    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry,
       isProjectBrain: () => true,
     });
     const listed: any = await brain[SUPERVISION_MCP_TOOLS.LIST]({});
@@ -490,7 +559,7 @@ describe('list/get visibility guards', () => {
   });
 
   it('threads explicit history filters without changing the default list surface', async () => {
-    const brain = createSupervisionMcpToolHandlers(CALLER, { registry, isProjectBrain: () => true });
+    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true });
     const defaultList: any = await brain[SUPERVISION_MCP_TOOLS.LIST]({});
     expect(defaultList.count).toBe(defaultList.tasks.length);
     expect(registry.listCalls.at(-1)).not.toHaveProperty('includeArchived');
@@ -563,13 +632,12 @@ describe('administrative recover', () => {
       rebindSessionName: liveIdentity.sessionName,
       idempotencyKey: 'repair-tsk-a-r1', reason: 'repair misprojected REWORK owner',
     } as const;
-    const participant = createSupervisionMcpToolHandlers(CALLER, { registry });
+    const participant = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry });
     expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER](request))
       .toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.coordinated).toEqual([]);
 
-    const brain = createSupervisionMcpToolHandlers(CALLER, {
-      registry, isProjectBrain: () => true,
+    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
       resolveSessionIdentity: (name) => name === liveIdentity.sessionName ? liveIdentity : undefined,
     });
     expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toEqual({
@@ -600,8 +668,7 @@ describe('administrative recover', () => {
     expect(registry.coordinated).toEqual([]);
 
     const foreignIdentity = { ...liveIdentity, sessionName: 'deck_foreign_worker', projectName: 'other-project' };
-    const crossProjectTargetBrain = createSupervisionMcpToolHandlers(CALLER, {
-      registry, isProjectBrain: () => true,
+    const crossProjectTargetBrain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
       resolveSessionIdentity: () => foreignIdentity,
     });
     expect(await crossProjectTargetBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
@@ -616,8 +683,7 @@ describe('administrative recover', () => {
     registry.item = (taskId: string) => ({
       taskId, projectName: 'other-project', status: 'ready_for_audit', assignments: [],
     });
-    const brain = createSupervisionMcpToolHandlers(CALLER, {
-      registry, isProjectBrain: () => true,
+    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
     });
     expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
@@ -638,13 +704,12 @@ describe('administrative recover', () => {
       evidenceManifestSha256: 'a'.repeat(64),
       reason: 'bind the frozen R3 evidence to the original assignment',
     };
-    const participant = createSupervisionMcpToolHandlers(CALLER, { registry });
+    const participant = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry });
     expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER](request))
       .toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.revisionRebound).toEqual([]);
 
-    const brain = createSupervisionMcpToolHandlers(CALLER, {
-      registry, isProjectBrain: () => true,
+    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
     });
     expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toEqual({
       status: 'ok', taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
@@ -708,10 +773,7 @@ describe('administrative recover', () => {
     const ownedFiles = ['src/one.ts', 'test/one.test.ts'];
     const scopeFiles = [...ownedFiles, 'test/authorized-extra.test.ts'].sort();
     const worker = {
-      sessionName: 'deck_production_recovery_worker',
-      sessionInstanceId: 'instance-production-recovery-worker',
-      runtimeEpoch: 'epoch-production-recovery-worker',
-      agentType: 'codex-sdk', providerFamily: 'openai',
+      ...testIdentity('deck_production_recovery_worker'),
     };
     try {
       expect(realRegistry.createOrGet({
@@ -752,6 +814,8 @@ describe('administrative recover', () => {
         }),
       } as unknown as SupervisionRegistryPort;
       const production = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      resolveSessionIdentity: testResolveSessionIdentity,
         registry: productionRegistry, isProjectBrain: () => true,
       });
       expect(await production[SUPERVISION_MCP_TOOLS.RECOVER]({
@@ -785,8 +849,7 @@ describe('administrative recover', () => {
       sessionName: 'deck_sub_rebound', sessionInstanceId: 'instance-rebound', runtimeEpoch: 'epoch-rebound',
       agentType: 'codex-sdk', providerFamily: 'openai', projectName: 'codedeck',
     };
-    const participant = createSupervisionMcpToolHandlers(CALLER, {
-      registry,
+    const participant = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry,
       resolveSessionIdentity: () => liveIdentity,
     });
     expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER]({
@@ -795,8 +858,7 @@ describe('administrative recover', () => {
     })).toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.rebound).toEqual([]);
 
-    const brain = createSupervisionMcpToolHandlers(CALLER, {
-      registry,
+    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry,
       isProjectBrain: () => true,
       resolveSessionIdentity: (name) => name === liveIdentity.sessionName ? liveIdentity : undefined,
     });
@@ -847,12 +909,11 @@ describe('administrative recover', () => {
       registry.statuses.set(input.taskId, 'ready_for_integration');
       return { ok: true as const, value: { status: 'ready_for_integration' } };
     };
-    const participant = createSupervisionMcpToolHandlers(CALLER, { registry });
+    const participant = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry });
     expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId: 'tsk_a', toStatus: 'recovered', reason: 'repair cascade',
     })).toMatchObject({ status: 'error', reason: 'forbidden' });
-    const projectBrain = createSupervisionMcpToolHandlers(CALLER, {
-      registry, isProjectBrain: () => true,
+    const projectBrain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
     });
     expect(await projectBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId: 'tsk_a', toStatus: 'recovered', reason: 'repair cascade',
@@ -869,10 +930,9 @@ describe('administrative recover', () => {
     registry.item = (taskId: string) => ({
       taskId,
       projectName: 'other-project',
-      assignments: [{ identity: { sessionName: 'deck_cd_brain' } }],
+      assignments: [{ identity: testIdentity('deck_cd_brain') }],
     });
-    const projectBrain = createSupervisionMcpToolHandlers(CALLER, {
-      registry, isProjectBrain: () => true,
+    const projectBrain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
     });
     expect(await projectBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId: 'tsk_a', toStatus: 'recovered', reason: 'must not cross project',
@@ -932,8 +992,7 @@ describe('bounded housekeeping administration', () => {
   });
 
   it('keeps registry housekeeping authoritative when physical GC is not bound', async () => {
-    const handlers = createSupervisionMcpToolHandlers(CALLER, {
-      registry,
+    const handlers = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry,
       isAdmin: () => true,
       isProjectBrain: () => true,
     });
@@ -1000,5 +1059,86 @@ describe('published schema enums match the fixed constants exactly', () => {
     for (const e of eventOnly) {
       expect((intent.inputSchema as any).properties.intent.enum, e).not.toContain(e);
     }
+  });
+});
+
+// R5 gap found by the cross-vendor auditor: rebindAuthorizedOrigin had ZERO
+// production callers. The capability was proven in isolation while the real
+// authorized coordinator rebind still stranded every pending return. This test
+// asserts the WIRE itself -- that the rebind success path invokes the advance
+// with the exact authority tuple -- so deleting the call makes it RED.
+describe('an authorized coordinator rebind advances the returns it owns', () => {
+  const TASK = 'tsk_wire';
+  const COORD_ASSIGNMENT = 'asg_wire_coordinator';
+
+  function wiredHandlers(advance: ReturnType<typeof vi.fn>) {
+    const registry = new FakeRegistry();
+    registry.statuses.set(TASK, 'implementing');
+    registry.classifications.set(TASK, 'independent_top_level');
+    registry.participants.set(TASK, ['deck_cd_brain']);
+    registry.assignmentStates.set(TASK, [{
+      assignmentId: COORD_ASSIGNMENT, role: 'coordinator', status: 'delegated', leaseId: 'lease',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    return { registry, handlers: createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+      isProjectBrain: () => true,
+      advancePendingRepliesForReboundCoordinator: advance,
+    } as never) };
+  }
+
+  it('invokes the advance with the exact task + coordinator assignment + rebound origin', async () => {
+    const advance = vi.fn(() => 1);
+    const { handlers } = wiredHandlers(advance);
+
+    const result = await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: TASK,
+      assignmentId: COORD_ASSIGNMENT,
+      rebindSessionName: 'deck_cd_brain',
+      leaseAction: 'preserve',
+      idempotencyKey: 'wire-1',
+      reason: 'daemon restart rotated the coordinator runtime',
+    });
+
+    expect(result).toMatchObject({ status: 'ok' });
+    expect(advance, 'the rebind success path must carry the pending returns with it').toHaveBeenCalledWith({
+      taskId: TASK,
+      coordinatorAssignmentId: COORD_ASSIGNMENT,
+      origin: {
+        sessionName: 'deck_cd_brain',
+        sessionInstanceId: testIdentity('deck_cd_brain').sessionInstanceId,
+        runtimeEpoch: testIdentity('deck_cd_brain').runtimeEpoch,
+      },
+    });
+  });
+
+  it('does not advance returns when the rebound assignment is not a coordinator', async () => {
+    const advance = vi.fn(() => 0);
+    const registry = new FakeRegistry();
+    registry.statuses.set(TASK, 'implementing');
+    registry.classifications.set(TASK, 'independent_top_level');
+    registry.participants.set(TASK, ['deck_cd_brain']);
+    registry.assignmentStates.set(TASK, [{
+      assignmentId: 'asg_wire_worker', role: 'implementer', status: 'implementing', leaseId: 'lease',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+      isProjectBrain: () => true,
+      advancePendingRepliesForReboundCoordinator: advance,
+    } as never);
+
+    await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: TASK,
+      assignmentId: 'asg_wire_worker',
+      rebindSessionName: 'deck_cd_brain',
+      leaseAction: 'preserve',
+      idempotencyKey: 'wire-2',
+      reason: 'worker rebind must not move coordinator returns',
+    });
+
+    expect(advance).not.toHaveBeenCalled();
   });
 });

@@ -32,8 +32,31 @@ export interface TransportQueueStoreOptions {
   busyTimeoutMs?: number;
 }
 
+/**
+ * The RUNTIME a queue row is addressed to.
+ *
+ * A session name is a reusable handle; queued work belongs to the instance that
+ * was live when it was queued. Rows carry this so a later session reusing the
+ * name cannot drain another runtime's messages.
+ */
+export interface QueueRecipientIdentity {
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+}
+
+/** Usable identity, or null. A blank field is not a wildcard. */
+export function normalizeQueueRecipient(
+  recipient: Partial<QueueRecipientIdentity> | null | undefined,
+): QueueRecipientIdentity | null {
+  const sessionInstanceId = recipient?.sessionInstanceId?.trim();
+  const runtimeEpoch = recipient?.runtimeEpoch?.trim();
+  return sessionInstanceId && runtimeEpoch ? { sessionInstanceId, runtimeEpoch } : null;
+}
+
 export interface EnqueueTransportQueueEntryInput {
   sessionName: string;
+  /** Bound at enqueue from the live SessionRecord. */
+  recipient?: QueueRecipientIdentity;
   text: string;
   clientMessageId?: string;
   commandId?: string;
@@ -172,7 +195,9 @@ export class TransportQueueStore {
         queue_authority_id TEXT NOT NULL,
         pending_message_version INTEGER NOT NULL DEFAULT 0,
         next_ordinal INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        recipient_session_instance_id TEXT,
+        recipient_runtime_epoch TEXT
       );
 
       CREATE TABLE IF NOT EXISTS queue_entries (
@@ -197,6 +222,8 @@ export class TransportQueueStore {
         handoff_expires_at INTEGER,
         handoff_attempt INTEGER,
         private_material_ref TEXT,
+        recipient_session_instance_id TEXT,
+        recipient_runtime_epoch TEXT,
         PRIMARY KEY (session_name, client_message_id)
       );
 
@@ -205,6 +232,8 @@ export class TransportQueueStore {
         client_message_id TEXT NOT NULL,
         material_json TEXT NOT NULL,
         updated_at INTEGER NOT NULL,
+        recipient_session_instance_id TEXT,
+        recipient_runtime_epoch TEXT,
         PRIMARY KEY (session_name, client_message_id)
       );
 
@@ -214,9 +243,32 @@ export class TransportQueueStore {
         client_message_id TEXT NOT NULL,
         delivery_frame_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        recipient_session_instance_id TEXT,
+        recipient_runtime_epoch TEXT,
         PRIMARY KEY (session_name, queue_epoch, client_message_id)
       );
     `);
+    this.migrateRecipientIdentityColumns();
+  }
+
+  /**
+   * Bounded migration for databases written before recipient identity existed.
+   *
+   * A queue row is addressed to a RUNTIME, not to a name. Existing rows carry no
+   * identity, so they are left NULL and quarantined by `queueBelongsTo` below --
+   * never handed to a session that merely reuses the name. Adding the columns is
+   * idempotent, so repeated daemon starts are a no-op.
+   */
+  private migrateRecipientIdentityColumns(): void {
+    const tables = ['queue_meta', 'queue_entries', 'queue_private_material', 'queue_delivery_tombstones'];
+    for (const table of tables) {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name?: unknown }[];
+      const present = new Set(columns.map((column) => String(column.name ?? '')));
+      for (const column of ['recipient_session_instance_id', 'recipient_runtime_epoch']) {
+        if (present.has(column)) continue;
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+      }
+    }
   }
 
   mutateSafely<T>(
@@ -236,14 +288,36 @@ export class TransportQueueStore {
     }
   }
 
-  private ensureMeta(sessionName: string, now = Date.now()): { queueEpoch: string; queueAuthorityId: string; pendingMessageVersion: number; nextOrdinal: number } {
+  private ensureMeta(
+    sessionName: string,
+    now = Date.now(),
+    recipient?: QueueRecipientIdentity | null,
+  ): { queueEpoch: string; queueAuthorityId: string; pendingMessageVersion: number; nextOrdinal: number } {
     const session = normalizeSessionName(sessionName);
+    const bound = normalizeQueueRecipient(recipient);
     const existing = this.db.prepare(`
       SELECT queue_epoch AS queueEpoch, queue_authority_id AS queueAuthorityId,
-        pending_message_version AS pendingMessageVersion, next_ordinal AS nextOrdinal
+        pending_message_version AS pendingMessageVersion, next_ordinal AS nextOrdinal,
+        recipient_session_instance_id AS recipientSessionInstanceId,
+        recipient_runtime_epoch AS recipientRuntimeEpoch
       FROM queue_meta WHERE session_name = ?
-    `).get(session) as { queueEpoch: string; queueAuthorityId: string; pendingMessageVersion: number; nextOrdinal: number } | undefined;
-    if (existing) return existing;
+    `).get(session) as {
+      queueEpoch: string; queueAuthorityId: string; pendingMessageVersion: number; nextOrdinal: number;
+      recipientSessionInstanceId?: string | null; recipientRuntimeEpoch?: string | null;
+    } | undefined;
+    if (existing) {
+      // Adopt an identity only for a row that has none (a legacy row, or one
+      // minted before the recipient was known). An existing DIFFERENT identity is
+      // never overwritten here -- that is a new instance taking the name, and
+      // `queueBelongsTo` refuses it.
+      if (bound && !existing.recipientSessionInstanceId && !existing.recipientRuntimeEpoch) {
+        this.db.prepare(`
+          UPDATE queue_meta SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?, updated_at = ?
+          WHERE session_name = ?
+        `).run(bound.sessionInstanceId, bound.runtimeEpoch, now, session);
+      }
+      return existing;
+    }
     const meta = {
       queueEpoch: randomUUID(),
       queueAuthorityId: randomUUID(),
@@ -251,9 +325,14 @@ export class TransportQueueStore {
       nextOrdinal: 0,
     };
     this.db.prepare(`
-      INSERT INTO queue_meta (session_name, queue_epoch, queue_authority_id, pending_message_version, next_ordinal, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(session, meta.queueEpoch, meta.queueAuthorityId, meta.pendingMessageVersion, meta.nextOrdinal, now);
+      INSERT INTO queue_meta (
+        session_name, queue_epoch, queue_authority_id, pending_message_version, next_ordinal, updated_at,
+        recipient_session_instance_id, recipient_runtime_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      session, meta.queueEpoch, meta.queueAuthorityId, meta.pendingMessageVersion, meta.nextOrdinal, now,
+      bound?.sessionInstanceId ?? null, bound?.runtimeEpoch ?? null,
+    );
     return meta;
   }
 
@@ -286,7 +365,8 @@ export class TransportQueueStore {
     const evictClientMessageId = evictClientMessageIdInput?.trim() || undefined;
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const meta = this.ensureMeta(sessionName, now);
+      const recipient = normalizeQueueRecipient(input.recipient);
+      const meta = this.ensureMeta(sessionName, now, recipient);
       if (evictClientMessageId) {
         this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
         this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
@@ -296,8 +376,9 @@ export class TransportQueueStore {
       this.db.prepare(`
         INSERT INTO queue_entries (
           session_name, client_message_id, command_id, text, status, placement, ordinal,
-          created_at, updated_at, activity_generation, replaces_client_message_id, private_material_ref
-        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+          created_at, updated_at, activity_generation, replaces_client_message_id, private_material_ref,
+          recipient_session_instance_id, recipient_runtime_epoch
+        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         sessionName,
         clientMessageId,
@@ -310,12 +391,19 @@ export class TransportQueueStore {
         input.activityGeneration === undefined ? null : String(input.activityGeneration),
         input.replacesClientMessageId?.trim() || null,
         input.privateMaterialJson === undefined ? null : clientMessageId,
+        recipient?.sessionInstanceId ?? null,
+        recipient?.runtimeEpoch ?? null,
       );
       if (input.privateMaterialJson !== undefined) {
         this.db.prepare(`
-          INSERT OR REPLACE INTO queue_private_material (session_name, client_message_id, material_json, updated_at)
-          VALUES (?, ?, ?, ?)
-        `).run(sessionName, clientMessageId, input.privateMaterialJson, now);
+          INSERT OR REPLACE INTO queue_private_material (
+            session_name, client_message_id, material_json, updated_at,
+            recipient_session_instance_id, recipient_runtime_epoch
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          sessionName, clientMessageId, input.privateMaterialJson, now,
+          recipient?.sessionInstanceId ?? null, recipient?.runtimeEpoch ?? null,
+        );
       }
       const version = this.bumpVersion(sessionName, now);
       this.db.exec('COMMIT');
@@ -409,22 +497,40 @@ export class TransportQueueStore {
     `).run(sessionName, clientMessageId, JSON.stringify(parsed), now);
   }
 
-  markHandoffInFlight(sessionNameInput: string, clientMessageIds: string[], leaseMs = 60_000, now = Date.now()): HandoffTransportQueueEntry[] {
+  markHandoffInFlight(
+    sessionNameInput: string,
+    clientMessageIds: string[],
+    leaseMs = 60_000,
+    now = Date.now(),
+    recipient?: QueueRecipientIdentity | null,
+  ): HandoffTransportQueueEntry[] {
     const sessionName = normalizeSessionName(sessionNameInput);
     if (clientMessageIds.length === 0) return [];
+    const caller = normalizeQueueRecipient(recipient);
+    // A caller that proves an identity leases ONLY rows addressed to it; a caller
+    // that proves none leases only rows that carry none (legacy). Identity-bound
+    // work is therefore never handed to an unproven caller, and legacy rows are
+    // never handed to a new instance. Unleased ids make the drain abort, because
+    // the caller compares leased.length against what it requested. The row filter
+    // in the UPDATE below is the single enforcement point; a meta-level pre-check
+    // here would be fully masked by it, i.e. redundant rather than defence.
     const handoffId = randomUUID();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.ensureMeta(sessionName, now);
+      this.ensureMeta(sessionName, now, caller);
       const update = this.db.prepare(`
         UPDATE queue_entries
         SET status = 'handoff_inflight', handoff_id = ?, handoff_started_at = ?, handoff_expires_at = ?,
           handoff_attempt = COALESCE(handoff_attempt, 0) + 1, updated_at = ?
         WHERE session_name = ? AND client_message_id = ? AND status = 'queued'
+          AND ${this.recipientPredicate(caller).sql}
       `);
+      const gate = this.recipientPredicate(caller).params;
       let changed = 0;
       for (const id of clientMessageIds) {
-        changed += Number(update.run(handoffId, now, now + leaseMs, now, sessionName, id).changes ?? 0);
+        changed += Number(update.run(
+          handoffId, now, now + leaseMs, now, sessionName, id, ...gate,
+        ).changes ?? 0);
       }
       if (changed > 0) this.bumpVersion(sessionName, now);
       const rows = this.readRows(sessionName).filter((entry) => (
@@ -487,14 +593,19 @@ export class TransportQueueStore {
     }
   }
 
-  readPrivateDispatchMaterial(sessionNameInput: string, clientMessageIdInput: string): string | undefined {
+  readPrivateDispatchMaterial(
+    sessionNameInput: string,
+    clientMessageIdInput: string,
+    recipient?: QueueRecipientIdentity | null,
+  ): string | undefined {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
+    const gate = this.recipientPredicate(normalizeQueueRecipient(recipient));
     const row = this.db.prepare(`
       SELECT material_json AS materialJson
       FROM queue_private_material
-      WHERE session_name = ? AND client_message_id = ?
-    `).get(sessionName, clientMessageId) as { materialJson?: string } | undefined;
+      WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}
+    `).get(sessionName, clientMessageId, ...gate.params) as { materialJson?: string } | undefined;
     return readString(row?.materialJson);
   }
 
@@ -574,6 +685,7 @@ export class TransportQueueStore {
     clientMessageIdInputs: string[],
     deliveryFrameId: string = randomUUID(),
     now = Date.now(),
+    recipient?: QueueRecipientIdentity | null,
   ): FinalizeTransportQueueSentResult {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageIds = [...new Set(clientMessageIdInputs.map((id) => id.trim()).filter(Boolean))];
@@ -584,20 +696,38 @@ export class TransportQueueStore {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const meta = this.ensureMeta(sessionName, now);
-      const deleteEntry = this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?');
-      const deletePrivateMaterial = this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?');
+      // Only the runtime a row is addressed to may record it delivered; a wrong
+      // runtime must not tombstone or destroy another instance's work.
+      const gate = this.recipientPredicate(normalizeQueueRecipient(recipient));
+      const deleteEntry = this.db.prepare(
+        `DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`,
+      );
+      const deletePrivateMaterial = this.db.prepare(
+        `DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`,
+      );
+      const finalized: string[] = [];
       const insertTombstone = this.db.prepare(`
-        INSERT OR REPLACE INTO queue_delivery_tombstones (session_name, queue_epoch, client_message_id, delivery_frame_id, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO queue_delivery_tombstones (
+          session_name, queue_epoch, client_message_id, delivery_frame_id, created_at,
+          recipient_session_instance_id, recipient_runtime_epoch
+        ) VALUES (?, ?, ?, ?, ?, (
+          SELECT recipient_session_instance_id FROM queue_meta WHERE session_name = ?
+        ), (
+          SELECT recipient_runtime_epoch FROM queue_meta WHERE session_name = ?
+        ))
       `);
       for (const clientMessageId of clientMessageIds) {
-        insertTombstone.run(sessionName, meta.queueEpoch, clientMessageId, deliveryFrameId, now);
-        deleteEntry.run(sessionName, clientMessageId);
-        deletePrivateMaterial.run(sessionName, clientMessageId);
+        // Delete first: its row count is the authorization answer. A tombstone is
+        // only written for a row this caller was actually entitled to finalize.
+        const removed = Number(deleteEntry.run(sessionName, clientMessageId, ...gate.params).changes ?? 0);
+        if (removed === 0) continue;
+        deletePrivateMaterial.run(sessionName, clientMessageId, ...gate.params);
+        insertTombstone.run(sessionName, meta.queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName);
+        finalized.push(clientMessageId);
       }
       const version = this.bumpVersion(sessionName, now);
       this.db.exec('COMMIT');
-      const deliveryFacts = clientMessageIds.map((clientMessageId): QueueDeliveryFact => ({
+      const deliveryFacts = finalized.map((clientMessageId): QueueDeliveryFact => ({
         type: 'transport.queue.delivery',
         sessionName,
         clientMessageId,
@@ -617,14 +747,26 @@ export class TransportQueueStore {
     }
   }
 
-  hasDeliveryTombstone(sessionNameInput: string, clientMessageIdInput: string): boolean {
+  /**
+   * Was this id already delivered IN THE CURRENT EPOCH?
+   *
+   * queue_epoch is part of the tombstone primary key but was omitted from this
+   * lookup, so a tombstone from a previous epoch suppressed a legitimately
+   * re-queued message after a reset. The epoch defaults to the session's current
+   * one, which is what every caller means.
+   */
+  hasDeliveryTombstone(sessionNameInput: string, clientMessageIdInput: string, queueEpochInput?: string): boolean {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
+    const queueEpoch = queueEpochInput?.trim() || (this.db.prepare(
+      'SELECT queue_epoch AS queueEpoch FROM queue_meta WHERE session_name = ?',
+    ).get(sessionName) as { queueEpoch?: string } | undefined)?.queueEpoch;
+    if (!queueEpoch) return false;
     const row = this.db.prepare(`
       SELECT 1 FROM queue_delivery_tombstones
-      WHERE session_name = ? AND client_message_id = ?
+      WHERE session_name = ? AND client_message_id = ? AND queue_epoch = ?
       LIMIT 1
-    `).get(sessionName, clientMessageId);
+    `).get(sessionName, clientMessageId, queueEpoch);
     return !!row;
   }
 
@@ -751,14 +893,23 @@ export class TransportQueueStore {
     return expiresAt !== undefined && expiresAt > now;
   }
 
-  drop(sessionNameInput: string, clientMessageIdInput: string, dropReason: QueueDropReason, now = Date.now()): QueueSnapshot {
+  drop(
+    sessionNameInput: string,
+    clientMessageIdInput: string,
+    dropReason: QueueDropReason,
+    now = Date.now(),
+    recipient?: QueueRecipientIdentity | null,
+  ): QueueSnapshot {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
+    const gate = this.recipientPredicate(normalizeQueueRecipient(recipient));
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.ensureMeta(sessionName, now);
-      this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?').run(sessionName, clientMessageId);
-      this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?').run(sessionName, clientMessageId);
+      this.db.prepare(`DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`)
+        .run(sessionName, clientMessageId, ...gate.params);
+      this.db.prepare(`DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`)
+        .run(sessionName, clientMessageId, ...gate.params);
       const version = this.bumpVersion(sessionName, now);
       this.db.exec('COMMIT');
       return this.readSnapshot(sessionName, 'drop', { ...version, dropReason });
@@ -766,6 +917,60 @@ export class TransportQueueStore {
       this.db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  /**
+   * May this runtime drain the queue held under that session name?
+   *
+   * Fail-closed in every ambiguous direction: an unusable caller identity, a
+   * queue bound to a DIFFERENT instance/epoch, and a legacy row carrying no
+   * identity at all are all refused. A name with no queue at all is allowed --
+   * there is nothing to mis-deliver.
+   */
+  queueBelongsTo(sessionNameInput: string, recipient?: QueueRecipientIdentity | null): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const caller = normalizeQueueRecipient(recipient);
+    if (!caller) return false;
+    const meta = this.db.prepare(`
+      SELECT recipient_session_instance_id AS sessionInstanceId, recipient_runtime_epoch AS runtimeEpoch
+      FROM queue_meta WHERE session_name = ?
+    `).get(sessionName) as { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | undefined;
+    if (!meta) return true;
+    const bound = normalizeQueueRecipient({
+      sessionInstanceId: meta.sessionInstanceId ?? '',
+      runtimeEpoch: meta.runtimeEpoch ?? '',
+    });
+    if (!bound) return false;
+    return bound.sessionInstanceId === caller.sessionInstanceId && bound.runtimeEpoch === caller.runtimeEpoch;
+  }
+
+  /**
+   * THE row-level recipient predicate, defined once and reused by every
+   * recipient-sensitive read/write.
+   *
+   * A caller proving an identity matches ONLY rows addressed to it; a caller
+   * proving none matches ONLY rows that carry none (legacy). Every other
+   * combination fails closed, so a same-named successor can neither drain, drop,
+   * finalize, nor read the private material of a previous instance's work.
+   */
+  private recipientPredicate(caller: QueueRecipientIdentity | null): { sql: string; params: (string | null)[] } {
+    return {
+      sql: '((? IS NULL AND recipient_session_instance_id IS NULL)'
+        + ' OR (recipient_session_instance_id = ? AND recipient_runtime_epoch = ?))',
+      params: [
+        caller?.sessionInstanceId ?? null,
+        caller?.sessionInstanceId ?? null,
+        caller?.runtimeEpoch ?? null,
+      ],
+    };
+  }
+
+  /** Every session name carrying durable queue state, memory mirror or not. */
+  listSessionNames(): string[] {
+    const rows = this.db.prepare(
+      'SELECT session_name AS sessionName FROM queue_meta UNION SELECT session_name AS sessionName FROM queue_entries',
+    ).all() as { sessionName?: unknown }[];
+    return rows.map((row) => String(row.sessionName ?? '')).filter((name) => name.length > 0);
   }
 
   dropAll(sessionNameInput: string, dropReason: QueueDropReason, now = Date.now()): QueueSnapshot {

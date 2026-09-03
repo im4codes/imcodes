@@ -31,6 +31,7 @@ import {
   clearAllTransportQueueRevisions,
 } from './transport-queue-revision.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from './transport-queue-store.js';
+import type { QueueRecipientIdentity } from './transport-queue-store.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
@@ -38,6 +39,11 @@ export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
 export const MAX_RESEND_ENTRIES = 10;
 
 export interface ResendEntry {
+  /**
+   * The runtime this work is addressed to, captured from the live SessionRecord
+   * at enqueue. Queued work belongs to an instance, not to a reusable name.
+   */
+  recipient?: QueueRecipientIdentity;
   /** User-visible task text — the ORIGINAL marker text used for the timeline. */
   text: string;
   /**
@@ -73,6 +79,19 @@ const queues = new Map<string, ResendEntry[]>();
  * Append an entry. If the queue is already at MAX_RESEND_ENTRIES the oldest
  * entry is discarded (FIFO) so newly-typed messages always take priority.
  */
+/**
+ * The queue recipient for a live session record, or undefined when the record
+ * cannot name a runtime. Callers that hold a SessionRecord must use this so the
+ * identity actually reaches the durable row.
+ */
+export function recipientFromSessionRecord(
+  record: { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | null | undefined,
+): QueueRecipientIdentity | undefined {
+  const sessionInstanceId = record?.sessionInstanceId?.trim();
+  const runtimeEpoch = record?.runtimeEpoch?.trim();
+  return sessionInstanceId && runtimeEpoch ? { sessionInstanceId, runtimeEpoch } : undefined;
+}
+
 export function enqueueResend(sessionName: string, entry: ResendEntry): {
   accepted: true;
   droppedOldest: boolean;
@@ -98,6 +117,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
   try {
     const result = getTransportQueueStore().enqueueWithCapacityEviction({
       sessionName,
+      ...(normalizedEntry.recipient ? { recipient: normalizedEntry.recipient } : {}),
       clientMessageId: normalizedEntry.clientMessageId,
       commandId: normalizedEntry.commandId,
       text: normalizedEntry.text,
@@ -265,17 +285,26 @@ export function clearResend(
   reason: QueueResetReason | QueueDropReason = 'user_clear',
 ): QueueSnapshot | undefined {
   let snapshot: QueueSnapshot | undefined;
-  if (queues.has(sessionName)) bumpTransportQueueRevision(sessionName);
-  if (queues.has(sessionName)) {
-    try {
-      if (reason === 'user_clear' || reason === 'sqlite_restore' || reason === 'runtime_recreated' || reason === 'authority_corrupt_reinitialized') {
-        snapshot = getTransportQueueStore().reset(sessionName, reason);
-      } else {
-        snapshot = getTransportQueueStore().dropAll(sessionName, reason);
+  bumpTransportQueueRevision(sessionName);
+  // UNCONDITIONAL. This used to run only when the in-memory map still held the
+  // session, so runtime-written rows, post-drain rows and every row surviving a
+  // daemon restart were invisible to "clear" -- durable work a later same-named
+  // session could then drain.
+  try {
+    const store = getTransportQueueStore();
+    if (reason === 'user_clear' || reason === 'sqlite_restore' || reason === 'runtime_recreated' || reason === 'authority_corrupt_reinitialized') {
+      snapshot = store.reset(sessionName, reason);
+    } else {
+      snapshot = store.dropAll(sessionName, reason);
+      if (reason === 'session_removed') {
+        // dropAll deletes rows but PRESERVES queue_epoch/queue_authority_id, so a
+        // new session reusing this name inherited the removed session's authority.
+        // Removal must rotate it.
+        store.reset(sessionName, 'runtime_recreated');
       }
-    } catch (err) {
-      logger.warn({ err, sessionName, reason }, 'transport queue sqlite clear failed for clearResend');
     }
+  } catch (err) {
+    logger.warn({ err, sessionName, reason }, 'transport queue sqlite clear failed for clearResend');
   }
   queues.delete(sessionName);
   return snapshot;
@@ -283,6 +312,20 @@ export function clearResend(
 
 /** Drop every queued entry everywhere. Test helper. */
 export function clearAllResend(): void {
+  // Durable state is cleared for EVERY session that has any, not just the ones
+  // with a live memory mirror; outside VITEST this used to touch memory only.
+  try {
+    const store = getTransportQueueStore();
+    for (const sessionName of new Set([...queues.keys(), ...store.listSessionNames()])) {
+      try {
+        store.reset(sessionName, 'user_clear');
+      } catch (err) {
+        logger.warn({ err, sessionName }, 'transport queue sqlite clear failed for clearAllResend');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'transport queue store unavailable for clearAllResend');
+  }
   queues.clear();
   clearAllTransportQueueRevisions();
   if (process.env.VITEST) resetTransportQueueStoreForTests();
@@ -328,6 +371,14 @@ export async function drainResend(
   onExpired?: ResendExpireCallback,
   onDispatchFailed?: ResendDispatchFailureCallback,
   onDelivered?: ResendDeliveryCallback,
+  /**
+   * The identity of the LIVE runtime asking to drain, captured when that runtime
+   * was constructed. It must be supplied by the caller and is never derived from
+   * the rows: reading it off the queued entry let the row authorise itself, so a
+   * same-named successor "proved" the previous instance's identity simply by
+   * draining its work. Absent identity drains only identity-less legacy rows.
+   */
+  recipient?: QueueRecipientIdentity | null,
 ): Promise<number> {
   const list = queues.get(sessionName);
   if (!list || list.length === 0) return 0;
@@ -346,6 +397,9 @@ export async function drainResend(
       freshClientMessageIds,
       RESEND_EXPIRY_MS,
       now,
+      // Caller-supplied LIVE identity. A same-named successor leases nothing, so
+      // the drain aborts rather than delivering another instance's work.
+      recipient ?? null,
     );
     if (leased.length !== freshEntries.length) {
       logger.warn({ sessionName, requested: freshEntries.length, leased: leased.length }, 'transport queue sqlite handoff lease incomplete for resend drain');
@@ -391,6 +445,9 @@ export async function drainResend(
           const result = getTransportQueueStore().finalizeSentBatch(
             sessionName,
             [clientMessageId],
+            undefined,
+            undefined,
+            recipient ?? null,
           );
           if (result.deliveryFacts.length > 0) onDelivered?.({ deliveryFacts: result.deliveryFacts });
         } catch (err) {

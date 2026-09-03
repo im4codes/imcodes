@@ -42,6 +42,9 @@ export interface DelegationReplyRecord {
   auditedSessionName?: string;
   taskId?: string;
   assignmentId?: string;
+  /** The task's ORIGINAL coordinator assignment; the only authority that may
+   *  advance this return onto a re-authorized origin. */
+  coordinatorAssignmentId?: string;
   status: AgentDelegationReplyStatus;
   result?: string;
   createdAt: number;
@@ -61,6 +64,9 @@ export interface CreateDelegationReplyInput {
   auditedSessionName?: string;
   taskId?: string;
   assignmentId?: string;
+  /** The task's ORIGINAL coordinator assignment; the only authority that may
+   *  advance this return onto a re-authorized origin. */
+  coordinatorAssignmentId?: string;
   now?: number;
 }
 
@@ -118,6 +124,9 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
     : undefined;
   const taskId = typeof row.taskId === 'string' && row.taskId ? row.taskId : undefined;
   const assignmentId = typeof row.assignmentId === 'string' && row.assignmentId ? row.assignmentId : undefined;
+  const coordinatorAssignmentId = typeof row.coordinatorAssignmentId === 'string' && row.coordinatorAssignmentId
+    ? row.coordinatorAssignmentId
+    : undefined;
   return {
     delegationId: rowString(row, 'delegationId'),
     capabilityHash: rowString(row, 'capabilityHash'),
@@ -140,6 +149,7 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
     ...(auditedSessionName ? { auditedSessionName } : {}),
     ...(taskId ? { taskId } : {}),
     ...(assignmentId ? { assignmentId } : {}),
+    ...(coordinatorAssignmentId ? { coordinatorAssignmentId } : {}),
     status: rowString(row, 'status') as AgentDelegationReplyStatus,
     ...(result !== undefined ? { result } : {}),
     createdAt: Number(row.createdAt ?? 0),
@@ -188,6 +198,7 @@ export class DelegationReplyStore {
         audited_session_name TEXT,
         task_id TEXT,
         assignment_id TEXT,
+        coordinator_assignment_id TEXT,
         status TEXT NOT NULL,
         result TEXT,
         created_at INTEGER NOT NULL,
@@ -228,6 +239,12 @@ export class DelegationReplyStore {
     }
     if (!names.has('task_id')) this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN task_id TEXT');
     if (!names.has('assignment_id')) this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN assignment_id TEXT');
+    // The ORIGINAL coordinator assignment a task-bound return is addressed to.
+    // Rows written before this column exists stay NULL and are unadoptable: no
+    // coordinator can claim authority over a return that never recorded one.
+    if (!names.has('coordinator_assignment_id')) {
+      this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN coordinator_assignment_id TEXT');
+    }
     // Preserve durable replies created by versions that stored the single
     // message directly on the authority row.
     const legacyRows = this.#db.prepare(`
@@ -317,9 +334,10 @@ export class DelegationReplyStore {
         origin_session_name, origin_session_instance_id, origin_runtime_epoch,
         target_session_name, target_session_instance_id, target_runtime_epoch,
         dispatch_id, message_id, notification_id, purpose, audit_attempt_id,
-        audit_revision, audited_session_name, task_id, assignment_id, status,
+        audit_revision, audited_session_name, task_id, assignment_id,
+        coordinator_assignment_id, status,
         created_at, expires_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       delegationId,
       '',
@@ -338,6 +356,7 @@ export class DelegationReplyStore {
       input.auditedSessionName ?? null,
       input.taskId ?? null,
       input.assignmentId ?? null,
+      input.coordinatorAssignmentId ?? null,
       AGENT_DELEGATION_REPLY_STATUSES.PENDING,
       now,
       now + AGENT_DELEGATION_REPLY_TTL_MS,
@@ -368,6 +387,7 @@ export class DelegationReplyStore {
         audited_session_name AS auditedSessionName,
         task_id AS taskId,
         assignment_id AS assignmentId,
+        coordinator_assignment_id AS coordinatorAssignmentId,
         status,
         result,
         created_at AS createdAt,
@@ -399,6 +419,7 @@ export class DelegationReplyStore {
         authority.audited_session_name AS auditedSessionName,
         authority.task_id AS taskId,
         authority.assignment_id AS assignmentId,
+        authority.coordinator_assignment_id AS coordinatorAssignmentId,
         message.status,
         message.result,
         authority.created_at AS createdAt,
@@ -413,6 +434,50 @@ export class DelegationReplyStore {
   }
 
   /** Apply only after the registry has recorded an explicit Brain-authorized rebind. */
+  /**
+   * Advance a task-bound reply onto a re-authorized coordinator origin.
+   *
+   * A pending return is addressed to the ORIGINAL coordinator assignment. When
+   * that coordinator's runtime is legitimately replaced (a restart rotates its
+   * instance/epoch), the reply must move WITH the authorization rather than be
+   * lost or silently delivered to whoever now holds the name. Authority is the
+   * exact (taskId, assignmentId) pair the record was minted under; anything else
+   * returns undefined and changes nothing.
+   */
+  rebindAuthorizedOrigin(input: {
+    delegationId: string;
+    taskId: string;
+    assignmentId: string;
+    /** The task's ORIGINAL coordinator assignment. Required: authority to move a
+     *  return belongs to that assignment, not to whoever holds the origin name. */
+    coordinatorAssignmentId: string;
+    origin: DelegationReplyBoundIdentity;
+    now?: number;
+  }): DelegationReplyRecord | undefined {
+    const current = this.get(input.delegationId);
+    if (!current || current.taskId !== input.taskId || current.assignmentId !== input.assignmentId) return undefined;
+    // Fail closed on a record that never recorded a coordinator (legacy rows):
+    // an unbound return must not become adoptable by any coordinator.
+    if (!current.coordinatorAssignmentId
+      || current.coordinatorAssignmentId !== input.coordinatorAssignmentId) return undefined;
+    // The logical coordinator is the same session; only its runtime rotated.
+    // A different NAME is a different coordinator and is never adopted here.
+    if (current.origin.sessionName !== input.origin.sessionName) return undefined;
+    this.#db.prepare(`
+      UPDATE delegation_replies
+      SET origin_session_instance_id = ?, origin_runtime_epoch = ?, updated_at = ?
+      WHERE delegation_id = ? AND task_id = ? AND assignment_id = ?
+    `).run(
+      input.origin.sessionInstanceId,
+      input.origin.runtimeEpoch,
+      input.now ?? Date.now(),
+      input.delegationId,
+      input.taskId,
+      input.assignmentId,
+    );
+    return this.get(input.delegationId);
+  }
+
   rebindAssignmentTarget(input: {
     delegationId: string;
     taskId: string;
@@ -715,6 +780,34 @@ export class DelegationReplyStore {
     );
   }
 
+  /**
+   * Every still-open return owned by one exact (task, coordinator assignment).
+   *
+   * This is what connects an authorized coordinator rebind to the pending
+   * replies it owns: without it `rebindAuthorizedOrigin` had no production
+   * caller and a real rebind still stranded the return. Delivered and expired
+   * rows are excluded -- there is nothing left to advance.
+   */
+  listPendingByCoordinator(input: { taskId: string; coordinatorAssignmentId: string }): DelegationReplyRecord[] {
+    const taskId = input.taskId?.trim();
+    const coordinatorAssignmentId = input.coordinatorAssignmentId?.trim();
+    if (!taskId || !coordinatorAssignmentId) return [];
+    const rows = this.#db.prepare(`
+      SELECT delegation_id AS delegationId
+      FROM delegation_replies
+      WHERE task_id = ? AND coordinator_assignment_id = ?
+      ORDER BY created_at ASC
+    `).all(taskId, coordinatorAssignmentId) as Array<{ delegationId?: unknown }>;
+    // Reuse the single proven read path rather than restating its projection.
+    return rows
+      .map((row) => this.get(String(row.delegationId ?? '')))
+      .filter((record): record is DelegationReplyRecord => (
+        record !== undefined
+        && record.status !== AGENT_DELEGATION_REPLY_STATUSES.DELIVERED
+        && record.status !== AGENT_DELEGATION_REPLY_STATUSES.EXPIRED
+      ));
+  }
+
   listReceived(limit = 128): DelegationReplyRecord[] {
     const rows = this.#db.prepare(`
       SELECT
@@ -735,6 +828,7 @@ export class DelegationReplyStore {
         authority.audited_session_name AS auditedSessionName,
         authority.task_id AS taskId,
         authority.assignment_id AS assignmentId,
+        authority.coordinator_assignment_id AS coordinatorAssignmentId,
         message.status,
         message.result,
         authority.created_at AS createdAt,

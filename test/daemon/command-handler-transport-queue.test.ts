@@ -1221,6 +1221,72 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(survivors.length, 'a live handoff must not be silently dropped').toBe(1);
   });
 
+  // R2 P1 continuation: the delete path must also prove the LIVE runtime identity.
+  // Otherwise a same-named successor B, which cannot DRAIN A's queued work, could
+  // still DESTROY it through undo.
+  it('undo_queued_message does not let a same-name NEW instance drop another instance\'s row', async () => {
+    const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+    const B = { sessionInstanceId: 'instance-B', runtimeEpoch: 'epoch-B' };
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      recipient: A,
+      clientMessageId: 'msg-owned-by-a',
+      commandId: 'msg-owned-by-a',
+      text: 'queued for A',
+      placement: 'normal',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      recipientIdentity: B, // a replacement runtime under the same name
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-owned-by-a', commandId: 'cmd-undo-foreign' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(
+      getTransportQueueStore().readSnapshot('deck_transport_brain')
+        .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-owned-by-a'),
+      "B must not destroy A's queued work",
+    ).toBe(true);
+  });
+
+  it('undo_queued_message still lets the exact live owner drop its own row', async () => {
+    const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      recipient: A,
+      clientMessageId: 'msg-owned-by-a2',
+      commandId: 'msg-owned-by-a2',
+      text: 'queued for A',
+      placement: 'normal',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      recipientIdentity: A,
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-owned-by-a2', commandId: 'cmd-undo-own' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-own', status: 'accepted' }),
+    );
+    expect(
+      getTransportQueueStore().readSnapshot('deck_transport_brain')
+        .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-owned-by-a2'),
+    ).toBe(false);
+  });
+
   it('undo_queued_message acks accepted (idempotent) when neither the runtime nor the store has the id', async () => {
     // Deleting a queued message is idempotent: if it is already absent, the goal
     // is met. The frontend now ALWAYS sends the undo (even for an entry that only
@@ -1663,8 +1729,16 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       expect.objectContaining({
         state: 'idle',
-        pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'sqlite-queued', text: 'sqlite queued' })],
-        pendingMessageVersion: committed.pendingMessageVersion,
+        // RETIRED (R2): this previously expected the SQLite-only entry to SURVIVE
+        // cancel. It did so only because clearResend skipped the durable store
+        // whenever the in-memory mirror was empty. Cancel routes through the
+        // transport stop path, whose whole purpose is dropping queued work (the
+        // `user_stopped` drop reason exists for exactly this), so the durable row
+        // is now dropped consistently with the in-memory one. The epoch and
+        // authority id are still preserved -- only a session REMOVAL rotates
+        // those -- and the version bumps because the queue really did change.
+        pendingMessageEntries: [],
+        pendingMessageVersion: expect.any(Number),
         queueEpoch: committed.queueEpoch,
         queueAuthorityId: committed.queueAuthorityId,
         queueSnapshot: expect.objectContaining({
@@ -1679,7 +1753,9 @@ describe('handleWebCommand transport queue behavior', () => {
       && call[1] === 'session.state'
       && (call[2] as Record<string, unknown>)?.state === 'idle'
     ));
-    expect(idleStateCall?.[2]).toHaveProperty('pendingCount', 1);
+    // Retired with the block above: the durable row is dropped by stop, so the
+    // idle snapshot reports an empty queue rather than the orphaned entry.
+    expect(idleStateCall?.[2]).toHaveProperty('pendingCount', 0);
     expect(idleStateCall?.[2]).not.toHaveProperty('pendingMessages');
     const stopFeedbackOrder = firstInvocationOrder((call) =>
       call[0] === 'deck_transport_brain'
