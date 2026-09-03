@@ -3,6 +3,7 @@ import {
   SUPERVISION_CHANGE_PROPORTIONALITY,
   SUPERVISION_GATE_ENFORCEMENT,
   SUPERVISION_MODE,
+  supervisionTaskAuditPolicyFromSnapshot,
 } from '../shared/supervision-config.js';
 import { PROVIDER_ERROR_CODES } from '../src/agent/transport-provider.js';
 import { CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
@@ -900,5 +901,36 @@ describe('supervision continuation repair (repair_then_resume)', () => {
     if (outcome.kind === 'pause') {
       expect(Object.values(SUPERVISION_PAUSE_CATEGORIES)).toContain(outcome.category);
     }
+  });
+});
+
+describe('automatic audit policy source (tsk_5ny)', () => {
+  // The policy may come ONLY from the authoritative session supervision mode
+  // captured when the task is created. Brain role, contract presence, provider,
+  // model, prior config and defaults are all non-authoritative: inferring a
+  // policy from any of them silently hands an auditor to a task that never
+  // opted in, and "no policy" is a durable fact rather than a gap to repair.
+  it('derives the task audit policy from the authoritative mode and nothing else', () => {
+    expect(supervisionTaskAuditPolicyFromSnapshot({ mode: SUPERVISION_MODE.SUPERVISED_AUDIT }))
+      .toBe('auto_allow_degraded');
+
+    for (const mode of Object.values(SUPERVISION_MODE)) {
+      if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) continue;
+      expect(
+        supervisionTaskAuditPolicyFromSnapshot({ mode }),
+        `${mode} must not carry an automatic audit policy`,
+      ).toBeUndefined();
+    }
+
+    // Exhaustive over the mode enum, so a mode added later cannot quietly
+    // default into an automatic policy without this test being updated.
+    const enabling = Object.values(SUPERVISION_MODE)
+      .filter((mode) => supervisionTaskAuditPolicyFromSnapshot({ mode }) !== undefined);
+    expect(enabling).toEqual([SUPERVISION_MODE.SUPERVISED_AUDIT]);
+
+    // The mere existence of a snapshot is not evidence of opt-in, and an
+    // absent snapshot fails closed rather than falling back to a default.
+    expect(supervisionTaskAuditPolicyFromSnapshot(null)).toBeUndefined();
+    expect(supervisionTaskAuditPolicyFromSnapshot(undefined)).toBeUndefined();
   });
 });

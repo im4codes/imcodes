@@ -1012,6 +1012,41 @@ describe('automatic supervision audit materialization', () => {
     expect(dispatch).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ target: transport.name }));
   });
 
+  it('never materializes an auditor for a policy-less task during boot recovery (tsk_5ny)', async () => {
+    // tsk_5ny. With supervision off/manual a task is created with NO auditPolicy.
+    // Boot recovery must not retroactively adopt a default policy and hand the
+    // task an auditor it never asked for: "no policy" is a durable fact, not a
+    // gap to be repaired on the next daemon start.
+    const manual = makeReadyTask({ taskId: 'boot-sweep-manual-task' });
+    const automatic = makeReadyTask({
+      taskId: 'boot-sweep-automatic-task',
+      auditPolicy: 'auto_allow_degraded',
+      registry: manual.registry,
+    });
+    expect(manual.registry.get(manual.taskId)?.auditPolicy).toBeUndefined();
+    expect(manual.registry.get(automatic.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+
+    const dispatched: string[] = [];
+    const swept = await dispatchReadyAuditSweep({
+      registry: manual.registry,
+      listSessions: () => [],
+      dispatch: (async (...args: unknown[]) => {
+        dispatched.push(String((args[1] as { target?: string } | undefined)?.target ?? 'unknown'));
+        return { ok: false };
+      }) as never,
+    });
+
+    // The policy-less task must not be SELECTED by the sweep at all. Asserting
+    // only "no auditor was created" is vacuous: dispatchReadyAudit independently
+    // rejects a policy-less task with manual_policy, so that assertion holds even
+    // if the sweep wrongly selects it. Pin the selection itself.
+    expect(swept).toHaveLength(1);
+    expect(swept.some((result) => result.reason === 'manual_policy')).toBe(false);
+    const auditors = manual.registry.get(manual.taskId)?.assignments
+      .filter((assignment) => assignment.role === 'auditor') ?? [];
+    expect(auditors, 'boot sweep must not create an auditor without a policy').toEqual([]);
+  });
+
   it('leaves legacy/manual tasks and a Brain-routed live fallback untouched', async () => {
     const legacy = makeReadyTask();
     await expect(dispatchReadyAudit(legacy.taskId, { registry: legacy.registry }))
