@@ -345,6 +345,51 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.phases).toEqual(['service_registered', 'service_start_requested']);
   });
 
+  it('re-installs an enrolled machine whose stable image drifted, instead of refusing forever', async () => {
+    // The exact field state: the node is enrolled, its journal says healthy, and
+    // its stable image no longer matches the receipt because it was replaced
+    // since the install. Re-running the downloaded installer is the one repair
+    // a person has, and it reported `stable executable hash mismatch` and quit.
+    //
+    // Distinct from the drift case below: this process is NOT the stable
+    // runtime and a credential already exists, so the enrolled early-return
+    // path is taken and executable staging is never reached at all.
+    const restaged: StagedExecutableReceipt = { ...STAGED_RECEIPT, sha256: 'f'.repeat(64) };
+    const source = makeSource({ stageTrailerFreeExecutable: vi.fn(async () => restaged) });
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => false),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        phase: 'service_healthy' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        serverId: CRED.serverId,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+      verifyStagedExecutable: vi.fn()
+        .mockRejectedValueOnce(new Error('stable executable hash mismatch'))
+        .mockResolvedValue(undefined),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+
+    // The installer's own bytes must land; that is what running it means.
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith(
+      '/tmp/staged/imcodes-node',
+      TRAILER.trailerStart,
+      undefined,
+    );
+    // The journal now describes what is actually on disk, not what used to be.
+    expect(result.journal.stagedReceipt).toEqual(restaged);
+    expect(result.credential).toEqual(CRED);
+  });
+
   it('re-stages when the staged copy drifted from its receipt instead of refusing the install', async () => {
     // Field failure (Windows, 2026-09): a node whose stable image had been
     // replaced since its install could never be re-installed. Every run failed
@@ -528,8 +573,17 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.phases).not.toContain('service_start_requested');
   });
 
-  it('fails closed when a files_staged recovery journal has no staged receipt', async () => {
+  it('repairs a files_staged journal with no staged receipt instead of refusing', async () => {
+    // This used to fail closed. It is the installer that reaches here, and the
+    // authority for installing is the package's OWN signature -- already
+    // verified before it ran, and re-verified when its trailer is read. A
+    // receipt describing the previous copy is evidence of what was installed
+    // last time, never a reason to refuse the bytes in hand, so a journal
+    // missing one is repaired by staging rather than declared unrecoverable.
+    const restaged: StagedExecutableReceipt = { ...STAGED_RECEIPT, sha256: 'f'.repeat(64) };
+    const source = makeSource({ stageTrailerFreeExecutable: vi.fn(async () => restaged) });
     const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
       loadCredential: vi.fn(async () => CRED),
       loadInstallJournal: vi.fn(async () => ({
         phase: 'files_staged' as InstallPhase,
@@ -540,8 +594,10 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
         stagedExePath: '/tmp/staged/imcodes-node',
       })),
     });
-    await expect(bootstrapControlledNode(deps)).rejects.toThrow(/staged executable receipt is missing/);
-    expect(deps.installDefinition).not.toHaveBeenCalled();
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledOnce();
+    expect(result.journal.stagedReceipt).toEqual(restaged);
+    expect(deps.installDefinition).toHaveBeenCalled();
   });
 
   it('repairs a service_registered definition by reinstalling from the staged receipt before start', async () => {

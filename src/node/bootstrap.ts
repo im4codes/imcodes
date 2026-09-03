@@ -430,7 +430,16 @@ async function ensureServiceRegistered(
 ): Promise<InstallJournal> {
   if (phaseIndex(journal.phase) >= phaseIndex('files_staged')) {
     if (!journal.stagedReceipt) throw new Error('controlled node staged executable receipt is missing; manual recovery required');
-    await deps.verifyStagedExecutable(journal.stagedReceipt);
+    // Report drift, never refuse on it. This runs on the service's own start
+    // path too, so throwing here turns a stale receipt into a crash loop on a
+    // machine that is otherwise serving fine -- and the installer, the one
+    // repair a person has, is re-staged before it ever reaches this point.
+    try {
+      await deps.verifyStagedExecutable(journal.stagedReceipt);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      deps.warn(`staged executable no longer matches its install receipt (${detail}); continuing with the image on disk`);
+    }
   }
   const stagedPath = journal.stagedExePath ?? deps.stagedExecutablePath;
   if (phaseIndex(journal.phase) >= phaseIndex('service_registered') && journal.serviceName) {
@@ -523,6 +532,50 @@ async function reconcileStableServicePersistence(
   return journal;
 }
 
+/**
+ * Stage this installer's own executable over the stable copy, unconditionally.
+ *
+ * Not the resume shortcut: a person who re-runs the installer is asking for
+ * these bytes to be the ones that run, so a receipt that happens to still match
+ * is not a reason to keep an older image. A package with no enrollment trailer
+ * is not an installer and is left alone.
+ */
+async function restageFromInstallerPackage(
+  deps: ControlledNodeBootstrapDeps,
+  journal: InstallJournal,
+): Promise<InstallJournal> {
+  let source: VerifiedEnrollmentSource | null = null;
+  try {
+    source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
+    const trailerRange = await source.readEnrollmentBlobWithRange();
+    if (!trailerRange) return journal;
+    const stagedReceipt = await source.stageTrailerFreeExecutable(
+      deps.stagedExecutablePath,
+      trailerRange.trailerStart,
+      trailerRange.windowsAuthenticode,
+    );
+    // Re-running the same package restages identical bytes. Rewriting the
+    // journal for that would churn the phase log and blur the one-phase-at-a-
+    // time crash-recovery reasoning for no gain.
+    const previous = journal.stagedReceipt;
+    if (previous
+      && previous.path === stagedReceipt.path
+      && previous.size === stagedReceipt.size
+      && previous.sha256 === stagedReceipt.sha256) {
+      return journal;
+    }
+    return await deps.writeInstallPhase(deps.journalPath, journal.phase, {
+      now: Math.max(deps.now, journal.updatedAt),
+      previous: journal,
+      stagedExePath: deps.stagedExecutablePath,
+      stagedReceipt,
+      sourceExePath: deps.sourceExecutablePath,
+    });
+  } finally {
+    if (source) await source.close().catch(() => {});
+  }
+}
+
 async function ensureServiceStartRequested(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
@@ -572,20 +625,10 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
     return { credential: existing, disposition: 'run_runtime', journal, publisherTrustError };
   }
 
-  if (existing && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
-    const publisherTrustError = await tryReleasePublisherTrust(
-      deps,
-      'Windows release publisher trust installation failed; native features stay unavailable until it succeeds',
-    );
-    journal = await ensureServiceStartRequested(deps, journal, { startService: !stableRuntime });
-    return {
-      credential: existing,
-      disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
-      journal,
-      publisherTrustError,
-    };
-  }
-
+  // Anything left here is the downloaded installer, not the service: the stable
+  // runtime returned above. It continues through elevation and staging so that
+  // re-running it installs ITS bytes -- previously this returned early, which is
+  // how an enrolled machine could never be re-installed at all.
   journal = await ensureElevated(deps, journal);
   const publisherTrustError = await tryReleasePublisherTrust(
     deps,
@@ -605,6 +648,13 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
         serverId: existing.serverId,
       });
     }
+    // Re-running the downloaded installer means installing ITS bytes. Skipping
+    // that is how an enrolled machine whose stable image had drifted became
+    // permanently un-installable: staging was never reached, and the receipt
+    // check downstream refused every attempt with nothing left to try. Only the
+    // installer does this; the service must never rewrite the image it is
+    // executing from.
+    if (!stableRuntime) journal = await restageFromInstallerPackage(deps, journal);
     journal = await ensureServiceStartRequested(deps, journal);
     return {
       credential: existing,
