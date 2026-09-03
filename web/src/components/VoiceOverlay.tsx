@@ -33,7 +33,13 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   const autoStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const setListeningState = useCallback((next: boolean) => {
-    if (next && !openRef.current) return;
+    // stopListening() reports `false` synchronously while the effect is being
+    // cleaned up. Never enqueue hook state once the overlay is closed or
+    // unmounting; the next open initializes both values below.
+    if (!openRef.current) {
+      listeningRef.current = false;
+      return;
+    }
     listeningRef.current = next;
     setListening(next);
   }, []);

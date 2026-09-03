@@ -392,6 +392,11 @@ describe('low-coverage page and component surfaces', () => {
     const originalDebounceRendering = options.debounceRendering;
     const scheduleRender = vi.fn();
     options.debounceRendering = scheduleRender;
+    voiceApi.stopListening.mockImplementationOnce(async () => {
+      // Match the production VoiceInput contract: stopListening publishes the
+      // terminal false state before it detaches recognition callbacks.
+      voiceApi.listeningHandler?.(false);
+    });
     try {
       view.unmount();
       expect(scheduleRender).not.toHaveBeenCalled();
