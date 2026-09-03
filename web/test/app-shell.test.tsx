@@ -464,6 +464,11 @@ vi.mock('../src/components/SessionTree.js', () => ({
     <div>
       session-tree
       <button onClick={() => onSelectSession?.(sessions?.[0]?.name)}>tree-select-session</button>
+      {sessions?.map((session: any) => (
+        <button key={session.name} onClick={() => onSelectSession?.(session.name)}>
+          tree-select-session-{session.name}
+        </button>
+      ))}
       <button onClick={() => onSelectSubSession?.(subSessions?.[0])}>tree-select-sub</button>
       <button onClick={onNewSession}>tree-new-session</button>
       <button onClick={onNewSubSession}>tree-new-sub</button>
@@ -4329,6 +4334,52 @@ describe('App shell', () => {
     expect(screen.queryByTestId('shared-return-guide')).toBeNull();
   }, 20_000);
 
+  it('keeps an explicit server choice authoritative after a shared route has settled', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-settled-switch',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult(
+      'share-settled-switch',
+      'dispatch-settled-switch',
+    ));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click((await screen.findByText('Shared Beta')).closest('button')!);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-settled-switch');
+    });
+
+    fireEvent.click(screen.getByTestId('shared-return-guide').querySelector('.shared-return-guide-return')!);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#/srv-1/deck_alpha_brain');
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({
+      serverId: 'srv-1',
+      sessionName: 'deck_alpha_brain',
+      sharedEntryId: null,
+    });
+  }, 20_000);
+
   it('does not let a pending shared open undo Back to dashboard', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
@@ -4567,6 +4618,230 @@ describe('App shell', () => {
     });
     await act(async () => { await Promise.resolve(); });
   };
+
+  it('lets an explicit session click retire an older shared-route promise', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const serverEntry = {
+      id: 'share-whole-server',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Whole Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    const lateEntry = {
+      id: 'share-late-session-route',
+      serverId: 'srv-late',
+      serverName: 'Late Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Late Session',
+      target: { kind: 'main', serverId: 'srv-late', sessionName: 'deck_late_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([serverEntry, lateEntry]);
+    let resolveLate!: (value: unknown) => void;
+    openSharedEntryMock.mockImplementation((target: { kind: string; serverId: string }) => {
+      if (target.serverId === 'srv-late') {
+        return new Promise((resolve) => { resolveLate = resolve; });
+      }
+      return Promise.resolve({
+        server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: serverEntry.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: [serverEntry.id],
+          primaryShareId: serverEntry.id,
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'running', agentType: 'codex-sdk' },
+          { sessionName: 'deck_gamma_brain', title: 'Shared Gamma', state: 'running', agentType: 'codex-sdk' },
+        ],
+        subSessions: [],
+      });
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click((await screen.findByText('Whole Shared Server')).closest('button')!);
+    await waitFor(() => expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-whole-server',
+    ));
+
+    await navigateExternally('/#/srv-late/deck_late_brain?shared=share-late-session-route');
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(lateEntry.target));
+
+    fireEvent.click(screen.getByText('tabs-select-deck_gamma_brain'));
+    await waitFor(() => expect(window.location.hash).toBe(
+      '#/srv-shared/deck_gamma_brain?shared=share-whole-server',
+    ));
+
+    await act(async () => {
+      resolveLate({
+        server: { id: 'srv-late', name: 'Late Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: lateEntry.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: [lateEntry.id],
+          primaryShareId: lateEntry.id,
+          authorizedAt: Date.now(),
+        },
+        sessions: [{ sessionName: 'deck_late_brain', title: 'Late Session', state: 'running', agentType: 'codex-sdk' }],
+        subSessions: [],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(window.location.hash).toBe('#/srv-shared/deck_gamma_brain?shared=share-whole-server');
+    expect(screen.queryByTestId('session-pane-deck_late_brain')).toBeNull();
+  }, 20_000);
+
+  it('retires a main-share route when the desktop SessionTree selects another session on that server', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-main-desktop',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      ...sharedMainOpenResult(sharedEntry.id, 'dispatch-main-desktop'),
+      sessions: [
+        { sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'running', agentType: 'codex-sdk' },
+        { sessionName: 'deck_gamma_brain', title: 'Shared Gamma', state: 'running', agentType: 'codex-sdk' },
+      ],
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click((await screen.findByText('Shared Beta')).closest('button')!);
+    await waitFor(() => expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-main-desktop',
+    ));
+
+    fireEvent.click(screen.getByText('tree-select-session-deck_gamma_brain'));
+
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_gamma_brain'));
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({
+      serverId: 'srv-shared',
+      sessionName: 'deck_gamma_brain',
+      sharedEntryId: null,
+    });
+    await waitFor(() => expect(wsInstances.at(-1)?.options?.shareTarget ?? null).toBeNull());
+  }, 20_000);
+
+  it('makes the mobile SessionTree click outrank a stale shared open and closes its sidebar', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const serverEntry = {
+        id: 'share-mobile-server',
+        serverId: 'srv-shared',
+        serverName: 'Shared Server',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Whole Mobile Server',
+        target: { kind: 'server', serverId: 'srv-shared' },
+      } as const;
+      const lateEntry = {
+        id: 'share-mobile-late',
+        serverId: 'srv-late',
+        serverName: 'Late Server',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Late Mobile Session',
+        target: { kind: 'main', serverId: 'srv-late', sessionName: 'deck_late_brain' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([serverEntry, lateEntry]);
+      let resolveLate!: (value: unknown) => void;
+      openSharedEntryMock.mockImplementation((target: { serverId: string }) => {
+        if (target.serverId === 'srv-late') {
+          return new Promise((resolve) => { resolveLate = resolve; });
+        }
+        return Promise.resolve({
+          server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: serverEntry.target,
+          coverage: {
+            effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [serverEntry.id], primaryShareId: serverEntry.id, authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'running', agentType: 'codex-sdk' },
+            { sessionName: 'deck_gamma_brain', title: 'Shared Gamma', state: 'running', agentType: 'codex-sdk' },
+          ],
+          subSessions: [],
+        });
+      });
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-toggle')).toBeTruthy());
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      fireEvent.click((await screen.findByText('Whole Mobile Server')).closest('button')!);
+      await waitFor(() => expect(window.location.hash).toBe(
+        '#/srv-shared/deck_beta_brain?shared=share-mobile-server',
+      ));
+
+      await navigateExternally('/#/srv-late/deck_late_brain?shared=share-mobile-late');
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(lateEntry.target));
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      fireEvent.click(screen.getByText('tree-select-session-deck_gamma_brain'));
+      await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+      await waitFor(() => expect(window.location.hash).toBe(
+        '#/srv-shared/deck_gamma_brain?shared=share-mobile-server',
+      ));
+
+      await act(async () => {
+        resolveLate({
+          server: { id: 'srv-late', name: 'Late Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: lateEntry.target,
+          coverage: {
+            effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [lateEntry.id], primaryShareId: lateEntry.id, authorizedAt: Date.now(),
+          },
+          sessions: [{ sessionName: 'deck_late_brain', title: 'Late Session', state: 'running', agentType: 'codex-sdk' }],
+          subSessions: [],
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(window.location.hash).toBe('#/srv-shared/deck_gamma_brain?shared=share-mobile-server');
+      expect(screen.queryByTestId('session-pane-deck_late_brain')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
 
   it('treats duplicate hashchange/popstate for one navigation as a single idempotent move', async () => {
     history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');

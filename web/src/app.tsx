@@ -589,6 +589,10 @@ export function App() {
   const initialHashStateRef = useRef(resolveInitialRouteState());
   const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
   const sharedOpenGenerationRef = useRef(0);
+  /** Invalidates asynchronous external-route authorization after a newer navigation. */
+  const externalRouteGenerationRef = useRef(0);
+  /** Deduplicates the hashchange/popstate pair emitted for one route transition. */
+  const externalRouteInFlightKeyRef = useRef<string | null>(null);
   const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
   useEffect(() => {
     applyGlobalFontPrefs(globalFontPrefs);
@@ -2652,7 +2656,36 @@ export function App() {
     }
   }, [setOpenSubIds]);
 
+  const claimExplicitSessionNavigation = useCallback((name: string) => {
+    sharedOpenGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+
+    const keepsSharedRoute = !selectedShareTarget
+      || selectedShareTarget.kind !== 'main'
+      || selectedShareTarget.sessionName === name;
+    const nextSharedEntryId = keepsSharedRoute ? selectedSharedEntryId : null;
+    if (!keepsSharedRoute) {
+      setSelectedShareTarget(null);
+      setSelectedSharedEntryId(null);
+      clearSharedTabRestoreMarker();
+      initialSharedTabRestoreRef.current = null;
+    }
+
+    const nextRoute = {
+      serverId: selectedServerId,
+      sessionName: name,
+      sharedEntryId: nextSharedEntryId,
+    };
+    initialHashStateRef.current = nextRoute;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    writeHashState(nextRoute.serverId, nextRoute.sessionName, nextRoute.sharedEntryId);
+  }, [selectedServerId, selectedSharedEntryId, selectedShareTarget]);
+
   const selectMainSessionTab = useCallback((name: string) => {
+    claimExplicitSessionNavigation(name);
     if (name === activeSessionRef.current) {
       closeAllSubSessionWindows();
     } else {
@@ -2663,14 +2696,15 @@ export function App() {
       next.delete(name);
       return next;
     });
-  }, [closeAllSubSessionWindows, setActiveSession]);
+  }, [claimExplicitSessionNavigation, closeAllSubSessionWindows, setActiveSession]);
 
   const selectSubSessionFromTree = useCallback((sub: SubSession) => {
+    claimExplicitSessionNavigation(sub.parentSession ?? activeSessionRef.current ?? sub.sessionName);
     if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
       setActiveSession(sub.parentSession, { keepSubWindows: true });
     }
     openSubSessionWindow(sub.id);
-  }, [openSubSessionWindow, setActiveSession]);
+  }, [claimExplicitSessionNavigation, openSubSessionWindow, setActiveSession]);
 
   useEffect(() => {
     if (!activeSession) return;
@@ -4921,6 +4955,8 @@ export function App() {
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
     sharedOpenGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
     setManualDashboard(false);
@@ -4948,6 +4984,21 @@ export function App() {
       localStorage.removeItem('rcc_session');
     }
 
+    // This click, not the route that happened to mount the document, is now
+    // authoritative. Converge the canonical state before the hash-sync effect
+    // can publish the old shared selection while reload is being scheduled.
+    // Retiring the startup refs also prevents a delayed restore/open result
+    // from treating the original shared URL as a still-live intent.
+    const nextRoute = { serverId, sessionName: savedSession, sharedEntryId: null };
+    initialHashStateRef.current = nextRoute;
+    initialSharedTabRestoreRef.current = null;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    selectedServerIdRef.current = serverId;
+    setSelectedServerId(serverId);
+    setSelectedServerName(serverName ?? null);
+    setActiveSession(savedSession);
+
     // Write the hash BEFORE reload so the new page picks up the right server+session
     // from the URL rather than from (now shared) localStorage.
     writeHashState(serverId, savedSession ?? null);
@@ -4956,7 +5007,7 @@ export function App() {
     // panels start fresh with the new server. Avoids stale WS/state bugs.
     markFastServerSwitchSplash();
     window.location.reload();
-  }, []);
+  }, [setActiveSession]);
 
   /**
    * The single consumer of route changes this document did not initiate.
@@ -4982,14 +5033,6 @@ export function App() {
    * the shared pane rather than leaving a privileged surface mounted under a
    * route that no longer authorizes it.
    */
-  const externalRouteGenerationRef = useRef(0);
-  /**
-   * Route currently being consumed. One user action fires `hashchange` AND
-   * `popstate`, and the second arrives while the first is still awaiting
-   * /api/shares/open, so the settled-state comparison alone cannot dedupe it.
-   * Without this the coverage check ran twice per navigation.
-   */
-  const externalRouteInFlightKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!auth || !serversLoaded) return;
 
@@ -5990,8 +6033,7 @@ export function App() {
               idleFlashTokens={idleFlashTokens}
               p2pSessionLabels={p2pSessionLabels}
               onSelectSession={(name) => {
-                setActiveSession(name);
-                setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+                selectMainSessionTab(name);
               }}
               onSelectSubSession={(sub) => {
                 selectSubSessionFromTree(sub);
@@ -6800,8 +6842,7 @@ export function App() {
                 idleFlashTokens={idleFlashTokens}
                 p2pSessionLabels={p2pSessionLabels}
                 onSelectSession={(name) => {
-                  setActiveSession(name);
-                  setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+                  selectMainSessionTab(name);
                   closeSidebar();
                 }}
                 onSelectSubSession={(sub) => {
