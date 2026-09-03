@@ -1426,6 +1426,14 @@ export class RemoteDesktopClient {
         } else if (this.lastMediaBytesReceived === null
           || inbound.bytesReceived !== this.lastMediaBytesReceived
           || this.lastMediaProgressAt === null) {
+          // Media is flowing again, so the recovery that got us here is over.
+          // The restart budget bounds a single incident; without releasing it
+          // on proof of recovery, a long healthy session eventually spends its
+          // lifetime allowance and is torn down by its own weak-network guard.
+          if (this.lastMediaBytesReceived !== null
+            && inbound.bytesReceived > this.lastMediaBytesReceived) {
+            this.iceRestartCount = 0;
+          }
           this.lastMediaBytesReceived = inbound.bytesReceived;
           this.lastMediaProgressAt = now;
         } else if (now - this.lastMediaProgressAt
@@ -1491,6 +1499,12 @@ export class RemoteDesktopClient {
     }
     this.iceRestartInFlight = true;
     this.iceRestartCount++;
+    // An ICE restart re-gathers a whole new candidate generation, just like
+    // `renegotiate()`. The flood cap bounds one negotiation, so it has to be
+    // rezeroed here too; counting across generations turns a recovering peer
+    // into a protocol_error.
+    this.localIceCandidates = 0;
+    this.remoteIceCandidates = 0;
     this.releaseAll();
     this.workerInputEnabled = false;
     this.requirePresentedFrameForCurrentTopology();

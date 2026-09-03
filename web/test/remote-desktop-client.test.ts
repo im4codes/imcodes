@@ -174,6 +174,11 @@ class FakePeer extends EventTarget {
     this.connectionState = 'connected';
     this.dispatchEvent(new Event('connectionstatechange'));
   }
+  emitLocalCandidate(candidate: string, sdpMid = '0'): void {
+    this.dispatchEvent(Object.assign(new Event('icecandidate'), {
+      candidate: { candidate, sdpMid },
+    }));
+  }
   close(): void { this.connectionState = 'closed'; }
 }
 
@@ -1662,4 +1667,401 @@ describe('RemoteDesktopClient', () => {
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
     }));
   });
-});
+
+  // tsk_4d0: 527ca1bda gave weak networks in-place ICE recovery, but its
+  // per-incident budgets are session-lifetime counters. A connection that
+  // recovers successfully never gets its budget back, so a long, healthy
+  // session is eventually torn down by its own recovery guard.
+  it('restores the ICE recovery budget after each successful in-place recovery', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-budget',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_budget01',
+      capability: 'b'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: 3_600_000,
+      leaseExpiresAt: 3_600_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_budget01',
+      sequence: 1,
+      preset: '720p30',
+      encoderClass: 'hardware',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrateBps: 3_000_000,
+      droppedFrames: 0,
+      rttMs: 1,
+    });
+    let bytes = 10_000;
+    peer.stats = [{ type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, timestamp: 1_000 }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    expect(statsTick).toBeTypeOf('function');
+    now = 1_000;
+    statsTick();
+    await Promise.resolve();
+
+    // Every one of these stalls is a *recovered* incident: the restart is
+    // answered and media resumes. One more than the budget proves the budget
+    // is per-incident rather than per-session.
+    for (let attempt = 1; attempt <= REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS + 1; attempt++) {
+      now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 1_000;
+      statsTick();
+      await vi.waitFor(() => expect(peer.offerOptions).toHaveLength(attempt + 1));
+      expect(peer.offerOptions.at(-1)).toEqual({ iceRestart: true });
+      expect(client.current().terminalReason).toBeUndefined();
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+
+      socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: `v=0\r\nrecovered-${attempt}` });
+      await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toContain(`recovered-${attempt}`));
+      peer.connect();
+      bytes += 10_000;
+      now += 1_000;
+      peer.stats = [{ type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, timestamp: now }];
+      statsTick();
+      await Promise.resolve();
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+    }
+    intervalSpy.mockRestore();
+  });
+
+  // The ICE-candidate flood cap is a per-negotiation guard: `renegotiate()`
+  // already rezeroes it for each new generation. The client-initiated restart
+  // path does not, so candidates accumulate across generations until a
+  // perfectly healthy peer is failed with protocol_error.
+  it('counts the ICE candidate flood cap per negotiation generation, not per session', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-flood',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_flood001',
+      capability: 'c'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: 3_600_000,
+      leaseExpiresAt: 3_600_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_flood001',
+      sequence: 1,
+      preset: '720p30',
+      encoderClass: 'hardware',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrateBps: 3_000_000,
+      droppedFrames: 0,
+      rttMs: 1,
+    });
+    await vi.waitFor(() => expect(socket.sent.filter((raw) => (
+      JSON.parse(raw).type === REMOTE_DESKTOP_MSG.OFFER
+    ))).toHaveLength(1));
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\r\ngen-1' });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toContain('gen-1'));
+
+    peer.stats = [{ type: 'inbound-rtp', kind: 'video', bytesReceived: 10_000, timestamp: 1_000 }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    now = 1_000;
+    statsTick();
+    await Promise.resolve();
+
+    // A busy but legal first generation, comfortably under the cap.
+    const firstGeneration = REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES - 8;
+    for (let i = 0; i < firstGeneration; i++) {
+      socket.receive({ type: REMOTE_DESKTOP_MSG.ICE, ...authority, candidate: `candidate:gen1-${i}`, mid: '0' });
+    }
+    await vi.waitFor(() => expect(peer.candidates.length).toBe(firstGeneration));
+    expect(client.current().terminalReason).toBeUndefined();
+
+    // Weak network: one in-place restart opens a brand new ICE generation.
+    now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 1_000;
+    statsTick();
+    await vi.waitFor(() => expect(peer.offerOptions).toHaveLength(2));
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\r\ngen-2' });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toContain('gen-2'));
+    peer.connect();
+
+    // The replacement generation re-gathers its own candidates. They must be
+    // counted against a fresh budget, exactly as `renegotiate()` does.
+    for (let i = 0; i < 16; i++) {
+      socket.receive({ type: REMOTE_DESKTOP_MSG.ICE, ...authority, candidate: `candidate:gen2-${i}`, mid: '0' });
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(client.current().terminalReason).toBeUndefined();
+    expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+    intervalSpy.mockRestore();
+  });
+
+
+  // The budget is earned back by recovering, not merely by ticking. A tab that
+  // is hidden and shown again clears the progress clock without any media
+  // arriving, and that must not hand a dead peer a fresh set of restarts.
+  it('keeps failing closed when restarts never actually restore media', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    let visible = true;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-failclosed',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => visible,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_failclos',
+      capability: 'd'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: 3_600_000,
+      leaseExpiresAt: 3_600_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_failclos',
+      sequence: 1,
+      preset: '720p30',
+      encoderClass: 'hardware',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrateBps: 3_000_000,
+      droppedFrames: 0,
+      rttMs: 1,
+    });
+
+    // Media starts once and then stops for good.
+    peer.stats = [{ type: 'inbound-rtp', kind: 'video', bytesReceived: 10_000, timestamp: 1_000 }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    now = 1_000;
+    statsTick();
+    await Promise.resolve();
+
+    // Spend the whole budget without a single byte of recovered media.
+    for (let attempt = 1; attempt <= REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS; attempt++) {
+      now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 1_000;
+      statsTick();
+      await vi.waitFor(() => expect(peer.offerOptions).toHaveLength(attempt + 1));
+      peer.connect();
+      await Promise.resolve();
+    }
+    expect(client.current().terminalReason).toBeUndefined();
+
+    // Hide and reveal the tab. This clears the media progress clock, but no
+    // media has arrived, so it is not evidence of recovery.
+    visible = false;
+    now += 1_000;
+    statsTick();
+    await Promise.resolve();
+    visible = true;
+    now += 1_000;
+    statsTick();
+    await Promise.resolve();
+
+    // The peer is still dead, and the exhausted budget must stay exhausted.
+    now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 1_000;
+    statsTick();
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    }));
+    expect(peer.offerOptions).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS + 1);
+    intervalSpy.mockRestore();
+  });
+
+})
+
+  // tsk_4d0 R3. The remote flood cap has a per-generation regression test, but
+  // the LOCAL counter is incremented on a different path -- the peer's own
+  // `icecandidate` events -- and had none. A restart that rezeroes only the
+  // remote counter still fails a healthy recovering peer with protocol_error
+  // once its own re-gathered candidates push the lifetime total past the cap.
+  it('counts locally gathered ICE candidates per generation, not per session', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-local-flood',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_locflood',
+      capability: 'e'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: 3_600_000,
+      leaseExpiresAt: 3_600_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_locflood',
+      sequence: 1,
+      preset: '720p30',
+      encoderClass: 'hardware',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrateBps: 3_000_000,
+      droppedFrames: 0,
+      rttMs: 1,
+    });
+    await vi.waitFor(() => expect(socket.sent.filter((raw) => (
+      JSON.parse(raw).type === REMOTE_DESKTOP_MSG.OFFER
+    ))).toHaveLength(1));
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\\r\\nlocal-gen-1' });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toContain('local-gen-1'));
+
+    peer.stats = [{ type: 'inbound-rtp', kind: 'video', bytesReceived: 10_000, timestamp: 1_000 }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    now = 1_000;
+    statsTick();
+    await Promise.resolve();
+
+    const iceSent = () => socket.sent.filter((raw) => JSON.parse(raw).type === REMOTE_DESKTOP_MSG.ICE).length;
+
+    // Generation 1: busy but legal, comfortably under the cap.
+    const firstGeneration = REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES - 8;
+    for (let i = 0; i < firstGeneration; i++) peer.emitLocalCandidate(`candidate:local-gen1-${i}`);
+    // Every one was really relayed, so the counter was really exercised: this
+    // is what keeps the assertion below from passing against a dropped event.
+    expect(iceSent()).toBe(firstGeneration);
+    expect(client.current().terminalReason).toBeUndefined();
+
+    // Weak network: one in-place restart on the SAME peer opens a new ICE
+    // generation. No session rebuild -- the peer object must be preserved.
+    const peerBeforeRestart = peer;
+    now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 1_000;
+    statsTick();
+    await vi.waitFor(() => expect(peer.offerOptions).toHaveLength(2));
+    expect(peer.offerOptions.at(-1)).toEqual({ iceRestart: true });
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\\r\\nlocal-gen-2' });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toContain('local-gen-2'));
+    peer.connect();
+
+    // Generation 2 stays well under the cap on its own, but the lifetime total
+    // (120 + 16 = 136) exceeds MAX_ICE_CANDIDATES (128).
+    const secondGeneration = 16;
+    for (let i = 0; i < secondGeneration; i++) peer.emitLocalCandidate(`candidate:local-gen2-${i}`);
+    expect(secondGeneration).toBeLessThan(REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES);
+    expect(firstGeneration + secondGeneration).toBeGreaterThan(REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES);
+
+    // A healthy, recovering peer must survive its own re-gathering.
+    expect(client.current().terminalReason).toBeUndefined();
+    expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+    expect(peer).toBe(peerBeforeRestart);
+    expect(iceSent()).toBe(firstGeneration + secondGeneration);
+    intervalSpy.mockRestore();
+  });
+;
