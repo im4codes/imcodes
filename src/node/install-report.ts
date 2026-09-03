@@ -82,6 +82,104 @@ export function controlledNodeInstallStatus(locale: string): string {
     : 'Installing IM.codes, please wait...';
 }
 
+/** Seconds the warning stays on screen before the install proceeds. */
+export const CONTROLLED_NODE_INSTALL_WARNING_SECONDS = 30;
+
+export interface InstallConsentFacts {
+  /** Origin that will control this machine, shown so it can be checked. */
+  serverUrl?: string;
+}
+
+/**
+ * Warning shown before anything is installed, held for a visible countdown.
+ *
+ * Remote-control installers are a standard step in telephone and chat scams:
+ * the victim is walked through pasting a command, and the attacker then owns
+ * the screen, keyboard, files and shell. So this has to arrive BEFORE the first
+ * protected write, name the capability in words a non-technical person already
+ * understands, and name the exact pretexts -- a victim mid-scam does not think
+ * "I am being scammed", they think "I am unfreezing my account", and only the
+ * specific sentence breaks that.
+ *
+ * It states an ACTION, not a caution. "Be careful" leaves someone on a phone
+ * call doing nothing, which is the outcome the caller wants; "close this window
+ * and delete the download" is a thing they can do while being talked at. The
+ * server origin is printed because it is the one fact they can check.
+ */
+export function controlledNodeInstallWarning(
+  locale: string,
+  facts: InstallConsentFacts = {},
+): string {
+  const zh = isChinese(locale);
+  const destination = facts.serverUrl
+    ? zh
+      ? ['', `   ▸ 这台电脑将交给这个服务器的管理员：${facts.serverUrl}`]
+      : ['', `   ▸ This computer will be handed to the administrator of: ${facts.serverUrl}`]
+    : [];
+  const lines = zh
+    ? [
+      RULE,
+      '⚠️  警告：装完之后，别人就能远程控制这台电脑。',
+      '',
+      '   对方将可以：看到你的屏幕、操作你的鼠标键盘、',
+      '   读写你的文件、以管理员身份运行任何命令。',
+      '   这包括你的聊天记录、网银、照片和文档。',
+      ...destination,
+      '',
+      '   如果你是被下面这些人或理由带到这里的，这就是诈骗：',
+      '     · 陌生人、“客服”、“技术支持”让你装',
+      '     · 自称公安/检察院/法院，说你涉案、要你“配合调查”',
+      '     · 刷单、贷款、投资、退款、解冻资金、领取补贴',
+      '     · 让你共享屏幕、开视频，或者念出验证码',
+      '',
+      '❗ 立即关闭当前窗口，并删除刚才下载的软件！',
+      '   真正的公检法不会让你装远程控制软件，也不会让你转账。',
+      '   现在关掉，对方什么也拿不到。',
+      RULE,
+    ]
+    : [
+      RULE,
+      '⚠️  WARNING: after this, someone else can control this computer remotely.',
+      '',
+      '   They will be able to: see your screen, move your mouse and keyboard,',
+      '   read and write your files, and run any command as administrator.',
+      '   That includes your messages, your banking, and your photos.',
+      ...destination,
+      '',
+      '   If any of these is why you are here, it is a scam:',
+      '     · a stranger, "support", or "technical service" told you to install',
+      '     · someone claiming to be the police says you are under investigation',
+      '     · refunds, loans, investments, unfreezing money, claiming a subsidy',
+      '     · they asked you to share your screen or read out a verification code',
+      '',
+      '❗ Close this window now and delete the file you just downloaded!',
+      '   Real police never ask you to install remote-control software, and',
+      '   never ask you to move money. Close it now and they get nothing.',
+      RULE,
+    ];
+  return lines.join('\n');
+}
+
+/**
+ * The line that counts down, rewritten in place each second.
+ *
+ * Naming the escape on every tick matters: someone who only looks up halfway
+ * through still learns they can stop it, and pressing a key is something a
+ * person can do while a caller is talking over them.
+ */
+export function controlledNodeInstallCountdown(locale: string, secondsLeft: number): string {
+  return isChinese(locale)
+    ? `   ${secondsLeft} 秒后开始安装 —— 按任意键立即取消。`
+    : `   Installing in ${secondsLeft}s — press any key to cancel.`;
+}
+
+/** Shown when the human declines, so they know nothing happened. */
+export function controlledNodeInstallDeclined(locale: string): string {
+  return isChinese(locale)
+    ? '已取消安装，这台电脑没有任何改动。'
+    : 'Install cancelled. Nothing on this computer was changed.';
+}
+
 /**
  * Map a thrown error to an actionable cause.
  *

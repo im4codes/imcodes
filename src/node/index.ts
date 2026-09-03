@@ -16,12 +16,16 @@ import {
   runMacosControlledNodeHealthWatchdog,
 } from './health-lease.js';
 import { CONTROLLED_NODE_SERVICE } from './installer.js';
-import { defaultStagedExecutablePath } from './enrollment.js';
+import { defaultStagedExecutablePath, readEnrollmentBlob } from './enrollment.js';
 import {
   CONSOLE_HOLD,
   consoleHoldCountdown,
   consoleHoldMode,
   consoleHoldPrompt,
+  CONTROLLED_NODE_INSTALL_WARNING_SECONDS,
+  controlledNodeInstallCountdown,
+  controlledNodeInstallDeclined,
+  controlledNodeInstallWarning,
   controlledNodeInstallStatus,
   formatInstallFailure,
   formatInstallSuccess,
@@ -96,6 +100,62 @@ async function holdConsoleForReader(): Promise<void> {
   });
 }
 
+/**
+ * Show the scam warning and hold it on screen before any protected write.
+ *
+ * A countdown rather than a typed answer, because the installer must stay
+ * usable where there is no keyboard on the other end -- `ssh` without a pty,
+ * fleet provisioning -- and a gate a legitimate operator cannot pass is a gate
+ * that gets removed. The cost is that silence proceeds, so the warning has to
+ * do the work: it names the capability, names the pretexts, and gives an action
+ * ("close this window and delete the download") rather than a caution.
+ *
+ * Any keypress cancels. That costs an unattended install nothing and gives a
+ * person being talked at by a caller a one-key way out, which is easier to do
+ * than typing while someone is telling you not to.
+ */
+async function warnBeforeInstall(): Promise<boolean> {
+  // Read straight off this installer's own trailer: the origin the human is
+  // about to hand the machine to is the one fact they can independently check,
+  // and a tail read must never be able to fail the install.
+  const serverUrl = await readEnrollmentBlob(process.execPath)
+    .then((blob) => blob?.serverUrl)
+    .catch(() => undefined);
+  const locale = installerLocale();
+  process.stdout.write(`${controlledNodeInstallWarning(locale, {
+    ...(serverUrl ? { serverUrl } : {}),
+  })}\n`);
+
+  const interactive = Boolean(process.stdin.isTTY);
+  return new Promise<boolean>((resolve) => {
+    let left = CONTROLLED_NODE_INSTALL_WARNING_SECONDS;
+    let settled = false;
+    const finish = (proceed: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearInterval(ticker);
+      process.stdin.removeListener('data', onKey);
+      if (interactive && process.stdin.isTTY) process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdout.write('\n');
+      resolve(proceed);
+    };
+    const onKey = (): void => finish(false);
+    const tick = (): void => {
+      process.stdout.write(`\r${controlledNodeInstallCountdown(locale, left)}   `);
+      if (left <= 0) finish(true);
+      left -= 1;
+    };
+    const ticker = setInterval(tick, 1_000);
+    tick();
+    // Raw mode so a single key cancels without waiting for Enter. Only a real
+    // terminal has it; a pipe simply never delivers a key and the timer wins.
+    if (interactive && process.stdin.isTTY) process.stdin.setRawMode(true);
+    process.stdin.on('data', onKey);
+    process.stdin.resume();
+  });
+}
+
 async function main(): Promise<void> {
   if (process.argv[2] === '--version') {
     process.stdout.write(`${DAEMON_VERSION}\n`);
@@ -129,6 +189,11 @@ async function main(): Promise<void> {
   installerLaunch = isInstallerLaunch(
     process.platform, process.execPath, defaultStagedExecutablePath(),
   );
+  if (installerLaunch && !await warnBeforeInstall()) {
+    process.stdout.write(`${controlledNodeInstallDeclined(installerLocale())}\n`);
+    await holdConsoleForReader();
+    return;
+  }
   const now = Date.now();
   const deps = defaultBootstrapDeps(now);
   if (installerLaunch) {

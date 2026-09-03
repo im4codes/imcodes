@@ -340,8 +340,20 @@ async function ensureExecutableStaged(
     if (journal.stagedReceipt.path !== journal.stagedExePath) {
       throw new Error('controlled node staged executable receipt path mismatch; manual recovery required');
     }
-    await deps.verifyStagedExecutable(journal.stagedReceipt);
-    return journal;
+    // The receipt resumes an interrupted staging of THIS package; it is not an
+    // upgrade gate. A staged copy that no longer matches it means the receipt is
+    // stale -- the node replaced its own image, or an operator swapped the file
+    // -- not that the machine is unrecoverable. Re-stage from this installer's
+    // signature-verified bytes instead of stranding the operator with a failure
+    // that no reinstall can clear, which is exactly the deadlock this product
+    // exists to remove.
+    try {
+      await deps.verifyStagedExecutable(journal.stagedReceipt);
+      return journal;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      deps.warn(`staged executable no longer matches its install receipt (${detail}); re-staging from this package`);
+    }
   }
   const stagedReceipt: StagedExecutableReceipt = await source.stageTrailerFreeExecutable(
     deps.stagedExecutablePath,

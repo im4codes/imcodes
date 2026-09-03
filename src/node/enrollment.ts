@@ -297,7 +297,7 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
       await dst.close();
       dst = null;
       if (process.platform !== 'win32') await this.stagingFs.chmod(temp, 0o755);
-      await this.stagingFs.rename(temp, destPath);
+      await this.replaceDestination(temp, destPath);
       renamed = true;
       if (process.platform === 'win32') {
         applyWindowsAclCommands(windowsExecutableFileAclCommands(destPath));
@@ -319,6 +319,34 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
       sourceIdentity: this.identity,
       stagedIdentity: fileIdentityFromStat(stagedStat),
     };
+  }
+
+  /**
+   * Publish the freshly written copy over the stable service path.
+   *
+   * Windows keeps a running image locked, so renaming *onto* the executing
+   * service copy fails with EACCES/EPERM even for SYSTEM. It does allow the
+   * running image to be renamed *away*, so displace the incumbent and take its
+   * name. The running process keeps its open handle and its own bytes; only the
+   * next launch sees the new copy. A failed second rename puts the incumbent
+   * back, so an interrupted re-stage can never leave the stable path missing.
+   */
+  private async replaceDestination(temp: string, destPath: string): Promise<void> {
+    try {
+      await this.stagingFs.rename(temp, destPath);
+      return;
+    } catch (error) {
+      if (process.platform !== 'win32' || !isLockedDestinationError(error)) throw error;
+    }
+    const displaced = `${destPath}.replaced-${randomUUID()}`;
+    await this.stagingFs.rename(destPath, displaced);
+    try {
+      await this.stagingFs.rename(temp, destPath);
+    } catch (error) {
+      await this.stagingFs.rename(displaced, destPath).catch(() => {});
+      throw error;
+    }
+    await this.stagingFs.unlink(displaced).catch(() => {});
   }
 
   async cleanupEnrollmentSource(trailerStart: number, trailerLength: number): Promise<SourceCleanupStatus> {
@@ -400,6 +428,12 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
 
 function isTextFileBusyError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === 'ETXTBSY';
+}
+
+/** Windows refuses to overwrite an executable that is currently running. */
+function isLockedDestinationError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EACCES' || code === 'EPERM' || code === 'EBUSY';
 }
 
 export async function openVerifiedEnrollmentSource(

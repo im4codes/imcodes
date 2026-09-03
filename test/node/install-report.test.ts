@@ -6,6 +6,10 @@ import {
   consoleHoldMode,
   classifyInstallFailure,
   consoleHoldPrompt,
+  CONTROLLED_NODE_INSTALL_WARNING_SECONDS,
+  controlledNodeInstallCountdown,
+  controlledNodeInstallDeclined,
+  controlledNodeInstallWarning,
   controlledNodeInstallStatus,
   formatInstallFailure,
   formatInstallSuccess,
@@ -50,6 +54,52 @@ describe('controlled-node install reporting', () => {
       '/Library/Application Support/imcodes-node/IMCODES-NODE-MACOS',
       '/Library/Application Support/imcodes-node/imcodes-node-macos',
     )).toBe(true);
+  });
+
+  it('names the capability, the scam pretexts and the checkable origin per locale', () => {
+    const zh = controlledNodeInstallWarning('zh-CN', { serverUrl: 'https://im.example.com' });
+    // The capability must be named, not hinted at: remote control is the thing
+    // the victim of a phone scam is never told they are agreeing to.
+    expect(zh).toContain('远程控制这台电脑');
+    expect(zh).toContain('诈骗');
+    expect(zh).toContain('解冻资金');
+    expect(zh).toContain('验证码');
+    // An instruction, not a caution. "Be careful" leaves a person on a phone
+    // call doing nothing, which is exactly what the caller wants.
+    expect(zh).toContain('立即关闭当前窗口，并删除刚才下载的软件！');
+    expect(zh).toContain('真正的公检法不会让你装远程控制软件');
+    // The origin is the one fact the person can independently verify.
+    expect(zh).toContain('https://im.example.com');
+
+    const en = controlledNodeInstallWarning('en-US', { serverUrl: 'https://im.example.com' });
+    expect(en).toContain('scam');
+    expect(en).toContain('remotely');
+    expect(en).toContain('verification code');
+    expect(en).toContain('Close this window now and delete the file you just downloaded!');
+    expect(en).toContain('https://im.example.com');
+
+    // An unreadable trailer must not invent an origin the human cannot check.
+    expect(controlledNodeInstallWarning('en-US')).not.toContain('administrator of:');
+    expect(controlledNodeInstallDeclined('zh-CN')).toContain('没有任何改动');
+    expect(controlledNodeInstallDeclined('en-US')).toContain('Nothing on this computer was changed');
+  });
+
+  it('repeats the escape on every countdown tick, not just the first', () => {
+    // Someone who only looks up halfway through still has to learn they can
+    // stop it, so the way out is on the line that is actually on screen.
+    for (const seconds of [CONTROLLED_NODE_INSTALL_WARNING_SECONDS, 7, 0]) {
+      expect(controlledNodeInstallCountdown('zh-CN', seconds)).toContain('按任意键立即取消');
+      expect(controlledNodeInstallCountdown('zh-CN', seconds)).toContain(String(seconds));
+      expect(controlledNodeInstallCountdown('en-US', seconds)).toContain('press any key to cancel');
+      expect(controlledNodeInstallCountdown('en-US', seconds)).toContain(String(seconds));
+    }
+  });
+
+  it('holds the warning long enough to be read and acted on', () => {
+    // Long enough to read the block and hang up; short enough that provisioning
+    // a fleet does not become a reason to strip the warning out.
+    expect(CONTROLLED_NODE_INSTALL_WARNING_SECONDS).toBeGreaterThanOrEqual(30);
+    expect(CONTROLLED_NODE_INSTALL_WARNING_SECONDS).toBeLessThanOrEqual(60);
   });
 
   it('uses a concise localized status without exposing implementation details', () => {

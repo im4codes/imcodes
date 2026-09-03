@@ -345,6 +345,37 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.phases).toEqual(['service_registered', 'service_start_requested']);
   });
 
+  it('re-stages when the staged copy drifted from its receipt instead of refusing the install', async () => {
+    // Field failure (Windows, 2026-09): a node whose stable image had been
+    // replaced since its install could never be re-installed. Every run failed
+    // with `stable executable size mismatch` because the resume path verified a
+    // stale receipt and refused, so the operator had no way back.
+    const source = makeSource();
+    const deps = makeDeps({
+      openVerifiedEnrollmentSource: vi.fn(async () => source),
+      loadCredential: vi.fn(async () => null),
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      loadInstallJournal: vi.fn(async () => ({
+        phase: 'service_healthy' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+      })),
+      // The stale receipt fails; the receipt written by the re-stage verifies.
+      verifyStagedExecutable: vi.fn()
+        .mockRejectedValueOnce(new Error('stable executable size mismatch'))
+        .mockResolvedValue(undefined),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith('/tmp/staged/imcodes-node', TRAILER.trailerStart, undefined);
+    expect(deps.phases).toContain('files_staged');
+    expect(result.journal.stagedReceipt).toEqual(STAGED_RECEIPT);
+  });
+
   it('first run stages a trailer-free service copy while preserving the reusable source installer', async () => {
     const order: string[] = [];
     const source = makeSource({
