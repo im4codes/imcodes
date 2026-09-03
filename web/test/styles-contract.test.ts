@@ -965,6 +965,37 @@ describe('styles.css regression contracts', () => {
     expect(close - open).toBe(0);
   });
 
+  it('places every assignment-card child outside the 7px icon track', () => {
+    // SessionButton has five possible children. CSS grid auto-placement put
+    // the fourth child (work/execution health) into row 2 / column 1, whose
+    // track is only 7px wide, rendering CJK one character per line. Keep every
+    // child explicit so inserting optional CI cannot shift an earlier fact.
+    const placement = (selector: string) => cssWithoutComments.match(
+      new RegExp(`\\.${selector}\\s*\\{[^}]*\\}`),
+    )?.[0];
+    const expectPlacement = (selector: string, column: RegExp, row: number) => {
+      const rule = placement(selector);
+      expect(rule, `${selector} needs an explicit grid placement`).toBeTruthy();
+      expect(rule).toMatch(column);
+      expect(rule).toMatch(new RegExp(`grid-row:\\s*${row}(?:;|\\s)`));
+    };
+
+    expectPlacement('supervision-task-console-session-icon', /grid-column:\s*1(?:;|\s)/, 1);
+    expectPlacement('supervision-task-console-session-copy', /grid-column:\s*2(?:;|\s)/, 1);
+    expectPlacement('supervision-task-console-session-state', /grid-column:\s*3(?:;|\s)/, 1);
+    expectPlacement('supervision-task-console-session-health', /grid-column:\s*2\s*\/\s*-1/, 2);
+    expectPlacement('supervision-task-console-session-ci', /grid-column:\s*2\s*\/\s*-1/, 3);
+
+    const readableFacts = cssWithoutComments.match(
+      /\.supervision-task-console-session-state,\s*\.supervision-task-console-session-health,\s*\.supervision-task-console-session-ci\s*\{[^}]*\}/,
+    )?.[0];
+    expect(readableFacts, 'variable text facts need one shared safe-overflow rule').toBeTruthy();
+    expect(readableFacts).toMatch(/min-width:\s*0/);
+    expect(readableFacts).toMatch(/overflow:\s*hidden/);
+    expect(readableFacts).toMatch(/text-overflow:\s*ellipsis/);
+    expect(readableFacts).toMatch(/white-space:\s*nowrap/);
+  });
+
   it('collapses the supervision console to one readable column with real touch targets on a phone', () => {
     // At ~375px the console still forced its role tracks into two columns while
     // every sibling grid collapsed to one, so the tracks overflowed the viewport.

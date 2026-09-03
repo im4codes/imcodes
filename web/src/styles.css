@@ -12166,12 +12166,15 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-role-tracks { padding: 7px 7px 7px 0; display: grid; gap: 4px; }
 .supervision-task-console-session { position: relative; min-width: 0; padding: 5px 6px; display: grid; grid-template-columns: 7px minmax(0,1fr) auto; align-items: center; gap: 5px; color: #94a3b8; background: rgba(2,6,23,.36); border: 1px solid rgba(148,163,184,.12); border-radius: 6px; font: inherit; text-align: left; cursor: pointer; }
 .supervision-task-console-session:hover, .supervision-task-console-session:focus-visible { color: #e2e8f0; border-color: rgba(34,211,238,.38); outline: none; }
-.supervision-task-console-session-icon { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 7px currentColor; }
-.supervision-task-console-session-copy { min-width: 0; display: flex; flex-direction: column; }
+.supervision-task-console-session-icon { grid-column: 1; grid-row: 1; width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 7px currentColor; }
+.supervision-task-console-session-copy { grid-column: 2; grid-row: 1; min-width: 0; display: flex; flex-direction: column; }
 .supervision-task-console-session-copy strong, .supervision-task-console-session-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .supervision-task-console-session-copy strong { color: inherit; font-size: 9px; }
 .supervision-task-console-session-copy small { color: #64748b; font-size: 7px; }
-.supervision-task-console-session-state { font-size: 7px; text-transform: uppercase; }
+.supervision-task-console-session-state { grid-column: 3; grid-row: 1; max-width: 12rem; font-size: 7px; text-transform: uppercase; }
+.supervision-task-console-session-health { grid-column: 2/-1; grid-row: 2; }
+.supervision-task-console-session-ci { grid-column: 2/-1; grid-row: 3; }
+.supervision-task-console-session-state, .supervision-task-console-session-health, .supervision-task-console-session-ci { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .supervision-task-console-session.session-running { color: #22d3ee; }
 .supervision-task-console-session.lane-auditor.session-running { color: #a78bfa; }
 .supervision-task-console-session.session-idle { color: #64748b; }
