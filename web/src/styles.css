@@ -12213,8 +12213,14 @@ button.quick-agent-delegation-preset.active {
 @media (max-width: 640px) {
   .supervision-task-console-grid { grid-template-columns: minmax(0,1fr) !important; }
   .supervision-task-console-task-head { grid-template-columns: minmax(0,1fr); }
-  .supervision-task-console-role-tracks { padding: 0 8px 7px; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  /* Every sibling grid collapses here; the role tracks stayed two-up and
+     overflowed a ~375px viewport. */
+  .supervision-task-console-role-tracks { padding: 0 8px 7px; grid-template-columns: minmax(0,1fr); }
   .supervision-task-console-fields { grid-template-columns: minmax(0,1fr); }
+  /* Desktop density is not tappable: give the real controls a 44px target. */
+  .supervision-task-console-tabs button { min-height: 44px; padding: 7px 12px; }
+  .supervision-task-console-session { min-height: 44px; padding: 8px 10px; }
+  .supervision-task-console-close { min-width: 44px; min-height: 44px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .supervision-task-console-task.activity-running,

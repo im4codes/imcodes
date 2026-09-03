@@ -964,4 +964,40 @@ describe('styles.css regression contracts', () => {
     const close = (stripped.match(/\}/g) ?? []).length;
     expect(close - open).toBe(0);
   });
+
+  it('collapses the supervision console to one readable column with real touch targets on a phone', () => {
+    // At ~375px the console still forced its role tracks into two columns while
+    // every sibling grid collapsed to one, so the tracks overflowed the viewport.
+    // The same breakpoint left every control at desktop density, well under the
+    // 44px minimum tap target.
+    // styles.css has many 640px blocks; select the one that owns the console.
+    let mobile = '';
+    for (let at = cssWithoutComments.indexOf('@media (max-width: 640px)');
+      at !== -1;
+      at = cssWithoutComments.indexOf('@media (max-width: 640px)', at + 1)) {
+      const end = cssWithoutComments.indexOf('\n}', at);
+      const block = cssWithoutComments.slice(at, end === -1 ? undefined : end);
+      if (block.includes('.supervision-task-console-grid')) { mobile = block; break; }
+    }
+    expect(mobile, 'the console mobile breakpoint must exist').not.toBe('');
+
+    const roleTracks = mobile.match(/\.supervision-task-console-role-tracks\s*\{[^}]*\}/)?.[0];
+    expect(roleTracks, 'the mobile block must address the role tracks').toBeTruthy();
+    expect(
+      roleTracks,
+      'role tracks must not stay two-up on a phone',
+    ).not.toMatch(/grid-template-columns:\s*repeat\(2/);
+    expect(roleTracks).toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+
+    for (const selector of [
+      '\\.supervision-task-console-tabs button',
+      '\\.supervision-task-console-session',
+      '\\.supervision-task-console-close',
+    ]) {
+      const rule = mobile.match(new RegExp(`${selector}\\s*\\{[^}]*\\}`))?.[0];
+      expect(rule, `${selector} must be sized for touch on a phone`).toBeTruthy();
+      expect(rule, `${selector} must meet the 44px tap target`).toMatch(/min-height:\s*44px/);
+    }
+  });
+
 });
