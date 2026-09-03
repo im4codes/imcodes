@@ -2472,6 +2472,127 @@ describe('SupervisionAutomation', () => {
     });
   });
 
+  it('keeps the 10-minute WAITING heartbeat alive while parked during post-audit finalization', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      mockSupervisionDecide.mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'only repository finalization remains',
+        confidence: 0.9,
+        gap: 'changes are uncommitted',
+        nextAction: 'Commit the completed changes and push to origin/dev.',
+      });
+
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-heartbeat-finalizing',
+        'implement the feature',
+        snapshot,
+      );
+      beginRun('cmd-heartbeat-finalizing', 'implement the feature');
+      completeTurn('Implementation and tests are complete.');
+      await waitForRunPhase('auditing');
+
+      completeDelegatedAudit('PASS', 'The implementation and tests pass.');
+      await waitForRunPhase('finalizing');
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+      expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain(
+        'Commit the completed changes and push to origin/dev.',
+      );
+
+      // The finalization turn reports it pushed and is now WAITING on an
+      // external reply (e.g. CI or an integration owner) before it can close
+      // out. `phase` here only records *why* the run is parked (post-audit
+      // delivery work vs. the original implementation); the 10-minute
+      // heartbeat watchdog must keep recurring exactly like any other parked
+      // WAITING regardless of that phase.
+      completeTurn(`Pushed and awaiting the integration owner's reply.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'finalizing',
+        waitingStartedAt: expect.any(Number),
+      });
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000 - 1);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+      const heartbeatPrompt = String(mockTransportRuntime.send.mock.calls[2]?.[0]);
+      expect(heartbeatPrompt).toContain('[Contract: supervision_waiting_heartbeat_v1]');
+      const heartbeatRows = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'user.message'
+          && String(event.payload.clientMessageId ?? '').startsWith('supervision-waiting-heartbeat:'),
+      );
+      expect(heartbeatRows).toHaveLength(1);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'finalizing',
+      });
+
+      // The cadence must keep recurring, not fire once and go silent.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves the finalizing phase (not just the heartbeat) for a WAITING park across a daemon restart', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      mockSupervisionDecide.mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'only repository finalization remains',
+        confidence: 0.9,
+        gap: 'changes are uncommitted',
+        nextAction: 'Commit the completed changes and push to origin/dev.',
+      });
+
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-heartbeat-finalizing-restart',
+        'implement the feature',
+        snapshot,
+      );
+      beginRun('cmd-heartbeat-finalizing-restart', 'implement the feature');
+      completeTurn('Implementation and tests are complete.');
+      await waitForRunPhase('auditing');
+
+      completeDelegatedAudit('PASS', 'The implementation and tests pass.');
+      await waitForRunPhase('finalizing');
+
+      completeTurn(`Pushed and awaiting the integration owner's reply.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+
+      // Simulate the daemon losing in-memory state (process restart) while the
+      // durable SQLite wait-state record survives. Restoring a `finalizing`
+      // WAITING park must not silently collapse it to a plain `execution`
+      // park: that would keep the heartbeat alive (a passing symptom) while
+      // still losing the finalization-specific continue/advance wording the
+      // rest of the automation keys off `phase === 'finalizing'` for.
+      supervisionAutomation.__simulateProcessRestartForTests();
+      const restored = supervisionAutomation.getActiveRun('deck_supervision_brain');
+      expect(restored).toMatchObject({
+        commandId: 'cmd-heartbeat-finalizing-restart',
+        phase: 'finalizing',
+        waitingStartedAt: expect.any(Number),
+      });
+
+      // The recurring heartbeat must also still fire post-restart.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockTransportRuntime.send.mock.calls.length).toBeGreaterThanOrEqual(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ['merge', 'Merge the repaired branch into master.'],
     ['release', 'Create the release for the repaired change.'],

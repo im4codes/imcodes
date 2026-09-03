@@ -1654,6 +1654,7 @@ class SupervisionAutomation {
       snapshot: run.snapshot,
       userText: run.userText,
       phase,
+      ...(run.phase === 'finalizing' ? { runPhase: 'finalizing' as const } : {}),
       requiresAudit: run.requiresAudit,
       freshAuditRequiredAfterRework: run.freshAuditRequiredAfterRework,
       continueLoops: run.continueLoops,
@@ -1740,7 +1741,9 @@ class SupervisionAutomation {
         snapshot,
         hasLiveSnapshotUpdate: false,
         userText: persisted.userText,
-        phase: persisted.phase === 'waiting' ? 'execution' : 'auditing',
+        phase: persisted.phase !== 'waiting'
+          ? 'auditing'
+          : persisted.runPhase === 'finalizing' ? 'finalizing' : 'execution',
         requiresAudit: persisted.requiresAudit,
         freshAuditRequiredAfterRework: persisted.freshAuditRequiredAfterRework,
         continueLoops: persisted.continueLoops,
@@ -2361,7 +2364,16 @@ class SupervisionAutomation {
 
   private dispatchWaitingHeartbeat(run: ActiveTaskRunState): void {
     const current = this.activeRuns.get(run.sessionName);
-    if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+    // WAITING can be reported from either the original implementation phase
+    // or from post-audit finalization (`dispatchContinue` on a deferred
+    // finalization action, e.g. "push and wait for the integration owner").
+    // `phase` records *why* the run is parked, not whether the 10-minute
+    // heartbeat watchdog still applies -- excluding 'finalizing' here left
+    // the recurring reminder permanently silent (armed once, never re-armed)
+    // for any run that parks WAITING while finishing delivery after audit
+    // PASS, even though the run itself stayed correctly parked.
+    if (!current || current.generation !== run.generation
+      || (current.phase !== 'execution' && current.phase !== 'finalizing')) return;
     if (!isAutomaticSupervisionEnabled(current.snapshot)) return;
     const now = Date.now();
     if (!current.waitingStartedAt) return;

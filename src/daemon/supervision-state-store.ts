@@ -93,6 +93,18 @@ export interface PersistedSupervisionWaitState {
   snapshot: SessionSupervisionSnapshot;
   userText: string;
   phase: PersistedSupervisionWaitPhase;
+  /**
+   * The in-memory `TaskRunPhase` ('execution' | 'auditing' | 'finalizing')
+   * at persist time, distinct from `phase` above (which only records the
+   * *kind* of park: waiting-heartbeat-governed vs audit-deadline-governed).
+   * Only meaningful when `phase === 'waiting'` and the run was parked while
+   * finishing post-audit delivery work (deferred finalization). Omitted for
+   * an ordinary execution-phase park. Restore must preserve this instead of
+   * collapsing every 'waiting' park to 'execution': losing it after a daemon
+   * restart silently downgrades a finalizing-phase wait back to a plain
+   * execution-phase wait, changing what continue/advance prompts it gets.
+   */
+  runPhase?: 'execution' | 'finalizing';
   requiresAudit: boolean;
   freshAuditRequiredAfterRework: boolean;
   continueLoops: number;
@@ -161,6 +173,9 @@ function parseRecord(payload: string): PersistedSupervisionWaitState | undefined
     if (!value.snapshot || typeof value.snapshot !== 'object') return undefined;
     if (typeof value.userText !== 'string') return undefined;
     if (value.phase !== 'waiting' && value.phase !== 'auditing') return undefined;
+    if (value.runPhase !== undefined && value.runPhase !== 'execution' && value.runPhase !== 'finalizing') {
+      return undefined;
+    }
     if (!isFiniteTimestamp(value.startedAt) || !isFiniteTimestamp(value.updatedAt)) return undefined;
     return value as PersistedSupervisionWaitState;
   } catch {
