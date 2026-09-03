@@ -1,4 +1,6 @@
 import {
+  directFileTransferAttemptBindingMatches,
+  type DirectFileTransferAttemptBinding,
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_FILE_TRANSFER_DATA_MSG,
@@ -82,6 +84,39 @@ export const DIRECT_FILE_TRANSFER_CLIENT_METRIC = {
   DIRECT_SUCCESS: 'direct_success',
   BYTES: 'bytes',
   ROUTE: 'route',
+  /** Why a lease peer was reused, restarted or rebuilt for an operation. */
+  PEER: 'peer',
+  /** Wall time of one establishment stage, so a slow upload can be attributed. */
+  STAGE: 'stage',
+} as const;
+
+/**
+ * Why `ensureLeasePeer` took the branch it did.
+ *
+ * Establishment previously reported nothing between "lease reused" and "bytes
+ * flowing", so a slow upload could not be attributed: an operation waiting on
+ * authorization looked exactly like one waiting on ICE. These reasons name the
+ * decision itself.
+ */
+export const DIRECT_FILE_TRANSFER_PEER_REASON = {
+  /** Live peer from a previous probe/operation carried the new channel. */
+  REUSED: 'reused',
+  /** Another caller was already building it; we joined that attempt. */
+  JOINED_PENDING: 'joined_pending',
+  /** No peer yet, or the old one was closed. */
+  BUILT_COLD: 'built_cold',
+  /** Peer was failed/disconnected; bounded ICE restart on the same lease. */
+  ICE_RESTART: 'ice_restart',
+  /** ICE restart already spent on this generation; full lease re-init. */
+  LEASE_REINIT: 'lease_reinit',
+} as const;
+
+/** Establishment stages, in the order an operation passes through them. */
+export const DIRECT_FILE_TRANSFER_STAGE = {
+  OPERATION_AUTHORIZE: 'operation_authorize',
+  PEER_READY: 'peer_ready',
+  CHANNEL_OPEN: 'channel_open',
+  FIRST_CHUNK: 'first_chunk',
 } as const;
 
 type DirectFileTransferClientMetric = typeof DIRECT_FILE_TRANSFER_CLIENT_METRIC[keyof typeof DIRECT_FILE_TRANSFER_CLIENT_METRIC];
@@ -93,6 +128,11 @@ type DirectFileTransferMetricFields = {
   /** Candidate type only; never an address, port, id, or URL. */
   route?: DirectConnectivityRoute | 'unknown';
   reused?: boolean;
+  /** One of DIRECT_FILE_TRANSFER_PEER_REASON; never free text. */
+  reason?: string;
+  /** One of DIRECT_FILE_TRANSFER_STAGE. */
+  stage?: string;
+  elapsedMs?: number;
 };
 
 function recordDirectFileTransferMetric(metric: DirectFileTransferClientMetric, fields: DirectFileTransferMetricFields = {}): void {
@@ -153,6 +193,10 @@ type Lease = {
   rebinding: Promise<void> | null;
   iceRestartedGeneration: number | null;
   peerCreating: Promise<void> | null;
+  /** Daemon generation the live peer was negotiated against. A warm transport
+   *  outlives lease authority, so after a daemon restart the far side of that
+   *  ICE/DTLS association is gone and reusing it would hang every new channel. */
+  peerDaemonGeneration: number | null;
   leaseSignalRequestId: string | null;
   /**
    * Browser WebSocket lifecycle generation. Any lease/SDP wait started on an
@@ -168,6 +212,29 @@ type Lease = {
   terminalGrace: Map<string, TerminalGrace>;
 };
 
+/**
+ * Receiver-confirmed progress for an upload attempt.
+ *
+ * The upload direction had no receiver-to-sender signal during transfer:
+ * UPLOAD_COMMITTED is a terminal message carrying the finished attachment, and
+ * CREDIT was validated for DOWNLOAD only. So the sender judged liveness purely
+ * from its own `bufferedAmount`, which cannot separate "the peer is committing
+ * steadily but slowly" from "the peer is gone" — and a single drain slower than
+ * the no-progress budget killed a transfer that was in fact advancing.
+ */
+type UploadCommitTracker = {
+  committedBytes: number;
+  /** Incremented on every advance so a sleeping waiter can tell it moved. */
+  advances: number;
+  /** Bytes this attempt has actually handed to the channel, resume prefix
+   *  included. A receiver cannot have committed more than was sent. */
+  sentBytes: number;
+  /** Total size of the file, so an ACK past the end is rejected. */
+  totalBytes: number;
+  /** Set once an ACK proves impossible; the pump stops rather than trusting it. */
+  fatal?: DirectFileTransferFailure;
+};
+
 type ActiveAttempt = {
   readonly requestId: string;
   readonly attemptId: string;
@@ -178,6 +245,8 @@ type ActiveAttempt = {
   daemonGeneration: number | null;
   authority: string | null;
   channel: RTCDataChannel | null;
+  /** Present for uploads only; fed by the daemon's committed-offset reports. */
+  uploadCommit?: UploadCommitTracker;
   signal?: AbortSignal;
 };
 
@@ -199,6 +268,15 @@ type DirectUploadAttempt = {
   kind: 'upload';
   file: File;
   operationId: string;
+  /**
+   * Byte offset the NEXT attempt of this operation may continue from.
+   *
+   * Only ever set from an offset the previous attempt saw confirmed on its own
+   * live channel, so a replacement never inherits a number it could not verify.
+   * A transient channel/ICE loss then costs the remaining bytes instead of the
+   * whole file (and instead of falling back to the relay with all of them).
+   */
+  resumeFromBytes?: number;
   sessionName?: string;
   destinationDirectory?: string;
   onProgress?: (pct: number) => void;
@@ -317,6 +395,7 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     rebinding: null,
     iceRestartedGeneration: null,
     peerCreating: null,
+    peerDaemonGeneration: null,
     leaseSignalRequestId: null,
     controlEpoch: 0,
     controlAbort: new AbortController(),
@@ -712,8 +791,21 @@ function closePeer(lease: Lease): void {
   lease.peerState = null;
 }
 
+/**
+ * Expire the lease AUTHORITY while leaving a healthy transport warm.
+ *
+ * This used to call `closePeer` first, so the daemon's five-minute lease TTL
+ * also tore down the ICE/DTLS association. Opening a server and uploading a few
+ * minutes later therefore paid for a full renegotiation even though the
+ * connectivity probe had already established a working path and nothing about
+ * the network had changed.
+ *
+ * Authority and transport are separate concerns: only the binding below
+ * expires. The peer is released by `disposeLease` (server close/switch, tab
+ * cleanup, LRU eviction) or by `ensureLeasePeer` when it is unhealthy or its
+ * daemon generation no longer matches.
+ */
 function clearLeaseBinding(lease: Lease): void {
-  closePeer(lease);
   lease.leaseId = null;
   lease.leaseGeneration = null;
   lease.daemonGeneration = null;
@@ -741,6 +833,12 @@ function invalidateLeaseControl(lease: Lease): void {
     // No data plane has to survive this control reconnect. A clean lease and
     // RTCPeerConnection is both cheaper and safer than trying to infer whether
     // a mobile WebView's old association is still viable.
+    //
+    // The closePeer is explicit now: `clearLeaseBinding` only expires AUTHORITY
+    // so that a five-minute lease TTL cannot destroy a healthy warm transport.
+    // Losing the daemon is a different event — its identity changed, so the far
+    // end of this association is gone and the peer must go with it.
+    closePeer(lease);
     clearLeaseBinding(lease);
     return;
   }
@@ -812,11 +910,28 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
   // no longer has a viable path; killing the app appeared to fix the issue
   // only because it constructed a fresh RTCPeerConnection. Treat an explicit
   // operation/probe against a disconnected peer as a bounded ICE restart.
+  // A warm transport may carry a new operation only when it is both healthy
+  // AND still facing the same daemon it was negotiated against.
+  const generationMatches = lease.peerDaemonGeneration === null
+    || lease.peerDaemonGeneration === lease.daemonGeneration;
   if (lease.peer
+    && generationMatches
     && lease.peer.connectionState !== 'failed'
     && lease.peer.connectionState !== 'disconnected'
-    && lease.peer.connectionState !== 'closed') return;
-  if (lease.peerCreating) return lease.peerCreating;
+    && lease.peer.connectionState !== 'closed') {
+    if (lease.peerDaemonGeneration === null) lease.peerDaemonGeneration = lease.daemonGeneration;
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
+      reason: DIRECT_FILE_TRANSFER_PEER_REASON.REUSED,
+    });
+    return;
+  }
+  if (lease.peer && !generationMatches) closePeer(lease);
+  if (lease.peerCreating) {
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
+      reason: DIRECT_FILE_TRANSFER_PEER_REASON.JOINED_PENDING,
+    });
+    return lease.peerCreating;
+  }
   const epoch = lease.controlEpoch;
   const signal = lease.controlAbort.signal;
   let peerCreating!: Promise<void>;
@@ -826,16 +941,29 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
     const restarting = lease.peer?.connectionState === 'failed'
       || lease.peer?.connectionState === 'disconnected';
     if (restarting && lease.iceRestartedGeneration === lease.leaseGeneration) {
+      recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
+        reason: DIRECT_FILE_TRANSFER_PEER_REASON.LEASE_REINIT,
+      });
+      // This branch is only reached with an already failed/disconnected peer
+      // whose one ICE restart is spent, so the transport is genuinely unhealthy
+      // and must be dropped explicitly rather than via clearLeaseBinding.
+      closePeer(lease);
       clearLeaseBinding(lease);
       return ensureLease(lease);
     }
     let peer = lease.peer;
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
+      reason: restarting
+        ? DIRECT_FILE_TRANSFER_PEER_REASON.ICE_RESTART
+        : DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD,
+    });
     if (!peer || peer.connectionState === 'closed') {
       closePeer(lease);
       peer = new RTCPeerConnection({ iceServers: toBrowserIceServers(lease.iceServers) });
       const createdPeer = peer;
       lease.peer = createdPeer;
       lease.peerState = createdPeer.connectionState;
+      lease.peerDaemonGeneration = lease.daemonGeneration;
       // A cold RTCPeerConnection has no application m-line until a data
       // channel exists. Creating this authority-free lease channel before the
       // first offer makes the initial SDP acceptable to node-datachannel and
@@ -1058,11 +1186,33 @@ function waitForChannelOpen(
   });
 }
 
-function waitForBufferedAmount(channel: RTCDataChannel): Promise<void> {
-  if (channel.bufferedAmount <= DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES) return Promise.resolve();
+function waitForBufferedAmount(channel: RTCDataChannel, commit?: UploadCommitTracker): Promise<void> {
+  // Two bounds, both on existing water marks. `bufferedAmount` covers what SCTP
+  // still holds locally; unacknowledged bytes cover what the receiver has not
+  // yet durably written. Watching only the first lets a peer that accepts fast
+  // but commits slowly pull an unbounded amount of the file into flight.
+  const unacknowledged = commit ? commit.sentBytes - commit.committedBytes : 0;
+  if (channel.bufferedAmount <= DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES
+    && unacknowledged <= DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES) return Promise.resolve();
   channel.bufferedAmountLowThreshold = DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_LOW_WATER_BYTES;
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => finish(directError(DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT)), DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
+    // The budget is about PROGRESS, not drain speed. Each expiry re-arms if the
+    // receiver committed more bytes while we slept, so a slow-but-advancing
+    // transfer is never killed, while one that genuinely stops still fails
+    // within the same NO_PROGRESS_TIMEOUT_MS. With no tracker (an older daemon
+    // that never reports commits) this is byte-for-byte the previous behaviour.
+    let seenAdvances = commit?.advances ?? 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      timer = setTimeout(() => {
+        if (commit && commit.advances !== seenAdvances) {
+          seenAdvances = commit.advances;
+          arm();
+          return;
+        }
+        finish(directError(DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT));
+      }, DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
+    };
     const finish = (error?: unknown) => {
       clearTimeout(timer);
       channel.removeEventListener('bufferedamountlow', onLow);
@@ -1073,6 +1223,7 @@ function waitForBufferedAmount(channel: RTCDataChannel): Promise<void> {
     const onClose = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
     channel.addEventListener('bufferedamountlow', onLow, { once: true });
     channel.addEventListener('close', onClose, { once: true });
+    arm();
   });
 }
 
@@ -1080,13 +1231,39 @@ function sendData(channel: RTCDataChannel, message: object): void {
   channel.send(JSON.stringify(message));
 }
 
+/**
+ * The exact tuple every data-plane frame of this attempt must carry — both the
+ * one we send and the one we will accept back. Returns null instead of
+ * throwing so the inbound path can reject rather than fail the transfer.
+ *
+ * A control-plane rebind can switch the lease's current daemon generation
+ * while this already-authorized channel is still carrying FINISH/CREDIT or
+ * CANCEL, so the attempt's authority stays bound to the generation frozen at
+ * AUTHORIZED rather than to whatever the lease holds now.
+ */
+function expectedDataBinding(lease: Lease, active: ActiveAttempt): DirectFileTransferAttemptBinding | null {
+  if (!lease.leaseId || !lease.leaseGeneration || active.daemonGeneration === null) return null;
+  return {
+    serverId: lease.serverId,
+    browserTabId: lease.browserTabId,
+    leaseId: lease.leaseId,
+    leaseGeneration: lease.leaseGeneration,
+    daemonGeneration: active.daemonGeneration,
+    requestId: active.requestId,
+    attemptId: active.attemptId,
+    attempt: active.attempt,
+    direction: active.direction,
+    operationId: active.operationId,
+  };
+}
+
 function makeDataBinding(lease: Lease, active: ActiveAttempt) {
-  const current = currentBinding(lease, active);
-  if (active.daemonGeneration === null) throw directError(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
-  // A control-plane rebind can switch the lease's current daemon generation
-  // while this already-authorized channel is still carrying FINISH/CREDIT or
-  // CANCEL. Its one-time authority remains bound to the original generation.
-  return { ...current, daemonGeneration: active.daemonGeneration };
+  // Keeps the pre-existing failure shapes: an unusable lease is LEASE_EXPIRED,
+  // an attempt with no frozen generation is INVALID_AUTHORITY.
+  currentBinding(lease, active);
+  const expected = expectedDataBinding(lease, active);
+  if (!expected) throw directError(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
+  return expected;
 }
 
 async function pumpUpload(
@@ -1096,11 +1273,25 @@ async function pumpUpload(
   file: File,
   onProgress?: (pct: number) => void,
 ): Promise<void> {
-  let offset = 0;
+  const commit = active.uploadCommit;
+  const pumpStartedAt = Date.now();
+  // Start where the receiver has already durably committed. The prefix is on
+  // disk on the far side; re-sending it is exactly the whole-file restart this
+  // exists to avoid.
+  let offset = commit?.committedBytes ?? 0;
   while (offset < file.size) {
-    await waitForBufferedAmount(channel);
+    if (commit?.fatal) throw commit.fatal;
+    await waitForBufferedAmount(channel, commit);
     const end = Math.min(file.size, offset + DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES);
     channel.send(await file.slice(offset, end).arrayBuffer());
+    if (commit) commit.sentBytes = end;
+    if (offset === 0) {
+      recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.STAGE, {
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+        stage: DIRECT_FILE_TRANSFER_STAGE.FIRST_CHUNK,
+        elapsedMs: Date.now() - pumpStartedAt,
+      });
+    }
     offset = end;
     // 100% means the daemon has durably committed the attachment, not merely
     // that the browser filled the SCTP send queue. Keeping the byte phase at
@@ -1134,8 +1325,21 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     daemonGeneration: null,
     authority: null,
     channel: null,
+    ...(op.kind === 'upload'
+      ? {
+        uploadCommit: {
+          // The prefix the daemon already holds is credited up front; this
+          // attempt only has to prove the remainder.
+          committedBytes: op.resumeFromBytes ?? 0,
+          advances: 0,
+          sentBytes: op.resumeFromBytes ?? 0,
+          totalBytes: op.file.size,
+        },
+      }
+      : {}),
     signal: op.signal,
   };
+  const attemptStartedAt = Date.now();
   lease.active.set(active.requestId, active);
   clearLeaseTimer(lease);
   recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ATTEMPT, {
@@ -1191,13 +1395,34 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     // prewarm. Operation authorization merely allocates a data channel on that
     // reusable peer, so no file authority ever appears in an offer or ICE.
     if (op.signal?.aborted) throw directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false);
+    // Establishment is timed per stage. Without this, "the upload took ages to
+    // connect" could not be attributed: waiting on operation authorization and
+    // waiting on ICE/DTLS look identical from the outside, and the fast daemon
+    // connectivity probe covers only part of the same path.
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.STAGE, {
+      direction: active.direction,
+      stage: DIRECT_FILE_TRANSFER_STAGE.OPERATION_AUTHORIZE,
+      elapsedMs: Date.now() - attemptStartedAt,
+    });
+    const peerStartedAt = Date.now();
     await waitForCaller(ensureLeasePeer(lease), op.signal);
     const peer = lease.peer;
     if (!peer) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.STAGE, {
+      direction: active.direction,
+      stage: DIRECT_FILE_TRANSFER_STAGE.PEER_READY,
+      elapsedMs: Date.now() - peerStartedAt,
+    });
+    const channelStartedAt = Date.now();
     const channel = peer.createDataChannel(parsed.value.channelLabel, { ordered: true });
     channel.binaryType = 'arraybuffer';
     active.channel = channel;
     await waitForChannelOpen(channel, peer, op.signal);
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.STAGE, {
+      direction: active.direction,
+      stage: DIRECT_FILE_TRANSFER_STAGE.CHANNEL_OPEN,
+      elapsedMs: Date.now() - channelStartedAt,
+    });
 
     const result = await new Promise<OperationSuccess>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1323,7 +1548,13 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
         const parsedData = validateDirectFileTransferDataMessage(raw);
         if (!parsedData.ok) return;
         const data = parsedData.value as DirectFileTransferDataMessage;
-        if (!('requestId' in data) || data.requestId !== active.requestId || data.attemptId !== active.attemptId) return;
+        // A frame is only this attempt's if it echoes the WHOLE tuple. The
+        // correlation pair alone let a well-formed frame from another daemon
+        // generation, lease, operation, direction or attempt set the resume
+        // boundary — the value that decides which bytes are never resent.
+        const expectedBinding = expectedDataBinding(lease, active);
+        if (!expectedBinding
+          || !directFileTransferAttemptBindingMatches(expectedBinding, data as unknown as Record<string, unknown>)) return;
         arm();
         if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.ERROR) {
           fail(directError(data.error));
@@ -1338,6 +1569,30 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
               uploadSourceFinished = true;
               arm(DIRECT_FILE_TRANSFER_LIMITS.STATUS_RECOVERY_DEADLINE_MS);
             }).catch(fail);
+            return;
+          }
+          if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT
+            && data.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD
+            && typeof data.committedBytes === 'number') {
+            const tracker = active.uploadCommit;
+            if (!tracker) return;
+            const committed = data.committedBytes;
+            // Re-stating the current offset is a harmless duplicate.
+            if (committed === tracker.committedBytes) return;
+            // Everything else that is not forward progress within what this
+            // attempt actually sent is impossible, so it is treated as a fault
+            // rather than silently ignored: going backwards, claiming more than
+            // the file holds, or claiming more than we have handed over would
+            // all corrupt the resume boundary a later attempt depends on.
+            if (committed < tracker.committedBytes
+              || committed > tracker.totalBytes
+              || committed > tracker.sentBytes) {
+              tracker.fatal = directError(DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
+              fail(tracker.fatal);
+              return;
+            }
+            tracker.committedBytes = committed;
+            tracker.advances += 1;
             return;
           }
           if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED) {
@@ -1420,11 +1675,15 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       channel.addEventListener('close', onClose, { once: true });
       channel.addEventListener('error', onError, { once: true });
       op.signal?.addEventListener('abort', onAbort, { once: true });
+      const resumeOffset = op.kind === 'upload' ? (op.resumeFromBytes ?? 0) : 0;
       sendData(channel, {
         type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
         protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
         ...makeDataBinding(lease, active),
         authority: parsed.value.authority,
+        // Only sent when actually resuming, so an older daemon that does not
+        // know the field keeps seeing exactly the frames it always saw.
+        ...(resumeOffset > 0 ? { resumeOffset } : {}),
       });
       arm();
     });
@@ -1442,6 +1701,16 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     await abortDownloadWriter(error);
     throw error;
   } finally {
+    // Hand this attempt's OWN confirmed offset to the next one. Each attempt
+    // trusts only what it saw acknowledged on its own live channel, so a
+    // replacement can never inherit an unverified boundary — and the boundary
+    // can only move forward, never past the file.
+    if (op.kind === 'upload') {
+      const confirmed = active.uploadCommit?.committedBytes ?? 0;
+      if (confirmed > (op.resumeFromBytes ?? 0) && confirmed <= op.file.size) {
+        op.resumeFromBytes = confirmed;
+      }
+    }
     cleanup();
   }
 }
@@ -1508,12 +1777,21 @@ async function retryDirect<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   let last: unknown = directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR);
+  // Carried between attempts of the SAME operation: how far the receiver was
+  // last seen to have durably committed. Only ever written from an offset the
+  // finished attempt confirmed on its own live channel.
+  let resumeFromBytes = 0;
   for (let attempt = 1; attempt <= DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS; attempt++) {
     if (attempt > 1) await wait(retryDelay(attempt - 1), signal);
     const attemptControlEpoch = lease.controlEpoch;
+    const operation = await createOperation(attempt);
+    if (operation.kind === 'upload' && resumeFromBytes > 0) operation.resumeFromBytes = resumeFromBytes;
     try {
-      return await runAttempt(lease, await createOperation(attempt), attempt) as T;
+      return await runAttempt(lease, operation, attempt) as T;
     } catch (error) {
+      if (operation.kind === 'upload' && (operation.resumeFromBytes ?? 0) > resumeFromBytes) {
+        resumeFromBytes = operation.resumeFromBytes ?? 0;
+      }
       last = error;
       const disposition = failureDisposition(error, attempt);
       // A retryable channel/ICE failure must not feed the next attempt back

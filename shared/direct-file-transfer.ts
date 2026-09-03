@@ -352,6 +352,36 @@ export interface DirectFileTransferAttemptBinding extends DirectFileTransferLeas
   operationId: string;
 }
 
+/**
+ * Every data-plane frame must echo the EXACT attempt tuple it belongs to.
+ *
+ * The correlation pair (requestId, attemptId) is not sufficient on its own: a
+ * frame can be well formed and carry the right pair while belonging to another
+ * daemon generation, another lease, another operation, another direction or an
+ * earlier attempt of the same operation. For uploads that is not cosmetic —
+ * the offset such a frame carries becomes the resume boundary a later attempt
+ * starts from, i.e. the value that decides which bytes are never sent again.
+ *
+ * Shared so the two ends cannot drift: the daemon validated the full tuple
+ * while the browser checked only two fields, and that asymmetry WAS the
+ * bypass. One definition, used by both.
+ */
+export function directFileTransferAttemptBindingMatches(
+  expected: DirectFileTransferAttemptBinding,
+  value: Record<string, unknown>,
+): boolean {
+  return value.serverId === expected.serverId
+    && value.browserTabId === expected.browserTabId
+    && value.leaseId === expected.leaseId
+    && value.leaseGeneration === expected.leaseGeneration
+    && value.daemonGeneration === expected.daemonGeneration
+    && value.requestId === expected.requestId
+    && value.attemptId === expected.attemptId
+    && value.attempt === expected.attempt
+    && value.direction === expected.direction
+    && value.operationId === expected.operationId;
+}
+
 export interface DirectFileTransferLeaseInit {
   type: typeof DIRECT_FILE_TRANSFER_MSG.LEASE_INIT;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
@@ -573,6 +603,21 @@ export interface DirectFileTransferDataStart extends DirectFileTransferAttemptBi
   type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.START;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
   authority: string;
+  /**
+   * UPLOAD only: byte offset this attempt wants to continue from.
+   *
+   * A transient DataChannel/ICE replacement used to cost the whole file: the
+   * next attempt started at zero, or the operation gave up and re-sent
+   * everything over the HTTP relay. The sender already learns a durable offset
+   * from the receiver (see `committedBytes` on CREDIT), so it can ask to
+   * continue from exactly that point.
+   *
+   * Advisory, never authority. The receiver accepts it only when the operation,
+   * authorized identity, declared size and the actual length of its own partial
+   * file all agree; anything else fails closed. Absent or 0 means "from the
+   * beginning", which is the only shape older senders can produce.
+   */
+  resumeOffset?: number;
 }
 
 export type DirectFileTransferDataAccepted = DirectFileTransferAttemptBinding & {
@@ -589,6 +634,20 @@ export interface DirectFileTransferDataCredit extends DirectFileTransferAttemptB
   type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
   creditBytes: number;
+  /**
+   * UPLOAD only: bytes the receiver has durably written, monotonic per attempt.
+   *
+   * The upload direction had no receiver-to-sender signal at all — CREDIT was
+   * validated for DOWNLOAD exclusively — so a browser sending a file could only
+   * judge liveness from its own `RTCDataChannel.bufferedAmount`. That cannot
+   * distinguish "the peer is committing steadily but slowly" from "the peer is
+   * gone", and a single drain slower than the no-progress budget killed a
+   * transfer that was in fact advancing the whole time.
+   *
+   * Emitted by the daemon AFTER the write resolves, so it is a commit point and
+   * never a promise. Absent from DOWNLOAD credits, which carry only a window.
+   */
+  committedBytes?: number;
 }
 
 export interface DirectFileTransferDataFinish extends DirectFileTransferAttemptBinding {
@@ -1203,8 +1262,14 @@ function isDataAttemptBinding(value: Record<string, unknown>): boolean {
 export function validateDirectFileTransferDataMessage(value: unknown): DirectFileTransferValidationResult<DirectFileTransferDataMessage> {
   if (!isRecord(value) || typeof value.type !== 'string') return invalid();
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.START) {
-    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority'])
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority'], ['resumeOffset'])
       || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isDataAttemptBinding(value) || !isAuthority(value.authority)) return invalid();
+    if (value.resumeOffset !== undefined) {
+      // Resuming is an upload-only notion, and a non-integer or negative offset
+      // is malformed rather than merely unsatisfiable.
+      if (value.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD
+        || !isDirectFileTransferSize(value.resumeOffset)) return invalid();
+    }
     return { ok: true, value: value as unknown as DirectFileTransferDataStart };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED) {
@@ -1219,10 +1284,20 @@ export function validateDirectFileTransferDataMessage(value: unknown): DirectFil
     return { ok: true, value: value as unknown as DirectFileTransferDataAccepted };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT) {
-    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'creditBytes'])
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'creditBytes'], ['committedBytes'])
       || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isDataAttemptBinding(value)
-      || value.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD
       || !isPositiveSafeInteger(value.creditBytes) || value.creditBytes > DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES) return invalid();
+    // DOWNLOAD credit is a pure flow-control window and must not claim a commit
+    // point; UPLOAD credit exists only to carry one, so it is required there.
+    // Keeping the two shapes disjoint means a peer cannot smuggle a fabricated
+    // offset in on the direction that has no receiver-side write behind it.
+    if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+      if (value.committedBytes !== undefined) return invalid();
+    } else if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+      if (!isDirectFileTransferSize(value.committedBytes)) return invalid();
+    } else {
+      return invalid();
+    }
     return { ok: true, value: value as unknown as DirectFileTransferDataCredit };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH) {

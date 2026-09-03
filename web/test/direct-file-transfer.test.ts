@@ -140,7 +140,7 @@ function controlBinding(message: Record<string, unknown>) {
 function createWs(
   capabilities: string[],
   mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' = 'success',
-  leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
+  leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
   const capabilityHandlers = new Set<(snapshot: { capabilities: string[] } | null) => void>();
@@ -283,7 +283,9 @@ function createWs(
           browserTabId: message.browserTabId,
           leaseId: id(),
           leaseGeneration: 1,
-          daemonGeneration: 1,
+          daemonGeneration: leaseInitCount >= 2 && leaseTiming.secondLeaseDaemonGeneration !== undefined
+            ? leaseTiming.secondLeaseDaemonGeneration
+            : 1,
           resumeTicket: `${opaque('r')}.${opaque('s')}.${opaque('t')}`,
           idleExpiresAt: issuedAt + (leaseTiming.idleWindowMs ?? DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS),
           expiresAt: issuedAt + 10 * 60_000,
@@ -400,6 +402,49 @@ function createUploadFile(name: string, content: string): File {
     }),
   } as unknown as File;
 }
+
+
+/**
+ * A large upload file whose slices are produced without materialising the whole
+ * buffer, so a 50 MB / 100 MB case stays cheap in CI.
+ */
+function createLargeUploadFile(name: string, size: number): File {
+  return {
+    name,
+    type: 'application/octet-stream',
+    size,
+    slice: (start: number, end: number) => ({
+      arrayBuffer: async () => new ArrayBuffer(Math.max(0, end - start)),
+    }),
+  } as unknown as File;
+}
+
+/**
+ * `createLargeUploadFile` with the pump's byte ranges recorded. The DATA frames
+ * on the wire are opaque ArrayBuffers, so the only faithful way to prove "the
+ * prefix was not re-sent" is to observe which ranges the pump actually read.
+ */
+function createRecordingUploadFile(name: string, size: number) {
+  const file = createLargeUploadFile(name, size);
+  const slices: Array<{ start: number; end: number }> = [];
+  const innerSlice = (file as unknown as { slice: (s: number, e: number) => unknown }).slice;
+  Object.defineProperty(file, 'slice', {
+    value: (start: number, end: number) => {
+      slices.push({ start, end });
+      return innerSlice(start, end);
+    },
+    configurable: true,
+    writable: true,
+  });
+  return { file, slices };
+}
+
+/** Large enough that the pump is still running after several receiver ticks,
+ *  so an injected counterexample actually reaches a live attempt. */
+const ACK_FILE_BYTES = 50 * 1024 * 1024;
+
+/** Inputs a commit-report counterexample is built from. */
+type BadAck = { lastGood: number; sent: number };
 
 describe('direct file transfer v2 browser broker', () => {
   afterEach(() => {
@@ -1351,7 +1396,22 @@ describe('direct file transfer v2 browser broker', () => {
     expect(FakePeerConnection.instances.at(-1)?.connectionState).toBe('new');
   });
 
-  it('tears down an idle prewarm after five minutes and initializes a new lease on the next click', async () => {
+  /**
+   * CONTRACT CHANGE: the idle window retires AUTHORITY, not the transport.
+   *
+   * This case previously asserted two RTCPeerConnections — the five-minute
+   * lease TTL tore down the ICE/DTLS association along with the binding. That
+   * made "open a server, upload a few minutes later" pay for a full
+   * renegotiation the connectivity probe had already completed, which is the
+   * reported slow-establishment symptom. The lease re-init is still expected
+   * and still asserted (LEASE_INIT twice); what must NOT happen any more is
+   * discarding a healthy peer with it.
+   *
+   * A cold rebuild is still required, and covered elsewhere, when the peer is
+   * unhealthy, the daemon generation/identity changes, or the lease is disposed
+   * by an explicit close, tab cleanup or LRU eviction.
+   */
+  it('retires only the authority after five minutes and re-binds onto the warm transport', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities);
@@ -1369,8 +1429,10 @@ describe('direct file transfer v2 browser broker', () => {
     await vi.advanceTimersByTimeAsync(0);
     await expect(pending).resolves.toMatchObject({ ok: true });
 
+    // Authority really did expire and was re-initialised...
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
-    expect(FakePeerConnection.instances).toHaveLength(2);
+    // ...but the transport the prewarm established was kept and reused.
+    expect(FakePeerConnection.instances).toHaveLength(1);
     release?.();
   });
 
@@ -1579,5 +1641,853 @@ describe('direct file transfer v2 browser broker', () => {
     await secondRejected;
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
   });
+
+
+  /**
+   * RED — upload-direction progress is invisible to the sender.
+   *
+   * CREDIT is the only receiver->sender signal in the protocol and its
+   * validator rejects anything that is not DOWNLOAD
+   * (shared/direct-file-transfer.ts, CREDIT branch). CREDIT is emitted only by
+   * the browser and consumed only by the daemon, so on an UPLOAD the daemon
+   * never tells the browser anything until FINISH. The sender's entire notion
+   * of "is this still working" is therefore `channel.bufferedAmount`, and
+   * `waitForBufferedAmount` fails the transfer if a single drain to the low
+   * water mark takes longer than NO_PROGRESS_TIMEOUT_MS.
+   *
+   * That conflates "the peer is slow" with "the peer is gone". A receiver that
+   * is steadily committing bytes — just slower than one timeout window per
+   * drain — is killed even though the transfer is advancing the whole time.
+   */
+  it('does not fail an upload that is still making progress, only slower than one drain window', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const file = createLargeUploadFile('large.bin', 50 * 1024 * 1024);
+
+    // Model a receiver that never stops committing but drains slowly: each
+    // send adds to the send queue, and the queue is relieved on a cadence
+    // longer than one NO_PROGRESS window. Progress never actually stalls.
+    const drainPeriodMs = DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS + 5_000;
+    let drainTimer: ReturnType<typeof setInterval> | null = null;
+    let commitTimer: ReturnType<typeof setInterval> | null = null;
+    // Commits land well inside one no-progress window; drains do not.
+    const commitPeriodMs = Math.floor(DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS / 5);
+    let maxBufferedSeen = 0;
+    let sendCount = 0;
+    // Wrap, do not replace: createWs installed the control-plane responder on
+    // this same hook, and dropping it silently pushes the upload onto the HTTP
+    // fallback so the direct path under test never runs.
+    const innerOnDataChannel = FakePeerConnection.onDataChannel;
+    let uploadBinding: Record<string, unknown> | null = null;
+    let committed = 0;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      innerOnDataChannel?.(channel, value);
+      if (typeof value === 'string') {
+        // Capture the attempt binding the browser is using so the fake daemon
+        // can address its commit reports back at the same attempt.
+        try {
+          const payload = JSON.parse(value) as Record<string, unknown>;
+          if (payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && payload.attemptId) {
+            uploadBinding = {
+              serverId: payload.serverId,
+              browserTabId: payload.browserTabId,
+              leaseId: payload.leaseId,
+              leaseGeneration: payload.leaseGeneration,
+              daemonGeneration: payload.daemonGeneration,
+              requestId: payload.requestId,
+              attemptId: payload.attemptId,
+              attempt: payload.attempt,
+              direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+              operationId: payload.operationId,
+            };
+          }
+        } catch { /* not a control frame */ }
+        return;
+      }
+      sendCount += 1;
+      channel.bufferedAmount += DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+      maxBufferedSeen = Math.max(maxBufferedSeen, channel.bufferedAmount);
+      if (!commitTimer) {
+        // A receiver that is committing steadily reports often — every durable
+        // write — even while its send queue drains slowly. Tying the two
+        // together would model a peer that only confirms once per drain, which
+        // is not the reported situation.
+        commitTimer = setInterval(() => {
+          // A receiver that is genuinely committing keeps up with what it has
+          // been handed; it is the QUEUE DRAIN that is slow here, not the disk.
+          // Reporting a fixed trickle instead would model a receiver falling
+          // permanently behind, which the in-flight bound is supposed to stop.
+          committed = sendCount * DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+          if (uploadBinding) {
+            const frame = {
+              type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+              protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+              ...uploadBinding,
+              creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+              committedBytes: committed,
+            };
+            channel.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(frame) }));
+          }
+        }, commitPeriodMs);
+      }
+      if (!drainTimer) {
+        drainTimer = setInterval(() => {
+          channel.bufferedAmount = 0;
+          channel.bufferedAmountLowThreshold = 0;
+          channel.dispatchEvent(new Event('bufferedamountlow'));
+        }, drainPeriodMs);
+      }
+    };
+
+    try {
+      const upload = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+      const settled = upload.then(() => 'resolved' as const, (error) => error);
+      // Enough virtual time for every chunk to clear: each backpressure wait
+      // costs one drain period, and 50 MB at 64 KiB is 800 chunks.
+      for (let i = 0; i < 40; i++) await vi.advanceTimersByTimeAsync(drainPeriodMs);
+      await settled;
+      // The outcome alone proves nothing: when direct fails, HTTP relay picks
+      // the upload up and the caller still sees success. What must be asserted
+      // is that the DIRECT path survived — otherwise a 50 MB upload silently
+      // re-sends every byte over the relay, which is the "it takes forever"
+      // the user reports.
+      expect(
+        maxBufferedSeen,
+        'the scenario must actually reach the backpressure high-water mark',
+      ).toBeGreaterThan(DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES);
+      expect(
+        apiMocks.uploadFile,
+        'a receiver that keeps committing must not push the upload onto the HTTP relay',
+      ).not.toHaveBeenCalled();
+      expect(sendCount, 'the direct pump must deliver every chunk').toBe(file.size / DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES);
+    } finally {
+      if (drainTimer) clearInterval(drainTimer);
+      if (commitTimer) clearInterval(commitTimer);
+    }
+  }, 30_000);
+
+
+  /**
+   * RED-A — a healthy peer left behind by a successful probe must carry the
+   * next upload.
+   *
+   * Reported symptom: on the same machine the Daemon status view's direct
+   * connectivity check completes in well under a second, but an upload started
+   * right afterwards takes a long time to establish. That asymmetry points at
+   * state reuse rather than the network: `brokers` is a
+   * `WeakMap<WsClient, Map<serverId, Lease>>`, so reuse requires the SAME
+   * WsClient object AND the same serverId string. The probe's `finally` only
+   * calls `release()` and deliberately does not tear the peer down on success,
+   * so the lease/peer should still be there for the upload.
+   *
+   * This test holds the identity inputs constant on purpose. If it passes, the
+   * reuse contract itself is sound and the production gap must be that the two
+   * call sites (SubSessionBar's probe vs SessionControls' upload) do not hand
+   * in the same WsClient instance / serverId — which is a wiring defect, not a
+   * protocol one. If it fails, reuse is broken in the broker itself.
+   */
+  /**
+   * A — name the state that is lost between a fast probe and a slow upload.
+   *
+   * The daemon connectivity probe completes in well under a second on the same
+   * machine, yet an upload started afterwards can take far longer to establish.
+   * Establishment reported nothing between "lease reused" and "bytes flowing",
+   * so the two cases were indistinguishable from the outside. This drives the
+   * documented state transitions and asserts the REASON the peer was reused or
+   * rebuilt, which is the thing that actually differs.
+   */
+  /**
+   * The warm transport survives authority expiry, but it must NOT survive the
+   * daemon changing underneath it: after a daemon restart the far end of that
+   * ICE/DTLS association no longer exists, and reusing it would hang every new
+   * channel instead of failing fast.
+   */
+  it('rebuilds the transport when the re-bound lease reports a different daemon generation', async () => {
+    vi.useFakeTimers();
+    const { prewarmDirectFileLease, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { DIRECT_FILE_TRANSFER_CLIENT_METRIC, DIRECT_FILE_TRANSFER_PEER_REASON } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities, undefined, { secondLeaseDaemonGeneration: 2 });
+
+    const peerReasons: string[] = [];
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation((...args: unknown[]) => {
+      const payload = args[1] as { metric?: string; reason?: string } | undefined;
+      if (payload?.metric === DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER && payload.reason) peerReasons.push(payload.reason);
+    });
+
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      const peersAfterPrewarm = FakePeerConnection.instances.length;
+
+      // Authority expires; the daemon comes back as a different generation.
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1_000);
+      const before = peerReasons.length;
+      await uploadFileWithDirectFallback({
+        ws,
+        serverId: 'server-1',
+        file: createUploadFile('new-generation.txt', 'gen'),
+      });
+
+      expect(
+        peerReasons.slice(before),
+        'a transport negotiated against the old daemon must not be reused',
+      ).toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
+      expect(FakePeerConnection.instances.length).toBeGreaterThan(peersAfterPrewarm);
+    } finally {
+      debugSpy.mockRestore();
+      release?.();
+    }
+  }, 20_000);
+
+  /**
+   * The reported failure: a 50 MB upload loses its transport partway and the
+   * whole file is re-sent. Resume means the replacement attempt starts at the
+   * offset the RECEIVER confirmed durable, and the prefix is never read again.
+   *
+   * The receiver here is deliberately asynchronous — commits are reported from
+   * a timer, exactly as a real peer's `message` events arrive on a later task.
+   * A synchronous commit report is not a faithful peer: it lands inside
+   * `channel.send()`, before the pump has recorded what it handed over, and
+   * makes the transfer fail on an ordering that no real transport can produce.
+   */
+  it('resumes an interrupted upload from the receiver-confirmed offset and never re-sends the prefix', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const { file, slices } = createRecordingUploadFile('resume.bin', 50 * 1024 * 1024);
+
+    const starts: Array<number | undefined> = [];
+    const sliceMarks: number[] = [];
+    let binding: Record<string, unknown> | null = null;
+    let currentChannel: FakeDataChannel | null = null;
+    let attemptBase = 0;
+    let attemptSent = 0;
+    let committed = 0;
+    let committedAtDrop = 0;
+    let dropped = false;
+    let tick: ReturnType<typeof setInterval> | null = null;
+
+    // Wrap, do not replace: createWs installed the responder that answers
+    // START with ACCEPTED and FINISH with UPLOAD_COMMITTED. Dropping it makes
+    // the direct path fail and the assertions below pass for the wrong reason.
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      inner?.(channel, value);
+      if (typeof value === 'string') {
+        try {
+          const payload = JSON.parse(value) as Record<string, unknown>;
+          if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+            && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+            starts.push(payload.resumeOffset as number | undefined);
+            sliceMarks.push(slices.length);
+            attemptBase = (payload.resumeOffset as number | undefined) ?? 0;
+            attemptSent = 0;
+            currentChannel = channel;
+            binding = {
+              serverId: payload.serverId, browserTabId: payload.browserTabId,
+              leaseId: payload.leaseId, leaseGeneration: payload.leaseGeneration,
+              daemonGeneration: payload.daemonGeneration, requestId: payload.requestId,
+              attemptId: payload.attemptId, attempt: payload.attempt,
+              direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, operationId: payload.operationId,
+            };
+          }
+        } catch { /* not a control frame */ }
+        return;
+      }
+      currentChannel = channel;
+      attemptSent += chunk;
+      channel.bufferedAmount += chunk;
+      if (tick) return;
+      tick = setInterval(() => {
+        const ch = currentChannel;
+        if (!ch || ch.readyState !== 'open' || !binding) return;
+        ch.bufferedAmount = 0;
+        ch.dispatchEvent(new Event('bufferedamountlow'));
+        const next = Math.min(file.size, attemptBase + attemptSent);
+        if (next <= committed) return;
+        committed = next;
+        ch.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...binding,
+            creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+            committedBytes: committed,
+          }),
+        }));
+        // Kill the transport exactly once: after a positive prefix is durable
+        // on the far side, and before any terminal frame.
+        if (!dropped && committed > 0 && committed < file.size) {
+          dropped = true;
+          committedAtDrop = committed;
+          ch.close();
+        }
+      }, 5);
+    };
+
+    try {
+      const upload = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+      const settled = upload.then((v) => ({ ok: true as const, v }), (e) => ({ ok: false as const, e }));
+      for (let i = 0; i < 1_200; i++) await vi.advanceTimersByTimeAsync(5);
+      const outcome = await settled;
+
+      expect(dropped, 'the scenario must actually lose the transport mid-transfer').toBe(true);
+      expect(starts.length, 'the first attempt must be retryable — a replacement attempt must start').toBeGreaterThanOrEqual(2);
+      expect(starts[0], 'a fresh upload must not advertise a resume offset').toBeUndefined();
+      expect(starts[1], 'the replacement must resume at exactly what the receiver confirmed').toBe(committedAtDrop);
+
+      const resumed = slices.slice(sliceMarks[1]);
+      expect(resumed.length, 'the replacement attempt must actually send data').toBeGreaterThan(0);
+      expect(resumed[0].start, 'the first byte of the replacement must be the resume boundary').toBe(committedAtDrop);
+      expect(
+        resumed.filter((r) => r.start < committedAtDrop),
+        'no byte below the confirmed offset may be read again — that is the whole-file restart being fixed',
+      ).toEqual([]);
+      expect(
+        Math.max(...resumed.map((r) => r.end)),
+        'the replacement must carry the transfer to the end of the file',
+      ).toBe(file.size);
+
+      expect(apiMocks.uploadFile, 'a resumable direct failure must not fall back to the HTTP relay').not.toHaveBeenCalled();
+      expect(outcome.ok, 'the resumed upload must succeed').toBe(true);
+      expect(
+        (outcome as { v: { attachment?: { id?: string } } }).v?.attachment?.id,
+        'success must come from the direct path, not from a relay upload',
+      ).toBe('direct-attachment');
+    } finally {
+      if (tick) clearInterval(tick);
+      FakePeerConnection.onDataChannel = inner;
+    }
+  }, 60_000);
+
+  /**
+   * RED — the browser accepts a commit report on requestId + attemptId alone.
+   *
+   * The daemon validates the FULL attempt tuple before it acts on a frame
+   * (`sameAttempt`), so the browser is the asymmetric weak side: a frame that
+   * is well formed and carries the right requestId/attemptId but belongs to a
+   * different daemon generation, lease, operation, direction or attempt is
+   * still trusted, and its offset becomes the resume boundary a later attempt
+   * starts from. That is an authorization bypass on the exact value that
+   * decides which bytes are never sent again.
+   *
+   * Asserted through the resume boundary rather than through an internal
+   * counter: the replacement attempt must resume at what the LEGITIMATE report
+   * confirmed, never at what the mis-bound one claimed.
+   */
+  /**
+   * Direction is guarded in two places: the shared attempt-binding comparison,
+   * and an explicit `direction === UPLOAD` test inside the CREDIT branch. A
+   * mis-directed CREDIT is therefore caught twice, and no single mutant on
+   * either guard can be killed by it.
+   *
+   * This case can only be caught by the binding comparison, because it is not
+   * a CREDIT at all: a well-formed ERROR frame belonging to the DOWNLOAD
+   * direction must not be able to kill an upload that is progressing normally.
+   */
+  it('ignores a well-formed frame from the other direction instead of letting it fail the upload', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const file = createLargeUploadFile('cross-direction.bin', ACK_FILE_BYTES);
+
+    let binding: Record<string, unknown> | null = null;
+    let currentChannel: FakeDataChannel | null = null;
+    let injected = false;
+    let sent = 0;
+    let committed = 0;
+    let tick: ReturnType<typeof setInterval> | null = null;
+
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      inner?.(channel, value);
+      if (typeof value === 'string') {
+        try {
+          const payload = JSON.parse(value) as Record<string, unknown>;
+          if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+            && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+            currentChannel = channel;
+            binding = {
+              serverId: payload.serverId, browserTabId: payload.browserTabId,
+              leaseId: payload.leaseId, leaseGeneration: payload.leaseGeneration,
+              daemonGeneration: payload.daemonGeneration, requestId: payload.requestId,
+              attemptId: payload.attemptId, attempt: payload.attempt,
+              direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, operationId: payload.operationId,
+            };
+          }
+        } catch { /* not a control frame */ }
+        return;
+      }
+      currentChannel = channel;
+      sent += chunk;
+      channel.bufferedAmount += chunk;
+      if (tick) return;
+      tick = setInterval(() => {
+        const ch = currentChannel;
+        if (!ch || ch.readyState !== 'open' || !binding) return;
+        ch.bufferedAmount = 0;
+        ch.dispatchEvent(new Event('bufferedamountlow'));
+        // A healthy receiver keeps confirming; without this the in-flight
+        // bound legitimately stalls the pump and the test proves nothing.
+        const next = Math.min(file.size, sent);
+        if (next > committed) {
+          committed = next;
+          ch.dispatchEvent(new MessageEvent('message', {
+            data: JSON.stringify({
+              type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+              protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+              ...binding,
+              creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+              committedBytes: committed,
+            }),
+          }));
+        }
+        if (!injected) {
+          injected = true;
+          ch.dispatchEvent(new MessageEvent('message', {
+            data: JSON.stringify({
+              type: DIRECT_FILE_TRANSFER_DATA_MSG.ERROR,
+              protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+              ...binding,
+              direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+              error: DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
+            }),
+          }));
+        }
+      }, 5);
+    };
+
+    try {
+      const upload = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+      const settled = upload.then((v) => ({ ok: true as const, v }), (e) => ({ ok: false as const, e }));
+      for (let i = 0; i < 400; i++) await vi.advanceTimersByTimeAsync(5);
+      const outcome = await settled;
+
+      expect(injected, 'the cross-direction frame must actually be delivered').toBe(true);
+      expect(outcome.ok, 'a frame bound to the other direction must not settle this upload').toBe(true);
+      expect(apiMocks.uploadFile, 'and must not push it onto the HTTP relay').not.toHaveBeenCalled();
+    } finally {
+      if (tick) clearInterval(tick);
+      FakePeerConnection.onDataChannel = inner;
+    }
+  }, 60_000);
+
+  it.each([
+    // A LOWER generation is deliberately not used: the lease starts at
+    // generation 1, so `- 1` is 0, which the shared schema already rejects as
+    // a non-positive integer. That would make the test green on validation
+    // rather than on authorization. A different well-formed generation is the
+    // case authorization actually has to carry.
+    { label: 'a wrong daemon generation', mutate: (b: Record<string, unknown>) => ({ daemonGeneration: (b.daemonGeneration as number) + 1 }) },
+    { label: 'a different lease id', mutate: () => ({ leaseId: 'lease-from-another-tab' }) },
+    { label: 'a wrong lease generation', mutate: (b: Record<string, unknown>) => ({ leaseGeneration: (b.leaseGeneration as number) + 1 }) },
+    { label: 'a different operation id', mutate: () => ({ operationId: 'operation-from-another-upload' }) },
+    { label: 'the wrong direction', mutate: () => ({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD }) },
+    { label: 'a different attempt number', mutate: (b: Record<string, unknown>) => ({ attempt: (b.attempt as number) + 1 }) },
+  ])('never advances the resume boundary from a commit report carrying $label', async ({ mutate }) => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const file = createLargeUploadFile('misbound.bin', ACK_FILE_BYTES);
+
+    const starts: Array<number | undefined> = [];
+    let binding: Record<string, unknown> | null = null;
+    let currentChannel: FakeDataChannel | null = null;
+    let attemptBase = 0;
+    let attemptSent = 0;
+    let confirmedByLegitimateReport = 0;
+    let spoofed = false;
+    let dropped = false;
+    let tick: ReturnType<typeof setInterval> | null = null;
+    // Deliberately far ahead of anything legitimately acknowledged, so trusting
+    // it would visibly skip bytes that were never durably written.
+    const spoofedOffset = ACK_FILE_BYTES - chunk;
+
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      inner?.(channel, value);
+      if (typeof value === 'string') {
+        try {
+          const payload = JSON.parse(value) as Record<string, unknown>;
+          if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+            && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+            starts.push(payload.resumeOffset as number | undefined);
+            attemptBase = (payload.resumeOffset as number | undefined) ?? 0;
+            attemptSent = 0;
+            currentChannel = channel;
+            binding = {
+              serverId: payload.serverId, browserTabId: payload.browserTabId,
+              leaseId: payload.leaseId, leaseGeneration: payload.leaseGeneration,
+              daemonGeneration: payload.daemonGeneration, requestId: payload.requestId,
+              attemptId: payload.attemptId, attempt: payload.attempt,
+              direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, operationId: payload.operationId,
+            };
+          }
+        } catch { /* not a control frame */ }
+        return;
+      }
+      currentChannel = channel;
+      attemptSent += chunk;
+      channel.bufferedAmount += chunk;
+      if (tick) return;
+      tick = setInterval(() => {
+        const ch = currentChannel;
+        if (!ch || ch.readyState !== 'open' || !binding) return;
+        ch.bufferedAmount = 0;
+        ch.dispatchEvent(new Event('bufferedamountlow'));
+        const emit = (frame: Record<string, unknown>) => ch.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...binding,
+            creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+            ...frame,
+          }),
+        }));
+        const next = Math.min(file.size, attemptBase + attemptSent);
+        if (!spoofed) {
+          // One legitimate report establishes the only boundary that may ever
+          // be trusted.
+          confirmedByLegitimateReport = next;
+          emit({ committedBytes: next });
+          // Then the same channel delivers a well-formed report whose binding
+          // belongs somewhere else, claiming far more.
+          emit({ committedBytes: spoofedOffset, ...mutate(binding) });
+          spoofed = true;
+          return;
+        }
+        if (!dropped) {
+          dropped = true;
+          ch.close();
+          return;
+        }
+        if (next > attemptBase) emit({ committedBytes: next });
+      }, 5);
+    };
+
+    try {
+      const upload = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+      const settled = upload.then((v) => ({ ok: true as const, v }), (e) => ({ ok: false as const, e }));
+      for (let i = 0; i < 1_500; i++) await vi.advanceTimersByTimeAsync(5);
+      await settled;
+
+      expect(spoofed, 'the mis-bound report must actually be delivered').toBe(true);
+      expect(dropped, 'the transport must actually be lost so a resume boundary is used').toBe(true);
+      expect(starts.length, 'a replacement attempt must start').toBeGreaterThanOrEqual(2);
+      expect(
+        starts[1],
+        'the replacement must resume at what the legitimate report confirmed, never at what the mis-bound one claimed',
+      ).toBe(confirmedByLegitimateReport);
+      expect(starts[1], 'a mis-bound report must never become the resume boundary').not.toBe(spoofedOffset);
+    } finally {
+      if (tick) clearInterval(tick);
+      FakePeerConnection.onDataChannel = inner;
+    }
+  }, 60_000);
+
+  /**
+   * A commit report is the resume boundary a later attempt trusts. Anything
+   * that is not forward progress inside what this attempt actually handed over
+   * would corrupt that boundary, so it must fail closed rather than be
+   * absorbed — and it must not be laundered into apparent success by the relay.
+   */
+  it.each([
+    // `lastGood` is what the receiver already confirmed, so "backwards" is
+    // measured against the boundary the sender is actually holding — measuring
+    // it against the live send counter would still be forward progress and
+    // would prove nothing.
+    { label: 'a report that goes backwards', bad: ({ lastGood }: BadAck) => lastGood - DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES },
+    { label: 'a report claiming more than was sent', bad: ({ sent }: BadAck) => sent + (DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 32) },
+    { label: 'a report past the end of the file', bad: () => ACK_FILE_BYTES + DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES },
+  ])('fails closed on $label instead of trusting it as a resume boundary', async ({ bad }) => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const file = createLargeUploadFile('ack.bin', ACK_FILE_BYTES);
+
+    let starts = 0;
+    let binding: Record<string, unknown> | null = null;
+    let currentChannel: FakeDataChannel | null = null;
+    let sent = 0;
+    let reportedGood = false;
+    let lastGood = 0;
+    let injected = false;
+    let tick: ReturnType<typeof setInterval> | null = null;
+
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      inner?.(channel, value);
+      if (typeof value === 'string') {
+        try {
+          const payload = JSON.parse(value) as Record<string, unknown>;
+          if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+            && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+            starts += 1;
+            currentChannel = channel;
+            binding = {
+              serverId: payload.serverId, browserTabId: payload.browserTabId,
+              leaseId: payload.leaseId, leaseGeneration: payload.leaseGeneration,
+              daemonGeneration: payload.daemonGeneration, requestId: payload.requestId,
+              attemptId: payload.attemptId, attempt: payload.attempt,
+              direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, operationId: payload.operationId,
+            };
+          }
+        } catch { /* not a control frame */ }
+        return;
+      }
+      currentChannel = channel;
+      sent += chunk;
+      channel.bufferedAmount += chunk;
+      if (tick) return;
+      tick = setInterval(() => {
+        const ch = currentChannel;
+        if (!ch || ch.readyState !== 'open' || !binding) return;
+        // Keep draining even after the injection: a hang would look like a
+        // failure but would not prove the report was rejected.
+        ch.bufferedAmount = 0;
+        ch.dispatchEvent(new Event('bufferedamountlow'));
+        const emit = (committedBytes: number) => ch.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...binding,
+            creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+            committedBytes,
+          }),
+        }));
+        if (!reportedGood) { reportedGood = true; lastGood = sent; emit(sent); return; }
+        if (injected) return;
+        injected = true;
+        emit(bad({ lastGood, sent }));
+      }, 5);
+    };
+
+    try {
+      const upload = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+      const settled = upload.then((v) => ({ ok: true as const, v }), (e) => ({ ok: false as const, e }));
+      for (let i = 0; i < 600; i++) await vi.advanceTimersByTimeAsync(5);
+      const outcome = await settled;
+
+      expect(injected, 'the counterexample must actually be delivered').toBe(true);
+      expect(outcome.ok, 'an impossible commit report must not be absorbed as success').toBe(false);
+      expect(
+        apiMocks.uploadFile,
+        'a protocol violation must not be laundered into success by the HTTP relay',
+      ).not.toHaveBeenCalled();
+      expect(starts, 'failing closed means no replacement attempt is started').toBe(1);
+    } finally {
+      if (tick) clearInterval(tick);
+      FakePeerConnection.onDataChannel = inner;
+    }
+  }, 60_000);
+
+  it('treats a repeated commit report at the current offset as a harmless duplicate', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const file = createLargeUploadFile('idempotent.bin', ACK_FILE_BYTES);
+
+    let binding: Record<string, unknown> | null = null;
+    let currentChannel: FakeDataChannel | null = null;
+    let sent = 0;
+    let committed = 0;
+    let replays = 0;
+    let tick: ReturnType<typeof setInterval> | null = null;
+
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      inner?.(channel, value);
+      if (typeof value === 'string') {
+        try {
+          const payload = JSON.parse(value) as Record<string, unknown>;
+          if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+            && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+            currentChannel = channel;
+            binding = {
+              serverId: payload.serverId, browserTabId: payload.browserTabId,
+              leaseId: payload.leaseId, leaseGeneration: payload.leaseGeneration,
+              daemonGeneration: payload.daemonGeneration, requestId: payload.requestId,
+              attemptId: payload.attemptId, attempt: payload.attempt,
+              direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, operationId: payload.operationId,
+            };
+          }
+        } catch { /* not a control frame */ }
+        return;
+      }
+      currentChannel = channel;
+      sent += chunk;
+      channel.bufferedAmount += chunk;
+      if (tick) return;
+      tick = setInterval(() => {
+        const ch = currentChannel;
+        if (!ch || ch.readyState !== 'open' || !binding) return;
+        ch.bufferedAmount = 0;
+        ch.dispatchEvent(new Event('bufferedamountlow'));
+        const emit = (committedBytes: number) => ch.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...binding,
+            creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+            committedBytes,
+          }),
+        }));
+        committed = Math.min(file.size, sent);
+        emit(committed);
+        // The same offset restated — a retransmitted ACK, not a fault.
+        emit(committed);
+        replays += 1;
+      }, 5);
+    };
+
+    try {
+      const upload = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+      const settled = upload.then((v) => ({ ok: true as const, v }), (e) => ({ ok: false as const, e }));
+      for (let i = 0; i < 600; i++) await vi.advanceTimersByTimeAsync(5);
+      const outcome = await settled;
+
+      expect(replays, 'the duplicate must actually be delivered').toBeGreaterThan(0);
+      expect(outcome.ok, 'a duplicate ACK must not fail the transfer').toBe(true);
+      expect(apiMocks.uploadFile, 'a duplicate ACK must not push the upload onto the relay').not.toHaveBeenCalled();
+    } finally {
+      if (tick) clearInterval(tick);
+      FakePeerConnection.onDataChannel = inner;
+    }
+  }, 60_000);
+
+  it('reports why the upload peer was reused or rebuilt after a probe', async () => {
+    const { probeDirectConnectivity, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { DIRECT_FILE_TRANSFER_CLIENT_METRIC, DIRECT_FILE_TRANSFER_PEER_REASON } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+
+    const peerReasons: string[] = [];
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation((...args: unknown[]) => {
+      const payload = args[1] as { metric?: string; reason?: string } | undefined;
+      if (payload?.metric === DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER && payload.reason) {
+        peerReasons.push(payload.reason);
+      }
+    });
+
+    try {
+      await probeDirectConnectivity(ws, undefined, 'server-1');
+      const afterProbe = peerReasons.length;
+
+      await uploadFileWithDirectFallback({
+        ws,
+        serverId: 'server-1',
+        file: createUploadFile('after-probe.txt', 'reuse'),
+      });
+
+      const duringUpload = peerReasons.slice(afterProbe);
+      expect(
+        duringUpload.length,
+        'establishment must say why it reused or rebuilt the peer, otherwise a slow upload cannot be attributed',
+      ).toBeGreaterThan(0);
+      expect(
+        duringUpload,
+        'a healthy peer left by the probe must be REUSED, never rebuilt',
+      ).not.toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
+      expect(duringUpload).not.toContain(DIRECT_FILE_TRANSFER_PEER_REASON.LEASE_REINIT);
+      expect(duringUpload).toContain(DIRECT_FILE_TRANSFER_PEER_REASON.REUSED);
+    } finally {
+      debugSpy.mockRestore();
+    }
+  });
+
+  /**
+   * A — the state actually lost between opening a server and uploading.
+   *
+   * A probe leaves a healthy peer, but the lease arms an idle timer
+   * (LEASE_IDLE_TTL_MS) as soon as nothing references it. Once that fires the
+   * binding is cleared, so an upload started later cannot reuse the transport
+   * the probe already paid for: it re-runs LEASE_INIT, SDP and ICE. That is the
+   * gap between "connectivity check is instant" and "the upload takes ages to
+   * connect" on the very same machine.
+   *
+   * This asserts the reason, so a regression cannot hide behind a passing
+   * transfer that merely got slower.
+   */
+  it('keeps the probe transport across authority expiry and only re-binds the lease', async () => {
+    vi.useFakeTimers();
+    const { prewarmDirectFileLease, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { DIRECT_FILE_TRANSFER_CLIENT_METRIC, DIRECT_FILE_TRANSFER_PEER_REASON } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+
+    const peerReasons: string[] = [];
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation((...args: unknown[]) => {
+      const payload = args[1] as { metric?: string; reason?: string } | undefined;
+      if (payload?.metric === DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER && payload.reason) {
+        peerReasons.push(payload.reason);
+      }
+    });
+
+    // Opening a server holds the warm transport for as long as it stays open,
+    // which is what `prewarmDirectFileLease`'s retained release represents.
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      const peersAfterProbe = FakePeerConnection.instances.length;
+
+      // Authority expires while the server stays open.
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1_000);
+
+      const before = peerReasons.length;
+      await uploadFileWithDirectFallback({
+        ws,
+        serverId: 'server-1',
+        file: createUploadFile('after-idle.txt', 'idle'),
+      });
+      const duringUpload = peerReasons.slice(before);
+
+      // Letting the AUTHORITY expire is correct and expected — the daemon lease
+      // really is five minutes. Re-initialising it (lease_reinit) is therefore
+      // allowed. What must not happen is throwing away a healthy ICE/DTLS
+      // transport along with it: that is what turns "open the server, upload a
+      // few minutes later" into a full renegotiation the probe already paid for.
+      expect(
+        duringUpload,
+        `upload rebuilt the transport the probe had already established (reasons=${JSON.stringify(duringUpload)})`,
+      ).not.toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
+      expect(
+        FakePeerConnection.instances.length,
+        'a second RTCPeerConnection means the probe transport was thrown away',
+      ).toBe(peersAfterProbe);
+    } finally {
+      debugSpy.mockRestore();
+      release?.();
+    }
+  }, 20_000);
+
+  it('reuses the probe peer for an upload on the same WsClient and serverId', async () => {
+    const { probeDirectConnectivity, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    const peersAfterProbe = FakePeerConnection.instances.length;
+    const leaseInitsAfterProbe = sent.filter((m) => m.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT).length;
+
+    await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('after-probe.txt', 'reuse'),
+    });
+
+    expect(
+      FakePeerConnection.instances.length,
+      'the upload must not build a second RTCPeerConnection when the probe left a healthy one',
+    ).toBe(peersAfterProbe);
+    expect(
+      sent.filter((m) => m.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT).length,
+      'the upload must not re-run LEASE_INIT after a successful probe',
+    ).toBe(leaseInitsAfterProbe);
+  });
+
+
 
 });

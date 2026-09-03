@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { open, statfs, unlink, rename } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { open, readdir, stat, statfs, unlink, rename } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import logger from '../util/logger.js';
@@ -9,6 +9,7 @@ import {
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_ERROR,
+  directFileTransferAttemptBindingMatches,
   DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_ERROR_SCOPE,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
@@ -84,6 +85,8 @@ interface ActiveDirectTransfer {
   finalFilename: string | null;
   uploadClaim: symbol | null;
   received: number;
+  /** Last `received` value already reported to the sender as a commit point. */
+  committedReported: number;
   pendingBytes: number;
   downloadCredit: number;
   downloadSource: DirectFileDownloadSource | null;
@@ -109,6 +112,166 @@ interface LedgerRecord {
   error?: DirectFileTransferError;
   expiresAt: number;
 }
+
+/**
+ * Server-owned resume state for an in-progress upload, keyed by operationId.
+ *
+ * A transient DataChannel/ICE replacement used to cost the whole file. The
+ * receiver already knows how many bytes it durably wrote, so the next attempt
+ * for the SAME logical upload can continue from there — but only if the
+ * partial file survives and can be proven to belong to that operation.
+ *
+ * The path is generated here from `randomBytes` and never contains anything
+ * the client supplied: an operationId or filename interpolated into a path is
+ * a traversal/collision surface, and the client must not be able to point the
+ * daemon at a file of its choosing. The client only ever sends a byte offset,
+ * which is checked against `stat()` of this path.
+ */
+interface UploadResumeState {
+  partPath: string;
+  finalPath: string;
+  finalFilename: string;
+  size: number;
+  /** Authorized identity this partial belongs to; a mismatch fails closed. */
+  serverId: string;
+  browserTabId: string;
+  leaseId: string;
+  expiresAt: number;
+}
+
+const uploadResumeStates = new Map<string, UploadResumeState>();
+
+/**
+ * Partials this daemon created: `<final>.<32 hex>.part`. Nothing else in the
+ * upload directory is ever a sweep candidate — an operator's own `.part` file
+ * or any committed upload must survive untouched.
+ */
+const ORPHAN_PARTIAL_RE = /\.[0-9a-f]{32}\.part$/;
+
+/**
+ * One sweep is bounded work. A directory that has somehow grown very large
+ * must not turn daemon startup into an unbounded stall.
+ */
+const ORPHAN_SWEEP_MAX_ENTRIES = 1_000;
+
+/** A partial still owned by a live resume state or an in-flight transfer. */
+function partialIsInUse(partPath: string, exceptOperationId?: string): boolean {
+  for (const [operationId, state] of uploadResumeStates) {
+    // The entry being released must not count as its own reason to survive.
+    if (operationId === exceptOperationId) continue;
+    if (state.partPath === partPath) return true;
+  }
+  for (const transfer of activeAttempts.values()) {
+    // A settled transfer no longer owns its partial even if its entry has not
+    // been reaped yet. Treating it as an owner is what makes the orphan
+    // permanent: the state expires, the file is judged "in use" forever, and
+    // nothing can ever name it again.
+    if (!transfer.settled && transfer.partPath === partPath) return true;
+  }
+  return false;
+}
+
+/**
+ * Drop a resume state AND the file it was the only reference to.
+ *
+ * The part path is `randomBytes(16)` and is recorded nowhere but this map, so
+ * deleting the entry alone leaves a file that no later request can name, prove
+ * ownership of, or resume from: a permanent orphan. The file is kept only when
+ * an in-flight transfer still holds it, which stays true after a capacity
+ * eviction races a live upload.
+ */
+async function releaseUploadResumeState(operationId: string, state: UploadResumeState): Promise<boolean> {
+  // Asked BEFORE the entry is dropped, not after. A live transfer owns both
+  // the state and the bytes; deleting the entry and keeping the file would
+  // leave that upload holding a file it can no longer name — unable to resume,
+  // and an orphan the moment it settles.
+  if (partialIsInUse(state.partPath, operationId)) return false;
+  uploadResumeStates.delete(operationId);
+  await unlink(state.partPath).catch(() => {});
+  return true;
+}
+
+/**
+ * @param resumingOperationId the operation this prune is running on behalf of,
+ *   which must survive CAPACITY eviction.
+ *
+ * Capacity eviction picks the oldest entry, and between an interruption and
+ * its retry the interrupted operation is legitimately settled — so "skip live
+ * states" alone does not protect it. Without this, a busy ledger silently
+ * evicts the exact state the retry is about to resume from, and the retry
+ * fails closed with invalid_authority having done nothing wrong. TTL expiry is
+ * deliberately NOT overridden: an expired state is expired, and the resume
+ * identity check rejects it anyway.
+ */
+async function pruneUploadResumeStates(resumingOperationId?: string): Promise<void> {
+  const now = Date.now();
+  for (const [key, state] of uploadResumeStates) {
+    if (state.expiresAt <= now) await releaseUploadResumeState(key, state);
+  }
+  if (uploadResumeStates.size > DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY) {
+    // Oldest first, skipping anything still live, and stopping as soon as the
+    // ledger is back within capacity. One pass over the map, so the work stays
+    // bounded even when every entry is live — in which case the bound is the
+    // number of concurrent in-flight uploads, which is the honest limit: a
+    // live upload cannot be evicted without breaking it.
+    for (const [key, state] of uploadResumeStates) {
+      if (uploadResumeStates.size <= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY) break;
+      if (key === resumingOperationId) continue;
+      await releaseUploadResumeState(key, state);
+    }
+  }
+}
+
+/**
+ * Reclaim partials whose in-memory resume state died with a previous process.
+ *
+ * Event-driven, never polled: one bounded pass at startup. A crash or restart
+ * is the only way a partial can outlive its state now that eviction unlinks,
+ * and startup is exactly when that backlog is visible.
+ *
+ * Deliberately conservative about what it will delete. Only files matching
+ * this daemon's own random-suffix pattern are candidates, never a committed
+ * upload (which carries no `.part`) and never one still referenced by a live
+ * state or in-flight transfer. Age is the deciding test: within the resume
+ * window a partial may still be legitimately recoverable, so only files older
+ * than that window — which no surviving authority could still resume — are
+ * removed.
+ */
+export async function scavengeOrphanUploadPartials(now = Date.now()): Promise<number> {
+  let directory: string;
+  try {
+    directory = path.dirname(resolveUploadPath('probe.bin'));
+  } catch { return 0; }
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch { return 0; }
+  let removed = 0;
+  for (const entry of entries.slice(0, ORPHAN_SWEEP_MAX_ENTRIES)) {
+    if (!ORPHAN_PARTIAL_RE.test(entry)) continue;
+    const candidate = path.join(directory, entry);
+    if (partialIsInUse(candidate)) continue;
+    const info = await stat(candidate).catch(() => null);
+    if (!info || !info.isFile()) continue;
+    if (now - info.mtimeMs <= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS) continue;
+    await unlink(candidate).catch(() => {});
+    removed += 1;
+  }
+  if (removed > 0) {
+    logger.info({ event: 'direct_file_v2.orphan_partials_reclaimed', removed }, 'Reclaimed orphaned upload partials');
+  }
+  return removed;
+}
+
+/** Drop resume state and its partial file. Only for terminal outcomes. */
+async function discardUploadResumeState(operationId: string): Promise<void> {
+  const state = uploadResumeStates.get(operationId);
+  if (!state) return;
+  uploadResumeStates.delete(operationId);
+  await unlink(state.partPath).catch(() => {});
+}
+
+
 
 let rtc: NodeDataChannel | null = null;
 let loadAttempted = false;
@@ -158,16 +321,7 @@ function attemptBinding(authority: DirectFileTransferPrepare): DirectFileTransfe
 }
 
 function sameAttempt(authority: DirectFileTransferPrepare, value: Record<string, unknown>): boolean {
-  return value.serverId === authority.serverId
-    && value.browserTabId === authority.browserTabId
-    && value.leaseId === authority.leaseId
-    && value.leaseGeneration === authority.leaseGeneration
-    && value.daemonGeneration === authority.daemonGeneration
-    && value.requestId === authority.requestId
-    && value.attemptId === authority.attemptId
-    && value.attempt === authority.attempt
-    && value.direction === authority.direction
-    && value.operationId === authority.operationId;
+  return directFileTransferAttemptBindingMatches(authority, value);
 }
 
 function errorDetail(error: unknown): string {
@@ -223,6 +377,10 @@ export async function initializeDirectFileTransfer(): Promise<boolean> {
       : DIRECT_CONNECTIVITY_RUNTIME_ERROR.LOAD_FAILED;
     logger.info({ event: 'direct_file_v2.runtime_unavailable', reason: rtcLoadError }, 'Direct file transfer unavailable; HTTP transfer remains enabled');
   }
+  // Reclaim what a previous process left behind. Bounded, one pass, and it
+  // runs whether or not the native transport loaded: the orphans exist either
+  // way, and this must never be the reason startup fails.
+  try { await scavengeOrphanUploadPartials(); } catch { /* startup must not fail on cleanup */ }
   return rtc !== null;
 }
 
@@ -345,6 +503,11 @@ async function closeTransferResources(transfer: ActiveDirectTransfer, removePart
   transfer.downloadFileHandle = null;
   try { transfer.channel?.close(); } catch { /* already closed */ }
   if (removePart) {
+    // `removePart` marks a terminal outcome — explicit cancel, expiry, or a
+    // final integrity failure — so the resume state goes with the bytes. A
+    // transient channel/ICE failure passes false and deliberately keeps both,
+    // which is what makes resuming from the confirmed offset possible.
+    await discardUploadResumeState(transfer.authority.operationId);
     if (transfer.partPath) await unlink(transfer.partPath).catch(() => {});
     // After the atomic staging rename, directory validation/commit can still
     // fail (missing directory, symlink, existing target). Do not strand the
@@ -367,16 +530,66 @@ async function closeLease(lease: DirectLease, cancelActive: boolean): Promise<vo
   directFileMetric('lease_evicted', { activeAttempts: lease.activeAttempts.size, canceled: cancelActive });
   if (cancelActive) {
     const transfers = [...activeAttempts.values()].filter((transfer) => transfer.lease === lease);
-    await Promise.all(transfers.map((transfer) => failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true)));
+    await Promise.all(transfers.map((transfer) => failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false)));
   }
   try { lease.peer.close(); } catch { /* already closed */ }
 }
 
+/**
+ * The transport went away and the same operation can pick up where it stopped.
+ *
+ * Deliberately narrower than `retryable`: a failed write or a failed commit is
+ * also retryable, but it is a LOCAL failure whose half-written staging must be
+ * cleaned up rather than preserved. Only these three describe "the connection
+ * died", which is the case resuming exists for.
+ */
+const RETRYABLE_TRANSPORT_LOSS: ReadonlySet<string> = new Set([
+  DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED,
+  DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+  DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
+]);
+
+function isRetryableTransportLoss(error: DirectFileTransferError, retryable: boolean): boolean {
+  return retryable && RETRYABLE_TRANSPORT_LOSS.has(error);
+}
+
+/**
+ * @param discardPartial whether this outcome also destroys the partial file.
+ *
+ * Only terminal outcomes should: an explicit cancel, an expired lease/resume
+ * window, or a final integrity failure. A transient channel/ICE loss, or a
+ * resume request whose offset does not match, must leave the partial intact —
+ * otherwise one dropped channel (or one malformed request) throws away bytes a
+ * legitimate sender could have continued from, which is exactly the whole-file
+ * restart this work exists to remove.
+ */
+/**
+ * @param discardPartial whether this outcome also destroys the partial file.
+ *
+ * Defaults to "keep it exactly when this was retryable TRANSPORT LOSS". The
+ * point of resuming is that losing the connection costs the remaining bytes
+ * rather than the whole file, so those outcomes must keep BOTH the resume map
+ * entry and the bytes on disk. Everything else — terminal outcomes like
+ * cancel, lease/authority expiry, size or checksum failure, and equally a
+ * retryable LOCAL failure such as a failed write or a failed commit, which is
+ * not transport loss at all — takes the partial with it.
+ *
+ * This was previously defaulted to `true`, so every retryable path that did
+ * not remember to pass the argument — `channel.onError`, every peer
+ * failed/closed/disconnected transition, the no-progress timeout, write
+ * failures — silently destroyed exactly what the next attempt needed. Only the
+ * clean-close path happened to pass it, which is why a resume test that only
+ * closed the channel could not see the defect.
+ *
+ * Call sites that are non-retryable but must still NOT destroy the file (a
+ * wrong or hostile resume request) keep passing `false` explicitly.
+ */
 async function failTransfer(
   transfer: ActiveDirectTransfer,
   error: DirectFileTransferError,
   retryable: boolean,
   detail?: string,
+  discardPartial = !isRetryableTransportLoss(error, retryable),
 ): Promise<void> {
   if (transfer.settled) return;
   transfer.settled = true;
@@ -398,7 +611,7 @@ async function failTransfer(
     state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED,
     error,
   });
-  await closeTransferResources(transfer, true);
+  await closeTransferResources(transfer, discardPartial);
 }
 
 async function ensureDiskCapacity(size: number, targetPath: string): Promise<void> {
@@ -483,7 +696,7 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
   });
 }
 
-async function startUpload(transfer: ActiveDirectTransfer): Promise<void> {
+async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset = 0): Promise<void> {
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD || transfer.started) return;
   const existing = lookupAttachmentByClientUploadId(authority.clientUploadId);
@@ -508,13 +721,102 @@ async function startUpload(transfer: ActiveDirectTransfer): Promise<void> {
     return;
   }
   await initFileTransfer();
-  const filename = createDirectUploadFilename(authority.filename);
-  const finalPath = resolveUploadPath(filename);
+  await pruneUploadResumeStates(authority.operationId);
+  const resumeOffset = requestedResumeOffset;
+  const priorResume = uploadResumeStates.get(authority.operationId);
+  // Identity is checked before anything is opened. A partial file belongs to
+  // one operation under one authorized identity; a request that does not match
+  // must never be able to read, extend or destroy it.
+  const resumeIdentityMatches = !!priorResume
+    && priorResume.serverId === authority.serverId
+    && priorResume.browserTabId === authority.browserTabId
+    && priorResume.leaseId === authority.leaseId
+    && priorResume.size === authority.size
+    && priorResume.expiresAt > Date.now();
+
+  if (resumeOffset > 0) {
+    if (!resumeIdentityMatches || !priorResume || resumeOffset > authority.size) {
+      // Fail closed WITHOUT deleting the partial: a wrong or hostile request
+      // must not be able to destroy data a legitimate sender can still resume.
+      void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false, undefined, false);
+      return;
+    }
+    const actual = await stat(priorResume.partPath).catch(() => null);
+    if (!actual || !actual.isFile() || actual.size !== resumeOffset) {
+      void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false, undefined, false);
+      return;
+    }
+    transfer.partPath = priorResume.partPath;
+    transfer.finalPath = priorResume.finalPath;
+    transfer.finalFilename = priorResume.finalFilename;
+    // Re-derive the digest by streaming [0, resumeOffset) back. The hash state
+    // cannot be serialised across attempts, and a per-chunk hash ledger would
+    // be a second source of truth; a bounded re-read keeps one.
+    transfer.uploadFileHandle = await open(transfer.partPath, 'r+');
+    const rehash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES);
+    let read = 0;
+    while (read < resumeOffset) {
+      const want = Math.min(buffer.length, resumeOffset - read);
+      const result = await transfer.uploadFileHandle.read(buffer, 0, want, read);
+      if (result.bytesRead <= 0) break;
+      rehash.update(buffer.subarray(0, result.bytesRead));
+      read += result.bytesRead;
+    }
+    if (read !== resumeOffset) {
+      await transfer.uploadFileHandle.close().catch(() => {});
+      transfer.uploadFileHandle = null;
+      void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false, undefined, false);
+      return;
+    }
+    transfer.hash = rehash;
+    transfer.received = resumeOffset;
+    // Left at zero on purpose: `committedReported` tracks what has been SENT to
+    // this sender, and the replacement attempt has been told nothing yet.
+    // Pre-seeding it would make the first report look like zero progress and
+    // the throttle would swallow it, leaving the resumed sender unable to see
+    // that its offset was accepted.
+    transfer.committedReported = 0;
+    priorResume.expiresAt = Date.now() + DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS;
+    transfer.started = true;
+    resetTransferIdleTimer(transfer);
+    reportUploadCommit(transfer);
+    transfer.channel?.sendMessage(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...makeDataBinding(authority),
+    }));
+    return;
+  }
+
+  const filename = priorResume && resumeIdentityMatches
+    ? priorResume.finalFilename
+    : createDirectUploadFilename(authority.filename);
+  const finalPath = priorResume && resumeIdentityMatches
+    ? priorResume.finalPath
+    : resolveUploadPath(filename);
   await ensureDiskCapacity(authority.size, finalPath);
-  transfer.partPath = `${finalPath}.${authority.attemptId}.part`;
+  // Suffix is server-random; nothing the client sent reaches the path.
+  const partPath = priorResume && resumeIdentityMatches
+    ? priorResume.partPath
+    : `${finalPath}.${randomBytes(16).toString('hex')}.part`;
+  transfer.partPath = partPath;
   transfer.finalPath = finalPath;
   transfer.finalFilename = filename;
-  transfer.uploadFileHandle = await open(transfer.partPath, 'wx');
+  // Starting from zero always begins a fresh file, so an existing partial for
+  // this operation is replaced rather than silently appended to.
+  await unlink(partPath).catch(() => {});
+  transfer.uploadFileHandle = await open(partPath, 'wx');
+  uploadResumeStates.set(authority.operationId, {
+    partPath,
+    finalPath,
+    finalFilename: filename,
+    size: authority.size,
+    serverId: authority.serverId,
+    browserTabId: authority.browserTabId,
+    leaseId: authority.leaseId,
+    expiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS,
+  });
   transfer.started = true;
   resetTransferIdleTimer(transfer);
   transfer.channel?.sendMessage(JSON.stringify({
@@ -560,6 +862,39 @@ async function startDownload(transfer: ActiveDirectTransfer): Promise<void> {
   }));
 }
 
+/**
+ * Tell the sender how many bytes are durably on disk.
+ *
+ * Uploads previously had no receiver-to-sender signal whatsoever, so the
+ * browser judged the transfer's health purely from its own
+ * `RTCDataChannel.bufferedAmount`. A receiver that was committing steadily but
+ * draining slower than one no-progress window was indistinguishable from a dead
+ * peer, and the transfer was killed mid-flight and re-sent whole over the HTTP
+ * relay.
+ *
+ * Called only AFTER `write()` resolves, so the number is a commit point rather
+ * than an intent, and it is monotonic by construction (`received` only grows).
+ * Reports are throttled to one per chunk-sized advance: the sender needs
+ * evidence of progress, not a frame per write. Send failures are ignored — this
+ * is advisory liveness, and losing one must never fail a healthy transfer.
+ */
+function reportUploadCommit(transfer: ActiveDirectTransfer): void {
+  if (transfer.settled || !transfer.channel) return;
+  if (transfer.authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) return;
+  const advanced = transfer.received - transfer.committedReported;
+  if (advanced < DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES && transfer.received < transfer.authority.size) return;
+  transfer.committedReported = transfer.received;
+  try {
+    transfer.channel.sendMessage(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...attemptBinding(transfer.authority),
+      creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+      committedBytes: transfer.received,
+    }));
+  } catch { /* peer already closed; the sender's own watchdog still applies */ }
+}
+
 function enqueueUploadChunk(transfer: ActiveDirectTransfer, bytes: Uint8Array): void {
   if (!transfer.started || transfer.settled || !transfer.uploadFileHandle) return;
   const authority = transfer.authority;
@@ -581,6 +916,7 @@ function enqueueUploadChunk(transfer: ActiveDirectTransfer, bytes: Uint8Array): 
     transfer.received += copy.byteLength;
     transfer.pendingBytes -= copy.byteLength;
     resetTransferIdleTimer(transfer);
+    reportUploadCommit(transfer);
   }).catch((error) => {
     transfer.pendingBytes = Math.max(0, transfer.pendingBytes - copy.byteLength);
     void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error));
@@ -606,6 +942,8 @@ async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, 
   await transfer.uploadFileHandle.close();
   transfer.uploadFileHandle = null;
   await rename(transfer.partPath, transfer.finalPath);
+  // Committed: the partial no longer exists, so neither should the resume state.
+  uploadResumeStates.delete(transfer.authority.operationId);
   const attachment = await finalizeDirectUploadedFile({
     clientUploadId: authority.clientUploadId,
     filename: transfer.finalFilename,
@@ -744,7 +1082,8 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel): vo
       if (parsed.value.authority !== transfer.authority.authority || Date.now() >= transfer.authority.authorityExpiresAt) {
         void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
       } else if (transfer.authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
-        void startUpload(transfer).catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error)));
+        void startUpload(transfer, parsed.value.resumeOffset ?? 0)
+          .catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error)));
       } else {
         void startDownload(transfer).catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, false, errorDetail(error)));
       }
@@ -770,7 +1109,7 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel): vo
       void completeDownload(transfer, parsed.value.totalBytes);
     }
   });
-  channel.onClosed(() => { if (!transfer.settled) void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true); });
+  channel.onClosed(() => { if (!transfer.settled) void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false); });
   channel.onError((error) => { void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, error); });
 }
 
@@ -936,6 +1275,7 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Fi
     finalFilename: null,
     uploadClaim: authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD ? tryClaimClientUpload(authority.operationId) : null,
     received: 0,
+    committedReported: 0,
     pendingBytes: 0,
     downloadCredit: 0,
     downloadSource: null,

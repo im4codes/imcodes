@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -34,6 +34,7 @@ class FakeDataChannel {
 
   getLabel = () => this.label;
   emit(message: string | Buffer | ArrayBuffer): void { this.messageHandler?.(message); }
+  emitError(error: string): void { this.errorHandler?.(error); }
   releaseBufferedAmount(): void {
     this.bufferedAmountValue = 0;
     this.bufferedAmountLowHandler?.();
@@ -68,6 +69,7 @@ class FakePeerConnection {
   onLocalCandidate = (handler: (candidate: string, mid: string) => void) => { this.localCandidateHandler = handler; };
   onStateChange = (handler: (state: string) => void) => { this.stateHandler = handler; };
   emitDataChannel(channel: FakeDataChannel): void { this.dataChannelHandler?.(channel); }
+  emitState(state: string): void { this.stateHandler?.(state); }
 }
 
 const serverId = 'daemon-0001';
@@ -279,6 +281,485 @@ describe('daemon direct file transfer v2 lease broker', () => {
     expect(replacement.addRemoteCandidate).toHaveBeenCalledTimes(1);
     await direct.shutdownDirectFileTransfers();
   });
+
+  /**
+   * The upload direction used to give the sender nothing until the transfer was
+   * over: UPLOAD_COMMITTED is terminal and carries the finished attachment, and
+   * CREDIT was validated for DOWNLOAD only. So a browser sending a large file
+   * judged liveness purely from its own bufferedAmount and could not tell a
+   * slow-but-committing receiver from a dead one.
+   *
+   * The daemon now reports its durable offset as it writes. This asserts the
+   * daemon HALF of that contract, which the browser suite cannot cover because
+   * it drives a fake peer rather than this module.
+   */
+  it('reports a monotonic committed offset while an upload is still streaming', async () => {
+    const { direct, sender } = await readyLease();
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const authority = uploadPrepare({ size: chunk * 3 });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(), authority: authority.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+
+    const committedOffsets = () => channel.sent
+      .filter((m): m is string => typeof m === 'string')
+      .map((m) => { try { return JSON.parse(m) as Record<string, unknown>; } catch { return null; } })
+      .filter((m): m is Record<string, unknown> => !!m
+        && m.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT
+        && m.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD)
+      .map((m) => m.committedBytes as number);
+
+    channel.emit(Buffer.alloc(chunk, 1));
+    await vi.waitFor(() => expect(committedOffsets().length).toBeGreaterThanOrEqual(1));
+    channel.emit(Buffer.alloc(chunk, 2));
+    await vi.waitFor(() => expect(committedOffsets().length).toBeGreaterThanOrEqual(2));
+
+    const offsets = committedOffsets();
+    // Reported only after the write resolves, so it is a commit point.
+    expect(offsets[0]).toBe(chunk);
+    expect(offsets[1]).toBe(chunk * 2);
+    // Monotonic, and never ahead of what was actually handed over.
+    for (let i = 1; i < offsets.length; i++) expect(offsets[i]).toBeGreaterThan(offsets[i - 1]!);
+    expect(Math.max(...offsets)).toBeLessThanOrEqual(chunk * 3);
+  });
+
+  /**
+   * C — a transient channel/ICE replacement must cost only the bytes not yet
+   * committed, not the whole file and not a fallback to the HTTP relay.
+   */
+  it('resumes a replacement attempt from the confirmed offset instead of restarting at zero', async () => {
+    const { direct, sender } = await readyLease();
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const total = chunk * 2;
+    const first = uploadPrepare({ size: total });
+    await direct.handleDirectFileTransferCommand(first, sender);
+    const firstChannel = new FakeDataChannel(first.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(firstChannel);
+    firstChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(), authority: first.authority,
+    }));
+    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    firstChannel.emit(Buffer.alloc(chunk, 7));
+    await vi.waitFor(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+
+    // Transient loss: the channel goes away with half the file committed.
+    firstChannel.close();
+
+    const second = uploadPrepare({
+      ...binding({ requestId: 'resume-request-2', attemptId: 'resume-attempt-2' }),
+      size: total,
+      authority: 'R'.repeat(43),
+      channelLabel: 'imcodes-file-upload-0002',
+    });
+    await direct.handleDirectFileTransferCommand(second, sender);
+    const secondChannel = new FakeDataChannel(second.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(secondChannel);
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: 'resume-request-2', attemptId: 'resume-attempt-2' }),
+      authority: second.authority,
+      resumeOffset: chunk,
+    }));
+    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+
+    // The replacement must already be credited with the committed prefix.
+    const committed = secondChannel.sent
+      .filter((m): m is string => typeof m === 'string')
+      .map((m) => { try { return JSON.parse(m) as Record<string, unknown>; } catch { return null; } })
+      .filter((m): m is Record<string, unknown> => !!m && m.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT)
+      .map((m) => m.committedBytes as number);
+    expect(committed[0], 'the resumed attempt must start credited at the confirmed offset, not zero').toBe(chunk);
+
+    // Only the remaining half is sent, and the file still commits intact.
+    secondChannel.emit(Buffer.alloc(chunk, 9));
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: 'resume-request-2', attemptId: 'resume-attempt-2' }),
+      totalBytes: total,
+    }));
+    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
+  });
+
+  it('fails closed on a resume offset that does not match the partial, and keeps the partial', async () => {
+    const { direct, sender } = await readyLease();
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const total = chunk * 2;
+    const first = uploadPrepare({ size: total });
+    await direct.handleDirectFileTransferCommand(first, sender);
+    const firstChannel = new FakeDataChannel(first.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(firstChannel);
+    firstChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(), authority: first.authority,
+    }));
+    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    firstChannel.emit(Buffer.alloc(chunk, 7));
+    await vi.waitFor(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+    firstChannel.close();
+
+    const uploadDir = path.dirname(storedPath);
+    const partialsBefore = (await readdir(uploadDir)).filter((e) => e.endsWith('.part'));
+    expect(partialsBefore).toHaveLength(1);
+
+    const second = uploadPrepare({
+      ...binding({ requestId: 'bad-offset-2', attemptId: 'bad-offset-attempt-2' }),
+      size: total,
+      authority: 'Q'.repeat(43),
+      channelLabel: 'imcodes-file-upload-0003',
+    });
+    await direct.handleDirectFileTransferCommand(second, sender);
+    const secondChannel = new FakeDataChannel(second.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(secondChannel);
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: 'bad-offset-2', attemptId: 'bad-offset-attempt-2' }),
+      authority: second.authority,
+      // Claims more than was actually committed.
+      resumeOffset: chunk + 1,
+    }));
+    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR)));
+    expect(secondChannel.sent).not.toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED));
+
+    // A wrong or hostile offset must not be able to destroy data a legitimate
+    // sender can still resume from.
+    const partialsAfter = (await readdir(uploadDir)).filter((e) => e.endsWith('.part'));
+    expect(partialsAfter, 'a mismatched resume must not delete the recoverable partial').toEqual(partialsBefore);
+  });
+
+  /**
+   * The mirror image of the test above, and the one the size check actually
+   * exists for. When the partial is SHORTER than the claimed offset, the
+   * re-hash of [0, resumeOffset) runs out of file and fails anyway. When it is
+   * LONGER, that fallback reads happily and nothing else notices: the handle is
+   * opened 'r+' and is never truncated, so the resumed write would continue on
+   * top of a file that still carries bytes past the agreed boundary.
+   */
+  it('fails closed when the partial is longer than the claimed resume offset', async () => {
+    const { direct, sender } = await readyLease();
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const total = chunk * 3;
+    const first = uploadPrepare({ size: total });
+    await direct.handleDirectFileTransferCommand(first, sender);
+    const firstChannel = new FakeDataChannel(first.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(firstChannel);
+    firstChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(), authority: first.authority,
+    }));
+    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    firstChannel.emit(Buffer.alloc(chunk, 7));
+    firstChannel.emit(Buffer.alloc(chunk, 9));
+    await vi.waitFor(() => expect(
+      firstChannel.sent.filter((m) => typeof m === 'string' && m.includes('"committedBytes"')).length,
+    ).toBeGreaterThanOrEqual(2));
+    firstChannel.close();
+
+    const uploadDir = path.dirname(storedPath);
+    const partialsBefore = (await readdir(uploadDir)).filter((e) => e.endsWith('.part'));
+    expect(partialsBefore).toHaveLength(1);
+
+    const second = uploadPrepare({
+      ...binding({ requestId: 'long-part-2', attemptId: 'long-part-attempt-2' }),
+      size: total,
+      authority: 'R'.repeat(43),
+      channelLabel: 'imcodes-file-upload-0004',
+    });
+    await direct.handleDirectFileTransferCommand(second, sender);
+    const secondChannel = new FakeDataChannel(second.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(secondChannel);
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: 'long-part-2', attemptId: 'long-part-attempt-2' }),
+      authority: second.authority,
+      // Two chunks are on disk; this claims only one.
+      resumeOffset: chunk,
+    }));
+    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR)));
+    expect(
+      secondChannel.sent,
+      'a resume offset that disagrees with the partial on disk must never be accepted',
+    ).not.toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED));
+
+    const partialsAfter = (await readdir(uploadDir)).filter((e) => e.endsWith('.part'));
+    expect(partialsAfter, 'the recoverable partial must survive the rejection').toEqual(partialsBefore);
+  });
+
+  /**
+   * RED — an evicted resume state leaves its partial behind forever.
+   *
+   * `pruneUploadResumeStates` deletes map entries only; the unlink lives in
+   * `discardUploadResumeState`, which is reached exclusively on terminal
+   * outcomes. The part path is `randomBytes(16)` and is recorded nowhere but
+   * that in-memory map, so once the entry is dropped the file on disk is
+   * unattributable and unreachable: a permanent orphan that grows with every
+   * abandoned upload.
+   */
+  async function leavePartial(
+    direct: Awaited<ReturnType<typeof readyLease>>['direct'],
+    sender: { send: (message: unknown) => void },
+    tag: string,
+    label: string,
+    size: number,
+  ): Promise<void> {
+    const prepare = uploadPrepare({
+      ...binding({ requestId: `${tag}-req`, attemptId: `${tag}-att`, operationId: `${tag}-op` }),
+      size,
+      authority: tag.padEnd(43, 'z').slice(0, 43),
+      channelLabel: label,
+      clientUploadId: `${tag}-op`,
+    });
+    await direct.handleDirectFileTransferCommand(prepare, sender);
+    const channel = new FakeDataChannel(label);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: `${tag}-req`, attemptId: `${tag}-att`, operationId: `${tag}-op` }),
+      authority: prepare.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(Buffer.alloc(DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES, 3));
+    await vi.waitFor(() => expect(channel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+    channel.close();
+  }
+
+  const partialsOf = async (dir: string) => (await readdir(dir)).filter((e) => e.endsWith('.part'));
+
+  /**
+   * How an in-flight attempt loses its transport. All four are RETRYABLE
+   * transport loss, so all four must leave both the resume state and the bytes
+   * intact — the whole point of resuming is that a dropped connection costs
+   * the remaining bytes, not the whole file.
+   */
+  type Interruption = 'close' | 'channel-error' | 'peer-failed' | 'peer-disconnected';
+
+  /**
+   * Triggers the loss AND waits for the daemon to finish acting on it. The
+   * unlink happens inside closeTransferResources, which runs after the
+   * TERMINAL control frame is sent, so waiting on TERMINAL alone would let a
+   * resume race ahead of the discard and pass for the wrong reason.
+   */
+  async function interrupt(
+    channel: FakeDataChannel,
+    mode: Interruption,
+    sent: Array<Record<string, unknown>>,
+  ): Promise<void> {
+    const before = sent.filter((m) => m.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL).length;
+    if (mode === 'close') channel.close();
+    else if (mode === 'channel-error') channel.emitError('ice-transport-failure');
+    else FakePeerConnection.latest!.emitState(mode === 'peer-failed' ? 'failed' : 'disconnected');
+    await vi.waitFor(() => expect(
+      sent.filter((m) => m.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL).length,
+    ).toBeGreaterThan(before));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  const committedFrom = (channel: FakeDataChannel): number => {
+    const frames = channel.sent.filter((m): m is string => typeof m === 'string' && m.includes('"committedBytes"'));
+    const last = frames[frames.length - 1];
+    return last ? (JSON.parse(last).committedBytes as number) : 0;
+  };
+
+  /** Start an upload, deliver one chunk, and return once the receiver has
+   *  durably committed it. The channel is left open and unsettled. */
+  async function uploadUpToFirstCommit(
+    direct: Awaited<ReturnType<typeof readyLease>>['direct'],
+    sender: { send: (message: unknown) => void },
+    tag: string,
+    label: string,
+    size: number,
+  ): Promise<{ channel: FakeDataChannel; authority: string }> {
+    const prepare = uploadPrepare({
+      ...binding({ requestId: `${tag}-req`, attemptId: `${tag}-att`, operationId: `${tag}-op` }),
+      size,
+      authority: tag.padEnd(43, 'z').slice(0, 43),
+      channelLabel: label,
+      clientUploadId: `${tag}-op`,
+    });
+    await direct.handleDirectFileTransferCommand(prepare, sender);
+    const channel = new FakeDataChannel(label);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: `${tag}-req`, attemptId: `${tag}-att`, operationId: `${tag}-op` }),
+      authority: prepare.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(Buffer.alloc(DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES, 5));
+    await vi.waitFor(() => expect(committedFrom(channel)).toBeGreaterThan(0));
+    return { channel, authority: prepare.authority as string };
+  }
+
+  /** A replacement attempt for the SAME operation, resuming at `offset`. */
+  async function resumeAttempt(
+    direct: Awaited<ReturnType<typeof readyLease>>['direct'],
+    sender: { send: (message: unknown) => void },
+    tag: string,
+    label: string,
+    size: number,
+    offset: number,
+  ): Promise<FakeDataChannel> {
+    const prepare = uploadPrepare({
+      ...binding({ requestId: `${tag}-req2`, attemptId: `${tag}-att2`, operationId: `${tag}-op` }),
+      size,
+      authority: `${tag}resume`.padEnd(43, 'y').slice(0, 43),
+      channelLabel: label,
+      clientUploadId: `${tag}-op`,
+    });
+    await direct.handleDirectFileTransferCommand(prepare, sender);
+    const channel = new FakeDataChannel(label);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: `${tag}-req2`, attemptId: `${tag}-att2`, operationId: `${tag}-op` }),
+      authority: prepare.authority,
+      resumeOffset: offset,
+    }));
+    await vi.waitFor(() => expect(channel.sent.length).toBeGreaterThan(0));
+    return channel;
+  }
+
+  /**
+   * RED — only a clean `close` preserved the partial. `channel.onError` and
+   * every peer state transition call failTransfer WITHOUT the discardPartial
+   * argument, so they take the default and destroy exactly the resume state
+   * and bytes a replacement attempt needs. The R2 resume evidence never caught
+   * this because its only interruption was a clean close.
+   */
+  it.each<Interruption>(['close', 'channel-error', 'peer-failed', 'peer-disconnected'])(
+    'keeps the resume state and the bytes after a retryable transport loss (%s)',
+    async (mode) => {
+      const { direct, sender, sent } = await readyLease();
+      const total = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 4;
+      const tag = `loss${mode.replace(/-/g, '')}`;
+      const { channel } = await uploadUpToFirstCommit(direct, sender, tag, 'imcodes-file-upload-0301', total);
+      const committed = committedFrom(channel);
+      expect(committed).toBe(DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES);
+
+      await interrupt(channel, mode, sent);
+
+      // The only assertion that proves BOTH survived: a replacement attempt
+      // resuming at the confirmed offset is accepted. A surviving file with a
+      // dropped map entry fails here, and so does a dropped file.
+      const resumed = await resumeAttempt(direct, sender, tag, 'imcodes-file-upload-0302', total, committed);
+      await vi.waitFor(() => expect(resumed.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      expect(
+        resumed.sent,
+        'a retryable transport loss must not turn the next attempt into a whole-file restart or a hard failure',
+      ).not.toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR));
+    },
+    60_000,
+  );
+
+  /**
+   * RED — capacity eviction deletes the map entry BEFORE asking whether the
+   * partial is still in use. A live oldest upload therefore keeps its file and
+   * loses the only reference that could ever name it again: it can no longer
+   * resume, and the file it left behind is an orphan.
+   */
+  it('never strips a live upload of its resume state under capacity pressure', async () => {
+    const { direct, sender, sent } = await readyLease();
+    const total = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 4;
+    // The oldest entry, and deliberately still live and unsettled.
+    const { channel } = await uploadUpToFirstCommit(direct, sender, 'liveoldest', 'imcodes-file-upload-0401', total);
+    const committed = committedFrom(channel);
+    expect(committed).toBeGreaterThan(0);
+
+    // Push the ledger past capacity so eviction runs and reaches the oldest.
+    for (let i = 0; i <= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY; i++) {
+      await leavePartial(direct, sender, `pressureprobe${i}`, `imcodes-file-upload-${String(500 + i).padStart(4, '0')}`, DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 2);
+    }
+
+    // Now lose the transport the ordinary way and retry.
+    await interrupt(channel, 'close', sent);
+    const resumed = await resumeAttempt(direct, sender, 'liveoldest', 'imcodes-file-upload-0402', total, committed);
+    await vi.waitFor(() => expect(resumed.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    expect(
+      resumed.sent,
+      'capacity pressure must never evict a live upload out of its own resume state',
+    ).not.toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR));
+  }, 300_000);
+
+
+  it('unlinks the partial when its resume state expires, instead of orphaning it', async () => {
+    const { direct, sender } = await readyLease();
+    const uploadDir = path.dirname(storedPath);
+    await leavePartial(direct, sender, 'ttlone', 'imcodes-file-upload-0101', DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 4);
+    const before = await partialsOf(uploadDir);
+    expect(before).toHaveLength(1);
+
+    // Only Date is faked, so vi.waitFor's own timers keep running.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS + 60_000);
+    try {
+      // Any later upload runs the prune; nothing here depends on a timer.
+      await leavePartial(direct, sender, 'ttltwo', 'imcodes-file-upload-0102', DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 4);
+      const after = await partialsOf(uploadDir);
+      expect(
+        after,
+        'the expired partial is unreachable once its state is gone; leaving it on disk is a permanent orphan',
+      ).not.toContain(before[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 60_000);
+
+  it('keeps the number of partials on disk bounded by the resume ledger capacity', async () => {
+    const { direct, sender } = await readyLease();
+    const uploadDir = path.dirname(storedPath);
+    const overflow = DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY + 2;
+    for (let i = 0; i < overflow; i++) {
+      await leavePartial(direct, sender, `capacityprobe${i}`, `imcodes-file-upload-${String(200 + i).padStart(4, '0')}`, DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 2);
+    }
+    const partials = await partialsOf(uploadDir);
+    // The prune runs at the START of an upload, before that upload inserts its
+    // own state, so the steady state is capacity + 1 rather than capacity.
+    // What matters is that it is BOUNDED: without eviction unlinking the file,
+    // every abandoned upload adds one partial that nothing can ever remove.
+    expect(
+      partials.length,
+      'capacity eviction drops the state but never the file, so partials grow without bound',
+    ).toBeLessThanOrEqual(DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY + 1);
+  }, 180_000);
+
+  it('scavenges partials orphaned by a previous process without touching recoverable or committed files', async () => {
+    const { direct } = await readyLease();
+    const uploadDir = path.dirname(storedPath);
+    const stale = path.join(uploadDir, `${path.basename(storedPath)}.${'a'.repeat(32)}.part`);
+    const fresh = path.join(uploadDir, `${path.basename(storedPath)}.${'b'.repeat(32)}.part`);
+    const committed = path.join(uploadDir, 'already-committed.bin');
+    const foreign = path.join(uploadDir, 'not-ours.part');
+    await writeFile(stale, 'stale');
+    await writeFile(fresh, 'fresh');
+    await writeFile(committed, 'committed');
+    await writeFile(foreign, 'foreign');
+    const old = Date.now() - DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS - 60_000;
+    await utimes(stale, old / 1000, old / 1000);
+    await utimes(foreign, old / 1000, old / 1000);
+
+    await direct.scavengeOrphanUploadPartials();
+
+    await expect(access(stale), 'a partial older than the resume TTL cannot belong to any live state').rejects.toThrow();
+    await expect(access(fresh)).resolves.toBeUndefined();
+    await expect(access(committed), 'a committed file is not a partial and must never be swept').resolves.toBeUndefined();
+    await expect(access(foreign), 'only this daemon\'s own random-suffix partials may be swept').resolves.toBeUndefined();
+  }, 60_000);
 
   it('commits a selected-directory upload once and exposes it through exact status recovery', async () => {
     const { direct, sent, sender } = await readyLease();
@@ -846,7 +1327,16 @@ describe('daemon direct file transfer v2 lease broker', () => {
       authority: first.authority,
     }));
     await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
-    const partialPath = `${storedPath}.${first.attemptId}.part`;
+    // The partial's path is server-generated and deliberately unpredictable —
+    // interpolating a client-supplied operationId/attemptId/filename into a
+    // path is a traversal and collision surface. So discover it rather than
+    // reconstructing it; a test that can guess the name would be asserting the
+    // very property we removed.
+    const partialsFor = async () => (await readdir(path.dirname(storedPath)))
+      .filter((entry) => entry.startsWith(`${path.basename(storedPath)}.`) && entry.endsWith('.part'));
+    const partials = await partialsFor();
+    expect(partials, 'the in-progress upload must have exactly one partial file').toHaveLength(1);
+    const partialPath = path.join(path.dirname(storedPath), partials[0]!);
     await expect(access(partialPath)).resolves.toBeUndefined();
     await direct.handleDirectFileTransferCommand({
       type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
