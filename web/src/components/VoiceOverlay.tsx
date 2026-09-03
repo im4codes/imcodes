@@ -93,7 +93,11 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       vv?.removeEventListener('resize', onResize);
       VoiceInput.onAudioLevel(null);
       VoiceInput.stopListening();
-      setListeningState(false);
+      // Effect cleanup also runs during unmount. Updating hook state here queues
+      // a Preact render after the component has already left the tree, leaving
+      // its after-paint RAF alive past test/page teardown. Keep the synchronous
+      // ref truthful; the next open initializes both ref and rendered state.
+      listeningRef.current = false;
     };
   }, [open, clearAutoStartTimer, setListeningState]);
 

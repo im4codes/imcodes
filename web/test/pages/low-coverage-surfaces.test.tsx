@@ -3,6 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { options } from 'preact';
 import { AddProject } from '../../src/pages/AddProject.js';
 import { AdminPage } from '../../src/pages/AdminPage.js';
 import { DashboardPage } from '../../src/pages/DashboardPage.js';
@@ -377,6 +378,26 @@ describe('low-coverage page and component surfaces', () => {
 
     await waitFor(() => expect(voiceApi.startListening).toHaveBeenCalledTimes(2));
     expect(voiceApi.stopListening).not.toHaveBeenCalled();
+  });
+
+  it('VoiceOverlay does not queue a render while an active listener is unmounting', async () => {
+    vi.useFakeTimers();
+    const view = render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
+
+    await vi.advanceTimersByTimeAsync(150);
+    await waitFor(() => expect(voiceApi.startListening).toHaveBeenCalledTimes(1));
+    voiceApi.listeningHandler?.(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const originalDebounceRendering = options.debounceRendering;
+    const scheduleRender = vi.fn();
+    options.debounceRendering = scheduleRender;
+    try {
+      view.unmount();
+      expect(scheduleRender).not.toHaveBeenCalled();
+    } finally {
+      options.debounceRendering = originalDebounceRendering;
+    }
   });
 
   it('OfficePreview renders unsupported and spreadsheet previews', async () => {
