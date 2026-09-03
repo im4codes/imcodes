@@ -7342,6 +7342,17 @@ export class WsBridge {
       return;
     }
 
+    // A daemon-originated terminal reset belongs only to the browsers watching
+    // that session. Falling through to default-allow broadcast made every other
+    // tab reset a terminal it was never subscribed to and that never congested.
+    if (type === 'terminal.stream_reset') {
+      const session = typeof msg.session === 'string' ? msg.session : '';
+      if (session) {
+        this.sendJsonToSessionSubscribers(session, JSON.stringify(msg));
+        return;
+      }
+    }
+
     // ── Default-allow: forward unrecognised types to all browsers ─────────────
     this.broadcastToBrowsers(JSON.stringify(msg));
   }

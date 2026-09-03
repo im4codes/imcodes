@@ -449,6 +449,43 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it('never silently drops terminal keystrokes typed during the foreground probe window', async () => {
+    // Terminal input is fire-and-forget: sendInput() has no commandId, no ACK
+    // and no replay, unlike session.send which the caller can retry. The probe
+    // flips _connected=false on every tab resume while readyState is still
+    // OPEN, so this window is hit constantly -- and every keystroke typed in it
+    // is discarded with no way for the user or the client to know. Keystrokes
+    // must survive the window in order, either by going out on the OS-open
+    // socket or by being buffered and flushed when the probe resolves.
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.onMessage(vi.fn());
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.probeConnection();
+    expect(client.connected).toBe(false);
+    expect(socket.readyState).toBe(MockWebSocket.OPEN);
+    socket.send.mockClear();
+
+    // The user types while the tab is resuming.
+    for (const ch of ['l', 's', '\r']) client.sendInput('deck_demo_brain', ch);
+
+    // Probe resolves; the path was healthy the whole time.
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    expect(client.connected).toBe(true);
+    await vi.advanceTimersByTimeAsync(50);
+
+    const delivered = socket.send.mock.calls
+      .map((c) => JSON.parse(c[0] as string))
+      .filter((m) => m.type === 'session.input')
+      .map((m) => m.data);
+    expect(delivered.join(''), 'every keystroke must survive the probe window in order').toBe('ls\r');
+    vi.useRealTimers();
+  });
+
   it('repairs already-sent transport subscriptions after foreground probe recovery without history replay', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');

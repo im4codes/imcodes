@@ -2034,6 +2034,33 @@ describe('WsBridge', () => {
       expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('terminal.diff');
     });
 
+    it('routes a daemon terminal.stream_reset only to browsers subscribed to that session', async () => {
+      // A daemon-originated reset (raw_buffer_overflow) previously fell through
+      // to the default-allow broadcast, so every connected tab reset a terminal
+      // it never subscribed to and that never congested.
+      const { bridge, daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const otherWs = new MockWs();
+      bridge.handleBrowserConnection(otherWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-congested' }));
+      otherWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-quiet' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+      otherWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'terminal.stream_reset', session: 'sess-congested', reason: 'raw_buffer_overflow',
+      }));
+      await flushAsync();
+
+      const resets = (ws: typeof browserWs) => ws.sentStrings
+        .filter((x) => x.includes('"terminal.stream_reset"'));
+      expect(resets(browserWs).length, 'the subscribed tab must receive the reset').toBe(1);
+      expect(
+        resets(otherWs).length,
+        'a tab subscribed to a different session must not be reset',
+      ).toBe(0);
+    });
+
     it('relays additive p2p.run_update payload fields without stripping legacy fields', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       const run = {

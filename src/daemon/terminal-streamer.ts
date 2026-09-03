@@ -505,6 +505,10 @@ export class TerminalStreamer {
     if (Date.now() < freshUntil) return;
 
     this.snapshotInFlight.add(sessionName);
+    // Same barrier the bootstrap re-probe uses: raw forwarded while we await
+    // the capture is NEWER than the captured screen, so publishing that frame
+    // afterwards would rewrite the pane from cursor home and regress it.
+    const rawGuardSince = Date.now();
     void (async () => {
       try {
         const size = await this.getSize(sessionName);
@@ -525,8 +529,12 @@ export class TerminalStreamer {
           newLineCount: 0,
         };
 
-        for (const [sub] of subs) {
-          try { sub.send(diff); } catch { /* ignore */ }
+        // The raw already reached the subscriber and proves the pane is live;
+        // a capture older than it must not be published over it.
+        if ((this.lastStreamRawAt.get(sessionName) ?? 0) < rawGuardSince) {
+          for (const [sub] of subs) {
+            try { sub.send(diff); } catch { /* ignore */ }
+          }
         }
 
         // ConPTY: ring buffer snapshot is approximate (no cursor/ANSI state).
@@ -904,10 +912,15 @@ export class TerminalStreamer {
   }
 
   private failSubscriber(sessionName: string, sub: StreamSubscriber, state: SubscriberState): void {
-    // Discard buffer and remove subscriber
+    // Overflow is a buffer problem, not a subscription problem. Removing the
+    // subscriber made the reset unrecoverable: the client's only reaction to
+    // stream_reset is a snapshot request, and requestSnapshot() returns early
+    // when the session has no subscribers, so the pane stayed dead until a full
+    // socket reconnect. Discard the buffered bytes and stop buffering, but keep
+    // the exact subscriber so the reset it receives can actually resync.
     state.rawBuffer = [];
     state.rawBufferBytes = 0;
-    this.removeSubscriber(sessionName, sub);
+    state.snapshotPending = false;
 
     // Notify client to reset and resubscribe
     try {

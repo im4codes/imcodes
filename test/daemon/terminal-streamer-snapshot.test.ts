@@ -732,4 +732,110 @@ describe('TerminalStreamer — snapshot coalescing (subscription storm)', () => 
     await vi.advanceTimersByTimeAsync(50);
     expect(mockCapture).toHaveBeenCalledTimes(2);
   });
+
+  it('does not let a slow requestSnapshot overwrite raw bytes that arrived while it was capturing', async () => {
+    // requestSnapshot awaits getSize + capturePaneVisible and then broadcasts
+    // fullFrame unconditionally. Raw bytes forwarded during that await are
+    // NEWER than the captured screen, so publishing the capture afterwards
+    // regresses the terminal. The bootstrap re-probe path already guards this
+    // exact hazard via rawGuardSince (terminal-streamer.ts:385-399, whose
+    // comment says emitting a stale fullFrame "would overwrite them and
+    // regress the screen"); requestSnapshot has no such guard.
+    const session = 'snapshot-vs-raw';
+    const frames: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    const rawSeen: string[] = [];
+    const stream = { on: vi.fn(), destroy: vi.fn() };
+    mockStartPipe.mockResolvedValueOnce({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+
+    streamer.subscribe({
+      sessionName: session,
+      send: (diff) => frames.push(diff),
+      sendRaw: (data: Buffer) => rawSeen.push(data.toString()),
+    });
+    await flush();
+    frames.length = 0;
+
+    // Hold the capture open so raw can overtake it.
+    let releaseCapture: (v: string) => void = () => {};
+    mockCapture.mockReturnValueOnce(new Promise<string>((res) => { releaseCapture = res; }));
+    streamer.requestSnapshot(session);
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Newer bytes arrive and are forwarded to the subscriber right now.
+    const onData = stream.on.mock.calls.find((c) => c[0] === 'data')?.[1] as (b: Buffer) => void;
+    expect(onData, 'pipe data handler must be registered').toBeTypeOf('function');
+    onData(Buffer.from('NEWER-OUTPUT'));
+    expect(rawSeen.join('')).toContain('NEWER-OUTPUT');
+
+    // The capture finally resolves with the pre-raw screen.
+    releaseCapture('stale0\nstale1\nstale2\nstale3');
+    await flush();
+
+    const stale = frames.filter((d) => d.snapshotRequested && d.fullFrame);
+    expect(
+      stale.length,
+      'a capture older than already-forwarded raw must not be published as a full frame',
+    ).toBe(0);
+  });
+
+  it('keeps a session recoverable after a raw_buffer_overflow reset', async () => {
+    // failSubscriber() removes the subscriber AND sends stream_reset. The
+    // browser never reads msg.reason and its only reaction is to request a
+    // snapshot -- but requestSnapshot returns early when the session has no
+    // subscribers, so the reset is unrecoverable and the pane stays dead until
+    // a full reconnect.
+    //
+    // Reaching the overflow path requires the production shape: raw is only
+    // buffered (snapshotPending) when a pipe is ALREADY running, which is the
+    // resubscribe case -- the first subscriber starts the pipe only after its
+    // snapshot, so its raw is forwarded, never buffered.
+    const session = 'overflow-recovery';
+    const frames: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    const control: Array<Record<string, unknown>> = [];
+    const stream = { on: vi.fn(), destroy: vi.fn() };
+    mockStartPipe.mockResolvedValue({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+
+    // First subscriber establishes the pipe, then leaves; the pipe lingers.
+    const unsub = streamer.subscribe({ sessionName: session, send: () => {}, sendRaw: () => {} });
+    await flush();
+    const onData = stream.on.mock.calls.find((c) => c[0] === 'data')?.[1] as (b: Buffer) => void;
+    expect(onData, 'pipe data handler must be registered').toBeTypeOf('function');
+    unsub();
+
+    // Resubscribe against the live pipe: this subscriber buffers raw while its
+    // snapshot is pending. Hold that capture open.
+    let releaseSecond: (v: string) => void = () => {};
+    mockCapture.mockReturnValueOnce(new Promise<string>((res) => { releaseSecond = res; }));
+    streamer.subscribe({
+      sessionName: session,
+      send: (diff) => frames.push(diff),
+      sendRaw: () => {},
+      sendControl: (msg: Record<string, unknown>) => control.push(msg),
+    });
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Exceed MAX_RAW_BUFFER (256 KiB) while that snapshot is still pending.
+    onData(Buffer.alloc(300 * 1024, 0x61));
+
+    expect(
+      control.some((m) => m.type === 'terminal.stream_reset'),
+      'overflow must notify the client',
+    ).toBe(true);
+
+    // The client's only recovery move is a snapshot request. It must produce a
+    // frame; otherwise the stream is permanently dead.
+    releaseSecond('a0\na1\na2\na3');
+    await flush();
+    frames.length = 0;
+    mockCapture.mockResolvedValue('r0\nr1\nr2\nr3');
+    streamer.requestSnapshot(session);
+    await flush();
+
+    expect(
+      frames.length,
+      'a snapshot request after stream_reset must re-deliver the screen',
+    ).toBeGreaterThan(0);
+  });
+
+
 });

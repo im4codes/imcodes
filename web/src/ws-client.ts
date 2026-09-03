@@ -131,7 +131,9 @@ export type SessionEventReason =
   | 'socket_open'
   | 'probe_start'
   | 'probe_recovered'
-  | 'socket_closed';
+  | 'socket_closed'
+  /** The bounded terminal-input queue had to discard the oldest keystrokes. */
+  | 'input_buffer_overflow';
 
 export type ServerMessage =
   | ResourceChangedMessage
@@ -366,6 +368,9 @@ const DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES = 60_000;
  *  liveness during normal use; foreground probes only need to fire after a
  *  genuine sleep/background gap. */
 const PROBE_FRESHNESS_MS = 5_000;
+/** Terminal input survives a brief probe/reconnect window, never an unbounded backlog. */
+const MAX_PENDING_INPUT_ENTRIES = 500;
+const MAX_PENDING_INPUT_BYTES = 32 * 1024;
 /** When a user interaction requests fresh data (opening a sub-session,
  *  subscribing to a terminal, asking for timeline history) and the socket has
  *  NOT proven liveness for at least one full heartbeat+pong window, eagerly
@@ -450,6 +455,13 @@ export class WsClient {
   private serverId: string;
   private shareTarget: ShareTarget | null;
   private _connected = false;
+  /**
+   * Terminal keystrokes awaiting an OPEN socket. Terminal input is the one
+   * payload with no commandId, ACK or replay, so it must not be discarded by
+   * the probe heuristic. Strictly bounded -- never an unlimited buffer.
+   */
+  private pendingInput: Array<{ sessionName: string; data: string }> = [];
+  private pendingInputBytes = 0;
   private _connecting = false;
   private _destroyed = false;
   private _pingLatency: number | null = null;
@@ -1107,7 +1119,49 @@ export class WsClient {
 
   /** Send raw keyboard input (from xterm onData) to a tmux session. */
   sendInput(sessionName: string, data: string): void {
-    this.send({ type: 'session.input', sessionName, data });
+    // The generic send() gate is deliberately left unchanged. Terminal input
+    // alone bypasses the probe heuristic, because `_connected=false` is flipped
+    // on every tab resume while readyState is still OPEN, and a dropped
+    // keystroke has no retry path (unlike session.send). readyState OPEN stays
+    // required -- the same OS-level truth sendUrgent() uses for /stop.
+    // Everything goes through the queue so order is preserved exactly.
+    this.queueInput(sessionName, data);
+    this.flushPendingInput();
+  }
+
+  private queueInput(sessionName: string, data: string): void {
+    this.pendingInput.push({ sessionName, data });
+    this.pendingInputBytes += utf8ByteLength(data);
+    while (
+      this.pendingInput.length > MAX_PENDING_INPUT_ENTRIES
+      || this.pendingInputBytes > MAX_PENDING_INPUT_BYTES
+    ) {
+      const dropped = this.pendingInput.shift();
+      if (!dropped) break;
+      this.pendingInputBytes -= utf8ByteLength(dropped.data);
+      // A bound is required, but a drop is never silent.
+      this.dispatch({
+        type: 'session.event',
+        event: 'warning',
+        session: dropped.sessionName,
+        state: 'warning',
+        reason: 'input_buffer_overflow',
+      });
+    }
+  }
+
+  private flushPendingInput(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    while (this.pendingInput.length > 0) {
+      const next = this.pendingInput[0]!;
+      try {
+        this.ws.send(JSON.stringify({ type: 'session.input', sessionName: next.sessionName, data: next.data }));
+      } catch {
+        return; // keep the remainder queued, in order
+      }
+      this.pendingInput.shift();
+      this.pendingInputBytes -= utf8ByteLength(next.data);
+    }
   }
 
   /** Notify the daemon that the terminal viewport has been resized. */
@@ -1414,6 +1468,7 @@ export class WsClient {
     }
     if (this._connected) return;
     this._connected = true;
+    this.flushPendingInput();
     this.flushSubscriptionDiffAfterProbeRecovery();
     this.dispatch({
       type: 'session.event',
@@ -1865,6 +1920,7 @@ export class WsClient {
       this.clearWsOpenTimer();
       this._connecting = false;
       this._connected = true;
+      this.flushPendingInput();
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;
       this.postConnectNonCriticalUntil = Date.now() + POST_CONNECT_NON_CRITICAL_WINDOW_MS;
