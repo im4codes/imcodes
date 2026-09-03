@@ -1031,4 +1031,85 @@ describe('styles.css regression contracts', () => {
     }
   });
 
+
+  // tsk_5zv. The running indicator was a 3.6s whole-card border/glow pulse
+  // (`subcard-sci-fi`) that users could not identify at a glance. It is replaced
+  // by a fast marquee on the BOTTOM edge only: the top 3px is the session accent
+  // colour strip and must stay completely static and uncovered.
+  describe('running session marquee (tsk_5zv)', () => {
+    const runningTrack = () => cssWithoutComments.match(
+      /\.subcard-running-pulse::after\s*\{[^}]*\}/,
+    )?.[0];
+
+    it('animates a bottom-edge track and never the top accent strip', () => {
+      const track = runningTrack();
+      expect(track, 'running needs a bottom-edge marquee track').toBeTruthy();
+      // Pinned to the bottom edge...
+      expect(track).toMatch(/bottom:\s*0/);
+      // ...and explicitly NOT spanning from the top, which would sit over the
+      // 3px accent strip.
+      expect(track).not.toMatch(/\btop:\s*0/);
+      expect(track).toMatch(/animation:/);
+      // It must not intercept drag/reorder/close clicks.
+      expect(track).toMatch(/pointer-events:\s*none/);
+    });
+
+    it('drives the marquee by background-position at a fast, steady rate', () => {
+      const track = runningTrack() ?? '';
+      const name = track.match(/animation:\s*([\w-]+)\s+([\d.]+)s\s+linear/);
+      expect(name, 'marquee must be linear with an explicit duration').toBeTruthy();
+      const seconds = Number(name?.[2]);
+      expect(seconds).toBeGreaterThanOrEqual(0.6);
+      expect(seconds).toBeLessThanOrEqual(1.4);
+      const frames = cssWithoutComments.match(
+        new RegExp(`@keyframes\\s+${name?.[1]}\\s*\\{[^@]*?\\}\\s*\\}`),
+      )?.[0];
+      expect(frames, 'the marquee keyframes must exist').toBeTruthy();
+      expect(frames).toMatch(/background-position/);
+      // The old slow whole-card pulse must be gone from the running class.
+      const runningRule = cssWithoutComments.match(/\.subcard-running-pulse\s*\{[^}]*\}/)?.[0] ?? '';
+      expect(runningRule).not.toMatch(/subcard-sci-fi/);
+    });
+
+    it('keeps a non-animated running signal and a static bottom edge under reduced motion', () => {
+      // Regex cannot do this safely: a lazy scan can start at an EARLIER
+      // reduced-motion block and run forward to this selector, so the assertion
+      // passed even with the rule deleted (mutant M3 survived twice). Brace-match
+      // each reduced-motion block and require the rule to live INSIDE one.
+      const reducedBlocks: string[] = [];
+      const marker = '@media (prefers-reduced-motion: reduce)';
+      for (let at = cssWithoutComments.indexOf(marker); at !== -1; at = cssWithoutComments.indexOf(marker, at + 1)) {
+        const open = cssWithoutComments.indexOf('{', at);
+        if (open === -1) continue;
+        let depth = 0;
+        let close = open;
+        for (; close < cssWithoutComments.length; close += 1) {
+          const ch = cssWithoutComments[close];
+          if (ch === '{') depth += 1;
+          else if (ch === '}') { depth -= 1; if (depth === 0) break; }
+        }
+        reducedBlocks.push(cssWithoutComments.slice(open, close + 1));
+      }
+      const reduced = reducedBlocks.find((block) => block.includes('.subcard-running-pulse::after'));
+      expect(reduced, 'reduced motion must neutralise the marquee').toBeTruthy();
+      expect(reduced).toMatch(/animation:\s*none/);
+      // Motion stops, but the edge stays visibly highlighted.
+      expect(reduced).toMatch(/background/);
+    });
+
+    it('does not apply the marquee to idle cards', () => {
+      // The track selector must be gated on the running class, never on the bare card.
+      expect(cssWithoutComments).not.toMatch(/^\s*\.subcard::after\s*\{[^}]*animation:/m);
+      expect(cssWithoutComments).not.toMatch(/^\s*\.subsession-card::after\s*\{[^}]*animation:/m);
+    });
+
+    it('leaves the top accent border owned by the session colour, unanimated', () => {
+      // The running class may re-assert the accent colour, but must not animate it.
+      const accentRules = cssWithoutComments.match(/\.subcard-running-pulse[^{]*\{[^}]*border-top[^}]*\}/g) ?? [];
+      for (const rule of accentRules) {
+        expect(rule).toMatch(/var\(--subsession-accent-color/);
+        expect(rule).not.toMatch(/animation/);
+      }
+    });
+  });
 });

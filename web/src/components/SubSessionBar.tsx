@@ -386,6 +386,10 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
       <SharedStateIndicator state={sharedState} iconOnly />
       {model && <span class="subsession-card-model">{model}</span>}
       {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
+      {/* tsk_5zv: a static running mark so the running state never depends on the
+          bottom marquee alone - it survives prefers-reduced-motion and reads at a
+          glance next to idle/starting. */}
+      {isVisuallyBusy(sub.state, false) && <span class="subcard-running" aria-hidden="true">●</span>}
       {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
       {ctxPct > 0 && (
         <span class="subsession-card-ctx" style={{ width: '100%' }}>

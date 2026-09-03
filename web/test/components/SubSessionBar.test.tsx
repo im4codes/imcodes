@@ -566,6 +566,7 @@ describe('SubSessionBar', () => {
     fireEvent.click(idleView.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
     const idleCard = idleView.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(idleCard.className).not.toContain('subcard-running-pulse');
+    expect(idleCard.querySelector('.subcard-running')).toBeNull();
     idleView.unmount();
 
     const runningView = render(
@@ -588,6 +589,10 @@ describe('SubSessionBar', () => {
     }
     const runningCard = runningView.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(runningCard.className).toContain('subcard-running-pulse');
+    // tsk_5zv: running must not be conveyed by animation alone. Under
+    // prefers-reduced-motion the marquee stops, so the collapsed/rail button
+    // needs a static running mark exactly like the expanded card has.
+    expect(runningCard.querySelector('.subcard-running')).not.toBeNull();
   });
 
   it('assigns ordered accent colors to collapsed buttons and cycles after the palette', () => {
