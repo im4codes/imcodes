@@ -244,6 +244,50 @@ describe('supervision config helpers', () => {
     } })).toBe(true);
   });
 
+  it('accepts targetless automatic audit only with a canonical explicit live pool route', () => {
+    const base = {
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      backend: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+      timeoutMs: SUPERVISION_MIN_TIMEOUT_MS,
+      promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+      maxParseRetries: 1,
+      maxAutoContinueStreak: 2,
+      maxAutoContinueTotal: 0,
+      maxAuditLoops: 2,
+      taskRunPromptVersion: SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
+    } as const;
+    const livePool = {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+          agentType: 'codex-sdk',
+          providerFamily: 'openai',
+          runtimeType: 'transport',
+          model: 'gpt-5.6-sol',
+        }],
+        controls: {},
+      },
+      economyTaskPool: { configs: [], controls: {} },
+    } as const;
+
+    expect(hasInvalidSessionSupervisionSnapshot({ supervision: { ...base, executionPools: livePool } })).toBe(false);
+    expect(getSessionSupervisionSnapshotIssues({ ...base, executionPools: livePool })).not.toContain('missing_audit_target');
+
+    const malformedPool = {
+      ...livePool,
+      primaryDevelopmentPool: { configs: [{}], controls: {} },
+    };
+    expect(hasInvalidSessionSupervisionSnapshot({ supervision: { ...base, executionPools: malformedPool } })).toBe(true);
+    expect(getSessionSupervisionSnapshotIssues({ ...base, executionPools: malformedPool })).toContain('missing_audit_target');
+
+    // Targetless snapshots written before pool routing remain readable for the
+    // legacy repair flow, but they are not valid automatic-audit writes.
+    expect(extractSessionSupervisionSnapshot({ supervision: base })).not.toBeNull();
+    expect(hasInvalidSessionSupervisionSnapshot({ supervision: base })).toBe(true);
+  });
+
   it('flags invalid persisted supervision snapshots instead of silently activating normalized automation', () => {
     const transportConfig = {
       keep: true,

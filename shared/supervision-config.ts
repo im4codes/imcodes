@@ -29,6 +29,7 @@ import {
   type SupervisionExecutionPoolKind,
   buildSupervisionPoolGateGuidance,
   evaluateSupervisionAutomationPoolGate,
+  normalizeSupervisionExecutionPools,
   type SupervisionAutomationPoolGateReason,
   type SupervisionExecutionPoolsConfig,
 } from './supervision-execution-pool.js';
@@ -1307,13 +1308,17 @@ export function getSessionSupervisionSnapshotIssues(
       if (record.auditMode !== '' && !isSupportedSupervisionAuditMode(String(record.auditMode))) issues.push('invalid_audit_mode');
       else issues.push('legacy_audit_mode_requires_repair');
     }
-    // The Supervisor Brain supplies the exact audit route; the daemon never
-    // selects one. A supervised_audit snapshot carrying no target is therefore
-    // an UNROUTABLE configuration, not a dynamic one: automatic dispatch has
-    // nothing to dispatch to. Flag it for repair instead of letting it reach
-    // the automation and fail there. A present-but-malformed target already
-    // produced invalid_audit_target_name above, so only absence lands here.
-    if (!hasTargetName) issues.push('missing_audit_target');
+    // Current automatic audit snapshots deliberately carry no manual target:
+    // the mode snapshots an auditPolicy onto each task and dispatch resolves a
+    // live auditor from the configured execution pool. Accept that targetless
+    // shape only when the payload itself contains a canonical usable pool. A
+    // missing/legacy/malformed pool still needs the historical target repair
+    // path and must remain invalid for a new automatic write.
+    const automaticPoolRoute = record.executionPools != null
+      && evaluateSupervisionAutomationPoolGate(
+        normalizeSupervisionExecutionPools(record.executionPools),
+      ).ok;
+    if (!hasTargetName && !automaticPoolRoute) issues.push('missing_audit_target');
     if (
       record.maxAuditLoops != null
       && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 0)

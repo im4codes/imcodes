@@ -10,6 +10,7 @@ import {
   DEFAULT_CODEX_AUTOMATION_MODEL,
 } from '../../../src/shared/models/options.js';
 import { DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS } from '../../../shared/supervision-execution-pool.js';
+import { hasInvalidSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 
 const patchSessionMock = vi.fn();
 const patchSubSessionMock = vi.fn();
@@ -397,6 +398,10 @@ describe('SessionSettingsDialog supervision', () => {
     expect(supervision, 'legacy auditor target must not be persisted').not.toHaveProperty('auditTargetSessionName');
     expect(supervision).not.toHaveProperty('auditTargetFingerprint');
     expect(supervision).not.toHaveProperty('peerAuditPromptVersion');
+    expect(
+      hasInvalidSessionSupervisionSnapshot(saved.transportConfig ?? null),
+      'the exact targetless Web payload must satisfy the canonical server validator',
+    ).toBe(false);
   });
 
   it('persists the default Brain model to account defaults without another pool interaction', async () => {

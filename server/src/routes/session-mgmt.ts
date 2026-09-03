@@ -282,20 +282,6 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   const proposed = parseSessionSupervisionSnapshot(body.supervision);
   if (!proposed) return c.json({ error: 'invalid_supervision' }, 400);
 
-  // Fail closed on execution pools. Automatic supervision may only be saved
-  // once the canonical pool config is explicitly configured AND a runtime is
-  // actually selected; a legacy_unconfigured install is never silently upgraded
-  // to a default here. The UI asks the same shared question, so the button and
-  // this authoritative entry cannot disagree.
-  const poolGate = evaluateAutomaticSupervisionEnablement(proposed);
-  if (!poolGate.ok) {
-    return c.json({
-      error: 'supervision_execution_pool_required',
-      reason: poolGate.reason,
-      guidance: poolGate.guidance,
-    }, 400);
-  }
-
   const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
   if (access.actor.kind === 'none') {
     return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
@@ -342,8 +328,17 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   if (nextSnapshot.mode !== SUPERVISION_MODE.OFF && !canOwnAutomaticSupervision) {
     return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
   }
-  if (nextSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT && !nextSnapshot.auditTargetSessionName) {
-    return c.json({ error: 'audit_target_required' }, 409);
+  // Validate the snapshot that will actually be persisted, not `proposed`.
+  // Existing sessions intentionally accept only a scoped mode change here, so
+  // their stored pools remain authoritative and must independently be usable.
+  // This keeps a caller from validating one pool while persisting another.
+  const poolGate = evaluateAutomaticSupervisionEnablement(nextSnapshot);
+  if (!poolGate.ok) {
+    return c.json({
+      error: 'supervision_execution_pool_required',
+      reason: poolGate.reason,
+      guidance: poolGate.guidance,
+    }, 400);
   }
   const nextTransportConfig = buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
 

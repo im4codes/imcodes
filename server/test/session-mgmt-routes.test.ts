@@ -379,6 +379,58 @@ describe('session-mgmt persistence routes', () => {
     });
   });
 
+  it('PATCH /sessions/:name accepts targetless automatic audit routed by an explicit live pool', async () => {
+    const transportConfig = {
+      supervision: {
+        mode: 'supervised_audit',
+        backend: 'codex-sdk',
+        model: 'gpt-5.6-sol',
+        timeoutMs: 30_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        maxAutoContinueStreak: 2,
+        maxAutoContinueTotal: 0,
+        maxAuditLoops: 2,
+        taskRunPromptVersion: 'task_run_status_v1',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{
+              capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+              agentType: 'codex-sdk',
+              providerFamily: 'openai',
+              runtimeType: 'transport',
+              model: 'gpt-5.6-sol',
+            }],
+            controls: {},
+          },
+          economyTaskPool: { configs: [], controls: {} },
+        },
+      },
+    };
+    mockGetDbSessionByName.mockResolvedValue({ name: 'deck_proj_brain', role: 'brain' });
+    const app = await buildApp();
+
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transportConfig }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSession).toHaveBeenCalledWith(
+      mockDb,
+      'srv-1',
+      'deck_proj_brain',
+      { transport_config: transportConfig },
+    );
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_proj_brain',
+      transportConfig,
+    });
+  });
+
   it('PATCH /sessions/:name refuses automatic supervision for a non-Brain session', async () => {
     mockGetDbSessionByName.mockResolvedValue({ name: 'deck_proj_worker', role: 'w1' });
     const app = await buildApp();
@@ -619,6 +671,113 @@ describe('session-mgmt persistence routes', () => {
       sessionName: 'deck_proj_brain',
       transportConfig: expectedTransportConfig,
     });
+  });
+
+  it('PATCH /sessions/:name/supervision accepts automatic audit routed from the live pool', async () => {
+    mockGetDbSessionByName.mockResolvedValue({
+      name: 'deck_proj_brain',
+      role: 'brain',
+      agent_type: 'codex-sdk',
+      transport_config: null,
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+                agentType: 'codex-sdk',
+                providerFamily: 'openai',
+                runtimeType: 'transport',
+                model: 'gpt-5.6-sol',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const persisted = mockUpdateSession.mock.calls.at(-1)?.[3] as {
+      transport_config?: { supervision?: Record<string, unknown> };
+    };
+    expect(persisted.transport_config?.supervision).toMatchObject({ mode: 'supervised_audit' });
+    expect(persisted.transport_config?.supervision).not.toHaveProperty('auditTargetSessionName');
+    expect(sendToDaemonMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('PATCH /sessions/:name/supervision rejects when the merged stored snapshot has no usable audit pool', async () => {
+    mockGetDbSessionByName.mockResolvedValue({
+      name: 'deck_proj_brain',
+      role: 'brain',
+      agent_type: 'codex-sdk',
+      transport_config: {
+        supervision: {
+          mode: 'off',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          executionPools: { state: 'legacy_unconfigured' },
+        },
+      },
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+                agentType: 'codex-sdk',
+                providerFamily: 'openai',
+                runtimeType: 'transport',
+                model: 'gpt-5.6-sol',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+        },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({
+      error: 'supervision_execution_pool_required',
+      reason: 'supervision_pools_legacy_unconfigured',
+    });
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
   it('PATCH /sessions/:name/supervision refuses enablement for a non-Brain session', async () => {

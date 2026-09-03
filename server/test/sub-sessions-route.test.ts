@@ -306,7 +306,7 @@ describe('sub-session routes', () => {
     expect(updateSubSessionMock).not.toHaveBeenCalled();
   });
 
-  it('PATCH /sub-sessions/:id refuses automatic-supervision enablement', async () => {
+  it('PATCH /sub-sessions/:id refuses targetless automatic-audit enablement even with a live pool', async () => {
     const { getSubSessionById } = await import('../src/db/queries.js');
     vi.mocked(getSubSessionById).mockResolvedValue({
       id: 'sub12345',
@@ -320,7 +320,7 @@ describe('sub-session routes', () => {
       body: JSON.stringify({
         transportConfig: {
           supervision: {
-            mode: 'supervised',
+            mode: 'supervised_audit',
             backend: 'codex-sdk',
             model: 'gpt-5.6-sol',
             timeoutMs: 30_000,
@@ -328,6 +328,22 @@ describe('sub-session routes', () => {
             maxParseRetries: 1,
             maxAutoContinueStreak: 2,
             maxAutoContinueTotal: 0,
+            maxAuditLoops: 2,
+            taskRunPromptVersion: 'task_run_status_v1',
+            executionPools: {
+              state: 'configured',
+              primaryDevelopmentPool: {
+                configs: [{
+                  capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+                  agentType: 'codex-sdk',
+                  providerFamily: 'openai',
+                  runtimeType: 'transport',
+                  model: 'gpt-5.6-sol',
+                }],
+                controls: {},
+              },
+              economyTaskPool: { configs: [], controls: {} },
+            },
           },
         },
       }),
