@@ -4373,6 +4373,64 @@ describe('App shell', () => {
     expect(wsInstances.some((instance) => instance.options?.shareTarget)).toBe(false);
   }, 20_000);
 
+  /**
+   * RED — the existing guards cover "Back to dashboard" and "Logout", but not
+   * the case the user actually reports: while a shared open is still in flight,
+   * explicitly navigating to ANOTHER AUTHORIZED SERVER must win.
+   *
+   * Both the URL and the canonical selection have to land on the newer
+   * destination. Asserting only one of them would let a stale write move the
+   * other half and still pass.
+   */
+  it('does not let a pending shared open undo selecting another authorized server', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-pending-switch',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOpen = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+
+    // The user changes their mind and picks one of their own servers while the
+    // shared open is still pending.
+    fireEvent.click(screen.getByRole('button', { name: 'server-select' }));
+    await waitFor(() => expect(window.location.hash).toContain('srv-1'));
+
+    // The stale shared open now settles.
+    await act(async () => {
+      resolveOpen(sharedMainOpenResult('share-pending-switch', 'dispatch-must-not-return'));
+      await Promise.resolve();
+    });
+
+    // URL must stay on the user's newer destination...
+    expect(window.location.hash).toContain('srv-1');
+    expect(window.location.hash).not.toContain('srv-shared');
+    // ...and so must the canonical selection: no shared pane, no share-scoped
+    // socket resurrected by the late response.
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readTabRouteState().serverId).not.toBe('srv-shared');
+  }, 20_000);
+
   it('does not let a pending shared open undo Logout while the logout request is pending', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
@@ -4430,6 +4488,391 @@ describe('App shell', () => {
     const { readTabRouteState } = await import('../src/hooks/useHashState.js');
     expect(readSharedTabRestoreMarker()).toBeNull();
     expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+  }, 20_000);
+
+  /**
+   * RED — an external URL change must not be silently reverted.
+   *
+   * `writeHashState` publishes routes with `history.replaceState`, and nothing
+   * in web/src subscribes to `popstate` or `hashchange` (verified: zero matches
+   * across the source tree). So when the URL changes underneath the app — the
+   * user edits the address bar, follows a direct link into the same tab, or the
+   * browser restores a session — the app never learns about it, while the
+   * unconditional hash-sync effect at app.tsx:1606 keeps republishing the
+   * in-memory selection.
+   *
+   * Net effect for a user sitting in a shared session: navigating to another
+   * authorized server by URL is undone, and the tab snaps back to the shared
+   * session. That is exactly the reported regression, and it needs no reload
+   * and no restore race to happen.
+   */
+  it('does not revert an explicit direct-URL navigation to another authorized server', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-direct-url',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-direct-url', 'dispatch-direct-url'));
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // The user navigates this tab to one of their OWN servers by URL.
+    await act(async () => {
+      history.replaceState(null, '', '/#/srv-1/deck_alpha_brain');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    // The URL itself survives — the hash-sync effect only republishes when the
+    // in-memory selection changes, so it does not stomp an external edit.
+    expect(window.location.hash).toContain('srv-1');
+
+    // But the app must actually FOLLOW that navigation. Nothing in web/src
+    // subscribes to popstate/hashchange, so the shared pane stays mounted and
+    // the tab keeps talking to the shared server while the address bar claims
+    // otherwise. A URL that no longer describes the session on screen is the
+    // user-visible half of "it forced me back to the shared session".
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'the shared pane is still mounted after the user navigated away by URL',
+    ).toBeNull();
+    expect(
+      screen.queryByTestId('session-pane-deck_alpha_brain'),
+      'the app did not follow the explicit URL navigation to the owned server',
+    ).not.toBeNull();
+  }, 20_000);
+
+  const navigateExternally = async (hash: string) => {
+    await act(async () => {
+      history.replaceState(null, '', hash);
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => { await Promise.resolve(); });
+  };
+
+  it('treats duplicate hashchange/popstate for one navigation as a single idempotent move', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-idem',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-idem', 'dispatch-idem'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    const openCallsAfterRestore = openSharedEntryMock.mock.calls.length;
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    // Fire the pair again for the SAME route: must be a no-op.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    // No extra share-open was attempted by the repeated events.
+    expect(openSharedEntryMock.mock.calls.length).toBe(openCallsAfterRestore);
+  }, 20_000);
+
+  it('fails closed on an unauthorized route and does not keep the privileged shared pane', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-unauth',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-unauth', 'dispatch-unauth'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // A server this account has neither ownership of nor a share for.
+    await navigateExternally('/#/srv-not-mine/deck_secret');
+
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a privileged shared pane survived a route that does not authorize it',
+    ).toBeNull();
+    expect(screen.queryByTestId('session-pane-deck_secret')).toBeNull();
+  }, 20_000);
+
+  /**
+   * RED — opening a share must not turn its server into an owned one.
+   *
+   * `handleOpenSharedEntry` merges the shared server into `servers`
+   * ([nextServer, ...prev]), so after one successful open that id is
+   * indistinguishable from a server this account actually owns. Any ownership
+   * check written as `servers.find(...)` therefore starts returning a hit for a
+   * shared server, and a later visit to that route takes the owned branch and
+   * never calls /api/shares/open — the coverage check is skipped entirely, so a
+   * revoked or expired share still renders.
+   *
+   * The assertion that matters is the AUTHORITY CALL, not the pane: checking
+   * only that a pane is absent is satisfied by merely having navigated
+   * elsewhere, which is how the previous version of this test passed while the
+   * bypass was live.
+   */
+  it('re-checks share authority when revisiting a previously opened shared server', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-revoked',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-revoked', 'dispatch-revoked'));
+
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // Leave for an owned server. srv-shared is now sitting in `servers`.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    // The share is revoked server-side.
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockRejectedValue(new Error('share_revoked'));
+
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-revoked');
+
+    expect(
+      openSharedEntryMock.mock.calls.length,
+      'revisiting a shared route must re-run the /api/shares/open coverage check exactly once',
+    ).toBe(1);
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a revoked share must not render',
+    ).toBeNull();
+  }, 20_000);
+
+  it('re-checks authority for a viewer role revisit, and fails closed when it expires', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-viewer',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-viewer', 'dispatch-viewer'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockRejectedValue(new Error('share_expired'));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-viewer');
+
+    expect(openSharedEntryMock.mock.calls.length).toBe(1);
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+  }, 20_000);
+
+  it('re-checks authority for a cross-user share id on a previously opened server', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-mine',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-mine', 'dispatch-mine'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    // Someone else's share id, aimed at a server this tab has already opened.
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockRejectedValue(new Error('not_covered'));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-someone-else');
+
+    expect(
+      openSharedEntryMock.mock.calls.length,
+      'a foreign share id must still be adjudicated by the server, exactly once',
+    ).toBe(1);
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+  }, 20_000);
+
+  it('does not let a late authority result for an abandoned shared route render', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-race',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValueOnce(sharedMainOpenResult('share-race', 'dispatch-race'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    // Revisit the shared route but hold the authority response open...
+    let resolveLate!: (v: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockClear();
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((r) => { resolveLate = r; }));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-race');
+    expect(openSharedEntryMock.mock.calls.length).toBe(1);
+
+    // ...and move away again before it settles.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await act(async () => {
+      resolveLate?.(sharedMainOpenResult('share-race', 'dispatch-race-late'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a late authority result for an abandoned route must not render',
+    ).toBeNull();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).not.toBeNull();
+  }, 20_000);
+
+  it('converges on the final route through a rapid A to B to A sequence', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-rapid',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('share-rapid', 'dispatch-rapid'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-rapid');
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(window.location.hash).toContain('srv-1');
+  }, 20_000);
+
+  it('does not let a late share-open settle over a newer external navigation', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-late',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveLate!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockResolvedValueOnce(sharedMainOpenResult('share-late', 'dispatch-late'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+
+    // Navigate back to the shared route, but hold the share-open open.
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => { resolveLate = resolve; }));
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-late');
+    // ...then move on to an owned server before it settles.
+    await navigateExternally('/#/srv-1/deck_alpha_brain');
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    await act(async () => {
+      resolveLate?.(sharedMainOpenResult('share-late', 'dispatch-late-2'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.queryByTestId('session-pane-deck_beta_brain'),
+      'a stale share-open won over a newer explicit navigation',
+    ).toBeNull();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).not.toBeNull();
   }, 20_000);
 
   it('restores a shared tab from the URL hash instead of falling back to an owned tab', async () => {

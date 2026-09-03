@@ -584,6 +584,8 @@ export function App() {
     remoteDesktopConnectionManagerRef.current = new RemoteDesktopConnectionManager();
   }
   const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
+  /** Server ids this account actually owns, sourced only from /api/server. */
+  const ownedServerIdsRef = useRef<Set<string>>(new Set());
   const initialHashStateRef = useRef(resolveInitialRouteState());
   const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
   const sharedOpenGenerationRef = useRef(0);
@@ -698,6 +700,7 @@ export function App() {
     // expired identity is discarded before asynchronous credential cleanup.
     setAuth(null);
     setServers([]);
+    ownedServerIdsRef.current = new Set();
     setServersLoaded(false);
     setServersSynced(false);
     setSessions([]);
@@ -1418,6 +1421,7 @@ export function App() {
     try {
       await apiFetch(`/api/server/${server.id}`, { method: 'DELETE' });
       setServers((prev) => prev.filter((s) => s.id !== server.id));
+      ownedServerIdsRef.current.delete(server.id);
       if (server.id === selectedServerId) {
         setSelectedServerId(null);
         setSelectedServerName(null);
@@ -1434,6 +1438,14 @@ export function App() {
     try {
       const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
       setServers(data.servers);
+      // Authoritative ownership, kept apart from `servers` on purpose.
+      // `handleOpenSharedEntry` merges the shared server into `servers` so the
+      // rest of the UI can render it, which makes that array a MIXED inventory:
+      // membership there proves the app has seen a server, never that this
+      // account owns it. Ownership decides whether a route may skip the
+      // /api/shares/open coverage check, so it must come from /api/server and
+      // nowhere else.
+      ownedServerIdsRef.current = new Set(data.servers.map((server) => server.id));
       setServersSynced(true);
     } catch {
       // Preserve the last known list on refresh failures. The request is still
@@ -4945,6 +4957,182 @@ export function App() {
     markFastServerSwitchSplash();
     window.location.reload();
   }, []);
+
+  /**
+   * The single consumer of route changes this document did not initiate.
+   *
+   * Nothing used to subscribe to `popstate`/`hashchange`, so editing the
+   * address bar, following a direct link into this tab, using back/forward, or
+   * having the browser restore a session moved the URL while the app kept
+   * rendering — and kept talking to — whatever it had already selected. A user
+   * sitting in a shared session who navigated to one of their own servers was
+   * left with that server in the address bar and the shared pane still mounted
+   * and still privileged.
+   *
+   * This is deliberately NOT a second router and holds no state of its own: it
+   * parses with the existing `readHashState` helper, resolves authorization
+   * BEFORE touching any UI, and then converges the same selection setters every
+   * other navigation path already uses.
+   *
+   * Authorization is the load-bearing part. A URL is an intent, never a grant:
+   * an owned server must be present in the authorized server set, and a shared
+   * target must pass the existing `/api/shares/open` coverage check through
+   * `handleOpenSharedEntry`. Anything unknown, expired, revoked, or belonging
+   * to another account fails closed — and failing closed explicitly tears down
+   * the shared pane rather than leaving a privileged surface mounted under a
+   * route that no longer authorizes it.
+   */
+  const externalRouteGenerationRef = useRef(0);
+  /**
+   * Route currently being consumed. One user action fires `hashchange` AND
+   * `popstate`, and the second arrives while the first is still awaiting
+   * /api/shares/open, so the settled-state comparison alone cannot dedupe it.
+   * Without this the coverage check ran twice per navigation.
+   */
+  const externalRouteInFlightKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!auth || !serversLoaded) return;
+
+    /**
+     * Land on the dashboard as an EXPLICIT choice.
+     *
+     * Simply nulling the selection is not enough: auto-entry reads a null
+     * `selectedServerId` as "the user has not picked yet" and helpfully picks
+     * one, which is how an unauthorized route ended up re-selecting the shared
+     * server (confirmed by stack: the stale hash write came from `choose` in
+     * the auto-entry effect). `manualDashboard` is the existing signal for
+     * "empty on purpose", so reuse it rather than inventing a second flag.
+     */
+    const failClosedToDashboard = () => {
+      autoEntryRunRef.current++;
+      setManualDashboard(true);
+      localStorage.removeItem('rcc_server');
+      localStorage.removeItem('rcc_server_name');
+      localStorage.removeItem('rcc_session');
+      clearSharedTabRestoreMarker();
+      setSelectedShareTarget(null);
+      setSelectedSharedEntryId(null);
+      setSelectedServerId(null);
+      setSelectedServerName(null);
+      setActiveSession(null);
+    };
+
+    const consumeExternalRoute = () => {
+      const route = readHashState();
+      // Same route: nothing to do. Also makes duplicate/coalesced events
+      // (hashchange + popstate fire together for one user action) idempotent.
+      const routeKey = `${route.serverId ?? ''}|${route.sessionName ?? ''}|${route.sharedEntryId ?? ''}`;
+      if (externalRouteInFlightKeyRef.current === routeKey) return;
+      if (route.serverId === selectedServerId
+        && route.sessionName === (activeSession ?? null)
+        && route.sharedEntryId === (selectedSharedEntryId ?? null)) {
+        // Already showing this route, so there is nothing to converge — but if
+        // some OTHER route is still being authorized, navigating back here is
+        // the user abandoning it. Returning early without retiring that work
+        // let a late /api/shares/open result land and render a session the user
+        // had already left.
+        if (externalRouteInFlightKeyRef.current !== null) {
+          externalRouteInFlightKeyRef.current = null;
+          sharedOpenGenerationRef.current += 1;
+          externalRouteGenerationRef.current += 1;
+          setOpeningSharedEntryId(null);
+        }
+        return;
+      }
+      externalRouteInFlightKeyRef.current = routeKey;
+
+      // An external navigation is an explicit user intent and outranks any
+      // shared-open still in flight, exactly like the in-app navigation paths.
+      sharedOpenGenerationRef.current += 1;
+      setOpeningSharedEntryId(null);
+      // Auto-entry treats a null selection as "nobody has chosen yet" and picks
+      // a server on the user's behalf. Clearing the selection to fail closed
+      // would therefore hand the tab straight back to it, which is how an
+      // unauthorized route ended up re-selecting the shared server. Retire the
+      // in-flight auto-entry run the same way the in-app navigation handlers do.
+      autoEntryRunRef.current++;
+      const generation = ++externalRouteGenerationRef.current;
+
+      // Route cleared (back to the dashboard URL): drop everything, including
+      // any shared authority.
+      if (!route.serverId) {
+        externalRouteInFlightKeyRef.current = null;
+        failClosedToDashboard();
+        return;
+      }
+
+      // Ownership is asked of the authoritative inventory, NOT of `servers`.
+      // Using `servers.find` here meant that once a share had been opened its
+      // server was permanently treated as owned, so revisiting that route
+      // skipped /api/shares/open and a revoked or expired share still rendered.
+      const ownedServer = ownedServerIdsRef.current.has(route.serverId)
+        ? servers.find((server) => server.id === route.serverId)
+        : undefined;
+      if (ownedServer) {
+        // Converge atomically onto the owned server; any prior shared authority
+        // is dropped in the same turn so no privileged pane survives the move.
+        setSelectedShareTarget(null);
+        setSelectedSharedEntryId(null);
+        clearSharedTabRestoreMarker();
+        setShowSharedReturnGuide(false);
+        setManualDashboard(false);
+        localStorage.setItem('rcc_server', ownedServer.id);
+        if (ownedServer.name) localStorage.setItem('rcc_server_name', ownedServer.name);
+        setSelectedServerId(ownedServer.id);
+        setSelectedServerName(ownedServer.name ?? null);
+        setActiveSession(route.sessionName ?? localStorage.getItem(`rcc_session_${ownedServer.id}`));
+        externalRouteInFlightKeyRef.current = null;
+        return;
+      }
+
+      // Not an owned server. The only way this may render is if the existing
+      // share-open path authorizes it; the inventory is navigation UI, so a
+      // hash-only target is reconstructed and left for the server to judge.
+      const entry = (route.sharedEntryId
+        ? sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.id === route.sharedEntryId
+            && candidate.serverId === route.serverId
+          )) ?? null
+        : findSharedEntryForHash(sharedEntries, route.serverId, route.sessionName))
+        ?? sharedEntryFallbackFromHash(route.sharedEntryId, route.serverId, route.sessionName);
+
+      if (!entry) {
+        // Unknown/unauthorized route: fail closed. Never keep a stale shared
+        // pane alive under a route that does not authorize it.
+        externalRouteInFlightKeyRef.current = null;
+        failClosedToDashboard();
+        return;
+      }
+
+      void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName })
+        .then((opened) => {
+          if (externalRouteInFlightKeyRef.current === routeKey) externalRouteInFlightKeyRef.current = null;
+          if (generation !== externalRouteGenerationRef.current) return;
+          if (opened) return;
+          // Expired/revoked/cross-user share: the server refused. Tear the
+          // privileged surface down instead of leaving it on screen.
+          failClosedToDashboard();
+        });
+    };
+
+    window.addEventListener('hashchange', consumeExternalRoute);
+    window.addEventListener('popstate', consumeExternalRoute);
+    return () => {
+      window.removeEventListener('hashchange', consumeExternalRoute);
+      window.removeEventListener('popstate', consumeExternalRoute);
+    };
+  }, [
+    activeSession,
+    auth,
+    handleOpenSharedEntry,
+    selectedServerId,
+    selectedSharedEntryId,
+    servers,
+    serversLoaded,
+    setActiveSession,
+    sharedEntries,
+  ]);
 
   // Pending navigation target for sub-sessions that haven't loaded yet
   const [pendingNav, setPendingNav] = useState<{ session: string; quote?: string } | null>(() => {
