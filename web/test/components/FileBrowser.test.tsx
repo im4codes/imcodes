@@ -7,6 +7,7 @@
  *
  * Heavy hljs/marked imports are mocked to prevent OOM in jsdom.
  */
+import { MINIMAL_DOCX_MIME, MINIMAL_DOCX_TEXT, buildMinimalDocx } from '../fixtures/minimal-docx.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
@@ -1026,6 +1027,178 @@ describe('FileBrowser', () => {
 
     expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
     expect(onDirectoryCreated).toHaveBeenCalledWith('/home/user/newdir');
+  });
+
+  // tsk_5rf. 6a169ad3c moved Office previews onto the chunked download channel.
+  // This drives the REAL production branch end to end - click a .docx, receive
+  // the streamed fs.read_response, let FileBrowser build the authenticated URL,
+  // let the real OfficePreview fetch an ArrayBuffer and the real docx-preview
+  // parser render it - and asserts the actual Word text reaches the DOM.
+  // Asserting previewMode === 'stream' would have passed while users saw blank.
+  it('renders real Word text through the streamed office preview branch (tsk_5rf)', async () => {
+    const bytes = await buildMinimalDocx();
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'report.docx', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('report.docx')); });
+    await waitFor(() => expect(vi.mocked(ws.fsReadFile)).toHaveBeenCalledWith('/home/user/report.docx'));
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/report.docx',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: MINIMAL_DOCX_MIME,
+        size: bytes.byteLength,
+        downloadId: 'docx-handle',
+      } as unknown as ServerMessage);
+    });
+
+    await waitFor(() => expect(view.container.textContent).toContain(MINIMAL_DOCX_TEXT), { timeout: 5000 });
+
+    // Bytes came over the authenticated chunked URL, never back through the WS.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toContain('/api/server/srv-1/uploads/docx-handle/download');
+  });
+
+  it('does not blank or leak when the office preview lacks a serverId (tsk_5rf)', async () => {
+    const bytes = await buildMinimalDocx();
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'report.docx', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('report.docx')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/report.docx',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: MINIMAL_DOCX_MIME,
+        downloadId: 'docx-handle',
+      } as unknown as ServerMessage);
+    });
+    // No daemon to build an authenticated URL against. The bug: both stream
+    // branches require serverId, so the response fell through to the text path,
+    // where `msg.content ?? ''` produced an EMPTY 'ok' preview - a silently
+    // blank pane with no explanation. Asserting only "no fetch / no text" would
+    // pass on exactly that blank, so assert the user is actually told.
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(view.container.textContent).not.toContain(MINIMAL_DOCX_TEXT);
+    await waitFor(() => expect(view.container.textContent).toContain('file_browser.preview_error'));
+  });
+
+  it('never renders a non-image streamed file as an <img> (tsk_5rf)', async () => {
+    // The streamed fallback branch set status 'image' for ANY streamed response
+    // that carried a mimeType, without checking it was actually an image. A
+    // streamed binary would then be handed to <img src=...>, which renders as a
+    // broken/blank box - the same symptom class as the Word blank.
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8) }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'blob.bin', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('blob.bin')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/blob.bin',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'application/octet-stream',
+        downloadId: 'bin-handle',
+      } as unknown as ServerMessage);
+    });
+    await waitFor(() => expect(view.container.textContent).toContain('file_browser.preview_error'));
+    expect(view.container.querySelector('img')).toBeNull();
+  });
+
+  it('fails the streamed image preview explicitly when the URL errors (tsk_5rf R2)', async () => {
+    // A resolved URL is not a loaded image. A dead/expired download handle used
+    // to leave a broken <img> on screen with the preview still reporting image
+    // state; it must surface the preview error instead.
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'shot.png', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('shot.png')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/shot.png',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'image/png',
+        downloadId: 'png-handle',
+      } as unknown as ServerMessage);
+    });
+    await waitFor(() => expect(view.container.querySelector('.fb-preview-image img')).not.toBeNull());
+
+    await act(async () => {
+      fireEvent.error(view.container.querySelector('.fb-preview-image img') as HTMLImageElement);
+    });
+
+    await waitFor(() => expect(view.container.textContent).toContain('file_browser.preview_error'));
+    expect(view.container.querySelector('.fb-preview-image img')).toBeNull();
+  });
+
+  it('keeps the streamed image in loading until the real img load event (tsk_5rf R3)', async () => {
+    // A built URL is not a loaded image. R2 added onError here but still flipped
+    // straight to interactive image state on URL construction, so a slow or
+    // never-loading handle showed an empty image frame with no loading signal.
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([{ name: 'shot.png', isDir: false }], '/home/user'); });
+    await act(async () => { fireEvent.click(view.getByText('shot.png')); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/shot.png',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'image/png',
+        downloadId: 'png-handle',
+      } as unknown as ServerMessage);
+    });
+
+    // The <img> exists so the browser can fetch it, but the pane still reports loading.
+    await waitFor(() => expect(view.container.querySelector('.fb-preview-image img')).not.toBeNull());
+    expect(view.container.querySelector('.fb-preview-loading')).not.toBeNull();
+
+    await act(async () => {
+      fireEvent.load(view.container.querySelector('.fb-preview-image img') as HTMLImageElement);
+    });
+
+    await waitFor(() => expect(view.container.querySelector('.fb-preview-loading')).toBeNull());
+    expect(view.container.querySelector('.fb-preview-image img')).not.toBeNull();
   });
 
   it('creates a new file, refreshes the parent directory, and opens the new file preview', async () => {

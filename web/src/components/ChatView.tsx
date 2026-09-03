@@ -3,6 +3,7 @@
  * Merges consecutive streaming assistant.text events into single blocks.
  * Supports basic Markdown rendering (code blocks, inline code, bold).
  */
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
@@ -196,26 +197,43 @@ interface AssistantBlockProps {
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
-const chatLocalImagePreviewCache = new Map<string, Promise<ChatLocalImagePreviewResult>>();
+/**
+ * tsk_5rf R2: a streamed preview caches a download-handle URL, and that handle
+ * expires server-side (4h). An LRU with no TTL therefore served dead URLs
+ * indefinitely. This bound is deliberately well under the handle lifetime so a
+ * cached entry can never outlive the handle it points at.
+ */
+const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS = 30 * 60 * 1000;
+interface ChatLocalImagePreviewCacheEntry {
+  promise: Promise<ChatLocalImagePreviewResult>;
+  createdAt: number;
+}
+const chatLocalImagePreviewCache = new Map<string, ChatLocalImagePreviewCacheEntry>();
+
+function invalidateChatLocalImagePreview(cacheKey: string): void {
+  chatLocalImagePreviewCache.delete(cacheKey);
+}
 
 function getCachedChatLocalImagePreview(
   cacheKey: string,
   load: () => Promise<ChatLocalImagePreviewResult>,
+  now: number = Date.now(),
 ): Promise<ChatLocalImagePreviewResult> {
   const existing = chatLocalImagePreviewCache.get(cacheKey);
-  if (existing) {
+  if (existing && now - existing.createdAt <= CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS) {
     chatLocalImagePreviewCache.delete(cacheKey);
     chatLocalImagePreviewCache.set(cacheKey, existing);
-    return existing;
+    return existing.promise;
   }
+  if (existing) chatLocalImagePreviewCache.delete(cacheKey);
 
   const pending = load().catch((err) => {
-    if (chatLocalImagePreviewCache.get(cacheKey) === pending) {
+    if (chatLocalImagePreviewCache.get(cacheKey)?.promise === pending) {
       chatLocalImagePreviewCache.delete(cacheKey);
     }
     throw err;
   });
-  chatLocalImagePreviewCache.set(cacheKey, pending);
+  chatLocalImagePreviewCache.set(cacheKey, { promise: pending, createdAt: now });
   while (chatLocalImagePreviewCache.size > CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT) {
     const oldestKey = chatLocalImagePreviewCache.keys().next().value;
     if (typeof oldestKey !== 'string') break;
@@ -227,6 +245,13 @@ function getCachedChatLocalImagePreview(
 export function __clearChatLocalImagePreviewCacheForTests() {
   chatLocalImagePreviewCache.clear();
 }
+
+/** Test seam for the streamed-URL cache boundary (tsk_5rf R2). */
+export const __chatLocalImagePreviewCacheInternals = {
+  get: getCachedChatLocalImagePreview,
+  invalidate: invalidateChatLocalImagePreview,
+  ttlMs: CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS,
+};
 
 /** Extract a chat event's visible text while preserving block/list/code
  *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
@@ -2133,53 +2158,32 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     })
   ), [fileScopeSessionName, mapDownloadError, t, ws]);
 
-  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
-    new Promise((resolve, reject) => {
-      if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
-        reject(new Error(t('file_browser.preview_error')));
-        return;
-      }
-
-      let unsub: (() => void) | undefined;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const resolvedPath = resolvePreviewPath(path, workdir);
-      const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
-      const cacheKey = `${cacheScope}\0${resolvedPath}`;
-      const cleanup = () => {
-        if (timer) clearTimeout(timer);
-        unsub?.();
-      };
-
-      getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
-        try {
-          const reqId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
-          timer = setTimeout(() => {
-            cleanup();
-            rejectCached(new Error(t('upload.download_timeout')));
-          }, 30_000);
-          unsub = ws.onMessage((msg) => {
-            if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-            cleanup();
-            if (msg.status === 'error') {
-              rejectCached(new Error(t('file_browser.preview_error')));
-              return;
-            }
-            if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
-              resolveCached({
-                dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
-                alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
-              });
-              return;
-            }
-            rejectCached(new Error(t('file_browser.preview_error')));
-          });
-        } catch (err) {
-          cleanup();
-          rejectCached(err instanceof Error ? err : new Error(String(err)));
-        }
-      })).then(resolve, reject);
-    })
-  ), [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
+  // tsk_5rf: this used to carry its own copy of the fs.read_response loader and
+  // accepted ONLY base64. After 6a169ad3c the daemon answers image previews with
+  // metadata plus a download handle, so that copy rejected every streamed image
+  // and the chat thumbnail vanished while FileBrowser (the other copy) kept
+  // working. There is now one shared loader, so a contract change cannot fix one
+  // surface and silently break the other.
+  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => {
+    if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
+      return Promise.reject(new Error(t('file_browser.preview_error')));
+    }
+    const resolvedPath = resolvePreviewPath(path, workdir);
+    const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
+    const cacheKey = `${cacheScope}\0${resolvedPath}`;
+    return getCachedChatLocalImagePreview(cacheKey, () => loadFsLocalImagePreview(ws, resolvedPath, {
+      sessionName: fileScopeSessionName,
+      serverId: serverId ?? undefined,
+      timeoutMs: 30_000,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('upload.download_timeout'),
+    }).then((result) => ({
+      ...result,
+      // Evict on a real <img> failure so the retry calls fsReadFile again for a
+      // fresh handle instead of replaying a dead URL.
+      onLoadFailed: () => invalidateChatLocalImagePreview(cacheKey),
+    })));
+  }, [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
     if (!serverId) throw new Error(t('upload.daemon_offline'));

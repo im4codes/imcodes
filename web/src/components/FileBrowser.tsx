@@ -282,7 +282,11 @@ export type FileBrowserPreviewState =
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
   /** `dataUrl` holds the chunked HTTP download URL (no inline data: payload). */
-  | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
+  // tsk_5rf R3: `settling` means the URL is built and the browser is still
+  // fetching it. The pane keeps reporting loading until the real <img> load
+  // event, so a slow or never-loading handle can never look like a rendered
+  // (but empty) image.
+  | { status: 'image'; path: string; dataUrl: string; downloadId?: string; settling?: boolean }
   | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string }
   | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'audio'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
@@ -994,9 +998,13 @@ export function FileBrowser({
           return;
         }
 
+        // tsk_5rf: this must verify the mime is actually an image. It previously
+        // accepted ANY streamed mimeType and handed it to <img src=...>, so a
+        // streamed binary rendered as a broken/blank box instead of an error.
         if (
           (msg as { previewMode?: string }).previewMode === 'stream'
-          && msg.mimeType
+          && typeof msg.mimeType === 'string'
+          && msg.mimeType.startsWith('image/')
           && dlId
           && serverId
         ) {
@@ -1005,7 +1013,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'image', path: filePath, dataUrl: streamUrl, downloadId: dlId });
+              setPreview({ status: 'image', path: filePath, dataUrl: streamUrl, downloadId: dlId, settling: true });
             })
             .catch(() => {
               if (!mountedRef.current) return;
@@ -1013,6 +1021,17 @@ export function FileBrowser({
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
               setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
             });
+          return;
+        }
+
+        // tsk_5rf: a streamed response carries NO content by design. Before this
+        // guard it fell through to the text path below, where `msg.content ?? ''`
+        // produced an empty 'ok' preview - the silently blank Word pane users
+        // reported. Both stream branches above require serverId (and a mimeType),
+        // so any streamed response that reaches here cannot be rendered and must
+        // say so instead of pretending to be an empty document.
+        if ((msg as { previewMode?: string }).previewMode === 'stream') {
+          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
           return;
         }
 
@@ -1895,11 +1914,12 @@ export function FileBrowser({
   const loadMarkdownImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
     loadFsLocalImagePreview(ws, path, {
       sessionName: scopedSessionName,
+      serverId,
       timeoutMs: PREVIEW_REQUEST_TIMEOUT_MS,
       errorMessage: t('file_browser.preview_error'),
       timeoutMessage: t('file_browser.timeout'),
     })
-  ), [scopedSessionName, t, ws]);
+  ), [scopedSessionName, serverId, t, ws]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -2033,7 +2053,7 @@ export function FileBrowser({
       </div>
       {/* Conflict dialog rendered inside FileEditor */}
       <div class="fb-preview-content" ref={previewContentRef}>
-        {preview.status === 'loading' && (
+        {(preview.status === 'loading' || (preview.status === 'image' && preview.settling)) && (
           <div class="fb-preview-loading">
             <div class="fb-loading-spinner" />
             <div class="fb-loading-text">{t('file_browser.preview_loading')}</div>
@@ -2047,6 +2067,19 @@ export function FileBrowser({
             <img
               src={preview.dataUrl}
               alt={preview.path.split(/[/\\]/).pop() ?? ''}
+              onLoad={() => {
+                setPreview((current) => (current.status === 'image' && current.path === preview.path && current.settling
+                  ? { ...current, settling: false }
+                  : current));
+              }}
+              onError={() => {
+                // tsk_5rf R2: a streamed preview resolves a URL, not bytes. A
+                // dead or expired download handle used to leave a broken image
+                // here while the preview still claimed image state.
+                setPreview((current) => (current.status === 'image' && current.path === preview.path
+                  ? { status: 'error', path: current.path, error: t('file_browser.preview_error'), downloadId: current.downloadId }
+                  : current));
+              }}
               onClick={() => setLightbox({
                 src: preview.dataUrl,
                 fileName: preview.path.split(/[/\\]/).pop() || undefined,

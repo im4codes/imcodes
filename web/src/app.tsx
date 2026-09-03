@@ -6935,6 +6935,7 @@ export function App() {
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
+              serverId={selectedServerId}
               onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); setDiscussionInitialTab('team'); }}
               initialSelectedId={discussionInitialId}
               initialTab={discussionInitialTab}
