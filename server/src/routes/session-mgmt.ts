@@ -69,6 +69,7 @@ import {
   SUPERVISION_MODE,
   SUPERVISION_USER_DEFAULT_PREF_KEY,
   type SessionSupervisionSnapshot,
+  evaluateAutomaticSupervisionEnablement,
 } from '../../../shared/supervision-config.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -280,6 +281,20 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   }
   const proposed = parseSessionSupervisionSnapshot(body.supervision);
   if (!proposed) return c.json({ error: 'invalid_supervision' }, 400);
+
+  // Fail closed on execution pools. Automatic supervision may only be saved
+  // once the canonical pool config is explicitly configured AND a runtime is
+  // actually selected; a legacy_unconfigured install is never silently upgraded
+  // to a default here. The UI asks the same shared question, so the button and
+  // this authoritative entry cannot disagree.
+  const poolGate = evaluateAutomaticSupervisionEnablement(proposed);
+  if (!poolGate.ok) {
+    return c.json({
+      error: 'supervision_execution_pool_required',
+      reason: poolGate.reason,
+      guidance: poolGate.guidance,
+    }, 400);
+  }
 
   const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
   if (access.actor.kind === 'none') {

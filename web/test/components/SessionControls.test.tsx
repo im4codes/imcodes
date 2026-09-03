@@ -5755,6 +5755,19 @@ afterEach(() => {
       model: 'gpt-5.4',
       timeoutMs: 12000,
       promptVersion: 'supervision_decision_v1',
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: {
+          configs: [{
+            agentType: 'codex-sdk',
+            providerFamily: 'openai',
+            runtimeType: 'transport',
+            model: 'gpt-5.4',
+          }],
+          controls: {},
+        },
+        economyTaskPool: { configs: [], controls: {} },
+      },
     });
     const onTransportConfigSaved = vi.fn();
     render(
@@ -5807,6 +5820,19 @@ afterEach(() => {
       model: 'gpt-5.4',
       timeoutMs: 12000,
       promptVersion: 'supervision_decision_v1',
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: {
+          configs: [{
+            agentType: 'codex-sdk',
+            providerFamily: 'openai',
+            runtimeType: 'transport',
+            model: 'gpt-5.4',
+          }],
+          controls: {},
+        },
+        economyTaskPool: { configs: [], controls: {} },
+      },
     });
     patchSessionSupervisionMock.mockRejectedValueOnce(new Error('relay_failed'));
     const onTransportConfigSaved = vi.fn();
@@ -8583,6 +8609,19 @@ afterEach(() => {
       model: 'gpt-5.4',
       timeoutMs: 30_000,
       promptVersion: 'supervision_decision_v1',
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: {
+          configs: [{
+            agentType: 'codex-sdk',
+            providerFamily: 'openai',
+            runtimeType: 'transport',
+            model: 'gpt-5.4',
+          }],
+          controls: {},
+        },
+        economyTaskPool: { configs: [], controls: {} },
+      },
     });
     patchSessionSupervisionMock.mockResolvedValue({
       supervision: {

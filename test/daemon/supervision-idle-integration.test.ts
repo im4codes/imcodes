@@ -157,6 +157,20 @@ function seedSupervisedSession(mode: 'supervised' | 'supervised_audit' = 'superv
     auditMode: 'audit',
     maxAuditLoops: 2,
     taskRunPromptVersion: 'supervision_continue_v1',
+    executionPools: {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          agentType: 'codex-sdk',
+          providerFamily: 'openai',
+          runtimeType: 'transport',
+          model: 'gpt-5.6-sol',
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+        }],
+        controls: {},
+      },
+      economyTaskPool: { configs: [], controls: {} },
+    },
   });
   getSessionMock.mockReturnValue({
     name: SESSION,
@@ -206,7 +220,7 @@ describe('supervision → idle → broker integration', () => {
       'implement the feature',
       'cmd-int-1',
       undefined,
-      expect.stringContaining(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE),
+      expect.stringContaining('"localWork":"perform_now_no_marker"'),
     );
     expect(supervisionAutomation.getActiveRun(SESSION)).toBeTruthy();
 

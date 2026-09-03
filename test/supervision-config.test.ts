@@ -4,6 +4,7 @@ import {
   SUPERVISION_GATE_ENFORCEMENT,
   SUPERVISION_MODE,
 } from '../shared/supervision-config.js';
+import { PROVIDER_ERROR_CODES } from '../src/agent/transport-provider.js';
 import { CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../shared/context-model-defaults.js';
 import { PEER_AUDIT_PROMPT_VERSION } from '../shared/peer-audit.js';
@@ -13,6 +14,8 @@ import {
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_AUDIT_MODES,
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
+  evaluateAutomaticSupervisionEnablement,
   SUPERVISION_DEFAULT_PROMPT_VERSION,
   SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   DEFAULT_SUPERVISION_TIMEOUT_MS,
@@ -38,9 +41,21 @@ import {
   parseTaskRunTerminalStateFromText,
   patchPeerAuditTargetInTransportConfig,
   resolveEffectiveCustomInstructions,
+  SUPERVISION_UNAVAILABLE_REASONS,
+  SUPERVISION_PAUSE_CATEGORIES,
+  SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS,
+  classifySupervisionContinuationFailure,
+  classifySupervisionInterruption,
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
+  it('registers the canonical Brain work-delegation contract in every standing reference', () => {
+    expect(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION)
+      .toBe('supervision_brain_work_delegation_v1');
+    expect(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE)
+      .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+  });
+
   it('uses one fail-closed authority for automatic supervision mode', () => {
     expect(isAutomaticSupervisionEnabled(null)).toBe(false);
     expect(isAutomaticSupervisionEnabled(undefined)).toBe(false);
@@ -661,5 +676,185 @@ describe('supervision gate scope and change proportionality', () => {
     expect(SUPERVISION_CHANGE_PROPORTIONALITY.functionalChangeAlwaysAudited).toBe(true);
     // ...and the trivial tier can never be reached by a production-byte change.
     expect(SUPERVISION_CHANGE_PROPORTIONALITY.trivialRequiresAll).toContain('no_production_byte_change');
+  });
+});
+
+describe('automatic supervision enablement gate', () => {
+  function snapshot(mode: string, pools: unknown) {
+    return { mode, executionPools: pools, uiLocale: 'zh-CN' } as never;
+  }
+  const configured = {
+    state: 'configured',
+    primaryDevelopmentPool: {
+      configs: [{
+        agentType: 'codex-sdk',
+        providerFamily: 'openai',
+        runtimeType: 'transport',
+        model: 'gpt-5.6-sol',
+      }],
+      controls: {},
+    },
+    economyTaskPool: { configs: [], controls: {} },
+  };
+
+  it('lets a non-automatic mode through untouched', () => {
+    // Turning supervision OFF must never be blocked by pool configuration.
+    expect(evaluateAutomaticSupervisionEnablement(snapshot('off', {})).ok).toBe(true);
+  });
+
+  it('refuses to enable automatic supervision on unconfigured pools', () => {
+    for (const mode of ['supervised', 'supervised_audit']) {
+      const gate = evaluateAutomaticSupervisionEnablement(snapshot(mode, {}));
+      expect(gate.ok).toBe(false);
+      expect(gate.ok === false && gate.reason).toBeTruthy();
+      // The refusal must carry actionable operator guidance, localized.
+      expect(gate.ok === false && gate.guidance.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('admits automatic supervision once a pool is genuinely selected', () => {
+    for (const mode of ['supervised', 'supervised_audit']) {
+      expect(evaluateAutomaticSupervisionEnablement(snapshot(mode, configured)).ok).toBe(true);
+    }
+  });
+
+  it('localizes the refusal to the snapshot ui locale', () => {
+    const zh = evaluateAutomaticSupervisionEnablement(snapshot('supervised', {}));
+    const en = evaluateAutomaticSupervisionEnablement(
+      { mode: 'supervised', executionPools: {}, uiLocale: 'en' } as never,
+    );
+    expect(zh.ok).toBe(false);
+    expect(en.ok).toBe(false);
+    expect(zh.ok === false && en.ok === false && zh.guidance === en.guidance).toBe(false);
+  });
+});
+
+describe('supervision interruption classification', () => {
+  // The heartbeat is the Brain main session's only way to keep supervising a
+  // task whose work lives in child sessions. A transient supervisor-side
+  // failure must therefore never end the run: only a condition a human must
+  // personally clear may pause it.
+  const resumes: Array<[string, Parameters<typeof classifySupervisionInterruption>[0]]> = [
+    ['an ordinary supervisor decision timeout', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT }],
+    ['a queue/capacity timeout', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT }],
+    ['an unparseable supervisor decision', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT }],
+    ['a disconnected supervisor provider', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED }],
+    ['a transient provider error', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+    }],
+    // A rate limit is a throttle with a reset, not exhausted quota. The
+    // requirement pauses only on quota that is *explicitly* exhausted, so this
+    // has to come back through the durable heartbeat rather than stop.
+    ['a rate-limited provider', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.RATE_LIMITED,
+    }],
+  ];
+
+  for (const [label, input] of resumes) {
+    it(`resumes supervision after ${label}`, () => {
+      expect(classifySupervisionInterruption(input)).toEqual({ kind: 'resume' });
+    });
+  }
+
+  const pauses: Array<[string, Parameters<typeof classifySupervisionInterruption>[0], string]> = [
+    ['credentials that must be re-authorized', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.AUTH_FAILED,
+    }, SUPERVISION_PAUSE_CATEGORIES.REAUTHORIZATION_REQUIRED],
+    ['a supervisor config the human must repair', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.CONFIG_ERROR,
+    }, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+    ['a missing supervisor provider', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND,
+    }, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+    ['an invalid supervision snapshot', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT,
+    }, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+    // No machine reason at all means the supervisor itself decided a human is
+    // needed; that is the explicit human-input request.
+    ['a bare ask_human with no machine reason', {}, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+  ];
+
+  for (const [label, input, category] of pauses) {
+    it(`pauses supervision for ${label}`, () => {
+      expect(classifySupervisionInterruption(input)).toEqual({ kind: 'pause', category });
+    });
+  }
+
+  it('only ever admits the four sanctioned pause categories', () => {
+    // Guards against a future reason quietly inventing a fifth way to stop.
+    expect(Object.values(SUPERVISION_PAUSE_CATEGORIES).sort()).toEqual([
+      'brain_only_authority',
+      'human_input_requested',
+      'quota_exhausted',
+      'reauthorization_required',
+    ]);
+    for (const reason of Object.values(SUPERVISION_UNAVAILABLE_REASONS)) {
+      const outcome = classifySupervisionInterruption({ unavailableReason: reason });
+      if (outcome.kind === 'pause') {
+        expect(Object.values(SUPERVISION_PAUSE_CATEGORIES)).toContain(outcome.category);
+      }
+    }
+  });
+});
+
+describe('supervision continuation repair (repair_then_resume)', () => {
+  // A delegated task whose continuation trips a recoverable control-plane
+  // fault must be REPAIRED and RESUMED, never abandoned. Stopping here is how
+  // a task silently dies while its child sessions are still holding work.
+  const recoverable = Object.values(SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS);
+
+  for (const condition of recoverable) {
+    it(`resumes after the recoverable control-plane condition ${condition}`, () => {
+      expect(classifySupervisionContinuationFailure({ condition }))
+        .toEqual({ kind: 'resume' });
+    });
+  }
+
+  it('names exactly the five user-specified recoverable conditions', () => {
+    expect([...recoverable].sort()).toEqual([
+      'ambiguous_assignment_worktree',
+      'identity_rejected_after_runtime_change',
+      'old_runtime_identity',
+      'role_continuation_routing_gap',
+      'stale_lease_or_pointer',
+    ]);
+  });
+
+  it('never resumes a cross-project or cross-user takeover, however recoverable it looks', () => {
+    // Repair authority stops at the project boundary. Every recoverable
+    // condition must still refuse when the work belongs to someone else.
+    for (const condition of recoverable) {
+      expect(classifySupervisionContinuationFailure({ condition, crossProject: true }))
+        .toEqual({
+          kind: 'pause',
+          category: SUPERVISION_PAUSE_CATEGORIES.BRAIN_ONLY_AUTHORITY,
+        });
+    }
+  });
+
+  it('pauses conservatively on an unrecognized condition rather than inventing a repair', () => {
+    expect(classifySupervisionContinuationFailure({ condition: 'something_new' }))
+      .toEqual({
+        kind: 'pause',
+        category: SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED,
+      });
+    expect(classifySupervisionContinuationFailure({}))
+      .toEqual({
+        kind: 'pause',
+        category: SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED,
+      });
+  });
+
+  it('reuses the existing pause vocabulary instead of a parallel enum', () => {
+    const outcome = classifySupervisionContinuationFailure({ condition: 'nope', crossProject: true });
+    expect(outcome.kind).toBe('pause');
+    if (outcome.kind === 'pause') {
+      expect(Object.values(SUPERVISION_PAUSE_CATEGORIES)).toContain(outcome.category);
+    }
   });
 });

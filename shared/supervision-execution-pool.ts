@@ -265,6 +265,83 @@ function normalizePool(value: unknown, kind: SupervisionExecutionPoolKind): Supe
   };
 }
 
+/**
+ * Why automatic supervision may not save or start yet.
+ *
+ * These are the only two ways the canonical pool config can be unusable, and
+ * both must fail closed: an install that never opted in, and an install that
+ * opted in but selected nothing to run on.
+ */
+export const SUPERVISION_AUTOMATION_POOL_GATE_REASONS = {
+  LEGACY_UNCONFIGURED: 'supervision_pools_legacy_unconfigured',
+  NO_POOL_SELECTED: 'supervision_pool_not_selected',
+} as const;
+
+export type SupervisionAutomationPoolGateReason =
+  typeof SUPERVISION_AUTOMATION_POOL_GATE_REASONS[
+    keyof typeof SUPERVISION_AUTOMATION_POOL_GATE_REASONS];
+
+export type SupervisionAutomationPoolGate =
+  | { ok: true }
+  | { ok: false; reason: SupervisionAutomationPoolGateReason };
+
+/**
+ * The single precondition for saving or starting automatic supervision.
+ *
+ * Reads only canonical `SupervisionExecutionPoolsConfig` fields, so the UI and
+ * the authoritative save entry cannot drift apart or disagree about what
+ * "configured" means. Deliberately fail-closed: anything other than an explicit
+ * `configured` state carrying a real primary selection is refused, and a legacy
+ * migration never silently satisfies it.
+ */
+export function evaluateSupervisionAutomationPoolGate(
+  pools: SupervisionExecutionPoolsConfig | null | undefined,
+): SupervisionAutomationPoolGate {
+  if (!pools || pools.state !== 'configured') {
+    return { ok: false, reason: SUPERVISION_AUTOMATION_POOL_GATE_REASONS.LEGACY_UNCONFIGURED };
+  }
+  if (!Array.isArray(pools.primaryDevelopmentPool?.configs)
+    || pools.primaryDevelopmentPool.configs.length === 0) {
+    return { ok: false, reason: SUPERVISION_AUTOMATION_POOL_GATE_REASONS.NO_POOL_SELECTED };
+  }
+  return { ok: true };
+}
+
+/**
+ * Operator-facing guidance for a refusal, in the seven supported UI locales.
+ *
+ * Takes a plain locale string rather than importing the locale list, because
+ * shared/supervision-config.ts already imports this module and a value import
+ * back would be a runtime cycle. Locale parity is enforced by test.
+ */
+export function buildSupervisionPoolGateGuidance(
+  reason: SupervisionAutomationPoolGateReason,
+  locale?: string,
+): string {
+  const guidance: Record<SupervisionAutomationPoolGateReason, Record<string, string>> = {
+    [SUPERVISION_AUTOMATION_POOL_GATE_REASONS.LEGACY_UNCONFIGURED]: {
+      en: 'Automatic supervision is off until you configure the execution pools. Open supervision settings and confirm the primary development pool; no legacy default is applied for you.',
+      'zh-CN': '在配置执行池之前，自动监督保持关闭。请打开监督设置并确认主开发池；系统不会为你套用任何旧版默认值。',
+      'zh-TW': '在設定執行池之前，自動監督維持關閉。請開啟監督設定並確認主開發池；系統不會為你套用任何舊版預設值。',
+      es: 'La supervisión automática permanece desactivada hasta que configures los grupos de ejecución. Abre los ajustes de supervisión y confirma el grupo de desarrollo principal; no se aplica ningún valor heredado por ti.',
+      ru: 'Автоматический надзор выключен, пока не настроены пулы выполнения. Откройте настройки надзора и подтвердите основной пул разработки; устаревшие значения по умолчанию не применяются автоматически.',
+      ja: '実行プールを構成するまで自動監督は無効のままです。監督設定を開いてプライマリ開発プールを確認してください。レガシーの既定値が自動適用されることはありません。',
+      ko: '실행 풀을 구성하기 전까지 자동 감독은 꺼져 있습니다. 감독 설정을 열어 기본 개발 풀을 확인하세요. 레거시 기본값이 자동으로 적용되지 않습니다.',
+    },
+    [SUPERVISION_AUTOMATION_POOL_GATE_REASONS.NO_POOL_SELECTED]: {
+      en: 'The execution pools are configured but the primary development pool has no runtime selected. Choose at least one execution config before enabling automatic supervision.',
+      'zh-CN': '执行池已配置，但主开发池尚未选择任何运行时。请在启用自动监督前至少选择一个执行配置。',
+      'zh-TW': '執行池已設定，但主開發池尚未選擇任何執行階段。請在啟用自動監督前至少選擇一個執行設定。',
+      es: 'Los grupos de ejecución están configurados, pero el grupo de desarrollo principal no tiene ningún runtime seleccionado. Elige al menos una configuración de ejecución antes de activar la supervisión automática.',
+      ru: 'Пулы выполнения настроены, но в основном пуле разработки не выбрана среда выполнения. Выберите хотя бы одну конфигурацию выполнения перед включением автоматического надзора.',
+      ja: '実行プールは構成済みですが、プライマリ開発プールにランタイムが選択されていません。自動監督を有効にする前に、実行構成を少なくとも 1 つ選択してください。',
+      ko: '실행 풀은 구성되었지만 기본 개발 풀에 선택된 런타임이 없습니다. 자동 감독을 켜기 전에 실행 구성을 하나 이상 선택하세요.',
+    },
+  };
+  const byLocale = guidance[reason];
+  return byLocale[locale ?? 'en'] ?? byLocale.en;
+}
+
 export function normalizeSupervisionExecutionPools(value: unknown): SupervisionExecutionPoolsConfig {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const primaryDevelopmentPool = normalizePool(source.primaryDevelopmentPool, 'primary');

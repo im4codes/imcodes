@@ -11,6 +11,7 @@ import {
   SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
+  SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND,
 } from '../../shared/supervision-config.js';
 import {
   PEER_AUDIT_DEADLINE_MS,
@@ -3150,7 +3151,7 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
-  it('reports the supervisor provider failure category and exhausted attempt count', async () => {
+  it('reports the supervisor provider failure category and exhausted attempt count without stopping', async () => {
     const snapshot = await seedSession('supervised');
     mockSupervisionDecide.mockResolvedValue({
       decision: 'ask_human',
@@ -3170,14 +3171,177 @@ describe('SupervisionAutomation', () => {
     completeTurn('implemented the feature');
     await sleep(25);
 
-    const warning = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+    // A generic upstream failure is not one of the four conditions a human
+    // must clear, so supervision reports it and stays alive rather than handing
+    // the task back. The cause, the attempt count and — critically — the
+    // redaction of the provider message must all survive that change.
+    const note = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
       event.type === 'assistant.text'
-      && event.payload.automationKind === 'supervision-warning',
+      && event.payload.automationKind === SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND,
     ).at(-1);
-    expect(warning?.payload.text).toBe(
-      '⚠️ Automation could not obtain a decision from supervisor model codex-sdk/gpt-5.3-codex-spark after 3 attempts: upstream provider failed token=[redacted]. Manual continuation is required.',
+    expect(note?.payload.text).toBe(
+      'Auto: the supervisor decision did not land — Automation could not obtain a decision from '
+      + 'supervisor model codex-sdk/gpt-5.3-codex-spark after 3 attempts: upstream provider failed '
+      + 'token=[redacted]. Supervision stays active and will retry on the next scheduled heartbeat.',
     );
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(String(note?.payload.text)).not.toContain('supersecret');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
+  });
+
+  describe('automatic supervision heartbeat continuity', () => {
+    // Automatic supervision is how the Brain MAIN session keeps driving a task
+    // whose work lives in child sessions. If a transient supervisor-side
+    // failure ends the run, nothing wakes up again to read the task registry,
+    // so the whole task silently stalls behind "Manual continuation required".
+    async function decideAndSettle(commandId: string, decision: Record<string, unknown>) {
+      const snapshot = await seedSession('supervised');
+      mockSupervisionDecide.mockResolvedValue({
+        reason: 'supervisor unavailable',
+        confidence: 0,
+        ...decision,
+      });
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain', commandId, 'implement the feature', snapshot,
+      );
+      beginRun(commandId, 'implement the feature');
+      completeTurn('implemented the feature');
+      await sleep(25);
+    }
+
+    const resumeCases: Array<[string, string, Record<string, unknown>]> = [
+      ['an ordinary supervisor decision timeout', 'cmd-hb-decision-timeout', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT,
+      }],
+      ['a supervisor capacity timeout', 'cmd-hb-queue-timeout', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT,
+      }],
+      ['an unparseable supervisor decision', 'cmd-hb-invalid-output', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT,
+      }],
+      ['a generic upstream provider failure', 'cmd-hb-provider-generic', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+        providerFailure: { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, attempts: 2 },
+      }],
+      ['a rate-limited supervisor provider', 'cmd-hb-rate-limited', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+        providerFailure: { code: PROVIDER_ERROR_CODES.RATE_LIMITED, attempts: 2 },
+      }],
+    ];
+
+    for (const [label, commandId, decision] of resumeCases) {
+      it(`keeps the main session supervising after ${label}`, async () => {
+        await decideAndSettle(commandId, decision);
+
+        // The live run object IS the scheduled heartbeat; losing it ends supervision.
+        expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
+        expect(lastStatusPayload()).not.toMatchObject({ status: 'supervision_needs_input' });
+      });
+    }
+
+    it('never emits the legacy manual-continuation stop for an ordinary decision timeout', async () => {
+      // This is the exact defect: an ordinary supervisor decision timeout used
+      // to terminate the run with this sentence, stranding a task whose child
+      // sessions were still working. Pin the literal copy and the terminal
+      // status so the old behavior cannot come back unnoticed.
+      await decideAndSettle('cmd-hb-exact-copy', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT,
+      });
+
+      const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+      const texts = events
+        .filter((event) => event.type === 'assistant.text')
+        .map((event) => String(event.payload.text));
+      expect(texts.join('\n')).not.toContain(
+        'Automation timed out waiting for a supervisor decision. Manual continuation is required.',
+      );
+      expect(texts.join('\n')).not.toContain('Manual continuation is required.');
+      expect(events.filter((event) =>
+        event.type === 'agent.status'
+        && (event.payload as { status?: string }).status === 'supervision_needs_input',
+      )).toHaveLength(0);
+
+      // The run must remain schedulable by the EXISTING daemon heartbeat —
+      // no new timer is introduced, the established one simply still owns it.
+      const run = supervisionAutomation.getActiveRun('deck_supervision_brain');
+      expect(run).toBeTruthy();
+      expect(run?.waitingNextHeartbeatAt ?? run?.waitingHeartbeatTimer).toBeTruthy();
+    });
+
+    it('defers to the scheduled heartbeat instead of busy polling the supervisor', async () => {
+      await decideAndSettle('cmd-hb-no-poll', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT,
+      });
+      const callsAfterFirstDecision = mockSupervisionDecide.mock.calls.length;
+
+      // Give a poll loop every chance to reveal itself.
+      await sleep(75);
+
+      expect(mockSupervisionDecide.mock.calls.length).toBe(callsAfterFirstDecision);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
+    });
+
+    it('keeps supervising while a child session is still busy', async () => {
+      // Outstanding delegated work is the normal state of a supervised task;
+      // it is emphatically not a reason for the main session to stop.
+      await decideAndSettle('cmd-hb-child-busy', {
+        decision: 'waiting',
+        reason: 'the delegated child session is still implementing',
+      });
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
+      expect(lastStatusPayload()).not.toMatchObject({ status: 'supervision_needs_input' });
+    });
+
+    it('keeps supervising when the main window has no safe local work', async () => {
+      // "Nothing safe for ME to do right now" is a scheduling fact, not a
+      // terminal condition: the child sessions are still producing work.
+      await decideAndSettle('cmd-hb-no-safe-work', {
+        decision: 'waiting',
+        reason: 'no safe local main-window work is available while delegates run',
+      });
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
+      expect(lastStatusPayload()).not.toMatchObject({ status: 'supervision_needs_input' });
+    });
+
+    const pauseCases: Array<[string, string, Record<string, unknown>]> = [
+      ['credentials that must be re-authorized', 'cmd-hb-auth', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+        providerFailure: { code: PROVIDER_ERROR_CODES.AUTH_FAILED, attempts: 1 },
+      }],
+      ['a supervisor configuration the human must repair', 'cmd-hb-config', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+        providerFailure: { code: PROVIDER_ERROR_CODES.CONFIG_ERROR, attempts: 1 },
+      }],
+      ['an invalid supervision snapshot', 'cmd-hb-invalid-snapshot', {
+        decision: 'ask_human',
+        unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT,
+      }],
+      ['an explicit request for human input', 'cmd-hb-ask-human', {
+        decision: 'ask_human',
+        reason: 'I need you to choose which endpoint to change',
+      }],
+    ];
+
+    for (const [label, commandId, decision] of pauseCases) {
+      it(`still pauses for ${label}`, async () => {
+        await decideAndSettle(commandId, decision);
+
+        expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+        expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+      });
+    }
   });
 
   it('fails closed when a supervised run reaches idle without a completed assistant response', async () => {

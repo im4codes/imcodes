@@ -9,9 +9,13 @@ import {
   normalizeSupervisionExecutionPools,
   planSupervisionExecutionCapacity,
   evaluateSupervisionObservedIdentity,
+  evaluateSupervisionAutomationPoolGate,
+  buildSupervisionPoolGateGuidance,
+  SUPERVISION_AUTOMATION_POOL_GATE_REASONS,
   SUPERVISION_AUDIT_ROUTING_REASONS,
   type SupervisionExecutionConfig,
 } from '../../shared/supervision-execution-pool.js';
+import { SUPERVISION_SUPPORTED_UI_LOCALES } from '../../shared/supervision-config.js';
 
 function config(agentType: string, providerFamily: string, model: string, ccPresetId?: string): SupervisionExecutionConfig {
   const runtimeType = 'transport' as const;
@@ -326,5 +330,86 @@ describe('supervision execution pools', () => {
       candidates: [{ config: opus, actual: honest, available: true, limited: false, staleRuntime: false }],
     });
     expect(excludedSession.action).not.toBe('reuse');
+  });
+});
+
+describe('automatic supervision execution-pool gate', () => {
+  function configuredPools() {
+    return normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [config('codex-sdk', 'openai', 'gpt-5.6-sol')],
+        controls: {},
+      },
+      economyTaskPool: { configs: [], controls: {} },
+    });
+  }
+
+  it('refuses automatic supervision until the pools are explicitly configured', () => {
+    // legacy_unconfigured is what normalize() produces for any snapshot that
+    // never opted in, so this is the state real upgraded installs are in.
+    const legacy = normalizeSupervisionExecutionPools({});
+    expect(legacy.state).toBe('legacy_unconfigured');
+    const gate = evaluateSupervisionAutomationPoolGate(legacy);
+    expect(gate.ok).toBe(false);
+    expect(gate.ok === false && gate.reason)
+      .toBe(SUPERVISION_AUTOMATION_POOL_GATE_REASONS.LEGACY_UNCONFIGURED);
+  });
+
+  it('fails closed on absent or malformed pool config rather than assuming a default', () => {
+    for (const value of [null, undefined, {}, { state: 'configured' }]) {
+      const gate = evaluateSupervisionAutomationPoolGate(
+        value === null || value === undefined
+          ? value
+          : normalizeSupervisionExecutionPools(value),
+      );
+      expect(gate.ok).toBe(false);
+    }
+  });
+
+  it('refuses a configured state that still selected no primary execution config', () => {
+    const empty = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [], controls: {} },
+      economyTaskPool: { configs: [], controls: {} },
+    });
+    expect(empty.state).toBe('configured');
+    const gate = evaluateSupervisionAutomationPoolGate(empty);
+    expect(gate.ok).toBe(false);
+    expect(gate.ok === false && gate.reason)
+      .toBe(SUPERVISION_AUTOMATION_POOL_GATE_REASONS.NO_POOL_SELECTED);
+  });
+
+  it('admits only an explicitly configured pool with a real selection', () => {
+    expect(evaluateSupervisionAutomationPoolGate(configuredPools()).ok).toBe(true);
+  });
+
+  it('never silently falls back to a legacy migration to satisfy the gate', () => {
+    // Migration may fill pool contents from an observed backend/model, but it
+    // must not by itself unlock automation: only an explicit configured state
+    // does, or the fail-closed rule is decorative.
+    const migrated = migrateLegacySupervisionExecutionPools({
+      backend: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+      executionPools: {},
+    });
+    if (migrated.state !== 'configured') {
+      expect(evaluateSupervisionAutomationPoolGate(migrated).ok).toBe(false);
+    }
+  });
+
+  it('gives seven-language guidance for every refusal reason', () => {
+    const reasons = Object.values(SUPERVISION_AUTOMATION_POOL_GATE_REASONS);
+    expect(reasons.length).toBeGreaterThanOrEqual(2);
+    for (const reason of reasons) {
+      const seen = new Set<string>();
+      for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+        const text = buildSupervisionPoolGateGuidance(reason, locale);
+        expect(text.length).toBeGreaterThan(0);
+        seen.add(text);
+      }
+      // Seven distinct locales must not collapse to one untranslated string.
+      expect(seen.size).toBe(SUPERVISION_SUPPORTED_UI_LOCALES.length);
+    }
   });
 });

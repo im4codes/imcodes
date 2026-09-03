@@ -1,6 +1,7 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { SupervisionAutomationPoolGateReason } from '../../shared/supervision-execution-pool.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import { validateBrainAuditRoute } from './peer-audit-candidates.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -40,6 +41,8 @@ import {
   type SupervisionExecutionState,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
+  classifySupervisionInterruption,
+  SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND,
 } from '../../shared/supervision-config.js';
 import {
   buildSupervisionContinuePrompt,
@@ -569,23 +572,30 @@ function classifyRepositoryFinalization(
   return 'completion_evidenced_mixed';
 }
 
+/** Told to the operator when the durable heartbeat, not the human, will retry. */
+const SUPERVISION_RETRY_CONTINUATION_SENTENCE =
+  'Supervision stays active and will retry on the next scheduled heartbeat.';
+
 function formatUnavailableReason(
   reason: SupervisionUnavailableReason | undefined,
   providerFailure?: SupervisionProviderFailure,
   providerMessage?: string,
   providerSelection?: { backend?: string; model?: string },
+  // What the operator should expect next. Transient failures are retried by the
+  // durable heartbeat, so telling the human to continue manually would be a lie.
+  continuation: string = 'Manual continuation is required.',
 ): string | null {
   switch (reason) {
     case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED:
-      return 'Automation could not reach the configured supervisor provider. Manual continuation is required.';
+      return 'Automation could not reach the configured supervisor provider. ' + continuation;
     case SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT:
       return 'Automation configuration is invalid. Repair the Auto settings before continuing.';
     case SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT:
-      return 'Automation timed out waiting for supervisor capacity. Manual continuation is required.';
+      return 'Automation timed out waiting for supervisor capacity. ' + continuation;
     case SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT:
-      return 'Automation timed out waiting for a supervisor decision. Manual continuation is required.';
+      return 'Automation timed out waiting for a supervisor decision. ' + continuation;
     case SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT:
-      return 'Automation could not parse a valid supervisor decision. Manual continuation is required.';
+      return 'Automation could not parse a valid supervisor decision. ' + continuation;
     case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR: {
       const attemptText = providerFailure && providerFailure.attempts > 1
         ? ` after ${providerFailure.attempts} attempts`
@@ -600,10 +610,10 @@ function formatUnavailableReason(
         case PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND:
           return `Automation could not start supervisor model${selectionText}. Repair the Auto settings before continuing.`;
         case PROVIDER_ERROR_CODES.RATE_LIMITED:
-          return `Automation could not obtain a decision from supervisor model${selectionText}${attemptText} because the provider is rate-limited. Manual continuation is required.`;
+          return `Automation could not obtain a decision from supervisor model${selectionText}${attemptText} because the provider is rate-limited. ${continuation}`;
         default: {
           const safeDetail = sanitizeMcpErrorMessage(providerMessage, 'provider error');
-          return `Automation could not obtain a decision from supervisor model${selectionText}${attemptText}: ${safeDetail}. Manual continuation is required.`;
+          return `Automation could not obtain a decision from supervisor model${selectionText}${attemptText}: ${safeDetail}. ${continuation}`;
         }
       }
     }
@@ -901,6 +911,38 @@ class SupervisionAutomation {
   /** Presentation seam for the console; this is authoritative run state. */
   isWaitingForUserInput(sessionName: string): boolean {
     return this.heartbeatPausedForNeedsInput.has(sessionName);
+  }
+
+  private readonly executionPoolWarned = new Set<string>();
+
+  /**
+   * Tell the operator, once per session, why an automatic run did not start.
+   *
+   * Reuses the existing supervision-warning channel and the shared seven-locale
+   * guidance rather than inventing a parallel message or status, so the daemon
+   * says exactly what the UI and the save entry say. The event id is stable per
+   * session and reason, so a refusal does not spam the timeline on every turn.
+   */
+  warnExecutionPoolUnconfigured(
+    sessionName: string,
+    reason: SupervisionAutomationPoolGateReason,
+    guidance: string,
+  ): void {
+    const key = `${sessionName}:${reason}`;
+    if (this.executionPoolWarned.has(key)) return;
+    this.executionPoolWarned.add(key);
+    timelineEmitter.emit(
+      sessionName,
+      'assistant.text',
+      {
+        text: `⚠️ ${guidance}`,
+        streaming: false,
+        automation: true,
+        automationKind: 'supervision-warning',
+        memoryExcluded: true,
+      },
+      { source: 'daemon', confidence: 'high', eventId: `supervision-warning:execution-pool:${key}` },
+    );
   }
 
   private emitWarning(sessionName: string, text: string): void {
@@ -2924,6 +2966,41 @@ class SupervisionAutomation {
       }
       case 'ask_human':
       default: {
+        // Automatic supervision is the Brain main session's only mechanism for
+        // driving a task whose work lives in child sessions. Ending the run
+        // means nothing wakes up to read the task registry again, so only a
+        // condition a human must personally clear may stop it. Everything else
+        // — a decision timeout, a throttled or briefly unreachable supervisor,
+        // an unparseable answer — comes back on the next scheduled heartbeat.
+        const outcome = classifySupervisionInterruption({
+          unavailableReason: decision.unavailableReason,
+          providerFailureCode: decision.providerFailure?.code,
+        });
+        if (outcome.kind === 'resume') {
+          const retryText = formatUnavailableReason(
+            decision.unavailableReason,
+            decision.providerFailure,
+            decision.reason,
+            { backend: run.snapshot.backend, model: run.snapshot.model },
+            SUPERVISION_RETRY_CONTINUATION_SENTENCE,
+          );
+          // Park exactly the way the waiting decision parks: same durable
+          // timer, no re-prompt, no poll loop. The next heartbeat re-enters
+          // evaluation on its own.
+          this.emitStatus(latest.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
+          this.emitAutomationNote(
+            latest.sessionName,
+            retryText ?? `Automation deferred the supervisor decision: ${decision.reason}. ${SUPERVISION_RETRY_CONTINUATION_SENTENCE}`,
+            SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND,
+          );
+          this.clearCompletionGrace(latest);
+          latest.waitingEvaluationPending = false;
+          latest.sawAssistantOutput = false;
+          latest.lastAssistantText = undefined;
+          latest.lastAssistantCompletionKey = undefined;
+          this.armWaitingTimers(latest, { preserveSchedule: true });
+          return;
+        }
         const unavailableText = formatUnavailableReason(
           decision.unavailableReason,
           decision.providerFailure,

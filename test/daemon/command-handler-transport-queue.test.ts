@@ -64,6 +64,7 @@ const {
   terminalRequestSnapshotMock,
   supervisionDecideMock,
   queueTaskIntentMock,
+  warnExecutionPoolUnconfiguredMock,
   cancelForUserStopMock,
   registerTaskIntentMock,
   applySnapshotUpdateMock,
@@ -102,6 +103,7 @@ const {
   terminalRequestSnapshotMock: vi.fn(),
   supervisionDecideMock: vi.fn(async () => ({ decision: 'complete', reason: 'ok', confidence: 0.9 })),
   queueTaskIntentMock: vi.fn(),
+  warnExecutionPoolUnconfiguredMock: vi.fn(),
   cancelForUserStopMock: vi.fn(),
   registerTaskIntentMock: vi.fn(),
   applySnapshotUpdateMock: vi.fn(),
@@ -353,6 +355,7 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
     cancelSession: vi.fn(),
     cancelForUserStop: cancelForUserStopMock,
     queueTaskIntent: queueTaskIntentMock,
+    warnExecutionPoolUnconfigured: warnExecutionPoolUnconfiguredMock,
     registerTaskIntent: registerTaskIntentMock,
     applySnapshotUpdate: applySnapshotUpdateMock,
     updateQueuedTaskIntent: updateQueuedTaskIntentMock,
@@ -366,6 +369,10 @@ import {
   __resetTransportListModelsCacheForTests,
   __resolveTransportListModelsCacheTtlMsForTests,
 } from '../../src/daemon/command-handler.js';
+import {
+  SUPERVISION_AUTOMATION_POOL_GATE_REASONS,
+  buildSupervisionPoolGateGuidance,
+} from '../../shared/supervision-execution-pool.js';
 import { getDefaultTimelineDetailStore } from '../../src/daemon/timeline-detail-store.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
@@ -1853,6 +1860,20 @@ describe('handleWebCommand transport queue behavior', () => {
       state: 'running',
       transportConfig: {
         supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk',
+                providerFamily: 'openai',
+                runtimeType: 'transport',
+                model: 'gpt-5.6-sol',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
           mode: 'supervised_audit',
           backend: 'codex-sdk',
           model: 'gpt-5.3-codex-spark',
@@ -4041,6 +4062,20 @@ describe('handleWebCommand transport queue behavior', () => {
       state: 'running',
       transportConfig: {
         supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk',
+                providerFamily: 'openai',
+                runtimeType: 'transport',
+                model: 'gpt-5.6-sol',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
           mode: 'supervised_audit',
           backend: 'codex-sdk',
           model: 'gpt-5.3-codex-spark',
@@ -4099,6 +4134,20 @@ describe('handleWebCommand transport queue behavior', () => {
       state: 'running',
       transportConfig: {
         supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk',
+                providerFamily: 'openai',
+                runtimeType: 'transport',
+                model: 'gpt-5.6-sol',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
           mode: 'supervised',
           backend: 'codex-sdk',
           model: 'gpt-5.3-codex-spark',
@@ -5710,4 +5759,150 @@ describe('handleWebCommand transport queue behavior', () => {
       error: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY,
     });
   });
+
+  describe('automatic supervision execution-pool START gate', () => {
+    // Selecting an execution pool is a precondition for running supervision,
+    // so the daemon START path has to refuse the same cases the UI and the
+    // authoritative save refuse. A session persisted before the gate existed
+    // still carries legacy pools, so the refusal cannot live at save time only.
+    function seed(supervision: Record<string, unknown>) {
+      const transportSend = vi.fn(() => 'sent');
+      getSessionMock.mockReturnValue({
+        name: 'deck_transport_brain',
+        projectName: 'transport',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        state: 'running',
+        transportConfig: { supervision },
+      });
+      getTransportRuntimeMock.mockReturnValue({
+        providerSessionId: 'route-transport',
+        send: transportSend,
+        pendingCount: 0,
+      });
+      return transportSend;
+    }
+
+    const SUPERVISED = {
+      mode: 'supervised',
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      taskRunPromptVersion: 'task_run_status_v1',
+    };
+
+    const CONFIGURED_POOLS = {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          agentType: 'codex-sdk',
+          providerFamily: 'openai',
+          runtimeType: 'transport',
+          model: 'gpt-5.6-sol',
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+        }],
+        controls: {},
+      },
+      economyTaskPool: { configs: [], controls: {} },
+    };
+
+    async function send(text: string, commandId: string) {
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_transport_brain',
+        text,
+        commandId,
+        uiLocale: 'zh-CN',
+      }, serverLink as any);
+      await flushAsync();
+    }
+
+    it('refuses to start an automatic run on explicitly unconfigured pools, and says why', async () => {
+      seed({ ...SUPERVISED, executionPools: { ...CONFIGURED_POOLS, state: 'legacy_unconfigured' } });
+
+      await send('implement the feature', 'cmd-gate-explicit');
+
+      expect(queueTaskIntentMock).not.toHaveBeenCalled();
+      expect(registerTaskIntentMock).not.toHaveBeenCalled();
+      // Fail-closed must never be silent: the operator has to learn that the
+      // run did not start and what to do about it.
+      expect(warnExecutionPoolUnconfiguredMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        SUPERVISION_AUTOMATION_POOL_GATE_REASONS.LEGACY_UNCONFIGURED,
+        buildSupervisionPoolGateGuidance(
+          SUPERVISION_AUTOMATION_POOL_GATE_REASONS.LEGACY_UNCONFIGURED,
+          'zh-CN',
+        ),
+      );
+    });
+
+    it('refuses a session persisted before pools existed rather than running it silently', async () => {
+      // No executionPools key at all: exactly the shape on disk from before
+      // the pool model shipped. It must not quietly fall back to running.
+      seed({ ...SUPERVISED });
+
+      await send('implement the feature', 'cmd-gate-legacy');
+
+      expect(queueTaskIntentMock).not.toHaveBeenCalled();
+      expect(registerTaskIntentMock).not.toHaveBeenCalled();
+      expect(warnExecutionPoolUnconfiguredMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        SUPERVISION_AUTOMATION_POOL_GATE_REASONS.LEGACY_UNCONFIGURED,
+        expect.any(String),
+      );
+      const guidance = String(warnExecutionPoolUnconfiguredMock.mock.calls[0]?.[2]);
+      expect(guidance.length).toBeGreaterThan(0);
+    });
+
+    it('refuses configured pools that still select nothing', async () => {
+      seed({
+        ...SUPERVISED,
+        executionPools: {
+          ...CONFIGURED_POOLS,
+          primaryDevelopmentPool: { configs: [], controls: {} },
+        },
+      });
+
+      await send('implement the feature', 'cmd-gate-empty');
+
+      expect(queueTaskIntentMock).not.toHaveBeenCalled();
+      expect(registerTaskIntentMock).not.toHaveBeenCalled();
+      expect(warnExecutionPoolUnconfiguredMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        SUPERVISION_AUTOMATION_POOL_GATE_REASONS.NO_POOL_SELECTED,
+        expect.any(String),
+      );
+    });
+
+    it('starts normally once a pool is configured', async () => {
+      seed({ ...SUPERVISED, executionPools: CONFIGURED_POOLS });
+
+      await send('implement the feature', 'cmd-gate-ok');
+
+      expect(warnExecutionPoolUnconfiguredMock).not.toHaveBeenCalled();
+      expect(registerTaskIntentMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'cmd-gate-ok',
+        'implement the feature',
+        expect.objectContaining({ mode: 'supervised', uiLocale: 'zh-CN' }),
+      );
+    });
+
+    it('never gates a session with supervision turned off', async () => {
+      // Turning supervision OFF is not an automatic run, so an unconfigured
+      // pool must neither block the send nor warn about pools.
+      const transportSend = seed({ mode: 'off' });
+
+      await send('implement the feature', 'cmd-gate-off');
+
+      expect(warnExecutionPoolUnconfiguredMock).not.toHaveBeenCalled();
+      expect(queueTaskIntentMock).not.toHaveBeenCalled();
+      expect(registerTaskIntentMock).not.toHaveBeenCalled();
+      expect(transportSend).toHaveBeenCalled();
+    });
+  });
+
 });

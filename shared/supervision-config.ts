@@ -1,5 +1,6 @@
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
+import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
   DEFAULT_CONTEXT_MODEL_BY_BACKEND,
@@ -26,6 +27,9 @@ import {
   type SupervisionEconomyTaskPolicy,
   type SupervisionExecutionConfig,
   type SupervisionExecutionPoolKind,
+  buildSupervisionPoolGateGuidance,
+  evaluateSupervisionAutomationPoolGate,
+  type SupervisionAutomationPoolGateReason,
   type SupervisionExecutionPoolsConfig,
 } from './supervision-execution-pool.js';
 
@@ -43,6 +47,8 @@ export const SUPERVISION_CONTRACT_IDS = {
   AUDIT_TARGET_RECOVERY: 'supervision_audit_target_recovery_v1',
   AUDIT_MARKER_CORRECTION: 'supervision_audit_marker_correction_v1',
   ORCHESTRATOR_CONTEXT: 'supervision_orchestrator_context_v1',
+  BRAIN_WORK_DELEGATION: 'supervision_brain_work_delegation_v1',
+  CONTINUATION_REPAIR: 'supervision_continuation_repair_v1',
   TASK_FINALIZATION: 'supervision_task_finalization_v1',
   DELEGATION_ELIGIBILITY: 'supervision_delegation_eligibility_v1',
   TASK_REGISTRY: 'supervision_task_registry_v1',
@@ -56,6 +62,8 @@ export const SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND = 'supervision-audit-he
 
 export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
   SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
+  SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
+  SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
   SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
   SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
   SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
@@ -272,6 +280,122 @@ export const SUPERVISION_UNAVAILABLE_REASONS = {
 } as const;
 export type SupervisionUnavailableReason =
   typeof SUPERVISION_UNAVAILABLE_REASONS[keyof typeof SUPERVISION_UNAVAILABLE_REASONS];
+
+/**
+ * The only four conditions that may pause automatic supervision.
+ *
+ * Automatic supervision is the Brain main session's mechanism for driving a
+ * task whose actual work lives in child sessions. If it stops, nothing else
+ * wakes up to check the task registry, so a stop is only legitimate when a
+ * human must personally clear the condition. Everything else — a supervisor
+ * decision timeout, a busy child session, an unparseable decision, no locally
+ * safe main-window work — is a reason to schedule the next heartbeat, not to
+ * end the run.
+ */
+/** Automation note kind for a supervisor call that will be retried by the heartbeat. */
+export const SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND = 'supervision-supervisor-retry';
+
+export const SUPERVISION_PAUSE_CATEGORIES = {
+  /** Blocked on an action only Brain may perform and cannot delegate. */
+  BRAIN_ONLY_AUTHORITY: 'brain_only_authority',
+  /** Quota is explicitly exhausted (not merely throttled). */
+  QUOTA_EXHAUSTED: 'quota_exhausted',
+  /** Credentials must be renewed before any further supervisor call. */
+  REAUTHORIZATION_REQUIRED: 'reauthorization_required',
+  /** A specific human action has already been requested. */
+  HUMAN_INPUT_REQUESTED: 'human_input_requested',
+} as const;
+export type SupervisionPauseCategory =
+  typeof SUPERVISION_PAUSE_CATEGORIES[keyof typeof SUPERVISION_PAUSE_CATEGORIES];
+
+export type SupervisionInterruptionOutcome =
+  | { kind: 'resume' }
+  | { kind: 'pause'; category: SupervisionPauseCategory };
+
+/**
+ * Decide whether a supervisor-side interruption ends the run or just defers it.
+ *
+ * `RATE_LIMITED` deliberately resumes: a rate limit is a throttle that resets,
+ * which is not the same as quota being exhausted, and the heartbeat is durably
+ * scheduled rather than a poll loop, so waiting it out costs nothing.
+ */
+/**
+ * Control-plane faults a continuation can repair by itself.
+ *
+ * These are the states where the registry and the runtime have drifted apart
+ * but the truth is still recoverable from authoritative same-task state: a
+ * runtime epoch changed under an unchanged assignment, an assignment resolved
+ * to the wrong worktree, a role had no continuation route, or a lease/pointer
+ * went stale. None of them mean the work is gone, so none of them may end a
+ * task. Read authoritative state, rebind or cancel through the supported
+ * same-object path, then resume.
+ */
+export const SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS = {
+  IDENTITY_REJECTED_AFTER_RUNTIME_CHANGE: 'identity_rejected_after_runtime_change',
+  AMBIGUOUS_ASSIGNMENT_WORKTREE: 'ambiguous_assignment_worktree',
+  ROLE_CONTINUATION_ROUTING_GAP: 'role_continuation_routing_gap',
+  STALE_LEASE_OR_POINTER: 'stale_lease_or_pointer',
+  OLD_RUNTIME_IDENTITY: 'old_runtime_identity',
+} as const;
+export type SupervisionRecoverableContinuationCondition =
+  typeof SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS[
+    keyof typeof SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS];
+
+/**
+ * Decide whether a failed continuation repairs-and-resumes or genuinely stops.
+ *
+ * Deliberately shares SupervisionInterruptionOutcome and the four pause
+ * categories with `classifySupervisionInterruption`: a continuation fault is
+ * the same question asked at a different seam, so it must not grow a second
+ * status vocabulary. Repair authority stops hard at the project boundary -
+ * a recoverable-looking fault on someone else's work is never a licence to
+ * take it over.
+ */
+export function classifySupervisionContinuationFailure(input: {
+  condition?: string | null;
+  crossProject?: boolean;
+}): SupervisionInterruptionOutcome {
+  if (input.crossProject === true) {
+    return { kind: 'pause', category: SUPERVISION_PAUSE_CATEGORIES.BRAIN_ONLY_AUTHORITY };
+  }
+  const recoverable = (Object.values(SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS) as string[])
+    .includes(String(input.condition ?? ''));
+  return recoverable
+    ? { kind: 'resume' }
+    : { kind: 'pause', category: SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED };
+}
+
+export function classifySupervisionInterruption(input: {
+  unavailableReason?: SupervisionUnavailableReason | null;
+  providerFailureCode?: string | null;
+}): SupervisionInterruptionOutcome {
+  const pause = (category: SupervisionPauseCategory): SupervisionInterruptionOutcome =>
+    ({ kind: 'pause', category });
+
+  switch (input.unavailableReason) {
+    case SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT:
+      // The stated remedy is "repair the Auto settings", which is a human action.
+      return pause(SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED);
+    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR:
+      switch (input.providerFailureCode) {
+        case PROVIDER_ERROR_CODES.AUTH_FAILED:
+          return pause(SUPERVISION_PAUSE_CATEGORIES.REAUTHORIZATION_REQUIRED);
+        case PROVIDER_ERROR_CODES.CONFIG_ERROR:
+        case PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND:
+          return pause(SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED);
+        default:
+          return { kind: 'resume' };
+      }
+    case SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT:
+    case SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT:
+    case SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT:
+    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED:
+      return { kind: 'resume' };
+    default:
+      // No machine-readable reason: the supervisor itself asked for a human.
+      return pause(SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED);
+  }
+}
 
 // Backwards-compatible alias: retained because `web/` still imports this name.
 // Prefer `SUPERVISION_DEFAULT_TIMEOUT_MS` in new code.
@@ -791,6 +915,36 @@ export function isAutomaticSupervisionEnabled(
   const mode = typeof input === 'string' ? input : input?.mode;
   return mode === SUPERVISION_MODE.SUPERVISED || mode === SUPERVISION_MODE.SUPERVISED_AUDIT;
 }
+/**
+ * The single decision both the UI and the authoritative save entry must ask
+ * before automatic supervision is enabled.
+ *
+ * Turning supervision OFF is never gated -- only enabling an automatic mode is.
+ * Both call sites share this one function so the button and the server cannot
+ * disagree, and so a refusal always arrives with localized, actionable guidance
+ * rather than a bare error code.
+ */
+export type AutomaticSupervisionEnablementGate =
+  | { ok: true }
+  | { ok: false; reason: SupervisionAutomationPoolGateReason; guidance: string };
+
+export function evaluateAutomaticSupervisionEnablement(
+  snapshot: {
+    mode?: SupervisionMode | null;
+    executionPools?: SupervisionExecutionPoolsConfig | null;
+    uiLocale?: string | null;
+  } | null | undefined,
+): AutomaticSupervisionEnablementGate {
+  if (!isAutomaticSupervisionEnabled(snapshot?.mode ?? null)) return { ok: true };
+  const gate = evaluateSupervisionAutomationPoolGate(snapshot?.executionPools ?? null);
+  if (gate.ok) return { ok: true };
+  return {
+    ok: false,
+    reason: gate.reason,
+    guidance: buildSupervisionPoolGateGuidance(gate.reason, snapshot?.uiLocale ?? undefined),
+  };
+}
+
 export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>plan' | 'audit>review>plan';
 export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
 export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';

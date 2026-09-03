@@ -21,6 +21,7 @@ import {
   type SessionSupervisionSnapshot,
   type SupervisionCustomInstructionsDetail,
   type SupervisionUiLocale,
+  SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import type { SupervisionBrokerRequest, SupervisionRecentEvidence } from './supervision-broker.js';
@@ -103,8 +104,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
     noSafeWork: (m) => `If none is safe, report the exact human blocker unless an already-sent external/delegated reply is required next; then use ${m.WAITING}. Do not guess. Uncommitted files alone are not completion.`,
     userRules: 'User supervision rules', taskContext: 'Task context', lastResult: 'Last result',
-    statusContract: (m) => `Do all safe work possible in this turn; never use a marker instead of acting. Include exactly one status marker: ${m.ADVANCE} this session itself has concrete work to continue next turn; ${m.AUDIT_READY} implementation+validation done; ${m.NEEDS_INPUT} human input required; ${m.WAITING} a sent external/delegated reply is required next and no independent safe work remains. Priority: when all known next work is assigned to other sessions, use ${m.WAITING}; finding issues, sending tasks, or a delegate's remaining work never counts as ${m.ADVANCE}.`,
-    waitingHeartbeat: (minutes, m) => `Waiting check after ${minutes} minutes: check the external/delegated request. If its reply arrived, continue. If still pending but this session has independent safe work, do it now; use ${m.ADVANCE} only for concrete work this session itself will continue next turn. A delegate still working is not ${m.ADVANCE}; otherwise report what is pending and use ${m.WAITING}. Use ${m.AUDIT_READY} if done and ${m.NEEDS_INPUT} only for an exact human blocker. Include exactly one status marker.`,
+    statusContract: (m) => `Do all safe work possible in this turn; never use a marker instead of acting. If this session has safe work, perform it now and do not announce future work. Include exactly one status marker: ${m.AUDIT_READY} implementation+validation done; ${m.NEEDS_INPUT} human input required; ${m.WAITING} no safe main-window work remains and delegated/external work is pending or running. Priority: when all known next work is assigned to other sessions, use ${m.WAITING}; finding issues, sending tasks, or a delegate's remaining work is never local work.`,
+    waitingHeartbeat: (minutes, m) => `Waiting check after ${minutes} minutes: check the external/delegated request. If its reply arrived, continue. If still pending but this session has independent safe work, do it now without announcing it. A delegate still working is not local work; otherwise report what is pending and use ${m.WAITING}. Use ${m.AUDIT_READY} if done and ${m.NEEDS_INPUT} only for an exact human blocker. Include exactly one status marker.`,
   },
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
@@ -114,8 +115,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
     noSafeWork: (m) => `若无可安全推进项，报告确切人工阻断；但若已发外部/委派请求且下一步需其回执，则改用 ${m.WAITING}。不要猜测。仅有未提交文件不代表已完成。`,
     userRules: '用户监督规则', taskContext: '任务上下文', lastResult: '最近结果',
-    statusContract: (m) => `本轮先尽量完成所有安全工作，不得用状态标记代替执行。回复中只用一个状态标记：${m.ADVANCE} 当前会话自己下一轮仍会执行具体工作；${m.AUDIT_READY} 实现验证完成；${m.NEEDS_INPUT} 必须人工输入；${m.WAITING} 已真实发出外部/委派请求、下一步依赖回执且当前无其他安全工作。优先规则：全部已知后续工作已派给其他会话时必须用 ${m.WAITING}；发现问题、派出任务或对方仍有工作都不算 ${m.ADVANCE}。`,
-    waitingHeartbeat: (minutes, m) => `等待状态检查（已等待 ${minutes} 分钟）：核对外部/委派请求。回执已到就继续；仍未到但当前会话有独立安全工作就现在执行，仅当当前会话自己下一轮还会执行具体工作时用 ${m.ADVANCE}。对方仍在工作不算 ${m.ADVANCE}；否则汇报等待对象并用 ${m.WAITING}。完成则用 ${m.AUDIT_READY}；只有确需人工时才用 ${m.NEEDS_INPUT}。只用一个状态标记。`,
+    statusContract: (m) => `本轮先尽量完成所有安全工作，不得用状态标记代替执行。当前会话有安全工作就立即执行，不要预告下一轮工作。回复中只用一个状态标记：${m.AUDIT_READY} 实现验证完成；${m.NEEDS_INPUT} 必须人工输入；${m.WAITING} 主窗口已无安全工作，且委派/外部工作待办或进行中。优先规则：全部已知后续工作已派给其他会话时必须用 ${m.WAITING}；发现问题、派出任务或对方仍有工作都不算本地工作。`,
+    waitingHeartbeat: (minutes, m) => `等待状态检查（已等待 ${minutes} 分钟）：核对外部/委派请求。回执已到就继续；仍未到但当前会话有独立安全工作就现在执行，不要预告。对方仍在工作不算本地工作；否则汇报等待对象并用 ${m.WAITING}。完成则用 ${m.AUDIT_READY}；只有确需人工时才用 ${m.NEEDS_INPUT}。只用一个状态标记。`,
   },
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
@@ -125,8 +126,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
     noSafeWork: (m) => `若無可安全推進項，回報確切人工阻斷；但若已發外部/委派請求且下一步需其回執，則改用 ${m.WAITING}。不要猜測。僅有未提交檔案不代表已完成。`,
     userRules: '使用者監督規則', taskContext: '任務上下文', lastResult: '最近結果',
-    statusContract: (m) => `本輪先盡量完成所有安全工作，不得用狀態標記代替執行。回覆中只用一個狀態標記：${m.ADVANCE} 目前會話自己下一輪仍會執行具體工作；${m.AUDIT_READY} 實作驗證完成；${m.NEEDS_INPUT} 必須人工輸入；${m.WAITING} 已真實發出外部/委派請求、下一步依賴回執且目前無其他安全工作。優先規則：全部已知後續工作已派給其他會話時必須用 ${m.WAITING}；發現問題、派出任務或對方仍有工作都不算 ${m.ADVANCE}。`,
-    waitingHeartbeat: (minutes, m) => `等待狀態檢查（已等待 ${minutes} 分鐘）：核對外部/委派請求。回執已到就繼續；仍未到但目前會話有獨立安全工作就現在執行，僅當目前會話自己下一輪還會執行具體工作時用 ${m.ADVANCE}。對方仍在工作不算 ${m.ADVANCE}；否則回報等待對象並用 ${m.WAITING}。完成則用 ${m.AUDIT_READY}；只有確需人工時才用 ${m.NEEDS_INPUT}。只用一個狀態標記。`,
+    statusContract: (m) => `本輪先盡量完成所有安全工作，不得用狀態標記代替執行。目前會話有安全工作就立即執行，不要預告下一輪工作。回覆中只用一個狀態標記：${m.AUDIT_READY} 實作驗證完成；${m.NEEDS_INPUT} 必須人工輸入；${m.WAITING} 主視窗已無安全工作，且委派/外部工作待辦或進行中。優先規則：全部已知後續工作已派給其他會話時必須用 ${m.WAITING}；發現問題、派出任務或對方仍有工作都不算本地工作。`,
+    waitingHeartbeat: (minutes, m) => `等待狀態檢查（已等待 ${minutes} 分鐘）：核對外部/委派請求。回執已到就繼續；仍未到但目前會話有獨立安全工作就現在執行，不要預告。對方仍在工作不算本地工作；否則回報等待對象並用 ${m.WAITING}。完成則用 ${m.AUDIT_READY}；只有確需人工時才用 ${m.NEEDS_INPUT}。只用一個狀態標記。`,
   },
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
@@ -136,8 +137,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
     noSafeWork: (m) => `Si nada es seguro, informa el bloqueo humano exacto, salvo que la siguiente acción requiera una respuesta externa/delegada ya solicitada; entonces usa ${m.WAITING}. No adivines. Archivos sin confirmar no implican finalización.`,
     userRules: 'Reglas de supervisión del usuario', taskContext: 'Contexto de la tarea', lastResult: 'Último resultado',
-    statusContract: (m) => `Primero completa todo el trabajo seguro posible en este turno; no uses un marcador en vez de actuar. Incluye un solo marcador de estado: ${m.ADVANCE} esta sesión ejecutará trabajo concreto en el próximo turno; ${m.AUDIT_READY} implementación+validación listas; ${m.NEEDS_INPUT} intervención humana obligatoria; ${m.WAITING} una solicitud externa/delegada ya enviada es necesaria y no queda trabajo seguro independiente. Prioridad: si todo el trabajo siguiente conocido se asignó a otras sesiones, usa ${m.WAITING}; encontrar problemas, enviar tareas o el trabajo pendiente del delegado nunca cuenta como ${m.ADVANCE}.`,
-    waitingHeartbeat: (minutes, m) => `Comprobación tras ${minutes} minutos: revisa la solicitud externa/delegada. Si llegó la respuesta, continúa. Si sigue pendiente pero esta sesión tiene trabajo seguro independiente, hazlo ahora; usa ${m.ADVANCE} solo para trabajo concreto que esta sesión continuará en el próximo turno. Que el delegado siga trabajando no es ${m.ADVANCE}; si no, informa qué esperas y usa ${m.WAITING}. Usa ${m.AUDIT_READY} si terminaste y ${m.NEEDS_INPUT} solo ante un bloqueo humano concreto. Incluye un solo marcador.`,
+    statusContract: (m) => `Primero completa todo el trabajo seguro posible en este turno; no uses un marcador en vez de actuar. Si esta sesión tiene trabajo seguro, hazlo ahora y no anuncies trabajo futuro. Incluye un solo marcador de estado: ${m.AUDIT_READY} implementación+validación listas; ${m.NEEDS_INPUT} intervención humana obligatoria; ${m.WAITING} no queda trabajo seguro en la ventana principal y hay trabajo delegado/externo pendiente o en curso. Prioridad: si todo el trabajo siguiente conocido se asignó a otras sesiones, usa ${m.WAITING}; encontrar problemas, enviar tareas o el trabajo pendiente del delegado nunca es trabajo local.`,
+    waitingHeartbeat: (minutes, m) => `Comprobación tras ${minutes} minutos: revisa la solicitud externa/delegada. Si llegó la respuesta, continúa. Si sigue pendiente pero esta sesión tiene trabajo seguro independiente, hazlo ahora sin anunciarlo. Que el delegado siga trabajando no es trabajo local; si no, informa qué esperas y usa ${m.WAITING}. Usa ${m.AUDIT_READY} si terminaste y ${m.NEEDS_INPUT} solo ante un bloqueo humano concreto. Incluye un solo marcador.`,
   },
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
@@ -147,8 +148,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
     noSafeWork: (m) => `Если безопасных действий нет, укажите точную человеческую блокировку, кроме случая, когда следующий шаг требует ответа на уже отправленный внешний/делегированный запрос; тогда используйте ${m.WAITING}. Не угадывайте. Незакоммиченные файлы не означают завершение.`,
     userRules: 'Правила надзора пользователя', taskContext: 'Контекст задачи', lastResult: 'Последний результат',
-    statusContract: (m) => `Сначала выполните всю безопасную работу, возможную в этом ходе; не заменяйте действие маркером. Используйте ровно один маркер статуса: ${m.ADVANCE} этот сеанс сам продолжит конкретную работу в следующем ходе; ${m.AUDIT_READY} реализация+проверка готовы; ${m.NEEDS_INPUT} обязателен ввод человека; ${m.WAITING} уже отправленный внешний/делегированный запрос нужен для следующего шага и независимой безопасной работы нет. Приоритет: если вся известная следующая работа назначена другим сеансам, используйте ${m.WAITING}; найденные проблемы, отправка задач и оставшаяся работа исполнителя не считаются ${m.ADVANCE}.`,
-    waitingHeartbeat: (minutes, m) => `Проверка ожидания через ${minutes} мин.: проверьте внешний/делегированный запрос. Если ответ получен, продолжайте. Если ответа нет, но у этого сеанса есть независимая безопасная работа, выполните её сейчас; используйте ${m.ADVANCE} только для конкретной работы, которую этот сеанс сам продолжит в следующем ходе. Работающий исполнитель — не ${m.ADVANCE}; иначе укажите, чего ждёте, и используйте ${m.WAITING}. ${m.AUDIT_READY} — если всё готово; ${m.NEEDS_INPUT} — только для точной человеческой блокировки. Используйте один маркер.`,
+    statusContract: (m) => `Сначала выполните всю безопасную работу, возможную в этом ходе; не заменяйте действие маркером. Если у сеанса есть безопасная работа, выполните её сейчас и не анонсируйте будущую. Используйте ровно один маркер статуса: ${m.AUDIT_READY} реализация+проверка готовы; ${m.NEEDS_INPUT} обязателен ввод человека; ${m.WAITING} безопасной работы в главном окне нет, а делегированная/внешняя работа ожидает или выполняется. Приоритет: если вся известная следующая работа назначена другим сеансам, используйте ${m.WAITING}; найденные проблемы, отправка задач и оставшаяся работа исполнителя не являются локальной работой.`,
+    waitingHeartbeat: (minutes, m) => `Проверка ожидания через ${minutes} мин.: проверьте внешний/делегированный запрос. Если ответ получен, продолжайте. Если ответа нет, но у этого сеанса есть независимая безопасная работа, выполните её сейчас без анонса. Работающий исполнитель — не локальная работа; иначе укажите, чего ждёте, и используйте ${m.WAITING}. ${m.AUDIT_READY} — если всё готово; ${m.NEEDS_INPUT} — только для точной человеческой блокировки. Используйте один маркер.`,
   },
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
@@ -158,8 +159,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
     noSafeWork: (m) => `安全に進められない場合は必要な人手の障害を明示してください。ただし次の手順が送信済みの外部/委任リクエストの返信を必要とするなら ${m.WAITING} を使います。推測しないでください。未コミットファイルだけでは完了を意味しません。`,
     userRules: 'ユーザーの監督ルール', taskContext: 'タスク文脈', lastResult: '直近の結果',
-    statusContract: (m) => `このターンで可能な安全な作業を先にすべて進め、マーカーを実行の代わりにしないでください。状態マーカーは1つだけ：${m.ADVANCE} このセッション自身が次のターンも具体的な作業を続ける；${m.AUDIT_READY} 実装検証完了；${m.NEEDS_INPUT} 人手の入力が必須；${m.WAITING} 送信済みの外部/委任リクエストの返信が次に必要で、独立して進められる安全な作業がない。優先規則：既知の次作業をすべて他セッションに委任した場合は ${m.WAITING}。問題の発見、タスク送信、委任先に残る作業は ${m.ADVANCE} に数えません。`,
-    waitingHeartbeat: (minutes, m) => `待機開始から ${minutes} 分の確認です。外部/委任リクエストを確認してください。返信済みなら続行します。未返信でもこのセッションに独立した安全な作業があれば今実行し、このセッション自身が次のターンも具体的な作業を続ける場合だけ ${m.ADVANCE} を使います。委任先が作業中でも ${m.ADVANCE} ではありません。なければ待機対象を報告して ${m.WAITING}。完了なら ${m.AUDIT_READY}、人手が必須の場合だけ ${m.NEEDS_INPUT}。マーカーは1つだけです。`,
+    statusContract: (m) => `このターンで可能な安全な作業を先にすべて進め、マーカーを実行の代わりにしないでください。安全な作業があれば今実行し、次の作業を予告しないでください。状態マーカーは1つだけ：${m.AUDIT_READY} 実装検証完了；${m.NEEDS_INPUT} 人手の入力が必須；${m.WAITING} メインウィンドウに安全な作業が残っておらず、委任/外部の作業が保留中または進行中。優先規則：既知の次作業をすべて他セッションに委任した場合は ${m.WAITING}。問題の発見、タスク送信、委任先に残る作業はローカル作業ではありません。`,
+    waitingHeartbeat: (minutes, m) => `待機開始から ${minutes} 分の確認です。外部/委任リクエストを確認してください。返信済みなら続行します。未返信でもこのセッションに独立した安全な作業があれば予告せず今実行します。委任先が作業中でもローカル作業ではありません。なければ待機対象を報告して ${m.WAITING}。完了なら ${m.AUDIT_READY}、人手が必須の場合だけ ${m.NEEDS_INPUT}。マーカーは1つだけです。`,
   },
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
@@ -169,8 +170,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
     noSafeWork: (m) => `안전하게 진행할 수 없으면 정확한 사람 개입 사유를 보고하세요. 단, 다음 단계에 이미 보낸 외부/위임 요청의 회신이 필요하면 ${m.WAITING}을 사용하세요. 추측하지 마세요. 미커밋 파일만으로 완료된 것은 아닙니다.`,
     userRules: '사용자 감독 규칙', taskContext: '작업 문맥', lastResult: '최근 결과',
-    statusContract: (m) => `이번 턴에 가능한 안전한 작업을 먼저 모두 수행하고, 상태 마커를 실행 대신 사용하지 마세요. 상태 마커는 하나만 사용: ${m.ADVANCE} 이 세션이 다음 턴에도 구체적인 작업을 직접 수행함; ${m.AUDIT_READY} 구현·검증 완료; ${m.NEEDS_INPUT} 사람 입력 필수; ${m.WAITING} 이미 보낸 외부/위임 요청의 회신이 다음 단계에 필요하고 독립적으로 진행할 안전한 작업이 없음. 우선 규칙: 알려진 후속 작업을 모두 다른 세션에 맡겼다면 ${m.WAITING}; 문제 발견, 작업 전송 또는 위임 대상에 남은 작업은 ${m.ADVANCE}로 세지 않습니다.`,
-    waitingHeartbeat: (minutes, m) => `대기 ${minutes}분 상태 확인: 외부/위임 요청을 확인하세요. 회신이 왔으면 계속하세요. 아직 대기 중이어도 이 세션에 독립적인 안전 작업이 있으면 지금 수행하고, 이 세션이 다음 턴에도 구체적인 작업을 직접 계속할 때만 ${m.ADVANCE}를 사용하세요. 위임 대상이 작업 중인 것은 ${m.ADVANCE}가 아닙니다. 없으면 대기 대상을 보고하고 ${m.WAITING}. 완료했으면 ${m.AUDIT_READY}, 사람 입력이 꼭 필요한 경우만 ${m.NEEDS_INPUT}. 상태 마커는 하나만 사용하세요.`,
+    statusContract: (m) => `이번 턴에 가능한 안전한 작업을 먼저 모두 수행하고, 상태 마커를 실행 대신 사용하지 마세요. 안전한 작업이 있으면 지금 수행하고 다음 작업을 예고하지 마세요. 상태 마커는 하나만 사용: ${m.AUDIT_READY} 구현·검증 완료; ${m.NEEDS_INPUT} 사람 입력 필수; ${m.WAITING} 메인 창에 안전한 작업이 없고 위임/외부 작업이 대기 중이거나 진행 중. 우선 규칙: 알려진 후속 작업을 모두 다른 세션에 맡겼다면 ${m.WAITING}; 문제 발견, 작업 전송 또는 위임 대상에 남은 작업은 로컬 작업이 아닙니다.`,
+    waitingHeartbeat: (minutes, m) => `대기 확인(${minutes}분 경과): 외부/위임 요청을 확인하세요. 회신이 도착했으면 계속합니다. 아직이지만 이 세션에 독립적인 안전한 작업이 있으면 예고 없이 지금 수행하세요. 위임 대상이 작업 중인 것은 로컬 작업이 아닙니다. 그렇지 않으면 대기 대상을 보고하고 ${m.WAITING}. 완료면 ${m.AUDIT_READY}, 정확한 사람 차단일 때만 ${m.NEEDS_INPUT}. 상태 마커는 하나만 포함하세요.`,
   },
 };
 
@@ -185,8 +186,13 @@ function buildExecutionStatusContract(_locale?: SupervisionUiLocale): string {
     v: 1,
     exactlyOne: true,
     actBeforeMarker: true,
-    markers: { local: m.ADVANCE, done: m.AUDIT_READY, human: m.NEEDS_INPUT, external: m.WAITING },
-    priority: ['human', 'external', 'done', 'local'],
+    // No local marker: if safe main-window work exists Brain performs it now
+    // rather than announcing it, so ADVANCE is deprecated for emission. It
+    // stays in SUPERVISION_EXECUTION_STATUS_MARKERS only so historical replies
+    // remain parseable.
+    markers: { done: m.AUDIT_READY, human: m.NEEDS_INPUT, external: m.WAITING },
+    localWork: 'perform_now_no_marker',
+    priority: ['human', 'external', 'done'],
     delegateWorkIsLocal: false,
   });
 }
@@ -231,6 +237,110 @@ export function buildSupervisionOrchestratorContext(_locale?: SupervisionUiLocal
     evidence: { fabricateOrInfer: false, kinds: ['validation', 'PASS', 'commit', 'push', 'CI', 'deploy', 'finalization'] },
     statusEnum: 'tool_schema',
     finalGate: 'tool_schema+authority_handler',
+  });
+}
+
+/**
+ * Brain-only routing rule for user-requested supervised assignment work.
+ *
+ * Keep this locale-invariant and machine-readable: every supported UI locale
+ * receives the same decision boundary, so translations cannot silently widen
+ * an exception or swap the IM.codes registry path for provider-native agents.
+ */
+export function buildBrainSupervisedWorkDelegationContract(_locale?: SupervisionUiLocale): string {
+  return JSON.stringify({
+    contractId: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
+    v: 1,
+    actor: 'Brain',
+    trigger: 'user_requests_supervised_assignment_or_coordination',
+    default: {
+      route: 'imcodes_supervision_visible_subsession',
+      sequence: ['send_list_targets', 'task_assignment', 'send_message'],
+      eligible: { availability: 'ready', replyCapable: true },
+      mainWindow: 'coordinate_not_implement',
+      forbid: ['provider_native_spawn', 'provider_native_collaboration'],
+    },
+    exceptions: [
+      'explicit_user_main_window_execution',
+      'no_eligible_ready_reply_capable_subsession',
+      'nondelegable_brain_identity_same_object_coordination_or_recovery',
+      'pure_read_only_localization_or_immediate_safe_containment',
+    ],
+    exceptionReason: 'required',
+    status: {
+      discoveryOrDispatchIsAdvance: false,
+      delegateRemainingIsAdvance: false,
+      sentAndNoIndependentSafeWork: SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+    },
+  });
+}
+
+/**
+ * Compact re-assertion of the Brain work-delegation contract.
+ *
+ * The full contract is ~830 characters and belongs where Brain actually makes
+ * the routing choice: the decision entrypoints. Restating it in the execution
+ * preamble would spend the preamble's remaining budget on prose Brain already
+ * has, so the preamble re-asserts the contract BY ID instead.
+ *
+ * `contractRef` deliberately avoids the `contractId` key: entrypoints that
+ * carry full contract text are identified by `"contractId":"..."`, so using a
+ * different key keeps "carries the contract" and "references the contract"
+ * mechanically distinguishable -- the same discipline the continuation prompts
+ * already use.
+ */
+export function buildBrainWorkDelegationContractRef(): string {
+  return JSON.stringify({
+    contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
+    fullText: 'supervisionDecision',
+  });
+}
+
+/**
+ * Repair-then-resume for own-project continuations.
+ *
+ * A continuation that trips a recoverable control-plane fault must be repaired
+ * and resumed, not reported and abandoned: the delegate's work is still live,
+ * so stopping there strands the whole task. The recoverable identifiers come
+ * from the shared constant so the contract and the runtime classifier can
+ * never drift apart.
+ */
+export function buildSupervisionContinuationRepairContract(_locale?: SupervisionUiLocale): string {
+  return JSON.stringify({
+    contractId: SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
+    v: 1,
+    actor: 'Brain',
+    trigger: 'own_project_task_or_child_session_continuation_failed',
+    recoverable: Object.values(SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS),
+    onRecoverable: {
+      sequence: [
+        'read_authoritative_same_task_state',
+        'same_object_recovery_rebind_or_cancel',
+        'resume_or_redeliver',
+      ],
+      forbid: [
+        'stop_after_reporting_error',
+        'create_replacement_task',
+        'reinterpret_delegate_remaining_as_main_window_implementation',
+      ],
+    },
+    stopOnly: [
+      'brain_only_unrecoverable_authority',
+      'quota_exhausted',
+      'login_or_authorization_required',
+      'explicit_human_input',
+      'finalized_goal',
+    ],
+    boundary: { foreignProjectOrUser: 'forbidden' },
+    heartbeat: 'existing_daemon_heartbeat_only',
+  });
+}
+
+/** Compact re-assertion; full text lives at the decision entrypoints. */
+export function buildSupervisionContinuationRepairContractRef(): string {
+  return JSON.stringify({
+    contractRef: SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
+    fullText: 'supervisionDecision',
   });
 }
 
@@ -389,6 +499,8 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
   return [
     SUPERVISION_CONTRACT_PREAMBLE_START,
     buildSupervisionOrchestratorContext(locale),
+    buildBrainWorkDelegationContractRef(),
+    buildSupervisionContinuationRepairContractRef(),
     buildSupervisionTaskFinalizationContract(locale),
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
@@ -403,6 +515,8 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
   return [
     SUPERVISION_CONTRACT_PREAMBLE_START,
     buildSupervisionOrchestratorContext(locale),
+    buildBrainWorkDelegationContractRef(),
+    buildSupervisionContinuationRepairContractRef(),
     buildSupervisionTaskFinalizationContract(locale),
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
@@ -878,6 +992,8 @@ export function buildSupervisionDecisionPrompt(
   return [
     `[Contract: ${contractId}]`,
     buildSupervisionOrchestratorContext(request.snapshot?.uiLocale),
+    buildBrainSupervisedWorkDelegationContract(request.snapshot?.uiLocale),
+    buildSupervisionContinuationRepairContract(request.snapshot?.uiLocale),
     buildSupervisionTaskFinalizationContract(request.snapshot?.uiLocale),
     buildSupervisionTaskRegistryContract(request.snapshot?.uiLocale),
     buildSupervisionDelegationEligibilityPolicy(request.snapshot?.uiLocale),
@@ -931,6 +1047,8 @@ export function buildSupervisionDecisionRepairPrompt(
   return [
     `[Contract: ${contractId}]`,
     buildSupervisionOrchestratorContext(request.snapshot?.uiLocale),
+    buildBrainSupervisedWorkDelegationContract(request.snapshot?.uiLocale),
+    buildSupervisionContinuationRepairContract(request.snapshot?.uiLocale),
     buildSupervisionTaskFinalizationContract(request.snapshot?.uiLocale),
     buildSupervisionTaskRegistryContract(request.snapshot?.uiLocale),
     buildSupervisionDelegationEligibilityPolicy(request.snapshot?.uiLocale),
@@ -1316,6 +1434,14 @@ export const SUPERVISION_PROMPT_BUILDER_REGISTRY_EXCLUSIONS = [
     reason: 'Contract segment builder; it is injected into registered model-facing entrypoints instead of being a standalone prompt entrypoint.',
   },
   {
+    builderName: 'buildBrainWorkDelegationContractRef',
+    reason: 'Compact contract reference; the execution preamble re-asserts the Brain work-delegation contract by id instead of restating its full text.',
+  },
+  {
+    builderName: 'buildBrainSupervisedWorkDelegationContract',
+    reason: 'Contract segment builder; it is injected into registered Brain-facing entrypoints instead of being a standalone prompt entrypoint.',
+  },
+  {
     builderName: 'buildSupervisionTaskFinalizationContract',
     reason: 'Contract segment builder; it is injected into registered model-facing entrypoints instead of being a standalone prompt entrypoint.',
   },
@@ -1338,6 +1464,12 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'supervisedAuditExecutionPreamble',
     builderName: 'buildSupervisedAuditExecutionPreamble',
     includesOrchestratorContext: true,
+    // An audit run does not route new work, so it re-asserts the delegation
+    // contract by id; the full text stays on the decision entrypoints.
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: true,
+    referencesContinuationRepairContract: true,
     includesTaskFinalizationContract: true,
     includesTaskRegistryContract: true,
     includesDelegationEligibilityPolicy: true,
@@ -1347,6 +1479,12 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'supervisionExecutionPreamble',
     builderName: 'buildSupervisionExecutionPreamble',
     includesOrchestratorContext: true,
+    // References the Brain work-delegation contract by id; the full text lives
+    // on the decision entrypoints, keeping this preamble inside its budget.
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: true,
+    referencesContinuationRepairContract: true,
     includesTaskFinalizationContract: true,
     includesTaskRegistryContract: true,
     includesDelegationEligibilityPolicy: true,
@@ -1356,6 +1494,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'waitingHeartbeat',
     builderName: 'buildSupervisionWaitingHeartbeatPrompt',
     includesOrchestratorContext: false,
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: false,
     includesTaskRegistryContract: false,
     includesDelegationEligibilityPolicy: false,
@@ -1365,6 +1507,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'auditHeartbeat',
     builderName: 'buildSupervisionAuditHeartbeatPrompt',
     includesOrchestratorContext: false,
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: false,
     includesTaskRegistryContract: false,
     includesDelegationEligibilityPolicy: false,
@@ -1380,6 +1526,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'automaticAuditTask',
     builderName: 'buildAutomaticAuditTaskPrompt',
     includesOrchestratorContext: false,
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: false,
     includesTaskRegistryContract: false,
     includesDelegationEligibilityPolicy: false,
@@ -1394,6 +1544,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'auditTargetRecovery',
     builderName: 'buildAuditTargetRecoveryPrompt',
     includesOrchestratorContext: false,
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: false,
     includesTaskRegistryContract: false,
     includesDelegationEligibilityPolicy: false,
@@ -1409,6 +1563,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'supervisionDecision',
     builderName: 'buildSupervisionDecisionPrompt',
     includesOrchestratorContext: true,
+    includesBrainWorkDelegationContract: true,
+    includesContinuationRepairContract: true,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: true,
     includesTaskRegistryContract: true,
     includesDelegationEligibilityPolicy: true,
@@ -1422,6 +1580,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'supervisionDecisionRepair',
     builderName: 'buildSupervisionDecisionRepairPrompt',
     includesOrchestratorContext: true,
+    includesBrainWorkDelegationContract: true,
+    includesContinuationRepairContract: true,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: true,
     includesTaskRegistryContract: true,
     includesDelegationEligibilityPolicy: true,
@@ -1436,6 +1598,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     builderName: 'buildSupervisionContinuePrompt',
     // Per-turn prompt: carries no standing contract blocks.
     includesOrchestratorContext: false,
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: false,
     includesTaskRegistryContract: false,
     includesDelegationEligibilityPolicy: false,
@@ -1445,6 +1611,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'reworkBrief',
     builderName: 'buildReworkBriefPrompt',
     includesOrchestratorContext: false,
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: false,
     includesTaskRegistryContract: false,
     includesDelegationEligibilityPolicy: false,
@@ -1461,6 +1631,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     id: 'auditMarkerCorrection',
     builderName: 'buildAuditMarkerCorrectionPrompt',
     includesOrchestratorContext: false,
+    includesBrainWorkDelegationContract: false,
+    includesContinuationRepairContract: false,
+    referencesBrainWorkDelegationContract: false,
+    referencesContinuationRepairContract: false,
     includesTaskFinalizationContract: false,
     includesTaskRegistryContract: false,
     includesDelegationEligibilityPolicy: false,
@@ -1470,6 +1644,10 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
   id: SupervisionPromptEntrypointId;
   builderName: string;
   includesOrchestratorContext: boolean;
+  includesBrainWorkDelegationContract: boolean;
+  includesContinuationRepairContract: boolean;
+  referencesBrainWorkDelegationContract: boolean;
+  referencesContinuationRepairContract: boolean;
   includesTaskFinalizationContract: boolean;
   includesTaskRegistryContract: boolean;
   includesDelegationEligibilityPolicy: boolean;

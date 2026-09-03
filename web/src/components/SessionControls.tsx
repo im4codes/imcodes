@@ -116,6 +116,7 @@ import {
   SUPERVISION_MODE,
   type SessionSupervisionSnapshot,
   type SupervisionMode,
+  evaluateAutomaticSupervisionEnablement,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { SESSION_MODEL_COMMAND, shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
@@ -2609,7 +2610,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         promptVersion: defaults.promptVersion,
         maxAutoContinueStreak: defaults.maxAutoContinueStreak,
         maxAutoContinueTotal: defaults.maxAutoContinueTotal,
+        // Carry the configured pools through. Dropping them here would both
+        // lose the operator's choice and make the pool gate below unsatisfiable
+        // for any session enabled straight from defaults.
+        executionPools: defaults.executionPools,
       };
+    }
+
+    // Fail closed on execution pools, asking the SAME shared question the
+    // authoritative save entry asks, so the toggle can never enable a mode the
+    // server will refuse. Guidance is already localized in shared/, so it is
+    // not restated here as seven more web-only strings.
+    const poolGate = evaluateAutomaticSupervisionEnablement({
+      mode: nextMode,
+      executionPools: (nextSnapshot as Partial<SessionSupervisionSnapshot>)?.executionPools ?? null,
+      uiLocale: i18n?.resolvedLanguage ?? i18n?.language,
+    });
+    if (!poolGate.ok) {
+      showSendWarning(poolGate.guidance);
+      openSettingsForMode();
+      return;
     }
 
     try {

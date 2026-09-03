@@ -123,9 +123,11 @@ describe('supervision prompts', () => {
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       const prompt = buildSupervisionExecutionPreamble(locale);
       expect(prompt).toContain('"actBeforeMarker":true');
-      expect(prompt).toContain('"priority":["human","external","done","local"]');
+      expect(prompt).toContain('"priority":["human","external","done"]');
       expect(prompt).toContain('"delegateWorkIsLocal":false');
-      expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+      // Local work has no marker: Brain performs it instead of announcing it.
+      expect(prompt).toContain('"localWork":"perform_now_no_marker"');
+      expect(prompt).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
     }
   });

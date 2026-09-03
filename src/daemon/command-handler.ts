@@ -302,6 +302,8 @@ import {
   isAutomaticSupervisionEnabled,
   isSupportedSupervisionTargetSessionType,
   normalizeSupervisionUiLocale,
+  evaluateAutomaticSupervisionEnablement,
+  type AutomaticSupervisionEnablementGate,
 } from '../../shared/supervision-config.js';
 import {
   PREFERENCE_FEATURE_FLAG,
@@ -3964,9 +3966,28 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const supervisionSnapshot = persistedSupervisionSnapshot && requestedUiLocale
     ? { ...persistedSupervisionSnapshot, uiLocale: requestedUiLocale }
     : persistedSupervisionSnapshot;
-  const shouldTrackSupervisionTaskRun = isAutomaticSupervisionEnabled(supervisionSnapshot)
+  const supervisionRunRequested = isAutomaticSupervisionEnabled(supervisionSnapshot)
     && canSessionRoleOwnAutomaticSupervision(record?.role)
     && isEligibleSupervisionTaskText(displayText);
+  // Fail closed on execution pools at START as well as at save. A session
+  // persisted before the save gate existed can still be carrying
+  // legacy_unconfigured pools, and starting an automatic run on it would be
+  // exactly the silent legacy fallback the gate exists to prevent.
+  const supervisionPoolGate = supervisionRunRequested
+    ? evaluateAutomaticSupervisionEnablement(supervisionSnapshot)
+    : ({ ok: true } as AutomaticSupervisionEnablementGate);
+  if (!supervisionPoolGate.ok) {
+    // Failing closed silently would look identical to supervision quietly not
+    // working. Say why on the operator-visible supervision-warning channel,
+    // reusing the same shared reason and guidance the UI and the authoritative
+    // save use, so all three entry points speak with one voice.
+    supervisionAutomation.warnExecutionPoolUnconfigured(
+      sessionName,
+      supervisionPoolGate.reason,
+      supervisionPoolGate.guidance,
+    );
+  }
+  const shouldTrackSupervisionTaskRun = supervisionRunRequested && supervisionPoolGate.ok;
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,
     attachmentRetentionPreamble,

@@ -59,19 +59,15 @@ export const SESSION_OWNERSHIP = {
   SHARED:   'shared',
 } as const;
 
-/** Common provider error codes. Import instead of hardcoding. */
-export const PROVIDER_ERROR_CODES = {
-  AUTH_FAILED:      'AUTH_FAILED',
-  CONFIG_ERROR:     'CONFIG_ERROR',
-  CONNECTION_LOST:  'CONNECTION_LOST',
-  SESSION_NOT_FOUND:'SESSION_NOT_FOUND',
-  RATE_LIMITED:     'RATE_LIMITED',
-  PROVIDER_ERROR:   'PROVIDER_ERROR',
-  CANCELLED:        'CANCELLED',
-  PARSE_ERROR:      'PARSE_ERROR',
-  PROVIDER_NOT_FOUND:'PROVIDER_NOT_FOUND',
-  SDK_TURN_LOST:    'SDK_TURN_LOST',
-} as const;
+/**
+ * Common provider error codes. Import instead of hardcoding.
+ *
+ * Defined in `shared/` so shared supervision code can classify provider
+ * failures without depending on the agent layer; re-exported here so every
+ * existing importer keeps working unchanged.
+ */
+import { PROVIDER_ERROR_CODES } from '../../shared/provider-error-codes.js';
+export { PROVIDER_ERROR_CODES, type ProviderErrorCode } from '../../shared/provider-error-codes.js';
 
 /** Why the runtime asked a provider to stop its active turn. */
 export const PROVIDER_CANCEL_ORIGINS = {
@@ -97,7 +93,6 @@ export type ConnectionMode = typeof CONNECTION_MODES[keyof typeof CONNECTION_MOD
 export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWNERSHIP];
 
 /** Error code from a provider operation. */
-export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
 export type ProviderCancelOrigin = typeof PROVIDER_CANCEL_ORIGINS[keyof typeof PROVIDER_CANCEL_ORIGINS];
 export type ProviderActiveTurnDeliveryKind =
   typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS[keyof typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS];
