@@ -12,7 +12,10 @@ const mocks = vi.hoisted(() => {
   const claudeRuns: Array<{ options: Record<string, unknown>; prompt: string }> = [];
   const codexRuns: Array<{ mode: 'start' | 'resume'; id: string | null; options: Record<string, unknown>; input: string }> = [];
   const claudeFailures = new Map<string, number>();
-  return { store, claudeRuns, codexRuns, claudeFailures };
+  // Whether the mock app-server reports the IM delegation MCP server as
+  // connected. Default true so ordinary Brain turns may start; a control test
+  // flips it to prove the production gate actually blocks the turn.
+  return { store, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true };
 });
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
@@ -73,6 +76,22 @@ vi.mock('node:child_process', async (importOriginal) => {
             stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-restore', status: 'inProgress', items: [], error: null } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: String(msg.params?.threadId ?? 'thread-restored'), turnId: 'turn-restore', item: { id: 'msg-restore', type: 'agentMessage', text: 'MANGO' } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: String(msg.params?.threadId ?? 'thread-restored'), turn: { id: 'turn-restore', status: 'completed', error: null } } }) + '\n');
+          }
+          // A Brain turn is gated on IM delegation being authoritatively usable
+          // (codex-sdk asserts this before every turn/start). The fixture models
+          // the app-server answering that inventory; `mcpDelegationConnected`
+          // lets a test flip it off to prove the gate is load-bearing.
+          if (msg.method === 'mcpServerStatus/list' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({
+              id: msg.id,
+              result: {
+                data: [{
+                  name: 'imcodes-memory',
+                  runtimeStatus: mocks.mcpDelegationConnected ? 'connected' : 'disconnected',
+                  tools: { send_list_targets: {}, send_message: {} },
+                }],
+              },
+            }) + '\n');
           }
           if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
             stdout.write(JSON.stringify({ id: msg.id, result: { status: 'unsubscribed' } }) + '\n');
@@ -300,13 +319,37 @@ function createOpenCodeRestoreHarness() {
   return { client, remoteSessions };
 }
 
+/**
+ * A Brain turn now carries the work-delegation contract as a leading
+ * `Context instructions:` block -- the full contract body on the first turn of a
+ * thread, and a short reference on later turns. That prefix is production
+ * behaviour, so these fixtures assert on the USER payload that follows it.
+ *
+ * Exactly one leading context block is stripped and the remainder is compared
+ * EXACTLY. Substring matching is deliberately avoided: it would let a
+ * regression that corrupts, truncates or reorders the payload keep passing.
+ */
+const PROMPT_CONTEXT_PREFIX = 'Context instructions:\n';
+
+function userPayloadOfPrompt(prompt: string): string {
+  if (!prompt.startsWith(PROMPT_CONTEXT_PREFIX)) return prompt;
+  const separator = prompt.indexOf('\n\n');
+  return separator === -1 ? '' : prompt.slice(separator + 2);
+}
+
+/** True when the turn actually carried the Brain delegation contract. */
+function promptCarriesDelegationContract(prompt: string): boolean {
+  return prompt.startsWith(PROMPT_CONTEXT_PREFIX)
+    && prompt.includes('supervision_brain_work_delegation_v1');
+}
+
 function claudeRunForSession(sessionName: string, prompt?: string) {
   return mocks.claudeRuns.find((run) => {
     const env = run.options.env;
     return !!env
       && typeof env === 'object'
       && (env as Record<string, unknown>).IMCODES_SESSION === sessionName
-      && (!prompt || run.prompt === prompt);
+      && (!prompt || userPayloadOfPrompt(run.prompt) === prompt);
   });
 }
 
@@ -385,6 +428,7 @@ describe('sdk transport session restore', () => {
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
     mocks.claudeFailures.clear();
+    mocks.mcpDelegationConnected = true;
     getDshPresetTransportConfigMock.mockClear();
     clearAllResend();
     timelineEmitterEmitMock.mockClear();
@@ -1605,8 +1649,17 @@ describe('sdk transport session restore', () => {
     //   - claudeRuns[1]: merged msg-2 + msg-3 (after first turn
     //     completed, _drainPending fired a new merged turn)
     expect(mocks.claudeRuns).toHaveLength(2);
-    expect(mocks.claudeRuns[0].prompt).toBe('offline-msg-1');
-    expect(mocks.claudeRuns[1].prompt).toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
+    // The user payload and its order are asserted exactly; the Brain delegation
+    // contract rides in front of it and is asserted separately below so a
+    // regression cannot drop the contract OR mangle the payload unnoticed.
+    expect(userPayloadOfPrompt(mocks.claudeRuns[0].prompt)).toBe('offline-msg-1');
+    expect(userPayloadOfPrompt(mocks.claudeRuns[1].prompt))
+      .toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
+    // Non-empty control: both turns must actually carry the contract, and the
+    // first turn carries the full body while the second re-asserts by reference.
+    expect(mocks.claudeRuns.every((run: { prompt: string }) => promptCarriesDelegationContract(run.prompt))).toBe(true);
+    expect(mocks.claudeRuns[0].prompt).toContain('"contractId":"supervision_brain_work_delegation_v1"');
+    expect(mocks.claudeRuns[1].prompt).toContain('"contractRef":"supervision_brain_work_delegation_v1"');
     for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
       const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
         call[0] === 'deck_sdk_drain_brain'
@@ -1663,6 +1716,45 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns).toHaveLength(2);
     expect(mocks.claudeRuns[0].prompt).toBe('relaunch-msg-1');
     expect(mocks.claudeRuns[1].prompt).toBe('relaunch-msg-2');
+  });
+
+  it('refuses to start a Brain codex turn when IM delegation is not authoritatively connected (control)', async () => {
+    // Guards the fixture change above: the mock now reports the delegation MCP
+    // server so ordinary Brain turns may start. If that gate were ever removed
+    // from production, this control fails -- the fixture cannot silently become
+    // the reason turns start.
+    mocks.mcpDelegationConnected = false;
+    mocks.store.set('deck_sdk_cx_gate_brain', {
+      name: 'deck_sdk_cx_gate_brain',
+      label: 'deck_sdk_cx_gate_brain',
+      projectName: 'sdk-cx-gate',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cx-gate',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-gate',
+      codexSessionId: 'codex-thread-gate',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+    const runtime = getTransportRuntime('deck_sdk_cx_gate_brain');
+    expect(runtime).toBeDefined();
+
+    const before = mocks.codexRuns.filter((run) => run.input).length;
+    runtime!.send('should not start a turn');
+    const deadline = Date.now() + 1_500;
+    while (Date.now() < deadline) await flush();
+
+    // No turn input was ever delivered: the gate blocked turn/start.
+    expect(mocks.codexRuns.filter((run) => run.input).length).toBe(before);
+    expect(mocks.codexRuns.some((run) => run.input.includes('should not start a turn'))).toBe(false);
   });
 
   it('restores codex-sdk sessions with persisted thread id and sends via resumeThread()', async () => {
