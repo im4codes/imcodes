@@ -4397,6 +4397,35 @@ html.native-ios-mac .chat-dl-btn {
 .delegation-claim-dispatches { list-style: none; margin: 2px 0 0; padding: 0; }
 .delegation-claim-dispatch { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 2px 0; }
 .delegation-claim-id code { font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; color: #e2e8f0; }
+/* The executor is the line the eye should land on, so it is the only part of
+   the row at full contrast and it takes the whole width on its own. */
+.delegation-claim-execution { flex: 1 1 100%; color: #e2e8f0; }
+.delegation-claim-execution code {
+  font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace;
+  color: #f1f5f9;
+  font-weight: 600;
+}
+/* Present, quotable, and quiet. */
+.delegation-claim-secondary { opacity: 0.7; }
+.delegation-claim-diagnostics { flex: 1 1 100%; opacity: 0.6; }
+.delegation-claim-diagnostics > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-block;
+  user-select: none;
+}
+.delegation-claim-diagnostics > summary::-webkit-details-marker { display: none; }
+.delegation-claim-diagnostics > summary::before { content: '▸ '; }
+.delegation-claim-diagnostics[open] > summary::before { content: '▾ '; }
+.delegation-claim-diagnostics > span { display: block; padding-left: 12px; }
+/* Narrow viewports: ids are long and monospaced, so let the row stack instead
+   of forcing a horizontal scroll that hides the executor off-screen. */
+@media (max-width: 640px) {
+  .delegation-claim-dispatch { gap: 2px 8px; }
+  .delegation-claim-execution code { overflow-wrap: anywhere; }
+  .delegation-claim-id { flex: 1 1 100%; }
+  .delegation-claim-id code { overflow-wrap: anywhere; }
+}
 .chat-rich-text { white-space: pre-wrap; }
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }

@@ -184,10 +184,152 @@ describe('DelegationClaimBadge', () => {
     const text = line?.textContent ?? '';
     // Facts, in the order a reader scans them: who, what it runs, which lane.
     expect(text).toContain('Coder (deck_imcodes_w1)');
-    expect(text).toContain('claude-code-sdk/anthropic');
     expect(text).toContain('claude-opus-5');
     expect(text).toContain('primary');
-    expect(text).toContain('delegated');
+    // Provider and assignment status are still carried, one layer down: the
+    // point of R1 was that no second lookup is needed, and that holds whether
+    // a fact is on the scanned line or in the diagnostics beside it.
+    const diagnostics = container.querySelector('details[data-delegation-field="diagnostics"]');
+    expect(diagnostics?.textContent).toContain('claude-code-sdk/anthropic');
+    expect(diagnostics?.textContent).toContain('delegated');
+  });
+
+  it('leads with session, then model, then pool — the three facts a reader acts on', () => {
+    // R1 made the executor available; R2 is about what the eye lands on first.
+    // A reader scanning a turn wants to know WHO ran it, on WHAT model, in
+    // WHICH lane. The authority ids answer none of those, so they must not be
+    // the first thing rendered.
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp_9f21',
+          taskId: 'task_4410',
+          assignmentId: 'asg_5gl',
+          deliveries: [{
+            target: 'deck_imcodes_w1',
+            status: 'delivered',
+            execution: {
+              sessionName: 'deck_imcodes_w1',
+              label: 'Coder',
+              agentType: 'claude-code-sdk',
+              providerFamily: 'anthropic',
+              model: 'claude-opus-5',
+              pool: 'primary',
+              assignmentStatus: 'delegated',
+              source: 'assignment',
+            },
+          }],
+        }],
+      }),
+    }));
+
+    const primary = container.querySelector('[data-delegation-field="execution"]');
+    const text = primary?.textContent ?? '';
+    expect(text).toContain('Coder (deck_imcodes_w1)');
+    expect(text).toContain('claude-opus-5');
+    expect(text).toContain('primary');
+    // Order, not just presence.
+    expect(text.indexOf('deck_imcodes_w1')).toBeLessThan(text.indexOf('claude-opus-5'));
+    expect(text.indexOf('claude-opus-5')).toBeLessThan(text.indexOf('primary'));
+
+    // The primary line stays about the executor: provider/runtime and the
+    // assignment status are real facts but they are not what a reader scans
+    // for, so they belong with the rest of the diagnostics.
+    expect(text).not.toContain('anthropic');
+    expect(text).not.toContain('delegated');
+
+    // ...and it is the first thing in the row.
+    const row = container.querySelector('[data-delegation-dispatch]')!;
+    const fields = Array.from(row.querySelectorAll('[data-delegation-field]'))
+      .map((node) => node.getAttribute('data-delegation-field'));
+    expect(fields[0]).toBe('execution');
+  });
+
+  it('demotes taskId and hides the dispatch/assignment ids behind diagnostics', () => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp_9f21',
+          taskId: 'task_4410',
+          assignmentId: 'asg_5gl',
+          deliveries: [{
+            target: 'deck_imcodes_w1',
+            status: 'delivered',
+            execution: {
+              sessionName: 'deck_imcodes_w1',
+              model: 'claude-opus-5',
+              pool: 'primary',
+              source: 'assignment',
+            },
+          }],
+        }],
+      }),
+    }));
+
+    // taskId stays visible but secondary: it is the one id a person quotes.
+    const task = container.querySelector('[data-delegation-field="taskId"]');
+    expect(task?.textContent).toContain('task_4410');
+    expect(task?.className).toContain('delegation-claim-secondary');
+
+    // The other two are diagnostics, collapsed and not open by default, so a
+    // normal turn reads as one line instead of a wall of opaque ids.
+    const details = container.querySelector('details[data-delegation-field="diagnostics"]');
+    expect(details).not.toBeNull();
+    expect(details?.hasAttribute('open')).toBe(false);
+    expect(details?.textContent).toContain('dsp_9f21');
+    expect(details?.textContent).toContain('asg_5gl');
+    // Still copyable as exact text, which is the only reason they are kept.
+    expect(details?.querySelector('[data-delegation-field="dispatchId"] code')?.textContent).toBe('dsp_9f21');
+    expect(details?.querySelector('[data-delegation-field="assignmentId"] code')?.textContent).toBe('asg_5gl');
+  });
+
+  it('keeps a queued receipt as readable as a delivered one', () => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp_q',
+          taskId: 'task_q',
+          assignmentId: 'asg_q',
+          deliveries: [{
+            target: 'deck_imcodes_w2',
+            status: 'queued',
+            execution: {
+              sessionName: 'deck_imcodes_w2',
+              model: 'gpt-5.6',
+              pool: 'economy',
+              source: 'live',
+            },
+          }],
+        }],
+      }),
+    }));
+    const text = container.querySelector('[data-delegation-field="execution"]')?.textContent ?? '';
+    expect(text).toContain('deck_imcodes_w2');
+    expect(text).toContain('gpt-5.6');
+    expect(text).toContain('economy');
+  });
+
+  it('still shows the ids for a legacy receipt that carries no executor', () => {
+    // Older daemons send no execution facts. Losing the ids there would leave
+    // the row saying nothing at all, so diagnostics remain the fallback.
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp_legacy',
+          taskId: 'task_legacy',
+          assignmentId: 'asg_legacy',
+          deliveries: [{ target: 'deck_imcodes_w1', status: 'delivered' }],
+        }],
+      }),
+    }));
+    expect(container.querySelector('[data-delegation-field="execution"]')).toBeNull();
+    const details = container.querySelector('details[data-delegation-field="diagnostics"]');
+    expect(details?.textContent).toContain('dsp_legacy');
+    expect(container.querySelector('[data-delegation-field="taskId"]')?.textContent).toContain('task_legacy');
   });
 
   it('renders no executor line when the facts do not name one', () => {
@@ -256,7 +398,7 @@ describe('readDelegationClaimMetadata', () => {
 
 describe('delegation.claim locale coverage', () => {
   const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
-  const KEYS = ['none', 'dispatch_count', 'dispatch_id', 'task_id', 'assignment_id'] as const;
+  const KEYS = ['none', 'dispatch_count', 'dispatch_id', 'task_id', 'assignment_id', 'execution', 'diagnostics'] as const;
 
   it('ships every badge string in all 7 locales', () => {
     for (const locale of SUPPORTED_LOCALES) {
@@ -274,6 +416,34 @@ describe('delegation.claim locale coverage', () => {
       expect(claim?.dispatch_count as string, `${locale}: delegation.claim.dispatch_count`)
         .toContain('{{total}}');
     }
+  });
+});
+
+describe('delegation-claim visual demotion', () => {
+  const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+  const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+
+  it('gives the executor its own full-width, full-contrast line', () => {
+    // Reordering the DOM is only half of "emphasise the executor"; without the
+    // rule the three lines render as equal-weight siblings and the ordering is
+    // invisible to anyone actually looking at it.
+    expect(css).toMatch(/\.delegation-claim-execution \{[^}]*flex: 1 1 100%/);
+    expect(css).toMatch(/\.delegation-claim-execution code \{[^}]*font-weight: 600/);
+  });
+
+  it('demotes the secondary id and the diagnostics block', () => {
+    expect(css).toMatch(/\.delegation-claim-secondary \{[^}]*opacity/);
+    expect(css).toMatch(/\.delegation-claim-diagnostics \{[^}]*opacity/);
+    // A closed <details> must not look like a link-less dead end.
+    expect(css).toMatch(/\.delegation-claim-diagnostics > summary \{[^}]*cursor: pointer/);
+  });
+
+  it('stacks the row on narrow viewports instead of scrolling the executor away', () => {
+    // Session names and ids are long and monospaced. On a phone the executor
+    // is the one thing that must stay on screen.
+    const narrow = css.slice(css.indexOf('@media (max-width: 640px)'));
+    expect(narrow).toContain('.delegation-claim-id { flex: 1 1 100%; }');
+    expect(narrow).toContain('overflow-wrap: anywhere');
   });
 });
 

@@ -3018,7 +3018,8 @@
       "dispatch_id": "ID de envío",
       "task_id": "ID de tarea",
       "assignment_id": "ID de asignación",
-      "execution": "Se ejecuta en"
+      "execution": "Se ejecuta en",
+      "diagnostics": "Diagnóstico"
     },
     "picker": {
       "agents": "Agentes",

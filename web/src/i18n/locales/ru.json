@@ -3017,7 +3017,8 @@
       "dispatch_id": "ID отправки",
       "task_id": "ID задачи",
       "assignment_id": "ID назначения",
-      "execution": "Выполняется на"
+      "execution": "Выполняется на",
+      "diagnostics": "Диагностика"
     },
     "picker": {
       "agents": "Агенты",

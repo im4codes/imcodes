@@ -3017,7 +3017,8 @@
       "dispatch_id": "送信 ID",
       "task_id": "タスク ID",
       "assignment_id": "アサインメント ID",
-      "execution": "実行先"
+      "execution": "実行先",
+      "diagnostics": "診断情報"
     },
     "picker": {
       "agents": "エージェント",

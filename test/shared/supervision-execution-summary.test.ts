@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   buildSupervisionExecutionSummary,
@@ -122,5 +124,84 @@ describe('buildSupervisionExecutionSummary', () => {
     expect(summary).not.toHaveProperty('pool');
     expect(summary).not.toHaveProperty('model');
     expect(summary).not.toHaveProperty('assignmentStatus');
+  });
+});
+
+describe('the receipt display path spends nothing', () => {
+  const root = join(import.meta.dirname, '..', '..');
+  const read = (relative: string) => readFileSync(join(root, relative), 'utf8');
+
+  /**
+   * The daemon-side join, sliced out of a file that legitimately does other
+   * things. Asserting on the whole of send-tool would prove nothing.
+   */
+  const joinBody = (): string => {
+    const source = read('src/daemon/send-tool.ts');
+    const start = source.indexOf('function resolveDeliveryExecution');
+    expect(start, 'resolveDeliveryExecution must exist').toBeGreaterThan(-1);
+    return source.slice(start, source.indexOf('\nfunction ', start + 1));
+  };
+
+  // Every file a dispatch receipt passes through on its way to a reader.
+  const DISPLAY_PATH = [
+    'shared/supervision-execution-summary.ts',
+    'shared/delegation-claim.ts',
+    'web/src/components/DelegationClaimBadge.tsx',
+  ] as const;
+
+  it('imports no model client and reaches no network from any display file', () => {
+    // The cheap way to build this feature would have been to hand a task object
+    // to a model and ask it for a one-line summary. That is a token cost and a
+    // latency cost on every rendered turn, for facts the registry already
+    // holds exactly. Naming the temptation in a test is the only way it stays
+    // refused after everyone has forgotten why.
+    const forbiddenImport = /^\s*import[^;]*from\s*'([^']*(?:anthropic|openai|langchain|genai|mistral|cohere|ollama|llm|completion)[^']*)'/gim;
+    const forbiddenCall = /\b(fetch|XMLHttpRequest|axios|generateText|createMessage|createCompletion)\s*\(/;
+    for (const relative of DISPLAY_PATH) {
+      const source = read(relative);
+      expect([...source.matchAll(forbiddenImport)].map((m) => m[1]), relative).toEqual([]);
+      expect(forbiddenCall.test(source), `${relative} must not call out`).toBe(false);
+    }
+  });
+
+  it('resolves the summary synchronously, with no awaited work', () => {
+    // A pure function cannot quietly grow a lookup. If this ever needs `await`,
+    // something has been added that this test exists to catch.
+    const source = read('shared/supervision-execution-summary.ts');
+    expect(source).not.toContain('await ');
+    expect(source).not.toContain('async ');
+  });
+
+  it('spends at most the one O(1) assignment read on the daemon side', () => {
+    const body = joinBody();
+    expect((body.match(/getSupervisionTaskRegistry\(\)/g) ?? []).length).toBe(1);
+    expect((body.match(/\.getAssignment\(/g) ?? []).length).toBe(1);
+    // No unbounded registry reads, and no second trip for the same receipt.
+    for (const unbounded of ['.list(', '.listEvents(', '.listAuditReceipts(', '.get(']) {
+      expect(body, `resolveDeliveryExecution must not call ${unbounded}`).not.toContain(unbounded);
+    }
+    expect(body).not.toMatch(/\bfor\s*\(|\.map\(|\.filter\(/);
+  });
+
+  it('generates nothing and calls nothing out from inside the real join', () => {
+    // The counting assertion above is not enough on its own: a `generateText`
+    // call added inside this function adds no registry read, no `.list(`, and
+    // no loop, so it would sail past every other check here. The join is where
+    // a per-receipt token cost would actually be introduced, so it is asserted
+    // directly rather than by proximity to the display files.
+    const body = joinBody();
+    const forbiddenCall =
+      /\b(fetch|XMLHttpRequest|axios|generateText|generateObject|streamText|createMessage|createCompletion|complete|summarize|prompt|invokeModel|chat)\s*\(/;
+    const offender = body.match(forbiddenCall)?.[1];
+    expect(offender, `resolveDeliveryExecution must not call ${offender ?? ''}`).toBeUndefined();
+    expect(body).not.toMatch(/\bawait\b/);
+
+    // send-tool talks to the network for other reasons, so call-shape scanning
+    // has to stay scoped -- but importing a model client is never legitimate
+    // anywhere in this file, and that is checkable file-wide.
+    const source = read('src/daemon/send-tool.ts');
+    const forbiddenImport =
+      /^\s*import[^;]*from\s*'([^']*(?:anthropic|openai|langchain|genai|mistral|cohere|ollama|llm|completion)[^']*)'/gim;
+    expect([...source.matchAll(forbiddenImport)].map((m) => m[1])).toEqual([]);
   });
 });

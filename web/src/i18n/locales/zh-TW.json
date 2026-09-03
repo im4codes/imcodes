@@ -3018,7 +3018,8 @@
       "dispatch_id": "派發 ID",
       "task_id": "任務 ID",
       "assignment_id": "指派 ID",
-      "execution": "執行於"
+      "execution": "執行於",
+      "diagnostics": "診斷資訊"
     },
     "picker": {
       "agents": "智能體",

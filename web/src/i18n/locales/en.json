@@ -3018,7 +3018,8 @@
       "dispatch_id": "Dispatch ID",
       "task_id": "Task ID",
       "assignment_id": "Assignment ID",
-      "execution": "Runs on"
+      "execution": "Runs on",
+      "diagnostics": "Diagnostics"
     },
     "picker": {
       "agents": "Agents",

@@ -59,22 +59,29 @@ const executionOf = (dispatch: { deliveries?: { execution?: SupervisionExecution
   (dispatch.deliveries ?? []).find((delivery) => delivery.execution)?.execution;
 
 /**
- * One line, facts only, in the order a reader scans them: who, then what it
- * runs, then which lane. Absent facts are skipped rather than padded, so the
- * line never claims precision it does not have.
+ * The line a reader actually scans: who ran it, on what model, in which lane.
+ *
+ * Nothing else belongs here. Provider, runtime type and assignment status are
+ * real facts, but a person reading a turn is asking those three questions and
+ * padding the line with the rest is how the answer stops being findable. The
+ * remainder is kept in diagnostics, not dropped. Absent facts are skipped
+ * rather than placeheld, so the line never implies precision it lacks.
  */
-export const formatExecutionSummary = (execution: SupervisionExecutionSummary): string => {
-  const runtime = [execution.agentType, execution.providerFamily].filter(Boolean).join('/');
-  return [
-    execution.label && execution.label !== execution.sessionName
-      ? `${execution.label} (${execution.sessionName})`
-      : execution.sessionName,
-    runtime || undefined,
-    execution.model,
-    execution.pool,
-    execution.assignmentStatus,
-  ].filter(Boolean).join(' · ');
-};
+export const formatExecutionSummary = (execution: SupervisionExecutionSummary): string => [
+  execution.label && execution.label !== execution.sessionName
+    ? `${execution.label} (${execution.sessionName})`
+    : execution.sessionName,
+  execution.model,
+  execution.pool,
+].filter(Boolean).join(' · ');
+
+/** Everything true but not scanned-for, kept exact for copying. */
+export const formatExecutionDiagnostics = (execution: SupervisionExecutionSummary): string => [
+  [execution.agentType, execution.providerFamily].filter(Boolean).join('/') || undefined,
+  execution.runtimeType,
+  execution.assignmentStatus,
+  execution.source,
+].filter(Boolean).join(' · ');
 
 export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
   const { t } = useTranslation();
@@ -116,25 +123,6 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
             class="delegation-claim-dispatch"
             data-delegation-dispatch={dispatch.dispatchId}
           >
-            <span class="delegation-claim-id" data-delegation-field="dispatchId">
-              {t('delegation.claim.dispatch_id', 'Dispatch ID')}
-              {': '}
-              <code>{dispatch.dispatchId}</code>
-            </span>
-            {dispatch.taskId ? (
-              <span class="delegation-claim-id" data-delegation-field="taskId">
-                {t('delegation.claim.task_id', 'Task ID')}
-                {': '}
-                <code>{dispatch.taskId}</code>
-              </span>
-            ) : null}
-            {dispatch.assignmentId ? (
-              <span class="delegation-claim-id" data-delegation-field="assignmentId">
-                {t('delegation.claim.assignment_id', 'Assignment ID')}
-                {': '}
-                <code>{dispatch.assignmentId}</code>
-              </span>
-            ) : null}
             {executionOf(dispatch) ? (
               <span class="delegation-claim-execution" data-delegation-field="execution">
                 {t('delegation.claim.execution', 'Runs on')}
@@ -142,6 +130,43 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
                 <code>{formatExecutionSummary(executionOf(dispatch)!)}</code>
               </span>
             ) : null}
+            {dispatch.taskId ? (
+              <span
+                class="delegation-claim-id delegation-claim-secondary"
+                data-delegation-field="taskId"
+              >
+                {t('delegation.claim.task_id', 'Task ID')}
+                {': '}
+                <code>{dispatch.taskId}</code>
+              </span>
+            ) : null}
+            {/*
+              Collapsed, and closed by default. These ids answer no question a
+              reader has while reading; they exist to be quoted back exactly
+              when something has gone wrong, and a legacy receipt with no
+              executor has nothing else to show, so they are demoted rather
+              than removed.
+            */}
+            <details class="delegation-claim-diagnostics" data-delegation-field="diagnostics">
+              <summary>{t('delegation.claim.diagnostics', 'Diagnostics')}</summary>
+              <span class="delegation-claim-id" data-delegation-field="dispatchId">
+                {t('delegation.claim.dispatch_id', 'Dispatch ID')}
+                {': '}
+                <code>{dispatch.dispatchId}</code>
+              </span>
+              {dispatch.assignmentId ? (
+                <span class="delegation-claim-id" data-delegation-field="assignmentId">
+                  {t('delegation.claim.assignment_id', 'Assignment ID')}
+                  {': '}
+                  <code>{dispatch.assignmentId}</code>
+                </span>
+              ) : null}
+              {executionOf(dispatch) && formatExecutionDiagnostics(executionOf(dispatch)!) ? (
+                <span class="delegation-claim-id" data-delegation-field="executionDetail">
+                  <code>{formatExecutionDiagnostics(executionOf(dispatch)!)}</code>
+                </span>
+              ) : null}
+            </details>
           </li>
         ))}
       </ul>
