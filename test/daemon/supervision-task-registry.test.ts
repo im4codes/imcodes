@@ -1307,6 +1307,685 @@ describe('SupervisionTaskRegistry', () => {
     database.close();
   });
 
+  it('advances the task revision when the owner already carries the successor auditRevision', () => {
+    // Live shape from tsk_4l8: a semantic rebase produced successor R4, the
+    // integration owner already had auditRevision=R4 bound (an auditRevision-only
+    // update succeeds), but task.currentRevision was still R3. Re-sending the
+    // exact same R4 as `revision` was then refused as old_revision, so the task
+    // revision could never catch up -- a deadlock, because bindsSuccessorRevision
+    // requires requestedRevision !== existing.auditRevision and is therefore
+    // false precisely once the assignment is already on the successor.
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'successor-task-revision-catchup';
+    const older = 'console-delta-r3';
+    const successor = 'console-delta-r4';
+    const ownerIdentity = identity(`deck_${taskId}_owner`);
+
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'advance the task revision to the bound successor', currentRevision: older,
+    })).toMatchObject({ ok: true });
+    const owner = registry.createAssignment({
+      assignmentId: `${taskId}-owner`, taskId, role: 'integration_owner',
+      identity: ownerIdentity, auditRevision: older,
+    });
+    if (!owner.ok) throw new Error('owner fixture creation failed');
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+
+    // Exactly the call that already works today: bind the successor on the
+    // assignment alone, leaving the task revision behind.
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity,
+      auditRevision: successor,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.value.assignmentId)?.auditRevision).toBe(successor);
+    expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(older);
+
+    // Now the same exact successor must be able to move the task revision.
+    const advanced = registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity,
+      revision: successor, auditRevision: successor,
+    });
+    expect(advanced, 'the bound successor must be able to advance the task revision')
+      .toMatchObject({ ok: true });
+    expect(
+      registry.getTaskRecord(taskId)?.currentRevision,
+      'task.currentRevision and assignment.auditRevision must advance atomically',
+    ).toBe(successor);
+    expect(registry.getAssignment(owner.value.assignmentId)?.auditRevision).toBe(successor);
+    registry.close();
+    database.close();
+  });
+  function prepareCatchUpShape(registry: SupervisionTaskRegistry, taskId: string) {
+    const older = `${taskId}-r3`;
+    const successor = `${taskId}-r4`;
+    const attemptId = `${taskId}-attempt-r3`;
+    const ownerIdentity = identity(`deck_${taskId}_owner`);
+    const auditorIdentity = identity(`deck_${taskId}_auditor`, 'codex-sdk');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'predecessor PASS must not authorize a successor', currentRevision: older,
+    })).toMatchObject({ ok: true });
+    const owner = registry.createAssignment({
+      assignmentId: `${taskId}-owner`, taskId, role: 'integration_owner',
+      identity: ownerIdentity,
+    });
+    const auditor = registry.createAssignment({
+      assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', required: false,
+      identity: auditorIdentity, auditAttemptId: attemptId, auditRevision: older,
+    });
+    // finishAssignment resolves through exactly one active implementer.
+    const implementerIdentity = identity(`deck_${taskId}_worker`);
+    const implementer = registry.createAssignment({
+      assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
+      identity: implementerIdentity, scopeFiles: ['src/a.ts'],
+      auditAttemptId: attemptId, auditRevision: older,
+    });
+    if (!owner.ok || !auditor.ok || !implementer.ok) throw new Error('catch-up fixture failed');
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    // The owner deliberately STAYS in implementing -- that is the catch-up shape.
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: implementer.value.assignmentId, identity: implementerIdentity,
+      status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: older,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      attemptId, revision: older, receiptKind: 'final', verdict: 'PASS',
+      auditorSessionName: auditorIdentity.sessionName, auditorIdentity,
+      findings: 'accepted predecessor PASS',
+      validations: [{ kind: 'test', label: 'frozen', outcome: 'passed', summary: 'predecessor evidence' }],
+    })).toMatchObject({ ok: true, value: { verdict: 'PASS' } });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision: older,
+    })).toMatchObject({ ok: true });
+    // Bind the owner pointer only after the auditor is finalized, so the
+    // predecessor PASS is unambiguously the auditor's.
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity, auditRevision: older,
+    })).toMatchObject({ ok: true });
+    // Exact acceptance state: predecessor PASS retained, owner still implementing.
+    expect(registry.updateTask({ taskId, status: 'ready_for_integration' })).toMatchObject({ ok: true });
+    return { taskId, older, successor, owner: owner.value, ownerIdentity, auditorIdentity };
+  }
+
+  it('demotes the predecessor integration-ready projection when the revision catches up', () => {
+    // Cx REWORK P1: the accepted R3 PASS must never authorize the unaudited R4.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'catchup-old-pass');
+    expect(registry.getTaskRecord(shape.taskId)).toMatchObject({
+      status: 'ready_for_integration', currentRevision: shape.older,
+    });
+
+    // auditRevision-only pointer move to the successor (this already worked).
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+
+    const after = registry.getTaskRecord(shape.taskId);
+    expect(after?.currentRevision, 'the revision must advance atomically').toBe(shape.successor);
+    expect(
+      after?.status,
+      'an unaudited successor must not inherit the predecessor PASS lifecycle',
+    ).toBe('implementing');
+  });
+
+  it('refuses a catch-up that would move the task back onto an already audited revision', () => {
+    // Downgrade is decidable from existing relations: the requested revision
+    // already carries an accepted final PASS receipt.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'catchup-two-pass');
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(shape.taskId)?.currentRevision).toBe(shape.successor);
+
+    // Point the owner back at the AUDITED predecessor and try to drag the task back.
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      auditRevision: shape.older,
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      revision: shape.older, auditRevision: shape.older,
+    }), 'a downgrade onto an audited revision must be refused')
+      .toMatchObject({ ok: false, reason: 'old_revision' });
+    expect(
+      registry.getTaskRecord(shape.taskId)?.currentRevision,
+      'a refused downgrade must not move the revision',
+    ).toBe(shape.successor);
+  });
+
+  it('refuses a catch-up from an owner that is not the task integration pointer', () => {
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'catchup-ptr-pass');
+    const otherIdentity = identity('deck_catchup_second_owner');
+    const second = registry.createAssignment({
+      assignmentId: 'catchup-wrong-pointer-owner-2', taskId: shape.taskId,
+      role: 'integration_owner', identity: otherIdentity, auditRevision: shape.older,
+    });
+    if (!second.ok) throw new Error('second owner fixture failed');
+    expect(registry.updateAssignment({
+      assignmentId: second.value.assignmentId, identity: otherIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: second.value.assignmentId, identity: otherIdentity,
+      auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+
+    expect(registry.getTaskRecord(shape.taskId)?.integrationOwnerAssignmentId)
+      .toBe(shape.owner.assignmentId);
+    expect(registry.updateAssignment({
+      assignmentId: second.value.assignmentId, identity: otherIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    }), 'a non-pointer owner must not drive the catch-up')
+      .toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.getTaskRecord(shape.taskId)?.currentRevision).toBe(shape.older);
+  });
+
+  it('does not widen the ordinary lifecycle: plain updateTask cannot walk back to implementing', () => {
+    // The catch-up demotion is scoped to its own authorized transaction. The
+    // shared transition table must stay untouched, so the generic surface still
+    // refuses ready_for_integration -> implementing.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'catchup-no-widening');
+    expect(registry.getTaskRecord(shape.taskId)).toMatchObject({ status: 'ready_for_integration' });
+    expect(
+      registry.updateTask({ taskId: shape.taskId, status: 'implementing' }),
+      'the ordinary lifecycle surface must not gain this edge',
+    ).toMatchObject({ ok: false });
+    expect(registry.getTaskRecord(shape.taskId)?.status).toBe('ready_for_integration');
+  });
+
+  it('refuses a catch-up from an optional implementer when the task has an authoritative pointer', () => {
+    // Cx6 REWORK: completesSuccessorRevision admits EVERY non-auditor, but the
+    // pointer gate only ran for role === 'integration_owner'. So while the task
+    // pointer named a different owner, an authenticated required:false
+    // implementer could bind auditRevision=R4 and then submit revision=R4,
+    // moving the task revision without any pointer authority at all. The gate
+    // must key on authority, not on role.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'catchup-optional-impl');
+    const strangerIdentity = identity('deck_catchup_optional_impl');
+    const stranger = registry.createAssignment({
+      assignmentId: 'catchup-optional-impl-extra', taskId: shape.taskId,
+      role: 'implementer', required: false, identity: strangerIdentity,
+    });
+    if (!stranger.ok) throw new Error('optional implementer fixture failed');
+    expect(registry.updateAssignment({
+      assignmentId: stranger.value.assignmentId, identity: strangerIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: stranger.value.assignmentId, identity: strangerIdentity,
+      auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+
+    // The pointer names the real integration owner, not this assignment.
+    expect(registry.getTaskRecord(shape.taskId)?.integrationOwnerAssignmentId)
+      .toBe(shape.owner.assignmentId);
+
+    expect(registry.updateAssignment({
+      assignmentId: stranger.value.assignmentId, identity: strangerIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    }), 'an optional implementer must not move the task revision past the pointer')
+      .toMatchObject({ ok: false });
+    expect(
+      registry.getTaskRecord(shape.taskId)?.currentRevision,
+      'the task revision must be unchanged',
+    ).toBe(shape.older);
+  });
+
+  it('refuses a catch-up driven by a required coordinator even with no pointer', () => {
+    // Cx6 REWORK: R3's no-pointer fallback only checked `required`, so a
+    // required:true COORDINATOR -- an observer/orchestrator that owns no
+    // implementation authority -- could bind auditRevision=r3 and then move the
+    // task revision. Authority must additionally be an implementation role.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const taskId = 'catchup-coordinator-authority';
+    const coordinatorIdentity = identity(`deck_${taskId}_brain`, 'codex-sdk');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'coordinators are not implementation authority', currentRevision: 'coord-r2',
+    })).toMatchObject({ ok: true });
+    const coordinator = registry.createAssignment({
+      assignmentId: `${taskId}-coordinator`, taskId, role: 'coordinator',
+      required: true, identity: coordinatorIdentity, auditRevision: 'coord-r2',
+    });
+    if (!coordinator.ok) throw new Error('coordinator fixture failed');
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: coordinator.value.assignmentId, identity: coordinatorIdentity,
+      status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(taskId)?.integrationOwnerAssignmentId).toBeUndefined();
+
+    expect(registry.updateAssignment({
+      assignmentId: coordinator.value.assignmentId, identity: coordinatorIdentity,
+      auditRevision: 'coord-r3',
+    })).toMatchObject({ ok: true });
+
+    expect(registry.updateAssignment({
+      assignmentId: coordinator.value.assignmentId, identity: coordinatorIdentity,
+      revision: 'coord-r3', auditRevision: 'coord-r3',
+    }), 'a coordinator must not advance the task revision').toMatchObject({ ok: false });
+    expect(
+      registry.getTaskRecord(taskId)?.currentRevision,
+      'the task revision must be unchanged',
+    ).toBe('coord-r2');
+  });
+
+  it('refuses a ONE-CALL successor bind from a non-pointer optional implementer', () => {
+    // Cx6 REWORK on R4: R1-R4 all guarded the two-step catch-up
+    // (completesSuccessorRevision). A single
+    // updateAssignment({revision, auditRevision}) takes the
+    // bindsSuccessorRevision path instead and skipped every one of those gates.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'onecall-nonpointer');
+    const strangerIdentity = identity('deck_onecall_stranger');
+    const stranger = registry.createAssignment({
+      assignmentId: 'onecall-nonpointer-extra', taskId: shape.taskId,
+      role: 'implementer', required: false, identity: strangerIdentity,
+      auditRevision: shape.older,
+    });
+    if (!stranger.ok) throw new Error('optional implementer fixture failed');
+    expect(registry.updateAssignment({
+      assignmentId: stranger.value.assignmentId, identity: strangerIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(shape.taskId)?.integrationOwnerAssignmentId)
+      .toBe(shape.owner.assignmentId);
+
+    // ONE call: bind the successor and move the revision in a single request.
+    expect(registry.updateAssignment({
+      assignmentId: stranger.value.assignmentId, identity: strangerIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    }), 'a single-call successor bind must obey the same authority boundary')
+      .toMatchObject({ ok: false });
+    expect(
+      registry.getTaskRecord(shape.taskId)?.currentRevision,
+      'the task revision must be unchanged',
+    ).toBe(shape.older);
+  });
+
+  it('refuses a ONE-CALL successor bind from the exact pointer owner on a blocked task', () => {
+    // Same boundary, terminal dimension: even the authoritative pointer owner
+    // must not move the task revision while the task is blocked.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'onecall-blocked');
+    expect(registry.updateTask({ taskId: shape.taskId, status: 'blocked' })).toMatchObject({ ok: true });
+
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    }), 'a blocked task must refuse a single-call successor bind')
+      .toMatchObject({ ok: false });
+    expect(
+      registry.getTaskRecord(shape.taskId)?.currentRevision,
+      'the task revision must be unchanged',
+    ).toBe(shape.older);
+  });
+
+  // One boundary, both shapes: every dimension is exercised through a single
+  // updateAssignment (bindsSuccessorRevision) AND through the two-step
+  // auditRevision-then-revision catch-up (completesSuccessorRevision).
+  for (const shapeName of ['one-call', 'two-call'] as const) {
+    const advance = (
+      registry: SupervisionTaskRegistry,
+      assignmentId: string,
+      who: ReturnType<typeof identity>,
+      revision: string,
+    ) => {
+      if (shapeName === 'two-call') {
+        const bound = registry.updateAssignment({ assignmentId, identity: who, auditRevision: revision });
+        if (!bound.ok) return bound;
+      }
+      return registry.updateAssignment({ assignmentId, identity: who, revision, auditRevision: revision });
+    };
+
+    it(`(${shapeName}) lets the no-pointer required implementer advance the task revision`, () => {
+      const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+      const taskId = `matrix-ok-${shapeName}`;
+      const workerIdentity = identity(`deck_${taskId}_worker`);
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'ordinary successor advance', currentRevision: 'm-r2',
+      })).toMatchObject({ ok: true });
+      const worker = registry.createAssignment({
+        assignmentId: `${taskId}-impl`, taskId, role: 'implementer',
+        identity: workerIdentity, scopeFiles: ['src/a.ts'], auditRevision: 'm-r2',
+      });
+      if (!worker.ok) throw new Error('fixture failed');
+      expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: worker.value.assignmentId, identity: workerIdentity, status: 'implementing',
+      })).toMatchObject({ ok: true });
+      expect(registry.getTaskRecord(taskId)?.integrationOwnerAssignmentId).toBeUndefined();
+
+      expect(advance(registry, worker.value.assignmentId, workerIdentity, 'm-r3'))
+        .toMatchObject({ ok: true });
+      expect(registry.getTaskRecord(taskId)?.currentRevision).toBe('m-r3');
+    });
+
+    it(`(${shapeName}) refuses a coordinator, a non-pointer optional implementer, and a blocked task`, () => {
+      // coordinator, no pointer
+      const coordReg = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+      const coordIdentity = identity('deck_matrix_coord', 'codex-sdk');
+      expect(coordReg.createOrGet({
+        taskId: 'matrix-coord', projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'coordinator has no implementation authority', currentRevision: 'c-r2',
+      })).toMatchObject({ ok: true });
+      const coord = coordReg.createAssignment({
+        assignmentId: 'matrix-coord-c', taskId: 'matrix-coord', role: 'coordinator',
+        required: true, identity: coordIdentity, auditRevision: 'c-r2',
+      });
+      if (!coord.ok) throw new Error('fixture failed');
+      expect(coordReg.updateTask({ taskId: 'matrix-coord', status: 'delegated' })).toMatchObject({ ok: true });
+      expect(coordReg.updateTask({ taskId: 'matrix-coord', status: 'implementing' })).toMatchObject({ ok: true });
+      expect(coordReg.updateAssignment({
+        assignmentId: coord.value.assignmentId, identity: coordIdentity, status: 'implementing',
+      })).toMatchObject({ ok: true });
+      expect(advance(coordReg, coord.value.assignmentId, coordIdentity, 'c-r3')).toMatchObject({ ok: false });
+      expect(coordReg.getTaskRecord('matrix-coord')?.currentRevision).toBe('c-r2');
+
+      // non-pointer optional implementer, pointer names someone else
+      const ptrReg = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+      const ptrShape = prepareCatchUpShape(ptrReg, `matrix-ptr-${shapeName}`);
+      const strangerIdentity = identity(`deck_matrix_stranger_${shapeName}`);
+      const stranger = ptrReg.createAssignment({
+        assignmentId: `matrix-ptr-${shapeName}-extra`, taskId: ptrShape.taskId,
+        role: 'implementer', required: false, identity: strangerIdentity, auditRevision: ptrShape.older,
+      });
+      if (!stranger.ok) throw new Error('fixture failed');
+      expect(ptrReg.updateAssignment({
+        assignmentId: stranger.value.assignmentId, identity: strangerIdentity, status: 'implementing',
+      })).toMatchObject({ ok: true });
+      expect(advance(ptrReg, stranger.value.assignmentId, strangerIdentity, ptrShape.successor))
+        .toMatchObject({ ok: false });
+      expect(ptrReg.getTaskRecord(ptrShape.taskId)?.currentRevision).toBe(ptrShape.older);
+
+      // exact pointer owner, but the task is blocked
+      const blockedReg = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+      const blockedShape = prepareCatchUpShape(blockedReg, `matrix-blocked-${shapeName}`);
+      expect(blockedReg.updateTask({ taskId: blockedShape.taskId, status: 'blocked' })).toMatchObject({ ok: true });
+      expect(advance(blockedReg, blockedShape.owner.assignmentId, blockedShape.ownerIdentity, blockedShape.successor))
+        .toMatchObject({ ok: false });
+      expect(blockedReg.getTaskRecord(blockedShape.taskId)?.currentRevision).toBe(blockedShape.older);
+    });
+  }
+
+  it('revokes the predecessor PASS projection on a ONE-CALL successor bind', () => {
+    // Cx6 REWORK on R5: R5 unified the GUARDS across both shapes but left the
+    // predecessor-PASS isolation EFFECT branching on completesSuccessorRevision.
+    // A single updateAssignment({revision, auditRevision}) therefore advanced the
+    // revision while leaving task=ready_for_integration and the predecessor
+    // implementer still holding its R3 PASS -- the old audit authorizing new bytes.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'onecall-old-pass');
+    expect(registry.getTaskRecord(shape.taskId)).toMatchObject({
+      status: 'ready_for_integration', currentRevision: shape.older,
+    });
+    const predecessor = registry.listAssignments(shape.taskId)
+      .find((a) => a.role === 'implementer');
+    expect(predecessor).toMatchObject({ status: 'ready_for_integration', verdict: 'PASS' });
+
+    // ONE call: bind the successor and move the revision in a single request.
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+
+    expect(registry.getTaskRecord(shape.taskId)?.currentRevision).toBe(shape.successor);
+    expect(
+      registry.getTaskRecord(shape.taskId)?.status,
+      'an unaudited successor must not inherit the predecessor PASS lifecycle',
+    ).toBe('implementing');
+    const after = registry.listAssignments(shape.taskId).find((a) => a.role === 'implementer');
+    expect(after?.status, 'the predecessor implementer must be demoted').toBe('implementing');
+    expect(after?.verdict, 'the predecessor PASS must not survive the successor').toBeUndefined();
+  });
+
+  // The predecessor-PASS isolation EFFECT must be identical for both shapes.
+  for (const shapeName of ['one-call', 'two-call'] as const) {
+    it(`(${shapeName}) produces the same predecessor-PASS revocation`, () => {
+      const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+      const shape = prepareCatchUpShape(registry, `equiv-${shapeName}`);
+      expect(registry.getTaskRecord(shape.taskId)).toMatchObject({
+        status: 'ready_for_integration', currentRevision: shape.older,
+      });
+
+      if (shapeName === 'two-call') {
+        expect(registry.updateAssignment({
+          assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+          auditRevision: shape.successor,
+        })).toMatchObject({ ok: true });
+      }
+      expect(registry.updateAssignment({
+        assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+        revision: shape.successor, auditRevision: shape.successor,
+      })).toMatchObject({ ok: true });
+
+      // Identical post-state whichever shape got here.
+      const task = registry.getTaskRecord(shape.taskId);
+      expect(task?.currentRevision).toBe(shape.successor);
+      expect(task?.status).toBe('implementing');
+      const predecessor = registry.listAssignments(shape.taskId)
+        .find((a) => a.role === 'implementer');
+      expect(predecessor?.status).toBe('implementing');
+      expect(predecessor?.verdict).toBeUndefined();
+      expect(predecessor?.crossVendorAuditPassed).toBeUndefined();
+      // The predecessor's own audit history is retired, not rewritten.
+      expect(predecessor?.auditRevision).toBe(shape.older);
+    });
+  }
+
+  // R7 (Cx R6 P1): the unified successor effects cleared verdict and
+  // crossVendorAuditPassed but NOT the revision-scoped primaryReviewPassed. An
+  // economy implementer therefore carried its R3 primary review across the
+  // R3->R4 boundary, so supplying only a fresh R4 cross-vendor receipt satisfied
+  // mayFinalizeEconomyAssignment and reached ready_for_integration -- an old
+  // primary review authorizing unaudited successor bytes.
+  for (const shapeName of ['one-call', 'two-call'] as const) {
+    it(`(${shapeName}) clears the economy primary review when the revision moves to a successor`, () => {
+      const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+      const taskId = `economy-primary-${shapeName}`;
+      const older = `${taskId}-r3`;
+      const successor = `${taskId}-r4`;
+      const workerIdentity = identity(`deck_${taskId}_worker`);
+
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'economy primary review is revision scoped', currentRevision: older,
+      })).toMatchObject({ ok: true });
+      const economyBinding = {
+        ...persistedExecutionBinding(`deck_${taskId}_worker`),
+        pool: 'economy' as const,
+      };
+      const worker = registry.createAssignment({
+        assignmentId: `${taskId}-impl`, taskId, role: 'implementer',
+        identity: workerIdentity, scopeFiles: ['src/a.ts'], auditRevision: older,
+        executionBinding: economyBinding,
+      });
+      if (!worker.ok) throw new Error('economy fixture failed');
+      expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      // The R3 round: an economy implementer that earned BOTH reviews.
+      expect(registry.updateAssignment({
+        assignmentId: worker.value.assignmentId, identity: workerIdentity,
+        status: 'implementing', primaryReviewPassed: true,
+      })).toMatchObject({ ok: true });
+      expect(registry.getAssignment(worker.value.assignmentId)?.primaryReviewPassed).toBe(true);
+
+      // Move the task revision onto the unaudited successor.
+      if (shapeName === 'two-call') {
+        expect(registry.updateAssignment({
+          assignmentId: worker.value.assignmentId, identity: workerIdentity, auditRevision: successor,
+        })).toMatchObject({ ok: true });
+      }
+      expect(registry.updateAssignment({
+        assignmentId: worker.value.assignmentId, identity: workerIdentity,
+        revision: successor, auditRevision: successor,
+      })).toMatchObject({ ok: true });
+
+      const after = registry.getAssignment(worker.value.assignmentId);
+      expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(successor);
+      expect(
+        after?.primaryReviewPassed,
+        'an R3 primary review must not survive onto the R4 successor',
+      ).not.toBe(true);
+      // Terminal-state equivalence across both shapes.
+      expect(after?.status).toBe('implementing');
+      expect(after?.verdict).toBeUndefined();
+      expect(after?.crossVendorAuditPassed).toBeUndefined();
+      // The predecessor revision itself is retired, never rewritten.
+      expect(after?.auditRevision).toBe(successor);
+      registry.close();
+    });
+  }
+
+  it('clears the economy primary review on a PARKED predecessor implementer too', () => {
+    // Distinct from the caller-record case: here the owner moving the revision
+    // is a different assignment, and the economy implementer is parked at
+    // ready_for_integration on the predecessor. Without this the demotion loop's
+    // own clearing is unverified -- a mutant that drops it passes.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const shape = prepareCatchUpShape(registry, 'economy-parked');
+    const parked = registry.listAssignments(shape.taskId).find((a) => a.role === 'implementer');
+    expect(parked?.status, 'the fixture must park an implementer on the predecessor')
+      .toBe('ready_for_integration');
+
+    // Give that parked predecessor an economy primary review for the old revision.
+    expect(registry.updateAssignment({
+      assignmentId: parked!.assignmentId, identity: parked!.identity,
+      primaryReviewPassed: true,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(parked!.assignmentId)?.primaryReviewPassed).toBe(true);
+
+    // A DIFFERENT assignment (the pointer owner) moves the task revision.
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
+      revision: shape.successor, auditRevision: shape.successor,
+    })).toMatchObject({ ok: true });
+
+    const after = registry.getAssignment(parked!.assignmentId);
+    expect(after?.status, 'the parked predecessor must be demoted').toBe('implementing');
+    expect(
+      after?.primaryReviewPassed,
+      'a parked predecessor must not keep its primary review across the boundary',
+    ).not.toBe(true);
+    expect(after?.verdict).toBeUndefined();
+    // Its own audit history is retired, not rewritten.
+    expect(after?.auditRevision).toBe(shape.older);
+    registry.close();
+  });
+
+  it('refuses a revision catch-up on a blocked task', () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'catchup-blocked';
+    const ownerIdentity = identity(`deck_${taskId}_owner`);
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'blocked tasks refuse catch-up', currentRevision: 'blk-r1',
+    })).toMatchObject({ ok: true });
+    const owner = registry.createAssignment({
+      assignmentId: `${taskId}-owner`, taskId, role: 'integration_owner',
+      identity: ownerIdentity, auditRevision: 'blk-r1',
+    });
+    if (!owner.ok) throw new Error('fixture failed');
+    expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity, auditRevision: 'blk-r2',
+    })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'blocked' })).toMatchObject({ ok: true });
+
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: ownerIdentity,
+      revision: 'blk-r2', auditRevision: 'blk-r2',
+    }), 'a blocked task must refuse the catch-up').toMatchObject({ ok: false });
+    expect(registry.getTaskRecord(taskId)?.currentRevision).toBe('blk-r1');
+  });
+
+  it('still fails closed on Git authority and foreign identity during a revision catch-up', () => {
+    // The catch-up exemption must move the task revision ONTO the successor the
+    // assignment already carries, and nothing else.
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const identityOf = (taskId: string) => identity(`deck_${taskId}_owner`);
+
+    const build = (taskId: string, current: string, bound: string) => {
+      const ownerIdentity = identityOf(taskId);
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'fail-closed boundary', currentRevision: current,
+      })).toMatchObject({ ok: true });
+      const owner = registry.createAssignment({
+        assignmentId: `${taskId}-owner`, taskId, role: 'integration_owner',
+        identity: ownerIdentity, auditRevision: current,
+      });
+      if (!owner.ok) throw new Error('fixture failed');
+      expect(registry.updateTask({ taskId, status: 'delegated' })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId, identity: ownerIdentity, status: 'implementing',
+      })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId, identity: ownerIdentity, auditRevision: bound,
+      })).toMatchObject({ ok: true });
+      return { owner: owner.value, ownerIdentity };
+    };
+
+    // Git authority already exists -> the revision must never be rewritten.
+    const git = build('catchup-git-authority', 'rev-r3', 'rev-r4');
+    expect(registry.updateTask({
+      taskId: 'catchup-git-authority', commitSha: 'a'.repeat(40),
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: git.owner.assignmentId, identity: git.ownerIdentity,
+      revision: 'rev-r4', auditRevision: 'rev-r4',
+    }), 'a task carrying Git authority must fail closed').toMatchObject({
+      ok: false, reason: 'invalid_transition',
+    });
+    expect(registry.getTaskRecord('catchup-git-authority')?.currentRevision).toBe('rev-r3');
+
+    // A foreign identity must never drive the catch-up.
+    const foreign = build('catchup-foreign', 'rev-r3', 'rev-r4');
+    expect(registry.updateAssignment({
+      assignmentId: foreign.owner.assignmentId, identity: identity('deck_other_project_owner'),
+      revision: 'rev-r4', auditRevision: 'rev-r4',
+    }), 'a foreign identity must be refused').toMatchObject({ ok: false });
+    expect(registry.getTaskRecord('catchup-foreign')?.currentRevision).toBe('rev-r3');
+
+    registry.close();
+    database.close();
+  });
+
   it('keeps the ordinary task-and-implementer REWORK finalized-successor recovery path', () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });

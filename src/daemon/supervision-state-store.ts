@@ -2008,6 +2008,22 @@ export class SupervisionTaskRegistry {
       && Boolean(existing.auditRevision)
       && requestedRevision !== existing.auditRevision
       && (existing.status === 'implementing' || existing.status === 'rework');
+    // The owner is ALREADY on the successor -- an auditRevision-only update
+    // binds it successfully -- while task.currentRevision still lags. By
+    // construction bindsSuccessorRevision is false here (it requires the
+    // requested revision to DIFFER from the stored one), so without this the
+    // identical successor was refused as `old_revision` and the task revision
+    // could never catch up: the same object deadlocked with the assignment on
+    // R(n+1) and the task stuck on R(n). Same fail-closed boundary as a
+    // successor bind; it only lets the task revision converge onto the
+    // successor the assignment already carries.
+    const completesSuccessorRevision = existing.role !== 'auditor'
+      && Boolean(requestedRevision)
+      && Boolean(existing.auditRevision)
+      && requestedRevision === existing.auditRevision
+      && (existing.status === 'implementing' || existing.status === 'rework')
+      && Boolean(task.currentRevision)
+      && task.currentRevision !== requestedRevision;
     if (!isNewAuditAfterRework && !bindsSuccessorRevision
       && requestedRevision && existing.auditRevision && requestedRevision !== existing.auditRevision) {
       return {
@@ -2027,7 +2043,60 @@ export class SupervisionTaskRegistry {
     // Anything outside that set makes the bind FAIL rather than be cancelled
     // silently -- a passed audit is authority, not noise.
     const supersededAuditors: PersistedSupervisionTaskAssignment[] = [];
-    if (bindsSuccessorRevision) {
+    // ONE successor boundary for BOTH shapes.
+    //
+    // R1-R4 each guarded only the two-step catch-up
+    // (completesSuccessorRevision), so a single
+    // updateAssignment({revision, auditRevision}) took the
+    // bindsSuccessorRevision path and skipped every gate. The property being
+    // protected is not "which shape produced this write" but "this write moves
+    // the TASK revision onto a successor", so it is defined once here and
+    // applied to both.
+    //
+    // An integration_task is exempt because it keeps its combined revision with
+    // the integration handoff: an assignment-only lineage bind there does not
+    // move the task revision and needs no pointer authority.
+    const movesTaskRevisionToSuccessor = (bindsSuccessorRevision || completesSuccessorRevision)
+      && task.classification !== 'integration_task'
+      && Boolean(requestedRevision)
+      && Boolean(task.currentRevision)
+      && task.currentRevision !== requestedRevision;
+    if (movesTaskRevisionToSuccessor) {
+      const rejectDetail = { taskStatus: task.status, assignmentStatus: existing.status };
+      // 1. Implementation role is a PRECONDITION of authority, not a substitute:
+      //    a coordinator is an observer/orchestrator and owns none.
+      if (existing.role !== 'implementer' && existing.role !== 'integration_owner') {
+        return { ok: false, reason: 'role_forbidden', detail: rejectDetail };
+      }
+      // 2. Pointer / required authority.
+      if (task.integrationOwnerAssignmentId) {
+        if (task.integrationOwnerAssignmentId !== existing.assignmentId) {
+          return { ok: false, reason: 'owner_mismatch', detail: rejectDetail };
+        }
+      } else if (!existing.required) {
+        return { ok: false, reason: 'owner_mismatch', detail: rejectDetail };
+      }
+      // 3. Terminal and Git authority: never rewrite a revision the task has
+      //    already committed to, and never move one that is blocked/cancelled.
+      if (['blocked', 'cancelled'].includes(task.status)) {
+        return { ok: false, reason: 'invalid_transition', detail: rejectDetail };
+      }
+      if (task.finalization || task.commitSha
+        || ['committed', 'pushed', 'finalized'].includes(task.status)) {
+        return { ok: false, reason: 'invalid_transition', detail: rejectDetail };
+      }
+      // 4. Downgrade, decided from existing object relations: the requested
+      //    revision already carries accepted audit authority, so the task has
+      //    moved past it.
+      if (this.#revisionHasAcceptedAudit(existing.taskId, requestedRevision!)) {
+        return {
+          ok: false,
+          reason: 'old_revision',
+          detail: { ...rejectDetail, expectedRevision: task.currentRevision, actualRevision: requestedRevision },
+        };
+      }
+    }
+    if (bindsSuccessorRevision || completesSuccessorRevision) {
       if (task.finalization || task.commitSha
         || ['committed', 'pushed', 'finalized'].includes(task.status)) {
         return {
@@ -2041,6 +2110,9 @@ export class SupervisionTaskRegistry {
           },
         };
       }
+      if (!bindsSuccessorRevision) {
+        // Nothing is superseded: the assignment revision is unchanged.
+      } else {
       const selection = this.#selectSupersedableAuditors({
         taskId: existing.taskId,
         taskStatus: task.status,
@@ -2049,6 +2121,7 @@ export class SupervisionTaskRegistry {
       });
       if (!selection.ok) return selection;
       supersededAuditors.push(...selection.superseded);
+      }
     }
     const bindsImplementationRevision = existing.role !== 'auditor' && Boolean(requestedRevision);
     // A slice/top-level implementer owns the task revision directly. An
@@ -2071,6 +2144,7 @@ export class SupervisionTaskRegistry {
     const taskRevisionConflicts = (currentRevision: string | undefined): boolean => (
       bindsTaskRevision
       && !bindsSuccessorRevision
+      && !completesSuccessorRevision
       && Boolean(currentRevision)
       && currentRevision !== requestedRevision
     );
@@ -2091,8 +2165,16 @@ export class SupervisionTaskRegistry {
       externalRunId: normalizeTaskString(input.externalRunId) ?? existing.externalRunId,
       externalHeadSha: normalizeTaskString(input.externalHeadSha) ?? existing.externalHeadSha,
       externalTaskId: normalizeTaskString(input.externalTaskId) ?? existing.externalTaskId,
-      primaryReviewPassed: input.primaryReviewPassed ?? existing.primaryReviewPassed,
-      crossVendorAuditPassed: input.crossVendorAuditPassed ?? existing.crossVendorAuditPassed,
+      // Revision-scoped reviews do not cross a successor boundary on the
+      // CALLER's own record either. The demotion loop below only retires OTHER
+      // parked implementers, so without this an economy owner kept its own
+      // predecessor primary review and a single fresh cross-vendor receipt was
+      // enough to reach ready_for_integration on unaudited bytes. An explicitly
+      // supplied value still wins: this clears inheritance, not new evidence.
+      primaryReviewPassed: input.primaryReviewPassed
+        ?? (movesTaskRevisionToSuccessor ? undefined : existing.primaryReviewPassed),
+      crossVendorAuditPassed: input.crossVendorAuditPassed
+        ?? (movesTaskRevisionToSuccessor ? undefined : existing.crossVendorAuditPassed),
       auditRoutingReason: input.auditRoutingReason ?? existing.auditRoutingReason,
       updatedAt: now,
     };
@@ -2108,7 +2190,49 @@ export class SupervisionTaskRegistry {
           return { ok: false, reason: lockedTask ? 'old_revision' : 'not_found' };
         }
         if (lockedTask.currentRevision !== requestedRevision) {
-          this.#writeTask({ ...lockedTask, currentRevision: requestedRevision, updatedAt: now }, this.#taskEventFor(lockedTask.status), {
+          // The predecessor's integration-ready projection was earned by an
+          // audit of DIFFERENT bytes. #deriveTaskStatus rebuilds the task status
+          // from the required implementers, so demoting the task row alone would
+          // be re-asserted immediately: the PROJECTION itself has to be revoked.
+          // Every required implementer still parked on the predecessor revision
+          // is returned to `implementing` and loses the PASS it earned against
+          // those other bytes, in this same transaction.
+          //
+          // Applied to EVERY movesTaskRevisionToSuccessor write, not per shape:
+          // R5 unified the guards but left this EFFECT on the catch-up branch, so
+          // a one-call bind advanced the revision while the predecessor kept its
+          // PASS and the task kept ready_for_integration.
+          if (movesTaskRevisionToSuccessor) {
+            for (const candidate of this.listAssignments(existing.taskId)) {
+              if (candidate.role !== 'implementer' || !candidate.required) continue;
+              if (candidate.status !== 'ready_for_integration' && candidate.status !== 'passed') continue;
+              if (candidate.auditRevision !== lockedTask.currentRevision) continue;
+              this.#writeAssignment({
+                ...candidate,
+                status: 'implementing',
+                verdict: undefined,
+                crossVendorAuditPassed: undefined,
+                // primaryReviewPassed is revision-scoped too. Leaving it set let
+                // an economy implementer carry its predecessor primary review
+                // across the boundary, so a single fresh cross-vendor receipt
+                // satisfied mayFinalizeEconomyAssignment and reached
+                // ready_for_integration on unaudited successor bytes.
+                primaryReviewPassed: undefined,
+                updatedAt: now,
+              }, 'implementing', {
+                source: 'successor_revision_boundary',
+                supersededRevision: lockedTask.currentRevision,
+                successorRevision: requestedRevision,
+              });
+            }
+          }
+          // Same write: the revision moves AND the lifecycle drops out of the
+          // predecessor's integration-ready projection. This is deliberately
+          // scoped to this authorized catch-up transaction -- the shared
+          // transition table is NOT widened, so an ordinary updateTask still
+          // cannot walk ready_for_integration back to implementing.
+          const catchUpStatus = movesTaskRevisionToSuccessor ? 'implementing' as const : lockedTask.status;
+          this.#writeTask({ ...lockedTask, status: catchUpStatus, currentRevision: requestedRevision, updatedAt: now }, this.#taskEventFor(catchUpStatus), {
             source: 'assignment_update',
             assignmentId: existing.assignmentId,
             revisionBound: true,
@@ -3035,6 +3159,26 @@ export class SupervisionTaskRegistry {
    * auditor: a stale in-progress audit of a superseded revision is exactly what
    * has to be retired, otherwise the task wedges with no operator escape.
    */
+  /**
+   * Existing object relations decide whether a revision has already been
+   * audited: a final receipt or an attestation for that exact revision. This is
+   * what makes a downgrade decidable without inventing an ordering over
+   * hash-suffixed revision ids -- moving the task back onto a revision that
+   * already carries accepted audit authority is never a catch-up.
+   */
+  #revisionHasAcceptedAudit(taskId: string, revision: string): boolean {
+    const receipt = this.#db.prepare(`
+      SELECT 1 AS ok FROM supervision_audit_receipts
+      WHERE task_id = ? AND revision = ? AND receipt_kind = 'final' LIMIT 1
+    `).get(taskId, revision) as { ok?: number } | undefined;
+    if (receipt?.ok === 1) return true;
+    const attestation = this.#db.prepare(`
+      SELECT 1 AS ok FROM supervision_audit_attestations
+      WHERE task_id = ? AND revision = ? LIMIT 1
+    `).get(taskId, revision) as { ok?: number } | undefined;
+    return attestation?.ok === 1;
+  }
+
   #selectSupersedableAuditors(input: {
     taskId: string;
     taskStatus: string;
