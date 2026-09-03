@@ -15,6 +15,9 @@ import {
   clearSendIdempotencyCacheForTests,
   dispatchReadyAudit,
   dispatchReadyAuditSweep,
+  runSupervisionConvergenceTick,
+  legacyExplicitAuditRecoveryAttempt,
+  __resetSupervisionConvergenceTickForTests,
   dispatchSendMessage,
   type SendMessageInput,
   type SendRuntimeCaller,
@@ -1088,5 +1091,371 @@ describe('automatic supervision audit materialization', () => {
     });
     expect(dispatch).toHaveBeenCalledTimes(3); // two deterministic provision attempts; one deduped blocker delivery
     expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([]);
+  });
+});
+
+describe('periodic supervision convergence tick', () => {
+  /**
+   * CC8 tsk_569 / CC9 tsk_5gi shape: the task is durably ready_for_audit with a
+   * clear lease, but the only auditor on record is a finalized REWORK from an
+   * OLDER revision. A boot-only sweep leaves this stranded forever while the
+   * implementer keeps receiving meaningless heartbeats.
+   */
+  function staleReworkAuditor(registry: SupervisionTaskRegistry, taskId: string, staleRevision: string) {
+    const stale = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_stale_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: automaticAttempt(taskId, staleRevision),
+      auditRevision: staleRevision,
+    });
+    if (!stale.ok) throw new Error(stale.reason);
+    // The real shape is a CLOSED auditor from the previous revision: it carries
+    // a REWORK verdict and is finalized, so it neither blocks a new auditor nor
+    // satisfies the current revision.
+    for (const status of ['auditing', 'rework'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: stale.value.assignmentId,
+        identity: stale.value.identity,
+        status,
+        auditAttemptId: automaticAttempt(taskId, staleRevision),
+        auditRevision: staleRevision,
+        ...(status === 'rework' ? { verdict: 'REWORK' } : {}),
+      } as never), `stale auditor -> ${status}`).toMatchObject({ ok: true });
+    }
+    expect(registry.finishAssignment({
+      assignmentId: stale.value.assignmentId,
+      identity: stale.value.identity,
+      revision: staleRevision,
+    })).toMatchObject({ ok: true });
+    return registry.getAssignment(stale.value.assignmentId)!;
+  }
+
+  it('dispatches a ready_for_audit task from the periodic tick, not only the boot sweep', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    staleReworkAuditor(registry, taskId, `${revision}-older`);
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidence = false;
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId,
+        auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000000' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId: created.value.assignmentId,
+      };
+    });
+    const deps = {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => evidence,
+    };
+
+    const first = await runSupervisionConvergenceTick(deps);
+
+    expect(first.audits).toEqual([
+      expect.objectContaining({ status: 'dispatched', attemptId: automaticAttempt(taskId, revision) }),
+    ]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays idempotent across repeated ticks and never reuses the older revision attempt', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });
+    const staleRevision = `${revision}-older`;
+    staleReworkAuditor(registry, taskId, staleRevision);
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidence = false;
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId,
+        auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000000' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId: created.value.assignmentId,
+      };
+    });
+    const deps = {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => evidence,
+    };
+
+    await runSupervisionConvergenceTick(deps);
+    const second = await runSupervisionConvergenceTick(deps);
+
+    expect(second.audits).toEqual([expect.objectContaining({ status: 'replayed' })]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    // The stale REWORK attempt must never be reused for the current revision.
+    const dispatched = dispatch.mock.calls[0]![1].audit!.attemptId;
+    expect(dispatched).toBe(automaticAttempt(taskId, revision));
+    expect(dispatched).not.toBe(automaticAttempt(taskId, staleRevision));
+  });
+
+  it('never mints or dispatches an auditor for a task without an audit policy', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId } = makeReadyTask();
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    const dispatch = vi.fn(async () => { throw new Error('must not dispatch without a policy'); });
+    const deps = {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!),
+      dispatch: dispatch as never,
+      hasDeliveryEvidence: () => false,
+    };
+
+    const result = await runSupervisionConvergenceTick(deps);
+
+    expect(result.audits).toEqual([]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+  });
+
+  it('is re-entrancy guarded so overlapping ticks cannot double dispatch', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidence = false;
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId,
+        auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000000' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId: created.value.assignmentId,
+      };
+    });
+    const deps = {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => evidence,
+    };
+
+    const [a, b] = await Promise.all([
+      runSupervisionConvergenceTick(deps),
+      runSupervisionConvergenceTick(deps),
+    ]);
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect([a.skipped, b.skipped].filter(Boolean)).toHaveLength(1);
+  });
+});
+
+describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
+  const LEGACY_ATTEMPT = 'remote-desktop-media-stall-audit-20260903-r5-532fc509';
+
+  /**
+   * Exactly tsk_569: ready_for_audit at r5.532fc509, task has NO auditPolicy,
+   * one required implementer already bound to that revision AND carrying an
+   * explicit human-minted attempt, and only an older finalized REWORK auditor.
+   * The explicit attempt is a pre-existing audit intent; a missing task-level
+   * policy must not strand it forever.
+   */
+  function legacyShape(options: { attemptId?: string | null; implementerRevision?: string } = {}) {
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const taskId = 'tsk_569';
+    const revision = 'r5.532fc509';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'legacy explicit audit', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', identity: identity('deck_alpha_brain'), required: false,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
+      scopeFiles: ['src/exact.ts'],
+      auditRevision: options.implementerRevision ?? revision,
+      ...(options.attemptId === null ? {} : { auditAttemptId: options.attemptId ?? LEGACY_ATTEMPT }),
+    } as never);
+    if (!worker.ok) throw new Error(worker.reason);
+    for (const [intent, toStatus] of [
+      ['start', 'implementing'], ['record_validation', 'validated'], ['open_audit', 'ready_for_audit'],
+    ] as const) {
+      registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent,
+        ...(intent === 'record_validation' ? { validationState: 'passed' } : {}),
+        identity: worker.value.identity, toStatus,
+      } as never);
+    }
+    return { registry, taskId, revision, worker: worker.value };
+  }
+
+  it('recovers the EXISTING explicit attempt rather than minting a canonical one', () => {
+    const { registry, taskId, revision } = legacyShape();
+    expect(registry.getTaskRecord(taskId)!.auditPolicy ?? null).toBeNull();
+
+    const recovered = legacyExplicitAuditRecoveryAttempt(registry.get(taskId)!, registry);
+
+    expect(recovered).toBe(LEGACY_ATTEMPT);
+    // It must NEVER be replaced by the canonical auto attempt.
+    expect(recovered).not.toBe(automaticAttempt(taskId, revision));
+  });
+
+  it('does not recover a task that has neither a policy nor an existing attempt', () => {
+    const { registry, taskId } = legacyShape({ attemptId: null });
+
+    expect(legacyExplicitAuditRecoveryAttempt(registry.get(taskId)!, registry)).toBeUndefined();
+  });
+
+  it('fails closed when the implementer attempt belongs to an older revision', () => {
+    const { registry, taskId } = legacyShape({ implementerRevision: 'r4.older' });
+
+    expect(legacyExplicitAuditRecoveryAttempt(registry.get(taskId)!, registry)).toBeUndefined();
+  });
+
+  it('fails closed when more than one required implementer could own the attempt', () => {
+    const { registry, taskId, revision } = legacyShape();
+    const second = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_second'),
+      scopeFiles: ['src/other.ts'], auditRevision: revision, auditAttemptId: 'another-attempt',
+    } as never);
+    if (!second.ok) throw new Error(second.reason);
+
+    expect(legacyExplicitAuditRecoveryAttempt(registry.get(taskId)!, registry)).toBeUndefined();
+  });
+
+  it('stops recovering once a live auditor already exists for the same revision', () => {
+    const { registry, taskId, revision } = legacyShape();
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false, identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: LEGACY_ATTEMPT, auditRevision: revision,
+    } as never);
+    if (!auditor.ok) throw new Error(auditor.reason);
+
+    // Restart/replay must be a no-op, not a second materialization.
+    expect(legacyExplicitAuditRecoveryAttempt(registry.get(taskId)!, registry)).toBeUndefined();
+  });
+
+  it('routes the recovered attempt through the periodic tick, never a canonical one', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = legacyShape();
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidence = false;
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId,
+        auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000000' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId: created.value.assignmentId,
+      };
+    });
+    const deps = {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => evidence,
+    };
+
+    const first = await runSupervisionConvergenceTick(deps);
+    const second = await runSupervisionConvergenceTick(deps);
+
+    // The pre-existing human attempt is routed as-is; no canonical attempt and
+    // no auditPolicy is ever written to the task.
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls[0]![1].audit!.attemptId).toBe(LEGACY_ATTEMPT);
+    expect(dispatch.mock.calls[0]![1].audit!.attemptId).not.toBe(automaticAttempt(taskId, revision));
+    expect(registry.getTaskRecord(taskId)!.auditPolicy ?? null).toBeNull();
+    expect(first.audits.concat(second.audits).some((a) => a.status === 'dispatched')).toBe(true);
+    // Replay is a no-op, not a second auditor.
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toHaveLength(1);
+  });
+
+  it('is stable across a restart: the same attempt is recovered, never a new one', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'legacy-audit-'));
+    const dbPath = join(dir, 'state.sqlite');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      const taskId = 'tsk_569';
+      const revision = 'r5.532fc509';
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'legacy explicit audit', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const worker = registry.createAssignment({
+        taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
+        scopeFiles: ['src/exact.ts'], auditRevision: revision, auditAttemptId: LEGACY_ATTEMPT,
+      } as never);
+      if (!worker.ok) throw new Error(worker.reason);
+      for (const [intent, toStatus] of [
+        ['start', 'implementing'], ['record_validation', 'validated'], ['open_audit', 'ready_for_audit'],
+      ] as const) {
+        registry.applyTaskIntent({
+          taskId, assignmentId: worker.value.assignmentId, intent,
+          ...(intent === 'record_validation' ? { validationState: 'passed' } : {}),
+          identity: worker.value.identity, toStatus,
+        } as never);
+      }
+      const first = legacyExplicitAuditRecoveryAttempt(registry.get(taskId)!, registry);
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const second = legacyExplicitAuditRecoveryAttempt(registry.get(taskId)!, registry);
+
+      expect(first).toBe(LEGACY_ATTEMPT);
+      expect(second).toBe(first);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

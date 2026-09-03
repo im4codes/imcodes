@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { SupervisionAutomationPoolGateReason } from '../../shared/supervision-execution-pool.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
+import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
 import { validateBrainAuditRoute } from './peer-audit-candidates.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
@@ -143,6 +144,12 @@ const SUPERVISION_COMPLETE_LABEL = 'Supervised: task looks complete.';
 const SUPERVISION_CONTINUE_LABEL = 'Supervised: sent a continue prompt.';
 const SUPERVISION_FINALIZING_LABEL = 'Supervised: audit passed; running post-audit finalization.';
 const SUPERVISION_NEEDS_INPUT_LABEL = 'Supervised: returned control to you.';
+
+/** Trimmed blocker text, or undefined when the assignment has no live blocker. */
+function normalizeBlockerText(value: string | null | undefined): string | undefined {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  return trimmed ? trimmed : undefined;
+}
 const SUPERVISION_AUDIT_PASS_LABEL = 'Supervised: audit passed.';
 const SUPERVISION_REWORK_LABEL = 'Supervised: audit requested rework; brief sent.';
 const SUPERVISION_BLOCKED_LABEL = 'Supervised: stopped because the session is blocked.';
@@ -1038,10 +1045,37 @@ class SupervisionAutomation {
     } catch (error) {
       logger.warn({ err: error }, 'Bounded supervision housekeeping tick failed');
     }
+    // Forward convergence rides this same bounded tick. A boot-only sweep
+    // cannot close a window that opens later: a task can reach ready_for_audit,
+    // or a parent can consume a slice's delivery evidence, at any time.
+    // Convergence is called directly (the registry is already in hand) so it
+    // cannot be silently skipped if the send path fails to load.
+    try {
+      registry.convergeLifecycle(now, {
+        // Production wiring: a stale coordinator epoch is repaired against the
+        // daemon's own live session registry, with no model or heartbeat.
+        resolveAuthoritativeBrain: (projectName) => resolveAuthoritativeBrainIdentity(projectName),
+      });
+    } catch (error) {
+      logger.warn({ err: error }, 'Supervision lifecycle convergence failed');
+    }
+    // The audit re-dispatch needs the send path, which is loaded lazily to keep
+    // this module free of a static send-tool dependency. It is itself
+    // re-entrancy guarded, so a slow dispatch never overlaps the next tick.
+    void import('./send-tool.js')
+      .then(({ runSupervisionConvergenceTick }) => runSupervisionConvergenceTick())
+      .catch((error) => {
+        logger.warn({ err: error }, 'Supervision audit re-dispatch tick failed');
+      });
     for (const task of registry.list()) {
       const events = registry.listEvents(task.taskId);
       for (const assignment of task.assignments) {
         if (assignment.role !== 'implementer' || assignment.status !== 'implementing') continue;
+        // A durable blocker is already the visible, actionable state. The
+        // worker has no authority to clear it, so another heartbeat cannot
+        // produce progress -- it only burns quota and hides the blocker behind
+        // reminder noise. Leave the single blocker standing instead.
+        if (normalizeBlockerText(assignment.blocker)) continue;
         const assignmentEvents = events.filter((event) => event.assignmentId === assignment.assignmentId);
         const progressAt = Math.max(
           assignment.updatedAt,

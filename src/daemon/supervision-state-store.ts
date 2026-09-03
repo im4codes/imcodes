@@ -8,6 +8,7 @@ import { SUPERVISION_ID_PREFIXES } from '../../shared/supervision-durable-identi
 
 import {
   canTransitionSupervisionTaskStatus,
+  isTerminalSupervisionTaskStatus,
   isSupervisionTaskVisibleByDefault,
   isSupervisionTaskClassification,
   isSupervisionTaskAuditPolicy,
@@ -461,6 +462,83 @@ export interface PersistedSupervisionTaskFileEvent {
   identity: PersistedSupervisionTaskAssignmentIdentity;
   createdAt: number;
 }
+
+/** One same-object forward step taken by {@link SupervisionTaskRegistry.convergeLifecycle}. */
+/** Why a receipt may not bind to an auditor. */
+export type SupervisionAuditReceiptAuthorityRejection =
+  'not_found' | 'owner_mismatch' | 'old_audit_attempt' | 'old_revision' | 'invalid';
+
+/**
+ * THE authority rule for binding an audit receipt to an auditor.
+ *
+ * This is a pure predicate on purpose: `appendMatchingAuditReceipt` evaluates
+ * it once before opening the write transaction and again on the locked rows
+ * inside it, so the TOCTOU defence is preserved while the rule itself exists in
+ * exactly one place. Relaxing any single clause here is therefore observable
+ * from the real entry point rather than silently covered by a duplicate check.
+ *
+ * It binds, together: the auditor identity, the assignment, the attempt, the
+ * revision (against BOTH the auditor and the task), and — for a final receipt —
+ * a PASS/REWORK verdict.
+ */
+export function evaluateAuditReceiptAuthority(input: {
+  task: Pick<PersistedSupervisionTaskRecord, 'taskId' | 'currentRevision'> | undefined;
+  audit: Pick<PersistedSupervisionTaskAssignment,
+    'taskId' | 'assignmentId' | 'role' | 'identity' | 'auditAttemptId' | 'auditRevision'> | undefined;
+  taskId: string;
+  assignmentId: string;
+  attemptId: string;
+  revision: string;
+  receiptKind: PeerAuditReceiptKind;
+  verdict?: PeerAuditVerdict;
+  auditorIdentity: PersistedSupervisionTaskAssignmentIdentity;
+  auditorSessionName: string;
+}): { ok: true } | { ok: false; reason: SupervisionAuditReceiptAuthorityRejection } {
+  const { task, audit } = input;
+  if (!task || !audit || audit.taskId !== input.taskId || audit.role !== 'auditor') {
+    return { ok: false, reason: 'not_found' };
+  }
+  if (audit.assignmentId !== input.assignmentId) return { ok: false, reason: 'not_found' };
+  if (!identityMatches(audit.identity, input.auditorIdentity)
+    || audit.identity.sessionName !== input.auditorSessionName) {
+    return { ok: false, reason: 'owner_mismatch' };
+  }
+  if (audit.auditAttemptId !== input.attemptId) return { ok: false, reason: 'old_audit_attempt' };
+  if (audit.auditRevision !== input.revision
+    || (task.currentRevision && task.currentRevision !== input.revision)) {
+    return { ok: false, reason: 'old_revision' };
+  }
+  if (input.receiptKind === 'final' && input.verdict !== 'PASS' && input.verdict !== 'REWORK') {
+    return { ok: false, reason: 'invalid' };
+  }
+  return { ok: true };
+}
+
+export interface SupervisionLifecycleConvergenceAction {
+  taskId: string;
+  assignmentId?: string;
+  action: 'retire_consumed_slice'
+    | 'align_revision_projection'
+    | 'project_validated_handoff'
+    | 'close_recorded_audit_receipt'
+    | 'rebind_stale_coordinator';
+}
+
+/** Runtime authority the registry cannot know by itself. */
+export interface SupervisionLifecycleConvergenceOptions {
+  limit?: number;
+  /**
+   * The daemon's CURRENT authoritative Brain for a project. Convergence only
+   * ever rebinds a coordinator onto this identity, and only when it is the same
+   * logical session (name + agent type + provider family) whose runtime epoch
+   * drifted. A same-named clone from another runtime family is refused.
+   */
+  resolveAuthoritativeBrain?: (projectName: string | null | undefined) =>
+    PersistedSupervisionTaskAssignmentIdentity | undefined;
+}
+
+/** Bounded default so one tick can never walk the whole registry. */
+export const SUPERVISION_LIFECYCLE_CONVERGENCE_LIMIT = 25;
 
 export interface SupervisionTaskCreateInput {
   /** Runtime-resolved caller project; never accepted from model metadata. */
@@ -3733,23 +3811,19 @@ export class SupervisionTaskRegistry {
     const validations = [...(input.validations ?? [])];
     if (!taskId || !assignmentId || !attemptId || !revision
       || (input.receiptKind !== 'progress' && input.receiptKind !== 'final')
-      || (input.receiptKind === 'final' && input.verdict !== 'PASS' && input.verdict !== 'REWORK')
       || (input.receiptKind === 'progress' && input.verdict !== undefined)) {
       return { ok: false, reason: 'invalid' };
     }
     const task = this.getTaskRecord(taskId);
     const audit = this.getAssignment(assignmentId);
-    if (!task || !audit || audit.taskId !== taskId || audit.role !== 'auditor') {
-      return { ok: false, reason: 'not_found' };
-    }
-    if (!identityMatches(audit.identity, input.auditorIdentity)
-      || audit.identity.sessionName !== input.auditorSessionName) {
-      return { ok: false, reason: 'owner_mismatch' };
-    }
-    if (audit.auditAttemptId !== attemptId) return { ok: false, reason: 'old_audit_attempt' };
-    if (audit.auditRevision !== revision || (task.currentRevision && task.currentRevision !== revision)) {
-      return { ok: false, reason: 'old_revision' };
-    }
+    const preAuthority = evaluateAuditReceiptAuthority({
+      task, audit, taskId, assignmentId, attemptId, revision,
+      receiptKind: input.receiptKind,
+      ...(input.verdict ? { verdict: input.verdict } : {}),
+      auditorIdentity: input.auditorIdentity,
+      auditorSessionName: input.auditorSessionName,
+    });
+    if (!preAuthority.ok) return { ok: false, reason: preAuthority.reason };
     const digest = auditReceiptDigest({
       taskId, assignmentId, attemptId, revision,
       receiptKind: input.receiptKind,
@@ -3770,19 +3844,16 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'not_found' };
       }
-      if (!identityMatches(lockedAudit.identity, input.auditorIdentity)
-        || lockedAudit.identity.sessionName !== input.auditorSessionName) {
+      const lockedAuthority = evaluateAuditReceiptAuthority({
+        task: lockedTask, audit: lockedAudit, taskId, assignmentId, attemptId, revision,
+        receiptKind: input.receiptKind,
+        ...(input.verdict ? { verdict: input.verdict } : {}),
+        auditorIdentity: input.auditorIdentity,
+        auditorSessionName: input.auditorSessionName,
+      });
+      if (!lockedAuthority.ok) {
         this.#db.exec('ROLLBACK');
-        return { ok: false, reason: 'owner_mismatch' };
-      }
-      if (lockedAudit.auditAttemptId !== attemptId) {
-        this.#db.exec('ROLLBACK');
-        return { ok: false, reason: 'old_audit_attempt' };
-      }
-      if (lockedAudit.auditRevision !== revision
-        || (lockedTask.currentRevision && lockedTask.currentRevision !== revision)) {
-        this.#db.exec('ROLLBACK');
-        return { ok: false, reason: 'old_revision' };
+        return { ok: false, reason: lockedAuthority.reason };
       }
       const existingDigest = this.#db.prepare(`
         SELECT receipt_id AS receiptId FROM supervision_audit_receipts
@@ -4479,6 +4550,236 @@ export class SupervisionTaskRegistry {
       source: 'admin_recovery', reason, status: input.toStatus,
     });
     return { ok: true, value: record };
+  }
+
+  /**
+   * Bounded, restart-idempotent forward convergence for facts that are already
+   * uniquely implied by durable authority.
+   *
+   * This deliberately invents nothing: it never mints a revision, verdict, CI
+   * result or Git evidence, never creates an assignment, and never advances a
+   * task whose next step is ambiguous. Every branch is same-object and routes
+   * through an existing atomic lifecycle path, so a crash between passes leaves
+   * the registry in a state a later pass simply re-derives (or skips).
+   */
+  convergeLifecycle(
+    now = Date.now(),
+    options: SupervisionLifecycleConvergenceOptions = {},
+  ): SupervisionLifecycleConvergenceAction[] {
+    const limit = Math.max(1, Math.trunc(options.limit ?? SUPERVISION_LIFECYCLE_CONVERGENCE_LIMIT));
+    const actions: SupervisionLifecycleConvergenceAction[] = [];
+    let scanned = 0;
+    for (const listed of this.list()) {
+      if (actions.length >= limit || scanned >= limit * 4) break;
+      scanned += 1;
+      const task = this.getTaskRecord(listed.taskId);
+      // A terminal task (pushed/finalized/blocked/cancelled) is never advanced:
+      // `blocked` in particular is an operator decision, not a derivable fact.
+      if (!task || isTerminalSupervisionTaskStatus(task.status)) continue;
+      const retired = this.#convergeConsumedIntegrationSlice(task, now);
+      if (retired) {
+        actions.push(retired);
+        continue;
+      }
+      // A record state is a projection of durable authority, never a gate the
+      // model must unlock in a fixed order. Each branch below closes a specific
+      // way a task can otherwise sit still forever.
+      for (const step of [
+        this.#convergeStaleCoordinator(task, now, options.resolveAuthoritativeBrain),
+        this.#convergeRevisionProjection(task, now),
+        this.#convergeValidatedHandoff(task, now),
+        this.#convergeRecordedAuditReceipt(task, now),
+      ]) {
+        if (step) actions.push(step);
+      }
+    }
+    return actions;
+  }
+
+  /**
+   * Retire an integration slice whose finalized parent already consumed this
+   * slice's exact delivery evidence (same externalRunId AND externalHeadSha).
+   * The slice cannot make further progress -- its work is already shipped -- so
+   * holding its lease only strands the file claims and keeps a worker awake.
+   *
+   * Fail-closed: it acts only when EXACTLY ONE implementer carries that
+   * evidence. Zero means the parent shipped something else; more than one means
+   * the authority is ambiguous and a human must decide.
+   */
+  /**
+   * Rebind a coordinator whose runtime epoch drifted (daemon restart) onto the
+   * SAME assignment. Authority is never transferred: the live Brain must be the
+   * same logical session name, agent type and provider family -- only the
+   * instance id and runtime epoch may differ. A same-named clone from another
+   * runtime family, or any other Brain, is refused.
+   */
+  #convergeStaleCoordinator(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+    resolve?: SupervisionLifecycleConvergenceOptions['resolveAuthoritativeBrain'],
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    if (!resolve) return undefined;
+    const live = resolve(task.projectName);
+    if (!live?.sessionName || !live.sessionInstanceId || !live.runtimeEpoch) return undefined;
+    const coordinators = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.role === 'coordinator'
+      && assignment.status !== 'cancelled'
+      && assignment.status !== 'finalized'
+    ));
+    if (coordinators.length !== 1) return undefined;
+    const coordinator = coordinators[0]!;
+    if (coordinator.identity.sessionName !== live.sessionName
+      || coordinator.identity.agentType !== live.agentType
+      || coordinator.identity.providerFamily !== live.providerFamily) return undefined;
+    if (coordinator.identity.sessionInstanceId === live.sessionInstanceId
+      && coordinator.identity.runtimeEpoch === live.runtimeEpoch) return undefined;
+    this.#writeAssignment({ ...coordinator, identity: { ...live }, updatedAt: now }, this.#taskEventFor(coordinator.status), {
+      source: 'lifecycle_convergence_coordinator_rebind',
+      previousRuntimeEpoch: coordinator.identity.runtimeEpoch,
+      runtimeEpoch: live.runtimeEpoch,
+    });
+    return { taskId: task.taskId, assignmentId: coordinator.assignmentId, action: 'rebind_stale_coordinator' };
+  }
+
+  /**
+   * Copy an already-authoritative revision to the side that is missing it. This
+   * mints nothing: it only projects a value that exists exactly once. Any
+   * disagreement between assignments is ambiguous authority and fails closed.
+   */
+  #convergeRevisionProjection(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const live = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.status !== 'cancelled' && assignment.status !== 'finalized'
+      && assignment.role !== 'coordinator'
+    ));
+    if (live.length === 0) return undefined;
+    const distinct = new Set(live
+      .map((assignment) => normalizeTaskString(assignment.auditRevision))
+      .filter((value): value is string => Boolean(value)));
+    if (distinct.size > 1) return undefined; // ambiguous: a human must decide
+    const taskRevision = normalizeTaskString(task.currentRevision);
+    const assignmentRevision = [...distinct][0];
+
+    if (taskRevision && !assignmentRevision) {
+      const missing = live.filter((assignment) => !normalizeTaskString(assignment.auditRevision));
+      if (missing.length !== 1) return undefined;
+      const target = missing[0]!;
+      this.#writeAssignment({ ...target, auditRevision: taskRevision, updatedAt: now }, this.#taskEventFor(target.status), {
+        source: 'lifecycle_convergence_revision_projection', revision: taskRevision, from: 'task',
+      });
+      return { taskId: task.taskId, assignmentId: target.assignmentId, action: 'align_revision_projection' };
+    }
+    if (!taskRevision && assignmentRevision) {
+      this.#writeTask({ ...task, currentRevision: assignmentRevision, updatedAt: now }, this.#taskEventFor(task.status), {
+        source: 'lifecycle_convergence_revision_projection', revision: assignmentRevision, from: 'assignment',
+      });
+      return { taskId: task.taskId, action: 'align_revision_projection' };
+    }
+    return undefined;
+  }
+
+  /**
+   * A recorded `validationState: passed` is the durable fact. Requiring the
+   * model to re-issue record_validation before anything may move is exactly the
+   * ordering gate that strands tasks, so project it forward instead.
+   */
+  #convergeValidatedHandoff(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const target = this.listAssignments(task.taskId).find((assignment) => (
+      assignment.role !== 'auditor'
+      && assignment.role !== 'coordinator'
+      && assignment.validationState === 'passed'
+      && canTransitionSupervisionTaskStatus(assignment.status, 'ready_for_audit')
+    ));
+    if (!target) return undefined;
+    // Passed validation is the durable fact; waiting for a separate open_audit
+    // call is the ordering gate that strands the object.
+    this.#writeAssignment({ ...target, status: 'ready_for_audit', updatedAt: now }, 'ready_for_audit', {
+      source: 'lifecycle_convergence_validated_handoff',
+    });
+    return { taskId: task.taskId, assignmentId: target.assignmentId, action: 'project_validated_handoff' };
+  }
+
+  /**
+   * An immutable final receipt that matches this auditor EXACTLY (assignment +
+   * attempt + revision) already carries the verdict. Close the auditor and free
+   * its lease instead of waiting for a finish call that may never arrive. A
+   * receipt from any other attempt or revision is ignored.
+   */
+  #convergeRecordedAuditReceipt(
+    task: PersistedSupervisionTaskRecord,
+    _now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const receipts = this.listAuditReceipts(task.taskId);
+    for (const auditor of this.listAssignments(task.taskId)) {
+      if (auditor.role !== 'auditor') continue;
+      if (auditor.status === 'finalized' || auditor.status === 'cancelled') continue;
+      const attemptId = normalizeTaskString(auditor.auditAttemptId);
+      const revision = normalizeTaskString(auditor.auditRevision);
+      if (!attemptId || !revision) continue;
+      const exact = receipts.filter((receipt) => (
+        receipt.assignmentId === auditor.assignmentId
+        && receipt.attemptId === attemptId
+        && receipt.revision === revision
+        && receipt.receiptKind === 'final'
+        && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
+      ));
+      if (exact.length !== 1) continue;
+      const closed = this.finishAssignment({
+        assignmentId: auditor.assignmentId,
+        identity: auditor.identity,
+        revision,
+      });
+      if (!closed.ok) continue;
+      return {
+        taskId: task.taskId,
+        assignmentId: auditor.assignmentId,
+        action: 'close_recorded_audit_receipt',
+      };
+    }
+    return undefined;
+  }
+
+  #convergeConsumedIntegrationSlice(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    if (task.classification !== 'integration_slice') return undefined;
+    const parentId = normalizeTaskString(task.topLevelTaskId);
+    if (!parentId || parentId === task.taskId) return undefined;
+    const parent = this.getTaskRecord(parentId);
+    if (!parent || parent.status !== 'finalized') return undefined;
+    const finalization = parent.finalization;
+    if (!finalization?.externalRunId || !finalization.externalHeadSha) return undefined;
+
+    const delivered = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.role === 'implementer'
+      && assignment.externalRunId === finalization.externalRunId
+      && assignment.externalHeadSha?.toLowerCase() === finalization.externalHeadSha.toLowerCase()
+    ));
+    if (delivered.length !== 1) return undefined;
+
+    // Reuse the participant cancel path: it is the one atomic lifecycle edge
+    // that also clears every stale assignment lease, so no lease can outlive
+    // the retired slice.
+    const result = this.applyTaskIntent({
+      taskId: task.taskId,
+      intent: 'cancel',
+      toStatus: 'cancelled',
+      note: `retired: parent ${parent.taskId} finalized on this slice's delivery evidence`
+        + ` (externalRunId ${finalization.externalRunId})`,
+      now,
+    } as never);
+    if (!result.ok) return undefined;
+    return {
+      taskId: task.taskId,
+      assignmentId: delivered[0]!.assignmentId,
+      action: 'retire_consumed_slice',
+    };
   }
 
   recordFileEvent(input: SupervisionTaskFileEventInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {

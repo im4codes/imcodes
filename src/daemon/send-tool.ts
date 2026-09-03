@@ -1,4 +1,5 @@
 import path from 'path';
+import logger from '../util/logger.js';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
@@ -95,11 +96,13 @@ const EXECUTION_CLONE_TERMINAL_REASON_DESTROYED: ExecutionCloneTerminalReason =
 import type { SessionRecord } from '../store/session-store.js';
 import {
   getSupervisionTaskRegistry,
+  type SupervisionLifecycleConvergenceAction,
   type PersistedSupervisionTaskAssignment,
   type PersistedSupervisionTaskAssignmentIdentity,
   type SupervisionTaskSnapshot,
 } from './supervision-state-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
+import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
 import { isExecutionClone } from './execution-clone.js';
 import {
   createDelegationReplyAuthority,
@@ -2133,7 +2136,11 @@ export async function dispatchReadyAudit(
   const registry = deps.registry ?? getSupervisionTaskRegistry();
   const task = registry.get(taskId);
   if (!task) return { status: 'ignored', reason: 'task_not_found' };
-  if (!task.auditPolicy) return { status: 'ignored', reason: 'manual_policy' };
+  // A task without a policy is normally not auto-audited. The one exception is
+  // a pre-existing explicit attempt that is already bound to this revision:
+  // routing it is recovery, not automatic materialisation.
+  const recoveredAttemptId = task.auditPolicy ? undefined : legacyExplicitAuditRecoveryAttempt(task, registry);
+  if (!task.auditPolicy && !recoveredAttemptId) return { status: 'ignored', reason: 'manual_policy' };
   if (!isAuditableSupervisionTaskClassification(task.classification)) {
     return { status: 'ignored', reason: 'classification_not_auditable' };
   }
@@ -2168,7 +2175,8 @@ export async function dispatchReadyAudit(
     return { status: 'blocked', reason: exactError, reported };
   }
 
-  const attemptId = automaticAuditAttemptId(task.taskId, revision);
+  // Never replace a recovered human attempt with the canonical derivation.
+  const attemptId = recoveredAttemptId ?? automaticAuditAttemptId(task.taskId, revision);
   const existingAudits = task.assignments.filter((assignment) => (
     assignment.role === 'auditor'
     && assignment.auditRevision === revision
@@ -2268,6 +2276,132 @@ export async function dispatchReadyAudit(
   const messageId = result.messageId
     ?? deterministicSendMessageId(`auto-audit:${result.assignmentId}:${attemptId}`);
   return { status: 'dispatched', assignmentId: result.assignmentId, attemptId, messageId };
+}
+
+/**
+ * Recover a PRE-EXISTING explicit audit intent that a missing task-level
+ * `auditPolicy` would otherwise strand forever (the tsk_569 shape).
+ *
+ * "No policy means no automatic audit" is the right rule for an ordinary task
+ * that never had an audit intent. It is the wrong rule for a task where a human
+ * already minted an exact attempt and bound it to the implementer: that attempt
+ * IS the intent, and the daemon may re-route it without inventing anything.
+ *
+ * This deliberately mints nothing: it returns the attempt that already exists,
+ * or undefined. It never writes `auditPolicy`, never derives a canonical
+ * attempt, and never inherits routing from an older revision.
+ *
+ * Fail-closed on every ambiguity: a revision that does not match exactly, more
+ * than one required implementer, a live auditor already on this revision, or
+ * any final receipt already recorded for it.
+ */
+export function legacyExplicitAuditRecoveryAttempt(
+  task: SupervisionTaskSnapshot,
+  registry: ReturnType<typeof getSupervisionTaskRegistry>,
+): string | undefined {
+  if (task.status !== 'ready_for_audit') return undefined;
+  // A task WITH a policy is owned by the ordinary canonical-attempt path.
+  if (task.auditPolicy) return undefined;
+  const revision = task.currentRevision?.trim();
+  if (!revision) return undefined;
+
+  const assignments = registry.listAssignments(task.taskId);
+  const implementers = assignments.filter((assignment) => (
+    assignment.role === 'implementer'
+    && assignment.required
+    && assignment.status !== 'cancelled'
+    && assignment.status !== 'finalized'
+  ));
+  if (implementers.length !== 1) return undefined;
+  const implementer = implementers[0]!;
+  // The attempt must belong to THIS revision; older routing is never inherited.
+  if (implementer.auditRevision?.trim() !== revision) return undefined;
+  const attemptId = implementer.auditAttemptId?.trim();
+  if (!attemptId) return undefined;
+
+  // Already materialised: replay is a no-op, not a second auditor.
+  const liveAuditor = assignments.some((assignment) => (
+    assignment.role === 'auditor'
+    && assignment.auditRevision?.trim() === revision
+    && assignment.status !== 'cancelled'
+    && assignment.status !== 'finalized'
+  ));
+  if (liveAuditor) return undefined;
+  const settled = registry.listAuditReceipts(task.taskId).some((receipt) => (
+    receipt.revision === revision && receipt.receiptKind === 'final'
+  ));
+  if (settled) return undefined;
+
+  return attemptId;
+}
+
+/** Result of one periodic convergence tick. */
+export interface SupervisionConvergenceTickResult {
+  converged: SupervisionLifecycleConvergenceAction[];
+  audits: ReadyAuditDispatchResult[];
+  /** True when a previous tick was still running and this one yielded. */
+  skipped?: boolean;
+}
+
+/**
+ * Re-entrancy guard. The tick is driven by an existing interval, so a slow
+ * dispatch must never be overlapped by the next tick -- that is how duplicate
+ * auditors get materialised.
+ */
+let supervisionConvergenceTickRunning = false;
+
+/** Test seam: clears the re-entrancy latch between cases. */
+export function __resetSupervisionConvergenceTickForTests(): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  supervisionConvergenceTickRunning = false;
+}
+
+/**
+ * One bounded periodic convergence step.
+ *
+ * Boot-only recovery cannot close a window that opens at any time: a task can
+ * become ready_for_audit long after startup, and a slice can be consumed by a
+ * parent finalization at any moment. This runs the same idempotent operations
+ * on the existing bounded tick instead of adding a polling state machine.
+ *
+ * Unlike the boot sweep it does NOT set `recoverRestartHandoffs`: mid-run a
+ * pending handoff belongs to this live process and must not be abandoned.
+ */
+export async function runSupervisionConvergenceTick(
+  deps: ReadyAuditDispatchDeps & { limit?: number } = {},
+): Promise<SupervisionConvergenceTickResult> {
+  if (supervisionConvergenceTickRunning) return { converged: [], audits: [], skipped: true };
+  supervisionConvergenceTickRunning = true;
+  try {
+    const registry = deps.registry ?? getSupervisionTaskRegistry();
+    const now = deps.now?.() ?? Date.now();
+    let converged: SupervisionLifecycleConvergenceAction[] = [];
+    try {
+      converged = registry.convergeLifecycle(now, {
+        ...(deps.limit ? { limit: deps.limit } : {}),
+        resolveAuthoritativeBrain: (projectName) => resolveAuthoritativeBrainIdentity(
+          projectName,
+          (deps.listSessions ?? listSessions)(),
+        ),
+      });
+    } catch (error) {
+      logger.warn({ err: error }, 'supervision lifecycle convergence failed');
+    }
+    // `dispatchReadyAudit` already refuses a task without an auditPolicy
+    // (`manual_policy`) and derives its attempt id canonically from
+    // (taskId, currentRevision), so a missing stored attempt is recomputed and
+    // an older revision's attempt can never be reused here.
+    const ready = registry.list({ status: 'ready_for_audit' })
+      .filter((task) => Boolean(task.auditPolicy)
+        || Boolean(legacyExplicitAuditRecoveryAttempt(task, registry)));
+    const audits: ReadyAuditDispatchResult[] = [];
+    for (const task of ready) {
+      audits.push(await dispatchReadyAudit(task.taskId, { ...deps, registry }));
+    }
+    return { converged, audits };
+  } finally {
+    supervisionConvergenceTickRunning = false;
+  }
 }
 
 /** One bounded startup recovery pass; no interval worker or new state machine. */

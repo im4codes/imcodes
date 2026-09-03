@@ -5483,7 +5483,149 @@ describe('SupervisionAutomation', () => {
     });
   });
 
+  describe('coordinator identity rebind through the real production tick', () => {
+    /**
+     * A daemon restart rotates the Brain's runtime epoch. The stored coordinator
+     * assignment still carries the OLD epoch, so every identity-bound operation
+     * (blocker delivery, delegation, audit receipt) is refused until something
+     * rebinds it. That rebind must happen from the production tick using the
+     * daemon's own session registry -- not from a resolver a test injects.
+     */
+    function liveBrain(name: string, projectName: string, agentType = 'claude-code-sdk') {
+      upsertSession({
+        name, label: name, projectName, role: 'brain',
+        agentType, runtimeType: 'transport', providerId: agentType,
+        projectDir: '/work/r4', state: 'idle', restarts: 0, restartTimestamps: [],
+        createdAt: Date.now(), updatedAt: Date.now(),
+      } as never);
+      const live = getSession(name);
+      if (!live?.sessionInstanceId || !live.runtimeEpoch) throw new Error('live brain identity missing');
+      return live;
+    }
+
+    function taskWithStaleCoordinator(taskId: string, projectName: string, brainName: string, agentType = 'claude-code-sdk') {
+      const registry = getSupervisionTaskRegistry();
+      expect(registry.createOrGet({
+        taskId, projectName, classification: 'independent_top_level',
+        objective: 'coordinator rebind', currentRevision: `${taskId}-r1`,
+      }).ok).toBe(true);
+      const coordinator = registry.createAssignment({
+        taskId, role: 'coordinator', required: false,
+        identity: {
+          sessionName: brainName,
+          sessionInstanceId: 'stale-instance',
+          runtimeEpoch: 'stale-epoch',
+          agentType,
+          providerFamily: agentType === 'claude-code-sdk' ? 'anthropic' : 'openai',
+        },
+      } as never);
+      if (!coordinator.ok) throw new Error(coordinator.reason);
+      return { registry, coordinator: coordinator.value };
+    }
+
+    it('rebinds a stale coordinator epoch from the production tick with no injected resolver', () => {
+      const brain = liveBrain('deck_r4a_brain', 'r4a');
+      const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4a', 'r4a', 'deck_r4a_brain');
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(9_100_000);
+
+      const rebound = registry.getAssignment(coordinator.assignmentId)!;
+      expect(rebound.assignmentId).toBe(coordinator.assignmentId); // same object
+      expect(rebound.identity.runtimeEpoch).toBe(brain.runtimeEpoch);
+      expect(rebound.identity.sessionInstanceId).toBe(brain.sessionInstanceId);
+      expect(registry.listAssignments('tsk_r4a').filter((a) => a.role === 'coordinator')).toHaveLength(1);
+    });
+
+    it('is idempotent: a repeated tick changes neither the identity nor the assignment count', () => {
+      const brain = liveBrain('deck_r4b_brain', 'r4b');
+      const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4b', 'r4b', 'deck_r4b_brain');
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(9_200_000);
+      const first = registry.getAssignment(coordinator.assignmentId)!;
+      supervisionAutomation.__checkImplementationAssignmentsForTests(9_300_000);
+      const second = registry.getAssignment(coordinator.assignmentId)!;
+
+      expect(first.identity.runtimeEpoch).toBe(brain.runtimeEpoch);
+      expect(second.identity).toEqual(first.identity);
+      expect(registry.listAssignments('tsk_r4b').filter((a) => a.role === 'coordinator')).toHaveLength(1);
+    });
+
+    it('refuses a live session of a different agent/provider family under the same name', () => {
+      liveBrain('deck_r4c_brain', 'r4c', 'codex-sdk');
+      // The stored coordinator is an anthropic Brain; the live same-named
+      // session is a different runtime family and must never inherit authority.
+      const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4c', 'r4c', 'deck_r4c_brain', 'claude-code-sdk');
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(9_400_000);
+
+      const unchanged = registry.getAssignment(coordinator.assignmentId)!;
+      expect(unchanged.identity.runtimeEpoch).toBe('stale-epoch');
+      expect(unchanged.identity.agentType).toBe('claude-code-sdk');
+    });
+
+    it('fails closed when the project has more than one live Brain', () => {
+      liveBrain('deck_r4d_brain', 'r4d');
+      liveBrain('deck_r4d_other', 'r4d');
+      const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4d', 'r4d', 'deck_r4d_brain');
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(9_500_000);
+
+      expect(registry.getAssignment(coordinator.assignmentId)!.identity.runtimeEpoch).toBe('stale-epoch');
+    });
+  });
+
   describe('durable single-implementer watchdog', () => {
+    it('drives forward convergence from the periodic tick, not only the boot sweep', async () => {
+      // Pins the WIRING: a boot-only sweep cannot close a window that opens
+      // later, so the bounded interval itself must run the convergence step.
+      const registry = getSupervisionTaskRegistry();
+      const converge = vi.spyOn(registry, 'convergeLifecycle');
+      try {
+        supervisionAutomation.__checkImplementationAssignmentsForTests(9_000_000);
+        await sleep(30);
+        expect(converge).toHaveBeenCalled();
+      } finally {
+        converge.mockRestore();
+      }
+    });
+
+    it('stops reminding a worker that already reported a durable blocker', () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-blocked-task';
+      const assignmentId = 'watchdog-blocked-implementer';
+      const identity = {
+        sessionName: 'deck_watchdog_worker', sessionInstanceId: 'watchdog-instance', runtimeEpoch: 'watchdog-epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+      };
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'blocked worker must not be nagged', now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity, scopeFiles: ['src/blocked.ts'], now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      expect(registry.updateTask({ taskId, status: 'implementing', now: 3_000 }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId, identity, status: 'implementing', now: 3_000,
+      }).ok).toBe(true);
+      // The worker has already reported a durable blocker it has no authority
+      // to clear. Repeating a heartbeat cannot produce progress; the blocker is
+      // the state a human must act on.
+      expect(registry.updateAssignment({
+        assignmentId, identity, blocker: 'needs Brain adjudication', now: 3_500,
+      }).ok).toBe(true);
+      mockTransportRuntime.send.mockClear();
+      mockTransportRuntimeWorking = false;
+
+      const due = 3_500 + 10 * 60_000;
+      supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      supervisionAutomation.__checkImplementationAssignmentsForTests(due + 60 * 60_000);
+
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.getAssignment(assignmentId)!.blocker).toBe('needs Brain adjudication');
+    });
+
     it('deduplicates and backs off reminders, resets on progress, and stops permanently after FINISHED handoff', () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-one-task';
