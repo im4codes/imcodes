@@ -617,6 +617,20 @@ describe('expired handoff leases survive restart and stay recoverable', () => {
     store.restoreExpiredHandoffs(NAME, 100_001);
     expect(store.readSnapshot(NAME).pendingMessageEntries.map((e) => [e.clientMessageId, e.status])).toEqual(first);
   });
+
+  it('moves the same message to explicit failed state after the bounded handoff budget', () => {
+    store.enqueue({ sessionName: NAME, recipient: A, clientMessageId: 'exhausted', text: 'same message', now: 10 });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(store.markHandoffInFlight(NAME, ['exhausted'], 1, 100 + attempt * 10, A)).toHaveLength(1);
+      store.restoreExpiredHandoffs(NAME, 102 + attempt * 10);
+    }
+
+    const snapshot = store.readSnapshot(NAME);
+    expect(snapshot.pendingMessageEntries).toHaveLength(0);
+    expect(snapshot.failedMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'exhausted', status: 'failed', failureReason: 'dispatch_failed' }),
+    ]);
+  });
 });
 
 // Every recipient-sensitive read/write must compare the CALLER's proven identity
@@ -652,6 +666,102 @@ describe('recipient-sensitive store operations are identity-gated', () => {
     queueForA();
     store.drop(NAME, 'm-a', 'user_cleared', 20, A);
     expect(pending()).toHaveLength(0);
+  });
+
+  it('atomically carries queued work across a runtime-epoch rotation of the same logical instance', () => {
+    queueForA();
+    const next = { sessionInstanceId: A.sessionInstanceId, runtimeEpoch: 'epoch-A-next' };
+
+    expect(store.rebindRecipientRuntimeEpoch(NAME, A, next, 20)).toBe(true);
+    expect(store.queueBelongsTo(NAME, A)).toBe(false);
+    expect(store.queueBelongsTo(NAME, next)).toBe(true);
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', A)).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', next)).toBeTypeOf('string');
+  });
+
+  it('refuses recipient recovery across logical session instances', () => {
+    queueForA();
+    const replacement = { sessionInstanceId: 'instance-replacement', runtimeEpoch: 'epoch-new' };
+
+    expect(store.rebindRecipientRuntimeEpoch(NAME, A, replacement, 20)).toBe(false);
+    expect(store.queueBelongsTo(NAME, A)).toBe(true);
+    expect(store.queueBelongsTo(NAME, replacement)).toBe(false);
+  });
+
+  it('refuses epoch rebinding when any recipient-bearing row conflicts with the expected identity', () => {
+    queueForA();
+    const dbPath = join(dir, 'queue.sqlite');
+    const raw = new DatabaseSync(dbPath);
+    try {
+      raw.prepare(`
+        UPDATE queue_private_material
+        SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?
+        WHERE session_name = ? AND client_message_id = ?
+      `).run(B.sessionInstanceId, B.runtimeEpoch, NAME, 'm-a');
+    } finally {
+      raw.close();
+    }
+    const next = { sessionInstanceId: A.sessionInstanceId, runtimeEpoch: 'epoch-A-next' };
+
+    expect(store.rebindRecipientRuntimeEpoch(NAME, A, next, 20)).toBe(false);
+    expect(store.queueBelongsTo(NAME, A)).toBe(true);
+    expect(store.queueBelongsTo(NAME, next)).toBe(false);
+  });
+
+  it('durably tombstones an accepted delete so a late enqueue cannot resurrect the same message', () => {
+    queueForA();
+    const cancelled = store.cancelQueuedMessage(NAME, 'm-a', A, 20);
+    expect(cancelled.status).toBe('accepted');
+    expect(cancelled.snapshot.pendingMessageEntries).toHaveLength(0);
+
+    store.close();
+    store = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+
+    const late = store.enqueueWithCapacityEviction({
+      sessionName: NAME,
+      recipient: A,
+      clientMessageId: 'm-a',
+      commandId: 'm-a',
+      text: 'late callback',
+      now: 30,
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'm-a', text: 'late callback' }),
+    });
+    expect(late.cancelled).toBe(true);
+    expect(late.queueSnapshot.pendingMessageEntries).toHaveLength(0);
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', A)).toBeUndefined();
+    expect(store.cancelQueuedMessage(NAME, 'm-a', A, 40).status).toBe('accepted');
+  });
+
+  it('does not let a replacement instance tombstone or delete another instance queue row', () => {
+    queueForA();
+    const result = store.cancelQueuedMessage(NAME, 'm-a', B, 20);
+    expect(result.status).toBe('identity_mismatch');
+    expect(pending()).toHaveLength(1);
+  });
+
+  it('fails closed when a restarted identified runtime cancels a legacy NULL-identity row', () => {
+    const legacyName = 'legacy-cancel-after-restart';
+    store.enqueue({
+      sessionName: legacyName,
+      clientMessageId: 'legacy-message',
+      text: 'must remain quarantined',
+      now: 10,
+      privateMaterialJson: JSON.stringify({ text: 'must remain quarantined' }),
+    });
+    store.close();
+    store = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+
+    const first = store.cancelQueuedMessage(legacyName, 'legacy-message', A, 20);
+    expect(first.status).toBe('identity_mismatch');
+    expect(first.snapshot.pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'legacy-message' }),
+    ]);
+    expect(store.readPrivateDispatchMaterial(legacyName, 'legacy-message')).toContain('must remain quarantined');
+
+    const repeated = store.cancelQueuedMessage(legacyName, 'legacy-message', A, 21);
+    expect(repeated.status).toBe('identity_mismatch');
+    expect(store.readSnapshot(legacyName).pendingMessageEntries).toHaveLength(1);
+    expect(store.readPrivateDispatchMaterial(legacyName, 'legacy-message')).toContain('must remain quarantined');
   });
 
   it('B cannot read A\'s private dispatch material', () => {

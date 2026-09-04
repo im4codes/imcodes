@@ -5578,7 +5578,10 @@ export class WsBridge {
       //
       // In all cases we record an inflight entry so that the later command.ack
       // (or timeout / disconnect) can correlate back to the right browser.
-      if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && typeof msg.commandId === 'string') {
+      if ((msg.type === 'session.send'
+        || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
+        || msg.type === 'session.undo_queued_message')
+        && typeof msg.commandId === 'string') {
         const sessionName = typeof msg.sessionName === 'string'
           ? msg.sessionName
           : (typeof msg.session === 'string' ? msg.session : '');
@@ -8140,7 +8143,17 @@ export class WsBridge {
     }
 
     // Fully offline (no daemon WS, no grace window): fail fast.
-    this.emitCommandFailed(ws, commandId, sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+    this.emitInflightFailure({
+      commandId,
+      sessionName,
+      browser: ws,
+      rawPayload: raw,
+      state: 'buffered',
+      sentAt: Date.now(),
+      dispatchAttempts: 0,
+      timeoutTimer: null,
+      share: this.inflightShareMetadata(ws),
+    }, ACK_FAILURE_DAEMON_OFFLINE);
   }
 
   /** Replay buffered + dispatched commands to the daemon after reconnect. */
@@ -8211,40 +8224,35 @@ export class WsBridge {
     if (!entry.share) return true;
     const state = this.browserShareStates.get(entry.browser);
     if (!state || state.userId !== entry.share.userId) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.REVOKED);
+      this.emitInflightFailure(entry, SHARE_REASONS.REVOKED);
       this.removeInflight(entry.commandId);
       return false;
     }
     const coverage = await this.resolveLiveShareCoverage(state);
     if (!coverage) {
-      this.emitCommandFailed(
-        entry.browser,
-        entry.commandId,
-        entry.sessionName,
-        this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
-      );
+      this.emitInflightFailure(entry, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
       this.removeInflight(entry.commandId);
       return false;
     }
     const current = await this.applyShareCoverage(entry.browser, state, coverage);
     if (!shareStateCoversSession(current, entry.sessionName)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;
     }
     const sameTarget = shareTargetKey(current.target) === shareTargetKey(entry.share.target);
     if (!sameTarget || !shareStateCoversSession(current, entry.sessionName)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;
     }
     if (this.shareStateLooksExpired(current)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.EXPIRED);
+      this.emitInflightFailure(entry, SHARE_REASONS.EXPIRED);
       this.removeInflight(entry.commandId);
       return false;
     }
     if (entry.share.requiredRole === 'participant' && current.snapshot.effectiveRole !== 'participant') {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.ROLE_DENIED);
+      this.emitInflightFailure(entry, SHARE_REASONS.ROLE_DENIED);
       this.removeInflight(entry.commandId);
       return false;
     }
@@ -8281,7 +8289,7 @@ export class WsBridge {
       this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_OFFLINE }));
     }
     for (const entry of [...this.inflightCommands.values()]) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+      this.emitInflightFailure(entry, ACK_FAILURE_DAEMON_OFFLINE);
       this.removeInflight(entry.commandId);
     }
   }
@@ -8300,7 +8308,7 @@ export class WsBridge {
           dispatchAttempts: entry.dispatchAttempts,
           retryLimit: ACK_TIMEOUT_RETRY_LIMIT,
         },
-        'command.ack timeout — retrying session.send',
+        'command.ack timeout — retrying reliable session command',
       );
       void this.dispatchInflightToDaemon(entry, true);
       return;
@@ -8314,7 +8322,7 @@ export class WsBridge {
       return;
     }
     logger.warn({ serverId: this.serverId, commandId, sessionName: entry.sessionName }, 'command.ack timeout');
-    this.emitCommandFailed(entry.browser, commandId, entry.sessionName, ACK_FAILURE_ACK_TIMEOUT);
+    this.emitInflightFailure(entry, ACK_FAILURE_ACK_TIMEOUT);
     this.removeInflight(commandId);
   }
 
@@ -8369,6 +8377,34 @@ export class WsBridge {
     } catch (err) {
       logger.warn({ commandId, err }, 'failed to deliver command.failed to browser');
     }
+  }
+
+  private emitInflightFailure(entry: InflightCommand, reason: AckFailureReason | ShareReason): void {
+    const type = this.rawPayloadType(entry.rawPayload);
+    if (type === 'session.undo_queued_message') {
+      const payload = JSON.stringify({
+        type: MSG_COMMAND_ACK,
+        commandId: entry.commandId,
+        session: entry.sessionName,
+        sessionName: entry.sessionName,
+        status: 'error',
+        error: reason,
+      });
+      try {
+        if (entry.browser.readyState === WebSocket.OPEN) {
+          entry.browser.send(payload);
+        }
+      } catch (err) {
+        logger.warn({ commandId: entry.commandId, err }, 'failed to deliver queue mutation error ack to browser');
+      }
+      // The initiating browser may have reconnected/rotated while the daemon
+      // was down. Session subscribers are the authoritative multi-device/user
+      // projection, so the terminal failure must reach the replacement socket
+      // too instead of leaving it on a permanent optimistic tombstone.
+      this.sendJsonToSessionSubscribers(entry.sessionName, payload);
+      return;
+    }
+    this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, reason);
   }
 
   /** Start periodic GC timer (idempotent). */

@@ -1339,6 +1339,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         },
       )
     : [];
+  const activeSessionFailedEntries: LocalQueuedTransportEntry[] = effectiveRuntimeType === 'transport'
+    ? (activeSession?.failedMessageEntries ?? []).map((entry) => ({ ...entry, status: 'failed' as const }))
+    : [];
   const activeSessionPendingVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
     ? activeSession.transportPendingMessageVersion
     : undefined;
@@ -1349,9 +1352,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       || activeSessionPendingVersion === undefined
       || realtimeQueueOverride.version >= activeSessionPendingVersion
     );
-  const incomingQueuedTransportEntries = shouldUseRealtimeQueueOverride
+  const incomingPendingTransportEntries = shouldUseRealtimeQueueOverride
     ? realtimeQueueOverride.entries
     : activeSessionPendingEntries;
+  const incomingQueuedTransportEntries: LocalQueuedTransportEntry[] = [
+    ...incomingPendingTransportEntries,
+    ...activeSessionFailedEntries.filter((failed) => (
+      !incomingPendingTransportEntries.some((pending) => pending.clientMessageId === failed.clientMessageId)
+    )),
+  ];
   const incomingQueuedTransportVersion = shouldUseRealtimeQueueOverride
     ? realtimeQueueOverride.version
     : activeSessionPendingVersion;
@@ -4096,11 +4105,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerMultiline(false);
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
-    // Drop the local optimistic copy immediately for responsiveness.
-    setOptimisticQueuedEntries((prev) => {
-      const source = prev ?? incomingQueuedTransportEntries;
-      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-    });
     // ALWAYS ask the backend to drop it — even when the entry still looks "local"
     // (present optimistically but not yet echoed in the authoritative snapshot).
     // The WS enqueue for this message is ordered BEFORE this delete, so the daemon
@@ -4118,8 +4122,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch {
       return;
     }
-    if (!mutationCommandId) return; // WS unavailable: the local removal above stands.
+    // Without a mutation command there is no authoritative cancellation. Keep
+    // the row visible rather than pretending a local-only delete succeeded.
+    if (!mutationCommandId) return;
     queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
+    setOptimisticQueuedEntries((prev) => {
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+    });
     setOptimisticallyRemovedQueuedIds((prev) => {
       if (prev.has(entry.clientMessageId)) return prev;
       return new Set([...prev, entry.clientMessageId]);
@@ -4212,8 +4222,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       commandId = null;
     }
     if (!commandId) return;
+    let dismissCommandId: string | false = false;
+    try {
+      dismissCommandId = sendQueuedMessageMutation('session.undo_queued_message', {
+        clientMessageId: entry.clientMessageId,
+      });
+    } catch {
+      dismissCommandId = false;
+    }
+    if (dismissCommandId) {
+      queuedMutationRollbackRef.current.set(dismissCommandId, { type: 'undo', entry });
+      setOptimisticallyRemovedQueuedIds((prev) => new Set([...prev, entry.clientMessageId]));
+    }
     setOptimisticQueuedEntries((prev) => {
-      const source = prev ?? [];
+      const source = prev ?? incomingQueuedTransportEntries;
       const next = source.filter((item) => item.clientMessageId !== entry.clientMessageId);
       next.push({
         clientMessageId: commandId,
@@ -4224,7 +4246,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       });
       return next;
     });
-  }, [aliasAll, incomingQueuedTransportVersion, sendSessionMessage]);
+  }, [aliasAll, incomingQueuedTransportEntries, incomingQueuedTransportVersion, sendQueuedMessageMutation, sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;

@@ -83,6 +83,27 @@ describe('transport-resend-queue', () => {
     ]);
   });
 
+  it('does not recreate resend memory after the same logical message was durably cancelled', () => {
+    const recipient = { sessionInstanceId: 'instance-cancelled', runtimeEpoch: 'epoch-cancelled' };
+    expect(getTransportQueueStore().cancelQueuedMessage(
+      's-cancelled',
+      'msg-cancelled',
+      recipient,
+    ).status).toBe('accepted');
+
+    const result = enqueueResend('s-cancelled', {
+      recipient,
+      text: 'late recovery callback',
+      commandId: 'cmd-cancelled',
+      clientMessageId: 'msg-cancelled',
+      queuedAt: Date.now(),
+    });
+
+    expect(result).toEqual(expect.objectContaining({ accepted: false, reason: 'cancelled' }));
+    expect(getResendEntries('s-cancelled')).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('s-cancelled').pendingMessageEntries).toEqual([]);
+  });
+
   it('isolates queues per session', () => {
     enqueueResend('alpha', { text: 'a', commandId: 'ca', queuedAt: 0 });
     enqueueResend('beta', { text: 'b', commandId: 'cb', queuedAt: 0 });

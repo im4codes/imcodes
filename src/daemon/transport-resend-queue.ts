@@ -102,7 +102,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
   accepted: false;
   droppedOldest: false;
   pendingVersion: number;
-  reason: 'sqlite_enqueue_failed';
+  reason: 'sqlite_enqueue_failed' | 'cancelled';
 } {
   const list = queues.get(sessionName) ?? [];
   const clientMessageId = entry.clientMessageId?.trim() || randomUUID();
@@ -137,6 +137,14 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
     }, evicted?.clientMessageId);
     queueSnapshot = result.queueSnapshot;
     dropSnapshot = result.dropSnapshot;
+    if (result.cancelled) {
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: queueSnapshot.pendingMessageVersion,
+        reason: 'cancelled',
+      };
+    }
   } catch (err) {
     const existingSnapshot = (() => {
       try {

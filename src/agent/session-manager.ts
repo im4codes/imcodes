@@ -84,6 +84,7 @@ import { clearResend, drainResend, getResendCount, getResendEntries, listFreshRe
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { deliverTransportResendEntry } from './transport-resend-delivery.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
+import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
@@ -2790,6 +2791,9 @@ export async function restoreTransportSessions(
       // `transportRuntimes.set` and `drainResend`, which WOULD reintroduce
       // a real race window letting msg-2 arrive at `handleSend` while
       // `_sending` is still false.
+      // Reclaim ONLY leases inherited from the dead daemon process, before this
+      // restore creates any new handoffs of its own.
+      getTransportQueueStore().restoreExpiredHandoffs(s.name, Date.now(), { includeUnexpired: true });
       await drainTransportResendQueueIntoRuntime(runtime, s.name, 'reconnect');
 
       // Rehydrate the runtime's pending queue from the SQLite queue authority.
@@ -3210,7 +3214,17 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           : {}),
       };
       upsertSession(record);
-      emitSessionPersist(record, name);
+      const persistedRecord = getSession(name);
+      const persistedRecipient = recipientFromSessionRecord(persistedRecord);
+      const runtimeRecipient = runtime.recipientIdentity;
+      if (runtimeRecipient && persistedRecipient
+        && (runtimeRecipient.sessionInstanceId !== persistedRecipient.sessionInstanceId
+          || runtimeRecipient.runtimeEpoch !== persistedRecipient.runtimeEpoch)) {
+        if (!runtime.rebindQueueRecipient(runtimeRecipient, persistedRecipient)) {
+          throw new Error('transport queue recipient rotation rejected');
+        }
+      }
+      emitSessionPersist(persistedRecord ?? record, name);
     }
 
     emitSessionEvent('started', name, 'idle');
@@ -3233,6 +3247,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // `runExclusiveSessionRelaunch`) does not resolve until the resend
   // queue has been fully transferred into the runtime. See the matching
   // change in `restoreTransportSessions` above for the full rationale.
+  // The old runtime has been killed and cannot complete any lease it left.
+  // Reclaim those old-generation handoffs before this runtime creates new ones;
+  // the durable attempt counter bounds repeated relaunch recovery.
+  getTransportQueueStore().restoreExpiredHandoffs(name, Date.now(), { includeUnexpired: true });
   await drainTransportResendQueueIntoRuntime(runtime, name, 'launch');
 }
 

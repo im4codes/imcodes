@@ -5059,28 +5059,29 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       });
       return;
     }
-    if (!removed && !queuedInStore) {
-      // Deleting a queued message is IDEMPOTENT: if it is already gone the goal
-      // is met, so ack success. The frontend now always sends the undo — even for
-      // an entry that only ever existed optimistically (never reached the store)
-      // — so an "error: not found" here would spuriously roll the deleted bubble
-      // back into the UI. "Already absent" is a successful delete.
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
-      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
-      return;
-    }
+    // Even an apparently absent id must pass through atomic cancellation. The
+    // matching send handler can still be awaiting context/runtime work on this
+    // ordered socket; accepting here without a tombstone lets its later enqueue
+    // resurrect a deletion that the user was told succeeded.
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
     peerAuditService.invalidateQueuedEdit(sessionName);
     try {
-      // Prove the LIVE runtime identity. Without it nobody can delete an
-      // identity-bound row (not even its owner); with the WRONG one a same-named
-      // successor could destroy work it was never able to drain.
-      queueSnapshot = getTransportQueueStore().drop(
-        sessionName, clientMessageId, 'user_cleared', undefined,
+      // Prove the LIVE runtime identity. The atomic cancellation also leaves a
+      // durable tombstone, so an async send/recovery callback that arrives after
+      // this point cannot resurrect the same logical message.
+      const cancellation = getTransportQueueStore().cancelQueuedMessage(
+        sessionName,
+        clientMessageId,
         (runtime as { recipientIdentity?: QueueRecipientIdentity }).recipientIdentity ?? null,
       );
+      if (cancellation.status === 'identity_mismatch') {
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queue ownership changed' });
+        emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queue ownership changed' });
+        return;
+      }
+      queueSnapshot = cancellation.snapshot;
     } catch (err) {
-      // The SQLite row is the queue authority. If the drop threw, the row is
+      // The SQLite row is the queue authority. If cancellation threw, the row is
       // STILL THERE — the delete did NOT happen — so we must NOT ack success
       // (that would leave the message queued on the backend while the UI claims
       // it is deleted). Ack an error so the frontend rolls the bubble back and

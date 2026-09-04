@@ -5318,6 +5318,69 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
+  it('keeps a queued row visible when no authoritative delete command can be sent', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-not-deleted', text: 'still authoritative' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    ws.send.mockClear();
+    ws.send.mockImplementation(() => { throw new Error('socket rotated'); });
+
+    fireEvent.click(screen.getByRole('button', { name: /delete/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.undo_queued_message',
+      clientMessageId: 'msg-not-deleted',
+    }));
+    expect(screen.getByText('still authoritative')).toBeDefined();
+  });
+
+  it('renders the daemon authoritative failed state after bounded recovery is exhausted', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'idle',
+          transportPendingMessageEntries: [],
+          failedMessageEntries: [
+            { clientMessageId: 'msg-exhausted', text: 'could not deliver after restart' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('could not deliver after restart')).toBeDefined();
+    expect(screen.getByLabelText('sendFailedLabel')).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: /retrySend/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'could not deliver after restart',
+      commandId: expect.any(String),
+    }));
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.undo_queued_message',
+      clientMessageId: 'msg-exhausted',
+      commandId: expect.any(String),
+    }));
+    expect(screen.queryByLabelText('sendFailedLabel')).toBeNull();
+  });
+
   it('sends the backend undo when deleting a still-local optimistic queue entry', () => {
     // Regression: an optimistic entry is queued locally the instant you send it,
     // but the daemon has ALSO already enqueued it (the WS enqueue is ordered

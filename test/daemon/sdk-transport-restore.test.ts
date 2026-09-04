@@ -1229,6 +1229,51 @@ describe('sdk transport session restore', () => {
     expect(stillQueued).toBe(false);
   });
 
+  it('restoreTransportSessions reclaims a dead-daemon unexpired handoff before rehydrate', async () => {
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_cx_unexpired_handoff_brain';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkunexpiredhandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-unexpired-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-unexpired-handoff',
+      codexSessionId: 'codex-thread-unexpired-handoff',
+    });
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-unexpired-handoff',
+      commandId: 'msg-unexpired-handoff',
+      text: 'recover lease owned by dead daemon',
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-unexpired-handoff',
+        text: 'recover lease owned by dead daemon',
+      }),
+    });
+    expect(getTransportQueueStore().markHandoffInFlight(
+      sessionName,
+      ['msg-unexpired-handoff'],
+      60_000,
+    )).toHaveLength(1);
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    await settleCodexRun(sessionName, 'resume');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('recover lease owned by dead daemon')
+      && Date.now() < deadline) await flush();
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('recover lease owned by dead daemon');
+  });
+
   it('does not attach cancellation errors to authoritative clean-idle lifecycle payloads', async () => {
     mocks.store.set('deck_sdk_cancel_idle_brain', {
       name: 'deck_sdk_cancel_idle_brain',

@@ -913,6 +913,60 @@ describe('TransportSessionRuntime', () => {
       return { restartMock, restarted };
     };
 
+    it('keeps the same durable message across a same-instance runtime epoch rotation', async () => {
+      const before = { sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-before' };
+      const after = { sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-after' };
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_rotated_brain',
+        recipient: before,
+        clientMessageId: 'msg-stable-across-rotation',
+        commandId: 'msg-stable-across-rotation',
+        text: 'survive provider relaunch',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'msg-stable-across-rotation',
+          text: 'survive provider relaunch',
+        }),
+      });
+      const replacementProvider = makeMockProvider();
+      const replacement = new TransportSessionRuntime(
+        replacementProvider.provider,
+        'deck_rotated_brain',
+        before,
+      );
+      await replacement.initialize({ sessionKey: 'deck_rotated_brain' });
+
+      expect(replacement.rebindQueueRecipient(before, after)).toBe(true);
+      expect(replacement.recipientIdentity).toEqual(after);
+      expect(replacement.rehydratePendingFromStore()).toBe(1);
+      expect(replacement.pendingEntries).toEqual([
+        { clientMessageId: 'msg-stable-across-rotation', text: 'survive provider relaunch' },
+      ]);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(
+        'deck_rotated_brain',
+        'msg-stable-across-rotation',
+        after,
+      )).toBeTypeOf('string');
+    });
+
+    it('does not retain a runtime-local copy when a durable cancellation beats late enqueue', async () => {
+      const recipient = { sessionInstanceId: 'instance-cancelled', runtimeEpoch: 'epoch-cancelled' };
+      const lateMock = makeMockProvider();
+      const lateRuntime = new TransportSessionRuntime(lateMock.provider, 'deck_cancelled_brain', recipient);
+      await lateRuntime.initialize({ sessionKey: 'deck_cancelled_brain' });
+      lateRuntime.send('active turn', 'msg-active');
+      await waitForProviderSendCount(lateMock.provider, 1);
+      expect(getTransportQueueStore().cancelQueuedMessage(
+        'deck_cancelled_brain',
+        'msg-cancel-won',
+        recipient,
+      ).status).toBe('accepted');
+
+      expect(lateRuntime.send('late callback', 'msg-cancel-won')).toBe('queued');
+
+      expect(lateRuntime.pendingEntries).toEqual([]);
+      expect(getTransportQueueStore().readSnapshot('deck_cancelled_brain').pendingMessageEntries).toEqual([]);
+    });
+
     it('recovers a queued message that only survives in SQLite after a restart', async () => {
       runtime.send('first');
       await waitForProviderSendCount(mock.provider, 1);
@@ -986,6 +1040,25 @@ describe('TransportSessionRuntime', () => {
       const { restarted } = await simulateRestart();
       expect(restarted.rehydratePendingFromStore()).toBe(0);
       expect(restarted.pendingCount).toBe(0);
+    });
+
+    it('restores an expired handoff under the same id before rehydrating after restart', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('expired handoff', 'msg-expired-handoff');
+      const expiredAt = Date.now() - 10_000;
+      expect(getTransportQueueStore().markHandoffInFlight(
+        'deck_test_brain',
+        ['msg-expired-handoff'],
+        1,
+        expiredAt,
+      )).toHaveLength(1);
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.pendingEntries).toEqual([
+        { clientMessageId: 'msg-expired-handoff', text: 'expired handoff' },
+      ]);
     });
 
     it('does NOT recover an already-delivered entry', async () => {

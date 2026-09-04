@@ -1134,6 +1134,48 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(stillPresent).toBe(false);
   });
 
+  it('durably prevents an immediate delete/send race from resurrecting the message', async () => {
+    const recipient = { sessionInstanceId: 'instance-race', runtimeEpoch: 'epoch-race' };
+    let pending = false;
+    const send = vi.fn((text: string, clientMessageId: string) => {
+      pending = true;
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_transport_brain', recipient, clientMessageId, commandId: clientMessageId,
+        text, privateMaterialJson: JSON.stringify({ clientMessageId, text }),
+      });
+      return 'queued';
+    });
+    const removePendingMessage = vi.fn((clientMessageId: string) => {
+      if (!pending) return null;
+      pending = false;
+      return { clientMessageId, text: 'race message' };
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport', recipientIdentity: recipient,
+      send, removePendingMessage, pendingCount: 1, sending: true,
+      pendingEntries: [], pendingMessages: [], pendingVersion: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send', sessionName: 'deck_transport_brain', text: 'race message',
+      commandId: 'msg-race', clientMessageId: 'msg-race',
+    }, serverLink as any);
+    handleWebCommand({
+      type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-race', commandId: 'undo-race',
+    }, serverLink as any);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(removePendingMessage).toHaveBeenCalledWith('msg-race');
+    expect(getTransportQueueStore().readSnapshot('deck_transport_brain').pendingMessageEntries)
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ clientMessageId: 'msg-race' })]));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack', commandId: 'undo-race', status: 'accepted',
+    }));
+  });
+
   it('undo_queued_message deletes an EXPIRED handoff_inflight row that the runtime no longer knows', async () => {
     // Field defect (172.16.253.217): client_message_id 535f388c-…, status
     // handoff_inflight, handoff_started_at 1788246218272, expires_at
@@ -1329,7 +1371,7 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingCount: 0,
       sending: false,
     });
-    const dropSpy = vi.spyOn(getTransportQueueStore(), 'drop').mockImplementation(() => { throw new Error('sqlite busy'); });
+    const dropSpy = vi.spyOn(getTransportQueueStore(), 'cancelQueuedMessage').mockImplementation(() => { throw new Error('sqlite busy'); });
     try {
       handleWebCommand(
         { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-drop-throw', commandId: 'cmd-undo-drop-throw' },

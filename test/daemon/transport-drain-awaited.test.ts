@@ -36,6 +36,7 @@
  */
 
 import { describe, expect, it, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   clearAllResend,
   drainResend,
@@ -48,6 +49,22 @@ beforeEach(() => {
 });
 
 describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
+  it('wires same-instance epoch rebinding and dead-runtime lease recovery before resend drain', () => {
+    const source = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
+    const launch = source.slice(source.indexOf('async function launchTransportSessionInner'));
+    const upsert = launch.indexOf('upsertSession(record);');
+    const rebind = launch.indexOf('runtime.rebindQueueRecipient(runtimeRecipient, persistedRecipient)');
+    const publish = launch.indexOf('emitSessionPersist(persistedRecord ?? record, name);');
+    const reclaim = launch.indexOf("restoreExpiredHandoffs(name, Date.now(), { includeUnexpired: true })");
+    const drain = launch.indexOf("drainTransportResendQueueIntoRuntime(runtime, name, 'launch')");
+
+    expect(upsert).toBeGreaterThanOrEqual(0);
+    expect(rebind).toBeGreaterThan(upsert);
+    expect(publish).toBeGreaterThan(rebind);
+    expect(reclaim).toBeGreaterThan(publish);
+    expect(drain).toBeGreaterThan(reclaim);
+  });
+
   it('synchronous dispatcher executes runtime.send before the first await yields', async () => {
     // Mirrors the shape of the dispatcher used in session-manager.ts:
     //   (entry) => { const result = runtime.send(...); ... return result; }

@@ -640,7 +640,7 @@ export class TransportSessionRuntime implements SessionRuntime {
      * over, a late lookup would return the successor and hand it the previous
      * instance's durable queue.
      */
-    private readonly queueRecipient?: QueueRecipientIdentity,
+    private queueRecipient?: QueueRecipientIdentity,
   ) {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
@@ -1200,8 +1200,18 @@ export class TransportSessionRuntime implements SessionRuntime {
    *     `readSnapshot`). Does NOT itself dispatch; the caller kicks a drain.
    * Returns the number of entries recovered into `_pendingMessages`.
    */
-  /** The identity of the instance this runtime serves, captured at construction. */
+  /** The identity this runtime serves; rotation is allowed only within the same logical instance. */
   get recipientIdentity(): QueueRecipientIdentity | undefined { return this.queueRecipient; }
+
+  /** Update the live runtime after the store rotated only its runtime epoch. */
+  rebindQueueRecipient(expected: QueueRecipientIdentity, next: QueueRecipientIdentity): boolean {
+    if (!this.queueRecipient
+      || this.queueRecipient.sessionInstanceId !== expected.sessionInstanceId
+      || this.queueRecipient.runtimeEpoch !== expected.runtimeEpoch) return false;
+    if (!getTransportQueueStore().rebindRecipientRuntimeEpoch(this.sessionKey, expected, next)) return false;
+    this.queueRecipient = next;
+    return true;
+  }
 
   rehydratePendingFromStore(): number {
     if (!this._providerSessionId) return 0; // not bound yet — caller retries post-initialize
@@ -1210,6 +1220,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     // same-named successor must not recover it; legacy rows carrying no identity
     // are quarantined by the same gate.
     if (this.queueRecipient && !store.queueBelongsTo(this.sessionKey, this.queueRecipient)) return 0;
+    // A callback that died with the previous runtime leaves a leased row. Once
+    // that lease expires it becomes retryable under the SAME clientMessageId;
+    // the store caps attempts and projects `failed` on exhaustion.
+    store.restoreExpiredHandoffs(this.sessionKey);
     // Peer-audit capabilities and controller state are intentionally daemon-memory
     // only. After restart no attempt can still own a queued audit brief, so scrub
     // those rows before ordinary queue rehydration while preserving user traffic.
@@ -1966,7 +1980,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._pendingMessages.push(entry);
       }
       try {
-        getTransportQueueStore().enqueue({
+        const persisted = getTransportQueueStore().enqueueWithCapacityEviction({
           sessionName: this.sessionKey,
           ...(this.queueRecipient ? { recipient: this.queueRecipient } : {}),
           clientMessageId: entry.clientMessageId,
@@ -1989,6 +2003,11 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
           }),
         });
+        if (persisted.cancelled) {
+          this._pendingMessages = this._pendingMessages.filter(
+            (candidate) => candidate.clientMessageId !== entry.clientMessageId,
+          );
+        }
       } catch (err) {
         logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
       }

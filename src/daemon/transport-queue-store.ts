@@ -25,6 +25,8 @@ const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'transport-queue.sqlite');
+export const MAX_QUEUE_HANDOFF_ATTEMPTS = 3;
+const QUEUE_CANCELLATION_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface TransportQueueStoreOptions {
   dbPath?: string;
@@ -70,6 +72,13 @@ export interface EnqueueTransportQueueEntryInput {
 export interface EnqueueTransportQueueEntryResult {
   queueSnapshot: QueueSnapshot;
   dropSnapshot?: QueueSnapshot;
+  /** A prior durable user cancellation won the enqueue race. */
+  cancelled?: boolean;
+}
+
+export interface CancelQueuedMessageResult {
+  status: 'accepted' | 'identity_mismatch';
+  snapshot: QueueSnapshot;
 }
 
 export interface HandoffTransportQueueEntry {
@@ -247,6 +256,15 @@ export class TransportQueueStore {
         recipient_runtime_epoch TEXT,
         PRIMARY KEY (session_name, queue_epoch, client_message_id)
       );
+
+      CREATE TABLE IF NOT EXISTS queue_cancellation_tombstones (
+        session_name TEXT NOT NULL,
+        client_message_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        recipient_session_instance_id TEXT,
+        recipient_runtime_epoch TEXT,
+        PRIMARY KEY (session_name, client_message_id)
+      );
     `);
     this.migrateRecipientIdentityColumns();
   }
@@ -260,7 +278,7 @@ export class TransportQueueStore {
    * idempotent, so repeated daemon starts are a no-op.
    */
   private migrateRecipientIdentityColumns(): void {
-    const tables = ['queue_meta', 'queue_entries', 'queue_private_material', 'queue_delivery_tombstones'];
+    const tables = ['queue_meta', 'queue_entries', 'queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones'];
     for (const table of tables) {
       const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name?: unknown }[];
       const present = new Set(columns.map((column) => String(column.name ?? '')));
@@ -367,6 +385,22 @@ export class TransportQueueStore {
     try {
       const recipient = normalizeQueueRecipient(input.recipient);
       const meta = this.ensureMeta(sessionName, now, recipient);
+      this.db.prepare('DELETE FROM queue_cancellation_tombstones WHERE created_at < ?')
+        .run(now - QUEUE_CANCELLATION_TOMBSTONE_TTL_MS);
+      // Deletion may overtake the async send path even though the browser put
+      // the frames on one socket in order. The tombstone is the durable winner
+      // of that race: a late callback with the SAME message id must not recreate
+      // work the user already cancelled.
+      const cancellationGate = this.recipientPredicate(recipient);
+      const cancelled = this.db.prepare(`
+        SELECT 1 FROM queue_cancellation_tombstones
+        WHERE session_name = ? AND client_message_id = ? AND ${cancellationGate.sql}
+        LIMIT 1
+      `).get(sessionName, clientMessageId, ...cancellationGate.params);
+      if (cancelled) {
+        this.db.exec('COMMIT');
+        return { queueSnapshot: this.readSnapshot(sessionName, 'enqueue_cancelled'), cancelled: true };
+      }
       if (evictClientMessageId) {
         this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
         this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
@@ -518,6 +552,8 @@ export class TransportQueueStore {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.ensureMeta(sessionName, now, caller);
+      this.db.prepare('DELETE FROM queue_cancellation_tombstones WHERE created_at < ?')
+        .run(now - QUEUE_CANCELLATION_TOMBSTONE_TTL_MS);
       const update = this.db.prepare(`
         UPDATE queue_entries
         SET status = 'handoff_inflight', handoff_id = ?, handoff_started_at = ?, handoff_expires_at = ?,
@@ -920,6 +956,142 @@ export class TransportQueueStore {
   }
 
   /**
+   * Atomically cancel one logical queued message and remember that decision.
+   * Replays are accepted, while a differently-bound runtime fails closed.
+   */
+  cancelQueuedMessage(
+    sessionNameInput: string,
+    clientMessageIdInput: string,
+    recipient?: QueueRecipientIdentity | null,
+    now = Date.now(),
+  ): CancelQueuedMessageResult {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
+    const caller = normalizeQueueRecipient(recipient);
+    const gate = this.recipientPredicate(caller);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.ensureMeta(sessionName, now, caller);
+      this.db.prepare('DELETE FROM queue_cancellation_tombstones WHERE created_at < ?')
+        .run(now - QUEUE_CANCELLATION_TOMBSTONE_TTL_MS);
+      const metaMatches = this.db.prepare(`
+        SELECT 1 FROM queue_meta WHERE session_name = ? AND ${gate.sql} LIMIT 1
+      `).get(sessionName, ...gate.params);
+      if (!metaMatches) {
+        this.db.exec('COMMIT');
+        return { status: 'identity_mismatch', snapshot: this.readSnapshot(sessionName, 'cancel_identity_mismatch') };
+      }
+      for (const table of ['queue_entries', 'queue_private_material', 'queue_cancellation_tombstones']) {
+        const foreign = this.db.prepare(`
+          SELECT 1 FROM ${table}
+          WHERE session_name = ? AND client_message_id = ? AND NOT ${gate.sql}
+          LIMIT 1
+        `).get(sessionName, clientMessageId, ...gate.params);
+        if (foreign) {
+          this.db.exec('COMMIT');
+          return { status: 'identity_mismatch', snapshot: this.readSnapshot(sessionName, 'cancel_identity_mismatch') };
+        }
+      }
+      this.db.prepare(`DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`)
+        .run(sessionName, clientMessageId, ...gate.params);
+      this.db.prepare(`DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`)
+        .run(sessionName, clientMessageId, ...gate.params);
+      this.db.prepare(`
+        INSERT INTO queue_cancellation_tombstones (
+          session_name, client_message_id, created_at,
+          recipient_session_instance_id, recipient_runtime_epoch
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_name, client_message_id) DO UPDATE SET
+          created_at = excluded.created_at,
+          recipient_session_instance_id = excluded.recipient_session_instance_id,
+          recipient_runtime_epoch = excluded.recipient_runtime_epoch
+      `).run(sessionName, clientMessageId, now, caller?.sessionInstanceId ?? null, caller?.runtimeEpoch ?? null);
+      const version = this.bumpVersion(sessionName, now);
+      this.db.exec('COMMIT');
+      return { status: 'accepted', snapshot: this.readSnapshot(sessionName, 'cancel', { ...version, dropReason: 'user_cleared' }) };
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Move a queue only across epochs of the SAME logical session instance.
+   * Every persisted recipient-bearing table must agree with the expected old
+   * identity; mixed/foreign state is ambiguous and is left untouched.
+   */
+  rebindRecipientRuntimeEpoch(
+    sessionNameInput: string,
+    previousInput: QueueRecipientIdentity,
+    nextInput: QueueRecipientIdentity,
+    now = Date.now(),
+  ): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const previous = normalizeQueueRecipient(previousInput);
+    const next = normalizeQueueRecipient(nextInput);
+    if (!previous || !next || previous.sessionInstanceId !== next.sessionInstanceId) return false;
+    if (previous.runtimeEpoch === next.runtimeEpoch) return this.queueBelongsTo(sessionName, next);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const meta = this.db.prepare(`
+        SELECT recipient_session_instance_id AS sessionInstanceId,
+          recipient_runtime_epoch AS runtimeEpoch
+        FROM queue_meta WHERE session_name = ?
+      `).get(sessionName) as { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | undefined;
+      const bound = normalizeQueueRecipient({
+        sessionInstanceId: meta?.sessionInstanceId ?? '',
+        runtimeEpoch: meta?.runtimeEpoch ?? '',
+      });
+      if (!meta) {
+        // Nothing durable exists yet. The runtime may still adopt the newly
+        // persisted epoch; the first enqueue will bind it normally.
+        this.db.exec('COMMIT');
+        return true;
+      }
+      if (!bound) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+      if (bound.sessionInstanceId === next.sessionInstanceId && bound.runtimeEpoch === next.runtimeEpoch) {
+        this.db.exec('COMMIT');
+        return true;
+      }
+      if (bound.sessionInstanceId !== previous.sessionInstanceId || bound.runtimeEpoch !== previous.runtimeEpoch) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+      for (const table of ['queue_entries', 'queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones']) {
+        const conflicting = this.db.prepare(`
+          SELECT 1 FROM ${table}
+          WHERE session_name = ? AND (
+            recipient_session_instance_id IS NOT ? OR recipient_runtime_epoch IS NOT ?
+          ) LIMIT 1
+        `).get(sessionName, previous.sessionInstanceId, previous.runtimeEpoch);
+        if (conflicting) {
+          this.db.exec('ROLLBACK');
+          return false;
+        }
+      }
+      for (const table of ['queue_entries', 'queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones']) {
+        this.db.prepare(`
+          UPDATE ${table}
+          SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?
+          WHERE session_name = ? AND recipient_session_instance_id = ? AND recipient_runtime_epoch = ?
+        `).run(next.sessionInstanceId, next.runtimeEpoch, sessionName, previous.sessionInstanceId, previous.runtimeEpoch);
+      }
+      this.db.prepare(`
+        UPDATE queue_meta SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?, updated_at = ?
+        WHERE session_name = ? AND recipient_session_instance_id = ? AND recipient_runtime_epoch = ?
+      `).run(next.sessionInstanceId, next.runtimeEpoch, now, sessionName, previous.sessionInstanceId, previous.runtimeEpoch);
+      this.db.exec('COMMIT');
+      return true;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
    * May this runtime drain the queue held under that session name?
    *
    * Fail-closed in every ambiguous direction: an unusable caller identity, a
@@ -955,10 +1127,14 @@ export class TransportQueueStore {
    */
   private recipientPredicate(caller: QueueRecipientIdentity | null): { sql: string; params: (string | null)[] } {
     return {
-      sql: '((? IS NULL AND recipient_session_instance_id IS NULL)'
-        + ' OR (recipient_session_instance_id = ? AND recipient_runtime_epoch = ?))',
+      // SQLite `=` and `NOT (...)` both propagate NULL. Using them here made
+      // a legacy NULL-identity row invisible to the foreign-row scan, so
+      // cancellation could report accepted even though neither the queue row
+      // nor its private material was deleted. `IS` gives us NULL-safe exact
+      // equality: an identified caller never matches a legacy row, while an
+      // identity-less caller matches only rows whose complete identity is NULL.
+      sql: '(recipient_session_instance_id IS ? AND recipient_runtime_epoch IS ?)',
       params: [
-        caller?.sessionInstanceId ?? null,
         caller?.sessionInstanceId ?? null,
         caller?.runtimeEpoch ?? null,
       ],
@@ -1063,13 +1239,22 @@ export class TransportQueueStore {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.ensureMeta(sessionName, now);
+      const exhausted = this.db.prepare(`
+        UPDATE queue_entries
+        SET status = 'failed', failure_reason = 'dispatch_failed', handoff_id = NULL,
+          handoff_started_at = NULL, handoff_expires_at = NULL, updated_at = ?
+        WHERE session_name = ? AND status = 'handoff_inflight'
+          AND COALESCE(handoff_attempt, 0) >= ?
+          AND (? = 1 OR (handoff_expires_at IS NOT NULL AND handoff_expires_at <= ?))
+      `).run(now, sessionName, MAX_QUEUE_HANDOFF_ATTEMPTS, options.includeUnexpired ? 1 : 0, now);
       const restored = this.db.prepare(`
         UPDATE queue_entries
         SET status = 'queued', handoff_id = NULL, handoff_started_at = NULL, handoff_expires_at = NULL, updated_at = ?
         WHERE session_name = ? AND status = 'handoff_inflight'
+          AND COALESCE(handoff_attempt, 0) < ?
           AND (? = 1 OR (handoff_expires_at IS NOT NULL AND handoff_expires_at <= ?))
-      `).run(now, sessionName, options.includeUnexpired ? 1 : 0, now);
-      const version = Number(restored.changes ?? 0) > 0
+      `).run(now, sessionName, MAX_QUEUE_HANDOFF_ATTEMPTS, options.includeUnexpired ? 1 : 0, now);
+      const version = Number(restored.changes ?? 0) > 0 || Number(exhausted.changes ?? 0) > 0
         ? this.bumpVersion(sessionName, now)
         : undefined;
       this.db.exec('COMMIT');
