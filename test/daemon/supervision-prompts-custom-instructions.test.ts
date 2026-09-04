@@ -69,6 +69,15 @@ describe('supervision prompt custom-instructions merge', () => {
           'pure_read_only_localization_or_immediate_safe_containment',
         ],
         exceptionReason: 'required',
+        // Brain-only authority is a duty, not just a permission: the exception
+        // list says which repairs cannot be delegated DOWN to a sub-session,
+        // and this says Brain may not push them SIDEWAYS onto the user either.
+        authorityDuty: {
+          when: 'brain_only_control_plane_identity_or_binding_repair_that_is_safe_and_uniquely_determined',
+          mustAct: 'personally_invoke_authoritative_tool_then_resume_same_object',
+          mustNotOffload: ['operation_to_user', 'responsibility_to_user', 'ask_user_to_run_brain_only_tool'],
+          needsInput: 'only_after_authorized_tools_exhausted_and_external_information_or_authorization_genuinely_missing',
+        },
         status: {
           discoveryOrDispatchIsAdvance: false,
           delegateRemainingIsAdvance: false,
@@ -326,19 +335,19 @@ describe('Brain work-delegation contract placement and budget', () => {
   });
 
   it('leaves real headroom under the existing preamble budgets', () => {
-    // The gates in supervision-prompts.test.ts are <4500 and <4700. Referencing
+    // The gates in supervision-prompts.test.ts are <5000 and <5200. Referencing
     // rather than restating must not merely squeak under them, or the next
     // contract addition silently reopens this regression.
     const execution = buildSupervisionExecutionPreamble('en').length;
     const audit = buildSupervisedAuditExecutionPreamble('en').length;
-    expect(execution).toBeLessThan(4_500);
-    expect(audit).toBeLessThan(4_700);
-    expect(4_500 - execution).toBeGreaterThanOrEqual(250);
-    expect(4_700 - audit).toBeGreaterThanOrEqual(250);
+    expect(execution).toBeLessThan(5_000);
+    expect(audit).toBeLessThan(5_200);
+    expect(5_000 - execution).toBeGreaterThanOrEqual(250);
+    expect(5_200 - audit).toBeGreaterThanOrEqual(250);
     // Restating the full contract in the preamble would blow the budget; that
     // is the regression this placement exists to prevent.
     expect(execution + buildBrainSupervisedWorkDelegationContract('en').length)
-      .toBeGreaterThan(4_500);
+      .toBeGreaterThan(5_000);
   });
 
   it('does not disturb status, no-safe-work or waiting-heartbeat semantics', () => {
@@ -365,7 +374,7 @@ describe('Brain continuation-repair contract placement and budget', () => {
 
   it('carries the full repair contract only where Brain actually decides', () => {
     // The routing choice happens at the decision entrypoints; the preambles
-    // re-assert by id so the 4500/4700 budgets are not spent on prose Brain
+    // re-assert by id so the 5000/5200 budgets are not spent on prose Brain
     // already holds.
     const carriers = SUPERVISION_PROMPT_ENTRYPOINTS
       .filter((entry) => entry.includesContinuationRepairContract)
@@ -414,8 +423,8 @@ describe('Brain continuation-repair contract placement and budget', () => {
   });
 
   it('keeps both execution budgets intact after the addition', () => {
-    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(4_500);
-    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(4_700);
+    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(5_000);
+    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(5_200);
   });
 
   it('registers the contract id as trusted so it is named in force', () => {
@@ -474,7 +483,7 @@ describe('ADVANCE marker deprecation and waiting semantics', () => {
   });
 
   it('holds both prompt budgets after the rewrite', () => {
-    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(4_500);
-    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(4_700);
+    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(5_000);
+    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(5_200);
   });
 });

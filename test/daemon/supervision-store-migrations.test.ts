@@ -69,7 +69,7 @@ describe('supervision store migrations', () => {
   it('migrates a legacy version-0 database deterministically', () => {
     expect(readSupervisionSchemaVersion(db as never)).toBe(0);
     const result = migrate();
-    expect(result).toEqual({ from: 0, to: SUPERVISION_SCHEMA_VERSION, applied: [1, 2, 3] });
+    expect(result).toEqual({ from: 0, to: SUPERVISION_SCHEMA_VERSION, applied: [1, 2, 3, 4] });
     for (const column of ['project_name', 'integration_owner', 'next_action', 'blocked_reason',
       'recovery_state', 'recovery_reason', 'last_durable_event_id', 'semantic_key']) {
       expect(columns('supervision_tasks'), column).toContain(column);

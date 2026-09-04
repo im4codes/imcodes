@@ -85,6 +85,8 @@ import {
   isAuthorizedSupervisionConsoleScope,
   type SupervisionConsoleBinding,
 } from './supervision-console-binding.js';
+import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
+import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
 
 let supervisionConsole: SupervisionConsoleBinding | undefined;
 
@@ -1336,6 +1338,13 @@ export async function startup(): Promise<DaemonContext> {
   supervisionAutomation.setServerLink(serverLink);
   // One recovery pass closes the durable ready_for_audit -> dispatch crash
   // window. Post-open hooks own normal materialization; no polling worker.
+  // Restart identity convergence needs the daemon's real view of live runtimes.
+  // Without this the singleton registry had no resolver and every rotated
+  // instance/epoch was refused as owner_mismatch in production while passing in
+  // tests that injected one.
+  setSupervisionLiveParticipantsResolver(
+    (projectName) => resolveLiveSupervisionParticipants(projectName),
+  );
   void dispatchReadyAuditSweep().catch((err) => {
     logger.warn({ err }, 'automatic supervision audit boot sweep failed');
   });

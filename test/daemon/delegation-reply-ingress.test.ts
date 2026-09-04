@@ -448,6 +448,95 @@ describe('delegation reply ingress', () => {
     expect(mocks.timelineEmit).toHaveBeenCalledOnce();
   });
 
+  /**
+   * tsk_6bk shape. The auditor filed its sequence-1 FINAL receipt, but the
+   * post-receipt finish was refused by a repairable lifecycle state. The
+   * ingress reported `blocked` and stopped, so the assignment stayed in
+   * `auditing` until the 60s watchdog -- progress depended on POLLING rather
+   * than on the event that caused it, which is exactly what the finish wire
+   * already refuses to do. A non-verdict stall must never gate the business.
+   */
+  function repairableAuditRecord() {
+    const auditRecord = {
+      ...record,
+      purpose: 'supervision_audit' as const,
+      auditAttemptId: 'attempt_repairable_1',
+      auditRevision: 'revision-repairable-1',
+      auditedSessionName: origin.sessionName,
+      taskId: 'supervision_task_repairable_1',
+      assignmentId: 'supervision_assignment_repairable_1',
+    };
+    mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
+    mocks.store.receive.mockImplementation((input: { result: string }) => ({
+      ok: true, record: { ...auditRecord, result: input.result }, replay: false,
+    }));
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: auditRecord.assignmentId,
+      taskId: auditRecord.taskId,
+      role: 'auditor',
+      auditAttemptId: auditRecord.auditAttemptId,
+      auditRevision: auditRecord.auditRevision,
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
+    return auditRecord;
+  }
+
+  function finalReplyBody(auditRecord: ReturnType<typeof repairableAuditRecord>) {
+    return JSON.stringify({
+      version: PEER_AUDIT_REPLY_VERSION,
+      taskId: auditRecord.taskId,
+      assignmentId: auditRecord.assignmentId,
+      attemptId: auditRecord.auditAttemptId,
+      revision: auditRecord.auditRevision,
+      receiptKind: 'final',
+      verdict: 'PASS',
+      findings: 'Exact frozen bytes verified.',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'green' }],
+    });
+  }
+
+  it('converges once and retries the finish when the post-receipt handoff is repairable', async () => {
+    const auditRecord = repairableAuditRecord();
+    mocks.finishAssignment
+      .mockReset()
+      .mockReturnValueOnce({ ok: false, reason: 'ambiguous_assignment' })
+      .mockReturnValueOnce({ ok: true, value: {}, replay: false });
+
+    await expect(submitPeerAuditReply({
+      rawBody: finalReplyBody(auditRecord),
+      senderSessionName: target.sessionName,
+      now: 120,
+    })).resolves.toEqual({ ok: true });
+
+    // The receipt event itself drove the repair: same assignment, no replacement.
+    expect(mocks.finishAssignment).toHaveBeenCalledTimes(2);
+    const result = JSON.parse(mocks.store.receive.mock.calls[0]![0].result) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      taskId: auditRecord.taskId,
+      assignmentId: auditRecord.assignmentId,
+      verdict: 'PASS',
+      assignmentHandoff: { status: 'finished', replay: false },
+    });
+  });
+
+  it('stays fail-closed and bounded when convergence cannot repair the handoff', async () => {
+    const auditRecord = repairableAuditRecord();
+    mocks.finishAssignment.mockReset().mockReturnValue({ ok: false, reason: 'ambiguous_assignment' });
+
+    await expect(submitPeerAuditReply({
+      rawBody: finalReplyBody(auditRecord),
+      senderSessionName: target.sessionName,
+      now: 130,
+    })).resolves.toEqual({ ok: true });
+
+    // Exactly one bounded retry -- never a loop -- and the exact error survives.
+    expect(mocks.finishAssignment).toHaveBeenCalledTimes(2);
+    const result = JSON.parse(mocks.store.receive.mock.calls[0]![0].result) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      assignmentHandoff: { status: 'blocked', exactError: 'task finish rejected: ambiguous_assignment' },
+    });
+  });
+
   it('rejects a delegated audit receipt that contradicts the authoritative task revision', async () => {
     const auditRecord = {
       ...record,

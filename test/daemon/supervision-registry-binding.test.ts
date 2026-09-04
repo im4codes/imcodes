@@ -41,6 +41,7 @@ import { resolvePeerAuditProviderFamily } from '../../src/daemon/peer-audit-cand
 import {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
+  setSupervisionLiveParticipantsResolver,
 } from '../../src/daemon/supervision-state-store.js';
 
 const SESSION = 'deck_alpha_brain';
@@ -165,5 +166,69 @@ describe('supervision registry binding', () => {
     expect(port.housekeeping({ mode: 'dryRun', projectName: '__legacy_unscoped__', limit: 10 })).toMatchObject({
       mode: 'dryRun', scanned: expect.any(Number), applyAuthorized: false,
     });
+  });
+
+  it('wires the live-participant resolver through the MCP construction path, not only lifecycle.startup', async () => {
+    // R13 audit P1: the resolver was registered ONLY in lifecycle.startup().
+    // `imcodes memory mcp` runs as a SEPARATE process with its own module
+    // state, so in the process that actually serves supervision tools the
+    // resolver stayed undefined, restart identity convergence never ran, and a
+    // rotated same-name owner was refused with owner_mismatch in production
+    // while the startup-based test stayed green.
+    setSupervisionLiveParticipantsResolver(undefined); // a fresh MCP process
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'tsk_mcp_rotate';
+    expect(registry.createOrGet({
+      taskId, projectName: LIVE_CALLER.projectName, classification: 'independent_top_level',
+      objective: 'mcp resolver wiring', currentRevision: 'rev-mcp-1',
+    } as never)).toMatchObject({ ok: true });
+    const stale = {
+      sessionName: LIVE_CALLER.name,
+      sessionInstanceId: 'instance-before',
+      runtimeEpoch: 'epoch-before',
+      agentType: LIVE_CALLER.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(LIVE_CALLER as never),
+    };
+    const owner = registry.createAssignment({
+      taskId, role: 'implementer', identity: stale, scopeFiles: ['src/exact.ts'],
+    } as never);
+    if (!owner.ok) throw new Error('owner: ' + owner.reason);
+    const rotated = {
+      ...stale,
+      sessionInstanceId: LIVE_CALLER.sessionInstanceId,
+      runtimeEpoch: LIVE_CALLER.runtimeEpoch,
+    };
+
+    // Before the MCP server is constructed the process has no resolver at all.
+    expect(registry.updateAssignment({
+      assignmentId: owner.value.assignmentId, identity: rotated, status: 'implementing',
+    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+
+    // Going through the REAL MCP construction path must wire it.
+    const { close } = await connectProductionServer();
+    try {
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId, identity: rotated, status: 'implementing',
+      } as never)).toMatchObject({ ok: true });
+      const bound = registry.getAssignment(owner.value.assignmentId)!;
+      expect(bound.assignmentId).toBe(owner.value.assignmentId); // same object
+      expect(bound.identity.runtimeEpoch).toBe(LIVE_CALLER.runtimeEpoch);
+
+      // Fail-closed still holds for an identity the daemon does not observe.
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId,
+        identity: { ...stale, sessionInstanceId: 'ghost', runtimeEpoch: 'ghost-epoch' },
+        status: 'implementing',
+      } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+      // ...and for a same-name candidate whose agent/provider differ.
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId,
+        identity: { ...rotated, agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+        status: 'implementing',
+      } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    } finally {
+      await close();
+    }
   });
 });

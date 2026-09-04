@@ -46,6 +46,7 @@ import {
   SUPERVISION_MODE,
   SUPERVISION_CONTRACT_IDS,
   isAuditableSupervisionTaskClassification,
+  isTerminalSupervisionTaskStatus,
   isSupervisionTaskAuditPolicy,
   readSupervisionSnapshotFromTransportConfig,
   supervisionTaskAuditPolicyFromSnapshot,
@@ -2190,31 +2191,96 @@ export async function dispatchReadyAudit(
     (assignment.role === 'implementer' || assignment.role === 'integration_owner')
     && Boolean(exactLiveSessionForAssignment(assignment, sessions))
   ));
+  // Blocker reporting is a Brain-EXCEPTION channel: when no coordinator is
+  // live there is simply nobody to notify, which must never stop the daemon
+  // from making its own deterministic progress.
+  const reportBlocker = async (
+    from: PersistedSupervisionTaskAssignment,
+    reason: string,
+  ): Promise<boolean> => (coordinator
+    ? reportAutomaticAuditBlocker(task, from, coordinator, reason, deps)
+    : false);
+
   const revision = task.currentRevision?.trim();
   if (!revision) {
     const reason = 'missing_current_revision';
     const reported = reporter && coordinator
-      ? await reportAutomaticAuditBlocker(task, reporter, coordinator, reason, deps)
+      ? await reportBlocker(reporter, reason)
       : false;
     return { status: 'blocked', reason, reported };
   }
+
+  // Never replace a recovered human attempt with the canonical derivation.
+  const attemptId = recoveredAttemptId ?? automaticAuditAttemptId(task.taskId, revision);
+  // PREFLIGHT, and it must stay AHEAD OF EVERY LIFECYCLE WRITE.
+  //
+  // The R12 audit caught this below the implementer alignment: a replay did
+  // correctly report `final_receipt_recorded`, but the alignment had already
+  // moved the owner implementing -> ready_for_audit, so the next successor
+  // bind failed with `old_revision`. Audit readiness is never INFERRED here --
+  // it is read from durable receipts before anything is written.
+  // An accepted FINAL receipt for this exact attempt+revision means
+  // the audit is already decided, whatever the assignment/task rows still say.
+  // Observed on tsk_4d0/asg_6h3: a queued replay arrived before the tick that
+  // closes the auditor, so the whole audit was re-delivered and re-run, and the
+  // duplicate was only caught at the very end by `attempt_mismatch` on
+  // peer_audit_reply -- after the artifacts had been read and the tests re-run.
+  // Checking the durable receipt FIRST makes that a deterministic no-op, and it
+  // must not depend on convergence having already advanced the task.
+  const decidedByFinalReceipt = registry.listAuditReceipts(task.taskId).some((receipt) => (
+    receipt.attemptId === attemptId
+    && receipt.revision === revision
+    && receipt.receiptKind === 'final'
+    && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
+  ));
+  if (decidedByFinalReceipt) return { status: 'ignored', reason: 'final_receipt_recorded' };
 
   const implementers = task.assignments.filter((assignment) => (
     (assignment.role === 'implementer' || assignment.role === 'integration_owner')
     && assignment.status === 'ready_for_audit'
     && assignment.auditRevision === revision
   ));
-  const implementer = implementers.length === 1 ? implementers[0] : undefined;
-  if (!implementer || !coordinator) {
-    const exactError = !implementer ? 'automatic audit requires one exact ready implementer revision' : 'automatic audit requires the live same-project Brain coordinator';
+  let implementer = implementers.length === 1 ? implementers[0] : undefined;
+  if (!implementer) {
+    // A record status is a projection of durable facts, not a gate the model
+    // must unlock in order. After a valid REWORK and resumed implementation the
+    // owner sits at `implementing` while the TASK is ready_for_audit, so the
+    // strict filter above found nothing and the round stalled on
+    // `automatic audit requires one exact ready implementer revision`.
+    //
+    // When the facts are unambiguous -- exactly ONE non-terminal implementation
+    // owner whose revision does not contradict task.currentRevision -- align the
+    // projection atomically on that same assignment and continue. Nothing is
+    // fabricated: the revision comes from the task, and a contradicting or
+    // ambiguous revision still fails closed below.
+    const alignable = task.assignments.filter((assignment) => (
+      (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+      && !isTerminalSupervisionTaskStatus(assignment.status)
+      && (!assignment.auditRevision?.trim() || assignment.auditRevision === revision)
+    ));
+    if (alignable.length === 1) {
+      const target = alignable[0]!;
+      const aligned = registry.updateAssignment({
+        assignmentId: target.assignmentId,
+        identity: target.identity,
+        status: 'ready_for_audit',
+        revision,
+        auditRevision: revision,
+      });
+      if (aligned.ok) implementer = registry.get(taskId)?.assignments
+        .find((assignment) => assignment.assignmentId === target.assignmentId);
+    }
+  }
+  if (!implementer) {
+    const exactError = 'automatic audit requires one exact ready implementer revision';
     const reported = reporter && coordinator
-      ? await reportAutomaticAuditBlocker(task, reporter, coordinator, exactError, deps)
+      ? await reportBlocker(reporter, exactError)
       : false;
     return { status: 'blocked', reason: exactError, reported };
   }
 
-  // Never replace a recovered human attempt with the canonical derivation.
-  const attemptId = recoveredAttemptId ?? automaticAuditAttemptId(task.taskId, revision);
+  // attemptId and the final-receipt PREFLIGHT are established above, ahead of
+  // every lifecycle write.
   const existingAudits = task.assignments.filter((assignment) => (
     assignment.role === 'auditor'
     && assignment.auditRevision === revision
@@ -2222,7 +2288,7 @@ export async function dispatchReadyAudit(
   ));
   if (existingAudits.length > 1) {
     const reason = 'multiple live auditors exist for the exact revision';
-    const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+    const reported = await reportBlocker(implementer, reason);
     return { status: 'blocked', reason, reported };
   }
   const existingAudit = existingAudits[0];
@@ -2237,12 +2303,12 @@ export async function dispatchReadyAudit(
     const target = exactLiveSessionForAssignment(existingAudit, sessions);
     if (!target) {
       const reason = 'existing automatic auditor identity is no longer live';
-      const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+      const reported = await reportBlocker(implementer, reason);
       return { status: 'blocked', reason, reported };
     }
     if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) !== 'transport') {
       const reason = 'existing automatic auditor is not a transport runtime target';
-      const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+      const reported = await reportBlocker(implementer, reason);
       return { status: 'blocked', reason, reported };
     }
     const messageId = deterministicSendMessageId(`auto-audit:${existingAudit.assignmentId}:${attemptId}`);
@@ -2253,7 +2319,23 @@ export async function dispatchReadyAudit(
     if (recoveredHandoff) recoveredExistingMessageId = messageId;
   }
 
-  const brain = exactLiveSessionForAssignment(coordinator, sessions)!;
+  // Pool scoping context, NOT a relay. The audit envelope is delivered straight
+  // to the auditor either way; this session only scopes the eligible-pool query
+  // (userId/sessionName/project). Requiring it to be a live Brain made the
+  // normal automatic path depend on a Brain session being up, and when it was
+  // not the daemon blocked and a human had to drive the manual two-step relay.
+  // The implementer is same-project and already authoritative here, so it is a
+  // correct fallback scope; identity, pool eligibility and the cross-vendor
+  // pick below are unchanged.
+  const brain = (coordinator ? exactLiveSessionForAssignment(coordinator, sessions) : undefined)
+    ?? exactLiveSessionForAssignment(implementer, sessions);
+  if (!brain) {
+    const reason = 'automatic audit requires one live same-project session to scope the auditor pool';
+    const reported = reporter && coordinator
+      ? await reportBlocker(reporter, reason)
+      : false;
+    return { status: 'blocked', reason, reported };
+  }
   // Automatic materialization is deliberately transport-only. Process peers
   // remain valid for the existing Brain-controlled exact/manual audit path,
   // but plain tmux delivery has no recipient-side durable command-id boundary
@@ -2308,7 +2390,7 @@ export async function dispatchReadyAudit(
   }
   if (result.status !== 'accepted' || !result.assignmentId) {
     const reason = result.status === 'error' ? result.error : `automatic audit dispatch ${result.status}`;
-    const reported = await reportAutomaticAuditBlocker(task, implementer, coordinator, reason, deps);
+    const reported = await reportBlocker(implementer, reason);
     return { status: 'blocked', reason, reported };
   }
   const messageId = result.messageId

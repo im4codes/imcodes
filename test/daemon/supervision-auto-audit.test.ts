@@ -1076,6 +1076,61 @@ describe('automatic supervision audit materialization', () => {
     expect(dispatch).not.toHaveBeenCalled();
   });
 
+  it('asks Brain exactly once for the same ambiguity across repeated ticks and changes no authority', async () => {
+    // Genuine ambiguity is a Brain decision, but it must be asked ONCE: the
+    // dedupe key has to be derived from (task, revision, exactError) so a
+    // repeated tick or a restart recognises the question it already sent.
+    // Evidence here is keyed by the exact messageId, so a drifting key shows up
+    // as a second request rather than being masked by a boolean flag.
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    const second = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_worker2'),
+      auditRevision: revision, scopeFiles: ['src/other.ts'],
+    });
+    if (!second.ok) throw new Error(second.reason);
+    expect(registry.updateAssignment({
+      assignmentId: second.value.assignmentId, identity: second.value.identity,
+      status: 'ready_for_audit', revision, auditRevision: revision,
+    } as never)).toMatchObject({ ok: true });
+
+    const delivered = new Set<string>();
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      expect(input.audit).toBeUndefined(); // never an audit envelope: this is a question
+      delivered.add(String(input.internalMessageId));
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: input.internalMessageId!,
+        deliveries: [{ target: 'deck_alpha_brain', status: 'queued' as const }],
+      };
+    });
+    const deps = {
+      registry,
+      listSessions: () => [
+        session('deck_alpha_brain', 'brain'),
+        session('deck_alpha_worker', 'w1'),
+        session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+      ],
+      listTargets: listTargetRecords(session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic')),
+      dispatch,
+      hasDeliveryEvidence: (_s: string, messageId: SendMessageId) => delivered.has(String(messageId)),
+    };
+
+    const before = JSON.stringify(registry.get(taskId));
+    const first = await dispatchReadyAudit(taskId, deps);
+    const secondRun = await dispatchReadyAudit(taskId, deps);
+    const third = await dispatchReadyAudit(taskId, deps);
+
+    expect(first.status).toBe('blocked');
+    expect(secondRun.status).toBe('blocked');
+    expect(third.status).toBe('blocked');
+    // ONE question, not one per tick.
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(delivered.size).toBe(1);
+    // And nothing was decided while waiting for the answer.
+    expect(JSON.stringify(registry.get(taskId))).toBe(before);
+  });
+
   it('leaves process-only candidates unmaterialized and reports one durable Brain blocker', async () => {
     const { registry, taskId } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });
     let blockerDelivered = false;
@@ -1164,6 +1219,174 @@ describe('periodic supervision convergence tick', () => {
     })).toMatchObject({ ok: true });
     return registry.getAssignment(stale.value.assignmentId)!;
   }
+
+  it('mutates NO lifecycle state when the exact attempt already has an accepted final receipt', async () => {
+    // R12 audit P1: the preflight ran AFTER the implementer alignment write, so
+    // a replay that correctly reported `final_receipt_recorded` had already
+    // moved the owner implementing -> ready_for_audit. The next successor bind
+    // then failed with `old_revision`. Readiness must never be inferred without
+    // durable validation/handoff evidence, and a no-op must write nothing.
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    const attemptId = automaticAttempt(taskId, revision);
+    // The implementer is deliberately still `implementing` with no anchor: the
+    // shape the alignment block would rewrite.
+    const owner = registry.get(taskId)!.assignments.find((a) => a.role === 'implementer')!;
+    expect(registry.coordinateTaskAssignment({
+      taskId, assignmentId: owner.assignmentId, assignmentStatus: 'implementing',
+      leaseAction: 'renew', idempotencyKey: 'preflight-shape', reason: 'return to implementer',
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.assignmentId)!.status).toBe('implementing');
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity,
+      auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision, receiptKind: 'final', verdict: 'REWORK',
+      findings: 'already decided', validations: [],
+    } as never)).toMatchObject({ ok: true });
+
+    const before = JSON.stringify(registry.get(taskId));
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    const dispatch = vi.fn(async () => { throw new Error('must not dispatch'); });
+    const result = await dispatchReadyAudit(taskId, {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => false,
+    });
+
+    expect(result).toMatchObject({ status: 'ignored', reason: 'final_receipt_recorded' });
+    expect(dispatch).not.toHaveBeenCalled();
+    // The decisive assertion: not one byte of lifecycle state moved.
+    expect(JSON.stringify(registry.get(taskId))).toBe(before);
+    expect(registry.getAssignment(owner.assignmentId)!.status).toBe('implementing');
+  });
+
+  it('no-ops before doing any work when the exact attempt already has an accepted final receipt', async () => {
+    // tsk_4d0/asg_6h3 shape: a queued replay/heartbeat arrived for an attempt
+    // whose auditor had ALREADY filed an accepted final PASS. The audit was
+    // re-run end to end and only discovered at the very last step, via
+    // attempt_mismatch on peer_audit_reply. The daemon must recognise the
+    // closed receipt up front and deterministically do nothing.
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    const attemptId = automaticAttempt(taskId, revision);
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity,
+      auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision, receiptKind: 'final', verdict: 'PASS',
+      findings: 'exact frozen bytes verified', validations: [],
+    } as never)).toMatchObject({ ok: true });
+    // Deliberately do NOT run convergence first: a queued replay can arrive
+    // before the tick that closes the auditor, and the preflight must not
+    // depend on that ordering.
+    expect(registry.getAssignment(auditor.value.assignmentId)!.status).toBe('auditing');
+    expect(registry.get(taskId)!.status).toBe('ready_for_audit');
+
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    const dispatch = vi.fn(async () => { throw new Error('must not dispatch a second audit'); });
+    const deps = {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => false,
+    };
+
+    const result = await dispatchReadyAudit(taskId, deps);
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: 'ignored', reason: 'final_receipt_recorded' });
+    // No replacement auditor and no second attempt were minted.
+    const auditors = registry.get(taskId)!.assignments.filter((a) => a.role === 'auditor');
+    expect(auditors).toHaveLength(1);
+    expect(auditors[0]!.auditAttemptId).toBe(attemptId);
+    expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+  });
+
+  it('dispatches directly to the exact auditor with no live Brain coordinator session', async () => {
+    // tsk_4d0 shape. The normal automatic path must not depend on a Brain
+    // session being live: the daemon owns selection and delivery, and Brain is
+    // only an exception path. Previously this blocked with
+    // `automatic audit requires the live same-project Brain coordinator`,
+    // which is what forced the manual two-step relay.
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    const sessions = [
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidence = false;
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId,
+        auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000000' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId: created.value.assignmentId,
+      };
+    });
+    const deps = {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[1]!), dispatch,
+      hasDeliveryEvidence: () => evidence,
+    };
+
+    const first = await runSupervisionConvergenceTick(deps);
+
+    expect(first.audits).toEqual([
+      expect.objectContaining({ status: 'dispatched', attemptId: automaticAttempt(taskId, revision) }),
+    ]);
+    // Exactly one envelope, delivered straight to the auditor -- no Brain relay.
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    const delivered = dispatch.mock.calls[0]![1];
+    expect(delivered.target).toBe('deck_alpha_auditor');
+    expect(delivered.audit?.attemptId).toBe(automaticAttempt(taskId, revision));
+    expect(sessions.some((entry) => entry.name.endsWith('_brain'))).toBe(false);
+
+    // Repeated ticks keep the SAME attempt and do not re-deliver.
+    const second = await runSupervisionConvergenceTick(deps);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(second.audits).toEqual([
+      expect.objectContaining({ attemptId: automaticAttempt(taskId, revision) }),
+    ]);
+  });
 
   it('dispatches a ready_for_audit task from the periodic tick, not only the boot sweep', async () => {
     __resetSupervisionConvergenceTickForTests();
@@ -1540,5 +1763,162 @@ describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('R5: deterministic implementer/revision alignment before materialization', () => {
+  /**
+   * tsk_5oc shape: a valid REWORK closed round one, implementation resumed, and
+   * the task is ready_for_audit again with exactly ONE non-terminal implementer
+   * and an unambiguous currentRevision -- yet the strict filter demanded
+   * status==='ready_for_audit' AND auditRevision===revision on the assignment,
+   * found nothing, and returned
+   * `automatic audit requires one exact ready implementer revision`.
+   */
+  function resumedAfterRework(revision = 'r5-resumed') {
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const taskId = 'tsk_5oc_shape';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'resumed after rework', currentRevision: revision,
+      auditPolicy: 'auto_strict_cross_vendor',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', identity: identity('deck_alpha_brain'), required: false,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
+      auditRevision: revision, scopeFiles: ['src/exact.ts'],
+    } as never);
+    if (!worker.ok) throw new Error(worker.reason);
+    // Round one ran and came back REWORK; implementation then resumed, so the
+    // assignment sits at `implementing` while the TASK is ready_for_audit.
+    for (const status of ['implementing', 'ready_for_audit', 'auditing', 'rework', 'implementing'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: worker.value.assignmentId, identity: worker.value.identity, status,
+        auditRevision: revision,
+        ...(status === 'rework' ? { verdict: 'REWORK' } : {}),
+      } as never), `worker -> ${status}`).toMatchObject({ ok: true });
+    }
+    expect(registry.updateTask({ taskId, status: 'ready_for_audit' } as never)).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(taskId)!.status).toBe('ready_for_audit');
+    expect(registry.getAssignment(worker.value.assignmentId)!.status).toBe('implementing');
+    return { registry, taskId, revision, worker: worker.value };
+  }
+
+  it('aligns the unique non-terminal implementer and materializes exactly one auditor', async () => {
+    const { registry, taskId, revision, worker } = resumedAfterRework();
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidence = false;
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      // A blocker report also rides dispatch but carries no audit envelope.
+      if (!input.audit) {
+        return {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+          messageId: 'send_message_00000000-0000-5000-a000-000000000001' as SendMessageId,
+          deliveries: [{ target: 'deck_alpha_brain', status: 'queued' as const }],
+        };
+      }
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit.attemptId, auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000000' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId, assignmentId: created.value.assignmentId,
+      };
+    });
+
+    const result = await dispatchReadyAudit(taskId, {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => evidence,
+    });
+
+    expect(result).toMatchObject({ status: 'dispatched', attemptId: automaticAttempt(taskId, revision) });
+    // The projection was aligned atomically on the SAME assignment.
+    const aligned = registry.getAssignment(worker.assignmentId)!;
+    expect(aligned.assignmentId).toBe(worker.assignmentId);
+    expect(aligned.auditRevision).toBe(revision);
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toHaveLength(1);
+  });
+
+  it('refuses to align an implementer that is pinned to a different revision', () => {
+    // Exactly one non-terminal implementer, but it carries a DIFFERENT revision.
+    // Aligning it would silently move audited-scope bytes across a revision
+    // boundary, so this must fail closed rather than converge.
+    const { registry, taskId, revision, worker } = resumedAfterRework();
+    expect(registry.updateAssignment({
+      assignmentId: worker.assignmentId, identity: worker.identity,
+      revision: `${revision}-other`, auditRevision: `${revision}-other`,
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(worker.assignmentId)!.auditRevision).toBe(`${revision}-other`);
+    expect(registry.updateTask({ taskId, status: 'ready_for_audit' } as never)).toMatchObject({ ok: true });
+
+    return dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => [session('deck_alpha_brain', 'brain'), session('deck_alpha_worker', 'w1')],
+      listTargets: listTargetRecords(session('deck_alpha_brain', 'brain')),
+      dispatch: vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+        if (input.audit) throw new Error('must not materialize across a revision boundary');
+        return {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+          messageId: 'send_message_00000000-0000-5000-a000-000000000001' as SendMessageId,
+          deliveries: [{ target: 'deck_alpha_brain', status: 'queued' as const }],
+        };
+      }) as never,
+      hasDeliveryEvidence: () => false,
+    }).then((result) => {
+      expect(result).toMatchObject({ status: 'blocked' });
+      // The pinned revision must be left exactly as it was.
+      expect(registry.getAssignment(worker.assignmentId)!.auditRevision).toBe(`${revision}-other`);
+      expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+    });
+  });
+
+  it('still fails closed when two non-terminal implementers make the choice ambiguous', async () => {
+    const { registry, taskId, revision } = resumedAfterRework();
+    const second = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_second'),
+      auditRevision: revision, scopeFiles: ['src/other.ts'],
+    } as never);
+    if (!second.ok) throw new Error(second.reason);
+    expect(registry.updateAssignment({
+      assignmentId: second.value.assignmentId, identity: second.value.identity, status: 'implementing',
+      auditRevision: revision,
+    } as never)).toMatchObject({ ok: true });
+    const sessions = [session('deck_alpha_brain', 'brain'), session('deck_alpha_worker', 'w1')];
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      if (input.audit) throw new Error('must not materialize an auditor on ambiguity');
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000001' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_brain', status: 'queued' as const }],
+      };
+    });
+
+    const result = await dispatchReadyAudit(taskId, {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[0]!), dispatch: dispatch as never,
+      hasDeliveryEvidence: () => false,
+    });
+
+    expect(result).toMatchObject({ status: 'blocked' });
+    expect(dispatch.mock.calls.some((call) => Boolean(call[1].audit))).toBe(false);
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
   });
 });

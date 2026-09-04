@@ -30,6 +30,7 @@ import { emitDelegationReplyDelivered } from './delegation-reply-events.js';
 import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
+import { advanceSupervisionTaskAfterAuditReceipt } from './supervision-convergence-wire.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const inFlight = new Map<string, Promise<DelegationReplyIngressResult>>();
@@ -240,12 +241,21 @@ async function submitDelegatedPeerAuditReply(input: {
     if (receiptKind === 'progress') return { ok: true };
     if (persisted.ok) {
       try {
-        const finished = registry.finishAssignment({
+        const runFinish = () => registry.finishAssignment({
           assignmentId,
           identity: auditAssignment.identity,
           revision,
           now: input.receivedAt,
         });
+        let finished = runFinish();
+        if (!finished.ok) {
+          // The receipt event -- not the next 60s poll -- drives the repair.
+          // One bounded, deterministic convergence pass, then exactly one
+          // retry of the SAME authoritative finish. A state that was not
+          // repairable refuses again below with its exact error intact.
+          await advanceSupervisionTaskAfterAuditReceipt(taskId);
+          finished = runFinish();
+        }
         assignmentHandoff = finished.ok
           ? { status: 'finished', replay: finished.replay === true }
           : { status: 'blocked', exactError: `task finish rejected: ${finished.reason}` };

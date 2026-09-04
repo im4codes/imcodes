@@ -14,6 +14,7 @@ import {
 import {
   SUPERVISION_PROMPT_ENTRYPOINTS,
   SUPERVISED_AUDIT_EXECUTION_PREAMBLE,
+  buildBrainSupervisedWorkDelegationContract,
   buildSupervisedAuditExecutionPreamble,
   buildSupervisionExecutionPreamble,
   buildSupervisionWaitingHeartbeatPrompt,
@@ -55,10 +56,11 @@ describe('supervision prompts', () => {
       existingTask: 'append', busy: 'durable_fifo', queue: 'genuinely_new_work_only', replacementObject: false,
     });
     expect(messaging.peer_audit_reply).toMatchObject({ verdictChannel: 'only' });
+    // target/ignore/order are defined ONCE, by the delegation-eligibility
+    // contract that ships in the same preamble; messaging points at it instead
+    // of keeping a second copy that can drift.
     expect(messaging.automaticAudit).toMatchObject({
-      target: 'live_started_authorized_transport',
-      eligibilityIgnores: ['replyCapable', 'restartDurableDeliveryId'],
-      order: ['ready', 'auto_provision', 'busy_fifo'],
+      eligibility: 'supervision_delegation_eligibility_v1',
     });
     expect(messaging.heartbeat.substitutesReply).toBe(false);
 
@@ -80,8 +82,8 @@ describe('supervision prompts', () => {
       buildSupervisionMessagingContract(),
     ].join('\n');
     expect(core.length).toBeLessThan(3_500); // before: 6,901 chars without messaging
-    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(4_500); // before: 7,984
-    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(4_700); // before: 8,847
+    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(5_000); // before: 7,984; raised for the escalation duty
+    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(5_200); // before: 8,847; raised for the escalation duty
   });
 
   // Wording snapshot, NOT a behavioural gate. There is no execution-time
@@ -609,5 +611,113 @@ describe('supervision user authority clause', () => {
       expect(contract.recovery.forbid).toEqual(expect.arrayContaining(['poll_loop', 'replacement_object']));
       expect(contract.evidence.fabricateOrInfer).toBe(false);
     }
+  });
+
+  it('injects the sub-session escalation duty into BOTH preambles without losing existing safety semantics', () => {
+    // The duty must reach the MODEL, not just the daemon: a sub-session that
+    // goes quiet, writes a local-only blocker, re-heartbeats the same state,
+    // guesses, or goes straight to the user is exactly what this prevents.
+    for (const preamble of [
+      buildSupervisionExecutionPreamble('en'),
+      buildSupervisedAuditExecutionPreamble('en'),
+    ]) {
+      expect(preamble).toContain('escalate');
+      expect(preamble).toContain('ambiguous_candidates');
+      expect(preamble).toContain('no_unique_recovery_target');
+      expect(preamble).toContain('exactly_one_structured_decision_request_to_authoritative_brain');
+      for (const forbidden of ['silent_wait', 'local_blocker_only', 'repeated_heartbeat', 'guess', 'ask_user_directly']) {
+        expect(preamble).toContain(forbidden);
+      }
+      expect(preamble).toContain('continue_same_object');
+      expect(preamble).toContain('only_when_brain_also_lacks_external_information');
+      expect(preamble).toContain('exact_pass_or_rework');
+      expect(preamble).toContain('"brainChatter":false');
+      expect(preamble).toContain('options');
+    }
+
+    // Compression must not have dropped any pre-existing safety semantics.
+    const messaging = JSON.parse(buildSupervisionMessagingContract());
+    expect(messaging.send_message).toEqual({
+      existingTask: 'append', busy: 'durable_fifo', queue: 'genuinely_new_work_only', replacementObject: false,
+    });
+    expect(messaging.binding).toEqual({
+      unchanged: 'continue_existing', changed: 'delta_only', unknownOrMismatch: 'fail_closed',
+    });
+    expect(messaging.delegation_reply).toEqual({ auth: 'daemon_session', mode: 'append_only', verdict: false });
+    expect(messaging.peer_audit_reply).toEqual({
+      verdictChannel: 'only',
+      bind: ['taskId', 'assignmentId', 'attemptId', 'revision'],
+      progress: true,
+      final: ['PASS', 'REWORK'],
+    });
+    expect(messaging.blocker.immediateReply).toBe(true);
+    expect(messaging.blocker.fields).toEqual(expect.arrayContaining([
+      'taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'options',
+    ]));
+    expect(messaging.heartbeat).toEqual({ reminderOnly: true, substitutesReply: false });
+    expect(messaging.gate).toBe('tool_schema+authority_handler');
+    // automaticAudit no longer restates target/ignore/order; it POINTS at the
+    // single definition, which must still ship in the same preamble.
+    expect(messaging.automaticAudit).toMatchObject({
+      materialize: 'once_after_open_audit',
+      eligibility: 'supervision_delegation_eligibility_v1',
+      recovery: 'boot_sweep',
+      successChatter: false,
+    });
+    const eligibility = JSON.parse(buildSupervisionDelegationEligibilityPolicy('en'));
+    expect(eligibility.independentAudit.automatic).toMatchObject({
+      target: 'live_started_authorized_transport',
+      ignore: ['replyCapable', 'restartDurableDeliveryId'],
+      order: ['ready', 'auto_provision', 'busy_fifo'],
+    });
+  });
+
+  // Brain-only authority is a duty, not a permission. Three separately
+  // checkable clauses, one test each, so a regression in any single clause is
+  // attributable on its own rather than hidden behind the other two.
+  it('requires Brain to personally perform a Brain-only repair and resume the same object', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.authorityDuty.when)
+      .toBe('brain_only_control_plane_identity_or_binding_repair_that_is_safe_and_uniquely_determined');
+    expect(contract.authorityDuty.mustAct)
+      .toBe('personally_invoke_authoritative_tool_then_resume_same_object');
+  });
+
+  it('forbids Brain from handing a Brain-only operation or its responsibility to the user', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.authorityDuty.mustNotOffload).toEqual([
+      'operation_to_user', 'responsibility_to_user', 'ask_user_to_run_brain_only_tool',
+    ]);
+  });
+
+  it('allows NEEDS_INPUT only after authorized tools are exhausted and external information is genuinely missing', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.authorityDuty.needsInput)
+      .toBe('only_after_authorized_tools_exhausted_and_external_information_or_authorization_genuinely_missing');
+  });
+
+  it('keeps the Brain duty at the Brain entrypoint and only a compact escalation ref in sub-session preambles', () => {
+    // Placement matters as much as content. The full duty belongs where Brain
+    // actually acts; restating it in every sub-session preamble would spend the
+    // preamble budget on text the sub-session cannot act on. The sub-session
+    // keeps only what IT needs: the duty to escalate upward.
+    const brain = buildBrainSupervisedWorkDelegationContract('en');
+    expect(brain).toContain('personally_invoke_authoritative_tool_then_resume_same_object');
+
+    for (const preamble of [
+      buildSupervisionExecutionPreamble('en'),
+      buildSupervisedAuditExecutionPreamble('en'),
+    ]) {
+      // The Brain-only duty body is NOT duplicated down here...
+      expect(preamble).not.toContain('personally_invoke_authoritative_tool_then_resume_same_object');
+      expect(preamble).not.toContain('ask_user_to_run_brain_only_tool');
+      // ...while the sub-session can still escalate to the authoritative Brain.
+      expect(preamble).toContain('escalate');
+      expect(preamble).toContain('exactly_one_structured_decision_request_to_authoritative_brain');
+    }
+
+    // And the budgets must not regress because of this change.
+    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(5_000 - 250);
+    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(5_200 - 250);
   });
 });

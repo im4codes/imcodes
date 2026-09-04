@@ -17,7 +17,7 @@
 import { SUPERVISION_TASK_LIFECYCLE_STATUSES } from '../../shared/supervision-config.js';
 
 /** Bump with every migration appended below. */
-export const SUPERVISION_SCHEMA_VERSION = 3;
+export const SUPERVISION_SCHEMA_VERSION = 4;
 
 /** Minimal surface we need; avoids importing node:sqlite types at the boundary. */
 export interface SupervisionMigrationDb {
@@ -248,7 +248,28 @@ const MIGRATION_3: SupervisionMigration = {
   },
 };
 
-export const SUPERVISION_MIGRATIONS: readonly SupervisionMigration[] = Object.freeze([MIGRATION_1, MIGRATION_2, MIGRATION_3]);
+const MIGRATION_4: SupervisionMigration = {
+  version: 4,
+  description: 'durable convergence rotation cursor so a bounded pass cannot starve a live backlog',
+  up(db) {
+    // One row. Convergence walks live tasks in bounded windows ordered by
+    // task_id and records where the window ended, so the NEXT tick resumes
+    // after it and wraps around. Without a durable position a restart would
+    // always rescan the same head of the ring and whatever sits past the
+    // window would never be reached.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS supervision_convergence_cursor (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        task_id TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO supervision_convergence_cursor (id, task_id, updated_at)
+        VALUES (1, '', 0);
+    `);
+  },
+};
+
+export const SUPERVISION_MIGRATIONS: readonly SupervisionMigration[] = Object.freeze([MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4]);
 
 export function readSupervisionSchemaVersion(db: SupervisionMigrationDb): number {
   const row = db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;

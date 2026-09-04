@@ -151,6 +151,13 @@ export interface SupervisionStateStoreOptions {
   dbPath?: string;
   database?: DatabaseSyncInstance;
   busyTimeoutMs?: number;
+  /**
+   * Live, non-stopped runtimes for a project, supplied by the daemon's session
+   * registry. The registry cannot observe runtimes itself, but the RULE for
+   * accepting one stays here so no caller can widen it.
+   */
+  resolveLiveParticipants?: (projectName: string | null | undefined)
+    => readonly PersistedSupervisionTaskAssignmentIdentity[];
 }
 
 export interface SupervisionWaitStateStore {
@@ -525,7 +532,10 @@ export interface SupervisionLifecycleConvergenceAction {
     | 'align_revision_projection'
     | 'project_validated_handoff'
     | 'close_recorded_audit_receipt'
-    | 'rebind_stale_coordinator';
+    | 'rebind_stale_coordinator'
+    | 'retire_consumed_finalized_implementer'
+    | 'retire_stale_finalized_owner_projection'
+    | 'clear_consumed_finalized_owner_pointer';
 }
 
 /** Runtime authority the registry cannot know by itself. */
@@ -1017,9 +1027,11 @@ function deterministicTerminalAggregate(
 export class SupervisionTaskRegistry {
   readonly #db: DatabaseSyncInstance;
   readonly #ownsDb: boolean;
+  readonly #resolveLiveParticipants?: SupervisionStateStoreOptions['resolveLiveParticipants'];
   #closed = false;
 
   constructor(options: SupervisionStateStoreOptions = {}) {
+    this.#resolveLiveParticipants = options.resolveLiveParticipants;
     if (options.database) { this.#db = options.database; this.#ownsDb = false; }
     else {
       const dbPath = options.dbPath?.trim()
@@ -1161,6 +1173,13 @@ export class SupervisionTaskRegistry {
         ON supervision_audit_receipts(attempt_id, revision, sequence);
       CREATE INDEX IF NOT EXISTS supervision_audit_receipts_task_idx
         ON supervision_audit_receipts(task_id, created_at);
+      CREATE TABLE IF NOT EXISTS supervision_convergence_cursor (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        task_id TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO supervision_convergence_cursor (id, task_id, updated_at)
+        VALUES (1, '', 0);
       CREATE TABLE IF NOT EXISTS supervision_housekeeping_state (
         project_name TEXT PRIMARY KEY,
         apply_authorized INTEGER NOT NULL DEFAULT 0,
@@ -2043,7 +2062,8 @@ export class SupervisionTaskRegistry {
   updateAssignment(input: SupervisionTaskAssignmentUpdateInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const existing = this.getAssignment(input.assignmentId);
     if (!existing) return { ok: false, reason: 'not_found' };
-    if (!identityMatches(existing.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
+    const authorizedIdentity = this.#authorizeParticipant(existing, input.identity);
+    if (!authorizedIdentity) return { ok: false, reason: 'owner_mismatch' };
     const task = this.getTaskRecord(existing.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
     const nextStatus = input.status ?? existing.status;
@@ -2081,10 +2101,20 @@ export class SupervisionTaskRegistry {
     // implementation state. Auditors never rebind their own revision, and a
     // task that already carries Git/finalization authority is never rewritten
     // here.
+    // A Brain coordination override back to implementing/rework RESETS the
+    // audit anchor (`resetsAudit` clears auditAttemptId/auditRevision/verdict).
+    // The owner is then anchorless, so this rule could not fire and the next
+    // frozen revision was refused as `old_revision` -- the asg_4xi/R6 shape,
+    // which needed a human to re-bind the anchor by hand every round. The
+    // anchor is not lost, only unrecorded: it is recoverable from durable
+    // evidence, namely the unique final receipt against the revision the task
+    // still points at.
+    const successorAnchor = normalizeTaskString(existing.auditRevision)
+      ?? this.#derivedSuccessorAnchor(task, existing);
     const bindsSuccessorRevision = existing.role !== 'auditor'
       && Boolean(requestedRevision)
-      && Boolean(existing.auditRevision)
-      && requestedRevision !== existing.auditRevision
+      && Boolean(successorAnchor)
+      && requestedRevision !== successorAnchor
       && (existing.status === 'implementing' || existing.status === 'rework');
     // The owner is ALREADY on the successor -- an auditRevision-only update
     // binds it successfully -- while task.currentRevision still lags. By
@@ -2187,6 +2217,7 @@ export class SupervisionTaskRegistry {
     const advancesPastFinalizedRevision = attemptsAdvancePastFinalizedRevision
       && activeFinalizedSuccessors.length === 1
       && activeFinalizedSuccessors[0]?.assignmentId === existing.assignmentId;
+    const historicalFinalizationOnly = this.#historicalFinalizationOnly(task);
     const movesTaskRevisionToSuccessor = (bindsSuccessorRevision || completesSuccessorRevision)
       && task.classification !== 'integration_task'
       && Boolean(requestedRevision)
@@ -2212,8 +2243,9 @@ export class SupervisionTaskRegistry {
       if (['blocked', 'cancelled'].includes(task.status)) {
         return { ok: false, reason: 'invalid_transition', detail: rejectDetail };
       }
-      if (task.finalization || task.commitSha
-        || ['committed', 'pushed', 'finalized'].includes(task.status)) {
+      if (!historicalFinalizationOnly
+        && (task.finalization || task.commitSha
+        || ['committed', 'pushed', 'finalized'].includes(task.status))) {
         return { ok: false, reason: 'invalid_transition', detail: rejectDetail };
       }
       // 4. Downgrade, decided from existing object relations: the requested
@@ -2261,8 +2293,9 @@ export class SupervisionTaskRegistry {
       }
     }
     if (bindsSuccessorRevision || completesSuccessorRevision) {
-      if (task.finalization || task.commitSha
-        || ['committed', 'pushed', 'finalized'].includes(task.status)) {
+      if (!historicalFinalizationOnly
+        && (task.finalization || task.commitSha
+        || ['committed', 'pushed', 'finalized'].includes(task.status))) {
         return {
           ok: false,
           reason: 'invalid_transition',
@@ -2319,6 +2352,9 @@ export class SupervisionTaskRegistry {
     const now = input.now ?? Date.now();
     const record: PersistedSupervisionTaskAssignment = {
       ...existing,
+      // A converged instance/epoch is written in the SAME transaction as the
+      // update it authorized, so no caller observes a half-rebound assignment.
+      identity: authorizedIdentity,
       status: nextStatus,
       auditAttemptId: normalizeTaskString(input.auditAttemptId) ?? existing.auditAttemptId,
       auditRevision: requestedAuditRevision
@@ -3666,7 +3702,17 @@ export class SupervisionTaskRegistry {
         // Finalization authorizes exactly one edge away from the revision it
         // closed. Once currentRevision has advanced, the historical R4 record
         // cannot be reused as standing authority for R5 -> R6 -> ... rewrites.
-        && task.currentRevision === task.finalization.revision
+        // Finalization is authority for its OWN revision, and history once the
+        // task has moved on. Previously this demanded equality, so an aggregate
+        // could take exactly one edge past a finalization and then wedge:
+        // Brain's own revision recovery refused every later rebind with
+        // `old_revision`. The historical case is admitted through the SAME
+        // shared predicate the two ordinary bind paths use, and it is not
+        // free-running -- no live integration owner, an internally consistent
+        // finalization, an assignment that finalization did not consume, plus
+        // every worktree/PASS/lease/ambiguity gate below still applies.
+        && (task.currentRevision === task.finalization.revision
+          || this.#historicalFinalizationOnly(task))
         && !this.#assignmentConsumedByFinalization(task, assignment)
       );
       const exactStaleShape = Boolean(
@@ -3701,7 +3747,7 @@ export class SupervisionTaskRegistry {
       );
       if (!exactStaleShape) {
         this.#db.exec('ROLLBACK');
-        return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
+          return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
           : activeAuditor ? { ok: false, reason: 'invalid_transition' }
             : task.finalization && task.currentRevision !== task.finalization.revision
               ? { ok: false, reason: 'old_revision' }
@@ -4009,7 +4055,25 @@ export class SupervisionTaskRegistry {
       return { ok: false, reason: 'invalid' };
     }
     const task = this.getTaskRecord(taskId);
-    const audit = this.getAssignment(assignmentId);
+    let audit = this.getAssignment(assignmentId);
+    // An open, non-terminal auditor whose runtime restarted mid-round presents a
+    // rotated instance/epoch. Converge it on the same rule as every other
+    // boundary BEFORE evaluating receipt authority, so a live round can be
+    // resumed on its exact attempt/revision. Terminal auditors are refused by
+    // the rule itself, so a closed round can never be reopened this way.
+    if (audit) {
+      const authorizedAuditor = this.#authorizeParticipant(audit, input.auditorIdentity);
+      if (authorizedAuditor
+        && (authorizedAuditor.sessionInstanceId !== audit.identity.sessionInstanceId
+          || authorizedAuditor.runtimeEpoch !== audit.identity.runtimeEpoch)) {
+        this.#writeAssignment(
+          { ...audit, identity: authorizedAuditor, updatedAt: Date.now() },
+          this.#taskEventFor(audit.status),
+          { source: 'identity_convergence', previousRuntimeEpoch: audit.identity.runtimeEpoch },
+        );
+        audit = this.getAssignment(assignmentId);
+      }
+    }
     const preAuthority = evaluateAuditReceiptAuthority({
       task, audit, taskId, assignmentId, attemptId, revision,
       receiptKind: input.receiptKind,
@@ -4411,9 +4475,33 @@ export class SupervisionTaskRegistry {
     toStatus: SupervisionTaskLifecycleStatus | null;
     validationState?: string;
     note?: string;
+    /**
+     * Caller identity. Optional for backward compatibility, but when supplied
+     * it is authorized on the SAME rule as every other boundary. Intents used
+     * to accept any caller while task_update refused a restart-rotated one, so
+     * `start` could succeed and the very next update fail owner_mismatch.
+     */
+    identity?: PersistedSupervisionTaskAssignmentIdentity;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
+    if (input.assignmentId && input.identity) {
+      const current = this.getAssignment(input.assignmentId);
+      if (current) {
+        const authorized = this.#authorizeParticipant(current, input.identity);
+        if (!authorized) return { ok: false, reason: 'owner_mismatch' };
+        if (authorized.sessionInstanceId !== current.identity.sessionInstanceId
+          || authorized.runtimeEpoch !== current.identity.runtimeEpoch) {
+          // Converge before the intent runs so this intent and every later
+          // authorization boundary agree on one identity.
+          this.#writeAssignment(
+            { ...current, identity: authorized, updatedAt: Date.now() },
+            this.#taskEventFor(current.status),
+            { source: 'identity_convergence', previousRuntimeEpoch: current.identity.runtimeEpoch },
+          );
+        }
+      }
+    }
     if (input.intent === 'open_audit' && task.classification === 'integration_slice') {
       // Preserve an idempotent compatibility path for durable auditor rows
       // minted before merge-before-audit became authoritative. New rows are
@@ -4756,6 +4844,68 @@ export class SupervisionTaskRegistry {
    * through an existing atomic lifecycle path, so a crash between passes leaves
    * the registry in a state a later pass simply re-derives (or skips).
    */
+  /**
+   * Bounded convergence candidate selection. Terminal statuses are excluded in
+   * SQL so they never consume the scan budget, archived rows are deliberately
+   * NOT filtered out, and LIMIT keeps one pass bounded. Ordered most-recently
+   * updated first so fresh work cannot be starved by old history, with a
+   * deterministic id tie-break.
+   */
+  #listConvergenceCandidateIds(scanLimit: number): string[] {
+    if (this.#closed) return [];
+    const bounded = Math.max(1, Math.trunc(scanLimit));
+    const select = (sql: string, ...params: Array<string | number>): string[] => (
+      (this.#db.prepare(sql).all(...params) as Array<Record<string, unknown>>)
+        .map((row) => (typeof row.taskId === 'string' ? row.taskId : ''))
+        .filter((taskId): taskId is string => taskId.length > 0)
+    );
+    const live = `SELECT task_id AS taskId FROM supervision_tasks
+       WHERE status NOT IN ('pushed', 'finalized', 'blocked', 'cancelled')`;
+    const cursor = this.#readConvergenceCursor();
+    // Resume strictly AFTER the last window, then wrap to the head of the ring
+    // to fill the remaining budget. Every live task is therefore reached within
+    // ceil(live / window) ticks no matter how large the backlog grows, while a
+    // single tick stays bounded.
+    const ahead = select(`${live} AND task_id > ? ORDER BY task_id ASC LIMIT ?`, cursor, bounded);
+    const candidates = ahead.length >= bounded
+      ? ahead
+      : [...ahead, ...select(
+        `${live} AND task_id <= ? ORDER BY task_id ASC LIMIT ?`,
+        cursor,
+        bounded - ahead.length,
+      )];
+    if (candidates.length > 0) this.#writeConvergenceCursor(candidates[candidates.length - 1]!);
+    return candidates;
+  }
+
+  /**
+   * The rotation position is durable so a restart resumes the ring instead of
+   * rescanning its head forever. A missing/unreadable row means "start of the
+   * ring", which is a safe, well-defined position rather than a failure.
+   */
+  #readConvergenceCursor(): string {
+    try {
+      const row = this.#db
+        .prepare('SELECT task_id AS taskId FROM supervision_convergence_cursor WHERE id = 1')
+        .get() as Record<string, unknown> | undefined;
+      return typeof row?.taskId === 'string' ? row.taskId : '';
+    } catch {
+      return '';
+    }
+  }
+
+  #writeConvergenceCursor(taskId: string): void {
+    try {
+      this.#db.prepare(
+        `INSERT INTO supervision_convergence_cursor (id, task_id, updated_at) VALUES (1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET task_id = excluded.task_id, updated_at = excluded.updated_at`,
+      ).run(taskId, Date.now());
+    } catch {
+      // A cursor that cannot be persisted must never fail the convergence pass;
+      // the next tick simply restarts the ring from a defined position.
+    }
+  }
+
   convergeLifecycle(
     now = Date.now(),
     options: SupervisionLifecycleConvergenceOptions = {},
@@ -4763,10 +4913,35 @@ export class SupervisionTaskRegistry {
     const limit = Math.max(1, Math.trunc(options.limit ?? SUPERVISION_LIFECYCLE_CONVERGENCE_LIMIT));
     const actions: SupervisionLifecycleConvergenceAction[] = [];
     let scanned = 0;
-    for (const listed of this.list()) {
+    // Archived aggregates are INCLUDED. Archival is a retention/visibility
+    // marker written at finalization, not a lifecycle state: a task that was
+    // finalized once and then handed a newly authorized round is archived while
+    // its status is back to a live one. Iterating the default (visible-only)
+    // listing therefore hid exactly those aggregates from EVERY branch below,
+    // so tsk_5o7 could not be advanced by any deterministic repair and needed a
+    // human Brain round every single time. Terminal status is still the real
+    // gate, and the existing `scanned` bound still caps the pass.
+    // Candidates come from a BOUNDED query that excludes terminal status in SQL
+    // and applies no visibility filter.
+    //
+    // Two things had to be true at once. Archival is a retention/visibility
+    // marker written at finalization, not a lifecycle state: an aggregate that
+    // was finalized once and then handed a newly authorized round is archived
+    // while its status is back to a live one, and the default visible-only
+    // listing hid exactly those from EVERY branch below -- tsk_5o7 could not be
+    // advanced by any deterministic repair and needed a human Brain round every
+    // time. But simply widening to `includeArchived` broke it the other way:
+    // `scanned` is incremented BEFORE the terminal skip, so a backlog of
+    // terminal archived history consumed the whole quota and permanently
+    // starved the one task that needed work, getting worse as history grows.
+    // Excluding terminal rows in the query means they never consume the budget,
+    // while LIMIT keeps this a bounded pass rather than a full-table walk. The
+    // terminal check below is kept as defence in depth for a status that
+    // changed between the query and the read.
+    for (const candidateId of this.#listConvergenceCandidateIds(limit * 4)) {
       if (actions.length >= limit || scanned >= limit * 4) break;
       scanned += 1;
-      const task = this.getTaskRecord(listed.taskId);
+      const task = this.getTaskRecord(candidateId);
       // A terminal task (pushed/finalized/blocked/cancelled) is never advanced:
       // `blocked` in particular is an operator decision, not a derivable fact.
       if (!task || isTerminalSupervisionTaskStatus(task.status)) continue;
@@ -4783,6 +4958,9 @@ export class SupervisionTaskRegistry {
         this.#convergeRevisionProjection(task, now),
         this.#convergeValidatedHandoff(task, now),
         this.#convergeRecordedAuditReceipt(task, now),
+        this.#convergeConsumedFinalizedImplementer(task, now),
+        this.#convergeStaleFinalizedOwnerProjection(task, now),
+        this.#convergeConsumedFinalizedOwnerPointer(task, now),
       ]) {
         if (step) actions.push(step);
       }
@@ -4938,6 +5116,273 @@ export class SupervisionTaskRegistry {
     return undefined;
   }
 
+  /**
+   * Retire the implementer whose work the task's own finalization ALREADY
+   * consumed, once a newly authorized successor exists.
+   *
+   * Observed on tsk_5o7: the aggregate was finalized at R4 with a real commit,
+   * push and CI run, yet the R4 implementer stayed parked in
+   * `ready_for_integration`. Recovery then counted it and the fresh successor
+   * as two active implementers and refused with `ambiguous_assignment`, so a
+   * human had to cancel the historical assignment by hand every round. The
+   * ambiguity is only apparent: the task's immutable finalization names
+   * exactly which revision and attempt were shipped.
+   *
+   * Fail-closed and evidence-anchored. It acts only when EXACTLY ONE parked
+   * implementer matches the finalization's revision AND attempt AND carries the
+   * PASS it earned, holds no lease, and only when a successor that is NOT on
+   * that revision actually exists -- otherwise there is nothing to disambiguate
+   * and retiring would destroy the only live implementer. The record is retired
+   * in place: identity, auditRevision, auditAttemptId, verdict and every other
+   * field are preserved, and the task's finalization/Git/CI evidence is never
+   * touched.
+   */
+  /**
+   * Retire a stale LIVE integration-owner projection once the round it belongs
+   * to is closed by the task's own finalization.
+   *
+   * Observed on the remote R3->R4 handoff: the task carried an immutable PASS
+   * receipt and real Git provenance, a non-terminal integration_owner
+   * projection was still sitting on the aggregate, and the implementer had
+   * already frozen its successor. That live owner counts as a second active
+   * successor candidate, so binding the frozen revision was refused with
+   * `ambiguous_assignment` and a human had to retire the projection by hand
+   * every round.
+   *
+   * Retirement is a STATUS-only change on the same object: identity,
+   * auditRevision, auditAttemptId, verdict, externalRunId/HeadSha and every
+   * other recorded field are preserved by spreading the record, and the task's
+   * finalization, commit and CI evidence are never touched. No revision, PASS,
+   * Git or CI byte is invented -- the successor still has to bind its own
+   * frozen revision through the ordinary authoritative path.
+   *
+   * Fail-closed on everything the daemon cannot decide alone: more than one
+   * live owner, an owner still holding a lease, an owner whose recorded
+   * evidence points at a revision finalization does not cover, or anything
+   * other than exactly one unique unconsumed successor.
+   */
+  /**
+   * Recover a successor-bind anchor that a coordination override erased.
+   *
+   * Only durable evidence is used, and only when it is unambiguous: exactly one
+   * final PASS/REWORK receipt recorded against the revision the task is still
+   * pointing at, and all such receipts must share ONE attempt. Zero receipts
+   * means the round was never audited, and receipts from different attempts
+   * mean the authority is genuinely ambiguous -- both fail closed and leave the
+   * caller with its ordinary `old_revision` refusal rather than a guess.
+   */
+  #derivedSuccessorAnchor(
+    task: PersistedSupervisionTaskRecord,
+    existing: PersistedSupervisionTaskAssignment,
+  ): string | undefined {
+    if (normalizeTaskString(existing.auditRevision)) return undefined;
+    if (existing.role === 'auditor') return undefined;
+    const current = normalizeTaskString(task.currentRevision);
+    if (!current) return undefined;
+    const finals = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.receiptKind === 'final'
+      && receipt.revision === current
+      && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
+    ));
+    if (finals.length === 0) return undefined;
+    const attempts = new Set(finals.map((receipt) => receipt.attemptId));
+    if (attempts.size !== 1) return undefined;
+    return current;
+  }
+
+  /**
+   * Clear an integration-owner POINTER that still names the owner of a round
+   * the task has already moved past.
+   *
+   * Observed on tsk_5o7: finalization covered R4 and named asg_5ve as the
+   * integration owner. The task then advanced to R9, but the pointer stayed on
+   * that now-finalized R4 owner. Because currentRevision no longer equals
+   * finalization.revision, a successor bind takes the ordinary
+   * `movesTaskRevisionToSuccessor` path, whose pointer rule demands the caller
+   * BE the pointer owner -- so the required implementer was refused with
+   * `owner_mismatch` on every single bind, and only a human could unstick it.
+   *
+   * The pointer is stale, not authoritative: the round it belonged to is closed
+   * by the task's own immutable finalization. Only the POINTER is cleared here.
+   * The owner assignment itself, its auditRevision/auditAttemptId/verdict and
+   * external run/head evidence, the task's finalization, commitSha and CI
+   * fields are all left exactly as they are -- this reopens nothing.
+   *
+   * Fail-closed: the pointer target must be terminal AND carry exactly the
+   * finalization's revision and attempt; the task must genuinely have moved on;
+   * there must be no other live integration owner; and exactly one required
+   * non-terminal implementer must exist to receive the binding. Anything else
+   * is ambiguous and stays for Brain to decide.
+   */
+  /**
+   * THE single definition of "this finalization is history, not authority over
+   * the round in flight".
+   *
+   * This rule existed in three places -- the `movesTaskRevisionToSuccessor`
+   * authority block, the `bindsSuccessorRevision` veto, and Brain's revision
+   * recovery -- and they drifted: fixing the first two still left recovery
+   * refusing with `old_revision`. One predicate, three consumers, so a fourth
+   * copy cannot appear.
+   *
+   * Historical means: finalization covers a DIFFERENT revision than the one in
+   * flight, the task is not itself in a Git/terminal state, and no integration
+   * owner is still live. When finalization still covers the current revision it
+   * remains full authority and this returns false, so the dedicated
+   * advance-past-finalized path keeps handling that case.
+   */
+  #historicalFinalizationOnly(task: PersistedSupervisionTaskRecord): boolean {
+    const finalizedRevision = normalizeTaskString(task.finalization?.revision);
+    if (!task.finalization || !finalizedRevision) return false;
+    if (finalizedRevision === normalizeTaskString(task.currentRevision)) return false;
+    if (['committed', 'pushed', 'finalized'].includes(task.status)) return false;
+    return !this.listAssignments(task.taskId).some((candidate) => (
+      candidate.role === 'integration_owner'
+      && !isTerminalSupervisionTaskStatus(candidate.status)
+    ));
+  }
+
+  #convergeConsumedFinalizedOwnerPointer(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const pointerId = normalizeTaskString(task.integrationOwnerAssignmentId);
+    const finalization = task.finalization;
+    if (!pointerId || !finalization) return undefined;
+    const finalizedRevision = normalizeTaskString(finalization.revision);
+    const finalizedAttempt = normalizeTaskString(finalization.auditAttemptId);
+    const current = normalizeTaskString(task.currentRevision);
+    if (!finalizedRevision || !finalizedAttempt || !current) return undefined;
+    // Only once the task has genuinely moved past the finalized round.
+    if (current === finalizedRevision) return undefined;
+    const assignments = this.listAssignments(task.taskId);
+    const pointer = assignments.find((a) => a.assignmentId === pointerId);
+    if (!pointer || pointer.role !== 'integration_owner') return undefined;
+    if (!isTerminalSupervisionTaskStatus(pointer.status)) return undefined;
+    // The pointer target must be exactly what finalization consumed.
+    if (normalizeTaskString(pointer.auditRevision) !== finalizedRevision) return undefined;
+    if (normalizeTaskString(pointer.auditAttemptId) !== finalizedAttempt) return undefined;
+    // A live owner anywhere means the pointer is still someone's authority.
+    if (assignments.some((a) => (
+      a.role === 'integration_owner' && !isTerminalSupervisionTaskStatus(a.status)
+    ))) return undefined;
+    const successors = assignments.filter((a) => (
+      a.role === 'implementer' && a.required && !isTerminalSupervisionTaskStatus(a.status)
+    ));
+    if (successors.length !== 1) return undefined;
+    const { integrationOwnerAssignmentId: _cleared, ...withoutPointer } = task;
+    this.#writeTask(
+      { ...withoutPointer, updatedAt: now },
+      this.#taskEventFor(task.status),
+      {
+        source: 'consumed_finalized_owner_pointer',
+        clearedPointer: pointerId,
+        finalizedRevision,
+        finalizedAuditAttemptId: finalizedAttempt,
+      },
+    );
+    return {
+      taskId: task.taskId,
+      assignmentId: pointerId,
+      action: 'clear_consumed_finalized_owner_pointer',
+    };
+  }
+
+  #convergeStaleFinalizedOwnerProjection(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const finalization = task.finalization;
+    if (!finalization) return undefined;
+    const revision = normalizeTaskString(finalization.revision);
+    if (!revision || task.currentRevision !== revision) return undefined;
+    const assignments = this.listAssignments(task.taskId);
+    const liveOwners = assignments.filter((assignment) => (
+      assignment.role === 'integration_owner'
+      && !isTerminalSupervisionTaskStatus(assignment.status)
+    ));
+    if (liveOwners.length !== 1) return undefined;
+    const owner = liveOwners[0]!;
+    // R12 audit P1: this previously accepted an owner carrying NO anchor at all
+    // and still terminalized it and released its lease. An owner without exact
+    // evidence is not demonstrably part of the finalized round -- it may be the
+    // next round's owner that simply has not bound yet -- so retiring it
+    // destroys live authority on a guess. Require the EXACT revision and
+    // attempt finalization recorded; anything else is handed to Brain untouched.
+    const ownerRevision = normalizeTaskString(owner.auditRevision);
+    const ownerAttempt = normalizeTaskString(owner.auditAttemptId);
+    const finalizedAttempt = normalizeTaskString(finalization.auditAttemptId);
+    if (!ownerRevision || ownerRevision !== revision) return undefined;
+    if (!ownerAttempt || !finalizedAttempt || ownerAttempt !== finalizedAttempt) return undefined;
+    const successors = assignments.filter((assignment) => (
+      assignment.role === 'implementer'
+      && assignment.required
+      && !isTerminalSupervisionTaskStatus(assignment.status)
+      && !this.#assignmentConsumedByFinalization(task, assignment)
+    ));
+    if (successors.length !== 1) return undefined;
+    if (successors[0]!.assignmentId === owner.assignmentId) return undefined;
+    // The lease goes with the projection. A stale owner keeps holding one --
+    // that is part of what makes it stale -- so liveness is decided by the
+    // finalization evidence, not by the presence of a lease, and releasing it
+    // here is what frees the aggregate instead of stranding the claim.
+    this.#writeAssignment(
+      { ...owner, status: 'finalized', leaseId: '', updatedAt: now },
+      'finalized',
+      {
+        source: 'stale_finalized_owner_projection',
+        finalizedRevision: revision,
+        finalizedAuditAttemptId: finalization.auditAttemptId,
+      },
+    );
+    return {
+      taskId: task.taskId,
+      assignmentId: owner.assignmentId,
+      action: 'retire_stale_finalized_owner_projection',
+    };
+  }
+
+  #convergeConsumedFinalizedImplementer(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const finalization = task.finalization;
+    if (!finalization) return undefined;
+    const revision = normalizeTaskString(finalization.revision);
+    const attemptId = normalizeTaskString(finalization.auditAttemptId);
+    if (!revision || !attemptId) return undefined;
+    const implementers = this.listAssignments(task.taskId)
+      .filter((assignment) => assignment.role === 'implementer');
+    const consumed = implementers.filter((assignment) => (
+      (assignment.status === 'ready_for_integration' || assignment.status === 'passed')
+      && assignment.auditRevision === revision
+      && assignment.auditAttemptId === attemptId
+      && assignment.verdict?.trim().toUpperCase() === 'PASS'
+      && !assignment.leaseId
+    ));
+    if (consumed.length !== 1) return undefined;
+    const target = consumed[0]!;
+    const successors = implementers.filter((assignment) => (
+      assignment.assignmentId !== target.assignmentId
+      && !isTerminalSupervisionTaskStatus(assignment.status)
+      && assignment.auditRevision !== revision
+    ));
+    if (successors.length === 0) return undefined;
+    this.#writeAssignment(
+      { ...target, status: 'finalized', updatedAt: now },
+      'finalized',
+      {
+        source: 'consumed_finalized_implementer',
+        consumedRevision: revision,
+        consumedAuditAttemptId: attemptId,
+      },
+    );
+    return {
+      taskId: task.taskId,
+      assignmentId: target.assignmentId,
+      action: 'retire_consumed_finalized_implementer',
+    };
+  }
+
   #convergeConsumedIntegrationSlice(
     task: PersistedSupervisionTaskRecord,
     now: number,
@@ -4974,6 +5419,54 @@ export class SupervisionTaskRegistry {
       assignmentId: delivered[0]!.assignmentId,
       action: 'retire_consumed_slice',
     };
+  }
+
+  /**
+   * Authorize a caller against a stored assignment, converging a restart-rotated
+   * identity for the SAME logical participant.
+   *
+   * A daemon restart rotates `sessionInstanceId`/`runtimeEpoch` while the
+   * participant is unchanged. Strict five-field equality then refused every
+   * authorization boundary (task_update, finish, intents) and the object was
+   * stranded with no legal way forward -- observed live on tsk_55y, tsk_5oc and
+   * tsk_5ns. Convergence repairs exactly that drift and nothing else.
+   *
+   * It is deliberately narrow and fail-closed:
+   *  - `sessionName`, `agentType` and `providerFamily` must match EXACTLY; only
+   *    instance/epoch may differ, so a same-named clone from another runtime
+   *    family can never inherit the assignment;
+   *  - the project must have EXACTLY ONE live runtime matching those three, so
+   *    ambiguity is refused rather than resolved by picking a row;
+   *  - the presented identity must BE that live runtime, so a caller cannot
+   *    assert an instance/epoch the daemon does not actually observe;
+   *  - a terminal assignment is never converged.
+   *
+   * Returns the identity to persist, or undefined to reject with owner_mismatch.
+   */
+  #authorizeParticipant(
+    existing: PersistedSupervisionTaskAssignment,
+    presented: PersistedSupervisionTaskAssignmentIdentity,
+  ): PersistedSupervisionTaskAssignmentIdentity | undefined {
+    if (identityMatches(existing.identity, presented)) return existing.identity;
+    if (isTerminalSupervisionTaskStatus(existing.status)) return undefined;
+    if (existing.identity.sessionName !== presented.sessionName
+      || existing.identity.agentType !== presented.agentType
+      || existing.identity.providerFamily !== presented.providerFamily) return undefined;
+    const resolve = this.#resolveLiveParticipants;
+    if (!resolve) return undefined;
+    const task = this.getTaskRecord(existing.taskId);
+    const candidates = resolve(task?.projectName).filter((candidate: PersistedSupervisionTaskAssignmentIdentity) => (
+      candidate.sessionName === existing.identity.sessionName
+      && candidate.agentType === existing.identity.agentType
+      && candidate.providerFamily === existing.identity.providerFamily
+      && Boolean(candidate.sessionInstanceId)
+      && Boolean(candidate.runtimeEpoch)
+    ));
+    if (candidates.length !== 1) return undefined;
+    const live = candidates[0]!;
+    if (live.sessionInstanceId !== presented.sessionInstanceId
+      || live.runtimeEpoch !== presented.runtimeEpoch) return undefined;
+    return { ...existing.identity, sessionInstanceId: live.sessionInstanceId, runtimeEpoch: live.runtimeEpoch };
   }
 
   recordFileEvent(input: SupervisionTaskFileEventInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
@@ -5043,10 +5536,27 @@ export class SupervisionTaskRegistry {
 }
 
 let supervisionTaskRegistry: SupervisionTaskRegistry | undefined;
+let liveParticipantsResolver: SupervisionStateStoreOptions['resolveLiveParticipants'] | undefined;
+
+/**
+ * Wire the production live-session view into the singleton registry.
+ *
+ * Registered from the daemon entrypoint rather than imported here, because the
+ * store must not depend on the session layer. Read through a module ref at CALL
+ * time so registration order cannot matter: the singleton is created lazily and
+ * may exist before the daemon finishes starting.
+ */
+export function setSupervisionLiveParticipantsResolver(
+  resolver: SupervisionStateStoreOptions['resolveLiveParticipants'] | undefined,
+): void {
+  liveParticipantsResolver = resolver;
+}
 
 export function getSupervisionTaskRegistry(): SupervisionTaskRegistry {
   if (supervisionTaskRegistry) return supervisionTaskRegistry;
-  supervisionTaskRegistry = new SupervisionTaskRegistry();
+  supervisionTaskRegistry = new SupervisionTaskRegistry({
+    resolveLiveParticipants: (projectName) => liveParticipantsResolver?.(projectName) ?? [],
+  });
   return supervisionTaskRegistry;
 }
 

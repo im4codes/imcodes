@@ -267,6 +267,20 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
       'pure_read_only_localization_or_immediate_safe_containment',
     ],
     exceptionReason: 'required',
+    // Brain-only authority is a DUTY, not merely a permission.
+    //
+    // `exceptions` above already says some control-plane/identity/binding
+    // repairs are nondelegable to a sub-session. It did NOT say what Brain owes
+    // in return, and the gap was load-bearing: a repair only Brain could make
+    // was handed to the human instead, which stalls the task on the one actor
+    // who cannot perform it and turns an authorized tool call into a support
+    // request. Each clause below is separately checkable.
+    authorityDuty: {
+      when: 'brain_only_control_plane_identity_or_binding_repair_that_is_safe_and_uniquely_determined',
+      mustAct: 'personally_invoke_authoritative_tool_then_resume_same_object',
+      mustNotOffload: ['operation_to_user', 'responsibility_to_user', 'ask_user_to_run_brain_only_tool'],
+      needsInput: 'only_after_authorized_tools_exhausted_and_external_information_or_authorization_genuinely_missing',
+    },
     status: {
       discoveryOrDispatchIsAdvance: false,
       delegateRemainingIsAdvance: false,
@@ -402,16 +416,40 @@ export function buildSupervisionMessagingContract(): string {
     binding: { unchanged: 'continue_existing', changed: 'delta_only', unknownOrMismatch: 'fail_closed' },
     delegation_reply: { auth: 'daemon_session', mode: 'append_only', verdict: false },
     peer_audit_reply: { verdictChannel: 'only', bind: ['taskId', 'assignmentId', 'attemptId', 'revision'], progress: true, final: ['PASS', 'REWORK'] },
+    // target/ignore/order are NOT restated here: the delegation-eligibility
+    // contract ships in the SAME preamble and is their single definition.
+    // Duplicating them cost ~150 chars of a budget that exists to keep task
+    // context in the window, and a second copy can drift from the first.
     automaticAudit: {
       materialize: 'once_after_open_audit',
-      target: SUPERVISION_DELEGATION_ELIGIBILITY_POLICY.automaticAudit.target,
-      eligibilityIgnores: SUPERVISION_DELEGATION_ELIGIBILITY_POLICY.automaticAudit.ignore,
-      order: SUPERVISION_DELEGATION_ELIGIBILITY_POLICY.automaticAudit.order,
+      eligibility: SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
       recovery: 'boot_sweep',
       failure: 'Brain_same_object_manual_exact_route',
       successChatter: false,
     },
-    blocker: { immediateReply: true, fields: ['taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'recommendedNextAction'] },
+    blocker: { immediateReply: true, fields: ['taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'options', 'recommendedNextAction'] },
+    // A sub-session that hits real uncertainty owns the duty to SPEAK. Going
+    // quiet, writing a local-only blocker, or re-heartbeating the same state
+    // all look like progress and are not; guessing is worse. Exactly one
+    // structured request reaches the authoritative Brain (blocker.fields above
+    // carry it), and work resumes on the SAME object once it answers.
+    //
+    // The converse -- certain PASS/REWORK and a unique delivery run directly,
+    // producing no Brain chatter -- is deliberately NOT restated here: it is a
+    // daemon-side guarantee enforced in dispatch and covered by test, and the
+    // preamble budget exists to keep task context in the window.
+    escalate: {
+      on: ['ambiguous_candidates', 'evidence_conflict', 'no_unique_recovery_target', 'brain_only_authority'],
+      request: 'exactly_one_structured_decision_request_to_authoritative_brain',
+      carry: 'blocker.fields',
+      never: ['silent_wait', 'local_blocker_only', 'repeated_heartbeat', 'guess', 'ask_user_directly'],
+      afterDecision: 'continue_same_object',
+      needsInput: 'only_when_brain_also_lacks_external_information',
+    },
+    determinate: {
+      direct: ['exact_pass_or_rework', 'unique_auditor_delivery', 'evidence_determined_repair'],
+      brainChatter: false,
+    },
     heartbeat: { reminderOnly: true, substitutesReply: false },
     gate: 'tool_schema+authority_handler',
   });

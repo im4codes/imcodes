@@ -20,6 +20,8 @@ import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { runSupervisionWorktreeGc } from './supervision-worktree-gc.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-ingress.js';
+import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
+import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
 
 /**
  * One live-session authority check shared by the MCP project list and the Web
@@ -129,6 +131,17 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
 }
 
 export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
+  // `imcodes memory mcp` runs as its OWN process with its own module state, so
+  // the registration done in lifecycle.startup() does not exist here. Without
+  // this the process that actually serves the supervision tools had
+  // resolveLiveParticipants undefined: restart identity convergence silently
+  // never ran and a rotated same-name owner was refused with owner_mismatch in
+  // production, while the startup-based test stayed green. Registering on the
+  // construction path covers every MCP entry, and the resolver is read at call
+  // time so it does not matter that the registry singleton may already exist.
+  setSupervisionLiveParticipantsResolver(
+    (projectName) => resolveLiveSupervisionParticipants(projectName),
+  );
   return {
     registry: createSupervisionRegistryPort(),
     isProjectBrain: (caller) => {
