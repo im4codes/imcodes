@@ -982,6 +982,153 @@ describe('TransportSessionRuntime', () => {
       ]);
     });
 
+    it('adopts an original persisted session legacy queue, drains it once, and survives epoch rotation', async () => {
+      const sessionName = 'deck_legacy_restart_brain';
+      const createdAt = Date.now() - 10_000;
+      const before = { sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch-1' };
+      const after = { sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch-2' };
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: 'legacy-stuck',
+        commandId: 'legacy-stuck',
+        text: 'resume this exact message',
+        now: createdAt + 1,
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'legacy-stuck',
+          text: 'resume this exact message',
+        }),
+      });
+
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(
+        restartMock.provider,
+        sessionName,
+        before,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.drainPendingIfIdle('legacy-adoption')).toBe(true);
+      await waitForProviderSendCount(restartMock.provider, 1);
+      expect(restartMock.provider.send).toHaveBeenCalledOnce();
+      expect(restartMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        userMessage: 'resume this exact message',
+      }));
+
+      expect(restarted.rebindQueueRecipient(before, after)).toBe(true);
+      expect(getTransportQueueStore().queueBelongsTo(sessionName, after)).toBe(true);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(sessionName, 'legacy-stuck', before))
+        .toBeUndefined();
+    });
+
+    it('purges a prior same-name session ghost on restart without dispatch, then permits epoch rotation', async () => {
+      const sessionName = 'deck_legacy_stale_restart_brain';
+      const createdAt = Date.now();
+      const before = { sessionInstanceId: 'current-instance', runtimeEpoch: 'current-epoch-1' };
+      const after = { sessionInstanceId: 'current-instance', runtimeEpoch: 'current-epoch-2' };
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: 'old-private-message',
+        commandId: 'old-private-message',
+        text: 'must never reach the replacement session',
+        now: createdAt - 1,
+        privateMaterialJson: JSON.stringify({ text: 'must never reach the replacement session' }),
+      });
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(
+        restartMock.provider,
+        sessionName,
+        before,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingEntries).toEqual([]);
+      expect(restartMock.provider.send).not.toHaveBeenCalled();
+      expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(sessionName, 'old-private-message', before))
+        .toBeUndefined();
+      expect(restarted.rebindQueueRecipient(before, after)).toBe(true);
+      expect(getTransportQueueStore().queueBelongsTo(sessionName, after)).toBe(true);
+      await restarted.kill();
+    });
+
+    it('continues a stale-ghost purge across the runtime bounded batch cursor', async () => {
+      const sessionName = 'deck_legacy_stale_batched_brain';
+      const createdAt = Date.now();
+      const recipient = { sessionInstanceId: 'batched-instance', runtimeEpoch: 'batched-epoch' };
+      for (let index = 0; index < 65; index++) {
+        const id = `old-${String(index).padStart(3, '0')}`;
+        getTransportQueueStore().enqueue({
+          sessionName,
+          clientMessageId: id,
+          commandId: id,
+          text: `old private ${index}`,
+          now: createdAt - 1,
+          privateMaterialJson: JSON.stringify({ text: `old private ${index}` }),
+        });
+      }
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(
+        restartMock.provider,
+        sessionName,
+        recipient,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+      expect(getTransportQueueStore().queueBelongsTo(sessionName, recipient)).toBe(true);
+      expect(restartMock.provider.send).not.toHaveBeenCalled();
+      await restarted.kill();
+    });
+
+    it('adopts a legacy row before an active-turn append and records one delivery tombstone', async () => {
+      const sessionName = 'deck_legacy_append_brain';
+      const createdAt = Date.now() - 10_000;
+      const recipient = { sessionInstanceId: 'legacy-append-instance', runtimeEpoch: 'legacy-append-epoch' };
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: 'legacy-append',
+        commandId: 'legacy-append',
+        text: 'append the stranded row',
+        now: createdAt + 1,
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'legacy-append',
+          text: 'append the stranded row',
+        }),
+      });
+      const appendMock = makeMockProvider();
+      appendMock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+      appendMock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+      const restarted = new TransportSessionRuntime(
+        appendMock.provider,
+        sessionName,
+        recipient,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+      restarted.send('active foreground', 'active-foreground');
+      await waitForProviderSendCount(appendMock.provider, 1);
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      await expect(restarted.appendPendingMessagesToActiveTurn(
+        ['legacy-append'],
+        'legacy-append-frame',
+      )).resolves.toEqual(expect.objectContaining({ status: 'delivered' }));
+      expect(appendMock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+      expect(appendMock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        text: 'append the stranded row',
+      }));
+      expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, 'legacy-append')).toBe(true);
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      await restarted.kill();
+    });
+
     it('drains the rehydrated message to the provider once idle', async () => {
       runtime.send('first');
       await waitForProviderSendCount(mock.provider, 1);

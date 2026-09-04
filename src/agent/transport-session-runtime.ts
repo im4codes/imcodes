@@ -97,7 +97,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
-import type { QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
+import type { LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
 import type { QueueDeliveryFact, QueueSnapshot } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 import {
@@ -628,6 +628,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _cancelledProviderErrorsToIgnore = 0;
   private _codexRolloutBackstopTimer: ReturnType<typeof setTimeout> | null = null;
   private _codexRolloutBackstopInFlight = false;
+  /**
+   * True when this runtime normalized or purged durable rows while proving
+   * queue ownership. Session-manager uses this to rehydrate SQLite-only rows
+   * even when canonicalization had to run before SessionRecord epoch rotation.
+   */
+  private _queueRecipientRecoveryChanged = false;
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
@@ -655,6 +661,8 @@ export class TransportSessionRuntime implements SessionRuntime {
      * instance's durable queue.
      */
     private queueRecipient?: QueueRecipientIdentity,
+    /** Persisted-record evidence used only to recover pre-identity queue rows. */
+    private readonly queueOwnershipEvidence?: LegacyQueueOwnershipEvidence,
   ) {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
@@ -1218,6 +1226,35 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** The identity this runtime serves; rotation is allowed only within the same logical instance. */
   get recipientIdentity(): QueueRecipientIdentity | undefined { return this.queueRecipient; }
 
+  /** Whether ownership recovery changed durable rows during this runtime launch. */
+  get queueRecipientRecoveryChanged(): boolean { return this._queueRecipientRecoveryChanged; }
+
+  /**
+   * Resume a bounded legacy-row migration. True means recipient-sensitive
+   * reads are safe now; false leaves the queue quarantined.
+   */
+  adoptLegacyQueueRecipient(): boolean {
+    const store = getTransportQueueStore();
+    if (!this.queueRecipient) return false;
+    if (this.queueOwnershipEvidence) {
+      for (let batch = 0; batch < 8; batch++) {
+        const result = store.adoptLegacyRecipientIdentity(
+          this.sessionKey,
+          this.queueRecipient,
+          this.queueOwnershipEvidence,
+        );
+        if (result.status === 'adopted' || result.migrated > 0 || (result.purged ?? 0) > 0) {
+          this._queueRecipientRecoveryChanged = true;
+        }
+        if (result.status === 'adopted' || result.status === 'already_bound') return true;
+        if (result.status === 'identity_conflict'
+          || (result.migrated === 0 && (result.purged ?? 0) === 0)) return false;
+      }
+      return false;
+    }
+    return store.queueBelongsTo(this.sessionKey, this.queueRecipient);
+  }
+
   /** Update the live runtime after the store rotated only its runtime epoch. */
   rebindQueueRecipient(expected: QueueRecipientIdentity, next: QueueRecipientIdentity): boolean {
     if (!this.queueRecipient
@@ -1234,7 +1271,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     // The durable queue under this NAME may belong to a previous instance. A
     // same-named successor must not recover it; legacy rows carrying no identity
     // are quarantined by the same gate.
-    if (this.queueRecipient && !store.queueBelongsTo(this.sessionKey, this.queueRecipient)) return 0;
+    if (this.queueRecipient && !store.queueBelongsTo(this.sessionKey, this.queueRecipient)) {
+      if (!this.adoptLegacyQueueRecipient()) return 0;
+    }
     // A callback that died with the previous runtime leaves a leased row. Once
     // that lease expires it becomes retryable under the SAME clientMessageId;
     // the store caps attempts and projects `failed` on exhaustion.

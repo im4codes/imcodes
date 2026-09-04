@@ -1229,6 +1229,55 @@ describe('sdk transport session restore', () => {
     expect(stillQueued).toBe(false);
   });
 
+  it('restoreTransportSessions adopts an identified original session legacy queue and dispatches it once', async () => {
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_cx_legacy_identity_brain';
+    const createdAt = Date.now() - 10_000;
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      sessionInstanceId: 'legacy-persisted-instance',
+      runtimeEpoch: 'legacy-current-epoch',
+      projectName: 'sdklegacyidentity',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-legacy-identity',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt,
+      updatedAt: createdAt,
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-legacy-identity',
+      codexSessionId: 'codex-thread-legacy-identity',
+    });
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-legacy-identity',
+      commandId: 'msg-legacy-identity',
+      text: 'legacy identified restart recovery',
+      now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-legacy-identity',
+        text: 'legacy identified restart recovery',
+      }),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    await settleCodexRun(sessionName, 'resume');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('legacy identified restart recovery')
+      && Date.now() < deadline) await flush();
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('legacy identified restart recovery');
+    expect(getTransportQueueStore().queueBelongsTo(sessionName, {
+      sessionInstanceId: 'legacy-persisted-instance',
+      runtimeEpoch: 'legacy-current-epoch',
+    })).toBe(true);
+    expect(mocks.codexRuns.filter((run) => run.input.includes('legacy identified restart recovery'))).toHaveLength(1);
+  });
+
   it('restoreTransportSessions reclaims a dead-daemon unexpired handoff before rehydrate', async () => {
     resetTransportQueueStoreForTests();
     const sessionName = 'deck_sdk_cx_unexpired_handoff_brain';
@@ -1761,6 +1810,57 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns).toHaveLength(2);
     expect(mocks.claudeRuns[0].prompt).toBe('relaunch-msg-1');
     expect(mocks.claudeRuns[1].prompt).toBe('relaunch-msg-2');
+  });
+
+  it('launchTransportSession resumes and drains a legacy queue only for the original persisted identity', async () => {
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_legacy_launch_w1';
+    const createdAt = Date.now() - 10_000;
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      sessionInstanceId: 'legacy-launch-instance',
+      runtimeEpoch: 'legacy-launch-epoch',
+      projectName: 'sdklegacylaunch',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-legacy-launch',
+      state: 'error',
+      restarts: 1,
+      restartTimestamps: [],
+      createdAt,
+      updatedAt: createdAt,
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-legacy-launch',
+      codexSessionId: 'codex-thread-legacy-launch',
+    });
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-legacy-launch',
+      commandId: 'msg-legacy-launch',
+      text: 'legacy relaunch recovery',
+      now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-legacy-launch',
+        text: 'legacy relaunch recovery',
+      }),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await launchTransportSession({
+      name: sessionName,
+      projectName: 'sdklegacylaunch',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-legacy-launch',
+      codexSessionId: 'codex-thread-legacy-launch',
+    });
+
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('legacy relaunch recovery')
+      && Date.now() < deadline) await flush();
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('legacy relaunch recovery');
+    expect(mocks.codexRuns.filter((run) => run.input.includes('legacy relaunch recovery'))).toHaveLength(1);
   });
 
   it('refuses to start a Brain codex turn when IM delegation is not authoritatively connected (control)', async () => {

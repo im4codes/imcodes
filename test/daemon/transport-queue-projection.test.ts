@@ -4,6 +4,10 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const { getSessionMock } = vi.hoisted(() => ({ getSessionMock: vi.fn() }));
+
+vi.mock('../../src/store/session-store.js', () => ({ getSession: getSessionMock }));
+
 import { buildLegacyTransportPendingQueueSnapshot, buildTransportQueueSnapshot } from '../../src/daemon/transport-queue-projection.js';
 import { buildTransportPendingQueueSnapshot } from '../../src/daemon/transport-pending-snapshot.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
@@ -16,6 +20,8 @@ beforeEach(() => {
   dbPath = join(dir, 'queue.sqlite');
   vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH', dbPath);
   resetTransportQueueStoreForTests();
+  getSessionMock.mockReset();
+  getSessionMock.mockReturnValue(undefined);
 });
 
 afterEach(() => {
@@ -60,6 +66,29 @@ describe('transport queue projection builder', () => {
     expect(legacy.pendingVersion).toBe(0);
     expect(legacy.queueEpoch).toEqual(expect.any(String));
     expect(legacy.queueAuthorityId).toEqual(expect.any(String));
+  });
+
+  it('does not project legacy rows to a newer identified session that reused the same name', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-reused',
+      clientMessageId: 'old-private-message',
+      text: 'must not be exposed to replacement UI',
+      now: 10,
+      privateMaterialJson: JSON.stringify({ text: 'must not be exposed to replacement UI' }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck-reused',
+      sessionInstanceId: 'replacement-instance',
+      runtimeEpoch: 'replacement-epoch',
+      runtimeType: 'transport',
+      createdAt: 20,
+    });
+
+    const snapshot = buildTransportQueueSnapshot('deck-reused', 'test');
+    expect(snapshot.pendingMessageEntries).toEqual([]);
+    expect(snapshot.failedMessageEntries).toEqual([]);
+    expect(JSON.stringify(snapshot)).not.toContain('must not be exposed');
   });
 
   it('does not use runtime, JSON, or JSONL replay pending arrays as queue authority', () => {

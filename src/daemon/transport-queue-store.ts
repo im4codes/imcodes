@@ -81,6 +81,18 @@ export interface CancelQueuedMessageResult {
   snapshot: QueueSnapshot;
 }
 
+export interface LegacyQueueOwnershipEvidence {
+  /** Stable creation time of the persisted SessionRecord claiming this name. */
+  sessionCreatedAt: number;
+}
+
+export interface AdoptLegacyRecipientResult {
+  status: 'pending' | 'adopted' | 'already_bound' | 'identity_conflict';
+  migrated: number;
+  /** Rows deleted because they provably predate the current SessionRecord. */
+  purged?: number;
+}
+
 export interface HandoffTransportQueueEntry {
   entry: QueueProjectionEntry;
   handoffId: string;
@@ -391,7 +403,16 @@ export class TransportQueueStore {
       // the frames on one socket in order. The tombstone is the durable winner
       // of that race: a late callback with the SAME message id must not recreate
       // work the user already cancelled.
-      const cancellationGate = this.recipientPredicate(recipient);
+      // Cancellation belongs to the stable logical session instance, not one
+      // transient runtime generation. A late callback from the epoch that was
+      // just rotated out must not resurrect the same clientMessageId. A reused
+      // session name has a different sessionInstanceId and never matches.
+      const cancellationGate = recipient
+        ? {
+            sql: '(recipient_session_instance_id IS ? AND recipient_runtime_epoch IS NOT NULL)',
+            params: [recipient.sessionInstanceId],
+          }
+        : this.recipientPredicate(null);
       const cancelled = this.db.prepare(`
         SELECT 1 FROM queue_cancellation_tombstones
         WHERE session_name = ? AND client_message_id = ? AND ${cancellationGate.sql}
@@ -400,6 +421,14 @@ export class TransportQueueStore {
       if (cancelled) {
         this.db.exec('COMMIT');
         return { queueSnapshot: this.readSnapshot(sessionName, 'enqueue_cancelled'), cancelled: true };
+      }
+      const metaRecipient = this.db.prepare(`
+        SELECT recipient_session_instance_id AS sessionInstanceId
+        FROM queue_meta WHERE session_name = ?
+      `).get(sessionName) as { sessionInstanceId?: string | null } | undefined;
+      if (recipient && metaRecipient?.sessionInstanceId
+        && metaRecipient.sessionInstanceId !== recipient.sessionInstanceId) {
+        throw new Error('transport queue recipient instance mismatch');
       }
       if (evictClientMessageId) {
         this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
@@ -971,16 +1000,41 @@ export class TransportQueueStore {
     const gate = this.recipientPredicate(caller);
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.ensureMeta(sessionName, now, caller);
       this.db.prepare('DELETE FROM queue_cancellation_tombstones WHERE created_at < ?')
         .run(now - QUEUE_CANCELLATION_TOMBSTONE_TTL_MS);
-      const metaMatches = this.db.prepare(`
+      const existingMeta = this.db.prepare(`
+        SELECT recipient_session_instance_id AS sessionInstanceId,
+          recipient_runtime_epoch AS runtimeEpoch
+        FROM queue_meta WHERE session_name = ? LIMIT 1
+      `).get(sessionName) as {
+        sessionInstanceId?: string | null;
+        runtimeEpoch?: string | null;
+      } | undefined;
+      const metaMatches = existingMeta && this.db.prepare(`
         SELECT 1 FROM queue_meta WHERE session_name = ? AND ${gate.sql} LIMIT 1
       `).get(sessionName, ...gate.params);
-      if (!metaMatches) {
-        this.db.exec('COMMIT');
-        return { status: 'identity_mismatch', snapshot: this.readSnapshot(sessionName, 'cancel_identity_mismatch') };
+      // Do not let ensureMeta adopt an identified caller before validating the
+      // existing aggregate. That used to turn a refused legacy-row delete into
+      // a misleading queueBelongsTo=true state while private child rows stayed
+      // untouched. A genuinely absent aggregate may still be created so a
+      // delete-before-enqueue tombstone wins its race durably.
+      if (existingMeta && !metaMatches) {
+        const metaIsCompletelyUnbound = existingMeta.sessionInstanceId == null
+          && existingMeta.runtimeEpoch == null;
+        // Read-only helpers can legitimately mint an empty legacy queue_meta
+        // before an async send reaches enqueue. An identified cancellation may
+        // adopt ONLY that empty shell so its tombstone wins the race. Any child
+        // row (including private material or an earlier tombstone) makes name-
+        // based adoption ambiguous and must remain byte-for-byte untouched.
+        const hasAnyChildRows = ['queue_entries', 'queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones']
+          .some((table) => this.db.prepare(`SELECT 1 FROM ${table} WHERE session_name = ? LIMIT 1`).get(sessionName));
+        if (!caller || !metaIsCompletelyUnbound || hasAnyChildRows) {
+          this.db.exec('COMMIT');
+          return { status: 'identity_mismatch', snapshot: this.readSnapshot(sessionName, 'cancel_identity_mismatch') };
+        }
+        this.ensureMeta(sessionName, now, caller);
       }
+      if (!existingMeta) this.ensureMeta(sessionName, now, caller);
       for (const table of ['queue_entries', 'queue_private_material', 'queue_cancellation_tombstones']) {
         const foreign = this.db.prepare(`
           SELECT 1 FROM ${table}
@@ -1009,6 +1063,216 @@ export class TransportQueueStore {
       const version = this.bumpVersion(sessionName, now);
       this.db.exec('COMMIT');
       return { status: 'accepted', snapshot: this.readSnapshot(sessionName, 'cancel', { ...version, dropReason: 'user_cleared' }) };
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Reconcile queue rows to the authoritative persisted SessionRecord.
+   *
+   * This is deliberately narrower than name-based adoption: every durable row
+   * must be unbound or carry the caller's stable sessionInstanceId. A different
+   * runtimeEpoch under that SAME instance is a restart generation and is
+   * normalized to the SessionRecord's current epoch. Rows strictly newer than
+   * the SessionRecord are adopted; older NULL-recipient rows provably belong to
+   * an earlier same-name session and are purged across every public/private
+   * table. A foreign instance, partial identity, or equal-time legacy row stays
+   * ambiguous and fails closed before any write.
+   * Work is bounded by logical message id, so restart resumes deterministically
+   * without splitting one message's public row from its private material.
+   */
+  adoptLegacyRecipientIdentity(
+    sessionNameInput: string,
+    recipientInput: QueueRecipientIdentity,
+    evidence: LegacyQueueOwnershipEvidence,
+    options: { limit?: number } = {},
+  ): AdoptLegacyRecipientResult {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const recipient = normalizeQueueRecipient(recipientInput);
+    const sessionCreatedAt = evidence.sessionCreatedAt;
+    if (!recipient || !Number.isFinite(sessionCreatedAt) || sessionCreatedAt < 0) {
+      return { status: 'identity_conflict', migrated: 0 };
+    }
+    const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 64)));
+    const tables = [
+      { name: 'queue_entries', timestamp: 'created_at' },
+      { name: 'queue_private_material', timestamp: 'updated_at' },
+      { name: 'queue_delivery_tombstones', timestamp: 'created_at' },
+      { name: 'queue_cancellation_tombstones', timestamp: 'created_at' },
+    ] as const;
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const meta = this.db.prepare(`
+        SELECT recipient_session_instance_id AS sessionInstanceId,
+          recipient_runtime_epoch AS runtimeEpoch
+        FROM queue_meta WHERE session_name = ?
+      `).get(sessionName) as { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | undefined;
+      if (!meta) {
+        this.db.exec('COMMIT');
+        return { status: 'already_bound', migrated: 0 };
+      }
+      const metaIsLegacy = meta.sessionInstanceId == null && meta.runtimeEpoch == null;
+      const metaIsCaller = meta.sessionInstanceId === recipient.sessionInstanceId
+        && meta.runtimeEpoch === recipient.runtimeEpoch;
+      const metaIsSameInstance = meta.sessionInstanceId === recipient.sessionInstanceId
+        && typeof meta.runtimeEpoch === 'string' && meta.runtimeEpoch.length > 0;
+      if (!metaIsLegacy && !metaIsCaller && !metaIsSameInstance) {
+        this.db.exec('ROLLBACK');
+        return { status: 'identity_conflict', migrated: 0 };
+      }
+
+      // Preflight the complete session before changing a single row. Caller-
+      // owned rows from multiple runtime generations may coexist with legacy
+      // rows after a crash. Partial identities or another stable session
+      // instance are never repairable here.
+      for (const table of tables) {
+        const conflict = this.db.prepare(`
+          SELECT 1 FROM ${table.name}
+          WHERE session_name = ? AND (
+            (recipient_session_instance_id IS NULL) != (recipient_runtime_epoch IS NULL)
+            OR (
+              recipient_session_instance_id IS NOT NULL
+              AND recipient_session_instance_id IS NOT ?
+            )
+            OR (
+              recipient_session_instance_id IS NULL
+              AND recipient_runtime_epoch IS NULL
+              AND ${table.timestamp} = ?
+            )
+          ) LIMIT 1
+        `).get(
+          sessionName,
+          recipient.sessionInstanceId,
+          sessionCreatedAt,
+        );
+        if (conflict) {
+          this.db.exec('ROLLBACK');
+          return { status: 'identity_conflict', migrated: 0 };
+        }
+      }
+
+      const recoverableMessages = this.db.prepare(`
+        SELECT client_message_id AS clientMessageId, MIN(row_time) AS oldestAt
+        FROM (
+          SELECT client_message_id, created_at AS row_time FROM queue_entries
+            WHERE session_name = ? AND (
+              (recipient_session_instance_id IS NULL AND recipient_runtime_epoch IS NULL)
+              OR (recipient_session_instance_id IS ? AND recipient_runtime_epoch IS NOT ?)
+            )
+          UNION ALL
+          SELECT client_message_id, updated_at AS row_time FROM queue_private_material
+            WHERE session_name = ? AND (
+              (recipient_session_instance_id IS NULL AND recipient_runtime_epoch IS NULL)
+              OR (recipient_session_instance_id IS ? AND recipient_runtime_epoch IS NOT ?)
+            )
+          UNION ALL
+          SELECT client_message_id, created_at AS row_time FROM queue_delivery_tombstones
+            WHERE session_name = ? AND (
+              (recipient_session_instance_id IS NULL AND recipient_runtime_epoch IS NULL)
+              OR (recipient_session_instance_id IS ? AND recipient_runtime_epoch IS NOT ?)
+            )
+          UNION ALL
+          SELECT client_message_id, created_at AS row_time FROM queue_cancellation_tombstones
+            WHERE session_name = ? AND (
+              (recipient_session_instance_id IS NULL AND recipient_runtime_epoch IS NULL)
+              OR (recipient_session_instance_id IS ? AND recipient_runtime_epoch IS NOT ?)
+            )
+        )
+        GROUP BY client_message_id
+        ORDER BY client_message_id
+        LIMIT ?
+      `).all(
+        sessionName, recipient.sessionInstanceId, recipient.runtimeEpoch,
+        sessionName, recipient.sessionInstanceId, recipient.runtimeEpoch,
+        sessionName, recipient.sessionInstanceId, recipient.runtimeEpoch,
+        sessionName, recipient.sessionInstanceId, recipient.runtimeEpoch,
+        limit,
+      ) as Array<{
+        clientMessageId: string;
+        oldestAt: number;
+      }>;
+
+      let migrated = 0;
+      let purged = 0;
+      for (const message of recoverableMessages) {
+        const stale = Number(message.oldestAt) < sessionCreatedAt;
+        for (const table of tables) {
+          const legacyResult = stale
+            ? this.db.prepare(`
+                DELETE FROM ${table.name}
+                WHERE session_name = ? AND client_message_id = ?
+                  AND recipient_session_instance_id IS NULL
+                  AND recipient_runtime_epoch IS NULL
+              `).run(sessionName, message.clientMessageId)
+            : this.db.prepare(`
+                UPDATE ${table.name}
+                SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?
+                WHERE session_name = ? AND client_message_id = ?
+                  AND recipient_session_instance_id IS NULL
+                  AND recipient_runtime_epoch IS NULL
+              `).run(recipient.sessionInstanceId, recipient.runtimeEpoch, sessionName, message.clientMessageId);
+          const rotated = this.db.prepare(`
+            UPDATE ${table.name}
+            SET recipient_runtime_epoch = ?
+            WHERE session_name = ? AND client_message_id = ?
+              AND recipient_session_instance_id IS ?
+              AND recipient_runtime_epoch IS NOT ?
+          `).run(
+            recipient.runtimeEpoch,
+            sessionName,
+            message.clientMessageId,
+            recipient.sessionInstanceId,
+            recipient.runtimeEpoch,
+          );
+          if (stale) purged += Number(legacyResult.changes ?? 0);
+          else migrated += Number(legacyResult.changes ?? 0);
+          migrated += Number(rotated.changes ?? 0);
+        }
+      }
+
+      const hasRecoverableRows = tables.some((table) => this.db.prepare(`
+        SELECT 1 FROM ${table.name}
+        WHERE session_name = ? AND (
+          (recipient_session_instance_id IS NULL AND recipient_runtime_epoch IS NULL)
+          OR (recipient_session_instance_id IS ? AND recipient_runtime_epoch IS NOT ?)
+        )
+        LIMIT 1
+      `).get(sessionName, recipient.sessionInstanceId, recipient.runtimeEpoch));
+      if (hasRecoverableRows) {
+        if (purged > 0) {
+          this.db.prepare(`
+            UPDATE queue_meta
+            SET pending_message_version = pending_message_version + 1, updated_at = ?
+            WHERE session_name = ?
+          `).run(Date.now(), sessionName);
+        }
+        this.db.exec('COMMIT');
+        return { status: 'pending', migrated, ...(purged > 0 ? { purged } : {}) };
+      }
+
+      if (!metaIsCaller) {
+        this.db.prepare(`
+          UPDATE queue_meta
+          SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?, updated_at = ?,
+            pending_message_version = pending_message_version + ?
+          WHERE session_name = ?
+        `).run(recipient.sessionInstanceId, recipient.runtimeEpoch, Date.now(), purged > 0 ? 1 : 0, sessionName);
+      } else if (purged > 0) {
+        this.db.prepare(`
+          UPDATE queue_meta
+          SET pending_message_version = pending_message_version + 1, updated_at = ?
+          WHERE session_name = ?
+        `).run(Date.now(), sessionName);
+      }
+      this.db.exec('COMMIT');
+      return {
+        status: !metaIsCaller || migrated > 0 || purged > 0 ? 'adopted' : 'already_bound',
+        migrated,
+        ...(purged > 0 ? { purged } : {}),
+      };
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
@@ -1114,6 +1378,21 @@ export class TransportQueueStore {
     });
     if (!bound) return false;
     return bound.sessionInstanceId === caller.sessionInstanceId && bound.runtimeEpoch === caller.runtimeEpoch;
+  }
+
+  /** Does any aggregate row still carry the pre-identity NULL/NULL shape? */
+  hasLegacyRecipientRows(sessionNameInput: string): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    for (const table of ['queue_meta', 'queue_entries', 'queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones']) {
+      if (this.db.prepare(`
+        SELECT 1 FROM ${table}
+        WHERE session_name = ?
+          AND recipient_session_instance_id IS NULL
+          AND recipient_runtime_epoch IS NULL
+        LIMIT 1
+      `).get(sessionName)) return true;
+    }
+    return false;
   }
 
   /**
@@ -1230,6 +1509,20 @@ export class TransportQueueStore {
     }
   }
 
+  /** Public projection for one authoritative recipient; foreign/legacy rows stay private. */
+  readSnapshotSafelyForRecipient(
+    sessionNameInput: string,
+    recipient: QueueRecipientIdentity | null,
+    source = 'read',
+  ): QueueSnapshot {
+    try {
+      return this.readSnapshotForRecipient(sessionNameInput, recipient, source);
+    } catch (err) {
+      const base = this.readSnapshotSafely(sessionNameInput, source);
+      return { ...base, pendingMessageEntries: [], failedMessageEntries: [] };
+    }
+  }
+
   restoreExpiredHandoffs(
     sessionNameInput: string,
     now = Date.now(),
@@ -1281,9 +1574,43 @@ export class TransportQueueStore {
       activityGeneration?: number | string;
     },
   ): QueueSnapshot {
+    return this.buildSnapshot(sessionNameInput, source, override);
+  }
+
+  readSnapshotForRecipient(
+    sessionNameInput: string,
+    recipient: QueueRecipientIdentity | null,
+    source = 'read',
+    override?: {
+      queueEpoch: string;
+      queueAuthorityId: string;
+      pendingMessageVersion: number;
+      resetReason?: QueueResetReason;
+      dropReason?: QueueDropReason;
+      activityGeneration?: number | string;
+    },
+  ): QueueSnapshot {
+    return this.buildSnapshot(sessionNameInput, source, override, {
+      caller: normalizeQueueRecipient(recipient),
+    });
+  }
+
+  private buildSnapshot(
+    sessionNameInput: string,
+    source: string,
+    override?: {
+      queueEpoch: string;
+      queueAuthorityId: string;
+      pendingMessageVersion: number;
+      resetReason?: QueueResetReason;
+      dropReason?: QueueDropReason;
+      activityGeneration?: number | string;
+    },
+    recipientFilter?: { caller: QueueRecipientIdentity | null },
+  ): QueueSnapshot {
     const sessionName = normalizeSessionName(sessionNameInput);
     const meta = override ?? this.ensureMeta(sessionName);
-    const rows = this.readRows(sessionName);
+    const rows = this.readRows(sessionName, recipientFilter);
     return {
       type: 'transport.queue.snapshot',
       sessionName,
@@ -1311,7 +1638,14 @@ export class TransportQueueStore {
     };
   }
 
-  private readRows(sessionName: string): QueueStoredEntry[] {
+  private readRows(
+    sessionName: string,
+    recipientFilter?: { caller: QueueRecipientIdentity | null },
+  ): QueueStoredEntry[] {
+    const gate = recipientFilter ? this.recipientPredicate(recipientFilter.caller) : null;
+    const rowGateSql = gate?.sql
+      .replaceAll('recipient_session_instance_id', 'e.recipient_session_instance_id')
+      .replaceAll('recipient_runtime_epoch', 'e.recipient_runtime_epoch');
     const rows = this.db.prepare(`
       SELECT
         e.session_name AS sessionName,
@@ -1341,8 +1675,9 @@ export class TransportQueueStore {
       FROM queue_entries e
       JOIN queue_meta m ON m.session_name = e.session_name
       WHERE e.session_name = ?
+        ${rowGateSql ? `AND ${rowGateSql}` : ''}
       ORDER BY CASE e.placement WHEN 'front' THEN 0 ELSE 1 END, e.ordinal, e.created_at, e.client_message_id
-    `).all(sessionName) as Array<Record<string, unknown>>;
+    `).all(sessionName, ...(gate?.params ?? [])) as Array<Record<string, unknown>>;
     return rows.map(parseStoredEntry);
   }
 }

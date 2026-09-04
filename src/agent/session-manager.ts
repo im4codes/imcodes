@@ -1487,6 +1487,40 @@ async function drainTransportResendQueueIntoRuntime(
   }
 }
 
+/**
+ * Recover every durable queue holder only after the live runtime proves it may
+ * own the SQLite rows under this reusable session name. The proof also resumes
+ * the bounded legacy NULL-recipient migration. Keeping this sequence shared is
+ * security-critical: restore and relaunch must not diverge on ownership gates.
+ */
+async function recoverPersistedTransportQueue(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+  context: 'reconnect' | 'launch',
+): Promise<number> {
+  const recipient = runtime.recipientIdentity;
+  const hadLegacyRows = getTransportQueueStore().hasLegacyRecipientRows(sessionName);
+  if (recipient && !runtime.adoptLegacyQueueRecipient()) {
+    logger.warn({ session: sessionName, context }, 'Transport queue recovery refused ambiguous recipient ownership');
+    return 0;
+  }
+  getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now(), { includeUnexpired: true });
+  await drainTransportResendQueueIntoRuntime(runtime, sessionName, context);
+  // Launch historically relies on the resend holder and may contain queue rows
+  // whose ids are not represented identically in older resend records. Reading
+  // all already-owned rows again would duplicate them. Only the newly-adopted
+  // legacy case needs SQLite rehydrate on launch; reconnect always does.
+  const recoveredPending = context === 'reconnect'
+    || (recipient && (hadLegacyRows || runtime.queueRecipientRecoveryChanged))
+    ? runtime.rehydratePendingFromStore()
+    : 0;
+  if (recoveredPending > 0) {
+    logger.info({ session: sessionName, recovered: recoveredPending, context }, 'Rehydrated queued transport messages from SQLite');
+    runtime.drainPendingIfIdle(`sqlite-${context}-rehydrate`);
+  }
+  return recoveredPending;
+}
+
 /** Drain control traffic that was deliberately persisted before delivery. */
 export async function drainTransportResendQueueForDispatch(sessionName: string): Promise<void> {
   const runtime = getTransportRuntime(sessionName);
@@ -2497,7 +2531,12 @@ export async function restoreTransportSessions(
         // the SDK rejected it ("model (fable) may not exist"). Idempotent for ids.
         requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
       }
-      const runtime = new TransportSessionRuntime(provider, s.name, recipientFromSessionRecord(s));
+      const runtime = new TransportSessionRuntime(
+        provider,
+        s.name,
+        recipientFromSessionRecord(s),
+        { sessionCreatedAt: s.createdAt },
+      );
       // initialize emits provider-ready before returning. A restore has not
       // won its final authority check at that point, so defer resend drain
       // until the runtime is committed below.
@@ -2793,26 +2832,10 @@ export async function restoreTransportSessions(
       // `_sending` is still false.
       // Reclaim ONLY leases inherited from the dead daemon process, before this
       // restore creates any new handoffs of its own.
-      getTransportQueueStore().restoreExpiredHandoffs(s.name, Date.now(), { includeUnexpired: true });
-      await drainTransportResendQueueIntoRuntime(runtime, s.name, 'reconnect');
-
-      // Rehydrate the runtime's pending queue from the SQLite queue authority.
-      // On a fresh daemon restart BOTH in-memory holders start empty (the resend
-      // queue drained just above AND this runtime's `_pendingMessages`), so a
-      // message that was `queued` behind an in-flight turn before the crash
-      // survives only in transport-queue.sqlite and would otherwise linger
-      // forever (daemon reports pending 0 while SQLite still holds the row —
-      // the "restart doesn't resync the queue" bug). Runs AFTER the resend drain
-      // so resend-claimed entries (now handoff_inflight/sent) are skipped by the
-      // clientMessageId + delivery-tombstone dedup inside the runtime method.
       try {
-        const recoveredPending = runtime.rehydratePendingFromStore();
-        if (recoveredPending > 0) {
-          logger.info({ session: s.name, recovered: recoveredPending }, 'Rehydrated queued transport messages from SQLite after restart');
-          runtime.drainPendingIfIdle('sqlite-restore-rehydrate');
-        }
+        await recoverPersistedTransportQueue(runtime, s.name, 'reconnect');
       } catch (err) {
-        logger.warn({ err, session: s.name }, 'Failed to rehydrate transport pending queue from SQLite after restart');
+        logger.warn({ err, session: s.name }, 'Failed to recover transport queue after restart');
       }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
@@ -2908,7 +2931,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
 
   const provider = await ensureProviderConnected(agentType, {});
 
-  const runtime = new TransportSessionRuntime(provider, name, recipientFromSessionRecord(getSession(name)));
+  const launchRecord = getSession(name);
+  const runtime = new TransportSessionRuntime(
+    provider,
+    name,
+    recipientFromSessionRecord(launchRecord),
+    launchRecord ? { sessionCreatedAt: launchRecord.createdAt } : undefined,
+  );
   wireTransportCallbacks(runtime, name);
   const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType);
   let effectiveSessionKey = name;
@@ -3213,6 +3242,17 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
           : {}),
       };
+      // Repair legacy NULL recipients and same-instance mixed epochs against
+      // the CURRENT persisted SessionRecord before upsert is allowed to rotate
+      // runtimeEpoch. Doing this after upsert is too late: the ordinary epoch
+      // rebind deliberately rejects mixed rows, which used to leave the new
+      // record persisted but the runtime rolled back with
+      // "transport queue recipient rotation rejected". The next enqueue could
+      // then add yet another epoch to the same aggregate, making cards visible
+      // but neither drainable nor cancellable.
+      if (runtime.recipientIdentity && !runtime.adoptLegacyQueueRecipient()) {
+        throw new Error('transport queue canonical recipient recovery rejected');
+      }
       upsertSession(record);
       const persistedRecord = getSession(name);
       const persistedRecipient = recipientFromSessionRecord(persistedRecord);
@@ -3250,8 +3290,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // The old runtime has been killed and cannot complete any lease it left.
   // Reclaim those old-generation handoffs before this runtime creates new ones;
   // the durable attempt counter bounds repeated relaunch recovery.
-  getTransportQueueStore().restoreExpiredHandoffs(name, Date.now(), { includeUnexpired: true });
-  await drainTransportResendQueueIntoRuntime(runtime, name, 'launch');
+  await recoverPersistedTransportQueue(runtime, name, 'launch');
 }
 
 const transportRuntimeRecoveries = new Map<string, Promise<void>>();

@@ -732,6 +732,37 @@ describe('recipient-sensitive store operations are identity-gated', () => {
     expect(store.cancelQueuedMessage(NAME, 'm-a', A, 40).status).toBe('accepted');
   });
 
+  it('keeps a cancellation final when a late callback carries the prior epoch of the same instance', () => {
+    queueForA();
+    expect(store.cancelQueuedMessage(NAME, 'm-a', A, 20).status).toBe('accepted');
+    const rotated = { sessionInstanceId: A.sessionInstanceId, runtimeEpoch: 'epoch-A-current' };
+    expect(store.rebindRecipientRuntimeEpoch(NAME, A, rotated, 21)).toBe(true);
+
+    const late = store.enqueueWithCapacityEviction({
+      sessionName: NAME,
+      recipient: A,
+      clientMessageId: 'm-a',
+      commandId: 'legacy-command-id',
+      text: 'stale callback must not resurrect',
+      now: 22,
+      privateMaterialJson: JSON.stringify({ text: 'stale callback must not resurrect' }),
+    });
+    expect(late.cancelled).toBe(true);
+    expect(store.readSnapshot(NAME).pendingMessageEntries).toEqual([]);
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', A)).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', rotated)).toBeUndefined();
+
+    const reusedName = { sessionInstanceId: 'different-instance', runtimeEpoch: 'epoch-A-current' };
+    expect(() => store.enqueueWithCapacityEviction({
+      sessionName: NAME,
+      recipient: reusedName,
+      clientMessageId: 'm-a',
+      text: 'different instance must not enter the old aggregate',
+      now: 23,
+    })).toThrow('recipient instance mismatch');
+    expect(store.readSnapshot(NAME).pendingMessageEntries).toEqual([]);
+  });
+
   it('does not let a replacement instance tombstone or delete another instance queue row', () => {
     queueForA();
     const result = store.cancelQueuedMessage(NAME, 'm-a', B, 20);
@@ -753,6 +784,9 @@ describe('recipient-sensitive store operations are identity-gated', () => {
 
     const first = store.cancelQueuedMessage(legacyName, 'legacy-message', A, 20);
     expect(first.status).toBe('identity_mismatch');
+    // A refused delete is read-only. In particular, ensureMeta must not bind
+    // queue_meta to the rejected caller while the child rows remain legacy.
+    expect(store.queueBelongsTo(legacyName, A)).toBe(false);
     expect(first.snapshot.pendingMessageEntries).toEqual([
       expect.objectContaining({ clientMessageId: 'legacy-message' }),
     ]);
@@ -760,8 +794,233 @@ describe('recipient-sensitive store operations are identity-gated', () => {
 
     const repeated = store.cancelQueuedMessage(legacyName, 'legacy-message', A, 21);
     expect(repeated.status).toBe('identity_mismatch');
+    expect(store.queueBelongsTo(legacyName, A)).toBe(false);
     expect(store.readSnapshot(legacyName).pendingMessageEntries).toHaveLength(1);
     expect(store.readPrivateDispatchMaterial(legacyName, 'legacy-message')).toContain('must remain quarantined');
+  });
+
+  it('purges pre-session legacy ghosts in bounded restart-durable batches without exposing private material', () => {
+    const legacyName = 'legacy-stale-before-session';
+    for (const [index, id] of ['ghost-1', 'ghost-2'].entries()) {
+      store.enqueue({
+        sessionName: legacyName,
+        clientMessageId: id,
+        commandId: id,
+        text: `private ghost ${index + 1}`,
+        now: 10 + index,
+        privateMaterialJson: JSON.stringify({ text: `private ghost ${index + 1}` }),
+      });
+    }
+    const adopt = () => store.adoptLegacyRecipientIdentity(
+      legacyName,
+      A,
+      { sessionCreatedAt: 50 },
+      { limit: 1 },
+    );
+
+    expect(adopt()).toMatchObject({ status: 'pending', migrated: 0, purged: 2 });
+    expect(store.readSnapshot(legacyName).pendingMessageEntries).toHaveLength(1);
+    store.close();
+    store = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+
+    expect(adopt()).toMatchObject({ status: 'adopted', migrated: 0, purged: 2 });
+    expect(store.readSnapshot(legacyName).pendingMessageEntries).toEqual([]);
+    expect(store.readPrivateDispatchMaterial(legacyName, 'ghost-1', A)).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial(legacyName, 'ghost-2', A)).toBeUndefined();
+    expect(store.queueBelongsTo(legacyName, A)).toBe(true);
+    expect(adopt()).toEqual({ status: 'already_bound', migrated: 0 });
+
+    // A duplicate delete remains accepted and durable; a late execution using
+    // the same id cannot resurrect the purged private payload.
+    expect(store.cancelQueuedMessage(legacyName, 'ghost-1', A, 100).status).toBe('accepted');
+    expect(store.cancelQueuedMessage(legacyName, 'ghost-1', A, 101).status).toBe('accepted');
+    const late = store.enqueueWithCapacityEviction({
+      sessionName: legacyName,
+      recipient: A,
+      clientMessageId: 'ghost-1',
+      commandId: 'ghost-1',
+      text: 'must not return',
+      now: 102,
+      privateMaterialJson: JSON.stringify({ text: 'must not return' }),
+    });
+    expect(late.cancelled).toBe(true);
+    expect(store.readPrivateDispatchMaterial(legacyName, 'ghost-1', A)).toBeUndefined();
+  });
+
+  it('adopts one original-session legacy queue in bounded restart-durable batches, then delete stays final', () => {
+    const legacyName = 'legacy-adopt-after-restart';
+    for (const [index, id] of ['legacy-1', 'legacy-2'].entries()) {
+      store.enqueue({
+        sessionName: legacyName,
+        clientMessageId: id,
+        commandId: id,
+        text: `legacy ${index + 1}`,
+        now: 100 + index,
+        privateMaterialJson: JSON.stringify({ clientMessageId: id, text: `legacy ${index + 1}` }),
+      });
+    }
+    const adopt = () => (store as unknown as {
+      adoptLegacyRecipientIdentity(
+        sessionName: string,
+        recipient: typeof A,
+        evidence: { sessionCreatedAt: number },
+        options: { limit: number },
+      ): { status: 'pending' | 'adopted' | 'already_bound' | 'identity_conflict'; migrated: number };
+    }).adoptLegacyRecipientIdentity(legacyName, A, { sessionCreatedAt: 50 }, { limit: 1 });
+
+    // R2's first fail-closed delete could bind queue_meta while leaving the
+    // legacy child rows NULL. The aggregate must still expose unfinished
+    // migration and let the restart-safe adoption resume.
+    expect(store.cancelQueuedMessage(legacyName, 'legacy-1', A, 150).status).toBe('identity_mismatch');
+    expect(store.hasLegacyRecipientRows(legacyName)).toBe(true);
+    // The bound is one logical message id, so its public row and private
+    // material migrate atomically in the same batch.
+    expect(adopt()).toEqual({ status: 'pending', migrated: 2 });
+    store.close();
+    store = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+
+    let result = adopt();
+    let calls = 1;
+    while (result.status === 'pending' && calls < 8) {
+      result = adopt();
+      calls++;
+    }
+    // The first invocation before restart migrated logical id #1; the first
+    // invocation after restart atomically migrates logical id #2 and finishes.
+    expect(calls).toBe(1);
+    expect(result.status).toBe('adopted');
+    expect(store.queueBelongsTo(legacyName, A)).toBe(true);
+    expect(store.readPrivateDispatchMaterial(legacyName, 'legacy-1', A)).toContain('legacy 1');
+
+    expect(store.cancelQueuedMessage(legacyName, 'legacy-1', A, 200).status).toBe('accepted');
+    expect(store.readPrivateDispatchMaterial(legacyName, 'legacy-1', A)).toBeUndefined();
+    const late = store.enqueueWithCapacityEviction({
+      sessionName: legacyName,
+      recipient: A,
+      clientMessageId: 'legacy-1',
+      commandId: 'legacy-1',
+      text: 'late duplicate',
+      now: 201,
+      privateMaterialJson: JSON.stringify({ text: 'late duplicate' }),
+    });
+    expect(late.cancelled).toBe(true);
+    expect(store.readSnapshot(legacyName).pendingMessageEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['legacy-2']);
+  });
+
+  it('purges an older same-name legacy row but refuses equal-time or conflicting recipient evidence', () => {
+    const legacyName = 'legacy-adopt-older';
+    store.enqueue({
+      sessionName: legacyName,
+      clientMessageId: 'legacy',
+      text: 'belongs to the earlier record',
+      now: 100,
+      privateMaterialJson: JSON.stringify({ text: 'belongs to the earlier record' }),
+    });
+    const adopter = store as unknown as {
+      adoptLegacyRecipientIdentity(
+        sessionName: string,
+        recipient: typeof A,
+        evidence: { sessionCreatedAt: number },
+        options?: { limit?: number },
+      ): { status: string; migrated: number };
+    };
+
+    expect(adopter.adoptLegacyRecipientIdentity(
+      legacyName,
+      A,
+      { sessionCreatedAt: 101 },
+    )).toEqual({ status: 'adopted', migrated: 0, purged: 2 });
+    expect(store.readSnapshot(legacyName).pendingMessageEntries).toEqual([]);
+    expect(store.readPrivateDispatchMaterial(legacyName, 'legacy')).toBeUndefined();
+
+    const equalName = 'legacy-adopt-equal';
+    store.enqueue({
+      sessionName: equalName,
+      clientMessageId: 'legacy',
+      text: 'timestamp remains ambiguous',
+      now: 100,
+      privateMaterialJson: JSON.stringify({ text: 'timestamp remains ambiguous' }),
+    });
+    // Equal millisecond is not unique ownership evidence: a remove/recreate
+    // can share the timestamp quantum with the old row, so adoption stays
+    // fail-closed rather than guessing by name.
+    expect(adopter.adoptLegacyRecipientIdentity(
+      equalName,
+      A,
+      { sessionCreatedAt: 100 },
+    )).toEqual({ status: 'identity_conflict', migrated: 0 });
+
+    const conflictName = 'legacy-adopt-foreign';
+    store.enqueue({
+      sessionName: conflictName,
+      clientMessageId: 'legacy',
+      text: 'belongs to another recipient',
+      now: 100,
+      privateMaterialJson: JSON.stringify({ text: 'belongs to another recipient' }),
+    });
+    const raw = new DatabaseSync(join(dir, 'queue.sqlite'));
+    try {
+      raw.prepare(`
+        UPDATE queue_private_material
+        SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?
+        WHERE session_name = ? AND client_message_id = ?
+      `).run(B.sessionInstanceId, B.runtimeEpoch, conflictName, 'legacy');
+    } finally {
+      raw.close();
+    }
+    expect(adopter.adoptLegacyRecipientIdentity(
+      conflictName,
+      A,
+      { sessionCreatedAt: 50 },
+    )).toEqual({ status: 'identity_conflict', migrated: 0 });
+    expect(store.queueBelongsTo(conflictName, A)).toBe(false);
+    expect(store.readPrivateDispatchMaterial(conflictName, 'legacy', A)).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial(conflictName, 'legacy', B)).toContain('another recipient');
+  });
+
+  it('reconciles a canonical SessionRecord across mixed epochs of the same instance before delete', () => {
+    const name = 'same-instance-mixed-epochs';
+    const canonical = { sessionInstanceId: 'stable-instance', runtimeEpoch: 'epoch-current' };
+    const stale = { sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: 'epoch-stale' };
+    store.enqueue({
+      sessionName: name,
+      recipient: stale,
+      clientMessageId: 'older-runtime-row',
+      text: 'same logical session before restart',
+      now: 110,
+      privateMaterialJson: JSON.stringify({ text: 'same logical session before restart' }),
+    });
+    // Reproduce the production split: queue_meta still names a stale runtime
+    // generation while a later enqueue already carries the SessionRecord's
+    // canonical generation. Ungated snapshots display the latter card, but a
+    // meta-only identity check used to make its delete return not-found.
+    store.enqueue({
+      sessionName: name,
+      recipient: canonical,
+      clientMessageId: 'displayed-current-row',
+      text: 'the card selected by the user',
+      now: 120,
+      privateMaterialJson: JSON.stringify({ text: 'the card selected by the user' }),
+    });
+    expect(store.readSnapshotForRecipient(name, canonical).pendingMessageEntries)
+      .toEqual([expect.objectContaining({ clientMessageId: 'displayed-current-row' })]);
+    expect(store.cancelQueuedMessage(name, 'displayed-current-row', canonical, 130).status)
+      .toBe('identity_mismatch');
+
+    expect(store.adoptLegacyRecipientIdentity(name, canonical, { sessionCreatedAt: 100 }))
+      .toMatchObject({ status: 'adopted', migrated: 2 });
+    expect(store.queueBelongsTo(name, canonical)).toBe(true);
+    expect(store.readSnapshotForRecipient(name, canonical).pendingMessageEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['older-runtime-row', 'displayed-current-row']);
+    expect(store.cancelQueuedMessage(name, 'displayed-current-row', canonical, 140).status)
+      .toBe('accepted');
+    expect(store.readPrivateDispatchMaterial(name, 'displayed-current-row', canonical)).toBeUndefined();
+
+    // A same-named but different stable instance is never an epoch rotation.
+    const foreign = { sessionInstanceId: 'foreign-instance', runtimeEpoch: 'epoch-current' };
+    expect(store.adoptLegacyRecipientIdentity(name, foreign, { sessionCreatedAt: 100 }))
+      .toEqual({ status: 'identity_conflict', migrated: 0 });
   });
 
   it('B cannot read A\'s private dispatch material', () => {

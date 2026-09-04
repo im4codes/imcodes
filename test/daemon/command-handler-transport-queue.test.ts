@@ -43,6 +43,10 @@ import {
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
 import { ALIAS_LEGEND_DIRECTIVE, buildAliasLegendLine } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from '../../src/daemon/alias-audit.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
@@ -1134,12 +1138,186 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(stillPresent).toBe(false);
   });
 
+  it('undo_queued_message safely adopts and deletes a legacy NULL-recipient row for its original session', async () => {
+    const createdAt = Date.now() - 10_000;
+    const recipient = { sessionInstanceId: 'legacy-original', runtimeEpoch: 'legacy-runtime' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-delete',
+      commandId: 'legacy-delete',
+      text: 'legacy private text',
+      now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'legacy-delete', text: 'legacy private text' }),
+    });
+    const runtime = new TransportSessionRuntime(
+      makeRuntimeProvider(vi.fn().mockResolvedValue(undefined)),
+      'deck_transport_brain',
+      recipient,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch, createdAt,
+    });
+
+    try {
+      handleWebCommand({
+        type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+        clientMessageId: 'legacy-delete', commandId: 'cmd-legacy-delete',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'command.ack', commandId: 'cmd-legacy-delete', status: 'accepted',
+      }));
+      expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'legacy-delete', recipient)).toBeUndefined();
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('undo_queued_message purges an older same-name legacy ghost and stays idempotent', async () => {
+    const createdAt = Date.now();
+    const recipient = { sessionInstanceId: 'replacement-instance', runtimeEpoch: 'replacement-runtime' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-old-delete',
+      commandId: 'legacy-old-delete',
+      text: 'old private text must not cross sessions',
+      now: createdAt - 1,
+      privateMaterialJson: JSON.stringify({ text: 'old private text must not cross sessions' }),
+    });
+    const runtime = new TransportSessionRuntime(
+      makeRuntimeProvider(vi.fn().mockResolvedValue(undefined)),
+      'deck_transport_brain',
+      recipient,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch, createdAt,
+    });
+
+    try {
+      for (const commandId of ['cmd-old-delete-1', 'cmd-old-delete-2']) {
+        handleWebCommand({
+          type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+          clientMessageId: 'legacy-old-delete', commandId,
+        }, serverLink as any);
+        await flushAsync();
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'command.ack', commandId, status: 'accepted',
+        }));
+      }
+      expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'legacy-old-delete', recipient)).toBeUndefined();
+      expect(store.queueBelongsTo('deck_transport_brain', recipient)).toBe(true);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('deletes a displayed canonical row when queue_meta is stranded on an older runtime epoch', async () => {
+    const createdAt = Date.now() - 10_000;
+    const canonical = { sessionInstanceId: 'stable-live-instance', runtimeEpoch: 'epoch-current' };
+    const staleEpoch = { sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: 'epoch-before-restart' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: staleEpoch,
+      clientMessageId: 'earlier-same-instance', text: 'survives the restart', now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({ text: 'survives the restart' }),
+    });
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: canonical,
+      clientMessageId: 'displayed-canonical-id', commandId: 'legacy-command-id',
+      text: 'visible card selected by its canonical id', now: createdAt + 2,
+      privateMaterialJson: JSON.stringify({ text: 'visible card selected by its canonical id' }),
+    });
+    expect(store.queueBelongsTo('deck_transport_brain', canonical)).toBe(false);
+    expect(store.readSnapshotForRecipient('deck_transport_brain', canonical).pendingMessageEntries)
+      .toEqual([expect.objectContaining({
+        clientMessageId: 'displayed-canonical-id', commandId: 'legacy-command-id',
+      })]);
+
+    const runtime = new TransportSessionRuntime(
+      makeRuntimeProvider(vi.fn().mockResolvedValue(undefined)),
+      'deck_transport_brain',
+      canonical,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', createdAt,
+      sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: canonical.runtimeEpoch,
+    });
+
+    try {
+      for (const commandId of ['delete-canonical-1', 'delete-canonical-2']) {
+        handleWebCommand({
+          type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+          clientMessageId: 'displayed-canonical-id', commandId,
+        }, serverLink as any);
+        await flushAsync();
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'command.ack', commandId, status: 'accepted',
+        }));
+      }
+      expect(store.queueBelongsTo('deck_transport_brain', canonical)).toBe(true);
+      expect(store.readSnapshotForRecipient('deck_transport_brain', canonical).pendingMessageEntries)
+        .toEqual([expect.objectContaining({ clientMessageId: 'earlier-same-instance' })]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'displayed-canonical-id', canonical))
+        .toBeUndefined();
+      expect(emitMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'session.state',
+        expect.objectContaining({
+          pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'earlier-same-instance' })],
+        }),
+        expect.any(Object),
+      );
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('undo_queued_message fails closed when legacy ownership cannot be proven', async () => {
+    const cancelSpy = vi.spyOn(getTransportQueueStore(), 'cancelQueuedMessage');
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      recipientIdentity: { sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch' },
+      adoptLegacyQueueRecipient: vi.fn(() => false),
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand({
+      type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-ambiguous', commandId: 'cmd-legacy-ambiguous-delete',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(cancelSpy).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-legacy-ambiguous-delete', status: 'error', error: 'Queue ownership changed',
+    }));
+    cancelSpy.mockRestore();
+  });
+
   it('durably prevents an immediate delete/send race from resurrecting the message', async () => {
     const recipient = { sessionInstanceId: 'instance-race', runtimeEpoch: 'epoch-race' };
     let pending = false;
+    let enqueueResult: ReturnType<ReturnType<typeof getTransportQueueStore>['enqueueWithCapacityEviction']> | undefined;
     const send = vi.fn((text: string, clientMessageId: string) => {
       pending = true;
-      getTransportQueueStore().enqueue({
+      enqueueResult = getTransportQueueStore().enqueueWithCapacityEviction({
         sessionName: 'deck_transport_brain', recipient, clientMessageId, commandId: clientMessageId,
         text, privateMaterialJson: JSON.stringify({ clientMessageId, text }),
       });
@@ -1168,6 +1346,8 @@ describe('handleWebCommand transport queue behavior', () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
 
     expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.results[0]?.type).toBe('return');
+    expect(enqueueResult?.cancelled).toBe(true);
     expect(removePendingMessage).toHaveBeenCalledWith('msg-race');
     expect(getTransportQueueStore().readSnapshot('deck_transport_brain').pendingMessageEntries)
       .not.toEqual(expect.arrayContaining([expect.objectContaining({ clientMessageId: 'msg-race' })]));
@@ -4878,6 +5058,155 @@ describe('handleWebCommand transport queue behavior', () => {
       commandId: 'cmd-append-action',
       status: 'accepted',
     }));
+  });
+
+  it('does not append or expose a legacy row when ownership adoption is ambiguous', async () => {
+    const appendPendingMessagesToActiveTurn = vi.fn();
+    getTransportRuntimeMock.mockReturnValue({
+      recipientIdentity: { sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch' },
+      adoptLegacyQueueRecipient: vi.fn(() => false),
+      rehydratePendingFromStore: vi.fn(),
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      pendingCount: 1,
+      pendingMessages: ['quarantined'],
+      pendingEntries: [{ clientMessageId: 'legacy-ambiguous', text: 'quarantined' }],
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['legacy-ambiguous'],
+      commandId: 'cmd-legacy-ambiguous-append',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-legacy-ambiguous-append', status: 'error', error: 'Queue ownership changed',
+    }));
+  });
+
+  it('append retires an older same-name ghost without dispatching its private text or re-projecting the card', async () => {
+    const createdAt = Date.now();
+    const recipient = { sessionInstanceId: 'append-replacement', runtimeEpoch: 'append-replacement-epoch' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-old-append',
+      commandId: 'legacy-old-append',
+      text: 'old append private text',
+      now: createdAt - 1,
+      privateMaterialJson: JSON.stringify({ text: 'old append private text' }),
+    });
+    const provider = makeRuntimeProvider(vi.fn().mockResolvedValue(undefined));
+    provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const runtime = new TransportSessionRuntime(
+      provider,
+      'deck_transport_brain',
+      recipient,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    runtime.send('current foreground turn', 'foreground-current');
+    await flushAsync();
+    // Simulate the card the browser selected only for the synchronizer's first
+    // observation. The real runtime queue remains empty, so the production
+    // append path must reconcile SQLite rather than dispatching stale text.
+    const pendingSpy = vi.spyOn(runtime, 'pendingEntries', 'get').mockReturnValueOnce([
+      { clientMessageId: 'legacy-old-append', text: 'public stale card' },
+    ]);
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch, createdAt,
+    });
+
+    try {
+      handleWebCommand({
+        type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+        sessionName: 'deck_transport_brain',
+        clientMessageIds: ['legacy-old-append'],
+        commandId: 'cmd-old-append',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(provider.notifyActiveDelegation).not.toHaveBeenCalled();
+      expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'legacy-old-append', recipient)).toBeUndefined();
+      expect(emitMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'session.state',
+        expect.objectContaining({ pendingMessageEntries: [], pendingCount: 0 }),
+        expect.any(Object),
+      );
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        commandId: 'cmd-old-append', status: 'error', error: 'Queued message not found',
+      }));
+    } finally {
+      pendingSpy.mockRestore();
+      await runtime.kill();
+    }
+  });
+
+  it('appends a displayed canonical row immediately across a stranded same-instance queue epoch', async () => {
+    const createdAt = Date.now() - 10_000;
+    const canonical = { sessionInstanceId: 'append-stable-instance', runtimeEpoch: 'append-current-epoch' };
+    const staleEpoch = { sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: 'append-stale-epoch' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: staleEpoch,
+      clientMessageId: 'same-instance-earlier', text: 'leave this queued', now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({ text: 'leave this queued' }),
+    });
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: canonical,
+      clientMessageId: 'canonical-append-id', commandId: 'legacy-append-command',
+      text: 'append the displayed card', now: createdAt + 2,
+      privateMaterialJson: JSON.stringify({ text: 'append the displayed card' }),
+    });
+    const provider = makeRuntimeProvider(vi.fn().mockResolvedValue(undefined));
+    provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const runtime = new TransportSessionRuntime(
+      provider,
+      'deck_transport_brain',
+      canonical,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    runtime.send('current foreground turn', 'foreground-current');
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', createdAt,
+      sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: canonical.runtimeEpoch,
+    });
+
+    try {
+      handleWebCommand({
+        type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+        sessionName: 'deck_transport_brain',
+        clientMessageIds: ['canonical-append-id'],
+        commandId: 'append-canonical-action',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(provider.notifyActiveDelegation).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ text: 'append the displayed card' }),
+      );
+      expect(store.queueBelongsTo('deck_transport_brain', canonical)).toBe(true);
+      expect(store.readSnapshotForRecipient('deck_transport_brain', canonical).pendingMessageEntries)
+        .toEqual([expect.objectContaining({ clientMessageId: 'same-instance-earlier' })]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'canonical-append-id', canonical))
+        .toBeUndefined();
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'command.ack', commandId: 'append-canonical-action', status: 'accepted',
+      }));
+    } finally {
+      await runtime.kill();
+    }
   });
 
   it('waits for an optimistic queue row even when append arrives before its matching send', async () => {

@@ -479,6 +479,27 @@ async function waitForSelectedSessionSends(
       const queuedIds = new Set((runtime.pendingEntries ?? []).map((entry) => entry.clientMessageId));
       if (ids.every((id) => queuedIds.has(id))) return;
     }
+    // After a daemon restart the browser may be rendering an authoritative
+    // SQLite snapshot while the new runtime has not rehydrated that row yet.
+    // Match the exact projected clientMessageId under the persisted recipient
+    // identity; do not burn the full optimistic-send wait budget for a row the
+    // authority already proves exists. The append handler will reconcile the
+    // queue generation and rehydrate it under the session mutex immediately
+    // after this barrier.
+    const recipient = recipientFromSessionRecord(getSession(sessionName));
+    if (recipient) {
+      try {
+        const durableIds = new Set(
+          getTransportQueueStore()
+            .readSnapshotForRecipient(sessionName, recipient, 'append_wait_authority')
+            .pendingMessageEntries
+            .map((entry) => entry.clientMessageId),
+        );
+        if (ids.every((id) => durableIds.has(id))) return;
+      } catch {
+        // The bounded polling path below remains the safe degraded fallback.
+      }
+    }
 
     const pending = [...new Set(ids.flatMap((clientMessageId) => {
       const tracked = inFlightSessionSends.get(inFlightSessionSendKey(sessionName, clientMessageId));
@@ -5010,6 +5031,14 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   }
   const release = await getMutex(sessionName).acquire();
   try {
+    // A pre-recipient-identity row may belong to this exact persisted session,
+    // but name equality alone is never authority. Let the runtime prove and
+    // complete its bounded adoption before any status or private-data mutation.
+    if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queue ownership changed' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queue ownership changed' });
+      return;
+    }
     const removed = runtime.removePendingMessage(clientMessageId);
     // The SQLite queue authority — not the runtime's in-memory queue — is what
     // keeps the UI queued bubble alive. After a daemon restart the row can still
@@ -5135,6 +5164,10 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
 
   const release = await getMutex(sessionName).acquire();
   try {
+    if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
+      reject('Queue ownership changed');
+      return;
+    }
     // Same bounded recovery boundary as the delete path: append reads the
     // runtime's pending list, so a row stranded in an EXPIRED handoff (or one
     // that only survives in SQLite after a restart) was unreachable here too.
@@ -5157,6 +5190,17 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
             : result.status === 'stale'
               ? 'The active turn already finished'
               : 'Queued message not found';
+      if (result.status === 'not_found') {
+        // A bounded ownership recovery may have retired a pre-session ghost.
+        // Publish the now-authoritative recipient-gated snapshot before the
+        // error ack so the browser removes the stale card instead of restoring
+        // it from optimistic local state.
+        const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+          ...queuePayload,
+        }, { source: 'daemon', confidence: 'high' });
+      }
       reject(error);
       return;
     }

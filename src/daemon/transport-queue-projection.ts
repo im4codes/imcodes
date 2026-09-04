@@ -2,6 +2,7 @@ import type { PendingTransportMessage } from '../agent/transport-session-runtime
 import { containsProhibitedQueueProjectionField } from '../../shared/transport-queue-privacy.js';
 import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import { getSession } from '../store/session-store.js';
 
 export type TransportQueueSnapshotSource =
   | 'command_handler'
@@ -60,7 +61,24 @@ export function buildTransportQueueSnapshot(
   sessionName: string,
   source: TransportQueueSnapshotSource,
 ): QueueSnapshot {
-  const snapshot = getTransportQueueStore().readSnapshotSafely(sessionName, source);
+  const store = getTransportQueueStore();
+  const record = getSession(sessionName);
+  const hasInstance = typeof record?.sessionInstanceId === 'string' && record.sessionInstanceId.length > 0;
+  const hasEpoch = typeof record?.runtimeEpoch === 'string' && record.runtimeEpoch.length > 0;
+  const snapshot = record && hasInstance === hasEpoch
+    ? store.readSnapshotSafelyForRecipient(
+        sessionName,
+        hasInstance && hasEpoch
+          ? { sessionInstanceId: record.sessionInstanceId!, runtimeEpoch: record.runtimeEpoch! }
+          : null,
+        source,
+      )
+    : store.readSnapshotSafely(sessionName, source);
+  // A partial persisted identity proves no recipient at all. Preserve authority
+  // metadata for convergence, but never expose queue text across that boundary.
+  if (record && hasInstance !== hasEpoch) {
+    return { ...snapshot, pendingMessageEntries: [], failedMessageEntries: [] };
+  }
   if (containsProhibitedQueueProjectionField(snapshot)) {
     return {
       type: 'transport.queue.snapshot',

@@ -52,16 +52,26 @@ describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
   it('wires same-instance epoch rebinding and dead-runtime lease recovery before resend drain', () => {
     const source = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
     const launch = source.slice(source.indexOf('async function launchTransportSessionInner'));
+    const canonicalize = launch.indexOf('runtime.adoptLegacyQueueRecipient()');
     const upsert = launch.indexOf('upsertSession(record);');
     const rebind = launch.indexOf('runtime.rebindQueueRecipient(runtimeRecipient, persistedRecipient)');
     const publish = launch.indexOf('emitSessionPersist(persistedRecord ?? record, name);');
-    const reclaim = launch.indexOf("restoreExpiredHandoffs(name, Date.now(), { includeUnexpired: true })");
-    const drain = launch.indexOf("drainTransportResendQueueIntoRuntime(runtime, name, 'launch')");
+    const recover = launch.indexOf("await recoverPersistedTransportQueue(runtime, name, 'launch')");
+    const helper = source.slice(
+      source.indexOf('async function recoverPersistedTransportQueue'),
+      source.indexOf('/** Drain control traffic', source.indexOf('async function recoverPersistedTransportQueue')),
+    );
+    const prove = helper.indexOf('runtime.adoptLegacyQueueRecipient()');
+    const reclaim = helper.indexOf('restoreExpiredHandoffs(sessionName, Date.now(), { includeUnexpired: true })');
+    const drain = helper.indexOf('await drainTransportResendQueueIntoRuntime(runtime, sessionName, context)');
 
-    expect(upsert).toBeGreaterThanOrEqual(0);
+    expect(canonicalize).toBeGreaterThanOrEqual(0);
+    expect(upsert).toBeGreaterThan(canonicalize);
     expect(rebind).toBeGreaterThan(upsert);
     expect(publish).toBeGreaterThan(rebind);
-    expect(reclaim).toBeGreaterThan(publish);
+    expect(recover).toBeGreaterThan(publish);
+    expect(prove).toBeGreaterThanOrEqual(0);
+    expect(reclaim).toBeGreaterThan(prove);
     expect(drain).toBeGreaterThan(reclaim);
   });
 
