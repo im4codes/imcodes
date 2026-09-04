@@ -664,13 +664,50 @@ describe('direct file transfer v2 browser broker', () => {
     release?.();
   });
 
-  it('does not allocate a prewarm peer when the daemon lacks the lease capability', async () => {
+  it('retains prewarm until a delayed daemon capability handshake arrives', async () => {
     const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
-    const { ws, sent } = createWs([]);
+    const { ws, sent, emitCapabilitySnapshot } = createWs([]);
 
-    expect(prewarmDirectFileLease(ws, 'server-1')).toBeUndefined();
+    const release = prewarmDirectFileLease(ws, 'server-1');
     expect(sent).toEqual([]);
     expect(FakePeerConnection.instances).toHaveLength(0);
+
+    emitCapabilitySnapshot(directCapabilities);
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    release();
+  });
+
+  it('does not allocate a peer if a retained surface unmounts before capabilities arrive', async () => {
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emitCapabilitySnapshot } = createWs([]);
+
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    release();
+    emitCapabilitySnapshot(directCapabilities);
+    await Promise.resolve();
+
+    expect(sent).toEqual([]);
+    expect(FakePeerConnection.instances).toHaveLength(0);
+  });
+
+  it('automatically restores a retained warm peer after daemon reconnect', async () => {
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emitCapabilitySnapshot } = createWs(directCapabilities);
+
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1));
+    const firstPeer = FakePeerConnection.instances.at(-1)!;
+
+    emitCapabilitySnapshot(null);
+    expect(firstPeer.connectionState).toBe('closed');
+    emitCapabilitySnapshot(directCapabilities);
+
+    await vi.waitFor(() => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2));
+    expect(FakePeerConnection.instances.at(-1)).not.toBe(firstPeer);
+    release();
   });
 
   it('shares one broker peer when chat controls and File Browser retain the same daemon lease', async () => {

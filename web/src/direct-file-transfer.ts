@@ -188,6 +188,8 @@ type Lease = {
   leaseIceOff: (() => void) | null;
   peerState: RTCPeerConnectionState | null;
   refs: number;
+  /** Mounted attachment surfaces waiting for (or retaining) a warm peer. */
+  prewarmRefs: number;
   idleTimer: ReturnType<typeof setTimeout> | null;
   creating: Promise<void> | null;
   rebinding: Promise<void> | null;
@@ -390,6 +392,7 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     leaseIceOff: null,
     peerState: null,
     refs: 0,
+    prewarmRefs: 0,
     idleTimer: null,
     creating: null,
     rebinding: null,
@@ -414,7 +417,15 @@ function getBroker(ws: WsClient, serverId: string): Lease {
       invalidateLeaseControl(lease);
       return;
     }
-    if (!lease.leaseId) return;
+    // SessionControls commonly mounts before daemon.hello arrives. The old
+    // prewarm path inspected the empty snapshot once and returned forever, so
+    // clicking Upload still paid the full cold ICE/DTLS setup. A retained
+    // attachment surface is an explicit request to warm as soon as this WS
+    // generation advertises the capability.
+    if (!lease.leaseId) {
+      warmRetainedLease(lease);
+      return;
+    }
     void rebindLease(lease).catch(() => undefined);
   });
   lease.unsubscribeTerminalObserver = ws.onMessage((raw) => {
@@ -507,15 +518,33 @@ function acquireLease(ws: WsClient, serverId: string): { lease: Lease; release: 
   };
 }
 
-/** Prewarm only the inert lease.  No file handle, session scope or authority is sent. */
-export function prewarmDirectFileLease(ws: WsClient, serverId: string): (() => void) | undefined {
-  if (!supportsLease(ws)) return undefined;
-  const { lease, release } = acquireLease(ws, serverId);
+function warmRetainedLease(lease: Lease): void {
+  if (lease.prewarmRefs === 0 || !supportsLease(lease.ws)) return;
   void ensureLease(lease).then(
     () => armLeaseIdleTimer(lease),
-    () => release(),
+    // Keep the surface's intent retained after a transient setup failure. A
+    // fresh capability snapshot (notably after reconnect) can then retry the
+    // warm-up instead of leaving every later upload permanently cold.
+    () => armLeaseIdleTimer(lease),
   );
-  return release;
+}
+
+/**
+ * Retain and prewarm the inert lease. No file handle, session scope or file
+ * authority is sent. If daemon.hello has not arrived yet, the broker waits for
+ * that handshake and warms immediately when the capability becomes visible.
+ */
+export function prewarmDirectFileLease(ws: WsClient, serverId: string): () => void {
+  const { lease, release } = acquireLease(ws, serverId);
+  lease.prewarmRefs++;
+  warmRetainedLease(lease);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    lease.prewarmRefs = Math.max(0, lease.prewarmRefs - 1);
+    release();
+  };
 }
 
 function leaseFromReady(lease: Lease, message: DirectFileTransferLeaseReady): void {
