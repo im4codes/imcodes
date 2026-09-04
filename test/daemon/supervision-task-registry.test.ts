@@ -5735,6 +5735,62 @@ describe('SupervisionTaskRegistry', () => {
     registry.close();
   });
 
+  it('checkpoint reprojects a retained ready-for-audit integration owner after a stale implementer is cancelled', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'aggregate-ready-for-audit-after-stale-cancel';
+    const revision = 'aggregate-ready-for-audit-r1';
+    const ownerIdentity = identity('deck_alpha_brain');
+    const staleIdentity = identity('deck_alpha_stale_worker');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'retain the exact integration round', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const owner = registry.createAssignment({
+      assignmentId: `${taskId}-owner`, taskId, role: 'integration_owner', identity: ownerIdentity,
+      required: true, scopeFiles: ['src/integration.ts'], auditRevision: revision,
+    });
+    const stale = registry.createAssignment({
+      assignmentId: `${taskId}-stale`, taskId, role: 'implementer', identity: staleIdentity,
+      required: true, scopeFiles: [], auditRevision: revision,
+    });
+    if (!owner.ok || !stale.ok) throw new Error('assignments should create');
+    for (const status of ['implementing', 'validated', 'ready_for_audit'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: owner.value.assignmentId, identity: ownerIdentity, status,
+        revision, auditRevision: revision,
+      })).toMatchObject({ ok: true });
+    }
+    expect(registry.updateAssignment({
+      assignmentId: stale.value.assignmentId, identity: staleIdentity, status: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing', currentRevision: revision }))
+      .toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: stale.value.assignmentId, identity: staleIdentity, status: 'cancelled',
+      blocker: 'superseded empty assignment',
+    })).toMatchObject({ ok: true });
+
+    const beforeOwner = registry.getAssignment(owner.value.assignmentId)!;
+    const beforeStale = registry.getAssignment(stale.value.assignmentId)!;
+    // Cancellation normally projects immediately. Recreate the persisted stale
+    // aggregate observed in production so checkpoint must repair it on reread.
+    rewritePersistedTask(database, { ...registry.get(taskId)!, status: 'implementing' });
+    expect(registry.get(taskId)).toMatchObject({ status: 'implementing', currentRevision: revision });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: owner.value.assignmentId, intent: 'checkpoint', toStatus: null,
+      note: 'reproject retained integration round',
+    })).toMatchObject({ ok: true, value: { status: 'ready_for_audit', currentRevision: revision } });
+
+    expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_audit', currentRevision: revision });
+    expect(registry.getAssignment(owner.value.assignmentId)).toMatchObject({
+      status: 'ready_for_audit', leaseId: beforeOwner.leaseId, auditRevision: revision,
+      scopeFiles: beforeOwner.scopeFiles,
+    });
+    expect(registry.getAssignment(stale.value.assignmentId)).toEqual(beforeStale);
+    registry.close();
+  });
+
   it('projects committed/pushed lifecycle from events for the OpenSpec 14.3-14.5 sample', () => {
     const registry = makeRegistry();
     registry.createOrGet({

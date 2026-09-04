@@ -5384,15 +5384,19 @@ export class SupervisionTaskRegistry {
         ? 'recovered'
         : required.every((assignment) => assignment.status === 'ready_for_integration' || assignment.status === 'passed')
           ? 'ready_for_integration'
-          : required.some((assignment) => assignment.status === 'rework')
-            ? 'rework'
-            : required.some((assignment) => assignment.status === 'blocked')
-              ? 'blocked'
-              : required.some((assignment) => assignment.status === 'retrying_external_ci')
-                ? 'retrying_external_ci'
-                : task.status;
+          : requiredImplementers.length === 0
+              && required.every((assignment) => assignment.status === 'ready_for_audit')
+            ? 'ready_for_audit'
+            : required.some((assignment) => assignment.status === 'rework')
+              ? 'rework'
+              : required.some((assignment) => assignment.status === 'blocked')
+                ? 'blocked'
+                : required.some((assignment) => assignment.status === 'retrying_external_ci')
+                  ? 'retrying_external_ci'
+                  : task.status;
     if (next !== task.status && canTransitionSupervisionTaskStatus(task.status, next)) {
       const aggregateEvent = next === 'ready_for_integration' ? 'ready_for_integration'
+        : next === 'ready_for_audit' ? 'ready_for_audit'
         : next === 'rework' ? 'rework'
           : next === 'blocked' ? 'blocked'
             : next === 'retrying_external_ci' ? 'retrying_external_ci'
