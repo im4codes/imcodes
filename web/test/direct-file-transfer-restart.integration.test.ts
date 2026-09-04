@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type WebSocket from 'ws';
 import {
+  DIRECT_FILE_CONNECTION_STATUS,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_MSG,
@@ -94,6 +95,7 @@ class IntegratedNodeDataChannel {
   constructor(private readonly label: string) {}
 
   getLabel = () => this.label;
+  isOpen = () => this.browser?.readyState === 'open';
   bufferedAmount = () => 0;
   setBufferedAmountLowThreshold = vi.fn();
   onMessage = (handler: (message: string | Buffer | ArrayBuffer) => void) => { this.messageHandler = handler; };
@@ -203,7 +205,7 @@ type Harness = {
   direct: DirectModule;
 };
 
-async function createHarness(): Promise<Harness> {
+async function createHarness(options: { operationPrepareDelayMs?: number } = {}): Promise<Harness> {
   const direct = await import('../../src/daemon/direct-file-transfer.js');
   const { DirectFileTransferRouter } = await import('../../server/src/ws/direct-file-transfer-router.js');
   expect(await direct.initializeDirectFileTransfer()).toBe(true);
@@ -228,7 +230,11 @@ async function createHarness(): Promise<Harness> {
     resumeTicketSigningKey: () => 'integrated-persistent-resume-ticket-signing-key',
     sendDaemon: (message, generation) => {
       expect(generation).toBe(1);
-      void direct.handleDirectFileTransferCommand(message, sender);
+      if (message.type === DIRECT_FILE_TRANSFER_MSG.PREPARE && options.operationPrepareDelayMs) {
+        setTimeout(() => void direct.handleDirectFileTransferCommand(message, sender), options.operationPrepareDelayMs);
+      } else {
+        void direct.handleDirectFileTransferCommand(message, sender);
+      }
       return true;
     },
     sendBrowser: (_socket, message) => {
@@ -364,6 +370,38 @@ describe('browser↔daemon direct file transfer across Server restart', () => {
     expect(storageMocks.finalize).toHaveBeenCalledOnce();
     expect(await readFile(storageMocks.storedPath)).toEqual(Buffer.from(bytes));
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it('uploads on a prewarmed peer when its channel reaches daemon before PREPARE', async () => {
+    const harness = await createHarness({ operationPrepareDelayMs: 50 });
+    direct = harness.direct;
+    const {
+      prewarmDirectFileLease,
+      subscribeDirectFileConnectionStatus,
+      uploadFileDirect,
+    } = await import('../src/direct-file-transfer.js');
+    let status = DIRECT_FILE_CONNECTION_STATUS.NONE;
+    const unsubscribe = subscribeDirectFileConnectionStatus(harness.ws, SERVER_ID, (next) => { status = next; });
+    const release = prewarmDirectFileLease(harness.ws, SERVER_ID);
+    await vi.waitFor(() => expect(status).toBe(DIRECT_FILE_CONNECTION_STATUS.DIRECT));
+
+    const bytes = new TextEncoder().encode('warm-channel-before-prepare');
+    await expect(uploadFileDirect(
+      harness.ws,
+      makeFile(bytes),
+      crypto.randomUUID(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      SERVER_ID,
+    )).resolves.toMatchObject({ attachment: { id: 'integrated-attachment' } });
+
+    expect(operationAttempts(harness.controls)).toEqual([1]);
+    expect(await readFile(storageMocks.storedPath)).toEqual(Buffer.from(bytes));
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    release();
+    unsubscribe();
   });
 
   it('survives a mid-stream restart without duplicate commit or retry-budget loss', async () => {

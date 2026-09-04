@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DIRECT_FILE_TRANSFER_DATA_MSG,
+  DIRECT_FILE_CONNECTION_STATUS,
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
@@ -664,6 +665,116 @@ describe('direct file transfer v2 browser broker', () => {
     release?.();
   });
 
+  it('reports prewarm ready only after an opened channel completes a health round trip', async () => {
+    const {
+      prewarmDirectFileLease,
+      subscribeDirectFileConnectionStatus,
+    } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const originalDataHandler = FakePeerConnection.onDataChannel;
+    let probeChannel: FakeDataChannel | null = null;
+    let probePayload: Record<string, unknown> | null = null;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
+          probeChannel = channel;
+          probePayload = payload;
+          return;
+        }
+      }
+      originalDataHandler?.(channel, value);
+    };
+    const statuses: string[] = [];
+    const unsubscribe = subscribeDirectFileConnectionStatus(ws, 'server-1', (status) => statuses.push(status));
+    const release = prewarmDirectFileLease(ws, 'server-1');
+
+    await vi.waitFor(() => expect(probePayload).not.toBeNull());
+    expect(statuses.at(-1)).toBe(DIRECT_FILE_CONNECTION_STATUS.NONE);
+
+    const payload = probePayload!;
+    probeChannel!.dispatchEvent(new MessageEvent('message', {
+      data: JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: payload.serverId,
+        browserTabId: payload.browserTabId,
+        leaseId: payload.leaseId,
+        leaseGeneration: payload.leaseGeneration,
+        daemonGeneration: payload.daemonGeneration,
+        nonce: payload.nonce,
+        rttMs: 1,
+        localCandidate: { address: '192.168.1.20', port: 5000, type: 'host', transportType: 'udp' },
+        remoteCandidate: { address: '192.168.1.21', port: 5001, type: 'host', transportType: 'udp' },
+      }),
+    }));
+
+    await vi.waitFor(() => expect(statuses.at(-1)).toBe(DIRECT_FILE_CONNECTION_STATUS.DIRECT));
+    expect(FakePeerConnection.instances[0]!.channels[0]!.readyState).toBe('open');
+    release();
+    unsubscribe();
+  });
+
+  it('marks a verified relay yellow, releases it, and skips repeat prewarm on upload', async () => {
+    const {
+      prewarmDirectFileLease,
+      subscribeDirectFileConnectionStatus,
+      uploadFileWithDirectFallback,
+    } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const originalDataHandler = FakePeerConnection.onDataChannel;
+    let probeChannel: FakeDataChannel | null = null;
+    let probePayload: Record<string, unknown> | null = null;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
+          probeChannel = channel;
+          probePayload = payload;
+          return;
+        }
+      }
+      originalDataHandler?.(channel, value);
+    };
+    let status = DIRECT_FILE_CONNECTION_STATUS.NONE;
+    const unsubscribe = subscribeDirectFileConnectionStatus(ws, 'server-1', (next) => { status = next; });
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(probePayload).not.toBeNull());
+
+    const payload = probePayload!;
+    probeChannel!.dispatchEvent(new MessageEvent('message', {
+      data: JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: payload.serverId,
+        browserTabId: payload.browserTabId,
+        leaseId: payload.leaseId,
+        leaseGeneration: payload.leaseGeneration,
+        daemonGeneration: payload.daemonGeneration,
+        nonce: payload.nonce,
+        rttMs: 1,
+        localCandidate: { address: '10.0.0.1', port: 5000, type: 'relay', transportType: 'udp' },
+        remoteCandidate: { address: '10.0.0.2', port: 5001, type: 'host', transportType: 'udp' },
+      }),
+    }));
+    await vi.waitFor(() => expect(status).toBe(DIRECT_FILE_CONNECTION_STATUS.RELAY));
+    expect(FakePeerConnection.instances[0]!.connectionState).toBe('closed');
+    const releaseSecondSurface = prewarmDirectFileLease(ws, 'server-1');
+    await Promise.resolve();
+    expect(FakePeerConnection.instances).toHaveLength(1);
+
+    await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('relay.txt', 'relay'),
+    });
+    expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toBe(false);
+    expect(apiMocks.uploadFile).toHaveBeenCalledOnce();
+    releaseSecondSurface();
+    release();
+    unsubscribe();
+  });
+
   it('retains prewarm until a delayed daemon capability handshake arrives', async () => {
     const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
     const { ws, sent, emitCapabilitySnapshot } = createWs([]);
@@ -883,7 +994,11 @@ describe('direct file transfer v2 browser broker', () => {
       await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS + 500);
       expect(settled).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(FakePeerConnection.channelOpenDelayMs);
+      // The bootstrap channel is now the readiness fence. Once it opens, a
+      // sibling operation channel on the established SCTP association opens
+      // immediately; model that rather than charging the cold delay twice.
+      FakePeerConnection.channelOpenDelayMs = 0;
+      await vi.advanceTimersByTimeAsync(12_000);
       await expect(upload).resolves.toBeDefined();
     } finally {
       vi.useRealTimers();
@@ -919,11 +1034,11 @@ describe('direct file transfer v2 browser broker', () => {
       // vi.waitFor cannot be used here: it polls on real time while the clock
       // driving this flow is fake, so it would starve rather than wait.
       for (let tick = 0; tick < 200; tick++) {
-        if ((FakePeerConnection.instances.at(-1)?.channels.length ?? 0) > 1) break;
+        if ((FakePeerConnection.instances.at(-1)?.channels.length ?? 0) > 0) break;
         await vi.advanceTimersByTimeAsync(10);
       }
       const peer = FakePeerConnection.instances.at(-1)!;
-      expect(peer.channels.length).toBeGreaterThan(1);
+      expect(peer.channels.length).toBeGreaterThan(0);
       const channelsBefore = FakePeerConnection.instances
         .reduce((total, instance) => total + instance.channels.length, 0);
 

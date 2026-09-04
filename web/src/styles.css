@@ -5141,6 +5141,22 @@ html.native-ios-mac .chat-dl-btn {
   outline-offset: 2px;
 }
 .daemon-stats-compact { font-size: 10px; }
+.daemon-connection-status {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: #64748b;
+  box-shadow: 0 0 0 1px rgba(148,163,184,0.24), 0 0 7px rgba(100,116,139,0.30);
+}
+.daemon-connection-status-direct {
+  background: #4ade80;
+  box-shadow: 0 0 0 1px rgba(134,239,172,0.35), 0 0 9px rgba(74,222,128,0.72);
+}
+.daemon-connection-status-relay {
+  background: #fbbf24;
+  box-shadow: 0 0 0 1px rgba(253,224,71,0.34), 0 0 9px rgba(251,191,36,0.68);
+}
 .daemon-stat-version,
 .daemon-stat-uptime,
 .daemon-stat-sep { color: #94a3b8; }

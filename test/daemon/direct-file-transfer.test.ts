@@ -8,6 +8,7 @@ import {
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_OPERATION_STATE,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_TERMINAL_STATE,
@@ -21,6 +22,7 @@ class FakeDataChannel {
   bufferedAmountValue = 0;
   sent: Array<string | Uint8Array> = [];
   close = vi.fn(() => this.closedHandler?.());
+  isOpen = vi.fn(() => this.close.mock.calls.length === 0);
   sendMessage = vi.fn((message: string) => { this.sent.push(message); return true; });
   sendMessageBinary = vi.fn((message: Uint8Array) => { this.sent.push(message); return true; });
   bufferedAmount = () => this.bufferedAmountValue;
@@ -231,6 +233,30 @@ describe('daemon direct file transfer v2 lease broker', () => {
     const pong = JSON.parse(health.sent[0] as string);
     expect(pong).toMatchObject({ nonce: 'probe-nonce-0001', localCandidate: { address: '192.168.1.2' } });
     expect(sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED)).toBeUndefined();
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('retains an operation channel that wins the PREPARE race on a warm peer', async () => {
+    const { direct, sender } = await readyLease();
+    const authority = uploadPrepare({
+      channelLabel: `${DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX}${attemptId}`,
+    });
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+
+    // Browser AUTHORIZED and daemon PREPARE use independent sockets. A warm
+    // peer can deliver this channel before the daemon processes PREPARE.
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    expect(channel.close).not.toHaveBeenCalled();
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      authority: authority.authority,
+    }));
+
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    expect(channel.close).not.toHaveBeenCalled();
     await direct.shutdownDirectFileTransfers();
   });
 

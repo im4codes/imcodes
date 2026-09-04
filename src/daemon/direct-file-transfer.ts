@@ -15,6 +15,7 @@ import {
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_OPERATION_STATE,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_TERMINAL_STATE,
@@ -59,6 +60,13 @@ interface PendingLeaseCandidate {
   mid: string;
 }
 
+interface PendingOperationChannel {
+  channel: DataChannel;
+  timer: ReturnType<typeof setTimeout>;
+  /** The browser sends only START before waiting for ACCEPTED. */
+  startMessage: string | null;
+}
+
 interface DirectLease {
   binding: Omit<DirectFileTransferLeasePrepare, 'type' | 'protocolVersion' | 'requestId' | 'iceServers'>;
   peer: PeerConnection;
@@ -72,6 +80,8 @@ interface DirectLease {
   pendingRemoteCandidates: PendingLeaseCandidate[];
   negotiationRequestId: string | null;
   activeAttempts: Set<string>;
+  /** Channels that reached an already-warm peer just before their PREPARE. */
+  pendingOperationChannels: Map<string, PendingOperationChannel>;
 }
 
 interface ActiveDirectTransfer {
@@ -532,6 +542,11 @@ async function closeLease(lease: DirectLease, cancelActive: boolean): Promise<vo
     const transfers = [...activeAttempts.values()].filter((transfer) => transfer.lease === lease);
     await Promise.all(transfers.map((transfer) => failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false)));
   }
+  for (const pending of lease.pendingOperationChannels.values()) {
+    clearTimeout(pending.timer);
+    try { pending.channel.close(); } catch { /* already closed */ }
+  }
+  lease.pendingOperationChannels.clear();
   try { lease.peer.close(); } catch { /* already closed */ }
 }
 
@@ -630,6 +645,71 @@ function channelMatches(transfer: ActiveDirectTransfer, channel: DataChannel): b
 
 function isLeaseHealthChannel(channel: DataChannel): boolean {
   try { return channel.getLabel().startsWith(DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX); } catch { return false; }
+}
+
+function channelLabel(channel: DataChannel): string | null {
+  try { return channel.getLabel(); } catch { return null; }
+}
+
+function takePendingOperationChannel(lease: DirectLease, label: string): PendingOperationChannel | null {
+  const pending = lease.pendingOperationChannels.get(label);
+  if (!pending) return null;
+  clearTimeout(pending.timer);
+  lease.pendingOperationChannels.delete(label);
+  try {
+    if (!pending.channel.isOpen()) return null;
+    directFileMetric('channel_bound_after_prepare');
+    return pending;
+  } catch { return null; }
+}
+
+/**
+ * PREPARE and the data channel travel over independent transports. On a warm
+ * peer the channel can arrive first, so retain only a recognized operation
+ * label for one signalling window. START still has to prove the full opaque
+ * authority before the channel can touch a file.
+ */
+function retainPendingOperationChannel(lease: DirectLease, channel: DataChannel): boolean {
+  const label = channelLabel(channel);
+  if (!label?.startsWith(DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX)) return false;
+  if (lease.pendingOperationChannels.has(label)
+    || lease.pendingOperationChannels.size + lease.activeAttempts.size >= DIRECT_FILE_TRANSFER_LIMITS.MAX_ACTIVE_CHANNELS_PER_LEASE) return false;
+
+  const pending = {} as PendingOperationChannel;
+  const discard = () => {
+    if (lease.pendingOperationChannels.get(label) !== pending) return;
+    lease.pendingOperationChannels.delete(label);
+    clearTimeout(pending.timer);
+  };
+  pending.channel = channel;
+  pending.startMessage = null;
+  pending.timer = setTimeout(() => {
+    discard();
+    directFileMetric('channel_prepare_timeout');
+    try { channel.close(); } catch { /* already closed */ }
+  }, DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+  lease.pendingOperationChannels.set(label, pending);
+  channel.onMessage((message) => {
+    if (lease.pendingOperationChannels.get(label) !== pending) return;
+    if (typeof message !== 'string' || pending.startMessage !== null) {
+      discard();
+      try { channel.close(); } catch { /* invalid early payload */ }
+      return;
+    }
+    let raw: unknown;
+    try { raw = JSON.parse(message); } catch { raw = null; }
+    const parsed = validateDirectFileTransferDataMessage(raw);
+    if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.START) {
+      discard();
+      try { channel.close(); } catch { /* invalid early payload */ }
+      return;
+    }
+    pending.startMessage = message;
+  });
+  channel.onClosed(discard);
+  channel.onError(discard);
+  directFileMetric('channel_held_before_prepare');
+  return true;
 }
 
 function toCandidateInfo(value: unknown): DirectConnectivityCandidateInfo | null {
@@ -1050,7 +1130,7 @@ async function completeDownload(transfer: ActiveDirectTransfer, totalBytes: numb
   await closeTransferResources(transfer, false);
 }
 
-function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel): void {
+function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, earlyStartMessage?: string | null): void {
   if (!channelMatches(transfer, channel)) {
     try { channel.close(); } catch { /* invalid channel */ }
     return;
@@ -1063,7 +1143,7 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel): vo
   // after a few seconds; now that a relayed path is allowed to take longer to
   // open, keep the two independent rather than merely far enough apart.
   resetTransferIdleTimer(transfer);
-  channel.onMessage((message) => {
+  const onMessage = (message: string | Buffer | ArrayBuffer) => {
     if (typeof message !== 'string') {
       const bytes = message instanceof ArrayBuffer
         ? new Uint8Array(message)
@@ -1108,9 +1188,11 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel): vo
     if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED) {
       void completeDownload(transfer, parsed.value.totalBytes);
     }
-  });
+  };
+  channel.onMessage(onMessage);
   channel.onClosed(() => { if (!transfer.settled) void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false); });
   channel.onError((error) => { void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, error); });
+  if (earlyStartMessage) onMessage(earlyStartMessage);
 }
 
 function attachLeasePeer(lease: DirectLease): void {
@@ -1121,6 +1203,7 @@ function attachLeasePeer(lease: DirectLease): void {
         attachLeaseHealthChannel(lease, channel);
         return;
       }
+      if (retainPendingOperationChannel(lease, channel)) return;
       try { channel.close(); } catch { /* unknown channel */ }
       return;
     }
@@ -1223,6 +1306,7 @@ async function prepareLease(command: DirectFileTransferLeasePrepare, sender: Fil
     pendingRemoteCandidates: [],
     negotiationRequestId: null,
     activeAttempts: new Set(),
+    pendingOperationChannels: new Map(),
   };
   leases.set(key, lease);
   directFileMetric('lease_prepared');
@@ -1292,6 +1376,8 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Fi
   lease.activeAttempts.add(authority.attemptId);
   resetLeaseIdleTimer(lease);
   resetTransferIdleTimer(transfer);
+  const pendingChannel = takePendingOperationChannel(lease, authority.channelLabel);
+  if (pendingChannel) attachChannel(transfer, pendingChannel.channel, pendingChannel.startMessage);
 }
 
 function findActive(command: { attemptId: string; authority: string }): ActiveDirectTransfer | undefined {
@@ -1327,6 +1413,11 @@ function replaceInactiveLeasePeer(lease: DirectLease): boolean {
     return false;
   }
   const previous = lease.peer;
+  for (const pending of lease.pendingOperationChannels.values()) {
+    clearTimeout(pending.timer);
+    try { pending.channel.close(); } catch { /* already closed */ }
+  }
+  lease.pendingOperationChannels.clear();
   lease.peer = peer;
   lease.remoteDescriptionSet = false;
   lease.negotiationRequestId = null;

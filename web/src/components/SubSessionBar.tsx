@@ -55,6 +55,7 @@ import {
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_CONNECTIVITY_RUNTIME_STATE,
+  DIRECT_FILE_CONNECTION_STATUS,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
   inferDirectConnectivityEndpointKind,
@@ -66,8 +67,14 @@ import {
   type DirectConnectivityProbeResult,
   type DirectConnectivityProbeStage,
   type DirectConnectivityRuntimeStatus,
+  type DirectFileConnectionStatus,
 } from '@shared/direct-file-transfer.js';
-import { DirectFileTransferFailure, probeDirectConnectivity } from '../direct-file-transfer.js';
+import {
+  DirectFileTransferFailure,
+  prewarmDirectFileLease,
+  probeDirectConnectivity,
+  subscribeDirectFileConnectionStatus,
+} from '../direct-file-transfer.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -734,6 +741,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
+  const [directFileConnectionStatus, setDirectFileConnectionStatus] = useState<DirectFileConnectionStatus>(DIRECT_FILE_CONNECTION_STATUS.NONE);
   const [showDaemonDetails, setShowDaemonDetails] = useState(false);
   const localClockNow = useNowTicker(!!stats && (desktopLayoutCapable || showDaemonDetails));
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
@@ -1278,6 +1286,36 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     });
   }, [ws]);
 
+  useEffect(() => {
+    if (!ws || !serverId || !connected) {
+      setDirectFileConnectionStatus(DIRECT_FILE_CONNECTION_STATUS.NONE);
+      return;
+    }
+    const unsubscribe = subscribeDirectFileConnectionStatus(ws, serverId, setDirectFileConnectionStatus);
+    const releasePrewarm = prewarmDirectFileLease(ws, serverId);
+    return () => {
+      releasePrewarm();
+      unsubscribe();
+    };
+  }, [connected, serverId, ws]);
+
+  const directFileConnectionLabel = t(
+    directFileConnectionStatus === DIRECT_FILE_CONNECTION_STATUS.DIRECT
+      ? 'subsessionBar.daemon_connection_direct'
+      : directFileConnectionStatus === DIRECT_FILE_CONNECTION_STATUS.RELAY
+        ? 'subsessionBar.daemon_connection_relay'
+        : 'subsessionBar.daemon_connection_none',
+  );
+  const directFileConnectionDot = (
+    <span
+      class={`daemon-connection-status daemon-connection-status-${directFileConnectionStatus}`}
+      data-testid="daemon-file-connection-status"
+      data-status={directFileConnectionStatus}
+      title={directFileConnectionLabel}
+      aria-label={directFileConnectionLabel}
+    />
+  );
+
   const toggleLayout = () => {
     const next: Layout = layout === 'single' ? 'double' : 'single';
     setLayout(next);
@@ -1530,6 +1568,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 aria-haspopup="dialog"
                 aria-label={t('subsessionBar.daemon_details_open')}
               >
+                {directFileConnectionDot}
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
@@ -1617,6 +1656,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               aria-haspopup="dialog"
               aria-label={t('subsessionBar.daemon_details_open')}
             >
+              {directFileConnectionDot}
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
               {stats.daemonVersion && (desktopLayoutCapable ? (
                 <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)} </span>

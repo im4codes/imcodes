@@ -3,6 +3,7 @@ import {
   type DirectFileTransferAttemptBinding,
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_CONNECTIVITY_ROUTE,
+  DIRECT_FILE_CONNECTION_STATUS,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
@@ -24,6 +25,7 @@ import {
   type DirectConnectivityProbeDiagnostics,
   type DirectConnectivityProbeResult,
   type DirectConnectivityRoute,
+  type DirectFileConnectionStatus,
   type DirectFileTransferAuthorized,
   type DirectFileTransferDataMessage,
   type DirectFileTransferDirection,
@@ -190,6 +192,9 @@ type Lease = {
   refs: number;
   /** Mounted attachment surfaces waiting for (or retaining) a warm peer. */
   prewarmRefs: number;
+  connectionStatus: DirectFileConnectionStatus;
+  connectionStatusListeners: Set<(status: DirectFileConnectionStatus) => void>;
+  warming: Promise<void> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   creating: Promise<void> | null;
   rebinding: Promise<void> | null;
@@ -393,6 +398,9 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     peerState: null,
     refs: 0,
     prewarmRefs: 0,
+    connectionStatus: DIRECT_FILE_CONNECTION_STATUS.NONE,
+    connectionStatusListeners: new Set(),
+    warming: null,
     idleTimer: null,
     creating: null,
     rebinding: null,
@@ -440,6 +448,12 @@ function clearLeaseTimer(lease: Lease): void {
   lease.idleTimer = null;
 }
 
+function setConnectionStatus(lease: Lease, status: DirectFileConnectionStatus): void {
+  if (lease.connectionStatus === status) return;
+  lease.connectionStatus = status;
+  for (const listener of lease.connectionStatusListeners) listener(status);
+}
+
 function disposeLease(lease: Lease): void {
   clearLeaseTimer(lease);
   lease.controlEpoch++;
@@ -447,6 +461,7 @@ function disposeLease(lease: Lease): void {
   lease.creating = null;
   lease.rebinding = null;
   lease.peerCreating = null;
+  lease.warming = null;
   for (const active of lease.active.values()) {
     try { active.channel?.close(); } catch { /* best effort */ }
   }
@@ -520,13 +535,31 @@ function acquireLease(ws: WsClient, serverId: string): { lease: Lease; release: 
 
 function warmRetainedLease(lease: Lease): void {
   if (lease.prewarmRefs === 0 || !supportsLease(lease.ws)) return;
-  void ensureLease(lease).then(
-    () => armLeaseIdleTimer(lease),
-    // Keep the surface's intent retained after a transient setup failure. A
-    // fresh capability snapshot (notably after reconnect) can then retry the
-    // warm-up instead of leaving every later upload permanently cold.
-    () => armLeaseIdleTimer(lease),
-  );
+  // Both resolved states are stable until the control socket/network changes.
+  // DIRECT retains its peer; RELAY deliberately retains only the result and
+  // must not allocate another idle TURN connection on every surface mount.
+  if (lease.connectionStatus !== DIRECT_FILE_CONNECTION_STATUS.NONE || lease.warming) return;
+  let warming!: Promise<void>;
+  warming = (async () => {
+    await ensureLease(lease);
+    const result = await probeLeasePeer(lease);
+    if (result.route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
+      // TURN is a useful fallback signal, not a connection worth pinning for
+      // uploads. Retaining it would consume relay resources while idle and
+      // would misleadingly call a relayed path "prewarmed".
+      if (lease.active.size === 0) closePeer(lease);
+      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
+      return;
+    }
+    setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
+  })().catch(() => {
+    if (lease.active.size === 0) closePeer(lease);
+    setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.NONE);
+  }).finally(() => {
+    if (lease.warming === warming) lease.warming = null;
+    armLeaseIdleTimer(lease);
+  });
+  lease.warming = warming;
 }
 
 /**
@@ -543,6 +576,20 @@ export function prewarmDirectFileLease(ws: WsClient, serverId: string): () => vo
     if (released) return;
     released = true;
     lease.prewarmRefs = Math.max(0, lease.prewarmRefs - 1);
+    release();
+  };
+}
+
+export function subscribeDirectFileConnectionStatus(
+  ws: WsClient,
+  serverId: string,
+  listener: (status: DirectFileConnectionStatus) => void,
+): () => void {
+  const { lease, release } = acquireLease(ws, serverId);
+  lease.connectionStatusListeners.add(listener);
+  listener(lease.connectionStatus);
+  return () => {
+    lease.connectionStatusListeners.delete(listener);
     release();
   };
 }
@@ -818,6 +865,8 @@ function closePeer(lease: Lease): void {
   try { lease.peer?.close(); } catch { /* best effort */ }
   lease.peer = null;
   lease.peerState = null;
+  lease.peerDaemonGeneration = null;
+  setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.NONE);
 }
 
 /**
@@ -974,9 +1023,7 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
   // AND still facing the same daemon it was negotiated against.
   const generationMatches = lease.peerDaemonGeneration === null
     || lease.peerDaemonGeneration === lease.daemonGeneration;
-  const bootstrapCanCarryData = lease.bootstrapChannel !== null
-    && lease.bootstrapChannel.readyState !== 'closing'
-    && lease.bootstrapChannel.readyState !== 'closed';
+  const bootstrapCanCarryData = lease.bootstrapChannel?.readyState === 'open';
   if (lease.peer
     && generationMatches
     && bootstrapCanCarryData
@@ -1123,6 +1170,12 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
       assertCurrentControl(lease, epoch);
       await leasePeer.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
       await candidates.flush((candidate) => leasePeer.addIceCandidate(candidate));
+      const bootstrap = lease.bootstrapChannel;
+      if (!bootstrap) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
+      // SDP/ICE signalling completion is not transport readiness. The old
+      // prewarm resolved here while SCTP was still connecting, so uploads
+      // appeared "prewarmed" but paid the full channel-open timeout anyway.
+      await waitForChannelOpen(bootstrap, leasePeer, signal);
     } catch (error) {
       if (lease.controlEpoch === epoch) {
         closePeer(lease);
@@ -1899,10 +1952,17 @@ export async function uploadFileDirect(
       kind: 'upload', file, operationId: clientUploadId, sessionName, destinationDirectory, onProgress, onConnected, signal,
     }), signal);
     if (result.kind !== 'upload') throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
+    const route = await selectedPeerRoute(lease.peer);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.DIRECT_SUCCESS, {
       direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
-      route: await selectedPeerRoute(lease.peer),
+      route,
     });
+    if (route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
+      if (lease.active.size === 0) closePeer(lease);
+      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
+    } else if (route !== 'unknown') {
+      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
+    }
     return { ok: true, attachment: result.attachment };
   } finally {
     release();
@@ -1920,8 +1980,12 @@ export async function uploadFileWithDirectFallback(options: {
   destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const clientUploadId = crypto.randomUUID();
+  const broker = options.ws ? getBroker(options.ws, options.serverId) : null;
   if (options.ws && supportsUpload(options.ws)
-    && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
+    && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))
+    // A verified TURN-only prewarm is not retained. Skip another doomed warm
+    // attempt and move straight to the one HTTP relay path.
+    && broker?.connectionStatus !== DIRECT_FILE_CONNECTION_STATUS.RELAY) {
     options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
     const directAbort = new AbortController();
     let directConnectTimedOut = false;
@@ -1968,6 +2032,10 @@ export async function uploadFileWithDirectFallback(options: {
     }
   } else if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
     throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
+  }
+  if (broker) {
+    if (broker.active.size === 0) closePeer(broker);
+    setConnectionStatus(broker, DIRECT_FILE_CONNECTION_STATUS.RELAY);
   }
   options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.RELAY);
   if (options.destinationDirectory !== undefined) {
@@ -2200,6 +2268,58 @@ export function isFileUploadCanceled(error: unknown): boolean {
     || (error instanceof Error && error.name === 'AbortError');
 }
 
+async function probeLeasePeer(
+  lease: Lease,
+  onDiagnostics?: (diagnostics: DirectConnectivityProbeDiagnostics) => void,
+): Promise<DirectConnectivityProbeResult> {
+  const peer = lease.peer;
+  if (!peer || !lease.leaseId || !lease.leaseGeneration || !lease.daemonGeneration) {
+    throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
+  }
+  onDiagnostics?.({
+    stage: DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING,
+    browserCandidateTypes: [],
+    daemonCandidateTypes: [],
+  });
+  const channel = peer.createDataChannel(`${DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX}${crypto.randomUUID()}`, { ordered: true });
+  await waitForChannelOpen(channel, peer, lease.controlAbort.signal);
+  const nonce = crypto.randomUUID();
+  const started = performance.now();
+  return new Promise<DirectConnectivityProbeResult>((resolve, reject) => {
+    const timer = setTimeout(() => done(directError(DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT)), DIRECT_FILE_TRANSFER_LIMITS.PROBE_TIMEOUT_MS);
+    const done = (error?: unknown, value?: DirectConnectivityProbeResult) => {
+      clearTimeout(timer);
+      channel.removeEventListener('message', onMessage);
+      try { channel.close(); } catch { /* best effort */ }
+      if (error) reject(error); else resolve(value!);
+    };
+    const onMessage = (event: MessageEvent) => {
+      if (typeof event.data !== 'string') return;
+      let raw: unknown;
+      try { raw = JSON.parse(event.data); } catch { raw = null; }
+      const parsed = validateDirectFileTransferDataMessage(raw);
+      if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG || parsed.value.nonce !== nonce) return;
+      done(undefined, {
+        route: classifyDirectConnectivityRoute(parsed.value.localCandidate, parsed.value.remoteCandidate),
+        rttMs: Math.max(0, performance.now() - started),
+        localCandidate: parsed.value.localCandidate,
+        remoteCandidate: parsed.value.remoteCandidate,
+      });
+    };
+    channel.addEventListener('message', onMessage);
+    sendData(channel, {
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: lease.serverId,
+      browserTabId: lease.browserTabId,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+      nonce,
+    });
+  });
+}
+
 /**
  * The legacy v1 connectivity probe was intentionally removed. A v2 health
  * probe establishes or reuses an inert lease only after the user opens the
@@ -2215,54 +2335,15 @@ export async function probeDirectConnectivity(
   const probeControlEpoch = lease.controlEpoch;
   try {
     await ensureLease(lease);
-    const peer = lease.peer;
-    if (!peer || !lease.leaseId || !lease.leaseGeneration || !lease.daemonGeneration) {
-      throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
-    }
-    onDiagnostics?.({
-      stage: DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING,
-      browserCandidateTypes: [],
-      daemonCandidateTypes: [],
-    });
-    const channel = peer.createDataChannel(`${DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX}${crypto.randomUUID()}`, { ordered: true });
-    await waitForChannelOpen(channel, peer);
-    const nonce = crypto.randomUUID();
-    const started = performance.now();
-    const result = await new Promise<DirectConnectivityProbeResult>((resolve, reject) => {
-      const timer = setTimeout(() => done(directError(DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT)), DIRECT_FILE_TRANSFER_LIMITS.PROBE_TIMEOUT_MS);
-      const done = (error?: unknown, value?: DirectConnectivityProbeResult) => {
-        clearTimeout(timer);
-        channel.removeEventListener('message', onMessage);
-        try { channel.close(); } catch { /* best effort */ }
-        if (error) reject(error); else resolve(value!);
-      };
-      const onMessage = (event: MessageEvent) => {
-        if (typeof event.data !== 'string') return;
-        let raw: unknown;
-        try { raw = JSON.parse(event.data); } catch { raw = null; }
-        const parsed = validateDirectFileTransferDataMessage(raw);
-        if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG || parsed.value.nonce !== nonce) return;
-        done(undefined, {
-          route: classifyDirectConnectivityRoute(parsed.value.localCandidate, parsed.value.remoteCandidate),
-          rttMs: Math.max(0, performance.now() - started),
-          localCandidate: parsed.value.localCandidate,
-          remoteCandidate: parsed.value.remoteCandidate,
-        });
-      };
-      channel.addEventListener('message', onMessage);
-      sendData(channel, {
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE,
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        serverId: lease.serverId,
-        browserTabId: lease.browserTabId,
-        leaseId: lease.leaseId,
-        leaseGeneration: lease.leaseGeneration,
-        daemonGeneration: lease.daemonGeneration,
-        nonce,
-      });
-    });
+    const result = await probeLeasePeer(lease, onDiagnostics);
     onDiagnostics?.({ stage: DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE, browserCandidateTypes: [], daemonCandidateTypes: [] });
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: result.route });
+    if (result.route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
+      if (lease.active.size === 0) closePeer(lease);
+      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
+    } else {
+      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
+    }
     return result;
   } catch (error) {
     // A failed explicit probe is itself proof that this idle peer should not be

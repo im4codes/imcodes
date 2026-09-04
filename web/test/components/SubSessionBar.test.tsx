@@ -7,8 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
-const { probeDirectConnectivityMock } = vi.hoisted(() => ({
+const { probeDirectConnectivityMock, directFileStatusListeners } = vi.hoisted(() => ({
   probeDirectConnectivityMock: vi.fn(),
+  directFileStatusListeners: new Set<(status: 'none' | 'direct' | 'relay') => void>(),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -33,6 +34,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'subsessionBar.daemon_details_memory_handles') return 'Memory handles';
       if (key === 'subsessionBar.daemon_details_memory_handles_ok') return 'Healthy';
       if (key === 'subsessionBar.daemon_details_direct_connectivity') return 'Direct connectivity';
+      if (key === 'subsessionBar.daemon_connection_direct') return 'Direct link';
+      if (key === 'subsessionBar.daemon_connection_relay') return 'Relay';
+      if (key === 'subsessionBar.daemon_connection_none') return 'Not connected';
       if (key === 'subsessionBar.daemon_details_direct_runtime_unavailable') return 'WebRTC runtime unavailable';
       if (key === 'subsessionBar.daemon_details_direct_probing') return 'Testing direct path…';
       if (key === 'subsessionBar.daemon_details_direct_lan') return 'LAN direct';
@@ -103,6 +107,12 @@ vi.mock('../../src/direct-file-transfer.js', () => ({
     constructor(readonly code: string) { super(code); }
   },
   probeDirectConnectivity: probeDirectConnectivityMock,
+  prewarmDirectFileLease: vi.fn(() => () => undefined),
+  subscribeDirectFileConnectionStatus: vi.fn((_ws, _serverId, listener) => {
+    directFileStatusListeners.add(listener);
+    listener('none');
+    return () => directFileStatusListeners.delete(listener);
+  }),
 }));
 
 import { SubSessionBar } from '../../src/components/SubSessionBar.js';
@@ -173,12 +183,45 @@ describe('SubSessionBar', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    directFileStatusListeners.clear();
     probeDirectConnectivityMock.mockResolvedValue({
       route: 'lan_direct',
       rttMs: 1.4,
       localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
       remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
     });
+  });
+
+  it('shows gray, green, and yellow daemon-bar connection states from the live broker', async () => {
+    const statsWs = makeStatsWs();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={statsWs.ws as any}
+        serverId="srv-1"
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    act(() => statsWs.emit(daemonStatsMessage));
+
+    const dot = await waitFor(() => view.getByTestId('daemon-file-connection-status'));
+    expect(dot.getAttribute('data-status')).toBe('none');
+    expect(dot.getAttribute('title')).toBe('Not connected');
+
+    act(() => directFileStatusListeners.forEach((listener) => listener('direct')));
+    expect(dot.getAttribute('data-status')).toBe('direct');
+    expect(dot.getAttribute('title')).toBe('Direct link');
+
+    act(() => directFileStatusListeners.forEach((listener) => listener('relay')));
+    expect(dot.getAttribute('data-status')).toBe('relay');
+    expect(dot.getAttribute('title')).toBe('Relay');
   });
 
   afterEach(() => {
@@ -1578,6 +1621,9 @@ describe('SubSessionBar', () => {
       'daemon_details_memory_handles',
       'daemon_details_memory_handles_ok',
       'daemon_details_direct_connectivity',
+      'daemon_connection_direct',
+      'daemon_connection_relay',
+      'daemon_connection_none',
       'daemon_details_direct_runtime_unavailable',
       'daemon_details_direct_probing',
       'daemon_details_direct_lan',

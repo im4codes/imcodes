@@ -16,6 +16,15 @@ export const DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY = 'file.transfer.d
 /** Optional rolling capability for direct uploads committed into a selected controlled-node directory. */
 export const DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY = 'file.transfer.direct.directory_upload.v1' as const;
 export const DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX = 'imcodes-health-' as const;
+export const DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX = 'direct-file-' as const;
+
+export const DIRECT_FILE_CONNECTION_STATUS = {
+  NONE: 'none',
+  DIRECT: 'direct',
+  RELAY: 'relay',
+} as const;
+
+export type DirectFileConnectionStatus = typeof DIRECT_FILE_CONNECTION_STATUS[keyof typeof DIRECT_FILE_CONNECTION_STATUS];
 
 export const DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES = [
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,

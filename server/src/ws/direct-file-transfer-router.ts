@@ -10,6 +10,7 @@ import {
   DIRECT_FILE_TRANSFER_ICE_SERVERS,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE,
   DIRECT_FILE_TRANSFER_TERMINAL_STATE,
@@ -617,7 +618,7 @@ export class DirectFileTransferRouter {
       daemonGeneration: lease.daemonGeneration,
       authority,
       authorityExpiresAt,
-      channelLabel: `direct-file-${init.attemptId}`,
+      channelLabel: `${DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX}${init.attemptId}`,
       iceServers: lease.iceServers,
     };
     const prepare = { ...authorityMessage, type: DIRECT_FILE_TRANSFER_MSG.PREPARE };
