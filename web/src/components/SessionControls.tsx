@@ -63,7 +63,7 @@ import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionC
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
-import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
+import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
@@ -1775,6 +1775,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.name, effectiveRuntimeType]);
 
   const connected = connectedProp ?? !!ws?.connected;
+
+  useEffect(() => {
+    if (!ws
+      || !serverId
+      || !activeSession
+      || !connected
+      || typeof ws.targetsServer !== 'function'
+      || !ws.targetsServer(serverId)) return;
+    return prewarmDirectFileLease(ws, serverId);
+  }, [activeSession?.name, connected, serverId, ws]);
 
   useEffect(() => {
     if (!ws) return;

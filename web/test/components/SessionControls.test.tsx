@@ -9,8 +9,11 @@ import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
-const { mockI18n } = vi.hoisted(() => ({
+const { mockI18n, directFileTransferMocks } = vi.hoisted(() => ({
   mockI18n: { language: undefined as string | undefined, resolvedLanguage: undefined as string | undefined },
+  directFileTransferMocks: {
+    prewarmDirectFileLease: vi.fn<(...args: unknown[]) => (() => void) | undefined>(() => undefined),
+  },
 }));
 
 if (!HTMLElement.prototype.scrollIntoView) {
@@ -174,6 +177,14 @@ vi.mock('react-i18next', () => ({
     },
   }),
 }));
+
+vi.mock('../../src/direct-file-transfer.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/direct-file-transfer.js')>();
+  return {
+    ...actual,
+    prewarmDirectFileLease: directFileTransferMocks.prewarmDirectFileLease,
+  };
+});
 
 vi.mock('../../src/components/QuickInputPanel.js', () => ({
   QuickInputPanel: ({ open, onSend }: { open: boolean; onSend: (text: string) => void }) => open ? (
@@ -388,6 +399,7 @@ const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabiliti
     unsubscribeTransportSession: vi.fn(),
     respondTransportApproval: vi.fn(),
     connected: true,
+    targetsServer: vi.fn((_serverId: string) => true),
     subSessionSetModel: vi.fn(),
     fsListDir: vi.fn(() => 'openspec-request'),
     onMessage: vi.fn((handler: (msg: unknown) => void) => {
@@ -567,6 +579,7 @@ afterEach(() => {
     patchSessionSupervisionMock.mockImplementation(async (_serverId: unknown, _sessionName: unknown, supervision: unknown) => ({ supervision }));
     patchSubSessionMock.mockResolvedValue(undefined);
     sendSessionViaHttpMock.mockReset().mockResolvedValue(undefined);
+    directFileTransferMocks.prewarmDirectFileLease.mockReset().mockReturnValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         return JSON.stringify({
@@ -585,6 +598,75 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect(screen.getByRole('textbox')).toBeDefined();
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
+  });
+
+  it('prewarms the selected daemon for chat attachments and releases on disconnect or server change', () => {
+    const ws = makeWs();
+    ws.targetsServer.mockImplementation((candidate: string) => candidate === 'srv-1');
+    const releaseOnDisconnect = vi.fn();
+    directFileTransferMocks.prewarmDirectFileLease.mockReturnValueOnce(releaseOnDisconnect);
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        connected
+        serverId="srv-1"
+        activeSession={makeSession({ name: 'deck_attachment_brain' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(directFileTransferMocks.prewarmDirectFileLease).toHaveBeenCalledWith(ws, 'srv-1');
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        connected={false}
+        serverId="srv-1"
+        activeSession={makeSession({ name: 'deck_attachment_brain' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(releaseOnDisconnect).toHaveBeenCalledOnce();
+
+    const releaseOnServerChange = vi.fn();
+    directFileTransferMocks.prewarmDirectFileLease.mockReturnValueOnce(releaseOnServerChange);
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        connected
+        serverId="srv-1"
+        activeSession={makeSession({ name: 'deck_attachment_brain' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(directFileTransferMocks.prewarmDirectFileLease).toHaveBeenCalledTimes(2);
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        connected
+        serverId="srv-2"
+        activeSession={makeSession({ name: 'deck_attachment_brain' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(releaseOnServerChange).toHaveBeenCalledOnce();
+    expect(directFileTransferMocks.prewarmDirectFileLease).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not request chat attachment prewarm while disconnected', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        connected={false}
+        serverId="srv-1"
+        activeSession={makeSession({ name: 'deck_attachment_brain' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(directFileTransferMocks.prewarmDirectFileLease).not.toHaveBeenCalled();
   });
 
   it('shares top-edge desktop resizing across every window and persists it', async () => {

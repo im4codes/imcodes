@@ -664,6 +664,30 @@ describe('direct file transfer v2 browser broker', () => {
     release?.();
   });
 
+  it('does not allocate a prewarm peer when the daemon lacks the lease capability', async () => {
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs([]);
+
+    expect(prewarmDirectFileLease(ws, 'server-1')).toBeUndefined();
+    expect(sent).toEqual([]);
+    expect(FakePeerConnection.instances).toHaveLength(0);
+  });
+
+  it('shares one broker peer when chat controls and File Browser retain the same daemon lease', async () => {
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    const releaseChat = prewarmDirectFileLease(ws, 'server-1');
+    const releaseBrowser = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    releaseChat?.();
+    releaseBrowser?.();
+  });
+
   it('cold-rebuilds a silently dead warm SCTP peer before a second consecutive upload', async () => {
     vi.useFakeTimers();
     const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
