@@ -59,6 +59,9 @@ function installCommandMocks() {
     if (cmd.includes('ps --format json server')) {
       return opts?.encoding ? '{"Health":"healthy"}\n' : Buffer.from('{"Health":"healthy"}\n');
     }
+    if (cmd.includes('ps --format json turn')) {
+      return opts?.encoding ? '{"State":"running"}\n' : Buffer.from('{"State":"running"}\n');
+    }
     return opts?.encoding ? '' : Buffer.from('');
   });
   execFileSyncMock.mockReturnValue('203.0.113.10\n');
@@ -139,6 +142,7 @@ describe('setupFlow contracts', () => {
     const compose = readFileSync(join(projectDir, 'docker-compose.yml'), 'utf8');
     const caddy = readFileSync(join(projectDir, 'Caddyfile'), 'utf8');
     const turnConfig = readFileSync(join(projectDir, 'turnserver.conf'), 'utf8');
+    const turnEntrypoint = readFileSync(join(projectDir, 'turn-entrypoint.sh'), 'utf8');
     const setupSecrets = readFileSync(join(projectDir, '.setup-secrets.json'), 'utf8');
     const sharedSecret = env.match(/^TURN_SHARED_SECRET=([a-f0-9]+)$/m)?.[1];
 
@@ -155,6 +159,8 @@ describe('setupFlow contracts', () => {
     expect(compose).toContain('${TURN_PORT}:${TURN_PORT}/udp');
     expect(compose).toContain('${TURN_PORT}:${TURN_PORT}/tcp');
     expect(compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(compose).toContain('./turn-entrypoint.sh:/usr/local/bin/imcodes-turn-entrypoint:ro');
+    expect(compose).toContain('entrypoint: ["/bin/sh", "/usr/local/bin/imcodes-turn-entrypoint"]');
     expect(compose).not.toContain(String(sharedSecret));
     expect(setupSecrets).not.toContain(String(sharedSecret));
     expect(turnConfig).toContain(`static-auth-secret=${sharedSecret}`);
@@ -172,6 +178,10 @@ describe('setupFlow contracts', () => {
     expect(turnConfig).toContain('denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff');
     expect(turnConfig).not.toContain('denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff');
     expect(turnConfig).toContain('denied-peer-ip=203.0.113.10-203.0.113.10');
+    expect(turnConfig).toContain('allowed-peer-ip=203.0.113.10-203.0.113.10');
+    expect(turnEntrypoint).toContain('hostname -i');
+    expect(turnEntrypoint).toContain('--allowed-peer-ip="${turn_container_ipv4}-${turn_container_ipv4}"');
+    expect(turnEntrypoint).toContain('exec docker-entrypoint.sh "$@"');
     expect(turnConfig).toContain('user-quota=32');
     expect(turnConfig).not.toContain('\ncli\n');
     expect(turnConfig).not.toContain('no-cli');
@@ -181,6 +191,9 @@ describe('setupFlow contracts', () => {
     expect(statSync(join(projectDir, '.env')).mode & 0o777).toBe(0o600);
     expect(statSync(join(projectDir, '.setup-secrets.json')).mode & 0o777).toBe(0o600);
     expect(statSync(join(projectDir, 'turnserver.conf')).mode & 0o777).toBe(0o600);
+    expect(statSync(join(projectDir, 'turn-entrypoint.sh')).mode & 0o777).toBe(0o700);
+    const commands = execSyncMock.mock.calls.map(([cmd]) => String(cmd));
+    expect(commands.some((cmd) => cmd.includes('up -d --force-recreate turn'))).toBe(true);
   });
 
   it('uses the same reachable registry proxy for coturn in mirror mode', async () => {

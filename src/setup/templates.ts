@@ -37,6 +37,11 @@ export function dockerComposeTemplate(opts?: {
       - "\${TURN_RELAY_MIN_PORT}-\${TURN_RELAY_MAX_PORT}:\${TURN_RELAY_MIN_PORT}-\${TURN_RELAY_MAX_PORT}/udp"
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./turn-entrypoint.sh:/usr/local/bin/imcodes-turn-entrypoint:ro
+    # Docker DNATs a peer's public relay address back to this container's
+    # bridge address. Allow only that exact runtime address so two clients on
+    # this TURN instance can communicate without opening private subnets.
+    entrypoint: ["/bin/sh", "/usr/local/bin/imcodes-turn-entrypoint"]
     command: ["-c", "/etc/coturn/turnserver.conf"]
     labels:
       - com.centurylinklabs.watchtower.scope=imcodes
@@ -181,5 +186,43 @@ no-tcp-relay
 no-multicast-peers
 ${deniedPeers}
 denied-peer-ip=${turn.externalIp}-${turn.externalIp}
+# allowed-peer-ip takes precedence over denied-peer-ip. This exact self-host
+# exception is required when both WebRTC endpoints use this TURN relay.
+allowed-peer-ip=${turn.externalIp}-${turn.externalIp}
+`;
+}
+
+/**
+ * Resolve the coturn container's current bridge IPv4 at each start. Docker may
+ * change it after a recreate, so baking the address into turnserver.conf would
+ * make relay-to-relay traffic fail again later.
+ */
+export function turnEntrypointTemplate(): string {
+  return `#!/bin/sh
+set -eu
+
+turn_container_ipv4="$(hostname -i | awk '
+  {
+    for (i = 1; i <= NF; i++) {
+      count = split($i, octets, ".")
+      valid = count == 4
+      for (j = 1; valid && j <= 4; j++) {
+        valid = octets[j] ~ /^[0-9]+$/ && octets[j] >= 0 && octets[j] <= 255
+      }
+      if (valid) {
+        print $i
+        exit
+      }
+    }
+  }
+')"
+
+if [ -z "$turn_container_ipv4" ]; then
+  echo "Unable to determine coturn container IPv4" >&2
+  exit 1
+fi
+
+exec docker-entrypoint.sh "$@" \
+  --allowed-peer-ip="\${turn_container_ipv4}-\${turn_container_ipv4}"
 `;
 }

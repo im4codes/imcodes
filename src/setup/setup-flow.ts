@@ -22,6 +22,7 @@ import {
   dockerComposeTemplate,
   caddyfileTemplate,
   envTemplate,
+  turnEntrypointTemplate,
   turnserverConfigTemplate,
   type TurnDeploymentTemplateConfig,
 } from './templates.js';
@@ -79,7 +80,14 @@ function teardown(compose: string, dir: string): void {
     // compose down may fail if services never started — that's fine
   }
   // Remove generated config files
-  for (const file of ['.env', '.setup-secrets.json', 'docker-compose.yml', 'Caddyfile', 'turnserver.conf']) {
+  for (const file of [
+    '.env',
+    '.setup-secrets.json',
+    'docker-compose.yml',
+    'Caddyfile',
+    'turnserver.conf',
+    'turn-entrypoint.sh',
+  ]) {
     const p = join(dir, file);
     if (existsSync(p)) {
       execSync(`rm -f "${p}"`);
@@ -538,11 +546,17 @@ async function writeConfigs(
   ));
   await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain));
   const turnConfigPath = join(dir, 'turnserver.conf');
+  const turnEntrypointPath = join(dir, 'turn-entrypoint.sh');
   if (turn) {
     await writeFile(turnConfigPath, turnserverConfigTemplate(turn), { encoding: 'utf8', mode: 0o600 });
     await chmod(turnConfigPath, 0o600);
+    await writeFile(turnEntrypointPath, turnEntrypointTemplate(), { encoding: 'utf8', mode: 0o700 });
+    await chmod(turnEntrypointPath, 0o700);
   } else if (existsSync(turnConfigPath)) {
     await unlink(turnConfigPath);
+    if (existsSync(turnEntrypointPath)) await unlink(turnEntrypointPath);
+  } else if (existsSync(turnEntrypointPath)) {
+    await unlink(turnEntrypointPath);
   }
 }
 
@@ -780,7 +794,7 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   }
   await writeConfigs(dir, domain, secrets, mirrorMode, turn);
   await persistSecrets(dir, secrets);
-  log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', turnserver.conf' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
+  log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', TURN config' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
 
   // 4. Start PostgreSQL (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'postgres')) {
@@ -792,7 +806,17 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
     log('PostgreSQL ready.');
   }
 
-  // 5. Start server (skip if already healthy)
+  // 5. Always recreate TURN after rewriting its bind-mounted configuration.
+  // Docker Compose does not otherwise notice file-content or REST-secret
+  // changes, leaving coturn with stale in-memory credentials and ACLs.
+  if (turn) {
+    log('Starting TURN with current configuration...');
+    composeCmd(compose, dir, 'up -d --force-recreate turn');
+    await waitForService(compose, dir, 'turn');
+    log('TURN ready.');
+  }
+
+  // 6. Start server (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'server')) {
     log('Server already running.');
   } else {
@@ -804,23 +828,23 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
     log('Server ready.');
   }
 
-  // 6. Bootstrap database (idempotent — handles duplicates gracefully)
+  // 7. Bootstrap database (idempotent — handles duplicates gracefully)
   log('Bootstrapping database...');
   bootstrapDatabase(compose, dir, secrets);
   log('Database bootstrapped.');
 
-  // 7. Start remaining services
+  // 8. Start remaining services
   log(`Starting Caddy${turn ? ', TURN' : ''} and Watchtower...`);
   composeCmd(compose, dir, 'up -d');
   log('All services running.');
 
-  // 8. Self-bind
+  // 9. Self-bind
   log('Binding daemon to local server...');
   await selfBind(secrets);
   installService();
   log('Daemon bound and running.');
 
-  // 9. Print summary
+  // 10. Print summary
   const bindUrl = `https://${domain}/bind/${secrets.apiKeyRaw}`;
   console.log(`
   ┌──────────────────────────────────────────────────────┐
