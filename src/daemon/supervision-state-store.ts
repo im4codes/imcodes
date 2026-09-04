@@ -6808,15 +6808,10 @@ export class SupervisionTaskRegistry {
    * stranded with no legal way forward -- observed live on tsk_55y, tsk_5oc and
    * tsk_5ns. Convergence repairs exactly that drift and nothing else.
    *
-   * It is deliberately narrow and fail-closed:
-   *  - `sessionName`, `agentType` and `providerFamily` must match EXACTLY; only
-   *    instance/epoch may differ, so a same-named clone from another runtime
-   *    family can never inherit the assignment;
-   *  - the project must have EXACTLY ONE live runtime matching those three, so
-   *    ambiguity is refused rather than resolved by picking a row;
-   *  - the presented identity must BE that live runtime, so a caller cannot
-   *    assert an instance/epoch the daemon does not actually observe;
-   *  - a terminal assignment is never converged.
+   * It is deliberately narrow: the enclosing task/caller boundary already
+   * proves project scope, so only `sessionName` decides durable ownership.
+   * Instance, epoch, agent type and provider family are refreshed as
+   * observational metadata and never veto a legitimate restart continuation.
    *
    * Returns the identity to persist, or undefined to reject with owner_mismatch.
    */

@@ -28,8 +28,8 @@ function registryWithLiveParticipants(
 ): SupervisionTaskRegistry {
   return new SupervisionTaskRegistry({
     database: new DatabaseSync(':memory:'),
-    // Production supplies this from the live session store; the rule itself is
-    // enforced by the registry, not by the caller.
+    // Specialized heartbeat recovery consumes this census. Ordinary
+    // project/session authorization intentionally does not.
     resolveLiveParticipants: (projectName: string | null | undefined) => (
       projectName === 'alpha' ? live : []
     ),
@@ -80,18 +80,20 @@ describe('same-logical-participant identity convergence', () => {
     expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-before');
   });
 
-  it('refuses a different agent type or provider family under the same name', () => {
+  it('accepts agent/provider migration for the same durable session', () => {
     const clone = rotated(storedIdentity('deck_alpha_worker', 'codex-sdk', 'openai'));
     const registry = registryWithLiveParticipants([clone]);
     const { owner } = seedOwner(registry);
 
     expect(registry.updateAssignment({
       assignmentId: owner.assignmentId, identity: clone, status: 'implementing',
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-    expect(registry.getAssignment(owner.assignmentId)!.identity.agentType).toBe('claude-code-sdk');
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.assignmentId)!.identity).toMatchObject({
+      sessionName: 'deck_alpha_worker', agentType: 'codex-sdk', providerFamily: 'openai',
+    });
   });
 
-  it('fails closed when more than one live runtime could be the participant', () => {
+  it('does not make ordinary durable authority depend on duplicate runtime observations', () => {
     const registry = registryWithLiveParticipants([
       rotated(),
       { ...rotated(), sessionInstanceId: 'instance-other', runtimeEpoch: 'epoch-other' },
@@ -100,18 +102,18 @@ describe('same-logical-participant identity convergence', () => {
 
     expect(registry.updateAssignment({
       assignmentId: owner.assignmentId, identity: rotated(), status: 'implementing',
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-before');
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-after');
   });
 
-  it('fails closed when no live runtime backs the claim', () => {
+  it('does not require a live-runtime census for an ordinary same-session update', () => {
     const registry = registryWithLiveParticipants([]);
     const { owner } = seedOwner(registry);
 
     expect(registry.updateAssignment({
       assignmentId: owner.assignmentId, identity: rotated(), status: 'implementing',
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-before');
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-after');
   });
 
   it('never converges a terminal assignment', () => {
@@ -137,51 +139,45 @@ describe('same-logical-participant identity convergence', () => {
     expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-after');
   });
 
-  it('refuses a presented agent/provider that differs from the stored one even when a matching runtime is live', () => {
-    // The live runtime matches the STORED participant, so the candidate filter
-    // alone would accept. Only the presented-vs-stored check can refuse here,
-    // which is what makes that check load-bearing.
+  it('treats presented agent/provider changes as observational metadata', () => {
     const registry = registryWithLiveParticipants([rotated()]);
     const { owner } = seedOwner(registry);
     const impostor = { ...rotated(), agentType: 'codex-sdk', providerFamily: 'openai' };
 
     expect(registry.updateAssignment({
       assignmentId: owner.assignmentId, identity: impostor, status: 'implementing',
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-    expect(registry.getAssignment(owner.assignmentId)!.identity.agentType).toBe('claude-code-sdk');
-    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-before');
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.assignmentId)!.identity.agentType).toBe('codex-sdk');
+    expect(registry.getAssignment(owner.assignmentId)!.identity.providerFamily).toBe('openai');
+    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-after');
   });
 
-  it('refuses an instance/epoch the daemon does not actually observe', () => {
-    // The caller asserts a plausible-looking but unobserved runtime. Accepting
-    // it would let any caller name its own epoch into the record.
+  it('does not use instance/epoch metadata as durable ownership', () => {
     const registry = registryWithLiveParticipants([rotated()]);
     const { owner } = seedOwner(registry);
     const asserted = { ...storedIdentity(), sessionInstanceId: 'instance-claimed', runtimeEpoch: 'epoch-claimed' };
 
     expect(registry.updateAssignment({
       assignmentId: owner.assignmentId, identity: asserted, status: 'implementing',
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-before');
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-claimed');
   });
 
-  it('does not rebind the identity of a terminal assignment even when the call is refused', () => {
-    // applyTaskIntent converges BEFORE running the intent, so a terminal
-    // assignment must be rejected by the identity rule itself rather than
-    // incidentally by a later transition guard.
+  it('keeps terminal lifecycle state closed while refreshing observational metadata', () => {
     const registry = registryWithLiveParticipants([rotated()]);
     const { taskId, owner } = seedOwner(registry);
     expect(registry.updateAssignment({
       assignmentId: owner.assignmentId, identity: storedIdentity(), status: 'cancelled',
     } as never)).toMatchObject({ ok: true });
 
-    registry.applyTaskIntent({
+    expect(registry.applyTaskIntent({
       taskId, assignmentId: owner.assignmentId, intent: 'start', toStatus: 'implementing', identity: rotated(),
-    } as never);
+    } as never)).toMatchObject({ ok: false });
 
-    // The stored identity must be untouched: no silent rebind of a closed row.
-    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-before');
-    expect(registry.getAssignment(owner.assignmentId)!.identity.sessionInstanceId).toBe('instance-before');
+    const closed = registry.getAssignment(owner.assignmentId)!;
+    expect(closed.status).toBe('cancelled');
+    expect(closed.identity.runtimeEpoch).toBe('epoch-after');
+    expect(closed.identity.sessionInstanceId).toBe('instance-after');
   });
 
   it('lets an already-open non-terminal auditor resume on its exact task/attempt/revision after a restart', () => {
@@ -255,7 +251,7 @@ describe('same-logical-participant identity convergence', () => {
       .toBe('REWORK');
   });
 
-  it('heartbeat either persists the rebind or refuses truthfully, never ok with a stale identity', () => {
+  it('heartbeat persists observational metadata for the same durable session', () => {
     const registry = registryWithLiveParticipants([rotated()]);
     const { taskId, owner } = seedOwner(registry);
 
@@ -265,12 +261,11 @@ describe('same-logical-participant identity convergence', () => {
     expect(converged).toMatchObject({ ok: true });
     expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-after');
 
-    // An identity the daemon does not observe must be refused, not reported ok.
-    const impostor = { ...storedIdentity(), sessionInstanceId: 'ghost', runtimeEpoch: 'ghost-epoch' };
+    const nextRuntime = { ...storedIdentity(), sessionInstanceId: 'next', runtimeEpoch: 'next-epoch' };
     expect(registry.applyTaskIntent({
-      taskId, assignmentId: owner.assignmentId, intent: 'heartbeat', toStatus: null, identity: impostor,
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('epoch-after');
+      taskId, assignmentId: owner.assignmentId, intent: 'heartbeat', toStatus: null, identity: nextRuntime,
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(owner.assignmentId)!.identity.runtimeEpoch).toBe('next-epoch');
   });
 
   it('a newly authorized successor assignment progresses without erasing prior finalization evidence', () => {

@@ -197,12 +197,14 @@ describe('daemon boot enters the same bounded supervision convergence', () => {
     expect(reboundIdentity.assignmentId).toBe(rotator.value.assignmentId); // same object
     expect(reboundIdentity.identity.runtimeEpoch).toBe(liveRotator.runtimeEpoch);
     expect(reboundIdentity.identity.sessionInstanceId).toBe(liveRotator.sessionInstanceId);
-    // Fail-closed holds: an identity the daemon does not observe is refused.
+    // Runtime metadata is observational: the same durable project/session can
+    // continue even if the session store has not yet hydrated its new epoch.
     expect(registry.updateAssignment({
       assignmentId: rotator.value.assignmentId,
       identity: { ...storedIdentity, sessionInstanceId: 'ghost', runtimeEpoch: 'ghost-epoch' },
       status: 'implementing',
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.getAssignment(rotator.value.assignmentId)!.identity.runtimeEpoch).toBe('ghost-epoch');
   }, 60_000);
 
 });

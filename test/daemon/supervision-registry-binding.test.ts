@@ -78,7 +78,9 @@ async function callList(client: Client): Promise<Record<string, unknown>> {
 /** A task the caller participates in, so LIST has something real to project. */
 function seedTaskOwnedByCaller(taskKey: string, scopeFiles: string[] = []): string {
   const registry = getSupervisionTaskRegistry();
-  const task = registry.createOrGet({ objective: `objective ${taskKey}`, idempotencyKey: taskKey });
+  const task = registry.createOrGet({
+    objective: `objective ${taskKey}`, idempotencyKey: taskKey, projectName: LIVE_CALLER.projectName,
+  });
   if (!task.ok) throw new Error(`seed failed: ${task.reason}`);
   const assignment = registry.createAssignment({
     taskId: task.value.taskId,
@@ -158,23 +160,17 @@ describe('supervision registry binding', () => {
   it('binds bounded housekeeping to the current real registry rather than a captured handle', () => {
     seedTaskOwnedByCaller('housekeeping-before-reopen');
     const port = createSupervisionRegistryPort();
-    expect(port.housekeeping({ mode: 'dryRun', projectName: '__legacy_unscoped__', limit: 1 })).toMatchObject({
+    expect(port.housekeeping({ mode: 'dryRun', projectName: LIVE_CALLER.projectName, limit: 1 })).toMatchObject({
       mode: 'dryRun', scanned: 1, applyAuthorized: false,
     });
     resetSupervisionTaskRegistryForTests();
     seedTaskOwnedByCaller('housekeeping-after-reopen');
-    expect(port.housekeeping({ mode: 'dryRun', projectName: '__legacy_unscoped__', limit: 10 })).toMatchObject({
+    expect(port.housekeeping({ mode: 'dryRun', projectName: LIVE_CALLER.projectName, limit: 10 })).toMatchObject({
       mode: 'dryRun', scanned: expect.any(Number), applyAuthorized: false,
     });
   });
 
-  it('wires the live-participant resolver through the MCP construction path, not only lifecycle.startup', async () => {
-    // R13 audit P1: the resolver was registered ONLY in lifecycle.startup().
-    // `imcodes memory mcp` runs as a SEPARATE process with its own module
-    // state, so in the process that actually serves supervision tools the
-    // resolver stayed undefined, restart identity convergence never ran, and a
-    // rotated same-name owner was refused with owner_mismatch in production
-    // while the startup-based test stayed green.
+  it('keeps durable authority stable before and after MCP construction', async () => {
     setSupervisionLiveParticipantsResolver(undefined); // a fresh MCP process
     resetSupervisionTaskRegistryForTests();
     const registry = getSupervisionTaskRegistry();
@@ -200,31 +196,33 @@ describe('supervision registry binding', () => {
       runtimeEpoch: LIVE_CALLER.runtimeEpoch,
     };
 
-    // Before the MCP server is constructed the process has no resolver at all.
+    // Ordinary ownership does not depend on an eventually hydrated runtime
+    // census. Project + session is the durable authority boundary.
     expect(registry.updateAssignment({
       assignmentId: owner.value.assignmentId, identity: rotated, status: 'implementing',
-    } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    } as never)).toMatchObject({ ok: true });
 
-    // Going through the REAL MCP construction path must wire it.
+    // Constructing the real MCP server must not change that authority rule.
     const { close } = await connectProductionServer();
     try {
+      const afterMcp = { ...rotated, sessionInstanceId: 'instance-after-mcp', runtimeEpoch: 'epoch-after-mcp' };
       expect(registry.updateAssignment({
-        assignmentId: owner.value.assignmentId, identity: rotated, status: 'implementing',
+        assignmentId: owner.value.assignmentId, identity: afterMcp, status: 'implementing',
       } as never)).toMatchObject({ ok: true });
       const bound = registry.getAssignment(owner.value.assignmentId)!;
       expect(bound.assignmentId).toBe(owner.value.assignmentId); // same object
-      expect(bound.identity.runtimeEpoch).toBe(LIVE_CALLER.runtimeEpoch);
+      expect(bound.identity.runtimeEpoch).toBe('epoch-after-mcp');
 
-      // Fail-closed still holds for an identity the daemon does not observe.
+      // Agent/provider are observational metadata too.
       expect(registry.updateAssignment({
         assignmentId: owner.value.assignmentId,
-        identity: { ...stale, sessionInstanceId: 'ghost', runtimeEpoch: 'ghost-epoch' },
+        identity: { ...afterMcp, agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
         status: 'implementing',
-      } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-      // ...and for a same-name candidate whose agent/provider differ.
+      } as never)).toMatchObject({ ok: true });
+      // A different durable session remains forbidden.
       expect(registry.updateAssignment({
         assignmentId: owner.value.assignmentId,
-        identity: { ...rotated, agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+        identity: { ...afterMcp, sessionName: 'deck_alpha_other' },
         status: 'implementing',
       } as never)).toMatchObject({ ok: false, reason: 'owner_mismatch' });
     } finally {

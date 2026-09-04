@@ -1,12 +1,10 @@
 /**
  * The PRODUCTION wiring of coordinator authority.
  *
- * The registry gate is only as good as the identity the port hands it. If the
- * port resolved anything other than the CALLER's own live identity -- the
- * assignment's stored identity, a name, a project -- the registry check would
- * be vacuous while still looking correct. These tests therefore drive
- * `createSupervisionRegistryPort()` itself, so a second Brain in the same
- * project cannot finish a task it never dispatched.
+ * Durable authority is project + session name. The port must still prove that
+ * the named caller is a live session in that project, while runtime metadata
+ * may rotate without stranding the assignment. These tests drive the real
+ * `createSupervisionRegistryPort()` boundary.
  */
 import { describe, expect, it, beforeEach, vi } from 'vitest';
 
@@ -110,8 +108,7 @@ describe('production coordinator authority wiring', () => {
     })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
   });
 
-  it('refuses the coordinator NAME on a replacement runtime', () => {
-    // Same name, new instance/epoch: a replacement window inherits nothing.
+  it('accepts the durable coordinator after runtime replacement', () => {
     listSessionsMock.mockReturnValue([
       { ...brainA, sessionInstanceId: 'instance-new', runtimeEpoch: 'epoch-new' },
       brainB, worker,
@@ -122,7 +119,7 @@ describe('production coordinator authority wiring', () => {
       callerSessionName: brainA.name,
       callerProjectName: PROJECT,
       projectBrain: true,
-    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    })).toMatchObject({ ok: true, value: { status: 'finalized' } });
   });
 
   it('refuses a caller with no live session record at all', () => {
@@ -149,11 +146,9 @@ describe('production coordinator authority wiring', () => {
 });
 
 // ── R2 P1-1: the NON-projectBrain owner path ────────────────────────────────
-// The port compared only `assignment.identity.sessionName === callerSessionName`
-// and then handed the registry the STORED identity, so the registry's own exact
-// check compared the stored identity against itself and was vacuously true. A
-// replacement runtime (same name, new instance/epoch) therefore finished another
-// instance's assignment.
+// The non-Brain owner path resolves a live caller first, then authorizes the
+// durable project/session identity. A restart must rotate metadata in place;
+// an absent live caller remains forbidden.
 describe('owner finish authority resolves the LIVE caller identity', () => {
   const brainA = brain('deck_alpha_brain');
   const workerLive = { ...brain('deck_alpha_impl'), role: 'w1' as const };
@@ -186,8 +181,7 @@ describe('owner finish authority resolves the LIVE caller identity', () => {
     }
   });
 
-  it('refuses a replacement runtime that reuses the owner session NAME', () => {
-    // Same name, new instance/epoch: this is a different identity.
+  it('accepts the durable owner after runtime replacement', () => {
     listSessionsMock.mockReturnValue([
       brainA,
       { ...workerLive, sessionInstanceId: 'instance-replacement', runtimeEpoch: 'epoch-replacement' },
@@ -198,7 +192,7 @@ describe('owner finish authority resolves the LIVE caller identity', () => {
       callerSessionName: workerLive.name,
       callerProjectName: PROJECT,
       projectBrain: false,
-    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    })).toMatchObject({ ok: true });
   });
 
   it('refuses an owner-named caller with no live session record', () => {
@@ -224,11 +218,9 @@ describe('owner finish authority resolves the LIVE caller identity', () => {
 });
 
 // ── R2 P1-2: task read/continuation gates ──────────────────────────────────
-// `supervisionCallerParticipates` mapped assignments to `identity.sessionName`
-// and did a string `.includes()`. A stale instance, a clone, or a same-name /
-// different-epoch runtime therefore passed every visibility and continuation
-// gate, while the call site's own comment claimed exact-identity binding.
-describe('task visibility is bound to exact persistent identity', () => {
+// Visibility is bound to the caller's project + durable session. Runtime
+// instance/epoch changes must not make a restarted participant invisible.
+describe('task visibility is bound to durable project/session identity', () => {
   const brainA = brain('deck_alpha_brain');
   const workerLive = { ...brain('deck_alpha_reader'), role: 'w1' as const };
   const taskId = 'visibility-exact-identity';
@@ -270,16 +262,16 @@ describe('task visibility is bound to exact persistent identity', () => {
 
   const replacement = { ...workerLive, sessionInstanceId: 'instance-new', runtimeEpoch: 'epoch-new' };
 
-  it('refuses task_get to a same-name replacement runtime', async () => {
+  it('allows task_get to the same durable session after runtime replacement', async () => {
     const handlers = handlersFor(workerLive, [brainA, replacement]);
     expect(await handlers[SUPERVISION_MCP_TOOLS.GET]({ taskId }))
-      .toMatchObject({ status: 'error', reason: 'identity_rejected' });
+      .toMatchObject({ status: 'ok', task: { taskId } });
   });
 
-  it('omits the task from task_list for a same-name replacement runtime', async () => {
+  it('keeps the task in task_list after runtime replacement', async () => {
     const handlers = handlersFor(workerLive, [brainA, replacement]);
     const res = await handlers[SUPERVISION_MCP_TOOLS.LIST]({}) as { tasks?: unknown[] };
-    expect(res.tasks ?? []).toHaveLength(0);
+    expect(res.tasks ?? []).toEqual(expect.arrayContaining([expect.objectContaining({ taskId })]));
   });
 
   it('still lets the exact live participant read', async () => {

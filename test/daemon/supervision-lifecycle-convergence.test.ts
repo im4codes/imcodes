@@ -508,7 +508,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     expect(registry.listAssignments(taskId).filter((a) => a.role === 'coordinator')).toHaveLength(1);
   });
 
-  it('refuses to hand a coordinator assignment to a different Brain identity', () => {
+  it('refuses to hand a coordinator assignment to a different durable Brain session', () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { currentRevision: 'r-c' });
     const coordinator = registry.createAssignment({
@@ -516,9 +516,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     } as never);
     if (!coordinator.ok) throw new Error(coordinator.reason);
 
-    // A clone that merely shares the session NAME but is a different runtime
-    // family must never inherit coordinator authority.
-    const clone = { ...identity('deck_alpha_brain'), agentType: 'codex-sdk', providerFamily: 'openai', runtimeEpoch: 'epoch-clone' };
+    const clone = { ...identity('deck_alpha_clone_brain'), agentType: 'codex-sdk', providerFamily: 'openai', runtimeEpoch: 'epoch-clone' };
     const actions = registry.convergeLifecycle(2_000, { resolveAuthoritativeBrain: () => clone });
 
     expect(actions.some((a) => a.action === 'rebind_stale_coordinator')).toBe(false);
