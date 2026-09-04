@@ -511,6 +511,11 @@ function armLeaseIdleTimer(lease: Lease): void {
   if (lease.active.size !== 0 || lease.terminalGrace.size !== 0
     || lease.creating || lease.rebinding || lease.peerCreating) return;
   clearLeaseTimer(lease);
+  // A verified TURN route deliberately retires its lease while retaining the
+  // yellow presentation state. There is no authority deadline left to arm;
+  // treating the zeroed timestamp as an expiry would immediately erase that
+  // truthful route status.
+  if (!lease.leaseId) return;
   // Unlike the browser's old relative five-minute timer, this deadline starts
   // when the server accepts LEASE_INIT. A delayed LEASE_READY/SDP exchange
   // therefore cannot extend a ticket the authority has already retired.
@@ -566,10 +571,11 @@ function warmRetainedLease(lease: Lease): void {
     await ensureLease(lease);
     const result = await probeLeasePeer(lease);
     if (result.route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
-      // TURN is a useful fallback signal, not a connection worth pinning for
-      // uploads. Retaining it would consume relay resources while idle and
-      // would misleadingly call a relayed path "prewarmed".
-      if (lease.active.size === 0) closePeer(lease);
+      // TURN is a valid P2P path for IPv6/mobile clients, but it must not stay
+      // prewarmed while idle. Retire the whole lease rather than only the
+      // browser peer: node-datachannel cannot ICE-restart the still-bound
+      // daemon peer, so reusing that split lease makes the real upload fail.
+      if (lease.active.size === 0) clearLeaseBinding(lease);
       setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
       return;
     }
@@ -2054,7 +2060,7 @@ export async function uploadFileDirect(
       route,
     });
     if (route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
-      if (lease.active.size === 0) closePeer(lease);
+      if (lease.active.size === 0) clearLeaseBinding(lease);
       setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
     } else if (route !== 'unknown') {
       setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
@@ -2078,10 +2084,7 @@ export async function uploadFileWithDirectFallback(options: {
   const clientUploadId = crypto.randomUUID();
   const broker = options.ws ? getBroker(options.ws, options.serverId) : null;
   if (options.ws && supportsUpload(options.ws)
-    && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))
-    // A verified TURN-only prewarm is not retained. Skip another doomed warm
-    // attempt and move straight to the one HTTP relay path.
-    && broker?.connectionStatus !== DIRECT_FILE_CONNECTION_STATUS.RELAY) {
+    && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
     options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
     const directAbort = new AbortController();
     let directConnectTimedOut = false;
@@ -2431,7 +2434,7 @@ export async function probeDirectConnectivity(
     reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE, lease);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: result.route });
     if (result.route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
-      if (lease.active.size === 0) closePeer(lease);
+      if (lease.active.size === 0) clearLeaseBinding(lease);
       setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
     } else {
       setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);

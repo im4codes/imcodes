@@ -726,7 +726,7 @@ describe('direct file transfer v2 browser broker', () => {
     unsubscribe();
   });
 
-  it('marks a verified relay yellow, releases it, and skips repeat prewarm on upload', async () => {
+  it('marks a verified relay yellow, avoids idle prewarm, and still uses TURN P2P on upload', async () => {
     const {
       prewarmDirectFileLease,
       subscribeDirectFileConnectionStatus,
@@ -779,8 +779,9 @@ describe('direct file transfer v2 browser broker', () => {
       serverId: 'server-1',
       file: createUploadFile('relay.txt', 'relay'),
     });
-    expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toBe(false);
-    expect(apiMocks.uploadFile).toHaveBeenCalledOnce();
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toBe(true);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
     releaseSecondSurface();
     release();
     unsubscribe();
