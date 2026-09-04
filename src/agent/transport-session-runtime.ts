@@ -103,6 +103,7 @@ import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js'
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  isDelegationUnsupportedControlText,
   type AgentDelegationNotificationResult,
 } from '../../shared/agent-delegation.js';
 import {
@@ -2327,7 +2328,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (selected.some((entry) => (entry.attachments?.length ?? 0) > 0)) {
       return { status: 'attachments_unsupported' };
     }
-    if (selected.some((entry) => entry.text.trim().startsWith('/'))) {
+    if (selected.some((entry) => isDelegationUnsupportedControlText(entry.text))) {
       return { status: 'control_unsupported' };
     }
 

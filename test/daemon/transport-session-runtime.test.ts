@@ -819,6 +819,24 @@ describe('TransportSessionRuntime', () => {
     ]);
   });
 
+  it('appends ordinary queued text that starts with an absolute path', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-path');
+    await flushDispatch();
+    expect(runtime.send('/home/ai/zhilan 就是这个目录复制过去啊!', 'queued-path')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-path'], 'append-path');
+
+    expect(result.status).toBe('delivered');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'append-path',
+      text: '/home/ai/zhilan 就是这个目录复制过去啊!',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
   it('keeps an accepted append delivered when SQLite finalization fails', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
