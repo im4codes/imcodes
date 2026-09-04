@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { buildSubSessionSyncPayload } from '../../src/daemon/subsession-sync.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
-import { listSessions, removeSession, upsertSession } from '../../src/store/session-store.js';
+import { recipientFromSessionRecord } from '../../src/daemon/transport-resend-queue.js';
+import { getSession, listSessions, removeSession, upsertSession } from '../../src/store/session-store.js';
 
 describe('subsession-sync transport queue projection', () => {
   beforeEach(() => {
@@ -32,6 +33,7 @@ describe('subsession-sync transport queue projection', () => {
       commandId: 'sqlite-cmd',
       text: 'from sqlite authority',
       now: Date.now(),
+      recipient: recipientFromSessionRecord(getSession('deck_sub_queue')),
     });
 
     const payload = await buildSubSessionSyncPayload('queue', undefined, {
