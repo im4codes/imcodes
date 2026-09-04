@@ -2,11 +2,17 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { SupervisionAutomationPoolGateReason } from '../../shared/supervision-execution-pool.js';
-import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
+import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../shared/delegation-availability.js';
+import { getSession, listSessions, upsertSession, type SessionRecord } from '../store/session-store.js';
 import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { validateBrainAuditRoute } from './peer-audit-candidates.js';
-import { getTransportRuntime } from '../agent/session-manager.js';
+import {
+  getTransportRuntime,
+  ensureTransportRuntimeAvailable,
+  MAX_RESTARTS,
+  RESTART_WINDOW_MS,
+} from '../agent/session-manager.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -192,6 +198,10 @@ interface ActiveTaskRunState {
   generation: number;
   sessionName: string;
   commandId: string;
+  /** The exact outage signature already recovered on this run, if any. */
+  recoveredAuthorityOutage?: string;
+  /** Pending daemon-owned retry for a recovery that could not deliver. */
+  authorityRecoveryTimer?: ReturnType<typeof setTimeout>;
   snapshot: SessionSupervisionSnapshot;
   hasLiveSnapshotUpdate: boolean;
   userText: string;
@@ -885,6 +895,22 @@ function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string 
 
 function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
   return payload.streaming === false || payload.streaming === undefined;
+}
+
+/**
+ * Exactly one recoverable failure signature. Anything else -- an unknown crash,
+ * an identity conflict, an empty reason -- is NOT recoverable here and keeps the
+ * existing terminal behaviour.
+ */
+/**
+ * How long to wait before re-attempting a recovery that could not deliver.
+ * Short enough that a transient catalog outage clears quickly, long enough
+ * that the bounded budget is not burned in a single burst.
+ */
+const AUTHORITY_RECOVERY_RETRY_MS = 15_000;
+
+function isRecoverableAuthorityOutage(reason: string | undefined): reason is string {
+  return reason?.trim() === IMCODES_DELEGATION_UNAVAILABLE_MESSAGE;
 }
 
 class SupervisionAutomation {
@@ -1703,8 +1729,12 @@ class SupervisionAutomation {
   ): void {
     if (run.waitingTimeoutTimer) clearTimeout(run.waitingTimeoutTimer);
     if (run.waitingHeartbeatTimer) clearTimeout(run.waitingHeartbeatTimer);
+    // A pending authority retry must die with the run; otherwise it fires
+    // against a finished run and, worse, keeps the process awake.
+    if (run.authorityRecoveryTimer) clearTimeout(run.authorityRecoveryTimer);
     run.waitingTimeoutTimer = undefined;
     run.waitingHeartbeatTimer = undefined;
+    run.authorityRecoveryTimer = undefined;
     if (!options.preserveWindow) {
       run.waitingStartedAt = undefined;
       run.waitingDeadlineAt = undefined;
@@ -2761,6 +2791,20 @@ class SupervisionAutomation {
       } else if (state && state !== 'idle') {
         run.ignoreIdleUntilPostAuditTurnActivity = false;
       }
+      // The session is alive again, so the outage that was recovered is over.
+      // Forgetting it here is what lets a genuinely NEW outage later recover
+      // again -- still bounded by the durable restart budget, which is never
+      // reset by this.
+      if (state && state !== 'stopped' && state !== 'error') {
+        run.recoveredAuthorityOutage = undefined;
+        // Cancel the retry armed for an outage that is now OVER. Leaving it
+        // pending means a recovered, healthy run is later torn down by its own
+        // stale timer -- the retry exists to rescue the run, never to kill it.
+        if (run.authorityRecoveryTimer) {
+          clearTimeout(run.authorityRecoveryTimer);
+          run.authorityRecoveryTimer = undefined;
+        }
+      }
       if (state === 'idle' && (run.phase === 'execution' || run.phase === 'finalizing') && !run.evaluating) {
         if (!run.sawAssistantOutput) {
           if (run.ignoreIdleUntilPostAuditTurnActivity) {
@@ -2773,6 +2817,8 @@ class SupervisionAutomation {
         this.evaluateIdleRun(run);
       }
       if ((state === 'stopped' || state === 'error') && run.phase === 'execution') {
+        // A precisely-typed, transient authority outage is not a blocked task.
+        if (this.tryRecoverAuthorityOutage(run)) return;
         this.emitTerminalStatus(run.sessionName, 'supervision_blocked', SUPERVISION_BLOCKED_LABEL);
         this.emitWarning(run.sessionName, 'Supervision stopped because the session entered a blocked state.');
         this.finishRun(run.sessionName, 'blocked', { preserveStatus: true });
@@ -2781,6 +2827,168 @@ class SupervisionAutomation {
         this.handleOrchestratedAuditCompletion(run);
       }
     }
+  }
+
+  /**
+   * Recover the SAME run from a transient authority-catalog/MCP outage.
+   *
+   * Observed live: a Brain turn threw
+   * `ImcodesDelegationUnavailableError('authoritative IM delegation unavailable')`,
+   * the session went stopped/error, and the caller below treated ANY
+   * stopped/error in execution as terminal -- so it emitted
+   * `supervision_blocked` and finished the run. The task was wedged for good
+   * even though the outage is transient and the session is rehydratable.
+   *
+   * Deliberately narrow. Only this exact, opaque-by-design message recovers;
+   * every other stopped/error reason (and anything without a session record)
+   * still falls through to the terminal path, so an unknown crash is never
+   * silently restarted.
+   *
+   * The budget is the session's OWN durable restart window -- the same
+   * `restartTimestamps` / MAX_RESTARTS / RESTART_WINDOW_MS loop prevention the
+   * session manager already enforces, persisted in the session store. Reusing
+   * it means the budget survives a daemon restart instead of resetting into an
+   * infinite recovery loop, and there is no second definition to drift.
+   * Rehydration itself is `ensureTransportRuntimeAvailable`, which de-duplicates
+   * concurrent recoveries, so repeated state edges cannot start it twice.
+   */
+  private tryRecoverAuthorityOutage(run: ActiveTaskRunState): boolean {
+    const record = getSession(run.sessionName);
+    if (!record) return false;
+    const outage = record.error?.trim();
+    if (!isRecoverableAuthorityOutage(outage)) return false;
+    // Already recovered from THIS outage. Providers re-emit the same terminal
+    // state edge freely (duplicate, reordered, or replayed on reconnect), and
+    // each replay would otherwise burn another restart from a 3-restart durable
+    // budget and re-deliver the turn again. Suppress the terminal path -- the
+    // run is legitimately mid-recovery -- but spend nothing.
+    if (run.recoveredAuthorityOutage === outage) return true;
+    const now = Date.now();
+    const recent = (record.restartTimestamps ?? []).filter((at) => at > now - RESTART_WINDOW_MS);
+    if (recent.length >= MAX_RESTARTS) return false;
+    run.recoveredAuthorityOutage = outage;
+    upsertSession({ ...record, restartTimestamps: [...recent, now], updatedAt: now });
+    this.emitAutomationNote(
+      run.sessionName,
+      '⏳ Auto: the authority catalog is momentarily unavailable; rehydrating this session and continuing the same task.',
+      'supervision-authority-recovery',
+    );
+    void ensureTransportRuntimeAvailable(run.sessionName)
+      .then(() => {
+        this.redeliverAuthorityOutageTurn(run, outage);
+      })
+      .catch(() => {
+        // Rehydration itself failed. Same rule as the other failure branches:
+        // this is not a completed recovery, so it must become a daemon-driven
+        // retry rather than a marker left behind for an edge that may never come.
+        const current = this.activeRuns.get(run.sessionName);
+        if (current && current.generation === run.generation && current.recoveredAuthorityOutage === outage) {
+          this.disarmAuthorityOutage(current, 'the session could not be rehydrated');
+        }
+      });
+    return true;
+  }
+
+  /**
+   * Re-deliver the exact turn the outage consumed.
+   *
+   * Rebuilding the transport is only half a recovery: the failed turn produced
+   * no result and no reply, so without this the run waits for a state edge that
+   * a session which died mid-turn may never emit. Re-sending `run.userText` on
+   * the SAME session resumes the same task and assignment -- it does not open a
+   * new one, and it does not degrade into a generic "continue" that would throw
+   * away what was actually asked for.
+   */
+  private redeliverAuthorityOutageTurn(run: ActiveTaskRunState, outage: string): void {
+    const current = this.activeRuns.get(run.sessionName);
+    // The run may have been finished, superseded, or moved on while the
+    // rehydration promise was in flight. Re-delivering then would inject a
+    // stale turn into whatever is running now.
+    if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+    if (current.recoveredAuthorityOutage !== outage) return;
+    const runtime = getTransportRuntime(run.sessionName);
+    if (!runtime) {
+      // Rehydration reported success but there is still nothing to deliver into.
+      // Leaving the marker armed here is what wedged the run: every later
+      // identical error edge matched it, returned "handled", and so spent no
+      // budget, retried nothing, and never went terminal -- the task sat in
+      // `execution` for ever. Disarm so the NEXT edge re-enters the budgeted
+      // path, which either succeeds or exhausts the budget and fails closed.
+      this.disarmAuthorityOutage(current, 'no runtime to resume into');
+      return;
+    }
+    const clientMessageId = `supervision-authority-recovery:${run.commandId}:${run.generation}`;
+    try {
+      runtime.send(run.userText, clientMessageId, undefined, undefined, {
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      });
+    } catch (error) {
+      logger.warn({ session: run.sessionName, err: error }, 'Supervision authority-outage turn redelivery failed');
+      // Same reasoning: a turn that was never delivered is not a recovery, so
+      // this must stay retryable instead of silently absorbing every later edge.
+      this.disarmAuthorityOutage(current, 'the interrupted turn could not be re-delivered');
+    }
+  }
+
+  /**
+   * Mark a recovery attempt as NOT completed, so the next identical error edge
+   * re-enters `tryRecoverAuthorityOutage` and spends real budget. The durable
+   * restart window is never reset here -- that is what guarantees the retries
+   * terminate and the run eventually fails closed rather than looping.
+   */
+  private disarmAuthorityOutage(run: ActiveTaskRunState, reason: string): void {
+    // No outage-identity re-check here: the only caller already compared it and
+    // nothing can interleave between that check and this call, so a guard here
+    // would be a branch no test could ever distinguish.
+    run.recoveredAuthorityOutage = undefined;
+    this.emitWarning(
+      run.sessionName,
+      `The session was rehydrated after an authority outage, but ${reason}; supervision will retry within its restart budget.`,
+    );
+    this.scheduleAuthorityOutageRetry(run);
+  }
+
+  /**
+   * Own the retry instead of waiting for the provider to speak again.
+   *
+   * Disarming the marker alone only made the run retryable BY THE NEXT ERROR
+   * EDGE, and a session that died mid-turn may never emit another one -- so a
+   * single failed recovery left the run parked in `execution` for ever: no
+   * retry, no budget consumed, never terminal. The daemon therefore schedules
+   * the next attempt itself.
+   *
+   * Bounded by construction: one pending timer per run, and each attempt goes
+   * through `tryRecoverAuthorityOutage`, which spends the session's OWN durable
+   * restart window. When that budget is exhausted the attempt returns false and
+   * this fails the run closed, so the retries terminate rather than looping.
+   */
+  private scheduleAuthorityOutageRetry(run: ActiveTaskRunState): void {
+    if (run.authorityRecoveryTimer) return;
+    const timer = setTimeout(() => {
+      run.authorityRecoveryTimer = undefined;
+      const current = this.activeRuns.get(run.sessionName);
+      // Finished, superseded, or moved on while the retry was pending.
+      if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+      if (this.tryRecoverAuthorityOutage(current)) return;
+      // `tryRecoverAuthorityOutage` returns false for TWO very different
+      // reasons, and conflating them is what let a healthy run be killed by the
+      // timer armed for an outage it had already survived:
+      //   * the session is no longer in that exact authoritative outage -- it
+      //     recovered, or failed for some other reason that is not ours to
+      //     judge from a stale timer. Exit silently; the live handler owns it.
+      //   * the outage is STILL exactly this one and the durable budget is
+      //     spent. Only THAT is a genuine terminal case.
+      const record = getSession(current.sessionName);
+      if (!isRecoverableAuthorityOutage(record?.error)) return;
+      const now = Date.now();
+      const spent = (record?.restartTimestamps ?? []).filter((at) => at > now - RESTART_WINDOW_MS);
+      if (spent.length < MAX_RESTARTS) return;
+      this.emitTerminalStatus(current.sessionName, 'supervision_blocked', SUPERVISION_BLOCKED_LABEL);
+      this.emitWarning(current.sessionName, 'Supervision stopped after the authority outage could not be recovered within its restart budget.');
+      this.finishRun(current.sessionName, 'blocked', { preserveStatus: true });
+    }, AUTHORITY_RECOVERY_RETRY_MS);
+    timer.unref?.();
+    run.authorityRecoveryTimer = timer;
   }
 
   private async evaluateExecutionTurn(run: ActiveTaskRunState): Promise<void> {

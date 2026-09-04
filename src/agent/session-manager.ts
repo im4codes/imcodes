@@ -217,8 +217,8 @@ function startStructuredWatcher(
 }
 
 // Restart loop prevention: max 3 restarts within 5 minutes
-const MAX_RESTARTS = 3;
-const RESTART_WINDOW_MS = 5 * 60 * 1000;
+export const MAX_RESTARTS = 3;
+export const RESTART_WINDOW_MS = 5 * 60 * 1000;
 
 type SessionEventCallback = (event: 'started' | 'stopped' | 'error', session: string, state: string) => void;
 let _onSessionEvent: SessionEventCallback | null = null;

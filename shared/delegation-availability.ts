@@ -584,3 +584,21 @@ export function resolveDelegationTargets(
   }
   return resolved;
 }
+
+/**
+ * The opaque message carried by `ImcodesDelegationUnavailableError`.
+ *
+ * It lives here, not next to the error class, because two distant places need
+ * the SAME string: the Codex provider that raises it, and the supervision
+ * recovery path that must recognise exactly this transient outage -- and
+ * nothing else -- as recoverable. Restating the literal in either place would
+ * let the matcher drift silently away from the thrower: recovery would stop
+ * firing and the task would go back to being permanently blocked, with both
+ * copies still looking correct in isolation.
+ *
+ * Keeping it in `shared/` also keeps the supervision automation OUT of the
+ * Codex provider's module graph, which it has no other reason to load.
+ *
+ * Deliberately opaque: it must never leak server errors or private MCP config.
+ */
+export const IMCODES_DELEGATION_UNAVAILABLE_MESSAGE = 'authoritative IM delegation unavailable';

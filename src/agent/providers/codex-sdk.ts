@@ -70,6 +70,7 @@ import { composeProviderSystemText, getProviderSystemTextParts } from '../provid
 import { getCodexAppServerArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../../shared/delegation-availability.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -212,7 +213,7 @@ const MCP_STATUS_PAGE_LIMIT = 20;
 export class ImcodesDelegationUnavailableError extends Error {
   constructor() {
     // Deliberately opaque: never leak server errors or private MCP config.
-    super('authoritative IM delegation unavailable');
+    super(IMCODES_DELEGATION_UNAVAILABLE_MESSAGE);
     this.name = 'ImcodesDelegationUnavailableError';
   }
 }

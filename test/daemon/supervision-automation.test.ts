@@ -74,6 +74,7 @@ const mockAuditTargetRuntime = {
   })),
 };
 const mockPersistSessionRecord = vi.fn();
+const mockEnsureTransportRuntimeAvailable = vi.fn(async () => {});
 
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: mockStartP2pRun,
@@ -82,13 +83,24 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   listP2pRuns: mockListP2pRuns,
 }));
 
-vi.mock('../../src/agent/session-manager.js', () => ({
-  getTransportRuntime: vi.fn((sessionName: string) => {
-    if (sessionName === 'deck_sub_reviewer') return mockAuditTargetRuntime;
-    return mockBrainRuntimeMissing ? undefined : mockTransportRuntime;
-  }),
-  persistSessionRecord: mockPersistSessionRecord,
-}));
+vi.mock('../../src/agent/session-manager.js', async () => {
+  // The restart-loop budget is re-exported from the REAL module, never retyped
+  // here. A test-local copy would silently diverge from the daemon's own
+  // MAX_RESTARTS/RESTART_WINDOW_MS and stop covering the code it claims to.
+  const actual = await vi.importActual<typeof import('../../src/agent/session-manager.js')>(
+    '../../src/agent/session-manager.js',
+  );
+  return {
+    MAX_RESTARTS: actual.MAX_RESTARTS,
+    RESTART_WINDOW_MS: actual.RESTART_WINDOW_MS,
+    ensureTransportRuntimeAvailable: mockEnsureTransportRuntimeAvailable,
+    getTransportRuntime: vi.fn((sessionName: string) => {
+      if (sessionName === 'deck_sub_reviewer') return mockAuditTargetRuntime;
+      return mockBrainRuntimeMissing ? undefined : mockTransportRuntime;
+    }),
+    persistSessionRecord: mockPersistSessionRecord,
+  };
+});
 
 vi.mock('../../src/daemon/supervision-broker.js', () => ({
   supervisionBroker: {
@@ -5754,4 +5766,413 @@ describe('SupervisionAutomation', () => {
       expect(registry.getAssignment(assignmentId)?.verdict).toBeUndefined();
     });
   });
+
+  it('does not permanently block a run on a recoverable authoritative-delegation outage', async () => {
+    // Live shape at 12:28:50: the Brain turn threw
+    // ImcodesDelegationUnavailableError('authoritative IM delegation unavailable')
+    // and the session went stopped/error. handleTimelineEvent treats ANY
+    // stopped/error in execution as terminal, so it emitted supervision_blocked
+    // and finished the run -- the task was wedged for good even though the
+    // authority catalog/MCP outage is transient and the session is restartable.
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-delegation-outage', 'implement the feature', snapshot);
+    beginRun('cmd-delegation-outage', 'implement the feature');
+    await waitForRunPhase('execution');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+
+    // The transient authority outage, exactly as the provider reports it.
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // A recoverable, precisely-typed outage must NOT tear the run down...
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+    // ...and it must survive because recovery RAN, not because the recovery
+    // path threw and aborted the terminal path on its way out. Asserting the
+    // durable budget was spent and the session was actually rehydrated is what
+    // makes this test unable to pass on an exception.
+    expect(getSession('deck_supervision_brain')!.restartTimestamps).toHaveLength(1);
+    expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_supervision_brain');
+    // Same run, same task, same assignment -- no replacement object.
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')!.commandId).toBe('cmd-delegation-outage');
+  }, 30_000);
+
+  it('stops recovering once the durable restart budget is spent, instead of looping forever', async () => {
+    // The budget is the session's OWN persisted restart window, so it survives a
+    // daemon restart. Seeding it as already-spent is exactly the state a
+    // restarted daemon would read back.
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-budget-spent', 'implement the feature', snapshot);
+    beginRun('cmd-budget-spent', 'implement the feature');
+    await waitForRunPhase('execution');
+
+    const now = Date.now();
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({
+      ...brain,
+      state: 'error',
+      error: 'authoritative IM delegation unavailable',
+      restartTimestamps: [now - 1_000, now - 2_000, now - 3_000], // MAX_RESTARTS already used
+    } as never);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await waitForRunEnd();
+
+    // Budget exhausted -> the terminal path runs, so it is reported rather than
+    // retried indefinitely.
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  }, 30_000);
+
+  it('re-delivers the SAME failed turn after rebuilding the runtime', async () => {
+    // Rebuilding the transport is only half a recovery. The turn that threw was
+    // consumed and never produced a result, so if nothing re-delivers it the run
+    // just sits there until some unrelated state edge happens to arrive -- which
+    // for a session that died mid-turn may be never.
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-redeliver', 'implement the feature', snapshot);
+    beginRun('cmd-redeliver', 'implement the feature');
+    await waitForRunPhase('execution');
+    mockTransportRuntime.send.mockClear();
+
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await vi.waitFor(() => expect(mockTransportRuntime.send).toHaveBeenCalled(), { timeout: 2_000 });
+
+    // The SAME text, on the SAME session -- not a fresh task, not a generic
+    // "continue" that discards what was actually asked for.
+    const [text] = mockTransportRuntime.send.mock.calls[0] as [string];
+    expect(text).toContain('implement the feature');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')!.commandId).toBe('cmd-redeliver');
+  }, 30_000);
+
+  it('spends the budget and rebuilds exactly once when the same error edge repeats', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-repeat-edge', 'implement the feature', snapshot);
+    beginRun('cmd-repeat-edge', 'implement the feature');
+    await waitForRunPhase('execution');
+    mockTransportRuntime.send.mockClear();
+    mockEnsureTransportRuntimeAvailable.mockClear();
+
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await vi.waitFor(() => expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1), { timeout: 2_000 });
+    expect(getSession('deck_supervision_brain')!.restartTimestamps).toHaveLength(1);
+
+    // The provider re-emits the SAME error edge (duplicate/reordered delivery is
+    // routine). Recovery already happened: doing it again would burn a second
+    // restart from a 3-restart durable budget for a single outage, and would
+    // deliver the turn twice.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(getSession('deck_supervision_brain')!.restartTimestamps).toHaveLength(1);
+    expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+  }, 30_000);
+
+  it('retries within budget when the rehydrated runtime is still missing', async () => {
+    // Failure boundary of the recovery. Rebuilding the transport can succeed and
+    // STILL leave no runtime to deliver into. If the outage marker stays armed
+    // after that, every later identical error edge is suppressed for ever: no
+    // budget is spent, no retry happens, the run never goes terminal, and the
+    // task sits in `execution` indefinitely. A recovery that cannot deliver has
+    // not recovered.
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-missing-runtime', 'implement the feature', snapshot);
+    beginRun('cmd-missing-runtime', 'implement the feature');
+    await waitForRunPhase('execution');
+    mockEnsureTransportRuntimeAvailable.mockClear();
+    mockBrainRuntimeMissing = true;
+
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await vi.waitFor(() => expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(1), { timeout: 2_000 });
+    expect(getSession('deck_supervision_brain')!.restartTimestamps).toHaveLength(1);
+
+    // The SAME outage edge again. Because the first attempt could not deliver,
+    // this must be a real retry against the durable budget -- not silence.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await vi.waitFor(() => expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(2), { timeout: 2_000 });
+    expect(getSession('deck_supervision_brain')!.restartTimestamps).toHaveLength(2);
+
+    mockBrainRuntimeMissing = false;
+  }, 30_000);
+
+  it('fails closed once redelivery has exhausted the durable budget', async () => {
+    // ...and the retries must terminate. Otherwise an outage that can never be
+    // delivered into becomes a run that is never blocked and never finished.
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-budget-exhaust', 'implement the feature', snapshot);
+    beginRun('cmd-budget-exhaust', 'implement the feature');
+    await waitForRunPhase('execution');
+    mockBrainRuntimeMissing = true;
+
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    }
+    await waitForRunEnd();
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    mockBrainRuntimeMissing = false;
+  }, 30_000);
+
+  it('retries within budget when the redelivery send itself throws', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-send-throws', 'implement the feature', snapshot);
+    beginRun('cmd-send-throws', 'implement the feature');
+    await waitForRunPhase('execution');
+    mockEnsureTransportRuntimeAvailable.mockClear();
+    mockTransportRuntime.send.mockImplementationOnce(() => { throw new Error('transport refused the resumed turn'); });
+
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await vi.waitFor(() => expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(1), { timeout: 2_000 });
+
+    // A throw on the resumed turn is a failed recovery, so the next identical
+    // edge must be allowed to try again rather than be swallowed for ever.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await vi.waitFor(() => expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(2), { timeout: 2_000 });
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+  }, 30_000);
+
+  it('drives its own bounded retries from a SINGLE error edge and then fails closed', async () => {
+    // The gap the previous fix left. Disarming the marker only made the run
+    // retryable BY THE NEXT ERROR EDGE -- and a session that died mid-turn may
+    // never emit another one. With exactly one edge ever delivered, the run then
+    // sat in `execution` for ever: no retry, no budget spent, never terminal.
+    // Recovery has to be daemon-owned, on its own timer, not a hope that the
+    // provider speaks again.
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-retry-scheduler', 'implement the feature', snapshot);
+      beginRun('cmd-retry-scheduler', 'implement the feature');
+      await vi.advanceTimersByTimeAsync(0);
+      mockEnsureTransportRuntimeAvailable.mockClear();
+      // Rehydration reports success but leaves nothing to deliver into.
+      mockBrainRuntimeMissing = true;
+
+      const brain = getSession('deck_supervision_brain')!;
+      upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+
+      // EXACTLY ONE edge. Nothing else is emitted for the rest of the test.
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(1);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+
+      // Only time passes now. The daemon must retry on its own schedule...
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mockEnsureTransportRuntimeAvailable.mock.calls.length).toBeGreaterThan(1);
+      // ...consume the DURABLE budget rather than an ad-hoc counter...
+      expect(getSession('deck_supervision_brain')!.restartTimestamps.length)
+        .toBe(mockEnsureTransportRuntimeAvailable.mock.calls.length);
+      // ...and stop, failing closed, instead of retrying for ever.
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      const settled = mockEnsureTransportRuntimeAvailable.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(settled);
+    } finally {
+      mockBrainRuntimeMissing = false;
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it('never exceeds the durable budget however many error edges and retries arrive', async () => {
+    // Single-flight. Extra edges DO arrive in practice (providers replay state
+    // on reconnect). Each one that lands while a retry is already pending must
+    // not queue another timer: parallel retries would burn the whole bounded
+    // budget in one burst and could drive the terminal path more than once.
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-single-flight', 'implement the feature', snapshot);
+      beginRun('cmd-single-flight', 'implement the feature');
+      await vi.advanceTimersByTimeAsync(0);
+      mockEnsureTransportRuntimeAvailable.mockClear();
+      mockBrainRuntimeMissing = true;
+
+      const brain = getSession('deck_supervision_brain')!;
+      upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(1);
+
+      // A burst of extra edges, plus retry intervals. Incoming edges ARE fresh
+      // evidence and may legitimately re-attempt, so the bound is not "one
+      // attempt per edge" -- it is the session's own durable restart window.
+      for (let extra = 0; extra < 6; extra += 1) {
+        timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+        await vi.advanceTimersByTimeAsync(15_000);
+      }
+
+      // However many edges and intervals arrive, the durable budget is the
+      // ceiling and the run ends rather than retrying for ever.
+      expect(mockEnsureTransportRuntimeAvailable.mock.calls.length).toBeLessThanOrEqual(3);
+      expect(getSession('deck_supervision_brain')!.restartTimestamps.length).toBeLessThanOrEqual(3);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      mockBrainRuntimeMissing = false;
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it('does not blocked-kill a run that RECOVERED before its pending retry fired', async () => {
+    // The auditor's counterexample, and it is the ugly failure mode of owning a
+    // timer: one error edge schedules a retry, the session then genuinely comes
+    // back (running, error cleared) well before the interval elapses, and the
+    // stale timer still fires. The callback asked "is this an exact recoverable
+    // outage?", got NO -- because the outage is over -- and treated that as
+    // grounds to emit supervision_blocked and finish the run. A recovered
+    // session must never be killed by the retry that was armed for its outage.
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-recovered-before-retry', 'implement the feature', snapshot);
+      beginRun('cmd-recovered-before-retry', 'implement the feature');
+      await vi.advanceTimersByTimeAsync(0);
+      mockBrainRuntimeMissing = true;
+
+      const brain = getSession('deck_supervision_brain')!;
+      upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+
+      // The outage clears well inside the 15s retry window: runtime is back and
+      // the session reports running with no error.
+      mockBrainRuntimeMissing = false;
+      const recovered = getSession('deck_supervision_brain')!;
+      upsertSession({ ...recovered, state: 'running', error: undefined } as never);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      // Now let the armed retry come due. It must not tear down a healthy run.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')!.commandId)
+        .toBe('cmd-recovered-before-retry');
+    } finally {
+      mockBrainRuntimeMissing = false;
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it('does not attribute an UNRELATED later failure to the exhausted authority outage', async () => {
+    // Pins the "still-exact outage" half of the terminal condition on its own.
+    // Once the durable budget is spent, a stale timer must not blame the
+    // authority outage for whatever the session died of next. An unrelated
+    // error is the live handler's case to judge on its own evidence, not
+    // something a timer armed for a DIFFERENT failure may convert into
+    // supervision_blocked behind its back.
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-unrelated-later', 'implement the feature', snapshot);
+      beginRun('cmd-unrelated-later', 'implement the feature');
+      await vi.advanceTimersByTimeAsync(0);
+      mockBrainRuntimeMissing = true;
+
+      // Spend the whole durable budget on the authority outage, but keep the
+      // run alive by arming the retry rather than letting it go terminal.
+      const now = Date.now();
+      const brain = getSession('deck_supervision_brain')!;
+      upsertSession({
+        ...brain,
+        state: 'error',
+        error: 'authoritative IM delegation unavailable',
+        restartTimestamps: [now - 1_000, now - 2_000],
+      } as never);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The session now fails for something else entirely, with the budget spent.
+      const spent = getSession('deck_supervision_brain')!;
+      upsertSession({ ...spent, state: 'error', error: 'provider crashed for an unrelated reason' } as never);
+
+      // The armed timer comes due. It must exit silently, leaving the terminal
+      // decision to the live handler and its own evidence.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+    } finally {
+      mockBrainRuntimeMissing = false;
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it('does not blocked-kill when the outage clears WITHOUT any further state edge', async () => {
+    // Isolates the callback's own healthy guard. The previous test lets a
+    // `running` edge arrive, which cancels the pending timer -- so the cancel
+    // alone is enough to keep the run alive there and the guard is never
+    // exercised. Here the session recovers with NO timeline event at all (the
+    // provider simply stops erroring), so nothing cancels the timer and the
+    // callback is the ONLY thing standing between a healthy run and a
+    // supervision_blocked teardown by a stale retry.
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-silent-recovery', 'implement the feature', snapshot);
+      beginRun('cmd-silent-recovery', 'implement the feature');
+      await vi.advanceTimersByTimeAsync(0);
+      mockBrainRuntimeMissing = true;
+
+      const brain = getSession('deck_supervision_brain')!;
+      upsertSession({ ...brain, state: 'error', error: 'authoritative IM delegation unavailable' } as never);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+
+      // Silent recovery: the error is gone from the durable record, but NO
+      // session.state event is emitted, so the cancel path never runs.
+      mockBrainRuntimeMissing = false;
+      const recovered = getSession('deck_supervision_brain')!;
+      upsertSession({ ...recovered, state: 'running', error: undefined } as never);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')!.commandId)
+        .toBe('cmd-silent-recovery');
+    } finally {
+      mockBrainRuntimeMissing = false;
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it('still fails closed on an unknown stopped/error reason', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-unknown-error', 'implement the feature', snapshot);
+    beginRun('cmd-unknown-error', 'implement the feature');
+    await waitForRunPhase('execution');
+
+    const brain = getSession('deck_supervision_brain')!;
+    upsertSession({ ...brain, state: 'error', error: 'segfault in provider bridge' } as never);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    await waitForRunEnd();
+
+    // Unknown failures keep the existing terminal behaviour.
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  }, 30_000);
 });
