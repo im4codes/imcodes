@@ -260,6 +260,7 @@ import {
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
+import { resumeDirectFileTransfers } from './direct-file-transfer.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
@@ -4568,6 +4569,7 @@ export function App() {
         hiddenSinceAt = Date.now();
         return;
       }
+      resumeDirectFileTransfers(ws, selectedServerId);
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > DISCUSSION_RECONCILE_HIDDEN_MS;
       hiddenSinceAt = 0;
       handleResume(wasLongHidden, wasLongHidden);
@@ -4607,6 +4609,7 @@ export function App() {
     if (isNative()) {
       void import('@capacitor/app')
         .then(({ App }) => installNativeAppResumeRefresh(true, (force) => {
+          resumeDirectFileTransfers(ws, selectedServerId);
           ws.resumeConnection(force);
           remoteDesktopConnectionManager.resumeExhaustedConnections();
         }, App))

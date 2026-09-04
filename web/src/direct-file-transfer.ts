@@ -25,6 +25,7 @@ import {
   type DirectConnectivityProbeDiagnostics,
   type DirectConnectivityProbeResult,
   type DirectConnectivityRoute,
+  type DirectConnectivityCandidateType,
   type DirectFileConnectionStatus,
   type DirectFileTransferAuthorized,
   type DirectFileTransferDataMessage,
@@ -38,6 +39,7 @@ import {
 } from '@shared/direct-file-transfer.js';
 import {
   PendingWebRtcCandidates,
+  readWebRtcCandidateType,
   toWebRtcIceServers,
 } from '@shared/webrtc-connectivity.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
@@ -145,8 +147,13 @@ function recordDirectFileTransferMetric(metric: DirectFileTransferClientMetric, 
 function reportProbeStage(
   onDiagnostics: ((diagnostics: DirectConnectivityProbeDiagnostics) => void) | undefined,
   stage: DirectConnectivityProbeDiagnostics['stage'],
+  lease?: Lease,
 ): void {
-  onDiagnostics?.({ stage, browserCandidateTypes: [], daemonCandidateTypes: [] });
+  onDiagnostics?.({
+    stage,
+    browserCandidateTypes: [...(lease?.browserCandidateTypes ?? [])],
+    daemonCandidateTypes: [...(lease?.daemonCandidateTypes ?? [])],
+  });
 }
 
 export class DirectFileTransferFailure extends Error {
@@ -195,6 +202,9 @@ type Lease = {
   bootstrapChannel: RTCDataChannel | null;
   /** Live subscription to the daemon's trickled ICE, torn down with the peer. */
   leaseIceOff: (() => void) | null;
+  /** Redacted candidate kinds retained for diagnostics; never addresses. */
+  browserCandidateTypes: Set<DirectConnectivityCandidateType>;
+  daemonCandidateTypes: Set<DirectConnectivityCandidateType>;
   peerState: RTCPeerConnectionState | null;
   refs: number;
   /** Mounted attachment surfaces waiting for (or retaining) a warm peer. */
@@ -403,6 +413,8 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     peer: null,
     bootstrapChannel: null,
     leaseIceOff: null,
+    browserCandidateTypes: new Set(),
+    daemonCandidateTypes: new Set(),
     peerState: null,
     refs: 0,
     prewarmRefs: 0,
@@ -604,6 +616,26 @@ export function subscribeDirectFileConnectionStatus(
   };
 }
 
+/**
+ * Retire idle browser WebRTC state after an OS background/foreground cycle.
+ *
+ * iOS may thaw JavaScript and the control WebSocket while leaving the native
+ * ICE/SCTP objects permanently frozen. Their JS-visible state can still say
+ * `connected`, so connectionState is not an authority signal on resume. A
+ * retained surface is warmed again immediately; a previously verified relay
+ * remains yellow and intentionally is not prewarmed.
+ */
+export function resumeDirectFileTransfers(ws: WsClient, serverId?: string): void {
+  const byServer = brokers.get(ws);
+  if (!byServer) return;
+  for (const lease of byServer.values()) {
+    if (serverId && lease.serverId !== serverId) continue;
+    if (lease.active.size !== 0 || lease.connectionStatus === DIRECT_FILE_CONNECTION_STATUS.RELAY) continue;
+    invalidateLeaseControl(lease);
+    if (lease.prewarmRefs > 0) queueMicrotask(() => warmRetainedLease(lease));
+  }
+}
+
 function leaseFromReady(lease: Lease, message: DirectFileTransferLeaseReady): void {
   lease.leaseId = message.leaseId;
   lease.leaseGeneration = message.leaseGeneration;
@@ -731,6 +763,41 @@ function startControlWait<T extends DirectFileTransferServerMessage>(
     timeout = setTimeout(() => finish(directError(DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT)), timeoutMs);
   });
   return { promise, cancel };
+}
+
+/**
+ * Bound browser-native WebRTC promises independently of Server signalling.
+ *
+ * WebKit can leave createOffer/setLocalDescription/setRemoteDescription
+ * pending forever after a long background suspension. The shared
+ * peerCreating slot then poisons every later probe and upload until the app is
+ * killed, because there is no Server response waiter yet to enforce a
+ * deadline. Keep the deadline owned by the shared peer setup (rather than by
+ * one upload caller) so timeout always releases that slot and closes the stale
+ * RTCPeerConnection for the next attempt.
+ */
+function waitForPeerNegotiation<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(
+      () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT)),
+      DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
+    );
+    const finish = (error?: unknown, value?: T) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      if (error) reject(error); else resolve(value as T);
+    };
+    const onAbort = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+    signal.addEventListener('abort', onAbort, { once: true });
+    // Attaching both continuations also consumes a native promise that settles
+    // after our timeout, preventing a late WebKit rejection from becoming an
+    // unhandled promise rejection.
+    pending.then((value) => finish(undefined, value), (error) => finish(error));
+  });
 }
 
 async function ensureLease(
@@ -882,6 +949,8 @@ function closePeer(lease: Lease): void {
   lease.peer = null;
   lease.peerState = null;
   lease.peerDaemonGeneration = null;
+  lease.browserCandidateTypes.clear();
+  lease.daemonCandidateTypes.clear();
   setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.NONE);
 }
 
@@ -998,12 +1067,12 @@ async function ensureLeasePeer(
   // would mistake `new` plus a connecting bootstrap channel for reusable
   // transport and open an operation channel on an unnegotiated association.
   if (lease.peerCreating) {
-    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER);
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER, lease);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
       reason: DIRECT_FILE_TRANSFER_PEER_REASON.JOINED_PENDING,
     });
     await lease.peerCreating;
-    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN);
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN, lease);
     return;
   }
   // Mobile WebViews commonly leave a WebRTC peer in `disconnected` after a
@@ -1027,7 +1096,7 @@ async function ensureLeasePeer(
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
       reason: DIRECT_FILE_TRANSFER_PEER_REASON.REUSED,
     });
-    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN);
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN, lease);
     return;
   }
   if (lease.peer && (!generationMatches
@@ -1064,7 +1133,7 @@ async function ensureLeasePeer(
     const restarting = lease.peer?.connectionState === 'failed'
       || lease.peer?.connectionState === 'disconnected';
     let peer = lease.peer;
-    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER);
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER, lease);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
       reason: restarting
         ? DIRECT_FILE_TRANSFER_PEER_REASON.ICE_RESTART
@@ -1087,7 +1156,15 @@ async function ensureLeasePeer(
       );
       createdPeer.addEventListener('connectionstatechange', () => { lease.peerState = createdPeer.connectionState; });
       createdPeer.addEventListener('icecandidate', (event) => {
-        if (!event.candidate || lease.peer !== createdPeer || !hasLeaseBinding(lease)) return;
+        // Firefox emits an RTCIceCandidate object with an empty candidate
+        // before the final null event. It is an end-of-candidates marker, not
+        // a candidate node-datachannel can parse.
+        if (!event.candidate?.candidate || lease.peer !== createdPeer || !hasLeaseBinding(lease)) return;
+        const candidateType = readWebRtcCandidateType(
+          event.candidate.candidate,
+          'type' in event.candidate ? event.candidate.type : undefined,
+        );
+        if (candidateType) lease.browserCandidateTypes.add(candidateType);
         try {
           sendControl(lease, {
             type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
@@ -1122,6 +1199,8 @@ async function ensureLeasePeer(
     const off = lease.ws.onMessage((raw) => {
       const message = parseMatchingControl(raw, requestId);
       if (!message || message.type !== DIRECT_FILE_TRANSFER_MSG.LEASE_ICE || !leaseSignalMatches(message, lease, requestId)) return;
+      const candidateType = readWebRtcCandidateType(message.candidate);
+      if (candidateType) lease.daemonCandidateTypes.add(candidateType);
       const candidate = { candidate: message.candidate, sdpMid: message.mid };
       if (leasePeer.remoteDescription) void leasePeer.addIceCandidate(candidate).catch(() => undefined);
       else candidates.push(candidate);
@@ -1132,8 +1211,19 @@ async function ensureLeasePeer(
         lease.iceRestartedGeneration = lease.leaseGeneration;
         leasePeer.restartIce();
       }
-      const offer = await leasePeer.createOffer(restarting ? { iceRestart: true } : undefined);
-      await leasePeer.setLocalDescription(offer);
+      const offer = await waitForPeerNegotiation((async () => {
+        const createdOffer = await leasePeer.createOffer(restarting ? { iceRestart: true } : undefined);
+        assertCurrentControl(lease, epoch);
+        if (lease.peer !== leasePeer || !hasLeaseBinding(lease)) {
+          throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+        }
+        await leasePeer.setLocalDescription(createdOffer);
+        assertCurrentControl(lease, epoch);
+        if (lease.peer !== leasePeer || !hasLeaseBinding(lease)) {
+          throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+        }
+        return createdOffer;
+      })(), signal);
       assertCurrentControl(lease, epoch);
       if (!hasLeaseBinding(lease)) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
       const answer = startControlWait(
@@ -1158,7 +1248,7 @@ async function ensureLeasePeer(
           requestId,
           sdp: offer.sdp ?? '',
         });
-        reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES);
+        reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES, lease);
       } catch (error) {
         answer.cancel(error);
         await answer.promise;
@@ -1166,16 +1256,22 @@ async function ensureLeasePeer(
       }
       const remote = await answer.promise;
       assertCurrentControl(lease, epoch);
-      await leasePeer.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
-      await candidates.flush((candidate) => leasePeer.addIceCandidate(candidate));
-      reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING);
+      await waitForPeerNegotiation((async () => {
+        await leasePeer.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
+        assertCurrentControl(lease, epoch);
+        if (lease.peer !== leasePeer || !hasLeaseBinding(lease)) {
+          throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+        }
+        await candidates.flush((candidate) => leasePeer.addIceCandidate(candidate));
+      })(), signal);
+      reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING, lease);
       const bootstrap = lease.bootstrapChannel;
       if (!bootstrap) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
       // SDP/ICE signalling completion is not transport readiness. The old
       // prewarm resolved here while SCTP was still connecting, so uploads
       // appeared "prewarmed" but paid the full channel-open timeout anyway.
       await waitForChannelOpen(bootstrap, leasePeer, signal);
-      reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN);
+      reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN, lease);
     } catch (error) {
       if (lease.controlEpoch === epoch) {
         closePeer(lease);
@@ -2276,11 +2372,7 @@ async function probeLeasePeer(
   if (!peer || !lease.leaseId || !lease.leaseGeneration || !lease.daemonGeneration) {
     throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   }
-  onDiagnostics?.({
-    stage: DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING,
-    browserCandidateTypes: [],
-    daemonCandidateTypes: [],
-  });
+  reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING, lease);
   const channel = peer.createDataChannel(`${DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX}${crypto.randomUUID()}`, { ordered: true });
   await waitForChannelOpen(channel, peer, lease.controlAbort.signal);
   const nonce = crypto.randomUUID();
@@ -2336,7 +2428,7 @@ export async function probeDirectConnectivity(
   try {
     await ensureLease(lease, onDiagnostics);
     const result = await probeLeasePeer(lease, onDiagnostics);
-    onDiagnostics?.({ stage: DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE, browserCandidateTypes: [], daemonCandidateTypes: [] });
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE, lease);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: result.route });
     if (result.route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
       if (lease.active.size === 0) closePeer(lease);

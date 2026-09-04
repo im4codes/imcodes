@@ -65,6 +65,9 @@ class FakePeerConnection extends EventTarget {
   static keepConnectingAfterAnswer = false;
   /** How long a newly created data channel takes to report `open`. */
   static channelOpenDelayMs = 0;
+  static hangCreateOffer = false;
+  static hangSetLocalDescription = false;
+  static hangSetRemoteDescription = false;
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
   /** A stale SCTP association can still leave WebRTC reporting `connected`. */
@@ -95,13 +98,17 @@ class FakePeerConnection extends EventTarget {
   }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
+    if (FakePeerConnection.hangCreateOffer) return new Promise(() => undefined);
     this.offerChannelLabels.push(this.channels.map((channel) => channel.label));
     if (this.channels.length === 0) throw new Error('cold offer has no data-channel application section');
     return { type: 'offer', sdp: 'browser-lease-offer' };
   }
 
-  async setLocalDescription(): Promise<void> {}
+  async setLocalDescription(): Promise<void> {
+    if (FakePeerConnection.hangSetLocalDescription) return new Promise(() => undefined);
+  }
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
+    if (FakePeerConnection.hangSetRemoteDescription) return new Promise(() => undefined);
     this.remoteDescription = description as RTCSessionDescription;
     if (!FakePeerConnection.keepConnectingAfterAnswer) {
       this.connectionState = 'connected';
@@ -476,6 +483,9 @@ describe('direct file transfer v2 browser broker', () => {
     FakePeerConnection.selectedCandidateType = 'host';
     FakePeerConnection.keepConnectingAfterAnswer = false;
     FakePeerConnection.channelOpenDelayMs = 0;
+    FakePeerConnection.hangCreateOffer = false;
+    FakePeerConnection.hangSetLocalDescription = false;
+    FakePeerConnection.hangSetRemoteDescription = false;
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
     apiMocks.uploadFile.mockResolvedValue({
       ok: true,
@@ -819,6 +829,23 @@ describe('direct file transfer v2 browser broker', () => {
 
     await vi.waitFor(() => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2));
     expect(FakePeerConnection.instances.at(-1)).not.toBe(firstPeer);
+    release();
+  });
+
+  it('replaces an idle WebKit peer on app resume without requiring an app restart', async () => {
+    const { prewarmDirectFileLease, resumeDirectFileTransfers } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1));
+    const frozenPeer = FakePeerConnection.instances.at(-1)!;
+
+    resumeDirectFileTransfers(ws, 'server-1');
+    expect(frozenPeer.connectionState).toBe('closed');
+    await vi.waitFor(() => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2));
+
+    expect(FakePeerConnection.instances.at(-1)).not.toBe(frozenPeer);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
     release();
   });
 
@@ -1659,6 +1686,54 @@ describe('direct file transfer v2 browser broker', () => {
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
     expect(FakePeerConnection.instances.at(0)?.connectionState).toBe('closed');
+  });
+
+  it('times out a WebKit createOffer stall and rebuilds without restarting the app', async () => {
+    vi.useFakeTimers();
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    FakePeerConnection.hangCreateOffer = true;
+
+    const stalled = probeDirectConnectivity(ws, undefined, 'server-1');
+    const rejected = expect(stalled).rejects.toMatchObject({
+      code: DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT,
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+    await rejected;
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(FakePeerConnection.instances[0]?.connectionState).toBe('closed');
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(0);
+
+    FakePeerConnection.hangCreateOffer = false;
+    const recovered = probeDirectConnectivity(ws, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(recovered).resolves.toMatchObject({ route: 'lan_direct' });
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+  });
+
+  it('times out a WebKit setRemoteDescription stall and rebuilds the poisoned peer', async () => {
+    vi.useFakeTimers();
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    FakePeerConnection.hangSetRemoteDescription = true;
+
+    const stalled = probeDirectConnectivity(ws, undefined, 'server-1');
+    const rejected = expect(stalled).rejects.toMatchObject({
+      code: DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT,
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+    await rejected;
+    expect(FakePeerConnection.instances[0]?.connectionState).toBe('closed');
+
+    FakePeerConnection.hangSetRemoteDescription = false;
+    const recovered = probeDirectConnectivity(ws, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(recovered).resolves.toMatchObject({ route: 'lan_direct' });
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
   });
 
   it('replaces an established idle lease peer after daemon generation replacement', async () => {
