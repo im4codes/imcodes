@@ -300,13 +300,40 @@ describe('automatic supervision audit materialization', () => {
     expect(owners).toHaveLength(1);
     expect(owners[0]).toMatchObject({
       identity: identity('deck_alpha_brain'), auditRevision: shape.revision,
-      auditAttemptId: shape.attemptId,
+      auditAttemptId: shape.attemptId, status: 'ready_for_integration',
+      verdict: 'PASS', crossVendorAuditPassed: true,
+    });
+    expect(shape.registry.get(shape.taskId)).toMatchObject({
+      status: 'ready_for_integration', integrationOwnerAssignmentId: owners[0]!.assignmentId,
     });
     expect(dispatch.mock.calls[0]![1].message).toContain('authoritativeWorktree=/tmp/authoritative-worker/repo');
     expect(dispatch.mock.calls[0]![1].message).toContain('- src/exact.ts');
+    const receiptCount = shape.registry.listAuditReceipts(shape.taskId).length;
     await expect(dispatchReadyIntegration(shape.taskId, deps)).resolves.toMatchObject({ status: 'replayed' });
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(shape.registry.get(shape.taskId)!.assignments.filter((assignment) => assignment.role === 'integration_owner')).toHaveLength(1);
+    expect(shape.registry.listAuditReceipts(shape.taskId)).toHaveLength(receiptCount);
+
+    expect(shape.registry.finalizeIntegration({
+      assignmentId: owners[0]!.assignmentId,
+      identity: owners[0]!.identity,
+      revision: shape.revision,
+      auditAttemptId: shape.attemptId,
+      auditRevision: shape.revision,
+      verdict: 'PASS',
+      ownedFiles: ['src/exact.ts'],
+      integrationManifest: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+      integrationOwner: 'deck_alpha_brain',
+      commitSha: 'a'.repeat(40),
+      pushResult: 'already_present',
+      pushRemoteRef: 'refs/remotes/origin/dev',
+      stagedPaths: [], conflictedPaths: [], untrackedOtherOwnerPaths: [],
+      ciResult: 'ci_not_configured',
+    })).toMatchObject({ ok: true, value: { status: 'finalized' } });
+    expect(shape.registry.getAssignment(shape.worker.assignmentId)).toMatchObject({
+      status: 'ready_for_integration', auditAttemptId: shape.attemptId,
+      auditRevision: shape.revision, verdict: 'PASS', crossVendorAuditPassed: true,
+    });
   });
 
   it('redelivers an already-present PASS artifact already owned by the exact integration owner', async () => {

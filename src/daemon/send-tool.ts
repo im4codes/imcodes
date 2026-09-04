@@ -2749,13 +2749,18 @@ export async function dispatchReadyIntegration(
   }
   const revision = task.currentRevision?.trim();
   if (!revision) return { status: 'blocked', reason: 'missing_current_revision', reported: false };
-  const implementers = task.assignments.filter((assignment) => (
+  const exactPassOwners = task.assignments.filter((assignment) => (
     assignment.required && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
     && assignment.status === 'ready_for_integration'
     && assignment.auditRevision === revision && Boolean(assignment.auditAttemptId)
     && assignment.verdict?.trim().toUpperCase() === 'PASS'
     && assignment.crossVendorAuditPassed === true
   ));
+  // Once materialized, the integration owner carries the same PASS authority;
+  // it is not a second implementation artifact. Prefer the still-live exact
+  // implementer, falling back to an owner only after implementers retire.
+  const exactImplementers = exactPassOwners.filter((assignment) => assignment.role === 'implementer');
+  const implementers = exactImplementers.length > 0 ? exactImplementers : exactPassOwners;
   if (implementers.length !== 1) {
     return { status: 'blocked', reason: 'integration requires one exact PASS artifact owner', reported: false };
   }
@@ -2800,17 +2805,26 @@ export async function dispatchReadyIntegration(
     if (!created.ok) return { status: 'blocked', reason: `integration owner materialization rejected: ${created.reason}`, reported: false };
     owner = created.value;
   }
-  if (owner.verdict?.trim().toUpperCase() !== 'PASS' || owner.crossVendorAuditPassed !== true) {
-    const bound = registry.updateAssignment({
-      assignmentId: owner.assignmentId,
-      identity: coordinator.identity,
-      auditAttemptId: implementer.auditAttemptId,
-      auditRevision: revision,
-      verdict: 'PASS',
-      crossVendorAuditPassed: true,
-    });
-    if (!bound.ok) return { status: 'blocked', reason: `integration owner PASS bind rejected: ${bound.reason}`, reported: false };
-    owner = bound.value;
+  // Reuse the registry's receipt-authenticated, atomic finish path rather than
+  // copying PASS fields onto a delegated row. That path binds the exact final
+  // audit, advances the owner to ready_for_integration, and keeps the parent at
+  // ready_for_integration in one transaction. A crash before this call is
+  // harmless: the idempotent owner is reused and completed on the next tick.
+  const readyOwner = registry.finishAssignment({
+    assignmentId: owner.assignmentId,
+    identity: coordinator.identity,
+    revision,
+  });
+  if (!readyOwner.ok) {
+    return { status: 'blocked', reason: `integration owner PASS bind rejected: ${readyOwner.reason}`, reported: false };
+  }
+  owner = readyOwner.value;
+  if (owner.status !== 'ready_for_integration'
+    || owner.auditAttemptId !== implementer.auditAttemptId
+    || owner.auditRevision !== revision
+    || owner.verdict?.trim().toUpperCase() !== 'PASS'
+    || owner.crossVendorAuditPassed !== true) {
+    return { status: 'blocked', reason: 'integration owner PASS bind did not converge', reported: false };
   }
   const messageId = deterministicSendMessageId(`auto-integration:${owner.assignmentId}:${revision}:${implementer.auditAttemptId}`);
   const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
