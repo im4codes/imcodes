@@ -4,10 +4,12 @@
  */
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import {
-  CRON_COMPLETION_POLICY,
+  buildCompactCronControlRef,
+  buildRegisteredCronSystemContract,
   CRON_CONTROL_PROTOCOL,
   CRON_MSG,
   normalizeCronCompletionPolicy,
+  validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
 import { getSession } from '../store/session-store.js';
@@ -58,6 +60,7 @@ type CronSendDispatcher = (input: CronSendDispatchInput) => Promise<CronSendDisp
 
 let cronSendDispatcherOverride: CronSendDispatcher | null = null;
 let cronProcessCommandSenderOverride: ((sessionName: string, text: string) => Promise<void>) | null = null;
+const processCronContractSignatures = new Map<string, string>();
 
 export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
   cronSendDispatcherOverride = dispatcher;
@@ -67,14 +70,13 @@ export function __setCronProcessCommandSenderForTests(
   sender: ((sessionName: string, text: string) => Promise<void>) | null,
 ): void {
   cronProcessCommandSenderOverride = sender;
+  processCronContractSignatures.clear();
 }
 
-export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, message: string): string {
+export function buildSelfManagedCronPrompt(msg: CronDispatchMessage): string {
   const completionPolicy = normalizeCronCompletionPolicy(msg.completionPolicy);
-  const lifecycleInstruction = completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
-    ? 'This schedule repeats until its overall goal is complete. Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.'
-    : 'Recurring task: complete this run and keep it scheduled. Cancel only on an explicit user request; force=true is required.';
-  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)} completion-policy=${JSON.stringify(completionPolicy)}>\nUse cron_update_self to change this task only when the user explicitly asks.\n${lifecycleInstruction}\nExecute only the operations explicitly requested above. Do not add web fetches, curl requests, or other network checks unless the task explicitly requests them.\nIf an explicitly requested tool returns ${CRON_CONTROL_PROTOCOL.SILENT_RESULT} as its first non-empty line, stop immediately, call no more tools, and finish this occurrence with exactly ${CRON_CONTROL_PROTOCOL.SILENT_RESULT}.\nAlways produce one final response for this occurrence.\n</imcodes-cron-control>`;
+  const binding = buildCompactCronControlRef(msg.jobId, completionPolicy, msg.executionId);
+  return `${CRON_CONTROL_PROTOCOL.OPEN_TAG}${binding}>${CRON_CONTROL_PROTOCOL.CLOSE_TAG}`;
 }
 
 async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
@@ -161,10 +163,28 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   if (action.type === 'command') {
+    const managedAgent = action.selfManaged && !isRawCommandSessionAgentType(session.agentType);
+    if (managedAgent) {
+      const control = validateRegisteredCronControlAction(action, jobId);
+      if (!control.ok) {
+        logger.error({ jobId, sessionName: name, reason: control.reason }, 'Cron: invalid registered control state');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron registered control rejected: ${control.reason}`,
+        });
+        return;
+      }
+    }
     logger.info({ jobId, jobName, sessionName: name, command: action.command.slice(0, 80) }, 'Cron: sending command');
-    const command = action.selfManaged && !isRawCommandSessionAgentType(session.agentType)
-      ? buildSelfManagedCronPrompt(msg, action.command)
+    const command = managedAgent
+      ? buildSelfManagedCronPrompt(msg)
       : action.command;
+    const registeredSystemContract = managedAgent
+      ? buildRegisteredCronSystemContract(action, jobId)
+      : undefined;
 
     if (session.runtimeType === 'transport') {
       let runtime = getTransportRuntime(name);
@@ -191,7 +211,9 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
             await transportRuntime.cancel();
           }
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
-          const result = await transportRuntime.send(command, clientMessageId);
+          const result = registeredSystemContract
+            ? await transportRuntime.send(command, clientMessageId, undefined, undefined, { registeredSystemContract })
+            : await transportRuntime.send(command, clientMessageId);
           if (result !== 'queued') {
             timelineEmitter.emit(name, 'user.message', { text: command, allowDuplicate: true });
           }
@@ -230,7 +252,15 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     } else {
       const collector = collectCommandResult(name, jobId, executionId, serverLink);
       try {
-        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command);
+        const processContractKey = `${name}\0${jobId}`;
+        const processCommand = registeredSystemContract
+          && processCronContractSignatures.get(processContractKey) !== registeredSystemContract.signature
+          ? `${registeredSystemContract.body}\n\n${command}`
+          : command;
+        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, processCommand);
+        if (registeredSystemContract) {
+          processCronContractSignatures.set(processContractKey, registeredSystemContract.signature);
+        }
       } catch (error) {
         collector.cancel();
         logger.error({ jobId, sessionName: name, error }, 'Cron: process session send failed');

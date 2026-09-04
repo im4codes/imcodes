@@ -48,6 +48,8 @@ export interface TransportRuntimeAssemblyInput {
    * thread start/resume or a compaction, which is when the prior text is gone.
    */
   brainContractRegistered?: boolean;
+  /** Full dynamic contracts that are not yet registered on this provider thread. */
+  registeredSystemContractText?: string;
   attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
   namespaceDiagnostics?: string[];
@@ -421,7 +423,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
       ? buildBrainWorkDelegationContractRef()
       : buildBrainSupervisedWorkDelegationContract())
     : undefined;
-  const turnSystemText = [brainDelegationContract, renderedAuthoredSystemText]
+  const turnSystemText = [brainDelegationContract, input.registeredSystemContractText, renderedAuthoredSystemText]
     .filter(Boolean).join('\n\n') || undefined;
   return {
     sessionSystemText,

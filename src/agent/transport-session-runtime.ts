@@ -150,6 +150,12 @@ export interface PendingTransportMessage {
   delegationReply?: {
     delegationId: string;
   };
+  /** @internal: dynamic system contract registration; never exposed publicly. */
+  registeredSystemContract?: {
+    contractId: string;
+    signature: string;
+    body: string;
+  };
 }
 
 export type ExternalAppendResult = 'sent' | 'appended' | 'stale' | 'unsupported';
@@ -198,6 +204,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
   delete publicEntry.delegationReply;
+  delete publicEntry.registeredSystemContract;
   return publicEntry;
 }
 
@@ -235,6 +242,12 @@ export interface TransportSendMetadata {
   /** @internal: marks a provider/runtime-native delegation completion. */
   delegationReply?: {
     delegationId: string;
+  };
+  /** @internal: full contract body retained only for provider-thread registration/replay. */
+  registeredSystemContract?: {
+    contractId: string;
+    signature: string;
+    body: string;
   };
 }
 
@@ -498,6 +511,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * those are exactly the points where the registered text no longer exists.
    */
   private _brainContractRegistered = false;
+  private _registeredSystemContractSignatures = new Map<string, string>();
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -717,6 +731,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           // Compaction discards the registered contract body, so the next turn
           // must register it again rather than reference text that is gone.
           this._brainContractRegistered = false;
+          this._registeredSystemContractSignatures.clear();
         }
         this.clearStalePendingCancelFallbackTimer();
         this._sending = false;
@@ -1268,6 +1283,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             timelineCommitted?: unknown;
             historyCommitted?: unknown;
             deliveryMode?: unknown;
+            registeredSystemContract?: unknown;
           };
           if (typeof material.text === 'string') {
             entry = {
@@ -1284,6 +1300,9 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
               ...(material.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
                 ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+                : {}),
+              ...(material.registeredSystemContract && typeof material.registeredSystemContract === 'object'
+                ? { registeredSystemContract: material.registeredSystemContract as PendingTransportMessage['registeredSystemContract'] }
                 : {}),
             };
           }
@@ -1872,6 +1891,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     try {
       this._providerSessionId = await this.provider.createSession(config);
       this._brainContractRegistered = false;
+      this._registeredSystemContractSignatures.clear();
     } finally {
       this._initializingProviderSessionId = null;
     }
@@ -1971,6 +1991,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         : {}),
       ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
       ...(metadata?.delegationReply ? { delegationReply: { ...metadata.delegationReply } } : {}),
+      ...(metadata?.registeredSystemContract
+        ? { registeredSystemContract: { ...metadata.registeredSystemContract } }
+        : {}),
     };
 
     if (this.hasActiveTurnWork()) {
@@ -2001,6 +2024,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
             ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
             ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+            ...(entry.registeredSystemContract ? { registeredSystemContract: entry.registeredSystemContract } : {}),
           }),
         });
         if (persisted.cancelled) {
@@ -3227,6 +3251,17 @@ export class TransportSessionRuntime implements SessionRuntime {
       summarySyncReservation = memoryRecallResult.summaryReservation;
       const memoryRecall = memoryRecallResult.artifact;
       const messagePreamble = isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message);
+      const registeredSystemContractText = this._activeDispatchEntries
+        .map((entry) => entry.registeredSystemContract)
+        .filter((contract): contract is NonNullable<typeof contract> => !!contract)
+        .filter((contract, index, contracts) => (
+          contracts.findIndex((candidate) => candidate.contractId === contract.contractId) === index
+        ))
+        .filter((contract) => (
+          this._registeredSystemContractSignatures.get(contract.contractId) !== contract.signature
+        ))
+        .map((contract) => contract.body)
+        .join('\n\n') || undefined;
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         rollbackSummarySyncReservation(summarySyncReservation);
         summarySyncReservation = undefined;
@@ -3271,6 +3306,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
         brainContractRegistered: this._brainContractRegistered,
+        registeredSystemContractText,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {
@@ -3309,6 +3345,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       // The contract body reached the provider on this turn, so later turns on
       // the same thread re-assert it by reference instead of resending it.
       this._brainContractRegistered = true;
+      for (const entry of this._activeDispatchEntries) {
+        const contract = entry.registeredSystemContract;
+        if (contract) this._registeredSystemContractSignatures.set(contract.contractId, contract.signature);
+      }
       this.markSdkTurnLostReplacementProviderAccepted(dispatchId);
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);

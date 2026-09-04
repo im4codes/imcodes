@@ -59,6 +59,18 @@ function makeRecall(overrides: Partial<TransportMemoryRecallArtifact> = {}): Tra
 }
 
 describe('buildProviderContextPayload', () => {
+  it('places a newly registered cron contract in per-turn system text, not the user message', () => {
+    const body = '{"contractId":"supervision_cron_control_v1","authoritative":{"taskBody":"inspect progress"}}';
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: '<imcodes-cron-control {"contractRef":"supervision_cron_control_v1","scheduleId":"job-1"}></imcodes-cron-control>',
+      registeredSystemContractText: body,
+    });
+
+    expect(payload.turnSystemText).toBe(body);
+    expect(payload.userMessage).not.toContain('inspect progress');
+    expect(payload.systemText).toContain('inspect progress');
+  });
+
   it('assembles normalized system context from description and runtime prompt', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',

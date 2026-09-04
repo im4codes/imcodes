@@ -22,12 +22,16 @@ function buildResendMetadata(entry: ResendEntry): TransportSendMetadata {
     ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
     ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
     ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+    ...(entry.registeredSystemContract
+      ? { registeredSystemContract: entry.registeredSystemContract }
+      : {}),
   };
 }
 
 function canUseNativeAppend(entry: ResendEntry): boolean {
   return entry.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
     && !entry.messagePreamble
+    && !entry.registeredSystemContract
     && !entry.historyCommitted
     && (entry.attachments?.length ?? 0) === 0;
 }

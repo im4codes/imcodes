@@ -32,6 +32,9 @@ function preserveEntries(
       ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(entry.historyCommitted ? { historyCommitted: true } : {}),
       ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
+      ...(entry.registeredSystemContract
+        ? { registeredSystemContract: entry.registeredSystemContract }
+        : {}),
       queuedAt: Date.now(),
     });
     seenCommandIds.add(entry.clientMessageId);

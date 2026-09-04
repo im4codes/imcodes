@@ -9,12 +9,14 @@ function runtimeSnapshot(
     text: string;
     messagePreamble?: string;
     sharedActor?: Record<string, unknown>;
+    registeredSystemContract?: { contractId: string; signature: string; body: string };
   }>,
   pendingEntries: Array<{
     clientMessageId: string;
     text: string;
     messagePreamble?: string;
     sharedActor?: Record<string, unknown>;
+    registeredSystemContract?: { contractId: string; signature: string; body: string };
   }>,
 ): TransportSessionRuntime {
   return {
@@ -49,7 +51,12 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
       },
     };
     const runtime = runtimeSnapshot(
-      [{ clientMessageId: 'cmd-active', text: 'active turn', messagePreamble: 'active context', sharedActor }],
+      [{
+        clientMessageId: 'cmd-active', text: 'active turn', messagePreamble: 'active context', sharedActor,
+        registeredSystemContract: {
+          contractId: 'supervision_cron_control_v1', signature: 'body-v1', body: 'authoritative cron body',
+        },
+      }],
       [
         { clientMessageId: 'cmd-pending-1', text: 'queued one' },
         { clientMessageId: 'cmd-pending-2', text: 'queued two', messagePreamble: 'queued context' },
@@ -66,7 +73,12 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
       pendingCount: 2,
     });
     expect(getResendEntries('deck_preserve_brain')).toEqual([
-      expect.objectContaining({ commandId: 'cmd-active', text: 'active turn', messagePreamble: 'active context', sharedActor }),
+      expect.objectContaining({
+        commandId: 'cmd-active', text: 'active turn', messagePreamble: 'active context', sharedActor,
+        registeredSystemContract: expect.objectContaining({
+          contractId: 'supervision_cron_control_v1', body: 'authoritative cron body',
+        }),
+      }),
       expect.objectContaining({ commandId: 'cmd-pending-1', text: 'queued one' }),
       expect.objectContaining({ commandId: 'cmd-pending-2', text: 'queued two', messagePreamble: 'queued context' }),
     ]);

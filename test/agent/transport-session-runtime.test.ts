@@ -85,6 +85,40 @@ describe('TransportSessionRuntime memory provenance', () => {
     resetContextStoreClientForTests();
   });
 
+  it('registers a dynamic cron system contract once per provider thread', async () => {
+    let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
+    const provider = makeProvider();
+    provider.onComplete = (callback) => {
+      complete = callback;
+      return () => undefined;
+    };
+    const runtime = new TransportSessionRuntime(provider, 'deck_cron_contract');
+    await runtime.initialize({ sessionKey: 'deck_cron_contract' });
+    const registeredSystemContract = {
+      contractId: 'supervision_cron_control_v1',
+      signature: 'cron-body-v1',
+      body: '{"contractId":"supervision_cron_control_v1","authoritative":{"taskBody":"inspect progress"}}',
+    };
+
+    runtime.send('cron-ref-1', 'cron-1', undefined, undefined, { registeredSystemContract });
+    await waitForProviderSend(provider);
+    expect((provider.send as ReturnType<typeof vi.fn>).mock.calls[0][1].systemText)
+      .toContain('"taskBody":"inspect progress"');
+
+    complete?.('provider-session-1', {
+      id: 'done-1', sessionId: 'provider-session-1', kind: 'text', role: 'assistant',
+      content: 'done', timestamp: Date.now(), status: 'complete',
+    });
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+    (provider.send as ReturnType<typeof vi.fn>).mockClear();
+
+    runtime.send('cron-ref-2', 'cron-2', undefined, undefined, { registeredSystemContract });
+    await waitForProviderSend(provider);
+    const secondPayload = (provider.send as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    expect(secondPayload.userMessage).toBe('cron-ref-2');
+    expect(secondPayload.systemText).not.toContain('inspect progress');
+  });
+
   it('preserves semantic recent-summary sourceSessionName through emitted memory.context', async () => {
     const result: MemorySearchResult = {
       items: [{

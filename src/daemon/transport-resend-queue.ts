@@ -69,6 +69,12 @@ export interface ResendEntry {
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
   historyCommitted?: boolean;
+  /** Private dynamic system contract required to reconstruct a queued cron turn. */
+  registeredSystemContract?: {
+    contractId: string;
+    signature: string;
+    body: string;
+  };
   /** Enqueue timestamp for expiry calculation. */
   queuedAt: number;
 }
@@ -133,6 +139,9 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
         ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
         ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
         ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
+        ...(normalizedEntry.registeredSystemContract
+          ? { registeredSystemContract: normalizedEntry.registeredSystemContract }
+          : {}),
       }),
     }, evicted?.clientMessageId);
     queueSnapshot = result.queueSnapshot;

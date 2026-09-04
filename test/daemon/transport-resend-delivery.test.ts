@@ -132,4 +132,32 @@ describe('transport resend delivery policy', () => {
       {},
     );
   });
+
+  it('rehydrates a queued cron registration through the system-contract path', async () => {
+    const harness = runtimeHarness();
+    harness.send.mockReturnValue('sent');
+    const registeredSystemContract = {
+      contractId: 'supervision_cron_control_v1',
+      signature: 'cron-v1-body',
+      body: '{"contractId":"supervision_cron_control_v1","authoritative":{"taskBody":"inspect"}}',
+    };
+
+    await expect(deliverTransportResendEntry(harness.runtime, {
+      text: 'compact cron ref',
+      commandId: 'cron-command',
+      clientMessageId: 'cron-message',
+      deliveryMode: 'append',
+      registeredSystemContract,
+      queuedAt: Date.now(),
+    })).resolves.toBe('sent');
+
+    expect(harness.appendExternalMessageToActiveTurn).not.toHaveBeenCalled();
+    expect(harness.send).toHaveBeenCalledWith(
+      'compact cron ref',
+      'cron-command',
+      undefined,
+      undefined,
+      { registeredSystemContract },
+    );
+  });
 });
