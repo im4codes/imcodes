@@ -605,7 +605,7 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.getByText('supervision_task_console.event_op.assignment_upsert')).toBeTruthy();
   });
 
-  it('does not count stale aggregate rows as active without a required live lease', () => {
+  it('counts by authoritative task status even when assignment lifecycle disagrees', () => {
     const tasks = {
       live: {
         taskId: 'live', title: 'Live', status: 'implementing' as const, phase: 'active' as const,
@@ -634,10 +634,56 @@ describe('SupervisionTaskConsole', () => {
       },
     })} mobile={false} onClose={() => {}} onNavigateSession={() => {}} />);
 
-    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 1/ })).toBeTruthy();
-    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 1/ })).toBeTruthy();
-    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_history 1/ })).toBeTruthy();
-    expect(screen.getByTestId('task-card-live')).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 3/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 0/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_history 0/ })).toBeTruthy();
+    expect(screen.getAllByTestId(/task-card-/)).toHaveLength(3);
+  });
+
+  it('keeps category, count, card label, next step and role details on the exact current revision', () => {
+    const task = {
+      taskId: 'revision-task', title: 'Revision authority', status: 'ready_for_integration' as const,
+      phase: 'integration' as const, currentRevision: 'r2', nextAction: 'Integrate exact R2',
+      validationState: 'passed' as const, updatedAt: NOW, lastEventId: 91,
+    };
+    const assignment = (
+      assignmentId: string,
+      role: 'implementer' | 'auditor',
+      status: 'implementing' | 'ready_for_integration' | 'auditing' | 'finalized',
+      auditRevision: string,
+      ownerSessionLabel: string,
+    ) => ({
+      assignmentId, taskId: task.taskId, role, status, auditRevision,
+      phase: supervisionConsoleStatusGroup(status), required: true, leaseActive: status === 'implementing' || status === 'auditing',
+      ownerSessionName: `deck_${assignmentId}`, ownerSessionLabel,
+      validationState: 'passed' as const, sessionState: 'running' as const,
+      sessionStateSource: 'runtime' as const, sessionStateObservedAt: NOW,
+      updatedAt: NOW, lastEventId: 92,
+    });
+    const assignments = [
+      assignment('old-worker', 'implementer', 'implementing', 'r1', 'Old running worker'),
+      assignment('current-worker', 'implementer', 'ready_for_integration', 'r2', 'Current integrable worker'),
+      assignment('old-auditor', 'auditor', 'auditing', 'r1', 'Old running auditor'),
+      assignment('current-auditor', 'auditor', 'finalized', 'r2', 'Current completed auditor'),
+    ];
+    render(<SupervisionTaskConsoleView state={state({
+      tasks: { [task.taskId]: task },
+      assignments: Object.fromEntries(assignments.map((row) => [row.assignmentId, row])),
+    })} mobile onClose={() => {}} onNavigateSession={() => {}} />);
+
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 0/ })).toBeTruthy();
+    const pending = screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 1/ });
+    fireEvent.click(pending);
+    const card = screen.getByTestId('task-card-revision-task');
+    expect(card.getAttribute('data-status')).toBe('ready_for_integration');
+    expect(card.getAttribute('data-task-tab')).toBe('pending');
+    expect(card.textContent).toContain('supervision_task_console.status.ready_for_integration');
+    expect(card.textContent).toContain('Integrate exact R2');
+    expect(card.textContent).toContain('Current integrable worker');
+    expect(card.textContent).toContain('Current completed auditor');
+    expect(card.textContent).not.toContain('Old running worker');
+    expect(card.textContent).not.toContain('Old running auditor');
+    expect(card.getAttribute('data-activity-state')).toBe('pending');
   });
 
   it('limits history to ten rows until show-more is requested', () => {

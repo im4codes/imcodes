@@ -146,6 +146,20 @@ describe('supervision task console reducer', () => {
     expect(Object.keys(restarted.tasks)).toEqual(['task-recovered']);
   });
 
+  it('preserves revision authority without deriving task state from assignments', () => {
+    const next = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({
+        tasks: [{ ...snapshot().tasks[0]!, status: 'ready_for_integration', phase: 'integration', currentRevision: 'r2' }],
+        assignments: [{
+          ...snapshot().assignments[0]!, status: 'implementing', phase: 'active', auditRevision: 'r1',
+        }],
+      }),
+    });
+    expect(next.tasks['task-1']).toMatchObject({ status: 'ready_for_integration', currentRevision: 'r2' });
+    expect(next.assignments['assignment-1']).toMatchObject({ status: 'implementing', auditRevision: 'r1' });
+  });
+
   it('applies only the next monotonic delta and ignores duplicate delivery', () => {
     const applied = supervisionTaskConsoleReducer(readyState(), { type: 'delta_received', payload: delta() });
     expect(applied.projectionVersion).toBe(4);

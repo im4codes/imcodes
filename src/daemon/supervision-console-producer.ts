@@ -251,7 +251,7 @@ export class SupervisionConsoleProducer {
   /** Project one durable task row into its browser-safe shape. */
   readTaskRow(taskId: string, projectName: string, lastEventId?: number): SupervisionTaskConsoleTaskRow | undefined {
     const row = this.#db.prepare(
-      `SELECT task_id, top_level_task_id, status, semantic_key, integration_owner, next_action,
+      `SELECT task_id, top_level_task_id, status, current_revision, semantic_key, integration_owner, next_action,
               blocked_reason, recovery_state, recovery_reason, last_durable_event_id, updated_at,
               validation_state, heartbeat_at, payload_json
        FROM supervision_tasks WHERE task_id = ? AND project_name = ?`,
@@ -273,6 +273,7 @@ export class SupervisionConsoleProducer {
       semanticKey: row.semantic_key ? String(row.semantic_key) : undefined,
       title: objective ?? String(row.task_id),
       status,
+      currentRevision: row.current_revision ? String(row.current_revision) : undefined,
       phase: supervisionConsoleStatusGroup(status),
       validationState: readValidationState(row.validation_state),
       heartbeatAt: row.heartbeat_at === null || row.heartbeat_at === undefined
@@ -292,7 +293,7 @@ export class SupervisionConsoleProducer {
     const rows = this.#db.prepare(
       `SELECT a.assignment_id, a.task_id, a.role, a.status, a.session_name, a.agent_type, a.provider_family,
               a.pool_kind, a.validation_state, a.observed_model, a.observed_provider, a.heartbeat_at,
-              a.audit_attempt_id, a.verdict, a.blocker, a.next_action,
+              a.audit_attempt_id, a.audit_revision, a.verdict, a.blocker, a.next_action,
               a.recovery_state, a.recovery_reason, a.last_durable_event_id, a.updated_at,
               a.lease_id, a.payload_json
        FROM supervision_task_assignments a
@@ -326,6 +327,7 @@ export class SupervisionConsoleProducer {
         taskId: String(row.task_id),
         status,
         phase: supervisionConsoleStatusGroup(status),
+        auditRevision: row.audit_revision ? String(row.audit_revision) : undefined,
         role: row.role ? String(row.role) : undefined,
         required,
         leaseActive,

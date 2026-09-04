@@ -424,6 +424,29 @@ describe('assignment, pool and validation projections', () => {
     expect(row.validationState).toBe('failed');
     expect(row.heartbeatAt).toBe(42);
   });
+
+  it('projects the authoritative task revision and each assignment revision unchanged', () => {
+    seedTask('ready_for_integration');
+    db.prepare("UPDATE supervision_tasks SET next_action='integrate exact r2' WHERE task_id='tsk_console'").run();
+    db.prepare("UPDATE supervision_task_assignments SET audit_revision='old-r1' WHERE assignment_id='asg_console'").run();
+    db.prepare(`INSERT INTO supervision_task_assignments
+      (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch,
+       agent_type, provider_family, lease_id, generation, audit_revision, payload_json, created_at, updated_at)
+      VALUES ('asg_current','tsk_console','auditor','finalized','deck_sub_current','i2','e2',
+       'claude-code','anthropic','',1,?,'{}',2,2)`).run(REVISION);
+
+    const snapshot = producer().buildSnapshot(SCOPE, 'sub-revision-authority');
+    expect(snapshot.tasks).toEqual([
+      expect.objectContaining({
+        taskId: 'tsk_console', status: 'ready_for_integration', currentRevision: REVISION,
+        nextAction: 'integrate exact r2',
+      }),
+    ]);
+    expect(snapshot.assignments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ assignmentId: 'asg_console', auditRevision: 'old-r1' }),
+      expect.objectContaining({ assignmentId: 'asg_current', auditRevision: REVISION }),
+    ]));
+  });
 });
 
 describe('audit receipt persistence', () => {

@@ -10,6 +10,7 @@ import {
   type SupervisionTaskConsoleAssignmentRow,
   type SupervisionTaskConsoleTaskRow,
   supervisionConsoleCardActivity,
+  supervisionConsoleAssignmentsForTask,
 } from '@shared/supervision-task-console.js';
 import { isSupervisionTaskLifecycleStatus } from '@shared/supervision-config.js';
 import type { WsClient } from '../ws-client.js';
@@ -138,7 +139,7 @@ function taskPriority(
   task: SupervisionTaskConsoleTaskRow,
   assignments: readonly SupervisionTaskConsoleAssignmentRow[],
 ): number {
-  const roleAssignments = taskRoleAssignments(assignments);
+  const roleAssignments = taskRoleAssignments(supervisionConsoleAssignmentsForTask(task, assignments));
   const tab = supervisionConsoleTabForTask(task, assignments);
   if (task.status === 'blocked' || task.blocker) return 0;
   if (tab !== 'active') {
@@ -160,7 +161,7 @@ function authoritativeActivityAt(
   assignments: readonly SupervisionTaskConsoleAssignmentRow[],
 ): number {
   if (supervisionConsoleTabForTask(task, assignments) !== 'active') return task.updatedAt;
-  const roleAssignments = taskRoleAssignments(assignments);
+  const roleAssignments = taskRoleAssignments(supervisionConsoleAssignmentsForTask(task, assignments));
   if (roleAssignments.length === 0) return task.updatedAt;
   return Math.max(...roleAssignments.map((assignment) => (
     assignment.sessionStateObservedAt ?? assignment.updatedAt
@@ -248,8 +249,9 @@ function TaskCard(props: {
   language: string;
 }) {
   const { t } = useTranslation();
-  const implementer = props.assignments.find(isImplementerAssignment);
-  const auditor = props.assignments.find(isAuditAssignment);
+  const currentAssignments = supervisionConsoleAssignmentsForTask(props.task, props.assignments);
+  const implementer = currentAssignments.find(isImplementerAssignment);
+  const auditor = currentAssignments.find(isAuditAssignment);
   const taskTab = supervisionConsoleTabForTask(props.task, props.assignments);
   // Derived by the shared canonical function, not locally: the browser renders
   // truth, it does not compute it. Blocker prose no longer masquerades as the
@@ -258,11 +260,11 @@ function TaskCard(props: {
     tab: taskTab,
     taskStatus: props.task.status,
     blocker: props.task.blocker,
-    assignments: props.assignments,
+    assignments: currentAssignments,
   });
   const activityAt = authoritativeActivityAt(props.task, props.assignments);
   const activityAssignment = taskTab === 'active'
-    ? taskRoleAssignments(props.assignments).sort((left, right) =>
+    ? taskRoleAssignments(currentAssignments).sort((left, right) =>
       (right.sessionStateObservedAt ?? right.updatedAt) - (left.sessionStateObservedAt ?? left.updatedAt))[0]
     : undefined;
   const activitySource = activityAssignment?.sessionStateSource ?? 'registry';
@@ -273,6 +275,7 @@ function TaskCard(props: {
     <article
       class={`supervision-task-console-task activity-${dominantState}`}
       data-status={props.task.status}
+      data-task-tab={taskTab}
       data-activity-state={dominantState}
       data-event-id={props.task.lastEventId}
       data-testid={`task-card-${props.task.taskId}`}

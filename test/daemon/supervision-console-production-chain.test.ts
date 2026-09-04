@@ -81,8 +81,26 @@ describe('browser -> server bridge -> daemon registry -> browser task-console ch
       const registry = new SupervisionTaskRegistry({ dbPath: databasePath });
       expect(registry.createOrGet({
         taskId: 'task-chain', projectName: 'alpha', objective: 'real production chain',
+        currentRevision: 'current-r2',
+      }).ok).toBe(true);
+      const identity = (sessionName: string) => ({
+        sessionName, sessionInstanceId: `${sessionName}-instance`, runtimeEpoch: 'epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+      });
+      expect(registry.createAssignment({
+        assignmentId: 'old-worker', taskId: 'task-chain', role: 'implementer',
+        identity: identity('deck_alpha_old'), auditRevision: 'old-r1',
       }).ok).toBe(true);
       registry.close();
+      const authority = new DatabaseSync(databasePath);
+      authority.prepare("UPDATE supervision_tasks SET status='ready_for_integration' WHERE task_id='task-chain'").run();
+      authority.prepare("UPDATE supervision_task_assignments SET status='implementing' WHERE assignment_id='old-worker'").run();
+      authority.prepare(`INSERT INTO supervision_task_assignments
+        (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch,
+         agent_type, provider_family, lease_id, generation, audit_revision, verdict, payload_json, created_at, updated_at)
+        VALUES ('current-auditor','task-chain','auditor','finalized','deck_alpha_current','current-instance','epoch',
+         'claude-code','anthropic','',1,'current-r2','PASS','{}',2,2)`).run();
+      authority.close();
 
       const bridge = WsBridge.get(serverId);
       const target: ShareTarget = { kind: 'main', serverId, sessionName: scope.coordinatorSessionName };
@@ -137,7 +155,14 @@ describe('browser -> server bridge -> daemon registry -> browser task-console ch
             type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
             scope,
             projectionVersion: 0,
-            tasks: [expect.objectContaining({ taskId: 'task-chain' })],
+            tasks: [expect.objectContaining({
+              taskId: 'task-chain', status: 'ready_for_integration',
+              currentRevision: 'current-r2',
+            })],
+            assignments: expect.arrayContaining([
+              expect.objectContaining({ assignmentId: 'old-worker', status: 'implementing', auditRevision: 'old-r1' }),
+              expect.objectContaining({ assignmentId: 'current-auditor', status: 'finalized', auditRevision: 'current-r2', auditVerdict: 'PASS' }),
+            ]),
           }),
         ]));
       }

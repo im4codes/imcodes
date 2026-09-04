@@ -283,44 +283,37 @@ export function supervisionConsoleTabForStatus(
   return SUPERVISION_CONSOLE_TAB_BY_STATUS[status];
 }
 
-/**
- * Resolve the product tab from durable task authority plus the assignments
- * that can actually keep an active lifecycle alive.
- *
- * A stale aggregate task row must never look Active merely because an old
- * runtime is still running or idle. Active requires at least one required,
- * leased assignment whose own lifecycle is active. Settled required
- * assignments move a stale active aggregate to History; every other mismatch
- * is conservatively Pending until the registry repairs it.
- */
+/** Resolve the product tab from the durable aggregate task authority. */
 export function supervisionConsoleTabForTask(
   task: Pick<SupervisionTaskConsoleTaskRow, 'status'>,
-  assignments: readonly Pick<
+  _assignments: readonly Pick<
     SupervisionTaskConsoleAssignmentRow,
     'role' | 'required' | 'leaseActive' | 'status'
   >[],
 ): SupervisionConsoleTab {
-  const taskTab = supervisionConsoleTabForStatus(task.status);
-  if (taskTab !== 'active') return taskTab;
-  const required = assignments.filter((assignment) => (
-    assignment.required === true
-    || (assignment.required === undefined
-      && (assignment.role === 'implementer' || assignment.role === 'auditor'))
-  ));
-  // Old cached snapshots predate leaseActive. Preserve their task-status
-  // partition until a fresh authoritative snapshot arrives rather than
-  // manufacturing a downgrade from missing wire data.
-  if (required.length === 0 || required.some((assignment) => assignment.leaseActive === undefined)) {
-    return taskTab;
-  }
-  if (required.some((assignment) => (
-    assignment.leaseActive === true
-    && supervisionConsoleTabForStatus(assignment.status) === 'active'
-  ))) return 'active';
-  if (required.length > 0 && required.every((assignment) => (
-    supervisionConsoleTabForStatus(assignment.status) === 'history'
-  ))) return 'history';
-  return 'pending';
+  // The registry task row is the aggregate lifecycle authority. Assignment
+  // rows describe individual roles only; using them to re-bucket the task made
+  // the count disagree with the status pill and let stale workers overwrite a
+  // finalized aggregate. Registry convergence must happen server-side rather
+  // than being guessed into existence by the browser.
+  return supervisionConsoleTabForStatus(task.status);
+}
+
+/**
+ * Keep role presentation on the task's exact current revision.
+ *
+ * Early, not-yet-frozen tasks have no revision and retain their assignments.
+ * Once a task carries an authoritative revision, an unbound or predecessor
+ * assignment is historical detail and cannot drive the current card.
+ */
+export function supervisionConsoleAssignmentsForTask<
+  T extends Pick<SupervisionTaskConsoleAssignmentRow, 'auditRevision'>,
+>(
+  task: Pick<SupervisionTaskConsoleTaskRow, 'currentRevision'>,
+  assignments: readonly T[],
+): T[] {
+  if (!task.currentRevision) return [...assignments];
+  return assignments.filter((assignment) => assignment.auditRevision === task.currentRevision);
 }
 
 /**
@@ -440,6 +433,8 @@ export interface SupervisionTaskConsoleTaskRow {
   title: string;
   /** Fixed enum id. Never free text, never model-authored. */
   status: SupervisionTaskLifecycleStatus;
+  /** Exact registry revision that owns this aggregate lifecycle. */
+  currentRevision?: string;
   ownerSessionName?: string;
   ownerAgentType?: string;
   /** Daemon-OBSERVED model, not self-reported. */
@@ -475,6 +470,8 @@ export interface SupervisionTaskConsoleAssignmentRow {
   taskId: string;
   status: SupervisionTaskLifecycleStatus;
   phase: SupervisionConsoleStatusGroup;
+  /** Exact task revision this role assignment is bound to. */
+  auditRevision?: string;
   /** Free-form slice role, e.g. "implementer" / "auditor". */
   role?: string;
   /** Durable participation authority; projected as a boolean only. */
@@ -622,7 +619,7 @@ export function evaluateSupervisionConsoleCursor(input: {
 export const SUPERVISION_CONSOLE_TRANSITION_FIELDS: readonly string[] = Object.freeze([
   'status', 'phase', 'auditVerdict', 'auditAttemptId', 'auditRound',
   'recoveryState', 'recoveryReason', 'snapshotState', 'validationState',
-  'blocker', 'checkpointId',
+  'blocker', 'checkpointId', 'currentRevision',
 ]);
 
 /**
@@ -717,6 +714,7 @@ function isTaskRow(value: unknown): boolean {
     && typeof value.title === 'string'
     // Rejects unknown/case-variant/model-authored status.
     && isSupervisionTaskLifecycleStatus(value.status)
+    && (value.currentRevision === undefined || typeof value.currentRevision === 'string')
     && hasDerivedPhase(value)
     && (value.auditVerdict === undefined || isPeerAuditVerdict(value.auditVerdict))
     && (value.poolKind === undefined || (SUPERVISION_EXECUTION_POOL_KINDS as readonly string[]).includes(value.poolKind as string))
@@ -731,6 +729,7 @@ function isAssignmentRow(value: unknown): boolean {
     && typeof value.assignmentId === 'string'
     && typeof value.taskId === 'string'
     && isSupervisionTaskLifecycleStatus(value.status)
+    && (value.auditRevision === undefined || typeof value.auditRevision === 'string')
     && hasDerivedPhase(value)
     && (value.required === undefined || typeof value.required === 'boolean')
     && (value.leaseActive === undefined || typeof value.leaseActive === 'boolean')

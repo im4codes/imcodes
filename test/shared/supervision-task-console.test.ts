@@ -21,6 +21,7 @@ import {
   supervisionConsoleStatusGroup,
   supervisionConsoleTabForStatus,
   supervisionConsoleTabForTask,
+  supervisionConsoleAssignmentsForTask,
   type SupervisionTaskConsoleCursorState,
   type SupervisionTaskConsoleTaskRow,
   SUPERVISION_CONSOLE_EXECUTION_HEALTH,
@@ -103,20 +104,30 @@ describe('supervision task console status grouping', () => {
     expect(supervisionConsoleTabForStatus('cancelled')).toBe('history');
   });
 
-  it('downgrades a stale active aggregate from durable required-assignment authority', () => {
-    const task = taskRow({ status: 'implementing' });
-    expect(supervisionConsoleTabForTask(task, [{
-      role: 'implementer', required: true, leaseActive: true, status: 'implementing',
-    }])).toBe('active');
-    expect(supervisionConsoleTabForTask(task, [{
-      role: 'implementer', required: true, leaseActive: false, status: 'validated',
-    }])).toBe('pending');
+  it('keeps the authoritative task aggregate in charge of its category', () => {
+    const task = taskRow({ status: 'implementing', currentRevision: 'r2' });
     expect(supervisionConsoleTabForTask(task, [{
       role: 'implementer', required: true, leaseActive: false, status: 'finalized',
-    }])).toBe('history');
-    expect(supervisionConsoleTabForTask(task, [{
-      role: 'implementer', status: 'implementing',
     }])).toBe('active');
+    expect(supervisionConsoleTabForTask(taskRow({ status: 'ready_for_integration' }), [{
+      role: 'implementer', required: true, leaseActive: true, status: 'implementing',
+    }])).toBe('pending');
+    expect(supervisionConsoleTabForTask(taskRow({ status: 'finalized' }), [{
+      role: 'auditor', required: true, leaseActive: true, status: 'auditing',
+    }])).toBe('history');
+  });
+
+  it('selects role details only from the exact current revision', () => {
+    const task = taskRow({ currentRevision: 'r2' });
+    const assignments = [
+      { assignmentId: 'old-worker', taskId: task.taskId, role: 'implementer', auditRevision: 'r1' },
+      { assignmentId: 'current-worker', taskId: task.taskId, role: 'implementer', auditRevision: 'r2' },
+      { assignmentId: 'unknown-worker', taskId: task.taskId, role: 'implementer' },
+      { assignmentId: 'current-auditor', taskId: task.taskId, role: 'auditor', auditRevision: 'r2' },
+    ];
+    expect(supervisionConsoleAssignmentsForTask(task, assignments).map((row) => row.assignmentId))
+      .toEqual(['current-worker', 'current-auditor']);
+    expect(supervisionConsoleAssignmentsForTask(taskRow(), assignments)).toEqual(assignments);
   });
 });
 
@@ -285,7 +296,7 @@ describe('supervision console coalescing', () => {
       { status: 'ready_for_audit' }, { phase: 'audit' }, { auditVerdict: 'REWORK' },
       { auditAttemptId: 'aud-1' }, { auditRound: 'r2' }, { validationState: 'failed' },
       { blocker: 'toolchain missing' }, { recoveryState: 're_audit_required' },
-      { snapshotState: 'frozen' }, { checkpointId: 'chk-1' },
+      { snapshotState: 'frozen' }, { checkpointId: 'chk-1' }, { currentRevision: 'r2' },
     ];
     for (const over of transitions) {
       expect(canCoalesceSupervisionTaskRows(taskRow(), taskRow(over)), JSON.stringify(over)).toBe(false);
