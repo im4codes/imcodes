@@ -65,6 +65,8 @@ class FakePeerConnection extends EventTarget {
   static channelOpenDelayMs = 0;
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
+  /** A stale SCTP association can still leave WebRTC reporting `connected`. */
+  acceptsNewDataChannels = true;
   channels: FakeDataChannel[] = [];
   offerChannelLabels: string[][] = [];
 
@@ -79,6 +81,9 @@ class FakePeerConnection extends EventTarget {
     channel.onSend = (value) => FakePeerConnection.onDataChannel?.(channel, value);
     // A LAN channel opens as good as immediately; a relayed one has to finish
     // ICE checks and a DTLS handshake first, which is what the delay models.
+    if (!this.acceptsNewDataChannels) {
+      return channel as unknown as RTCDataChannel;
+    }
     if (FakePeerConnection.channelOpenDelayMs > 0) {
       setTimeout(() => channel.open(), FakePeerConnection.channelOpenDelayMs);
     } else {
@@ -102,6 +107,11 @@ class FakePeerConnection extends EventTarget {
     }
   }
   addedCandidates: RTCIceCandidateInit[] = [];
+  emitIceCandidate(candidate: string, sdpMid = '0'): void {
+    this.dispatchEvent(Object.assign(new Event('icecandidate'), {
+      candidate: { candidate, sdpMid },
+    }));
+  }
   async addIceCandidate(candidate?: RTCIceCandidateInit): Promise<void> {
     if (candidate) this.addedCandidates.push(candidate);
   }
@@ -140,7 +150,7 @@ function controlBinding(message: Record<string, unknown>) {
 function createWs(
   capabilities: string[],
   mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' = 'success',
-  leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number } = {},
+  leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number; secondOfferAnswerDelayMs?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
   const capabilityHandlers = new Set<(snapshot: { capabilities: string[] } | null) => void>();
@@ -305,7 +315,12 @@ function createWs(
             retryable: true,
           }));
         } else {
-          queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
+          const respond = () => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' });
+          if (leaseOfferCount >= 2 && leaseTiming.secondOfferAnswerDelayMs) {
+            setTimeout(respond, leaseTiming.secondOfferAnswerDelayMs);
+          } else {
+            queueMicrotask(respond);
+          }
         }
     } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND) {
         queueMicrotask(() => emit({
@@ -647,6 +662,133 @@ describe('direct file transfer v2 browser broker', () => {
       expect(message).not.toHaveProperty('sessionName');
     }
     release?.();
+  });
+
+  it('cold-rebuilds a silently dead warm SCTP peer before a second consecutive upload', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('first.txt', 'first'),
+    });
+    const stalePeer = FakePeerConnection.instances.at(-1)!;
+    const bootstrap = stalePeer.channels.find((channel) => channel.label.startsWith('imcodes-health-'))!;
+    expect(stalePeer.connectionState).toBe('connected');
+    expect(bootstrap.readyState).toBe('open');
+
+    // WebKit can retain `connected` after the SCTP association has died. The
+    // bootstrap channel is the earliest truthful signal; any new channel on
+    // the stale peer would otherwise consume the full open timeout.
+    stalePeer.acceptsNewDataChannels = false;
+    bootstrap.close();
+    const second = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('second.txt', 'second'),
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    await expect(second).resolves.toMatchObject({ attachment: { id: 'direct-attachment' } });
+    expect(stalePeer.connectionState).toBe('closed');
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it('joins a cold rebuild before opening concurrent operation channels', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const rebuildDelay = 500;
+    const { ws, sent } = createWs(directCapabilities, 'success', {
+      secondOfferAnswerDelayMs: rebuildDelay,
+    });
+
+    await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('first.txt', 'first'),
+    });
+    const stalePeer = FakePeerConnection.instances.at(-1)!;
+    stalePeer.acceptsNewDataChannels = false;
+    stalePeer.channels.find((channel) => channel.label.startsWith('imcodes-health-'))!.close();
+
+    const uploads = [
+      uploadFileWithDirectFallback({ ws, serverId: 'server-1', file: createUploadFile('second-a.txt', 'a') }),
+      uploadFileWithDirectFallback({ ws, serverId: 'server-1', file: createUploadFile('second-b.txt', 'b') }),
+    ];
+    await vi.advanceTimersByTimeAsync(0);
+
+    const rebuildingPeer = FakePeerConnection.instances.at(-1)!;
+    expect(rebuildingPeer).not.toBe(stalePeer);
+    expect(rebuildingPeer.channels.filter((channel) => channel.label.startsWith('imcodes-op-'))).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(rebuildDelay);
+    await expect(Promise.all(uploads)).resolves.toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it('keeps upload-to-download direct after a cold rebuild and scopes late TURN ICE to its new offer', async () => {
+    const { uploadFileDirect, downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities);
+
+    await uploadFileDirect(
+      ws,
+      createUploadFile('first.txt', 'first'),
+      id(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'server-1',
+    );
+    const stalePeer = FakePeerConnection.instances.at(-1)!;
+    stalePeer.acceptsNewDataChannels = false;
+    stalePeer.channels.find((channel) => channel.label.startsWith('imcodes-health-'))!.close();
+
+    const writer = {
+      write: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      abort: vi.fn().mockResolvedValue(undefined),
+    };
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      destination: { handle: { createWritable: vi.fn().mockResolvedValue(writer) } },
+    });
+
+    const rebuiltPeer = FakePeerConnection.instances.at(-1)!;
+    expect(rebuiltPeer).not.toBe(stalePeer);
+    expect(writer.close).toHaveBeenCalledOnce();
+    expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
+
+    const offers = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER);
+    expect(offers).toHaveLength(2);
+    const [staleOffer, rebuiltOffer] = offers;
+    const staleCandidate = 'candidate:20 1 UDP 1046015 43.248.99.95 49200 typ relay raddr 0.0.0.0 rport 0';
+    const liveCandidate = 'candidate:21 1 UDP 1046015 43.248.99.95 49201 typ relay raddr 0.0.0.0 rport 0';
+    const emitIce = (offer: Record<string, unknown>, candidate: string) => emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+      requestId: offer.requestId,
+      candidate,
+      mid: '0',
+    });
+    emitIce(staleOffer!, staleCandidate);
+    emitIce(rebuiltOffer!, liveCandidate);
+
+    await vi.waitFor(() => expect(rebuiltPeer.addedCandidates)
+      .toContainEqual(expect.objectContaining({ candidate: liveCandidate })));
+    expect(rebuiltPeer.addedCandidates).not.toContainEqual(expect.objectContaining({ candidate: staleCandidate }));
   });
 
   it('opens a relayed data channel that needs longer than the signalling budget', async () => {
@@ -1433,6 +1575,65 @@ describe('direct file transfer v2 browser broker', () => {
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
     // ...but the transport the prewarm established was kept and reused.
     expect(FakePeerConnection.instances).toHaveLength(1);
+    release?.();
+  });
+
+  it('re-arms one current signalling identity when authority expiry retains the warm peer', async () => {
+    vi.useFakeTimers();
+    const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities, 'success', {
+      idleWindowMs: DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+    });
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1);
+
+    const second = uploadFileDirect(
+      ws,
+      createUploadFile('second.txt', 'second'),
+      id(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'server-1',
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(second).resolves.toMatchObject({ ok: true });
+
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    const peer = FakePeerConnection.instances[0]!;
+    const before = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE).length;
+    peer.emitIceCandidate('candidate:31 1 UDP 1 10.0.0.2 5001 typ host');
+    peer.emitIceCandidate('candidate:32 1 UDP 1 10.0.0.3 5002 typ host');
+    await vi.advanceTimersByTimeAsync(0);
+    const outbound = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE).slice(before);
+    expect(outbound).toHaveLength(2);
+    expect(new Set(outbound.map((message) => message.requestId)).size).toBe(1);
+
+    const current = outbound[0]!;
+    const liveCandidate = 'candidate:39 1 UDP 1 43.248.99.95 49201 typ relay raddr 0.0.0.0 rport 0';
+    const emitCandidate = (leaseGeneration: number, candidate: string) => emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: current.serverId,
+      browserTabId: current.browserTabId,
+      leaseId: current.leaseId,
+      leaseGeneration,
+      daemonGeneration: current.daemonGeneration,
+      requestId: current.requestId,
+      candidate,
+      mid: '0',
+    });
+    emitCandidate(current.leaseGeneration as number, liveCandidate);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(peer.addedCandidates).toContainEqual(expect.objectContaining({ candidate: liveCandidate }));
+
+    const staleCandidate = 'candidate:40 1 UDP 1 10.9.9.9 6001 typ host';
+    emitCandidate((current.leaseGeneration as number) + 1, staleCandidate);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(peer.addedCandidates).not.toContainEqual(expect.objectContaining({ candidate: staleCandidate }));
     release?.();
   });
 

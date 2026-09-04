@@ -897,6 +897,27 @@ function leaseSignalMatches(
 }
 
 /**
+ * Restore one stable signalling identity when a live transport is carried
+ * across an authority expiry. `clearLeaseBinding` deliberately keeps that
+ * peer but clears its request id; without this re-arm, outbound candidates use
+ * unrelated random ids while inbound candidates are still filtered by the old
+ * negotiation id.
+ */
+function rearmLeaseSignalling(lease: Lease, peer: RTCPeerConnection): void {
+  const requestId = crypto.randomUUID();
+  lease.leaseSignalRequestId = requestId;
+  lease.leaseIceOff?.();
+  lease.leaseIceOff = lease.ws.onMessage((raw) => {
+    const message = parseMatchingControl(raw, requestId);
+    if (!message
+      || message.type !== DIRECT_FILE_TRANSFER_MSG.LEASE_ICE
+      || !leaseSignalMatches(message, lease, requestId)) return;
+    void peer.addIceCandidate({ candidate: message.candidate, sdpMid: message.mid })
+      .catch(() => undefined);
+  });
+}
+
+/**
  * Establish the file-agnostic lease peer.  This is deliberately separate from
  * operation authorization: File Browser prewarming sends only a tab/daemon
  * lease binding and SDP/ICE, never a path, preview handle, session name, or
@@ -904,6 +925,16 @@ function leaseSignalMatches(
  */
 async function ensureLeasePeer(lease: Lease): Promise<void> {
   if (!hasLeaseBinding(lease)) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+  // A second caller must join the negotiation already in flight. The cold
+  // peer is assigned before its offer/answer settles, so inspecting it first
+  // would mistake `new` plus a connecting bootstrap channel for reusable
+  // transport and open an operation channel on an unnegotiated association.
+  if (lease.peerCreating) {
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
+      reason: DIRECT_FILE_TRANSFER_PEER_REASON.JOINED_PENDING,
+    });
+    return lease.peerCreating;
+  }
   // Mobile WebViews commonly leave a WebRTC peer in `disconnected` after a
   // long background suspension while the browser-server WebSocket recovers.
   // Reusing that peer makes every new data channel wait on an association that
@@ -914,23 +945,32 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
   // AND still facing the same daemon it was negotiated against.
   const generationMatches = lease.peerDaemonGeneration === null
     || lease.peerDaemonGeneration === lease.daemonGeneration;
+  const bootstrapCanCarryData = lease.bootstrapChannel !== null
+    && lease.bootstrapChannel.readyState !== 'closing'
+    && lease.bootstrapChannel.readyState !== 'closed';
   if (lease.peer
     && generationMatches
+    && bootstrapCanCarryData
     && lease.peer.connectionState !== 'failed'
     && lease.peer.connectionState !== 'disconnected'
     && lease.peer.connectionState !== 'closed') {
     if (lease.peerDaemonGeneration === null) lease.peerDaemonGeneration = lease.daemonGeneration;
+    if (lease.leaseSignalRequestId === null) rearmLeaseSignalling(lease, lease.peer);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
       reason: DIRECT_FILE_TRANSFER_PEER_REASON.REUSED,
     });
     return;
   }
-  if (lease.peer && !generationMatches) closePeer(lease);
-  if (lease.peerCreating) {
-    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
-      reason: DIRECT_FILE_TRANSFER_PEER_REASON.JOINED_PENDING,
-    });
-    return lease.peerCreating;
+  if (lease.peer && (!generationMatches
+    || (lease.peer.connectionState !== 'failed'
+      && lease.peer.connectionState !== 'disconnected'
+      && lease.peer.connectionState !== 'closed'
+      && !bootstrapCanCarryData))) {
+    // WebKit can retain `connected` after SCTP has closed. The inert bootstrap
+    // channel belongs to that same association and is therefore the earliest
+    // reliable signal that a new operation channel would wait out the entire
+    // open budget. Rebuild now; do not spend a retry on the known-dead peer.
+    closePeer(lease);
   }
   const epoch = lease.controlEpoch;
   const signal = lease.controlAbort.signal;
