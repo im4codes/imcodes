@@ -34,6 +34,8 @@ export interface SupervisionTaskConsoleReducerState {
   scope: SupervisionTaskConsoleScope;
   subscriptionId: string | null;
   phase: SupervisionTaskConsolePhase;
+  hasAuthoritativeSnapshot: boolean;
+  syncing: boolean;
   schemaVersion: number;
   statusContractVersion: number;
   projectionVersion: number;
@@ -61,6 +63,7 @@ export type SupervisionTaskConsoleReducerAction =
   | { type: 'delta_received'; payload: unknown }
   | { type: 'server_resync_required'; reason: SupervisionConsoleResyncReason }
   | { type: 'transport_error'; error: string }
+  | { type: 'authority_invalidated'; error: string }
   | { type: 'transport_disconnected' };
 
 function sameScope(left: SupervisionTaskConsoleScope, right: SupervisionTaskConsoleScope): boolean {
@@ -123,7 +126,10 @@ function requestResync(
 ): SupervisionTaskConsoleReducerState {
   return {
     ...state,
-    phase: SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING,
+    phase: state.hasAuthoritativeSnapshot
+      ? SUPERVISION_TASK_CONSOLE_PHASE.READY
+      : SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING,
+    syncing: true,
     resyncReason: reason,
     resyncGeneration: state.resyncGeneration + 1,
     error: null,
@@ -138,6 +144,8 @@ export function createSupervisionTaskConsoleState(
     scope,
     subscriptionId: null,
     phase: SUPERVISION_TASK_CONSOLE_PHASE.IDLE,
+    hasAuthoritativeSnapshot: false,
+    syncing: false,
     schemaVersion: cursor.schemaVersion,
     statusContractVersion: cursor.statusContractVersion,
     projectionVersion: cursor.projectionVersion,
@@ -170,6 +178,8 @@ function applySnapshot(
   if (snapshot.statusContractVersion !== SUPERVISION_TASK_STATUS_CONTRACT_VERSION) {
     return requestResync(state, 'status_contract_mismatch');
   }
+  if (snapshot.projectionEpoch === state.projectionEpoch
+    && snapshot.projectionVersion < state.projectionVersion) return state;
   const tasks = indexUnique(snapshot.tasks, (task) => task.taskId);
   const assignments = indexUnique(snapshot.assignments, (assignment) => assignment.assignmentId);
   const poolsById = indexUnique(snapshot.pools, (pool) => pool.poolId);
@@ -179,6 +189,8 @@ function applySnapshot(
   return {
     ...state,
     phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+    hasAuthoritativeSnapshot: true,
+    syncing: false,
     schemaVersion: snapshot.schemaVersion,
     statusContractVersion: snapshot.statusContractVersion,
     projectionVersion: snapshot.projectionVersion,
@@ -265,6 +277,8 @@ function applyDelta(
     projectionVersion: delta.projectionVersion,
     lastDurableEventId: delta.lastDurableEventId,
     projectionEpoch: delta.projectionEpoch,
+    hasAuthoritativeSnapshot: true,
+    syncing: false,
     tasks,
     assignments,
     eventsByTask,
@@ -285,7 +299,10 @@ export function supervisionTaskConsoleReducer(
       return {
         ...state,
         subscriptionId: action.subscriptionId,
-        phase: SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING,
+        phase: state.hasAuthoritativeSnapshot
+          ? SUPERVISION_TASK_CONSOLE_PHASE.READY
+          : SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING,
+        syncing: true,
         error: null,
       };
     case 'snapshot_received':
@@ -311,13 +328,25 @@ export function supervisionTaskConsoleReducer(
     case 'transport_error':
       return {
         ...state,
+        phase: state.hasAuthoritativeSnapshot
+          ? SUPERVISION_TASK_CONSOLE_PHASE.READY
+          : SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+        syncing: false,
+        error: action.error,
+      };
+    case 'authority_invalidated':
+      return {
+        ...createSupervisionTaskConsoleState(state.scope),
         phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
         error: action.error,
       };
     case 'transport_disconnected':
       return {
         ...state,
-        phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+        phase: state.hasAuthoritativeSnapshot
+          ? SUPERVISION_TASK_CONSOLE_PHASE.READY
+          : SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+        syncing: false,
         error: 'transport_disconnected',
       };
   }

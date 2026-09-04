@@ -21,6 +21,10 @@ import {
   createSupervisionTaskConsoleState,
   type SupervisionTaskConsoleReducerState,
 } from '../../src/supervision-task-console-reducer.js';
+import {
+  clearAllSupervisionTaskConsoleCaches,
+  writeSupervisionTaskConsoleCache,
+} from '../../src/supervision-task-console-cache.js';
 
 // Preact chooses the native lowercase event name only when the DOM advertises
 // `onpointerdown`. jsdom does not, so without this capability marker Preact
@@ -161,6 +165,7 @@ function state(
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  clearAllSupervisionTaskConsoleCaches();
   window.localStorage.clear();
   Object.defineProperty(window, 'innerWidth', {
     configurable: true,
@@ -274,6 +279,8 @@ describe('SupervisionTaskConsole', () => {
       <SupervisionTaskConsole
         ws={null}
         connected={false}
+        userId="user-1"
+        serverId="server-1"
         projectName="alpha"
         coordinatorSessionName="deck_alpha_brain"
         mobile={false}
@@ -313,6 +320,8 @@ describe('SupervisionTaskConsole', () => {
       <SupervisionTaskConsole
         ws={null}
         connected={false}
+        userId="user-1"
+        serverId="server-1"
         projectName="alpha"
         coordinatorSessionName="deck_alpha_brain"
         mobile={false}
@@ -349,6 +358,8 @@ describe('SupervisionTaskConsole', () => {
     const props = {
       ws: null,
       connected: false,
+      userId: 'user-1',
+      serverId: 'server-1',
       projectName: 'alpha',
       coordinatorSessionName: 'deck_alpha_brain',
       mobile: false,
@@ -371,6 +382,8 @@ describe('SupervisionTaskConsole', () => {
       <SupervisionTaskConsole
         ws={null}
         connected={false}
+        userId="user-1"
+        serverId="server-1"
         projectName="alpha"
         coordinatorSessionName="deck_alpha_brain"
         mobile
@@ -382,6 +395,33 @@ describe('SupervisionTaskConsole', () => {
     const panel = screen.getByRole('dialog', { name: 'supervision_task_console.title' });
     expect(panel.getAttribute('style')).toBeNull();
     expect(screen.queryByRole('separator', { name: 'supervision_task_console.resize' })).toBeNull();
+  });
+
+  it('renders a cached same-authority projection even while the authenticated socket is temporarily absent', () => {
+    writeSupervisionTaskConsoleCache({
+      userId: 'user-1',
+      serverId: 'server-1',
+      projectName: 'alpha',
+      coordinatorSessionName: 'deck_alpha_brain',
+    }, state({ hasAuthoritativeSnapshot: true }));
+
+    render(
+      <SupervisionTaskConsole
+        ws={null}
+        connected={false}
+        userId="user-1"
+        serverId="server-1"
+        projectName="alpha"
+        coordinatorSessionName="deck_alpha_brain"
+        mobile
+        readOnly
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+
+    expect(screen.getByText('Build live task console')).toBeTruthy();
+    expect(screen.queryByText('supervision_task_console.loading')).toBeNull();
   });
 
   it('suppresses mutation controls for viewers while retaining them for participants', () => {
@@ -937,6 +977,22 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.getByText('supervision_task_console.recovering')).toBeTruthy();
     view.rerender(<SupervisionTaskConsoleView state={state({ phase: SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING, resyncReason: 'status_contract_mismatch' })} mobile={false} now={NOW} onClose={() => {}} onNavigateSession={() => {}} />);
     expect(screen.getByRole('alert').textContent).toContain('supervision_task_console.unsupported');
+  });
+
+  it('keeps cached task cards readable on mobile while revalidating in the background', () => {
+    render(
+      <SupervisionTaskConsoleView
+        state={state({ syncing: true })}
+        mobile
+        now={NOW}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole('status').textContent).toBe('supervision_task_console.recovering');
+    expect(screen.getByText('Build live task console')).toBeTruthy();
+    expect(screen.queryByText('supervision_task_console.loading')).toBeNull();
   });
 
   it('has a localized label for every fixed status and disables transition motion when requested', () => {

@@ -463,7 +463,11 @@ export function SupervisionTaskConsoleView(props: {
         <button ref={closeRef} type="button" class="supervision-task-console-close" onClick={closeAndReturnFocus} aria-label={t('common.close')}>×</button>
       </header>
       {!props.readOnly && props.mutationControls}
-      <div class="supervision-task-console-cursor" aria-live="polite"><span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span><span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span></div>
+      <div class="supervision-task-console-cursor" aria-live="polite">
+        <span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span>
+        <span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span>
+        {props.state.syncing && <span class="supervision-task-console-sync" role="status">{t('supervision_task_console.recovering')}</span>}
+      </div>
       {bodyState === 'ready' && <div class="supervision-task-console-tabs" role="tablist" aria-label={t('supervision_task_console.tabs_label')}>
         <button ref={activeTabRef} type="button" role="tab" id="task-console-tab-active" aria-selected={activeTab === 'active'} aria-controls="task-console-panel-active" tabIndex={activeTab === 'active' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'active')} onClick={() => setActiveTab('active')}>{t('supervision_task_console.tab_active')} <span>{activeTasks.length}</span></button>
         <button ref={pendingTabRef} type="button" role="tab" id="task-console-tab-pending" aria-selected={activeTab === 'pending'} aria-controls="task-console-panel-pending" tabIndex={activeTab === 'pending' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'pending')} onClick={() => setActiveTab('pending')}>{t('supervision_task_console.tab_pending')} <span>{pendingTasks.length}</span></button>
@@ -501,6 +505,8 @@ export function SupervisionTaskConsoleView(props: {
 export function SupervisionTaskConsole(props: {
   ws: WsClient | null;
   connected: boolean;
+  userId: string;
+  serverId: string;
   projectName: string;
   coordinatorSessionName: string;
   mobile: boolean;
@@ -511,7 +517,13 @@ export function SupervisionTaskConsole(props: {
 }) {
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [width, setWidth] = useState(() => loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds(window.innerWidth)).width);
-  const state = useSupervisionTaskConsole({ ws: props.ws, connected: props.connected, scope: { projectName: props.projectName, coordinatorSessionName: props.coordinatorSessionName } });
+  const state = useSupervisionTaskConsole({
+    ws: props.ws,
+    connected: props.connected,
+    userId: props.userId,
+    serverId: props.serverId,
+    scope: { projectName: props.projectName, coordinatorSessionName: props.coordinatorSessionName },
+  });
   useEffect(() => {
     const handleViewportResize = () => { setViewportWidth(window.innerWidth); setWidth((current) => clampSupervisionConsoleWidth(current, window.innerWidth)); };
     window.addEventListener('resize', handleViewportResize);

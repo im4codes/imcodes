@@ -19,6 +19,12 @@ import {
   type SupervisionTaskConsoleReducerAction,
   type SupervisionTaskConsoleReducerState,
 } from './supervision-task-console-reducer.js';
+import {
+  clearSupervisionTaskConsoleCache,
+  readSupervisionTaskConsoleCache,
+  writeSupervisionTaskConsoleCache,
+  type SupervisionTaskConsoleAuthority,
+} from './supervision-task-console-cache.js';
 
 export interface SupervisionTaskConsoleSocket {
   send(message: object): void;
@@ -90,8 +96,11 @@ export class SupervisionTaskConsoleController {
   constructor(
     private readonly socket: SupervisionTaskConsoleSocket,
     private readonly scope: SupervisionTaskConsoleScope,
+    private readonly authority?: SupervisionTaskConsoleAuthority,
   ) {
-    this.state = createSupervisionTaskConsoleState(scope);
+    this.state = authority
+      ? readSupervisionTaskConsoleCache(authority) ?? createSupervisionTaskConsoleState(scope)
+      : createSupervisionTaskConsoleState(scope);
   }
 
   getState(): SupervisionTaskConsoleReducerState {
@@ -150,6 +159,10 @@ export class SupervisionTaskConsoleController {
     const next = supervisionTaskConsoleReducer(previous, action);
     if (next === previous) return;
     this.state = next;
+    if (this.authority && next.hasAuthoritativeSnapshot
+      && (action.type === 'snapshot_received' || action.type === 'delta_received')) {
+      writeSupervisionTaskConsoleCache(this.authority, next);
+    }
     this.emit();
 
     if (next.resyncGeneration > previous.resyncGeneration && this.connected && next.resyncReason) {
@@ -160,6 +173,7 @@ export class SupervisionTaskConsoleController {
       next.phase === SUPERVISION_TASK_CONSOLE_PHASE.READY
       && next.subscriptionId
       && (previous.phase !== SUPERVISION_TASK_CONSOLE_PHASE.READY
+        || (previous.syncing && !next.syncing)
         || next.projectionVersion !== previous.projectionVersion
         || next.lastDurableEventId !== previous.lastDurableEventId
         || next.projectionEpoch !== previous.projectionEpoch)
@@ -178,6 +192,7 @@ export class SupervisionTaskConsoleController {
 
   private requestSubscription(reason: SupervisionConsoleResyncReason, fullSnapshot: boolean): void {
     if (!this.connected) return;
+    if (!fullSnapshot && reason === 'initial' && this.state.syncing && this.state.subscriptionId) return;
     const subscriptionId = newSubscriptionId();
     const current = this.state;
     const cursor = fullSnapshot
@@ -228,7 +243,8 @@ export class SupervisionTaskConsoleController {
       if (!unavailable || !this.state.subscriptionId
         || unavailable.subscriptionId !== this.state.subscriptionId
         || !sameScope(unavailable.scope, this.scope)) return;
-      this.apply({ type: 'transport_error', error: unavailable.reason });
+      if (this.authority) clearSupervisionTaskConsoleCache(this.authority);
+      this.apply({ type: 'authority_invalidated', error: unavailable.reason });
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {

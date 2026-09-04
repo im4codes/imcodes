@@ -87,6 +87,18 @@ describe('supervision task console toolbar placement', () => {
     expect(app.match(/<SupervisionTaskConsole(?=\s)/g)).toHaveLength(1);
   });
 
+  it('binds cached projections to the full authenticated authority and evicts them on lost access', () => {
+    const workspace = boundedBlock(
+      '<div class="supervision-task-console-workspace">',
+      '{/* Desktop floating file browser */}',
+    );
+    expect(workspace).toContain('key={`${auth.userId}:${selectedServerId}:${activeSessionInfo.project}:${activeSessionInfo.name}`}');
+    expect(workspace).toContain('userId={auth.userId}');
+    expect(workspace).toContain('serverId={selectedServerId!}');
+    expect(app).toMatch(/if \(!auth \|\| canViewTaskConsole \|\| !selectedServerId \|\| !activeSessionInfo\) return;[\s\S]*?clearSupervisionTaskConsoleCache\(\{[\s\S]*?userId: auth\.userId,[\s\S]*?serverId: selectedServerId,[\s\S]*?projectName: activeSessionInfo\.project,[\s\S]*?coordinatorSessionName: activeSessionInfo\.name/);
+    expect(app).toContain('if (!nextUserId) clearAllSupervisionTaskConsoleCaches();');
+  });
+
   it('restores and persists panel open state through the shared preferences helper', () => {
     expect(app).toMatch(/useState\(\s*\(\) => loadSupervisionTaskConsolePreferences\(supervisionTaskConsolePreferenceBounds\(\)\)\.open/);
     expect(app).toContain('saveSupervisionTaskConsolePreferences({ ...preferences, open: nextOpen }, bounds);');

@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
   SUPERVISION_TASK_CONSOLE_MSG,
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
   type SupervisionTaskConsoleScope,
+  type SupervisionTaskConsoleDelta,
   type SupervisionTaskConsoleSnapshot,
 } from '../../shared/supervision-task-console.js';
 import { SUPERVISION_TASK_STATUS_CONTRACT_VERSION } from '../../shared/supervision-config.js';
@@ -13,10 +14,20 @@ import {
   type SupervisionTaskConsoleSocket,
 } from '../src/supervision-task-console-controller.js';
 import { SUPERVISION_TASK_CONSOLE_PHASE } from '../src/supervision-task-console-reducer.js';
+import {
+  clearAllSupervisionTaskConsoleCaches,
+  type SupervisionTaskConsoleAuthority,
+} from '../src/supervision-task-console-cache.js';
 
 const SCOPE: SupervisionTaskConsoleScope = {
   projectName: 'alpha',
   coordinatorSessionName: 'deck_alpha_brain',
+};
+
+const AUTHORITY: SupervisionTaskConsoleAuthority = {
+  userId: 'user-1',
+  serverId: 'server-1',
+  ...SCOPE,
 };
 
 class FakeSocket implements SupervisionTaskConsoleSocket {
@@ -66,7 +77,31 @@ function emptySnapshot(subscriptionId: string): SupervisionTaskConsoleSnapshot {
   };
 }
 
+function taskDelta(
+  subscriptionId: string,
+  overrides: Partial<SupervisionTaskConsoleDelta> = {},
+): SupervisionTaskConsoleDelta {
+  return {
+    type: SUPERVISION_TASK_CONSOLE_MSG.DELTA,
+    subscriptionId,
+    scope: SCOPE,
+    schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+    statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+    projectionVersion: 8,
+    lastDurableEventId: 42,
+    projectionEpoch: 'epoch-1',
+    eventId: 42,
+    op: 'task_upsert',
+    task: {
+      taskId: 'task-1', title: 'Task', status: 'validated', phase: 'active',
+      validationState: 'passed', updatedAt: 200, lastEventId: 42,
+    },
+    ...overrides,
+  } as SupervisionTaskConsoleDelta;
+}
+
 describe('SupervisionTaskConsoleController', () => {
+  beforeEach(() => clearAllSupervisionTaskConsoleCaches());
   it('does not leave an initially offline console in IDLE/loading', () => {
     const socket = new FakeSocket();
     const controller = new SupervisionTaskConsoleController(socket, SCOPE);
@@ -179,7 +214,8 @@ describe('SupervisionTaskConsoleController', () => {
 
     controller.setConnected(false);
     expect(controller.getState()).toMatchObject({
-      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
       error: 'transport_disconnected',
     });
     const sendsBeforeDisconnectedRetry = socket.sent.length;
@@ -210,7 +246,7 @@ describe('SupervisionTaskConsoleController', () => {
     expect(resumed).toMatchObject({ afterEventId: 41, projectionVersion: 7 });
   });
 
-  it('leaves SUBSCRIBING when a current-cursor reconnect receives the explicit current snapshot', () => {
+  it('keeps cached rows ready while a current-cursor reconnect receives the explicit current snapshot', () => {
     const socket = new FakeSocket();
     const controller = new SupervisionTaskConsoleController(socket, SCOPE);
     controller.start();
@@ -221,9 +257,15 @@ describe('SupervisionTaskConsoleController', () => {
     controller.setConnected(true);
     const resumed = latest<{ subscriptionId: string; afterEventId: number | null }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
     expect(resumed.afterEventId).toBe(41);
-    expect(controller.getState().phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING);
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      syncing: true,
+    });
     socket.emit(snapshot(resumed.subscriptionId));
-    expect(controller.getState().phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      syncing: false,
+    });
     expect(controller.getState().lastDurableEventId).toBe(41);
   });
 
@@ -280,5 +322,164 @@ describe('SupervisionTaskConsoleController', () => {
     expect(socket.sent.some((message) => (
       (message as { type?: unknown }).type === SUPERVISION_TASK_CONSOLE_MSG.ACK
     ))).toBe(false);
+  });
+
+  it('renders the last authoritative snapshot immediately after an unmount and revalidates in background', () => {
+    const firstSocket = new FakeSocket();
+    const first = new SupervisionTaskConsoleController(firstSocket, SCOPE, AUTHORITY);
+    first.start();
+    first.setConnected(true);
+    const initial = latest<{ subscriptionId: string }>(firstSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    firstSocket.emit(snapshot(initial.subscriptionId));
+    expect(first.getState().tasks).toHaveProperty('task-1');
+    first.stop();
+
+    const secondSocket = new FakeSocket();
+    const second = new SupervisionTaskConsoleController(secondSocket, SCOPE, AUTHORITY);
+    expect(second.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      projectionVersion: 7,
+    });
+    expect(second.getState().tasks).toHaveProperty('task-1');
+
+    second.start();
+    second.setConnected(true);
+    const refresh = latest<{ afterEventId: number | null }>(secondSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    expect(refresh.afterEventId).toBe(41);
+    expect(second.getState().phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    second.stop();
+  });
+
+  it('isolates cached projections by user, server, project, and coordinator before A to B to A', () => {
+    const firstSocket = new FakeSocket();
+    const first = new SupervisionTaskConsoleController(firstSocket, SCOPE, AUTHORITY);
+    first.start();
+    first.setConnected(true);
+    firstSocket.emit(snapshot(latest<{ subscriptionId: string }>(firstSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE).subscriptionId));
+    first.stop();
+
+    const mismatches: SupervisionTaskConsoleAuthority[] = [
+      { ...AUTHORITY, userId: 'user-2' },
+      { ...AUTHORITY, serverId: 'server-2' },
+      { ...AUTHORITY, projectName: 'beta', coordinatorSessionName: 'deck_beta_brain' },
+      { ...AUTHORITY, coordinatorSessionName: 'deck_alpha_other_brain' },
+    ];
+    for (const authority of mismatches) {
+      const scope = { projectName: authority.projectName, coordinatorSessionName: authority.coordinatorSessionName };
+      const other = new SupervisionTaskConsoleController(new FakeSocket(), scope, authority);
+      expect(other.getState()).toMatchObject({
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.IDLE,
+        hasAuthoritativeSnapshot: false,
+        tasks: {},
+      });
+    }
+
+    const returned = new SupervisionTaskConsoleController(new FakeSocket(), SCOPE, AUTHORITY);
+    expect(returned.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      projectionVersion: 7,
+    });
+    expect(returned.getState().tasks).toHaveProperty('task-1');
+  });
+
+  it('merges a live event into cached state and never lets a slower snapshot roll it back', () => {
+    const seedSocket = new FakeSocket();
+    const seed = new SupervisionTaskConsoleController(seedSocket, SCOPE, AUTHORITY);
+    seed.start();
+    seed.setConnected(true);
+    seedSocket.emit(snapshot(latest<{ subscriptionId: string }>(seedSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE).subscriptionId));
+    seed.stop();
+
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE, AUTHORITY);
+    controller.start();
+    controller.setConnected(true);
+    const refresh = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    socket.emit(taskDelta(refresh.subscriptionId));
+    expect(controller.getState()).toMatchObject({ projectionVersion: 8, syncing: false });
+    expect(controller.getState().tasks['task-1']?.status).toBe('validated');
+
+    socket.emit(snapshot(refresh.subscriptionId));
+    expect(controller.getState().projectionVersion).toBe(8);
+    expect(controller.getState().tasks['task-1']?.status).toBe('validated');
+    controller.stop();
+
+    const remounted = new SupervisionTaskConsoleController(new FakeSocket(), SCOPE, AUTHORITY);
+    expect(remounted.getState().projectionVersion).toBe(8);
+    expect(remounted.getState().tasks['task-1']?.status).toBe('validated');
+  });
+
+  it('coalesces repeated reconnect refreshes while one current subscription is in flight', () => {
+    const seedSocket = new FakeSocket();
+    const seed = new SupervisionTaskConsoleController(seedSocket, SCOPE, AUTHORITY);
+    seed.start();
+    seed.setConnected(true);
+    seedSocket.emit(snapshot(latest<{ subscriptionId: string }>(seedSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE).subscriptionId));
+    seed.stop();
+
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE, AUTHORITY);
+    controller.start();
+    controller.setConnected(true);
+    socket.emit({ type: DAEMON_MSG.RECONNECTED });
+    socket.emit({ type: DAEMON_MSG.RECONNECTED });
+
+    expect(socket.sent.filter((message) => (
+      (message as { type?: unknown }).type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE
+    ))).toHaveLength(1);
+    expect(controller.getState()).toMatchObject({ phase: SUPERVISION_TASK_CONSOLE_PHASE.READY, syncing: true });
+  });
+
+  it('caches an authoritative empty snapshot without confusing it with a missing key', () => {
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE, AUTHORITY);
+    controller.start();
+    controller.setConnected(true);
+    socket.emit(emptySnapshot(latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE).subscriptionId));
+    controller.stop();
+
+    expect(new SupervisionTaskConsoleController(new FakeSocket(), SCOPE, AUTHORITY).getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      hasAuthoritativeSnapshot: true,
+      tasks: {},
+    });
+  });
+
+  it('evicts cached authority on an unavailable response and on an authoritative task removal', () => {
+    const seedSocket = new FakeSocket();
+    const seed = new SupervisionTaskConsoleController(seedSocket, SCOPE, AUTHORITY);
+    seed.start();
+    seed.setConnected(true);
+    seedSocket.emit(snapshot(latest<{ subscriptionId: string }>(seedSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE).subscriptionId));
+    seed.stop();
+
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE, AUTHORITY);
+    controller.start();
+    controller.setConnected(true);
+    const refresh = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    socket.emit({
+      type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+      subscriptionId: refresh.subscriptionId,
+      scope: SCOPE,
+      reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
+      retryable: true,
+    });
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      hasAuthoritativeSnapshot: false,
+      tasks: {},
+    });
+    expect(new SupervisionTaskConsoleController(new FakeSocket(), SCOPE, AUTHORITY).getState().hasAuthoritativeSnapshot).toBe(false);
+
+    const removalSocket = new FakeSocket();
+    const removal = new SupervisionTaskConsoleController(removalSocket, SCOPE, AUTHORITY);
+    removal.start();
+    removal.setConnected(true);
+    const initial = latest<{ subscriptionId: string }>(removalSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    removalSocket.emit(snapshot(initial.subscriptionId));
+    removalSocket.emit(taskDelta(initial.subscriptionId, { op: 'task_remove', removedId: 'task-1', task: undefined }));
+    removal.stop();
+    expect(new SupervisionTaskConsoleController(new FakeSocket(), SCOPE, AUTHORITY).getState().tasks).not.toHaveProperty('task-1');
   });
 });

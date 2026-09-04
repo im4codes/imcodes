@@ -168,12 +168,14 @@ describe('supervision task console reducer', () => {
     expect(supervisionTaskConsoleReducer(applied, { type: 'delta_received', payload: delta() })).toBe(applied);
   });
 
-  it('requests a full resync for a version gap or out-of-order future update', () => {
+  it('keeps the last authoritative rows visible while requesting a full resync for a version gap', () => {
     const gapped = supervisionTaskConsoleReducer(readyState(), {
       type: 'delta_received',
       payload: delta({ projectionVersion: 5, lastDurableEventId: 5, eventId: 5 }),
     });
-    expect(gapped.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING);
+    expect(gapped.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(gapped.syncing).toBe(true);
+    expect(gapped.tasks).toEqual(readyState().tasks);
     expect(gapped.resyncReason).toBe('version_gap');
   });
 

@@ -46,6 +46,11 @@ import {
   saveSupervisionTaskConsolePreferences,
 } from './supervision-task-console-preferences.js';
 import { canViewSupervisionTaskConsole } from './supervision-task-console-visibility.js';
+import {
+  clearAllSupervisionTaskConsoleCaches,
+  clearSupervisionTaskConsoleCache,
+  clearSupervisionTaskConsoleCacheForUser,
+} from './supervision-task-console-cache.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
@@ -610,6 +615,16 @@ export function App() {
       return null;
     }
   });
+  const supervisionCacheUserRef = useRef<string | null>(auth?.userId ?? null);
+  useEffect(() => {
+    const previousUserId = supervisionCacheUserRef.current;
+    const nextUserId = auth?.userId ?? null;
+    if (previousUserId && previousUserId !== nextUserId) {
+      clearSupervisionTaskConsoleCacheForUser(previousUserId);
+    }
+    if (!nextUserId) clearAllSupervisionTaskConsoleCaches();
+    supervisionCacheUserRef.current = nextUserId;
+  }, [auth?.userId]);
   const [initialAuthVerificationPending, setInitialAuthVerificationPending] = useState(
     () => !isNative(),
   );
@@ -5374,6 +5389,28 @@ export function App() {
     return <NativeAuthBridge callbackUrl={nativeCallback} />;
   }
 
+  const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  const sharedAccessRole = selectedShareTarget
+    ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
+    : null;
+  const supervisionTaskConsoleVisibility = {
+    session: activeSessionInfo,
+    shareTargetKind: selectedShareTarget?.kind ?? null,
+    sharedAccessRole: selectedShareTarget
+      ? (activeSessionInfo?.sharedState?.effectiveRole ?? null)
+      : null,
+  };
+  const canViewTaskConsole = canViewSupervisionTaskConsole(supervisionTaskConsoleVisibility);
+  useEffect(() => {
+    if (!auth || canViewTaskConsole || !selectedServerId || !activeSessionInfo) return;
+    clearSupervisionTaskConsoleCache({
+      userId: auth.userId,
+      serverId: selectedServerId,
+      projectName: activeSessionInfo.project,
+      coordinatorSessionName: activeSessionInfo.name,
+    });
+  }, [activeSessionInfo?.name, activeSessionInfo?.project, auth?.userId, canViewTaskConsole, selectedServerId]);
+
   if (!nativeReady || !splashDone) {
     return null; // Wait for startup readiness while the HTML splash remains visible
   }
@@ -5425,18 +5462,6 @@ export function App() {
     );
   }
 
-  const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
-  const sharedAccessRole = selectedShareTarget
-    ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
-    : null;
-  const supervisionTaskConsoleVisibility = {
-    session: activeSessionInfo,
-    shareTargetKind: selectedShareTarget?.kind ?? null,
-    sharedAccessRole: selectedShareTarget
-      ? (activeSessionInfo?.sharedState?.effectiveRole ?? null)
-      : null,
-  };
-  const canViewTaskConsole = canViewSupervisionTaskConsole(supervisionTaskConsoleVisibility);
   const canCreateSubSession = !selectedShareTarget
     || (sharedAccessRole === 'participant' && selectedShareTarget.kind !== 'subsession');
 
@@ -6546,9 +6571,11 @@ export function App() {
               </div>
               {showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo && (
                 <SupervisionTaskConsole
-                  key={`${activeSessionInfo.project}:${activeSessionInfo.name}`}
+                  key={`${auth.userId}:${selectedServerId}:${activeSessionInfo.project}:${activeSessionInfo.name}`}
                   ws={wsRef.current}
                   connected={connected && daemonOnline}
+                  userId={auth.userId}
+                  serverId={selectedServerId!}
                   projectName={activeSessionInfo.project}
                   coordinatorSessionName={activeSessionInfo.name}
                   mobile={isMobile}
