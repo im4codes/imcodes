@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "signaling_types.h"
 #include "transport_session_core.h"
 
 namespace common = imcodes::remote_desktop::common;
@@ -174,6 +175,34 @@ int main() {
   FakeQualityLadder ladder;
 
   {
+    imcodes::rd::Authority current;
+    current.expires_at_ms = 9'000;
+    current.lease_expires_at_ms = 5'000;
+    current.daemon_generation = 41;
+    current.route_generation = 9;
+
+    imcodes::rd::Authority incremental;
+    incremental.lease_expires_at_ms = 6'000;
+    const imcodes::rd::Authority bound =
+        imcodes::rd::BindOmittedAuthorityFields(current, incremental);
+    Require(bound.expires_at_ms == 9'000 &&
+                bound.lease_expires_at_ms == 6'000 &&
+                bound.daemon_generation == 41 &&
+                bound.route_generation == 9,
+            "incremental authority inherits only omitted route fields");
+
+    incremental.expires_at_ms = 9'001;
+    incremental.daemon_generation = 42;
+    incremental.route_generation = 10;
+    const imcodes::rd::Authority attempted_change =
+        imcodes::rd::BindOmittedAuthorityFields(current, incremental);
+    Require(attempted_change.expires_at_ms == 9'001 &&
+                attempted_change.daemon_generation == 42 &&
+                attempted_change.route_generation == 10,
+            "incremental authority never overwrites explicit route changes");
+  }
+
+  {
     FakeTransportAdapter adapter;
     common::TransportSessionLimits unbounded = Limits();
     unbounded.maximum_remote_ice_candidates =
@@ -209,26 +238,40 @@ int main() {
                 core.authority()->lease_expires_at_unix_ms == 6'000,
             "matching increasing renewal extends the lease");
 
+    // The signed LEASE wire envelope deliberately does not carry expiresAt:
+    // that immutable deadline was bound by PREPARE and a renewal must not be
+    // able to replace it.  The native parser therefore represents the omitted
+    // field as zero.  The first real Server renewal arrives after 15 seconds;
+    // rejecting that zero as a changed deadline made every healthy Windows
+    // session terminate as protocol_error at that exact boundary.
+    common::RouteAuthority wire_renewal = renewal;
+    wire_renewal.expires_at_unix_ms = 0;
+    wire_renewal.lease_expires_at_unix_ms = 7'000;
+    Require(core.RenewLease(wire_renewal, At(100, 103)) &&
+                core.authority()->expires_at_unix_ms == 9'000 &&
+                core.authority()->lease_expires_at_unix_ms == 7'000,
+            "lease wire omission inherits the bound absolute route expiry");
+
     common::RouteAuthority changed_absolute_expiry = renewal;
     changed_absolute_expiry.expires_at_unix_ms++;
-    changed_absolute_expiry.lease_expires_at_unix_ms = 7'000;
-    Require(!core.RenewLease(changed_absolute_expiry, At(100, 103)) &&
+    changed_absolute_expiry.lease_expires_at_unix_ms = 8'000;
+    Require(!core.RenewLease(changed_absolute_expiry, At(100, 104)) &&
                 core.authority()->expires_at_unix_ms == 9'000 &&
-                core.authority()->lease_expires_at_unix_ms == 6'000,
+                core.authority()->lease_expires_at_unix_ms == 7'000,
             "renewal cannot mutate the bound absolute route expiry");
 
     common::RouteAuthority beyond_absolute_expiry = renewal;
     beyond_absolute_expiry.lease_expires_at_unix_ms = 9'001;
-    Require(!core.RenewLease(beyond_absolute_expiry, At(100, 104)) &&
-                core.authority()->lease_expires_at_unix_ms == 6'000,
+    Require(!core.RenewLease(beyond_absolute_expiry, At(100, 105)) &&
+                core.authority()->lease_expires_at_unix_ms == 7'000,
             "renewal lease cannot outlive absolute route authority");
 
     common::RouteAuthority changed_binding = renewal;
     changed_binding.identity.negotiated_capability_binding =
         "other_binding_1234567890";
-    changed_binding.lease_expires_at_unix_ms = 7'000;
-    Require(!core.RenewLease(changed_binding, At(100, 105)) &&
-                core.authority()->lease_expires_at_unix_ms == 6'000,
+    changed_binding.lease_expires_at_unix_ms = 8'000;
+    Require(!core.RenewLease(changed_binding, At(100, 106)) &&
+                core.authority()->lease_expires_at_unix_ms == 7'000,
             "negotiated capability binding fences renewal authority");
 
     Require(!core.OnPeerConnectionState(Stamp(40, 9),
@@ -239,8 +282,8 @@ int main() {
 
     common::RouteAuthority expired_renewal = renewal;
     expired_renewal.lease_expires_at_unix_ms = 8'000;
-    Require(!core.RenewLease(expired_renewal, At(6'000, 107)) &&
-                core.authority()->lease_expires_at_unix_ms == 6'000,
+    Require(!core.RenewLease(expired_renewal, At(7'000, 107)) &&
+                core.authority()->lease_expires_at_unix_ms == 7'000,
             "expired authority cannot be revived by a late renewal");
   }
 

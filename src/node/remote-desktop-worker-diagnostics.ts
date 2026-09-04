@@ -6,6 +6,10 @@ import {
   stat,
 } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import {
+  REMOTE_DESKTOP_TERMINAL_REASON,
+  type RemoteDesktopTerminalReason,
+} from '../../shared/remote-desktop.js';
 import { windowsCredentialDir } from './installer.js';
 
 export const REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT = {
@@ -78,6 +82,9 @@ const CLEANUP_REASONS = new Set<unknown>([
   'worker_failed',
   REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON,
 ]);
+const TERMINAL_REASONS = new Set<unknown>(
+  Object.values(REMOTE_DESKTOP_TERMINAL_REASON),
+);
 
 export interface RemoteDesktopWorkerDiagnosticEvent {
   event: RemoteDesktopWorkerDiagnosticEventName;
@@ -92,6 +99,7 @@ export interface RemoteDesktopWorkerDiagnosticEvent {
   signal?: string | null;
   observedBy?: 'pipe_close';
   cleanupReason?: string;
+  terminalReason?: RemoteDesktopTerminalReason;
   stdio?: 'ignored';
 }
 
@@ -184,6 +192,10 @@ function boundedRecord(
     && CLEANUP_REASONS.has(input.cleanupReason)
     ? input.cleanupReason
     : undefined;
+  const terminalReason = typeof input.terminalReason === 'string'
+    && TERMINAL_REASONS.has(input.terminalReason)
+    ? input.terminalReason as RemoteDesktopTerminalReason
+    : undefined;
   const launchMode = LAUNCH_MODES.has(input.launchMode)
     && typeof input.launchMode === 'string'
     ? input.launchMode as RemoteDesktopWorkerDiagnosticEvent['launchMode']
@@ -206,6 +218,7 @@ function boundedRecord(
     ...(signal === undefined ? {} : { signal }),
     ...(observedBy === undefined ? {} : { observedBy }),
     ...(cleanupReason === undefined ? {} : { cleanupReason }),
+    ...(terminalReason === undefined ? {} : { terminalReason }),
     ...(stdio === undefined ? {} : { stdio }),
   };
 }

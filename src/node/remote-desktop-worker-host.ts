@@ -1211,7 +1211,11 @@ export class RemoteDesktopWorkerHost {
           void this.retryOnOtherDesktop(event.value, tracked);
           continue;
         }
-        this.untrack(event.value.sessionId, REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON);
+        this.untrack(
+          event.value.sessionId,
+          REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON,
+          event.value.reason,
+        );
       }
       this.onMessage(event.value);
     }
@@ -1274,7 +1278,11 @@ export class RemoteDesktopWorkerHost {
     this.stopVirtualDisplayController();
   }
 
-  private untrack(sessionId: string, cleanupReason = 'authority_removed'): void {
+  private untrack(
+    sessionId: string,
+    cleanupReason = 'authority_removed',
+    terminalReason?: RemoteDesktopWorkerDiagnosticEvent['terminalReason'],
+  ): void {
     const authority = this.core.get(sessionId);
     if (authority) {
       const connection = this.socket
@@ -1285,7 +1293,10 @@ export class RemoteDesktopWorkerHost {
         authority,
         connection?.generation,
         connection?.workerPid,
-        { cleanupReason },
+        {
+          cleanupReason,
+          ...(terminalReason === undefined ? {} : { terminalReason }),
+        },
       );
       // A worker that DECLARES a terminal is not thereby gone. Observed on a
       // real Windows node: the host logged cleanupReason="worker_terminal" and

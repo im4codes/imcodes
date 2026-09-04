@@ -33,6 +33,24 @@ struct Authority {
   std::vector<IceServer> ice_servers;
 };
 
+/**
+ * Bind fields deliberately omitted by an incremental authority envelope to
+ * the route admitted by PREPARE. Non-zero/non-empty values are never replaced,
+ * so downstream identity and deadline checks still reject attempted changes.
+ */
+inline Authority BindOmittedAuthorityFields(const Authority& current,
+                                             Authority update) noexcept {
+  if (update.expires_at_ms == 0)
+    update.expires_at_ms = current.expires_at_ms;
+  if (update.lease_expires_at_ms == 0)
+    update.lease_expires_at_ms = current.lease_expires_at_ms;
+  if (update.daemon_generation == 0)
+    update.daemon_generation = current.daemon_generation;
+  if (!update.route_generation)
+    update.route_generation = current.route_generation;
+  return update;
+}
+
 struct Signal {
   enum class Kind { kPrepare, kOffer, kIce, kLease, kMode, kStop };
   Kind kind = Kind::kStop;

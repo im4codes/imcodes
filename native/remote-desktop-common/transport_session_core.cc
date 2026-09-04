@@ -168,16 +168,27 @@ bool TransportSessionCore::Start(RouteAuthority authority, TransportTime now) {
 
 bool TransportSessionCore::RenewLease(const RouteAuthority& renewal,
                                       TransportTime now) {
+  // LEASE carries only the renewable deadline.  Its immutable absolute
+  // expiresAt was authenticated by PREPARE and is deliberately absent from
+  // every renewal envelope, so the native JSON parser leaves it at zero. Bind
+  // that omission to the already-held value before validation; a non-zero
+  // different value is still rejected below and can never move the boundary.
+  RouteAuthority bound_renewal = renewal;
+  if (bound_renewal.expires_at_unix_ms == 0) {
+    bound_renewal.expires_at_unix_ms = authority_.expires_at_unix_ms;
+  }
   if (!started_ || terminal_ || !ObserveTime(now) || !AuthorityAlive(now) ||
-      !renewal.IsValid(now, limits_.maximum_lease_future_ms) ||
-      !SameIdentity(authority_.identity, renewal.identity) ||
-      renewal.expires_at_unix_ms != authority_.expires_at_unix_ms ||
-      renewal.mode != authority_.mode ||
-      renewal.input_epoch != authority_.input_epoch ||
-      renewal.lease_expires_at_unix_ms <= authority_.lease_expires_at_unix_ms) {
+      !bound_renewal.IsValid(now, limits_.maximum_lease_future_ms) ||
+      !SameIdentity(authority_.identity, bound_renewal.identity) ||
+      bound_renewal.expires_at_unix_ms != authority_.expires_at_unix_ms ||
+      bound_renewal.mode != authority_.mode ||
+      bound_renewal.input_epoch != authority_.input_epoch ||
+      bound_renewal.lease_expires_at_unix_ms <=
+          authority_.lease_expires_at_unix_ms) {
     return false;
   }
-  authority_.lease_expires_at_unix_ms = renewal.lease_expires_at_unix_ms;
+  authority_.lease_expires_at_unix_ms =
+      bound_renewal.lease_expires_at_unix_ms;
   PublishDiagnostics();
   return true;
 }

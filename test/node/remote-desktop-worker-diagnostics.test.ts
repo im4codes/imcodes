@@ -7,6 +7,7 @@ import {
   RemoteDesktopWorkerDiagnostics,
   remoteDesktopWorkerDiagnosticsPath,
 } from '../../src/node/remote-desktop-worker-diagnostics.js';
+import { REMOTE_DESKTOP_TERMINAL_REASON } from '../../shared/remote-desktop.js';
 
 const correlationId = '0123456789abcdef01234567';
 const cleanup: string[] = [];
@@ -86,6 +87,7 @@ describe('RemoteDesktopWorkerDiagnostics', () => {
       signal: 'SECRET_SIGNAL',
       observedBy: 'SECRET_OBSERVER',
       cleanupReason: 'secret_cleanup_reason',
+      terminalReason: 'SECRET_TERMINAL_REASON',
       stdio: 'SECRET_STDIO',
     } as never);
     writer.write({
@@ -107,6 +109,32 @@ describe('RemoteDesktopWorkerDiagnostics', () => {
       correlationId,
     });
     expect(text).not.toMatch(/SECRET|secret/);
+  });
+
+  it('records only a shared terminal reason beside worker-declared cleanup', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-worker-diagnostics-'));
+    cleanup.push(directory);
+    const logPath = join(directory, 'worker.log');
+    const writer = new RemoteDesktopWorkerDiagnostics({
+      logPath,
+      now: () => Date.UTC(2026, 8, 4, 0, 0, 0),
+    });
+    writer.write({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+      correlationId,
+      cleanupReason: 'worker_terminal',
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    });
+    await writer.drain();
+
+    expect(JSON.parse(await readFile(logPath, 'utf8'))).toEqual({
+      version: 1,
+      timestamp: '2026-09-04T00:00:00.000Z',
+      event: 'cleanup',
+      correlationId,
+      cleanupReason: 'worker_terminal',
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    });
   });
 
   it('defers every filesystem operation off the lifecycle callback', async () => {

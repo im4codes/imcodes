@@ -1650,12 +1650,14 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
   bool RenewLease(const imcodes::rd::Authority& authority,
                   std::int64_t now_unix_ms,
                   std::int64_t now_monotonic_ms) override {
-    if (!Matches(authority) || session_ == nullptr ||
-        !session_->RenewRouteAuthority(CommonAuthority(authority),
+    const imcodes::rd::Authority bound =
+        imcodes::rd::BindOmittedAuthorityFields(authority_, authority);
+    if (!Matches(bound) || session_ == nullptr ||
+        !session_->RenewRouteAuthority(CommonAuthority(bound),
                                        {now_unix_ms, now_monotonic_ms})) {
       return false;
     }
-    authority_ = authority;
+    authority_ = bound;
     if (emitter_ != nullptr)
       emitter_->BindAuthority(authority_);
     return true;
@@ -1665,12 +1667,14 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
                std::string_view /*reason*/,
                std::int64_t now_unix_ms,
                std::int64_t now_monotonic_ms) override {
-    if (!Matches(authority) || session_ == nullptr ||
-        !session_->ApplyModeAuthority(CommonAuthority(authority),
+    const imcodes::rd::Authority bound =
+        imcodes::rd::BindOmittedAuthorityFields(authority_, authority);
+    if (!Matches(bound) || session_ == nullptr ||
+        !session_->ApplyModeAuthority(CommonAuthority(bound),
                                       {now_unix_ms, now_monotonic_ms})) {
       return false;
     }
-    authority_ = authority;
+    authority_ = bound;
     if (emitter_ != nullptr)
       emitter_->BindAuthority(authority_);
     if (transport_sink_ != nullptr)

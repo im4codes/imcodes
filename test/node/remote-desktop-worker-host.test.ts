@@ -920,12 +920,14 @@ describe('remote desktop worker artifact and IPC host', () => {
     const received: RemoteDesktopDaemonMessage[] = [];
     const helpers: net.Socket[] = [];
     const terminated: number[] = [];
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
       platform: 'win32',
       artifact,
       pipePath,
       allowPipeClients: () => {},
+      onLifecycleEvent: (event) => lifecycle.push(event),
       terminateProcess: (pid) => terminated.push(pid),
       launch: (_executable, argsLine) => {
         if (argsLine.includes('--release-all-input')) return;
@@ -975,6 +977,11 @@ describe('remote desktop worker artifact and IPC host', () => {
 
     // The process must be reaped even though it never closed its own pipe.
     await vi.waitFor(() => expect(terminated).toEqual([4242]), { timeout: 1_000 });
+    await vi.waitFor(() => expect(lifecycle).toContainEqual(expect.objectContaining({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+      cleanupReason: 'worker_terminal',
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })), { timeout: 1_000 });
   });
 
   it('does not reap on a controller stop, so a graceful worker exits on its own', async () => {

@@ -8,6 +8,8 @@ import { describe, expect, it } from "vitest";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const COMMON = resolve(ROOT, "native", "remote-desktop-common");
+const WINDOWS_PEER = resolve(ROOT, "native", "windows-remote-desktop", "peer_session.cc");
+const MACOS_WORKER = resolve(ROOT, "native", "macos-remote-desktop", "macos_remote_desktop_worker_main.mm");
 const COUNTERFACTUAL = resolve(
   ROOT,
   "test",
@@ -105,6 +107,15 @@ describe("remote-desktop common transport/session core contract", () => {
     );
   });
 
+  it("binds incremental lease and mode envelopes before platform authority checks", () => {
+    const windows = readFileSync(WINDOWS_PEER, "utf8");
+    const macos = readFileSync(MACOS_WORKER, "utf8");
+    expect(windows.match(/BindOmittedAuthorityFields\(authority_, (?:renewal|update)\)/g) ?? [])
+      .toHaveLength(2);
+    expect(macos.match(/BindOmittedAuthorityFields\(authority_, authority\)/g) ?? [])
+      .toHaveLength(2);
+  });
+
   it("pins every requested executable counterfactual", async () => {
     const counterfactual = readFileSync(COUNTERFACTUAL, "utf8").replace(
       /"\s*"/g,
@@ -114,6 +125,9 @@ describe("remote-desktop common transport/session core contract", () => {
       "stale generation renewal cannot extend route authority",
       "non-increasing renewal is rejected",
       "matching increasing renewal extends the lease",
+      "incremental authority inherits only omitted route fields",
+      "incremental authority never overwrites explicit route changes",
+      "lease wire omission inherits the bound absolute route expiry",
       "renewal cannot mutate the bound absolute route expiry",
       "renewal lease cannot outlive absolute route authority",
       "negotiated capability binding fences renewal authority",

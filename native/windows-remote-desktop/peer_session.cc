@@ -602,29 +602,33 @@ bool PeerSession::AddRemoteIceCandidate(
 }
 
 bool PeerSession::Renew(const Authority& renewal) {
-  if (!Matches(renewal) ||
-      renewal.daemon_generation != authority_.daemon_generation ||
-      renewal.route_generation != authority_.route_generation ||
-      !transport_core_.RenewLease(CommonAuthority(renewal),
+  const Authority bound_renewal =
+      BindOmittedAuthorityFields(authority_, renewal);
+  if (!Matches(bound_renewal) ||
+      bound_renewal.daemon_generation != authority_.daemon_generation ||
+      bound_renewal.route_generation != authority_.route_generation ||
+      !transport_core_.RenewLease(CommonAuthority(bound_renewal),
                                   CurrentTransportTime())) {
     return false;
   }
-  authority_.lease_expires_at_ms = renewal.lease_expires_at_ms;
+  authority_.lease_expires_at_ms = bound_renewal.lease_expires_at_ms;
   return true;
 }
 
 bool PeerSession::SetMode(const Authority& update, const std::string& reason) {
-  if (!Matches(update) ||
-      (update.mode != kViewMode && update.mode != kControlMode) ||
-      !transport_core_.UpdateMode(CommonAuthority(update),
+  const Authority bound_update =
+      BindOmittedAuthorityFields(authority_, update);
+  if (!Matches(bound_update) ||
+      (bound_update.mode != kViewMode && bound_update.mode != kControlMode) ||
+      !transport_core_.UpdateMode(CommonAuthority(bound_update),
                                   CurrentTransportTime())) {
     return false;
   }
   // The input epoch moves with the mode, and every input frame is bound to it,
   // so a stale-mode packet is already refused without a separate counter.
-  authority_.mode = update.mode;
-  authority_.input_epoch = update.input_epoch;
-  authority_.lease_expires_at_ms = update.lease_expires_at_ms;
+  authority_.mode = bound_update.mode;
+  authority_.input_epoch = bound_update.input_epoch;
+  authority_.lease_expires_at_ms = bound_update.lease_expires_at_ms;
   Json::Value response = BaseEnvelope(kModeStateType, authority_);
   response["mode"] = authority_.mode;
   response["inputEpoch"] = authority_.input_epoch;
