@@ -31,6 +31,8 @@ import {
 import { isMemoryScope } from '../../shared/memory-scope.js';
 import { registerMemoryShortRef } from '../context/memory-short-ref.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
+import { projectionOwnerCache } from '../daemon/memory-projection-owner-cache.js';
+import { matchesContextConsumerNamespace } from '../../shared/actionable-consumer-scope.js';
 
 export interface TransportContextBootstrapInput {
   projectDir?: string;
@@ -206,7 +208,20 @@ export async function buildTransportStartupMemory(
       ? { limit: limitOrOptions }
       : limitOrOptions;
     const limit = options.limit ?? STARTUP_MEMORY_TOTAL_LIMIT;
-    const remoteItems = options.managedSkillsOnly ? [] : (options.remoteItems ?? []);
+    const remoteItems = options.managedSkillsOnly ? [] : (options.remoteItems ?? []).filter((item) => (
+      matchesContextConsumerNamespace({
+        scope: item.scope as ContextNamespace['scope'],
+        projectId: item.projectId,
+        ...(item.userId ? { userId: item.userId } : {}),
+        ...(item.workspaceId ? { workspaceId: item.workspaceId } : {}),
+        ...(item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
+      }, namespace)
+    ));
+    for (const item of remoteItems) {
+      if (item.type === 'processed' && item.originServerId) {
+        projectionOwnerCache.set(item.id, item.originServerId);
+      }
+    }
     const remoteIds = new Set(remoteItems.map((item) => item.id));
     const selectionOptions = { totalLimit: limit, extraItems: remoteItems };
     // Startup memory selection runs in the context-store worker (bounded L3

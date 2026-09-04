@@ -9,6 +9,7 @@ import {
   isSupervisionTaskCoordinator,
 } from '../../shared/supervision-participant-authority.js';
 import { SUPERVISION_ID_PREFIXES } from '../../shared/supervision-durable-identity.js';
+import { matchesProjectSessionConsumer } from '../../shared/actionable-consumer-scope.js';
 
 import {
   canTransitionSupervisionTaskStatus,
@@ -409,6 +410,60 @@ export interface PersistedSupervisionTaskRecord {
   updatedAt: number;
 }
 
+export interface SupervisionLiveParticipantCandidate {
+  projectName: string;
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+}
+
+const SUPERVISION_IMPLEMENTATION_CONTINUATION_STATUSES = new Set([
+  'delegated', 'implementing', 'retrying_external_ci', 'rework',
+]);
+const SUPERVISION_OWNER_TERMINAL_STATUSES = new Set(['cancelled', 'finalized']);
+const SUPERVISION_AUDITOR_TERMINAL_STATUSES = new Set(['cancelled', 'finalized', 'passed', 'ready_for_integration']);
+
+/**
+ * Durable participant identity is deliberately smaller than runtime fencing
+ * metadata. A daemon/provider restart may rotate instance, epoch, agent type,
+ * or provider family without changing who owns the assignment.
+ */
+export function matchesDurableSupervisionParticipant(input: {
+  taskProjectName?: string | null;
+  assignmentSessionName?: string | null;
+  candidateProjectName?: string | null;
+  candidateSessionName?: string | null;
+}): boolean {
+  return matchesProjectSessionConsumer({
+    projectName: input.taskProjectName,
+    sessionName: input.assignmentSessionName,
+  }, {
+    projectName: input.candidateProjectName,
+    sessionName: input.candidateSessionName,
+  });
+}
+
+/** One role/status/revision predicate shared by delivery and recovery. */
+export function isSupervisionAssignmentContinuable(input: {
+  taskCurrentRevision?: string;
+  assignment: Pick<PersistedSupervisionTaskAssignment,
+    'role' | 'status' | 'required' | 'auditAttemptId' | 'auditRevision'>;
+}): boolean {
+  const { assignment } = input;
+  if (assignment.role === 'implementer') {
+    return assignment.required && SUPERVISION_IMPLEMENTATION_CONTINUATION_STATUSES.has(assignment.status);
+  }
+  if (assignment.role === 'coordinator' || assignment.role === 'integration_owner') {
+    return !SUPERVISION_OWNER_TERMINAL_STATUSES.has(assignment.status)
+      && (!assignment.auditRevision || input.taskCurrentRevision === assignment.auditRevision);
+  }
+  if (assignment.role === 'auditor') {
+    return !SUPERVISION_AUDITOR_TERMINAL_STATUSES.has(assignment.status)
+      && Boolean(assignment.auditAttemptId)
+      && Boolean(assignment.auditRevision)
+      && input.taskCurrentRevision === assignment.auditRevision;
+  }
+  return false;
+}
+
 export interface PersistedSupervisionTaskAssignment {
   version: typeof SUPERVISION_TASK_REGISTRY_DB_VERSION;
   assignmentId: string;
@@ -562,7 +617,8 @@ export interface SupervisionLifecycleConvergenceAction {
     | 'clear_consumed_finalized_owner_pointer'
     | 'adopt_cancelled_completion_evidence'
     | 'request_cancelled_completion_evidence_decision'
-    | 'record_already_present_delivery';
+    | 'record_already_present_delivery'
+    | 'retire_terminal_stale_auditor';
 }
 
 /** Runtime authority the registry cannot know by itself. */
@@ -572,13 +628,11 @@ export interface SupervisionLifecycleConvergenceOptions {
   inspectAssignmentWorktree?: (
     assignment: PersistedSupervisionTaskAssignment,
   ) => SupervisionWorktreeSnapshot | undefined;
-  /**
-   * The daemon's CURRENT authoritative Brain for a project. Convergence only
-   * ever rebinds a coordinator onto this identity, and only when it is the same
-   * logical session (name + agent type + provider family) whose runtime epoch
-   * drifted. A same-named clone from another runtime family is refused.
-   */
-  resolveAuthoritativeBrain?: (projectName: string | null | undefined) =>
+  /** The live runtime for the task's durable project + coordinator session. */
+  resolveAuthoritativeBrain?: (
+    projectName: string | null | undefined,
+    sessionName?: string | null | undefined,
+  ) =>
     PersistedSupervisionTaskAssignmentIdentity | undefined;
 }
 
@@ -768,6 +822,8 @@ export interface SupervisionTaskSnapshot extends PersistedSupervisionTaskRecord 
 
 export type SupervisionHousekeepingMode = 'dryRun' | 'apply';
 export type SupervisionHousekeepingActionKind =
+  | 'backfill_orphan_project'
+  | 'quarantine_orphan'
   | 'release_terminal_assignment'
   | 'retire_consumed_assignment'
   | 'repair_aggregate'
@@ -786,6 +842,15 @@ export interface SupervisionHousekeepingAction {
   fromRevision?: string;
   toRevision?: string;
   relatedTaskId?: string;
+  projectName?: string;
+  reason?: string;
+}
+
+export interface SupervisionHousekeepingDiagnostic {
+  taskId: string;
+  reason: 'orphan_project_backfill_ready' | 'orphan_project_ambiguous' | 'orphan_project_quarantine_ready';
+  assignmentIds: string[];
+  sessionNames: string[];
 }
 
 export interface SupervisionHousekeepingResult {
@@ -798,6 +863,7 @@ export interface SupervisionHousekeepingResult {
   archivedCount: number;
   actionCounts: Partial<Record<SupervisionHousekeepingActionKind, number>>;
   actions: SupervisionHousekeepingAction[];
+  orphanDiagnostics: SupervisionHousekeepingDiagnostic[];
   applyAuthorized: boolean;
 }
 
@@ -1047,6 +1113,17 @@ function parseEventRow(row: Record<string, unknown>): PersistedSupervisionTaskEv
 /** Re-exported from the ONE shared participant-authority boundary. Defining a
  *  second copy here is what let the task-visibility gate drift to name-only. */
 const identityMatches = supervisionIdentityMatches;
+
+function runtimeIdentityMetadataMatches(
+  left: PersistedSupervisionTaskAssignmentIdentity,
+  right: PersistedSupervisionTaskAssignmentIdentity,
+): boolean {
+  return left.sessionName === right.sessionName
+    && left.sessionInstanceId === right.sessionInstanceId
+    && left.runtimeEpoch === right.runtimeEpoch
+    && left.agentType === right.agentType
+    && left.providerFamily === right.providerFamily;
+}
 
 const HOUSEKEEPING_ASSIGNMENT_TERMINAL = new Set<SupervisionTaskLifecycleStatus>([
   'passed', 'ready_for_integration', 'committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled',
@@ -1639,19 +1716,79 @@ export class SupervisionTaskRegistry {
       SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
       Math.floor(input.limit ?? SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE),
     ));
-    const rows = this.list({
-      includeArchived: true,
-      projectName,
-      ...(input.cursor ? { cursor: input.cursor } : {}),
-      limit: limit + 1,
-    });
-    const hasMore = rows.length > limit;
+    const orphanCursorPrefix = 'orphan:';
+    const scanningOrphans = input.cursor?.startsWith(orphanCursorPrefix) === true;
+    const orphanCursor = scanningOrphans ? input.cursor!.slice(orphanCursorPrefix.length) : '';
+    const rows: SupervisionTaskSnapshot[] = scanningOrphans
+      ? (this.#db.prepare(
+          `SELECT payload_json AS payloadJson FROM supervision_tasks
+           WHERE project_name IS NULL AND task_id > ?
+           ORDER BY task_id ASC LIMIT ?`,
+        ).all(orphanCursor, limit + 1) as Array<Record<string, unknown>>)
+          .map(parseTaskRow)
+          .filter((task): task is PersistedSupervisionTaskRecord => task !== undefined)
+          .map((task) => this.get(task.taskId))
+          .filter((task): task is SupervisionTaskSnapshot => task !== undefined)
+      : this.list({
+          includeArchived: true,
+          projectName,
+          ...(input.cursor ? { cursor: input.cursor } : {}),
+          limit: limit + 1,
+        });
+    const pageHasMore = rows.length > limit;
     const batch = rows.slice(0, limit);
+    const hasNullProjectRows = !scanningOrphans && !pageHasMore && Boolean(this.#db.prepare(
+      'SELECT 1 AS found FROM supervision_tasks WHERE project_name IS NULL LIMIT 1',
+    ).get());
+    const hasMore = pageHasMore || hasNullProjectRows;
     const actions: SupervisionHousekeepingAction[] = [];
+    const orphanDiagnostics: SupervisionHousekeepingDiagnostic[] = [];
 
     for (const task of batch) {
       const assignments = task.assignments;
       const taskEvents = this.listEvents(task.taskId);
+      if (scanningOrphans) {
+        const assignmentIds = assignments.map((assignment) => assignment.assignmentId).sort();
+        const sessionNames = [...new Set(assignments.map((assignment) => assignment.identity.sessionName).filter(Boolean))].sort();
+        const liveSessionNames = new Set(
+          (this.#resolveLiveParticipants?.(projectName) ?? []).map((identity) => identity.sessionName),
+        );
+        const lineageProject = task.topLevelTaskId !== task.taskId
+          ? normalizeTaskString(this.getTaskRecord(task.topLevelTaskId)?.projectName)
+          : undefined;
+        const liveMatches = sessionNames.filter((sessionName) => liveSessionNames.has(sessionName));
+        const provenProject = lineageProject === projectName || liveMatches.length === 1;
+        const hasLiveReference = assignments.some((assignment) => Boolean(assignment.leaseId)
+          || !HOUSEKEEPING_ASSIGNMENT_TERMINAL.has(assignment.status));
+        const hasDurableEvidence = Boolean(task.currentRevision || task.commitSha || task.pushRemoteRef || task.finalization)
+          || taskEvents.some((event) => event.eventType !== 'created')
+          || this.listAuditReceipts(task.taskId).length > 0
+          || this.listCompletionEvidence(task.taskId).length > 0;
+        if (provenProject) {
+          actions.push({
+            taskId: task.taskId,
+            kind: 'backfill_orphan_project',
+            projectName,
+            reason: lineageProject === projectName ? 'top_level_project_lineage' : 'unique_live_session_lineage',
+          });
+          orphanDiagnostics.push({
+            taskId: task.taskId,
+            reason: 'orphan_project_backfill_ready', assignmentIds, sessionNames,
+          });
+        } else if (!hasLiveReference && !hasDurableEvidence) {
+          actions.push({ taskId: task.taskId, kind: 'quarantine_orphan', reason: 'no_authoritative_project_lineage' });
+          orphanDiagnostics.push({
+            taskId: task.taskId,
+            reason: 'orphan_project_quarantine_ready', assignmentIds, sessionNames,
+          });
+        } else {
+          orphanDiagnostics.push({
+            taskId: task.taskId,
+            reason: 'orphan_project_ambiguous', assignmentIds, sessionNames,
+          });
+        }
+        continue;
+      }
       for (const assignment of assignments) {
         const implementationFinished = assignment.status === 'ready_for_audit'
           && taskEvents.some((event) => event.assignmentId === assignment.assignmentId
@@ -1763,7 +1900,10 @@ export class SupervisionTaskRegistry {
            VALUES (?, 1, ?, ?, ?)
            ON CONFLICT(project_name) DO UPDATE SET apply_authorized = 1, cursor = excluded.cursor,
              next_due_at = excluded.next_due_at, updated_at = excluded.updated_at`,
-        ).run(projectName, hasMore ? batch.at(-1)?.taskId ?? null : null,
+        ).run(projectName, hasMore
+          ? (scanningOrphans ? `${orphanCursorPrefix}${batch.at(-1)?.taskId ?? ''}`
+            : pageHasMore ? batch.at(-1)?.taskId ?? null : orphanCursorPrefix)
+          : null,
           now + (hasMore ? 60_000 : 10 * 60_000), now);
         this.#db.exec('COMMIT');
       } catch (error) {
@@ -1778,13 +1918,18 @@ export class SupervisionTaskRegistry {
     return {
       mode,
       ...(input.cursor ? { cursor: input.cursor } : {}),
-      ...(hasMore && batch.length > 0 ? { nextCursor: batch.at(-1)!.taskId } : {}),
+      ...(hasMore ? {
+        nextCursor: scanningOrphans
+          ? `${orphanCursorPrefix}${batch.at(-1)?.taskId ?? orphanCursor}`
+          : pageHasMore ? batch.at(-1)!.taskId : orphanCursorPrefix,
+      } : {}),
       hasMore,
       scanned: batch.length,
       activeCount: counts.activeCount,
       archivedCount: counts.archivedCount,
       actionCounts,
       actions,
+      orphanDiagnostics,
       applyAuthorized: mode === 'apply' || this.housekeepingApplyAuthorized(projectName),
     };
   }
@@ -1856,6 +2001,69 @@ export class SupervisionTaskRegistry {
   }
 
   #applyHousekeepingAction(action: SupervisionHousekeepingAction, now: number): void {
+    if (action.kind === 'backfill_orphan_project' && action.projectName) {
+      const row = this.#db.prepare(
+        'SELECT project_name AS projectName FROM supervision_tasks WHERE task_id = ?',
+      ).get(action.taskId) as { projectName?: string | null } | undefined;
+      const task = this.getTaskRecord(action.taskId);
+      if (!task || row?.projectName != null) return;
+      const sessionNames = [...new Set(this.listAssignments(task.taskId)
+        .map((assignment) => assignment.identity.sessionName).filter(Boolean))];
+      const liveSessionNames = new Set(
+        (this.#resolveLiveParticipants?.(action.projectName) ?? []).map((identity) => identity.sessionName),
+      );
+      const lineageProject = task.topLevelTaskId !== task.taskId
+        ? normalizeTaskString(this.getTaskRecord(task.topLevelTaskId)?.projectName)
+        : undefined;
+      const liveMatches = sessionNames.filter((sessionName) => liveSessionNames.has(sessionName));
+      if (lineageProject !== action.projectName && liveMatches.length !== 1) return;
+      this.#writeTask({
+        ...task,
+        projectName: action.projectName,
+        cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
+        updatedAt: now,
+      }, this.#taskEventFor(task.status), {
+        source: 'housekeeping_orphan_project_backfill',
+        reason: lineageProject === action.projectName ? 'top_level_project_lineage' : 'unique_live_session_lineage',
+        projectName: action.projectName,
+        identityRebound: false,
+      });
+      return;
+    }
+    if (action.kind === 'quarantine_orphan') {
+      const row = this.#db.prepare(
+        'SELECT project_name AS projectName FROM supervision_tasks WHERE task_id = ?',
+      ).get(action.taskId) as { projectName?: string | null } | undefined;
+      const task = this.getTaskRecord(action.taskId);
+      if (!task || row?.projectName != null) return;
+      const assignments = this.listAssignments(task.taskId);
+      const taskEvents = this.listEvents(task.taskId);
+      const hasLiveReference = assignments.some((assignment) => Boolean(assignment.leaseId)
+        || !HOUSEKEEPING_ASSIGNMENT_TERMINAL.has(assignment.status));
+      const hasDurableEvidence = Boolean(task.currentRevision || task.commitSha || task.pushRemoteRef || task.finalization)
+        || taskEvents.some((event) => event.eventType !== 'created')
+        || this.listAuditReceipts(task.taskId).length > 0
+        || this.listCompletionEvidence(task.taskId).length > 0;
+      if (hasLiveReference || hasDurableEvidence) return;
+      const quarantined: PersistedSupervisionTaskRecord = {
+        ...task,
+        status: 'blocked',
+        blocker: 'orphan_project_unresolved',
+        cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
+        updatedAt: now,
+      };
+      this.#db.prepare(
+        `UPDATE supervision_tasks
+         SET status = ?, blocker = ?, payload_json = ?, updated_at = ?
+         WHERE task_id = ? AND project_name IS NULL`,
+      ).run(quarantined.status, quarantined.blocker ?? 'orphan_project_unresolved', JSON.stringify(quarantined), now, task.taskId);
+      this.#appendEvent(task.taskId, undefined, 'blocked', 'blocked', {
+        source: 'housekeeping_orphan_quarantine',
+        reason: 'no_authoritative_project_lineage',
+        identityRebound: false,
+      }, now);
+      return;
+    }
     if (action.kind === 'retire_consumed_assignment' && action.assignmentId) {
       const task = this.getTaskRecord(action.taskId);
       const assignment = this.getAssignment(action.assignmentId);
@@ -2158,6 +2366,26 @@ export class SupervisionTaskRegistry {
       clientMessageId: input.clientMessageId,
     }, now);
     this.#recordAssignmentHeartbeat(assignment, now);
+    const event = this.listEvents(assignment.taskId).at(-1);
+    return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
+  }
+
+  recordImplementationHeartbeatUnavailable(input: {
+    assignmentId: string;
+    now?: number;
+    retryNumber: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskEvent> {
+    const assignment = this.getAssignment(input.assignmentId);
+    if (!assignment) return { ok: false, reason: 'not_found' };
+    if (assignment.role !== 'implementer'
+      || (assignment.status !== 'delegated' && assignment.status !== 'implementing')) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    this.#appendEvent(assignment.taskId, assignment.assignmentId, 'implementation_heartbeat', assignment.status, {
+      source: 'implementation_watchdog_runtime_unavailable',
+      substantiveProgress: false,
+      retryNumber: input.retryNumber,
+    }, input.now ?? Date.now());
     const event = this.listEvents(assignment.taskId).at(-1);
     return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
   }
@@ -2677,6 +2905,17 @@ export class SupervisionTaskRegistry {
       // A converged instance/epoch is written in the SAME transaction as the
       // update it authorized, so no caller observes a half-rebound assignment.
       identity: authorizedIdentity,
+      executionBinding: existing.executionBinding ? {
+        ...existing.executionBinding,
+        actual: {
+          ...existing.executionBinding.actual,
+          sessionName: authorizedIdentity.sessionName,
+          sessionInstanceId: authorizedIdentity.sessionInstanceId,
+          runtimeEpoch: authorizedIdentity.runtimeEpoch,
+          agentType: authorizedIdentity.agentType,
+          providerFamily: authorizedIdentity.providerFamily,
+        },
+      } : undefined,
       status: nextStatus,
       auditAttemptId: normalizeTaskString(input.auditAttemptId) ?? existing.auditAttemptId,
       auditRevision: requestedAuditRevision
@@ -2796,6 +3035,106 @@ export class SupervisionTaskRegistry {
       this.#deriveTaskStatus(record.taskId, now);
       this.#db.exec('COMMIT');
       return { ok: true, value: record };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Refresh observational runtime metadata for one durable participant before
+   * a supervision continuation is delivered. Durable identity is exactly
+   * projectName + sessionName; instance/epoch/agent/provider are fencing and
+   * diagnostics only and may all rotate across a restart.
+   *
+   * This is intentionally below the ordinary participant gate so a legacy
+   * NULL-project row can be repaired. Exactly one live candidate must resolve
+   * by the durable key. No status, lease, revision, receipt or ownership
+   * pointer changes.
+   */
+  convergeImplementationHeartbeatTarget(input: {
+    taskId: string;
+    assignmentId: string;
+    candidates: readonly SupervisionLiveParticipantCandidate[];
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const assignment = this.getAssignment(input.assignmentId);
+    const task = this.getTaskRecord(input.taskId);
+    if (!assignment || !task || assignment.taskId !== task.taskId) return { ok: false, reason: 'not_found' };
+    if (!isSupervisionAssignmentContinuable({
+      taskCurrentRevision: task.currentRevision,
+      assignment,
+    })) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    const taskProject = normalizeTaskString(task.projectName);
+    const matches = input.candidates.filter((candidate) => matchesDurableSupervisionParticipant({
+      taskProjectName: taskProject,
+      assignmentSessionName: assignment.identity.sessionName,
+      candidateProjectName: candidate.projectName,
+      candidateSessionName: candidate.identity.sessionName,
+    }));
+    if (matches.length !== 1) return { ok: false, reason: 'ambiguous_assignment' };
+    const live = matches[0]!;
+    const now = input.now ?? Date.now();
+    const nextIdentity = live.identity;
+    const nextProject = live.projectName.trim();
+    const identityChanged = !runtimeIdentityMetadataMatches(assignment.identity, nextIdentity);
+    const projectChanged = taskProject !== nextProject;
+    if (!identityChanged && !projectChanged) return { ok: true, value: assignment, replay: true };
+
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedAssignment = this.getAssignment(input.assignmentId);
+      const lockedTask = this.getTaskRecord(input.taskId);
+      if (!lockedAssignment || !lockedTask || lockedAssignment.taskId !== lockedTask.taskId
+        || !isSupervisionAssignmentContinuable({
+          taskCurrentRevision: lockedTask.currentRevision,
+          assignment: lockedAssignment,
+        })) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (lockedAssignment.identity.sessionName !== assignment.identity.sessionName) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'owner_mismatch' };
+      }
+      const lockedProject = normalizeTaskString(lockedTask.projectName);
+      if (lockedProject && lockedProject !== nextProject) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'owner_mismatch' };
+      }
+      const rebound = {
+        ...lockedAssignment,
+        identity: nextIdentity,
+        executionBinding: lockedAssignment.executionBinding ? {
+          ...lockedAssignment.executionBinding,
+          actual: {
+            ...lockedAssignment.executionBinding.actual,
+            sessionName: nextIdentity.sessionName,
+            sessionInstanceId: nextIdentity.sessionInstanceId,
+            runtimeEpoch: nextIdentity.runtimeEpoch,
+            agentType: nextIdentity.agentType,
+            providerFamily: nextIdentity.providerFamily,
+          },
+        } : undefined,
+        updatedAt: now,
+      };
+      this.#writeAssignment(rebound, 'recovered', {
+        source: 'implementation_heartbeat_authoritative_rebind',
+        providerFamilyNormalized: lockedAssignment.identity.providerFamily !== nextIdentity.providerFamily,
+        agentTypeChanged: lockedAssignment.identity.agentType !== nextIdentity.agentType,
+        runtimeIdentityRotated: lockedAssignment.identity.sessionInstanceId !== nextIdentity.sessionInstanceId
+          || lockedAssignment.identity.runtimeEpoch !== nextIdentity.runtimeEpoch,
+      });
+      if (!lockedProject) {
+        this.#writeTask({ ...lockedTask, projectName: nextProject, updatedAt: now }, this.#taskEventFor(lockedTask.status), {
+          source: 'implementation_heartbeat_project_normalization',
+          assignmentId: lockedAssignment.assignmentId,
+        });
+      }
+      this.#db.exec('COMMIT');
+      return { ok: true, value: rebound };
     } catch (error) {
       this.#db.exec('ROLLBACK');
       throw error;
@@ -3325,15 +3664,11 @@ export class SupervisionTaskRegistry {
     const task = this.getTaskRecord(assignment.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
     if (task.projectName !== callerProjectName) return { ok: false, reason: 'owner_mismatch' };
-    // Authority is the coordinator assignment bound to THIS task, matched on the
-    // full persistent identity -- never "some available Brain in the project".
-    // A same-named replacement runtime is a different identity and inherits
-    // nothing; only an explicit authorized rebind may move the coordinator.
-    //
-    // An unusable identity FAILS CLOSED rather than throwing: an authority gate
-    // that raises on malformed input is a gate that can be crashed past.
+    // Authority is the coordinator assignment bound to THIS task. The task
+    // project was checked above; within it, sessionName is the durable owner.
+    // Runtime metadata may rotate and cannot strand the coordinator.
     const callerIdentity = input.callerIdentity;
-    if (!callerIdentity?.sessionName || !callerIdentity.sessionInstanceId || !callerIdentity.runtimeEpoch) {
+    if (!callerIdentity?.sessionName) {
       return { ok: false, reason: 'owner_mismatch' };
     }
     const coordinatorBound = isSupervisionTaskCoordinator(this.listAssignments(task.taskId), callerIdentity);
@@ -3622,7 +3957,7 @@ export class SupervisionTaskRegistry {
         && staleOwner.role === 'integration_owner'
         && staleOwner.taskId === task.taskId
         && staleOwner.identity.sessionName === owner.identity.sessionName
-        && !identityMatches(staleOwner.identity, owner.identity)
+        && !runtimeIdentityMetadataMatches(staleOwner.identity, owner.identity)
         && staleOwner.status === 'ready_for_integration'
         && staleOwner.leaseId === ''
         && !staleOwnerHasClaims
@@ -3848,7 +4183,9 @@ export class SupervisionTaskRegistry {
       || ['committed', 'pushed', 'finalized'].includes(task.status)) {
       return { ok: false, reason: 'receipt_closed' };
     }
-    if (identityMatches(assignment.identity, input.identity)) return { ok: true, value: assignment, replay: true };
+    if (runtimeIdentityMetadataMatches(assignment.identity, input.identity)) {
+      return { ok: true, value: assignment, replay: true };
+    }
     const now = input.now ?? Date.now();
     const rebound: PersistedSupervisionTaskAssignment = {
       ...assignment,
@@ -5000,12 +5337,26 @@ export class SupervisionTaskRegistry {
       if (current) {
         const authorized = this.#authorizeParticipant(current, input.identity);
         if (!authorized) return { ok: false, reason: 'owner_mismatch' };
-        if (authorized.sessionInstanceId !== current.identity.sessionInstanceId
-          || authorized.runtimeEpoch !== current.identity.runtimeEpoch) {
+        if (!runtimeIdentityMetadataMatches(authorized, current.identity)) {
           // Converge before the intent runs so this intent and every later
           // authorization boundary agree on one identity.
           this.#writeAssignment(
-            { ...current, identity: authorized, updatedAt: Date.now() },
+            {
+              ...current,
+              identity: authorized,
+              executionBinding: current.executionBinding ? {
+                ...current.executionBinding,
+                actual: {
+                  ...current.executionBinding.actual,
+                  sessionName: authorized.sessionName,
+                  sessionInstanceId: authorized.sessionInstanceId,
+                  runtimeEpoch: authorized.runtimeEpoch,
+                  agentType: authorized.agentType,
+                  providerFamily: authorized.providerFamily,
+                },
+              } : undefined,
+              updatedAt: Date.now(),
+            },
             this.#taskEventFor(current.status),
             { source: 'identity_convergence', previousRuntimeEpoch: current.identity.runtimeEpoch },
           );
@@ -5423,6 +5774,12 @@ export class SupervisionTaskRegistry {
     const limit = Math.max(1, Math.trunc(options.limit ?? SUPERVISION_LIFECYCLE_CONVERGENCE_LIMIT));
     const actions: SupervisionLifecycleConvergenceAction[] = [];
     let scanned = 0;
+    // Terminal aggregates are intentionally excluded from the ordinary ring,
+    // but legacy databases may still hold delegated/auditing auditor rows (and
+    // leases) beneath a cancelled aggregate. Retire a bounded batch first.
+    // This never invents a verdict or receipt and never touches active tasks.
+    actions.push(...this.#convergeTerminalStaleAuditors(now, limit));
+    if (actions.length >= limit) return actions;
     // Archived aggregates are INCLUDED. Archival is a retention/visibility
     // marker written at finalization, not a lifecycle state: a task that was
     // finalized once and then handed a newly authorized round is archived while
@@ -5501,6 +5858,74 @@ export class SupervisionTaskRegistry {
         const refreshed = this.getTaskRecord(candidateId);
         if (!refreshed || isTerminalSupervisionTaskStatus(refreshed.status)) break;
         current = refreshed;
+      }
+    }
+    return actions;
+  }
+
+  #convergeTerminalStaleAuditors(
+    now: number,
+    limit: number,
+  ): SupervisionLifecycleConvergenceAction[] {
+    const rows = this.#db.prepare(`
+      SELECT a.assignment_id AS assignmentId
+      FROM supervision_task_assignments a
+      JOIN supervision_tasks t ON t.task_id = a.task_id
+      WHERE t.status IN ('cancelled', 'finalized')
+        AND a.role = 'auditor'
+        AND a.status NOT IN ('cancelled', 'finalized')
+      ORDER BY a.assignment_id ASC
+      LIMIT ?
+    `).all(limit) as Array<{ assignmentId?: unknown }>;
+    const actions: SupervisionLifecycleConvergenceAction[] = [];
+    for (const row of rows) {
+      const assignmentId = normalizeTaskString(row.assignmentId as string | undefined);
+      const auditor = assignmentId ? this.getAssignment(assignmentId) : undefined;
+      const task = auditor ? this.getTaskRecord(auditor.taskId) : undefined;
+      if (!auditor || !task || auditor.role !== 'auditor'
+        || !['cancelled', 'finalized'].includes(task.status)
+        || ['cancelled', 'finalized'].includes(auditor.status)) continue;
+      // Any receipt is durable audit authority. Leave it for an exact receipt
+      // convergence/repair path rather than guessing how it should close.
+      if (this.listAuditReceipts(task.taskId).some((receipt) => receipt.assignmentId === auditor.assignmentId)) continue;
+      this.#db.exec('BEGIN IMMEDIATE');
+      try {
+        const lockedAuditor = this.getAssignment(auditor.assignmentId);
+        const lockedTask = this.getTaskRecord(task.taskId);
+        const hasReceipt = this.listAuditReceipts(task.taskId)
+          .some((receipt) => receipt.assignmentId === auditor.assignmentId);
+        if (!lockedAuditor || !lockedTask || lockedAuditor.role !== 'auditor'
+          || !['cancelled', 'finalized'].includes(lockedTask.status)
+          || ['cancelled', 'finalized'].includes(lockedAuditor.status)
+          || hasReceipt) {
+          this.#db.exec('ROLLBACK');
+          continue;
+        }
+        this.#writeAssignment({
+          ...lockedAuditor,
+          status: 'cancelled',
+          leaseId: '',
+          blocker: JSON.stringify({
+            kind: 'terminal_task_stale_auditor_retired',
+            taskId: lockedTask.taskId,
+            assignmentId: lockedAuditor.assignmentId,
+            priorStatus: lockedAuditor.status,
+          }),
+          updatedAt: now,
+        }, 'cancelled', {
+          source: 'terminal_task_stale_auditor_cleanup',
+          receiptFabricated: false,
+          leaseRevoked: Boolean(lockedAuditor.leaseId),
+        });
+        this.#db.exec('COMMIT');
+        actions.push({
+          taskId: lockedTask.taskId,
+          assignmentId: lockedAuditor.assignmentId,
+          action: 'retire_terminal_stale_auditor',
+        });
+      } catch (error) {
+        this.#db.exec('ROLLBACK');
+        throw error;
       }
     }
     return actions;
@@ -5839,11 +6264,8 @@ export class SupervisionTaskRegistry {
    * the authority is ambiguous and a human must decide.
    */
   /**
-   * Rebind a coordinator whose runtime epoch drifted (daemon restart) onto the
-   * SAME assignment. Authority is never transferred: the live Brain must be the
-   * same logical session name, agent type and provider family -- only the
-   * instance id and runtime epoch may differ. A same-named clone from another
-   * runtime family, or any other Brain, is refused.
+   * Refresh a coordinator's observational runtime metadata after restart while
+   * preserving its durable projectName + sessionName authority.
    */
   #convergeStaleCoordinator(
     task: PersistedSupervisionTaskRecord,
@@ -5851,8 +6273,6 @@ export class SupervisionTaskRegistry {
     resolve?: SupervisionLifecycleConvergenceOptions['resolveAuthoritativeBrain'],
   ): SupervisionLifecycleConvergenceAction | undefined {
     if (!resolve) return undefined;
-    const live = resolve(task.projectName);
-    if (!live?.sessionName || !live.sessionInstanceId || !live.runtimeEpoch) return undefined;
     const coordinators = this.listAssignments(task.taskId).filter((assignment) => (
       assignment.role === 'coordinator'
       && assignment.status !== 'cancelled'
@@ -5860,11 +6280,15 @@ export class SupervisionTaskRegistry {
     ));
     if (coordinators.length !== 1) return undefined;
     const coordinator = coordinators[0]!;
-    if (coordinator.identity.sessionName !== live.sessionName
-      || coordinator.identity.agentType !== live.agentType
-      || coordinator.identity.providerFamily !== live.providerFamily) return undefined;
-    if (coordinator.identity.sessionInstanceId === live.sessionInstanceId
-      && coordinator.identity.runtimeEpoch === live.runtimeEpoch) return undefined;
+    const live = resolve(task.projectName, coordinator.identity.sessionName);
+    if (!live?.sessionName) return undefined;
+    if (!matchesDurableSupervisionParticipant({
+      taskProjectName: task.projectName,
+      assignmentSessionName: coordinator.identity.sessionName,
+      candidateProjectName: task.projectName,
+      candidateSessionName: live.sessionName,
+    })) return undefined;
+    if (runtimeIdentityMetadataMatches(coordinator.identity, live)) return undefined;
     this.#writeAssignment({ ...coordinator, identity: { ...live }, updatedAt: now }, this.#taskEventFor(coordinator.status), {
       source: 'lifecycle_convergence_coordinator_rebind',
       previousRuntimeEpoch: coordinator.identity.runtimeEpoch,
@@ -6400,26 +6824,17 @@ export class SupervisionTaskRegistry {
     existing: PersistedSupervisionTaskAssignment,
     presented: PersistedSupervisionTaskAssignmentIdentity,
   ): PersistedSupervisionTaskAssignmentIdentity | undefined {
-    if (identityMatches(existing.identity, presented)) return existing.identity;
-    if (isTerminalSupervisionTaskStatus(existing.status)) return undefined;
-    if (existing.identity.sessionName !== presented.sessionName
-      || existing.identity.agentType !== presented.agentType
-      || existing.identity.providerFamily !== presented.providerFamily) return undefined;
-    const resolve = this.#resolveLiveParticipants;
-    if (!resolve) return undefined;
-    const task = this.getTaskRecord(existing.taskId);
-    const candidates = resolve(task?.projectName).filter((candidate: PersistedSupervisionTaskAssignmentIdentity) => (
-      candidate.sessionName === existing.identity.sessionName
-      && candidate.agentType === existing.identity.agentType
-      && candidate.providerFamily === existing.identity.providerFamily
-      && Boolean(candidate.sessionInstanceId)
-      && Boolean(candidate.runtimeEpoch)
-    ));
-    if (candidates.length !== 1) return undefined;
-    const live = candidates[0]!;
-    if (live.sessionInstanceId !== presented.sessionInstanceId
-      || live.runtimeEpoch !== presented.runtimeEpoch) return undefined;
-    return { ...existing.identity, sessionInstanceId: live.sessionInstanceId, runtimeEpoch: live.runtimeEpoch };
+    if (!identityMatches(existing.identity, presented)) return undefined;
+    // The assignment's task supplies the durable project boundary. Within it,
+    // sessionName is the owner; every other field is observational and can
+    // rotate or be absent during restart hydration.
+    return {
+      sessionName: existing.identity.sessionName,
+      sessionInstanceId: normalizeTaskString(presented.sessionInstanceId) ?? existing.identity.sessionInstanceId,
+      runtimeEpoch: normalizeTaskString(presented.runtimeEpoch) ?? existing.identity.runtimeEpoch,
+      agentType: normalizeTaskString(presented.agentType) ?? existing.identity.agentType,
+      providerFamily: normalizeTaskString(presented.providerFamily) ?? existing.identity.providerFamily,
+    };
   }
 
   recordFileEvent(input: SupervisionTaskFileEventInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {

@@ -49,6 +49,17 @@ beforeEach(() => {
 });
 
 describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
+  it('reuses the supervision authority gate at both resend and runtime FIFO drain edges', () => {
+    const manager = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
+    const resendGate = manager.indexOf('authorizeQueuedSupervisionHeartbeatDelivery({');
+    const resendDispatch = manager.indexOf('deliverTransportResendEntry(runtime, entry)');
+    const runtimeGate = manager.indexOf('runtime.pendingDrainAdmission = (entry) => authorizeQueuedSupervisionHeartbeatDelivery({');
+
+    expect(resendGate).toBeGreaterThanOrEqual(0);
+    expect(resendGate).toBeLessThan(resendDispatch);
+    expect(runtimeGate).toBeGreaterThan(resendDispatch);
+  });
+
   it('wires same-instance epoch rebinding and dead-runtime lease recovery before resend drain', () => {
     const source = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
     const launch = source.slice(source.indexOf('async function launchTransportSessionInner'));

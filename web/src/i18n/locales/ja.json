@@ -3018,6 +3018,7 @@
       "task_id": "タスク ID",
       "assignment_id": "アサインメント ID",
       "execution": "実行先",
+      "execution_identity": "{{label}}（{{sessionName}}）",
       "diagnostics": "診断情報"
     },
     "picker": {

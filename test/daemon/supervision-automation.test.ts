@@ -147,7 +147,13 @@ const { emitDelegationReplyDelivered } = await import('../../src/daemon/delegati
 const {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
+  setSupervisionLiveParticipantsResolver,
 } = await import('../../src/daemon/supervision-state-store.js');
+const { resolveLiveSupervisionParticipants } = await import('../../src/daemon/supervision-brain-authority.js');
+const {
+  authorizeQueuedSupervisionHeartbeatDelivery,
+  isExactContinuationEligible,
+} = await import('../../src/daemon/supervision-participant-delivery.js');
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -492,8 +498,8 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
   });
 
-  it('falls back to the supervisor when execution markers conflict', async () => {
-    const snapshot = await seedSession('supervised');
+  it('uses only the last authored execution marker and cannot double-advance', async () => {
+    const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-conflict', 'finish the task', snapshot);
     beginRun('cmd-marker-conflict', 'finish the task');
@@ -502,19 +508,31 @@ describe('SupervisionAutomation', () => {
       SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY,
     ].join('\n'));
 
-    await vi.waitFor(() => expect(mockSupervisionDecide).toHaveBeenCalledTimes(1));
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    await waitForTransportSendCount(1);
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('send exactly one reply-enabled audit request');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
   });
 
-  it('fast-paths the unique reserved status prefix without requiring terminal layout', async () => {
+  it('ignores quoted markers and preserves the assistant/host-dispatch metadata boundary', async () => {
     const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-inline', 'finish and audit the status protocol', snapshot);
     beginRun('cmd-marker-inline', 'finish and audit the status protocol');
-    completeTurn([
-      `Implementation is ready ${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`,
-      'Layout after the reserved marker does not change its protocol meaning.',
-    ].join('\n'));
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: [
+        `> ${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}`,
+        '```md',
+        SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+        '```',
+        SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY,
+        'Assistant-authored text may continue after the marker.',
+      ].join('\n'),
+      streaming: false,
+      delegationClaim: { status: 'substantiated', dispatches: [] },
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
 
     await waitForTransportSendCount(1);
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
@@ -5562,31 +5580,76 @@ describe('SupervisionAutomation', () => {
       expect(registry.listAssignments('tsk_r4b').filter((a) => a.role === 'coordinator')).toHaveLength(1);
     });
 
-    it('refuses a live session of a different agent/provider family under the same name', () => {
-      liveBrain('deck_r4c_brain', 'r4c', 'codex-sdk');
-      // The stored coordinator is an anthropic Brain; the live same-named
-      // session is a different runtime family and must never inherit authority.
+    it('keeps the same durable coordinator across agent/provider migration', () => {
+      const brain = liveBrain('deck_r4c_brain', 'r4c', 'codex-sdk');
       const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4c', 'r4c', 'deck_r4c_brain', 'claude-code-sdk');
 
       supervisionAutomation.__checkImplementationAssignmentsForTests(9_400_000);
 
-      const unchanged = registry.getAssignment(coordinator.assignmentId)!;
-      expect(unchanged.identity.runtimeEpoch).toBe('stale-epoch');
-      expect(unchanged.identity.agentType).toBe('claude-code-sdk');
+      const rebound = registry.getAssignment(coordinator.assignmentId)!;
+      expect(rebound.identity.runtimeEpoch).toBe(brain.runtimeEpoch);
+      expect(rebound.identity.agentType).toBe('codex-sdk');
     });
 
-    it('fails closed when the project has more than one live Brain', () => {
-      liveBrain('deck_r4d_brain', 'r4d');
+    it('selects the exact durable session when the project has another live Brain', () => {
+      const brain = liveBrain('deck_r4d_brain', 'r4d');
       liveBrain('deck_r4d_other', 'r4d');
       const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4d', 'r4d', 'deck_r4d_brain');
 
       supervisionAutomation.__checkImplementationAssignmentsForTests(9_500_000);
 
-      expect(registry.getAssignment(coordinator.assignmentId)!.identity.runtimeEpoch).toBe('stale-epoch');
+      expect(registry.getAssignment(coordinator.assignmentId)!.identity.runtimeEpoch).toBe(brain.runtimeEpoch);
     });
   });
 
   describe('durable single-implementer watchdog', () => {
+    const workerSessionNames = new Set<string>();
+
+    function liveWorkerIdentity(
+      sessionName = 'deck_watchdog_worker',
+      projectName = 'alpha',
+      agentType = 'codex-sdk',
+    ) {
+      workerSessionNames.add(sessionName);
+      upsertSession({
+        name: sessionName,
+        label: sessionName,
+        projectName,
+        parentSession: `${projectName}_brain`,
+        role: 'w1',
+        agentType,
+        runtimeType: 'transport',
+        providerId: agentType,
+        providerSessionId: `${sessionName}-provider`,
+        projectDir: '/work/watchdog',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      } as never);
+      const live = getSession(sessionName);
+      if (!live?.sessionInstanceId || !live.runtimeEpoch) throw new Error('live watchdog identity missing');
+      return {
+        sessionName,
+        sessionInstanceId: live.sessionInstanceId,
+        runtimeEpoch: live.runtimeEpoch,
+        agentType,
+        providerFamily: agentType === 'claude-code-sdk' ? 'anthropic' : 'openai',
+      };
+    }
+
+    beforeEach(() => {
+      setSupervisionLiveParticipantsResolver((projectName) => resolveLiveSupervisionParticipants(projectName));
+    });
+
+    afterEach(() => {
+      for (const sessionName of workerSessionNames) removeSession(sessionName);
+      workerSessionNames.clear();
+      setSupervisionLiveParticipantsResolver(undefined);
+      mockTransportRuntime.pendingEntries.length = 0;
+    });
+
     it('drives forward convergence from the periodic tick, not only the boot sweep', async () => {
       // Pins the WIRING: a boot-only sweep cannot close a window that opens
       // later, so the bounded interval itself must run the convergence step.
@@ -5605,10 +5668,7 @@ describe('SupervisionAutomation', () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-blocked-task';
       const assignmentId = 'watchdog-blocked-implementer';
-      const identity = {
-        sessionName: 'deck_watchdog_worker', sessionInstanceId: 'watchdog-instance', runtimeEpoch: 'watchdog-epoch',
-        agentType: 'codex-sdk', providerFamily: 'openai',
-      };
+      const identity = liveWorkerIdentity();
       expect(registry.createOrGet({
         taskId, projectName: 'alpha', classification: 'independent_top_level',
         objective: 'blocked worker must not be nagged', now: 1_000,
@@ -5642,10 +5702,7 @@ describe('SupervisionAutomation', () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-delegated-task';
       const assignmentId = 'watchdog-delegated-implementer';
-      const identity = {
-        sessionName: 'deck_watchdog_worker', sessionInstanceId: 'watchdog-instance', runtimeEpoch: 'watchdog-epoch',
-        agentType: 'codex-sdk', providerFamily: 'openai',
-      };
+      const identity = liveWorkerIdentity();
       expect(registry.createOrGet({
         taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'wake never-started work', now: 1_000,
       }).ok).toBe(true);
@@ -5676,10 +5733,7 @@ describe('SupervisionAutomation', () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-one-task';
       const assignmentId = 'watchdog-one-implementer';
-      const identity = {
-        sessionName: 'deck_watchdog_worker', sessionInstanceId: 'watchdog-instance', runtimeEpoch: 'watchdog-epoch',
-        agentType: 'codex-sdk', providerFamily: 'openai',
-      };
+      const identity = liveWorkerIdentity();
       expect(registry.createOrGet({
         taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'watch one implementer', now: 1_000,
       }).ok).toBe(true);
@@ -5700,7 +5754,7 @@ describe('SupervisionAutomation', () => {
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
       mockTransportRuntimeWorking = true;
       supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
-      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       mockTransportRuntimeWorking = false;
       supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -5764,6 +5818,280 @@ describe('SupervisionAutomation', () => {
         status: 'ready_for_audit',
       });
       expect(registry.getAssignment(assignmentId)?.verdict).toBeUndefined();
+    });
+
+    it.each([
+      ['short ids', 'tsk_wrong_target', 'asg_wrong_target'],
+      [
+        'uuid ids',
+        'supervision_task_02194a68-b895-4066-a720-239d22b0def4',
+        'supervision_assignment_d731cadc-04c6-46ed-939e-5acad1556238',
+      ],
+      [
+        'observed R6 uuid ids',
+        'supervision_task_d7f73972-b5f0-4c5b-8335-93eb3de9ef7a',
+        'supervision_assignment_d0d3e64a-263f-412c-9742-199cf6723186',
+      ],
+    ])('boundedly retries %s when its durable session runtime is transiently absent', (_label, taskId, assignmentId) => {
+      const registry = getSupervisionTaskRegistry();
+      const identity = {
+        sessionName: `missing_${assignmentId}`,
+        sessionInstanceId: 'assignment-instance',
+        runtimeEpoch: 'assignment-epoch',
+        agentType: 'codex-sdk',
+        providerFamily: 'openai',
+      };
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'never wake an arbitrary ready session', now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity, scopeFiles: ['src/target.ts'], now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      // A different ready runtime exists, and the transport mock would return
+      // it for any name. Session readiness therefore cannot be routing authority.
+      liveWorkerIdentity(`arbitrary_ready_${assignmentId}`);
+      mockTransportRuntime.send.mockClear();
+
+      let due = 2_000 + 10 * 60_000;
+      for (let retry = 1; retry <= 6; retry += 1) {
+        supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+        if (retry < 6) {
+          expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+          due += 10 * 60_000 * (2 ** (retry - 1));
+        }
+      }
+
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      const parked = registry.getAssignment(assignmentId)!;
+      expect(JSON.parse(parked.blocker!)).toMatchObject({
+        kind: 'implementation_heartbeat_runtime_unavailable',
+        taskId,
+        assignmentId,
+        retryCount: 6,
+      });
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_heartbeat'
+        && event.payload?.source === 'implementation_watchdog_runtime_unavailable'
+      ))).toHaveLength(5);
+      const eventsAfterPark = registry.listEvents(taskId).length;
+      supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+      expect(registry.listEvents(taskId)).toHaveLength(eventsAfterPark);
+    });
+
+    it.each([
+      ['supervision_task_16dedc23-1ef4-4ee9-829a-37595fb07527', 'supervision_assignment_b3958384-aa27-42c5-8665-26cb3b8b98a7'],
+      ['supervision_task_9637f19d-7269-49e2-b3e9-aaddb552a691', 'supervision_assignment_35ef1291-0a8e-4e35-8b56-51a583778456'],
+      ['supervision_task_e1c7ff3b-6dc7-463d-b949-a169ab98870a', 'supervision_assignment_fb3c4937-f727-4dbd-93ce-bac1d37e2cc5'],
+    ])('rejects the observed stale drain pairing %s without recording progress or retrying', (taskId, assignmentId) => {
+      const registry = getSupervisionTaskRegistry();
+      const identity = {
+        sessionName: `authoritative_owner_${assignmentId}`,
+        sessionInstanceId: 'owner-instance', runtimeEpoch: 'owner-epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+      };
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'production wrong drain fixture', now: 1,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity, scopeFiles: ['src/drain.ts'], now: 2,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      liveWorkerIdentity('deck_sub_4s48141x');
+      const text = JSON.stringify({
+        contractRefs: [SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT],
+        binding: { mode: 'continue_existing', taskId, assignmentId },
+        action: 'advance_safe_unfinished',
+      });
+      const input = {
+        targetSessionName: 'deck_sub_4s48141x',
+        clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:1`,
+        text,
+      };
+
+      expect(authorizeQueuedSupervisionHeartbeatDelivery(input)).toBe(false);
+      const eventCount = registry.listEvents(taskId).length;
+      expect(authorizeQueuedSupervisionHeartbeatDelivery(input)).toBe(false);
+
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+      expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_heartbeat')).toHaveLength(0);
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
+        kind: 'implementation_heartbeat_identity_rebind_required', taskId, assignmentId,
+      });
+    });
+
+    it('uses only durable project+session identity across empty or rotated runtime metadata', () => {
+      const assignment = {
+        role: 'implementer' as const,
+        status: 'implementing' as const,
+        required: true,
+        identity: {
+          sessionName: 'deck_alpha_worker', sessionInstanceId: 'old-instance', runtimeEpoch: 'old-epoch',
+          agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        },
+      };
+      expect(isExactContinuationEligible({
+        taskProjectName: 'alpha', taskCurrentRevision: 'r1', assignment,
+        targetProjectName: 'alpha', targetIdentity: { sessionName: 'deck_alpha_worker' },
+      })).toBe(true);
+      expect(isExactContinuationEligible({
+        taskProjectName: 'alpha', taskCurrentRevision: 'r1', assignment,
+        targetProjectName: 'alpha', targetIdentity: {
+          sessionName: 'deck_alpha_worker', sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch',
+          agentType: 'codex-sdk', providerFamily: 'openai',
+        },
+      })).toBe(true);
+      expect(isExactContinuationEligible({
+        taskProjectName: 'alpha', taskCurrentRevision: 'r1', assignment,
+        targetProjectName: 'beta', targetIdentity: { sessionName: 'deck_alpha_worker' },
+      })).toBe(false);
+      expect(isExactContinuationEligible({
+        taskProjectName: 'alpha', taskCurrentRevision: 'r1', assignment,
+        targetProjectName: 'alpha', targetIdentity: {},
+      })).toBe(false);
+    });
+
+    it('fails closed on registry outage and malformed heartbeat XOR pairings', () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-outage-task';
+      const assignmentId = 'watchdog-outage-assignment';
+      const identity = liveWorkerIdentity('deck_watchdog_outage');
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'fail closed', now: 1,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({ assignmentId, taskId, role: 'implementer', identity, now: 2 }).ok).toBe(true);
+      const text = JSON.stringify({
+        contractRefs: [SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT],
+        binding: { mode: 'continue_existing', taskId, assignmentId },
+        action: 'advance_safe_unfinished',
+      });
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:1`,
+        text: '{}',
+      })).toBe(false);
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId: 'ordinary-message-id',
+        text,
+      })).toBe(false);
+
+      const outage = vi.spyOn(registry, 'convergeImplementationHeartbeatTarget')
+        .mockImplementation(() => { throw new Error('registry unavailable'); });
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:2`,
+        text,
+      })).toBe(false);
+      outage.mockRestore();
+    });
+
+    it('quarantines a same-named runtime from a different project exactly once', () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-cross-project-task';
+      const assignmentId = 'watchdog-cross-project-assignment';
+      const identity = liveWorkerIdentity('deck_shared_name', 'beta');
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'project fence', now: 1,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer',
+        identity: { ...identity, sessionInstanceId: 'stored-instance', runtimeEpoch: 'stored-epoch' }, now: 2,
+      }).ok).toBe(true);
+      const text = JSON.stringify({
+        contractRefs: [SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT],
+        binding: { mode: 'continue_existing', taskId, assignmentId },
+        action: 'advance_safe_unfinished',
+      });
+      const input = {
+        targetSessionName: identity.sessionName,
+        clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:1`,
+        text,
+      };
+      expect(authorizeQueuedSupervisionHeartbeatDelivery(input)).toBe(false);
+      const events = registry.listEvents(taskId).length;
+      expect(authorizeQueuedSupervisionHeartbeatDelivery(input)).toBe(false);
+      expect(registry.listEvents(taskId)).toHaveLength(events);
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
+        kind: 'implementation_heartbeat_identity_rebind_required', candidateCount: 1,
+      });
+    });
+
+    it('atomically rebinds a rotated runtime epoch before delivering to the same live participant', () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-rotated-task';
+      const assignmentId = 'watchdog-rotated-implementer';
+      const live = liveWorkerIdentity('deck_watchdog_rotated');
+      const stale = { ...live, sessionInstanceId: 'old-instance', runtimeEpoch: 'old-epoch' };
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'resume after restart', now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: stale, scopeFiles: ['src/restart.ts'], now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      mockTransportRuntime.send.mockClear();
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
+
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(registry.getAssignment(assignmentId)!.identity).toEqual(live);
+      expect(registry.getAssignment(assignmentId)!.blocker).toBeUndefined();
+    });
+
+    it('normalizes the legacy claude family while preserving the same assignment', () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-legacy-family-task';
+      const assignmentId = 'watchdog-legacy-family-implementer';
+      const live = liveWorkerIdentity('deck_watchdog_legacy', 'alpha', 'claude-code-sdk');
+      const legacy = {
+        ...live,
+        sessionInstanceId: 'legacy-instance',
+        runtimeEpoch: 'legacy-epoch',
+        providerFamily: 'claude',
+      };
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'legacy metadata migration', now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: legacy, scopeFiles: ['src/legacy.ts'], now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      mockTransportRuntime.send.mockClear();
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
+
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(registry.getAssignment(assignmentId)).toMatchObject({ assignmentId, identity: live });
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+    });
+
+    it('appends one durable reminder while busy and does not enqueue a second across a restart tick', () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-busy-task';
+      const assignmentId = 'watchdog-busy-implementer';
+      const identity = liveWorkerIdentity('deck_watchdog_busy');
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'durable busy wake', now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity, scopeFiles: ['src/busy.ts'], now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      mockTransportRuntimeWorking = true;
+      mockTransportRuntime.send.mockImplementationOnce((_prompt, clientMessageId) => {
+        (mockTransportRuntime.pendingEntries as Array<{ clientMessageId: string }>).push({ clientMessageId });
+      });
+
+      const due = 2_000 + 10 * 60_000;
+      supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      // A rehydrated automation tick observes the same durable FIFO entry and
+      // must not append a duplicate, even long after the ordinary backoff.
+      supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_heartbeat')).toHaveLength(1);
     });
   });
 

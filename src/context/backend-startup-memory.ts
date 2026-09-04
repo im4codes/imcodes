@@ -10,6 +10,10 @@ interface BackendStartupMemorySearchResponse {
     class?: string;
     preview?: string;
     projectId?: string;
+    userId?: string;
+    workspaceId?: string;
+    enterpriseId?: string;
+    originServerId?: string;
     updatedAt?: number;
   }>;
 }
@@ -77,6 +81,7 @@ export async function fetchBackendStartupMemoryItems(
         ...(namespace.enterpriseId ? { enterpriseId: namespace.enterpriseId } : {}),
         ...(namespace.workspaceId ? { workspaceId: namespace.workspaceId } : {}),
         ...(namespace.userId ? { userId: namespace.userId } : {}),
+        ...(item.originServerId ? { originServerId: item.originServerId } : {}),
         projectionClass,
         summary: item.preview,
         createdAt: item.updatedAt ?? 0,

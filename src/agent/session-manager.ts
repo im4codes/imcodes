@@ -83,6 +83,7 @@ import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup
 import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues, recipientFromSessionRecord } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { deliverTransportResendEntry } from './transport-resend-delivery.js';
+import { authorizeQueuedSupervisionHeartbeatDelivery } from '../daemon/supervision-participant-delivery.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
@@ -1380,6 +1381,11 @@ async function drainTransportResendQueueIntoRuntime(
     await drainResend(
       sessionName,
       async (entry) => {
+        if (!authorizeQueuedSupervisionHeartbeatDelivery({
+          targetSessionName: sessionName,
+          clientMessageId: entry.clientMessageId ?? entry.commandId ?? '',
+          text: entry.text,
+        })) return 'failed';
         const attachments = entry.attachments ?? [];
         const result = await deliverTransportResendEntry(runtime, entry);
         if ((result === 'sent' || result === 'appended') && !entry.timelineCommitted) {
@@ -1756,6 +1762,11 @@ function wireTransportCallbacks(
       { source: 'daemon', confidence: 'high' },
     );
   };
+  runtime.pendingDrainAdmission = (entry) => authorizeQueuedSupervisionHeartbeatDelivery({
+    targetSessionName: sessionName,
+    clientMessageId: entry.clientMessageId,
+    text: entry.text,
+  });
   runtime.onActiveAppend = (messages, snapshot) => {
     const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);
     for (const entry of messages) {

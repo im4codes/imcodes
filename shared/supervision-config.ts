@@ -1598,19 +1598,42 @@ export interface ParsedSupervisionExecutionState {
   markerCount: number;
 }
 
+const SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(ADVANCE|AUDIT_READY|NEEDS_INPUT|WAITING)\s*-->[ \t]*$/;
+const MARKDOWN_FENCE_OPEN_RE = /^[ \t]{0,3}(`{3,}|~{3,})/;
+
+/**
+ * Parse only assistant-authored marker lines. Host dispatch metadata is carried
+ * beside `assistant.text.payload.text`, never concatenated into this input.
+ * Markdown quotations, fenced examples, inline prose and indented code are not
+ * protocol authority. When a model corrects itself in one response, the last
+ * valid marker is authoritative and the caller still performs one transition.
+ */
 export function parseSupervisionExecutionStateDetailsFromText(text: string): ParsedSupervisionExecutionState {
-  const matches = [...text.matchAll(/<!--\s*IMCODES_EXEC:\s*(ADVANCE|AUDIT_READY|NEEDS_INPUT|WAITING)\s*-->/g)];
-  if (matches.length !== 1) return { state: null, markerCount: matches.length };
-  const state = matches[0]?.[1];
+  const matches: string[] = [];
+  let fence: { delimiter: '`' | '~'; length: number } | undefined;
+  for (const line of text.split(/\r?\n/u)) {
+    const fenceMatch = line.match(MARKDOWN_FENCE_OPEN_RE)?.[1];
+    if (fence) {
+      if (fenceMatch?.[0] === fence.delimiter && fenceMatch.length >= fence.length) fence = undefined;
+      continue;
+    }
+    if (fenceMatch) {
+      fence = { delimiter: fenceMatch[0] as '`' | '~', length: fenceMatch.length };
+      continue;
+    }
+    const marker = line.match(SUPERVISION_EXECUTION_MARKER_LINE_RE)?.[1];
+    if (marker) matches.push(marker);
+  }
+  const state = matches[matches.length - 1];
   switch (state) {
     case 'ADVANCE':
-      return { state: 'advance', markerCount: 1 };
+      return { state: 'advance', markerCount: matches.length };
     case 'AUDIT_READY':
-      return { state: 'audit_ready', markerCount: 1 };
+      return { state: 'audit_ready', markerCount: matches.length };
     case 'NEEDS_INPUT':
-      return { state: 'needs_input', markerCount: 1 };
+      return { state: 'needs_input', markerCount: matches.length };
     case 'WAITING':
-      return { state: 'waiting', markerCount: 1 };
+      return { state: 'waiting', markerCount: matches.length };
     default:
       return { state: null, markerCount: matches.length };
   }

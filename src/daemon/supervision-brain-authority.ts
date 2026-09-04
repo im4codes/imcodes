@@ -13,20 +13,22 @@ import type { PersistedSupervisionTaskAssignmentIdentity } from './supervision-s
  * instance, epoch, agent type, provider family) and the caller compares the
  * stable parts itself.
  *
- * Fail-closed by construction. It returns undefined unless EXACTLY ONE live,
- * non-stopped, top-level Brain owns the project, so a same-named clone, a
- * sub-session, or two competing Brains all yield no answer rather than a guess.
- * It never picks the first row of an ambiguous list and never matches on
- * project or session name alone.
+ * When a durable session name is supplied, other Brain sessions in the same
+ * project are irrelevant rather than ambiguous. Without it, legacy callers
+ * still require exactly one live top-level Brain. Runtime metadata is returned
+ * for observability only and never changes the durable owner.
  */
 export function resolveAuthoritativeBrainIdentity(
   projectName: string | null | undefined,
   sessions: readonly SessionRecord[] = listSessions(),
+  sessionName?: string | null,
 ): PersistedSupervisionTaskAssignmentIdentity | undefined {
   const project = projectName?.trim();
+  const durableSession = sessionName?.trim();
   if (!project) return undefined;
   const brains = sessions.filter((session) => (
     session.projectName === project
+    && (!durableSession || session.name === durableSession)
     && session.role === 'brain'
     // A sub-session can carry a brain-ish role but never owns project authority.
     && !session.parentSession

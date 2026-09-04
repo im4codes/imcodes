@@ -194,6 +194,30 @@ describe('DelegationClaimBadge', () => {
     expect(diagnostics?.textContent).toContain('delegated');
   });
 
+  it.each([
+    { label: undefined, expected: 'deck_sub_3v4p6g0n' },
+    { label: 'deck_sub_3v4p6g0n', expected: 'deck_sub_3v4p6g0n' },
+  ])('falls back to sessionName without duplicating an absent or identical label', ({ label, expected }) => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp_label_fallback', taskId: 'tsk_label', assignmentId: 'asg_label',
+          deliveries: [{
+            target: 'deck_sub_3v4p6g0n', status: 'delivered',
+            execution: {
+              sessionName: 'deck_sub_3v4p6g0n', ...(label ? { label } : {}),
+              model: 'gpt-5.6-sol', pool: 'primary', source: 'assignment',
+            },
+          }],
+        }],
+      }),
+    }));
+    const text = container.querySelector('[data-delegation-field="execution"]')?.textContent ?? '';
+    expect(text).toContain(expected);
+    expect(text.match(/deck_sub_3v4p6g0n/g)).toHaveLength(1);
+  });
+
   it('leads with session, then model, then pool — the three facts a reader acts on', () => {
     // R1 made the executor available; R2 is about what the eye lands on first.
     // A reader scanning a turn wants to know WHO ran it, on WHAT model, in
@@ -398,7 +422,7 @@ describe('readDelegationClaimMetadata', () => {
 
 describe('delegation.claim locale coverage', () => {
   const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
-  const KEYS = ['none', 'dispatch_count', 'dispatch_id', 'task_id', 'assignment_id', 'execution', 'diagnostics'] as const;
+  const KEYS = ['none', 'dispatch_count', 'dispatch_id', 'task_id', 'assignment_id', 'execution', 'execution_identity', 'diagnostics'] as const;
 
   it('ships every badge string in all 7 locales', () => {
     for (const locale of SUPPORTED_LOCALES) {
@@ -416,6 +440,17 @@ describe('delegation.claim locale coverage', () => {
       expect(claim?.dispatch_count as string, `${locale}: delegation.claim.dispatch_count`)
         .toContain('{{total}}');
     }
+  });
+
+  it('localizes the visible label/session provenance shape', () => {
+    const zh = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/zh-CN.json'), 'utf8')) as {
+      delegation: { claim: Record<string, string> };
+    };
+    const en = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as {
+      delegation: { claim: Record<string, string> };
+    };
+    expect(zh.delegation.claim.execution_identity).toBe('{{label}}（{{sessionName}}）');
+    expect(en.delegation.claim.execution_identity).toBe('{{label}} ({{sessionName}})');
   });
 });
 

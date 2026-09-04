@@ -3018,6 +3018,7 @@
       "task_id": "ID задачи",
       "assignment_id": "ID назначения",
       "execution": "Выполняется на",
+      "execution_identity": "{{label}} ({{sessionName}})",
       "diagnostics": "Диагностика"
     },
     "picker": {

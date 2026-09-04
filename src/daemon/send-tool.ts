@@ -79,6 +79,7 @@ import type {
   SupervisionAutoProvisionResult,
 } from './supervision-auto-provision.js';
 import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
+import { isExactContinuationEligible } from './supervision-participant-delivery.js';
 import {
   EXECUTION_CLONE_KIND,
   EXECUTION_CLONE_ERROR_CODES,
@@ -613,15 +614,6 @@ const AUDITOR_TERMINAL_STATUSES = new Set<string>(['cancelled', 'finalized', 'pa
  * with a perfectly valid binding fell through to the compatibility scan and
  * was reported as an unrelated worktree ambiguity.
  */
-const OWNER_CONTINUATION_ROLES = new Set<string>(['integration_owner', 'coordinator']);
-
-/**
- * Terminal states for those owner roles. This is deliberately NOT the auditor
- * set: `ready_for_integration` ends an audit but is the WORKING state of an
- * integration owner, so sharing one set would make every owner unreachable
- * exactly when it needs to be driven.
- */
-const OWNER_TERMINAL_STATUSES = new Set<string>(['cancelled', 'finalized']);
 
 function assignmentMatchesLiveTargetBase(
   assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
@@ -631,30 +623,14 @@ function assignmentMatchesLiveTargetBase(
     && assignment.role === 'implementer'
     && assignment.required
     && HOOK_WORKTREE_RECOVERY_STATUSES.has(assignment.status)
-    && assignment.identity.sessionName === target.name
-    && assignment.identity.sessionInstanceId === target.sessionInstanceId
-    && assignment.identity.runtimeEpoch === target.runtimeEpoch);
+    && assignment.identity.sessionName === target.name);
 }
 
 function assignmentMatchesLiveTarget(
   assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
   target: SessionRecord,
 ): boolean {
-  return assignmentMatchesLiveTargetBase(assignment, target)
-    && assignment?.identity.agentType === target.agentType
-    && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target);
-}
-
-/** The exact five-field identity match shared by every exact-binding role. */
-function identityMatchesLiveTarget(
-  assignment: NonNullable<ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>>,
-  target: SessionRecord,
-): boolean {
-  return assignment.identity.sessionName === target.name
-    && assignment.identity.sessionInstanceId === target.sessionInstanceId
-    && assignment.identity.runtimeEpoch === target.runtimeEpoch
-    && assignment.identity.agentType === target.agentType
-    && assignment.identity.providerFamily === resolvePeerAuditProviderFamily(target);
+  return assignmentMatchesLiveTargetBase(assignment, target);
 }
 
 /**
@@ -662,50 +638,9 @@ function identityMatchesLiveTarget(
  * send_message resolution AND the hook worktree gate so the two cannot drift.
  * There is deliberately no second role set anywhere: both layers call this.
  *
- * `targetIdentity` is already-resolved identity, so callers holding a
- * SessionRecord must map it (including resolvePeerAuditProviderFamily) first.
+ * Runtime instance/epoch/agent/provider remain observational metadata. The
+ * durable participant key is only projectName + sessionName.
  */
-export function isExactContinuationEligible(input: {
-  taskCurrentRevision?: string | undefined;
-  assignment: {
-    role: string; status: string; required?: boolean;
-    auditAttemptId?: string | undefined; auditRevision?: string | undefined;
-    identity: { sessionName: string; sessionInstanceId: string; runtimeEpoch: string; agentType: string; providerFamily: string };
-  };
-  targetIdentity: {
-    sessionName?: string | undefined; sessionInstanceId?: string | undefined;
-    runtimeEpoch?: string | undefined; agentType?: string | undefined; providerFamily?: string | undefined;
-  };
-}): boolean {
-  const { assignment, targetIdentity } = input;
-  // Fail closed on any missing identity field, so two `undefined`s can never
-  // be treated as a match.
-  if ([targetIdentity.sessionName, targetIdentity.sessionInstanceId, targetIdentity.runtimeEpoch,
-    targetIdentity.agentType, targetIdentity.providerFamily].some((value) => !value)) return false;
-  const identityMatches = assignment.identity.sessionName === targetIdentity.sessionName
-    && assignment.identity.sessionInstanceId === targetIdentity.sessionInstanceId
-    && assignment.identity.runtimeEpoch === targetIdentity.runtimeEpoch
-    && assignment.identity.agentType === targetIdentity.agentType
-    && assignment.identity.providerFamily === targetIdentity.providerFamily;
-  if (!identityMatches) return false;
-  if (assignment.role === 'implementer') {
-    return HOOK_WORKTREE_RECOVERY_STATUSES.has(assignment.status);
-  }
-  if (OWNER_CONTINUATION_ROLES.has(assignment.role)) {
-    if (OWNER_TERMINAL_STATUSES.has(assignment.status)) return false;
-    // A bound revision must still agree with the task, so a stale owner cannot
-    // be driven against a revision the task has moved past.
-    return !assignment.auditRevision || input.taskCurrentRevision === assignment.auditRevision;
-  }
-  if (assignment.role === 'auditor') {
-    return !AUDITOR_TERMINAL_STATUSES.has(assignment.status)
-      && Boolean(assignment.auditAttemptId)
-      && Boolean(assignment.auditRevision)
-      && input.taskCurrentRevision === assignment.auditRevision;
-  }
-  return false;
-}
-
 function explicitAssignmentMatchesLiveTarget(
   task: SupervisionTaskSnapshot | undefined,
   assignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>,
@@ -714,6 +649,7 @@ function explicitAssignmentMatchesLiveTarget(
   if (!task || !assignment || assignment.taskId !== task.taskId) return false;
   if (assignment.role === 'implementer' && !assignment.required) return false;
   return isExactContinuationEligible({
+    taskProjectName: task.projectName,
     taskCurrentRevision: task.currentRevision,
     assignment: {
       role: assignment.role,
@@ -723,6 +659,7 @@ function explicitAssignmentMatchesLiveTarget(
       auditRevision: assignment.auditRevision,
       identity: assignment.identity,
     },
+    targetProjectName: target.projectName,
     targetIdentity: {
       sessionName: target.name,
       sessionInstanceId: target.sessionInstanceId,
@@ -795,6 +732,21 @@ async function ensureHookSupervisionAssignmentWorktree(input: {
           }),
         };
       }
+      const refreshed = registry.convergeImplementationHeartbeatTarget({
+        taskId: task.taskId,
+        assignmentId: assignment.assignmentId,
+        candidates: [{
+          projectName: input.target.projectName,
+          identity: {
+            sessionName: input.target.name,
+            sessionInstanceId: input.target.sessionInstanceId ?? '',
+            runtimeEpoch: input.target.runtimeEpoch ?? '',
+            agentType: input.target.agentType,
+            providerFamily: resolvePeerAuditProviderFamily(input.target),
+          },
+        }],
+      });
+      if (refreshed.ok) assignment = refreshed.value;
     }
     if (!task || !assignment
       || assignment.taskId !== task.taskId
@@ -1037,11 +989,11 @@ function deterministicSendMessageId(seed: string): SendMessageId {
 
 
 function supervisionTaskIdentityForTarget(target: SessionRecord): PersistedSupervisionTaskAssignmentIdentity | undefined {
-  if (!target.sessionInstanceId || !target.runtimeEpoch) return undefined;
+  if (!target.name.trim()) return undefined;
   return {
     sessionName: target.name,
-    sessionInstanceId: target.sessionInstanceId,
-    runtimeEpoch: target.runtimeEpoch,
+    sessionInstanceId: target.sessionInstanceId ?? '',
+    runtimeEpoch: target.runtimeEpoch ?? '',
     agentType: target.agentType,
     providerFamily: resolvePeerAuditProviderFamily(target),
   };
@@ -1051,11 +1003,8 @@ function supervisionIdentityMatches(
   left: PersistedSupervisionTaskAssignmentIdentity,
   right: PersistedSupervisionTaskAssignmentIdentity,
 ): boolean {
-  return left.sessionName === right.sessionName
-    && left.sessionInstanceId === right.sessionInstanceId
-    && left.runtimeEpoch === right.runtimeEpoch
-    && left.agentType === right.agentType
-    && left.providerFamily === right.providerFamily;
+  return Boolean(left.sessionName.trim() && right.sessionName.trim()
+    && left.sessionName === right.sessionName);
 }
 
 export async function dispatchSendMessage(
@@ -1452,6 +1401,7 @@ export async function dispatchSendMessage(
         || !supervisionCallerParticipates(
           existing,
           callerRecord ? supervisionTaskIdentityForTarget(callerRecord) : undefined,
+          callerProjectName,
         )) {
         return {
           status: 'error',
@@ -1548,12 +1498,14 @@ export async function dispatchSendMessage(
           const exact = existing.assignments.find((assignment) => assignment.assignmentId === requestedExactId);
           if (exact && exact.role !== 'implementer') {
             if (!isExactContinuationEligible({
+              taskProjectName: existing.projectName,
               taskCurrentRevision: existing.currentRevision,
               assignment: {
                 role: exact.role, status: exact.status, required: exact.required,
                 auditAttemptId: exact.auditAttemptId, auditRevision: exact.auditRevision,
                 identity: exact.identity,
               },
+              targetProjectName: targetRecord.projectName,
               targetIdentity,
             })) {
               return {
@@ -1600,10 +1552,7 @@ export async function dispatchSendMessage(
             };
           }
           const sameTarget = continuation.identity.sessionName === targetIdentity.sessionName
-            && continuation.identity.sessionInstanceId === targetIdentity.sessionInstanceId
-            && continuation.identity.runtimeEpoch === targetIdentity.runtimeEpoch
-            && continuation.identity.agentType === targetIdentity.agentType
-            && continuation.identity.providerFamily === targetIdentity.providerFamily;
+            && existing.projectName === targetRecord.projectName;
           if (!sameTarget) {
             return {
               status: 'error',
@@ -1757,10 +1706,7 @@ export async function dispatchSendMessage(
         && receipt.revision === assignment.value.auditRevision
       ));
       const sameTarget = assignment.value.identity.sessionName === targetIdentity.sessionName
-        && assignment.value.identity.sessionInstanceId === targetIdentity.sessionInstanceId
-        && assignment.value.identity.runtimeEpoch === targetIdentity.runtimeEpoch
-        && assignment.value.identity.agentType === targetIdentity.agentType
-        && assignment.value.identity.providerFamily === targetIdentity.providerFamily;
+        && authoritativeTask?.projectName === targetRecord.projectName;
       // tsk_4d0 shape: an auditor that had already started (status past
       // `delegated`) and had recorded PROGRESS could not be continued, so the
       // assignment sat in `implementing` with an idle session and Brain had no
@@ -2075,8 +2021,6 @@ function exactLiveSessionForAssignment(
 ): SessionRecord | undefined {
   return sessions.find((session) => (
     session.name === assignment.identity.sessionName
-    && session.sessionInstanceId === assignment.identity.sessionInstanceId
-    && session.runtimeEpoch === assignment.identity.runtimeEpoch
   ));
 }
 
@@ -2849,9 +2793,10 @@ export async function runSupervisionConvergenceTick(
     try {
       converged = registry.convergeLifecycle(now, {
         ...(deps.limit ? { limit: deps.limit } : {}),
-        resolveAuthoritativeBrain: (projectName) => resolveAuthoritativeBrainIdentity(
+        resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
           projectName,
           (deps.listSessions ?? listSessions)(),
+          sessionName,
         ),
         inspectAssignmentWorktree: (assignment) => {
           const inspected = inspectSupervisionAssignmentWorktree({

@@ -56,21 +56,17 @@ export function isAuthorizedSupervisionProjectBrain(
  * up on each call means the tools always speak to the current binding.
  */
 /**
- * The caller's exact live identity, or undefined when it cannot be established.
- *
- * Supervision authority is an identity, never a name: a replacement runtime
- * reuses the session name but is a different `sessionInstanceId`/`runtimeEpoch`
- * and inherits nothing. Callers that cannot be resolved fail closed.
+ * The caller's live durable session identity plus observational metadata.
  */
 function liveCallerIdentity(callerSessionName: string | undefined) {
   const name = callerSessionName?.trim();
   if (!name) return undefined;
   const session = listSessions().find((candidate) => candidate.name === name);
-  if (!session?.sessionInstanceId || !session.runtimeEpoch) return undefined;
+  if (!session) return undefined;
   return {
     sessionName: session.name,
-    sessionInstanceId: session.sessionInstanceId,
-    runtimeEpoch: session.runtimeEpoch,
+    sessionInstanceId: session.sessionInstanceId ?? '',
+    runtimeEpoch: session.runtimeEpoch ?? '',
     agentType: session.agentType,
     providerFamily: resolvePeerAuditProviderFamily(session),
   };
@@ -87,6 +83,10 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       const registry = getSupervisionTaskRegistry();
       const assignment = registry.getAssignment(assignmentId);
       if (!assignment) return { ok: false, reason: 'not_found' };
+      const task = registry.getTaskRecord(assignment.taskId);
+      if (!task || !callerProjectName || task.projectName !== callerProjectName) {
+        return { ok: false, reason: 'owner_mismatch' };
+      }
       if (projectBrain && callerProjectName) {
         const callerIdentity = liveCallerIdentity(callerSessionName);
         if (!callerIdentity) return { ok: false, reason: 'owner_mismatch' };

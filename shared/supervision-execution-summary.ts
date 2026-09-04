@@ -78,8 +78,17 @@ export function buildSupervisionExecutionSummary(input: {
   const actual = input.binding?.actual;
   const boundName = text(actual?.sessionName);
   if (actual && boundName) {
+    // Binding remains authority for provider/model/pool. The live target
+    // projection contributes only its human-readable display label, and only
+    // when exactly one non-dead row resolves the already-bound sessionName.
+    const liveLabelMatches = (input.candidates ?? []).filter((candidate) => (
+      candidate.sessionName === boundName
+      && (candidate.status === undefined || !DEAD_SESSION_STATES.has(candidate.status))
+    ));
+    const liveLabel = liveLabelMatches.length === 1 ? text(liveLabelMatches[0]?.label) : undefined;
     return {
       sessionName: boundName,
+      ...(liveLabel && liveLabel !== boundName ? { label: liveLabel } : {}),
       ...(text(actual.agentType) ? { agentType: text(actual.agentType)! } : {}),
       ...(text(actual.providerFamily) ? { providerFamily: text(actual.providerFamily)! } : {}),
       ...(text(actual.model) ? { model: text(actual.model)! } : {}),

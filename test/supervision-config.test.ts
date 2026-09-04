@@ -433,21 +433,35 @@ describe('supervision config helpers', () => {
     }
   });
 
-  it('rejects conflicting execution markers instead of guessing', () => {
+  it('selects the last assistant-authored execution marker exactly once', () => {
     expect(parseSupervisionExecutionStateDetailsFromText(
       `${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`,
-    )).toEqual({ state: null, markerCount: 2 });
+    )).toEqual({ state: 'audit_ready', markerCount: 2 });
   });
 
-  it('treats the unique reserved prefix as status without imposing layout rules', () => {
+  it('does not require the marker to be the final bytes of assistant content', () => {
     const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY;
     expect(parseSupervisionExecutionStateDetailsFromText(`${marker}\nmore text`))
       .toEqual({ state: 'audit_ready', markerCount: 1 });
-    expect(parseSupervisionExecutionStateDetailsFromText(`End your turn with ${marker}`))
-      .toEqual({ state: 'audit_ready', markerCount: 1 });
-    expect(parseSupervisionExecutionStateDetailsFromText(`\`\`\`ts\nconst marker = ${JSON.stringify(marker)};\n\`\`\``))
-      .toEqual({ state: 'audit_ready', markerCount: 1 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${marker}\n已授权派发：1\n执行于: deck_sub_reviewer · claude-opus-5 · primary`,
+    )).toEqual({ state: 'audit_ready', markerCount: 1 });
     expect(parseSupervisionExecutionStateFromText(`done\n  ${marker}\n`)).toBe('audit_ready');
+  });
+
+  it('ignores quoted and fenced marker examples before selecting the last authored marker', () => {
+    const advance = SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE;
+    const ready = SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY;
+    expect(parseSupervisionExecutionStateDetailsFromText([
+      `> ${advance}`,
+      '```md',
+      ready,
+      '```',
+      `The prompt said \`${advance}\`.`,
+      ready,
+    ].join('\n'))).toEqual({ state: 'audit_ready', markerCount: 1 });
+    expect(parseSupervisionExecutionStateDetailsFromText(`> ${advance}\n\`\`\`\n${ready}\n\`\`\``))
+      .toEqual({ state: null, markerCount: 0 });
   });
 
   describe('mergeTransportConfigPreservingSupervision', () => {

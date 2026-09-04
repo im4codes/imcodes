@@ -4710,6 +4710,28 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(resentPayload.userMessage).toBe('queued-after-idle');
   });
 
+  it('revalidates queued control-message authority at drain and drops a stale heartbeat exactly once', async () => {
+    runtime.send('active turn', 'cmd-active');
+    await waitForProviderSendCount(mock.provider, 1);
+    const staleHeartbeat = JSON.stringify({
+      contractRefs: ['supervision_implementation_heartbeat_v1'],
+      binding: { mode: 'continue_existing', taskId: 'tsk_stale', assignmentId: 'asg_stale' },
+      action: 'advance_safe_unfinished',
+    });
+    expect(runtime.send(
+      staleHeartbeat,
+      'supervision-implementation-heartbeat:asg_stale:1',
+    )).toBe('queued');
+    runtime.pendingDrainAdmission = (entry) => !entry.clientMessageId.startsWith('supervision-implementation-heartbeat:');
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
   it('cancels a stale active turn once so queued messages drain without waiting for the cancel callback', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);

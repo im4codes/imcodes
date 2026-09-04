@@ -1513,7 +1513,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (requestedTaskId && (
         !existing
         || existing.projectName !== projectName
-        || !supervisionCallerParticipates(existing, identity)
+        || !supervisionCallerParticipates(existing, identity, projectName)
       )) {
         return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
       }

@@ -637,6 +637,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
+  /** Synchronous authority check run immediately before a queued entry drains. */
+  private _pendingDrainAdmission?: (message: PendingTransportMessage) => boolean;
   /** Callback fired when composer rows are admitted into the current provider turn. */
   private _onActiveAppend?: (messages: PendingTransportMessage[], snapshot: QueueSnapshot) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
@@ -955,6 +957,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void) { this._onDrain = cb; }
+  set pendingDrainAdmission(cb: (message: PendingTransportMessage) => boolean) { this._pendingDrainAdmission = cb; }
   set onActiveAppend(cb: (messages: PendingTransportMessage[], snapshot: QueueSnapshot) => void) { this._onActiveAppend = cb; }
   /** Register a callback fired exactly once when startup memory reaches the provider. */
   set onStartupMemoryInjected(cb: () => void) { this._onStartupMemoryInjected = cb; }
@@ -3607,6 +3610,14 @@ export class TransportSessionRuntime implements SessionRuntime {
    */
   private _drainPending(): boolean {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
+    // Durable rows can outlive the scheduler decision that created them. Re-run
+    // the daemon authority predicate at the final delivery edge; rejected rows
+    // are removed before any provider turn can observe them.
+    if (this._pendingDrainAdmission) {
+      const rejected = this._pendingMessages.filter((entry) => !this._pendingDrainAdmission!(entry));
+      for (const entry of rejected) this.removePendingMessage(entry.clientMessageId);
+      if (this._pendingMessages.length === 0) return false;
+    }
     const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount > 0) {
       logger.warn(

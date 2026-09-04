@@ -1,11 +1,9 @@
 /**
  * THE participant-authority boundary for supervision.
  *
- * Authority is an IDENTITY, never a name. A session name is a reusable handle:
- * a restarted Brain, a replacement window and a cloned session group can all
- * present the same `sessionName` while being different runtimes. Every gate that
- * decides "may this caller read / continue / finish / receive for this task"
- * must therefore compare the full persistent identity.
+ * Durable authority is exactly projectName + sessionName. Project scope is
+ * enforced by the task/caller boundary; within that project, a daemon restart,
+ * provider migration, or runtime replacement does not change the participant.
  *
  * This module exists because that comparison was previously restated at five
  * separate call sites (supervision-state-store, delegation-reply-store,
@@ -14,11 +12,11 @@
  * definition, imported everywhere, is the only way those cannot drift apart
  * again.
  *
- * Fail-closed is deliberate: a missing or blank field is NOT a wildcard, it is
- * an unusable identity, and an unusable identity matches nothing.
+ * Runtime instance, epoch, agent type and provider family remain useful
+ * observational/fencing metadata, but never decide visibility or ownership.
  */
 
-/** The five fields that together name one supervision runtime. */
+/** Durable session name plus observational runtime metadata. */
 export interface SupervisionPersistentIdentity {
   sessionName: string;
   sessionInstanceId: string;
@@ -33,38 +31,25 @@ export interface SupervisionIdentityBearer {
   identity?: Partial<SupervisionPersistentIdentity> | undefined;
 }
 
-const IDENTITY_FIELDS = [
-  'sessionName', 'sessionInstanceId', 'runtimeEpoch', 'agentType', 'providerFamily',
-] as const satisfies readonly (keyof SupervisionPersistentIdentity)[];
-
 /**
- * Is this a usable identity? Every field must be a non-blank string.
- *
- * Callers use this to fail closed BEFORE comparing, so a half-built identity can
- * never be silently treated as "matches whatever is also half-built".
+ * Is this a usable durable session identity? Project scope is checked by the
+ * caller because assignments intentionally do not duplicate task.projectName.
  */
 export function isUsableSupervisionIdentity(
   value: Partial<SupervisionPersistentIdentity> | null | undefined,
 ): value is SupervisionPersistentIdentity {
-  if (!value) return false;
-  return IDENTITY_FIELDS.every((field) => {
-    const candidate = value[field];
-    return typeof candidate === 'string' && candidate.trim().length > 0;
-  });
+  return typeof value?.sessionName === 'string' && value.sessionName.trim().length > 0;
 }
 
 /**
- * Exact identity equality across all five fields.
- *
- * Two identities that agree on `sessionName` alone do NOT match: that is the
- * whole point. An unusable identity on either side matches nothing.
+ * Durable identity equality within an already-authorized project scope.
  */
 export function supervisionIdentityMatches(
   left: Partial<SupervisionPersistentIdentity> | null | undefined,
   right: Partial<SupervisionPersistentIdentity> | null | undefined,
 ): boolean {
   if (!isUsableSupervisionIdentity(left) || !isUsableSupervisionIdentity(right)) return false;
-  return IDENTITY_FIELDS.every((field) => left[field] === right[field]);
+  return left.sessionName === right.sessionName;
 }
 
 /** Every assignment on the task bound to exactly this identity. */
@@ -77,11 +62,7 @@ export function supervisionParticipantAssignments<T extends SupervisionIdentityB
 }
 
 /**
- * Does this exact identity participate in the task?
- *
- * Read, continuation and finish gates all share this predicate, so a stale
- * instance, a clone, or a same-name/different-epoch runtime is refused
- * everywhere rather than at whichever entry point remembered to check.
+ * Does this durable session participate in the already project-scoped task?
  */
 export function isSupervisionTaskParticipant(
   assignments: readonly SupervisionIdentityBearer[] | undefined,
@@ -91,11 +72,10 @@ export function isSupervisionTaskParticipant(
 }
 
 /**
- * Is this exact identity the task's COORDINATOR?
+ * Is this durable session the task's COORDINATOR?
  *
- * Dispatch authority lives on the coordinator assignment bound to the task, so
- * "some available Brain in the same project" is never an answer. Only an
- * explicit authorized rebind of that same assignment moves the identity.
+ * Dispatch authority remains bound to the coordinator assignment; runtime
+ * metadata rotation does not move that assignment to another logical session.
  */
 export function isSupervisionTaskCoordinator(
   assignments: readonly SupervisionIdentityBearer[] | undefined,

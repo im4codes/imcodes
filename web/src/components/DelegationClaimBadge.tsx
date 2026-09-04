@@ -67,10 +67,13 @@ const executionOf = (dispatch: { deliveries?: { execution?: SupervisionExecution
  * remainder is kept in diagnostics, not dropped. Absent facts are skipped
  * rather than placeheld, so the line never implies precision it lacks.
  */
-export const formatExecutionSummary = (execution: SupervisionExecutionSummary): string => [
-  execution.label && execution.label !== execution.sessionName
+export const formatExecutionSummary = (
+  execution: SupervisionExecutionSummary,
+  localizedIdentity?: string,
+): string => [
+  localizedIdentity ?? (execution.label && execution.label !== execution.sessionName
     ? `${execution.label} (${execution.sessionName})`
-    : execution.sessionName,
+    : execution.sessionName),
   execution.model,
   execution.pool,
 ].filter(Boolean).join(' · ');
@@ -117,17 +120,26 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
         })}
       </span>
       <ul class="delegation-claim-dispatches">
-        {dispatches.map((dispatch) => (
+        {dispatches.map((dispatch) => {
+          const execution = executionOf(dispatch);
+          const localizedIdentity = execution?.label && execution.label !== execution.sessionName
+            ? t('delegation.claim.execution_identity', {
+              defaultValue: '{{label}} ({{sessionName}})',
+              label: execution.label,
+              sessionName: execution.sessionName,
+            })
+            : execution?.sessionName;
+          return (
           <li
             key={dispatch.dispatchId}
             class="delegation-claim-dispatch"
             data-delegation-dispatch={dispatch.dispatchId}
           >
-            {executionOf(dispatch) ? (
+            {execution ? (
               <span class="delegation-claim-execution" data-delegation-field="execution">
                 {t('delegation.claim.execution', 'Runs on')}
                 {': '}
-                <code>{formatExecutionSummary(executionOf(dispatch)!)}</code>
+                <code>{formatExecutionSummary(execution, localizedIdentity)}</code>
               </span>
             ) : null}
             {dispatch.taskId ? (
@@ -161,14 +173,15 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
                   <code>{dispatch.assignmentId}</code>
                 </span>
               ) : null}
-              {executionOf(dispatch) && formatExecutionDiagnostics(executionOf(dispatch)!) ? (
+              {execution && formatExecutionDiagnostics(execution) ? (
                 <span class="delegation-claim-id" data-delegation-field="executionDetail">
-                  <code>{formatExecutionDiagnostics(executionOf(dispatch)!)}</code>
+                  <code>{formatExecutionDiagnostics(execution)}</code>
                 </span>
               ) : null}
             </details>
           </li>
-        ))}
+          );
+        })}
       </ul>
     </div>
   );

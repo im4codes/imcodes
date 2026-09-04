@@ -190,10 +190,15 @@ function prepareStructuredFinalizationShape(
     authorizedUntouchedFiles?: string[];
     ownerFileCount?: number;
     classification?: SupervisionTaskClassification;
+    revision?: string;
+    attemptId?: string;
+    ownerAssignmentId?: string;
+    commitSha?: string;
   } = {},
 ) {
-  const revision = `${taskId}-r1`;
-  const attemptId = `${taskId}-overall-audit`;
+  const revision = options.revision ?? `${taskId}-r1`;
+  const attemptId = options.attemptId ?? `${taskId}-overall-audit`;
+  const commitSha = options.commitSha ?? 'a'.repeat(40);
   const files = [...(options.files ?? ['src/final-a.ts', 'src/final-b.ts'])].sort();
   const scopeFiles = [...files, ...(options.authorizedUntouchedFiles ?? [])].sort();
   const ownerIdentity = identity(`${taskId}-owner`);
@@ -207,7 +212,8 @@ function prepareStructuredFinalizationShape(
     taskId, role: 'coordinator', identity: identity(`${taskId}-brain`), required: false,
   });
   const owner = registry.createAssignment({
-    taskId, role: 'integration_owner', identity: ownerIdentity, scopeFiles,
+    taskId, assignmentId: options.ownerAssignmentId,
+    role: 'integration_owner', identity: ownerIdentity, scopeFiles,
     auditAttemptId: attemptId, auditRevision: revision,
   });
   const implementer = registry.createAssignment({
@@ -243,7 +249,7 @@ function prepareStructuredFinalizationShape(
         } : {}),
         ...(target.role === 'integration_owner' ? {
           externalRunId: '33287386936',
-          externalHeadSha: 'a'.repeat(40),
+          externalHeadSha: commitSha,
           externalTaskId: 'ci-node24',
         } : {}),
       }), `${target.role}:${status}`).toMatchObject({ ok: true });
@@ -288,14 +294,14 @@ function prepareStructuredFinalizationShape(
       sha256: ((index + 1) % 10).toString().repeat(64),
     })),
     integrationOwner: ownerIdentity.sessionName,
-    commitSha: 'a'.repeat(40),
+    commitSha,
     pushResult: 'pushed' as const,
     pushRemoteRef: 'refs/heads/dev',
     stagedPaths: files,
     conflictedPaths: [] as string[],
     untrackedOtherOwnerPaths: [] as string[],
     externalRunId: '33287386936',
-    externalHeadSha: 'a'.repeat(40),
+    externalHeadSha: commitSha,
     externalTaskId: 'ci-node24',
     ciResult: 'success' as const,
   };
@@ -342,6 +348,226 @@ function rewritePersistedTask(
     task.updatedAt, task.taskId,
   );
 }
+
+describe('implementation heartbeat legacy authority convergence', () => {
+  it('atomically converges tsk_5w9 identity and executionBinding.actual on the same durable owner', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'tsk_5w9';
+    const assignmentId = 'asg_5wc';
+    const oldIdentity = {
+      sessionName: 'deck_sub_1g6w5672', sessionInstanceId: '8db00b24', runtimeEpoch: '60136366',
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+    };
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'same durable owner', now: 1,
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', required: true, identity: oldIdentity,
+      executionBinding: {
+        pool: 'primary',
+        requested: {
+          capabilityId: buildSupervisionExecutionCapabilityId({
+            agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport', model: 'claude-sonnet',
+          }),
+          agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport', model: 'claude-sonnet',
+        },
+        actual: {
+          ...oldIdentity, runtimeType: 'transport', model: 'claude-sonnet',
+        },
+        origin: 'reused',
+      },
+      now: 2,
+    }).ok).toBe(true);
+    const currentIdentity = {
+      sessionName: oldIdentity.sessionName, sessionInstanceId: '3ae6320c', runtimeEpoch: 'd1210488',
+      agentType: 'codex-sdk', providerFamily: 'openai',
+    };
+
+    expect(registry.convergeImplementationHeartbeatTarget({
+      taskId,
+      assignmentId,
+      candidates: [{ projectName: 'alpha', identity: currentIdentity }],
+      now: 3,
+    })).toMatchObject({ ok: true, value: { assignmentId, identity: currentIdentity } });
+    expect(registry.getAssignment(assignmentId)?.executionBinding?.actual).toMatchObject(currentIdentity);
+    expect(registry.listAssignments(taskId)).toHaveLength(1);
+    database.close();
+  });
+
+  it.each(['coordinator', 'integration_owner', 'auditor'] as const)(
+    'refreshes %s runtime metadata without changing durable project+session ownership',
+    (role) => {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      const taskId = `stable-role-${role}`;
+      const revision = 'stable-role-r1';
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'role restart continuity', currentRevision: revision, now: 1,
+      }).ok).toBe(true);
+      const assignmentId = `${taskId}-assignment`;
+      const created = registry.createAssignment({
+        assignmentId, taskId, role, required: role === 'auditor',
+        identity: {
+          sessionName: `deck_alpha_${role}`, sessionInstanceId: 'old-instance', runtimeEpoch: 'old-epoch',
+          agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        },
+        ...(role === 'auditor' ? { auditAttemptId: 'attempt-1', auditRevision: revision } : {}),
+        now: 2,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      const live = {
+        sessionName: created.value.identity.sessionName,
+        sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+      };
+      expect(registry.convergeImplementationHeartbeatTarget({
+        taskId, assignmentId, candidates: [{ projectName: 'alpha', identity: live }], now: 3,
+      })).toMatchObject({ ok: true, value: { assignmentId, identity: live } });
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+      database.close();
+    },
+  );
+
+  it('requires bounded admin census before normalizing NULL project, then refreshes legacy runtime metadata', () => {
+    const database = new DatabaseSync(':memory:');
+    const liveIdentity = {
+      sessionName: 'deck_legacy_worker', sessionInstanceId: 'live-instance', runtimeEpoch: 'live-epoch',
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+    };
+    const registry = new SupervisionTaskRegistry({
+      database,
+      resolveLiveParticipants: (projectName) => projectName === 'legacy-project' ? [liveIdentity] : [],
+    });
+    const taskId = 'supervision_task_936f239f-d86f-4708-9d9f-f952cb82d0b5';
+    const assignmentId = 'supervision_assignment_b4945502-0d07-4b6d-8009-e6db970d6689';
+    expect(registry.createOrGet({
+      taskId, projectName: 'legacy-project', classification: 'independent_top_level', objective: 'legacy wake', now: 1,
+    }).ok).toBe(true);
+    const created = registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', required: true,
+      identity: {
+        sessionName: 'deck_legacy_worker', sessionInstanceId: 'old-instance', runtimeEpoch: 'old-epoch',
+        agentType: 'claude-code-sdk', providerFamily: 'claude',
+      },
+      now: 2,
+    });
+    if (!created.ok) throw new Error(created.reason);
+    // Production legacy shape: payload and indexed project column both lost
+    // their project audience, and there is deliberately no coordinator row.
+    const task = registry.get(taskId)!;
+    rewritePersistedTask(database, { ...task, projectName: null as never });
+    database.prepare('UPDATE supervision_tasks SET project_name = NULL WHERE task_id = ?').run(taskId);
+
+    const converge = () => registry.convergeImplementationHeartbeatTarget({
+      taskId,
+      assignmentId,
+      candidates: [{
+        projectName: 'legacy-project',
+        identity: liveIdentity,
+      }],
+      now: 3,
+    });
+
+    // Ordinary delivery cannot infer a missing durable project identity. The
+    // restricted census must establish that authority first; observational
+    // identity refresh is not a substitute for project recovery.
+    expect(converge()).toMatchObject({ ok: false, reason: 'ambiguous_assignment' });
+    expect(registry.getTaskRecord(taskId)!.projectName).toBeNull();
+    const normalPage = registry.reconcileHousekeeping({
+      mode: 'dryRun', projectName: 'legacy-project', limit: 10, now: 3,
+    });
+    expect(normalPage).toMatchObject({ scanned: 0, hasMore: true, nextCursor: 'orphan:' });
+    const orphanPage = registry.reconcileHousekeeping({
+      mode: 'apply', projectName: 'legacy-project', cursor: normalPage.nextCursor, limit: 10, now: 3,
+    });
+    expect(orphanPage.actions).toEqual([
+      expect.objectContaining({
+        taskId, kind: 'backfill_orphan_project', reason: 'unique_live_session_lineage',
+      }),
+    ]);
+    expect(converge()).toMatchObject({ ok: true, value: { assignmentId } });
+    expect(registry.getAssignment(assignmentId)!.identity).toMatchObject({
+      sessionInstanceId: 'live-instance', runtimeEpoch: 'live-epoch', providerFamily: 'anthropic',
+    });
+    expect(registry.getTaskRecord(taskId)!.projectName).toBe('legacy-project');
+    expect(registry.listAssignments(taskId).filter((entry) => entry.role === 'coordinator')).toHaveLength(0);
+    database.close();
+  });
+
+  it('boundedly retires the exact terminal-task stale auditors and resumes after restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'terminal-stale-auditor-cleanup-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    const taskId = 'supervision_task_3559c97a-b45e-4ab4-95c1-0a8cdbc55dd2';
+    const auditorIds = [
+      'supervision_assignment_442148e6-e553-4ad7-b4c7-0af82d808bad',
+      'supervision_assignment_3f6e473e-5d85-4af0-995b-58bb91c0cf99',
+      'supervision_assignment_634cce10-6a76-4f8c-a041-b181f9774380',
+    ];
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task', objective: 'already landed at c2fc056', now: 1,
+      }).ok).toBe(true);
+      for (const [index, assignmentId] of auditorIds.entries()) {
+        const auditorIdentity = identity(`deck_legacy_auditor_${index}`, 'claude-code-sdk');
+        const created = registry.createAssignment({
+          assignmentId, taskId, role: 'auditor', required: true,
+          identity: auditorIdentity,
+          auditAttemptId: `legacy-attempt-${index}`,
+          leaseId: `legacy-lease-${index}`,
+          now: 2 + index,
+        });
+        if (!created.ok) throw new Error(created.reason);
+        expect(registry.updateAssignment({
+          assignmentId, identity: auditorIdentity, status: 'cancelled', now: 5 + index,
+        }).ok).toBe(true);
+      }
+      const database = new DatabaseSync(dbPath);
+      rewritePersistedTask(database, { ...registry.get(taskId)!, status: 'cancelled', currentRevision: undefined });
+      for (const [index, assignmentId] of auditorIds.entries()) {
+        rewritePersistedAssignment(database, {
+          ...registry.getAssignment(assignmentId)!,
+          status: 'delegated',
+          leaseId: `legacy-lease-${index}`,
+          blocker: undefined,
+        });
+      }
+      database.close();
+
+      const first = registry.convergeLifecycle(10, { limit: 2 });
+      expect(first).toEqual([
+        expect.objectContaining({ taskId, action: 'retire_terminal_stale_auditor' }),
+        expect.objectContaining({ taskId, action: 'retire_terminal_stale_auditor' }),
+      ]);
+      expect(auditorIds.filter((id) => registry.getAssignment(id)!.status === 'cancelled')).toHaveLength(2);
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      // Startup's existing cancelled-task repair may consume the final row
+      // before the periodic backstop runs; either way, no replacement object
+      // is created and the next tick has no repeated cleanup.
+      const resumed = registry.convergeLifecycle(20, { limit: 2 });
+      expect(resumed.length).toBeLessThanOrEqual(1);
+      expect(resumed.every((action) => (
+        action.taskId === taskId && action.action === 'retire_terminal_stale_auditor'
+      ))).toBe(true);
+      for (const assignmentId of auditorIds) {
+        expect(registry.getAssignment(assignmentId)).toMatchObject({
+          assignmentId, status: 'cancelled', leaseId: '',
+        });
+      }
+      expect(registry.listAuditReceipts(taskId)).toEqual([]);
+      const eventCount = registry.listEvents(taskId).length;
+      expect(registry.convergeLifecycle(30, { limit: 2 })).toEqual([]);
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 function prepareFinalizedAuditAuthorityReplayGap(
   registry: SupervisionTaskRegistry,
@@ -402,7 +628,7 @@ function prepareStaleRuntimeIntegrationOwnerShape(
   });
   const replacementIdentity = {
     ...shape.owner.identity,
-    sessionName: options.replacementSessionName ?? shape.owner.identity.sessionName,
+    sessionName: options.replacementSessionName ?? `${shape.owner.identity.sessionName}_replacement`,
     sessionInstanceId: `${taskId}-replacement-instance`,
     runtimeEpoch: `${taskId}-replacement-epoch`,
   };
@@ -878,6 +1104,48 @@ describe('SupervisionTaskRegistry', () => {
     registry.close();
   });
 
+  it('finalizes the exact tsk_7l9 PASS already present on dev after only runtime metadata rotates', () => {
+    const registry = makeRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'tsk_7l9', {
+      ownerAssignmentId: 'asg_a3t',
+      revision: 'supervision-console-stale-while-revalidate-cx5-r1-66338e3ccf07',
+      attemptId: 'auto-audit-b216c040cdb19632efcfe4f7',
+      commitSha: 'a3c610eef5997990a9bf608aa0b0d7401dc3a79b',
+      files: Array.from({ length: 10 }, (_, index) => `web/src/tsk-7l9-${index}.ts`),
+    });
+    const rotatedBrain = {
+      ...shape.owner.identity,
+      sessionInstanceId: 'current-brain-instance',
+      runtimeEpoch: 'current-brain-epoch',
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+    };
+    const {
+      externalRunId: _run, externalHeadSha: _head, externalTaskId: _task,
+      ciResult: _ci, ...alreadyPresent
+    } = shape.finalization;
+
+    expect(registry.finalizeIntegration({
+      ...alreadyPresent,
+      pushResult: 'already_present',
+      ciResult: 'ci_not_configured',
+      identity: rotatedBrain,
+    })).toMatchObject({
+      ok: true,
+      value: {
+        status: 'finalized', archivedAt: expect.any(Number),
+        commitSha: 'a3c610eef5997990a9bf608aa0b0d7401dc3a79b',
+      },
+    });
+    expect(registry.finalizeIntegration({
+      ...alreadyPresent,
+      pushResult: 'already_present',
+      ciResult: 'ci_not_configured',
+      identity: { ...rotatedBrain, sessionName: 'deck_other_project_brain' },
+    })).toEqual({ ok: false, reason: 'owner_mismatch' });
+    registry.close();
+  });
+
   it('records current exact-commit pending CI as optional smoke without blocking finalization', () => {
     const registry = makeRegistry();
     const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-current-ci-running');
@@ -1108,12 +1376,19 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
-  it('atomically rebinds a stale same-session integration owner after restart and replays idempotently', () => {
+  it('finalizes through the same durable project+session owner after runtime rotation and replays idempotently', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-stale-integration-owner-'));
     const dbPath = join(dir, 'supervision-state.sqlite');
     let registry = new SupervisionTaskRegistry({ dbPath });
     try {
-      const shape = prepareStaleRuntimeIntegrationOwnerShape(registry, 'stale-runtime-owner-restart');
+      const shape = prepareStructuredFinalizationShape(registry, 'stale-runtime-owner-restart');
+      const rotatedIdentity = {
+        ...shape.owner.identity,
+        sessionInstanceId: 'rotated-owner-instance',
+        runtimeEpoch: 'rotated-owner-epoch',
+        agentType: 'claude-code-sdk',
+        providerFamily: 'anthropic',
+      };
       expect(registry.get(shape.taskId)).toMatchObject({
         status: 'ready_for_integration',
         currentRevision: shape.revision,
@@ -1123,10 +1398,6 @@ describe('SupervisionTaskRegistry', () => {
             assignmentId: shape.owner.assignmentId,
             role: 'integration_owner', status: 'ready_for_integration', leaseId: '',
           }),
-          expect.objectContaining({
-            assignmentId: shape.replacement.assignmentId,
-            role: 'integration_owner', status: 'ready_for_integration', leaseId: '',
-          }),
         ]),
       });
       registry.close();
@@ -1134,39 +1405,30 @@ describe('SupervisionTaskRegistry', () => {
 
       const eventCount = registry.listEvents(shape.taskId).length;
       expect(registry.finalizeIntegration({
-        ...shape.finalization, identity: shape.replacementIdentity, now: 500,
+        ...shape.finalization, identity: rotatedIdentity, now: 500,
       })).toMatchObject({
         ok: true,
         value: {
           status: 'finalized',
-          integrationOwnerAssignmentId: shape.replacement.assignmentId,
+          integrationOwnerAssignmentId: shape.owner.assignmentId,
           archivedAt: 500,
         },
       });
       expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
-        status: 'ready_for_integration', leaseId: '',
+        status: 'finalized', leaseId: '',
       });
-      const firstFinalizationTaskEvent = registry.listEvents(shape.taskId)
-        .slice(eventCount)
-        .find((event) => !event.assignmentId);
-      expect(firstFinalizationTaskEvent).toMatchObject({
-        status: 'integrating',
-        payload: {
-          integrationOwnerReboundFromAssignmentId: shape.owner.assignmentId,
-          integrationOwnerReboundToAssignmentId: shape.replacement.assignmentId,
-        },
-      });
+      expect(registry.listEvents(shape.taskId).length).toBeGreaterThan(eventCount);
 
       const finalizedEventCount = registry.listEvents(shape.taskId).length;
       registry.close();
       registry = new SupervisionTaskRegistry({ dbPath });
       expect(registry.finalizeIntegration({
-        ...shape.finalization, identity: shape.replacementIdentity, now: 900,
+        ...shape.finalization, identity: rotatedIdentity, now: 900,
       })).toMatchObject({
         ok: true, replay: true,
         value: {
           status: 'finalized',
-          integrationOwnerAssignmentId: shape.replacement.assignmentId,
+          integrationOwnerAssignmentId: shape.owner.assignmentId,
           archivedAt: 500,
         },
       });
@@ -1215,19 +1477,22 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
-  it('does not use scope metadata to veto an otherwise exact stale-owner rebind', () => {
+  it('does not use runtime metadata to veto the exact durable owner', () => {
     const registry = makeRegistry();
-    const shape = prepareStaleRuntimeIntegrationOwnerShape(registry, 'stale-owner-scope-record-only', {
-      replacementScopeFiles: ['src/reported-different.ts'],
-    });
+    const shape = prepareStructuredFinalizationShape(registry, 'stale-owner-scope-record-only');
+    const rotatedIdentity = {
+      ...shape.owner.identity,
+      sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch',
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+    };
     expect(registry.finalizeIntegration({
       ...shape.finalization,
-      identity: shape.replacementIdentity,
+      identity: rotatedIdentity,
     })).toMatchObject({
       ok: true,
       value: {
         status: 'finalized',
-        integrationOwnerAssignmentId: shape.replacement.assignmentId,
+        integrationOwnerAssignmentId: shape.owner.assignmentId,
       },
     });
     registry.close();
@@ -3233,12 +3498,12 @@ describe('SupervisionTaskRegistry', () => {
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
         receiptKind: 'progress', auditorSessionName: auditorIdentity.sessionName,
         auditorIdentity, findings: 'stale device', validations: [], now: 106,
-      })).toEqual({ ok: false, reason: 'owner_mismatch' });
+      })).toMatchObject({ ok: true, value: { sequence: 2 } });
       expect(registry.appendMatchingAuditReceipt({
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
         receiptKind: 'progress', auditorSessionName: reboundAuditorIdentity.sessionName,
         auditorIdentity: reboundAuditorIdentity, findings: 'second progress', validations: [], now: 110,
-      })).toMatchObject({ ok: true, value: { sequence: 2 } });
+      })).toMatchObject({ ok: true, value: { sequence: 3 } });
       expect(registry.appendMatchingAuditReceipt({
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId: 'wrong-attempt', revision,
         receiptKind: 'final', verdict: 'PASS', auditorSessionName: reboundAuditorIdentity.sessionName,
@@ -3246,11 +3511,11 @@ describe('SupervisionTaskRegistry', () => {
       })).toEqual({ ok: false, reason: 'old_audit_attempt' });
       expect(registry.appendMatchingAuditReceipt({
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
-        receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
-        auditorIdentity: { ...reboundAuditorIdentity, runtimeEpoch: 'wrong-epoch' },
+        receiptKind: 'final', verdict: 'PASS', auditorSessionName: 'deck_other_auditor',
+        auditorIdentity: { ...reboundAuditorIdentity, sessionName: 'deck_other_auditor' },
         findings: 'wrong identity', validations: [], now: 112,
       })).toEqual({ ok: false, reason: 'owner_mismatch' });
-      expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(3);
 
       const pass = registry.appendMatchingAuditReceipt({
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
@@ -3258,7 +3523,7 @@ describe('SupervisionTaskRegistry', () => {
         auditorIdentity: reboundAuditorIdentity, findings: 'pass before correction',
         validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '1 passed' }], now: 120,
       });
-      expect(pass).toMatchObject({ ok: true, value: { sequence: 3, verdict: 'PASS' } });
+      expect(pass).toMatchObject({ ok: true, value: { sequence: 4, verdict: 'PASS' } });
       expect(registry.getAssignment(implementer.value.assignmentId)?.status).toBe('ready_for_audit');
       const corrected = registry.appendMatchingAuditReceipt({
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
@@ -3267,13 +3532,13 @@ describe('SupervisionTaskRegistry', () => {
       });
       expect(corrected).toMatchObject({
         ok: true,
-        value: { sequence: 4, verdict: 'REWORK', supersedesReceiptId: pass.ok ? pass.value.receiptId : undefined },
+        value: { sequence: 5, verdict: 'REWORK', supersedesReceiptId: pass.ok ? pass.value.receiptId : undefined },
       });
       expect(registry.appendMatchingAuditReceipt({
         taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
         receiptKind: 'final', verdict: 'REWORK', auditorSessionName: reboundAuditorIdentity.sessionName,
         auditorIdentity: reboundAuditorIdentity, findings: 'correction before finish', validations: [], now: 131,
-      })).toMatchObject({ ok: true, replay: true, value: { sequence: 4 } });
+      })).toMatchObject({ ok: true, replay: true, value: { sequence: 5 } });
 
       expect(registry.finishAssignment({
         assignmentId: auditor.value.assignmentId, identity: reboundAuditorIdentity, revision,
@@ -3288,11 +3553,11 @@ describe('SupervisionTaskRegistry', () => {
         receiptKind: 'final', verdict: 'PASS', auditorSessionName: reboundAuditorIdentity.sessionName,
         auditorIdentity: reboundAuditorIdentity, findings: 'conflict after finish', validations: [], now: 140,
       })).toEqual({ ok: false, reason: 'receipt_closed' });
-      expect(registry.listAuditReceipts(taskId)).toHaveLength(4);
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(5);
       registry.close();
 
       registry = new SupervisionTaskRegistry({ dbPath });
-      expect(registry.listAuditReceipts(taskId).map((receipt) => receipt.sequence)).toEqual([1, 2, 3, 4]);
+      expect(registry.listAuditReceipts(taskId).map((receipt) => receipt.sequence)).toEqual([1, 2, 3, 4, 5]);
       expect(registry.getAssignment(auditor.value.assignmentId)?.status).toBe('finalized');
       expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
         status: 'rework', auditAttemptId: attemptId, auditRevision: revision, verdict: 'REWORK',
@@ -4438,18 +4703,12 @@ describe('SupervisionTaskRegistry', () => {
       },
     );
 
-    // RETIRED ASSERTION (R2 ruling). This previously expected
-    //   { status: 'ok', fromStatus: 'ready_for_audit', toStatus: 'cancelled' }
-    // for a plain `cancel` intent. It passed ONLY because the replacement owner
-    // and the superseded owner share sessionName 'deck_alpha_brain' while
-    // differing in sessionInstanceId/runtimeEpoch -- i.e. cross-instance
-    // authority by name equality. That is exactly the grant this task retires:
-    // a same-name/different-epoch runtime has no rights by default. The plain
-    // intent must now be refused.
+    // Runtime incarnation metadata is observational. The same project/session
+    // owns the same assignment after restart and may cancel it once.
     expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'cancel', taskId: 'task-replacement-owner-cancel',
       assignmentId: shape.oldOwner.value.assignmentId, note: 'superseded runtime epoch',
-    })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    })).toMatchObject({ status: 'ok', toStatus: 'cancelled' });
 
     // Superseded-owner cleanup now travels the EXPLICIT authorized path on the
     // same assignment, which carries its own reason/idempotency and leaves the
@@ -4488,9 +4747,6 @@ describe('SupervisionTaskRegistry', () => {
       assignments: expect.arrayContaining([
         expect.objectContaining({
           assignmentId: shape.oldOwner.value.assignmentId, status: 'cancelled', leaseId: '',
-        }),
-        expect.objectContaining({
-          assignmentId: shape.replacement.value.assignmentId, status: 'ready_for_integration',
           auditAttemptId: shape.attemptId, auditRevision: shape.revision, verdict: 'PASS',
         }),
         expect.objectContaining({
@@ -4530,11 +4786,10 @@ describe('SupervisionTaskRegistry', () => {
       });
       expect(registry.get('task-cancelled-evidence-recovery')).toMatchObject({
         status: 'ready_for_integration', currentRevision: shape.revision,
-        integrationOwnerAssignmentId: shape.replacement.value.assignmentId,
+        integrationOwnerAssignmentId: shape.oldOwner.value.assignmentId,
         assignments: expect.arrayContaining([
-          expect.objectContaining({ assignmentId: shape.oldOwner.value.assignmentId, status: 'cancelled' }),
           expect.objectContaining({
-            assignmentId: shape.replacement.value.assignmentId, status: 'ready_for_integration',
+            assignmentId: shape.oldOwner.value.assignmentId, status: 'ready_for_integration',
             verdict: 'PASS', auditAttemptId: shape.attemptId, auditRevision: shape.revision,
           }),
           expect.objectContaining({ assignmentId: shape.auditor.value.assignmentId, status: 'finalized' }),
@@ -4545,7 +4800,7 @@ describe('SupervisionTaskRegistry', () => {
           eventType: 'recovered', status: 'ready_for_integration',
           payload: expect.objectContaining({
             source: 'cancelled_task_evidence_recovery',
-            replacementIntegrationOwnerAssignmentId: shape.replacement.value.assignmentId,
+            replacementIntegrationOwnerAssignmentId: shape.oldOwner.value.assignmentId,
             revision: shape.revision,
             auditAttemptId: shape.attemptId,
           }),
@@ -5143,12 +5398,12 @@ describe('SupervisionTaskRegistry', () => {
     if (!impl.ok || !audit.ok) throw new Error('assignments should create');
 
     expect(registry.recordFileEvent({ assignmentId: audit.value.assignmentId, identity: auditor, path: 'src/ok.ts', operation: 'modify' })).toEqual({ ok: false, reason: 'role_forbidden' });
-    expect(registry.recordFileEvent({ assignmentId: impl.value.assignmentId, identity: { ...implementer, runtimeEpoch: 'old' }, path: 'src/ok.ts', operation: 'modify' })).toEqual({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.recordFileEvent({ assignmentId: impl.value.assignmentId, identity: { ...implementer, runtimeEpoch: 'old' }, path: 'src/ok.ts', operation: 'modify' })).toMatchObject({ ok: true });
     const first = registry.recordFileEvent({ assignmentId: impl.value.assignmentId, identity: implementer, path: 'src/ok.ts', operation: 'modify', beforeHash: 'a', afterHash: 'b', tool: 'apply_patch', idempotencyKey: 'edit-1' });
     const replay = registry.recordFileEvent({ assignmentId: impl.value.assignmentId, identity: implementer, path: 'src/ok.ts', operation: 'modify', beforeHash: 'a', afterHash: 'b', tool: 'apply_patch', idempotencyKey: 'edit-1' });
     expect(first.ok).toBe(true);
     expect(replay).toMatchObject({ ok: true, replay: true });
-    expect(registry.listFileEvents('task-files')).toHaveLength(1);
+    expect(registry.listFileEvents('task-files')).toHaveLength(2);
     for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'rework'] as const) {
       expect(registry.updateAssignment({
         assignmentId: impl.value.assignmentId,
@@ -5484,7 +5739,7 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
-  it('rejects an explicit binding when the live target agentType differs without ensure, dispatch, or registry mutation', async () => {
+  it('keeps an explicit durable project+session binding across agent/provider/epoch rotation', async () => {
     const brain = session('deck_alpha_brain');
     const target = session('deck_sub_identity_target', 'alpha', 'codex');
     const sessions = [brain, target];
@@ -5496,15 +5751,15 @@ describe('SupervisionTaskRegistry', () => {
       taskId, assignmentId, role: 'implementer', scopeFiles: [],
       identity: { ...identity(target.name, 'codex-sdk'), providerFamily: 'openai' },
     }).ok).toBe(true);
-    const before = JSON.stringify(registry.get(taskId));
-    const eventCount = registry.listEvents(taskId).length;
-    const ensure = vi.fn();
+    const ensure = vi.fn(async () => ({
+      ok: true as const, worktreePath: '/worktrees/stable-owner/repo', baseRevision: 'a'.repeat(40), created: true,
+    }));
     const dispatchMessage = vi.fn();
 
     const result = await dispatchHookSend({
       from: brain.name,
       targetRecords: [target],
-      message: 'must refuse wrong agent type',
+      message: 'same durable owner after restart',
       projectRoot: '/work/alpha',
       supervision: { taskId, assignmentId },
     }, {
@@ -5514,17 +5769,20 @@ describe('SupervisionTaskRegistry', () => {
       dispatchMessage,
     });
 
-    expect(result).toMatchObject({
-      delivered: [], queued: [],
-      errors: [expect.stringContaining('supervision binding does not match the live task, assignment, revision, and target identity')],
+    expect(result.errors).toEqual([]);
+    expect(result.delivered).toEqual([target.name]);
+    expect(ensure).toHaveBeenCalledOnce();
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+    expect(registry.getAssignment(assignmentId)?.identity).toMatchObject({
+      sessionName: target.name,
+      sessionInstanceId: target.sessionInstanceId,
+      runtimeEpoch: target.runtimeEpoch,
+      agentType: target.agentType,
+      providerFamily: 'openai',
     });
-    expect(ensure).not.toHaveBeenCalled();
-    expect(dispatchMessage).not.toHaveBeenCalled();
-    expect(JSON.stringify(registry.get(taskId))).toBe(before);
-    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
   });
 
-  it('rejects stale-bridge fallback when the resolved live providerFamily differs without ensure, dispatch, or registry mutation', async () => {
+  it('keeps legacy fallback on the same project+session when provider metadata rotates', async () => {
     const brain = session('deck_alpha_brain');
     const target = session('deck_sub_provider_target');
     target.providerId = 'anthropic';
@@ -5537,15 +5795,15 @@ describe('SupervisionTaskRegistry', () => {
       taskId, assignmentId, role: 'implementer', scopeFiles: [],
       identity: { ...identity(target.name, target.agentType), providerFamily: 'openai' },
     }).ok).toBe(true);
-    const before = JSON.stringify(registry.get(taskId));
-    const eventCount = registry.listEvents(taskId).length;
-    const ensure = vi.fn();
+    const ensure = vi.fn(async () => ({
+      ok: true as const, worktreePath: '/worktrees/stable-provider/repo', baseRevision: 'b'.repeat(40), created: true,
+    }));
     const dispatchMessage = vi.fn();
 
     const result = await dispatchHookSend({
       from: brain.name,
       targetRecords: [target],
-      message: 'stale bridge must refuse wrong provider',
+      message: 'same durable owner after provider migration',
       projectRoot: '/work/alpha',
     }, {
       listSessions: () => sessions,
@@ -5554,14 +5812,10 @@ describe('SupervisionTaskRegistry', () => {
       dispatchMessage,
     });
 
-    expect(result).toMatchObject({
-      delivered: [], queued: [],
-      errors: [expect.stringContaining('active implementer identity does not match the live target agent/provider')],
-    });
-    expect(ensure).not.toHaveBeenCalled();
-    expect(dispatchMessage).not.toHaveBeenCalled();
-    expect(JSON.stringify(registry.get(taskId))).toBe(before);
-    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+    expect(result.errors).toEqual([]);
+    expect(result.delivered).toEqual([target.name]);
+    expect(ensure).toHaveBeenCalledOnce();
+    expect(dispatchMessage).toHaveBeenCalledOnce();
   });
 
   it('send_message provisions before dispatch and durably projects the selected pool/config/session evidence', async () => {
@@ -5865,7 +6119,7 @@ describe('SupervisionTaskRegistry', () => {
     if (!implementer.ok || !auditor.ok) throw new Error('expected assignments');
 
     const ownerIntent = createSupervisionMcpToolHandlers(
-      { sessionName: implementerIdentity.sessionName } as never,
+      { sessionName: implementerIdentity.sessionName, projectName: 'alpha' } as never,
       { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
     );
     expect(await ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
@@ -5927,7 +6181,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.listFileClaims('matching-pass-close')).toEqual([]);
 
     const auditorIntent = createSupervisionMcpToolHandlers(
-      { sessionName: auditorIdentity.sessionName } as never,
+      { sessionName: auditorIdentity.sessionName, projectName: 'alpha' } as never,
       { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
     );
     await expect(auditorIntent[SUPERVISION_MCP_TOOLS.INTENT]({
@@ -5962,7 +6216,7 @@ describe('SupervisionTaskRegistry', () => {
     if (!worker.ok) throw new Error(worker.reason);
     const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'dispatched' });
     const handlers = createSupervisionMcpToolHandlers(
-      { sessionName: 'deck_alpha_w1' } as never,
+      { sessionName: 'deck_alpha_w1', projectName: 'alpha' } as never,
       {
         resolveSessionIdentity: testIdentityResolver,
         registry: supervisionRegistryPort(registry),
@@ -6076,7 +6330,10 @@ describe('SupervisionTaskRegistry', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-finish-revision-recovery-'));
     const dbPath = join(dir, 'supervision-state.sqlite');
     const revision = 'integration-revision-r1';
-    const roles = ['coordinator', 'integration_owner', 'implementer'] as const;
+    // Coordinator authority drives the task but never masquerades as an
+    // implementation assignment. Exercise both roles whose own finish edge is
+    // legal; coordinator restart continuity is covered at its authority gate.
+    const roles = ['integration_owner', 'implementer'] as const;
     const targets: Array<{
       taskId: string;
       assignmentId: string;
@@ -6184,12 +6441,13 @@ describe('SupervisionTaskRegistry', () => {
           assignmentId: target.assignmentId, identity: target.owner, revision: 'older-revision',
         })).toEqual({ ok: false, reason: 'old_revision' });
         const intent = createSupervisionMcpToolHandlers(
-          { sessionName: target.owner.sessionName } as never,
+          { sessionName: target.owner.sessionName, projectName: 'alpha' } as never,
           { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort(registry) },
         );
-        await expect(intent[SUPERVISION_MCP_TOOLS.INTENT]({
+        const finishResponse = await intent[SUPERVISION_MCP_TOOLS.INTENT]({
           intent: 'finish', taskId: target.taskId, assignmentId: target.assignmentId,
-        })).resolves.toMatchObject({
+        });
+        expect(finishResponse, JSON.stringify(finishResponse)).toMatchObject({
           status: 'ok',
           intent: 'finish',
           toStatus: 'ready_for_integration',
@@ -6365,7 +6623,7 @@ describe('SupervisionTaskRegistry', () => {
     // list/get are now owned by the audited supervision handlers; the legacy
     // duplicates were removed in the consolidation merge.
     const own = createSupervisionMcpToolHandlers(
-      { sessionName: 'deck_alpha_w1' } as never, { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort() },
+      { sessionName: 'deck_alpha_w1', projectName: 'alpha' } as never, { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort() },
     );
     const list: any = await own[SUPERVISION_MCP_TOOLS.LIST]({});
     expect(list.status).toBe('ok');
@@ -6375,7 +6633,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(get.status).toBe('ok');
 
     const other = createSupervisionMcpToolHandlers(
-      { sessionName: 'deck_alpha_w2' } as never, { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort() },
+      { sessionName: 'deck_alpha_w2', projectName: 'alpha' } as never, { resolveSessionIdentity: testIdentityResolver, registry: supervisionRegistryPort() },
     );
     const invisible = await other[SUPERVISION_MCP_TOOLS.GET]({ taskId: (start as { taskId: string }).taskId });
     expect(invisible).toMatchObject({ status: 'error', reason: 'identity_rejected' });
@@ -6472,7 +6730,7 @@ describe('SupervisionTaskRegistry', () => {
         recover: () => {},
       });
       const handlers = createSupervisionMcpToolHandlers(
-        { sessionName: owner.sessionName } as never,
+        { sessionName: owner.sessionName, projectName: 'alpha' } as never,
         { resolveSessionIdentity: testIdentityResolver, registry: port() },
       );
       expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'start', taskId: 'cancel-me' }))
@@ -7014,6 +7272,75 @@ describe('SupervisionTaskRegistry', () => {
     database.close();
   });
 
+  it('censuses NULL-project orphans on a bounded cursor and backfills only unique lineage', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-null-project-census-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const liveIdentity = identity('deck_alpha_live_worker');
+    let registry = new SupervisionTaskRegistry({
+      dbPath,
+      resolveLiveParticipants: (projectName) => projectName === 'alpha' ? [liveIdentity] : [],
+    });
+    try {
+      for (const [taskId, owner] of [
+        ['orphan-unique', liveIdentity],
+        ['orphan-ambiguous', identity('deck_unknown_worker')],
+      ] as const) {
+        expect(registry.createOrGet({ taskId, projectName: 'alpha', objective: taskId })).toMatchObject({ ok: true });
+        expect(registry.createAssignment({ taskId, role: 'implementer', identity: owner })).toMatchObject({ ok: true });
+      }
+      registry.close();
+      const database = new DatabaseSync(dbPath);
+      for (const taskId of ['orphan-unique', 'orphan-ambiguous']) {
+        const row = database.prepare('SELECT payload_json AS payload FROM supervision_tasks WHERE task_id = ?')
+          .get(taskId) as { payload: string };
+        const payload = { ...JSON.parse(row.payload), projectName: '' };
+        database.prepare('UPDATE supervision_tasks SET project_name = NULL, payload_json = ? WHERE task_id = ?')
+          .run(JSON.stringify(payload), taskId);
+      }
+      database.close();
+
+      registry = new SupervisionTaskRegistry({
+        dbPath,
+        resolveLiveParticipants: (projectName) => projectName === 'alpha' ? [liveIdentity] : [],
+      });
+      const normalPage = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 1 });
+      expect(normalPage).toMatchObject({ scanned: 0, hasMore: true, nextCursor: 'orphan:' });
+      const firstOrphan = registry.reconcileHousekeeping({
+        mode: 'dryRun', projectName: 'alpha', cursor: normalPage.nextCursor, limit: 1,
+      });
+      expect(firstOrphan).toMatchObject({ scanned: 1, hasMore: true, nextCursor: 'orphan:orphan-ambiguous' });
+      expect(firstOrphan.orphanDiagnostics).toEqual([
+        expect.objectContaining({ taskId: 'orphan-ambiguous', reason: 'orphan_project_ambiguous' }),
+      ]);
+      const secondOrphan = registry.reconcileHousekeeping({
+        mode: 'dryRun', projectName: 'alpha', cursor: firstOrphan.nextCursor, limit: 1,
+      });
+      expect(secondOrphan.actions).toEqual([
+        expect.objectContaining({
+          taskId: 'orphan-unique', kind: 'backfill_orphan_project',
+          projectName: 'alpha', reason: 'unique_live_session_lineage',
+        }),
+      ]);
+      registry.reconcileHousekeeping({
+        mode: 'apply', projectName: 'alpha', cursor: firstOrphan.nextCursor, limit: 1,
+      });
+      expect(registry.getTaskRecord('orphan-unique')).toMatchObject({ projectName: 'alpha' });
+      expect(registry.getAssignment('orphan-unique')?.identity ?? registry.listAssignments('orphan-unique')[0]?.identity)
+        .toMatchObject(liveIdentity);
+      expect(registry.getTaskRecord('orphan-ambiguous')?.projectName).toBe('');
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({
+        dbPath,
+        resolveLiveParticipants: (projectName) => projectName === 'alpha' ? [liveIdentity] : [],
+      });
+      expect(registry.getTaskRecord('orphan-unique')).toMatchObject({ projectName: 'alpha' });
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('retires and archives a legacy active projection only when immutable finalization consumed its exact PASS', () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
@@ -7495,9 +7822,9 @@ describe('project-Brain finish authority is bound to the task coordinator', () =
     f.registry.close();
   });
 
-  it('refuses the same session NAME on a different instance/epoch', () => {
+  it('accepts the same durable project/session across instance and epoch rotation', () => {
     const f = coordinatorBoundTask('coord-bound-reincarnated');
-    // Same logical name as Brain A, but a replacement runtime: no inheritance.
+    // Runtime incarnation is fencing/observability metadata, not authority.
     const reincarnated = {
       ...f.brainA,
       sessionInstanceId: `${f.brainA.sessionInstanceId}-new`,
@@ -7506,7 +7833,7 @@ describe('project-Brain finish authority is bound to the task coordinator', () =
     expect(f.registry.finishAssignmentAsProjectBrain({
       assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
       callerIdentity: reincarnated, now: 110,
-    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
     f.registry.close();
   });
 
@@ -7534,13 +7861,12 @@ describe('project-Brain finish authority is bound to the task coordinator', () =
   it('fails closed on an unusable caller identity instead of throwing', () => {
     // An authority gate that raises on malformed input is a gate that can be
     // crashed past; every unusable shape must be an ordinary refusal.
-    const f = coordinatorBoundTask('coord-bound-unusable');
-    for (const bad of [
+    const malformed = [
       undefined,
-      { ...f.brainA, sessionInstanceId: '' },
-      { ...f.brainA, runtimeEpoch: '' },
-      { ...f.brainA, sessionName: '' },
-    ]) {
+      { ...identity('deck_coord-bound-unusable_brain'), sessionName: '' },
+    ];
+    for (const [index, bad] of malformed.entries()) {
+      const f = coordinatorBoundTask(`coord-bound-unusable-${index}`);
       expect(() => f.registry.finishAssignmentAsProjectBrain({
         assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
         callerIdentity: bad as never, now: 110,
@@ -7549,8 +7875,24 @@ describe('project-Brain finish authority is bound to the task coordinator', () =
         assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
         callerIdentity: bad as never, now: 110,
       })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+      f.registry.close();
     }
-    f.registry.close();
+  });
+
+  it('does not require observational runtime metadata from the durable coordinator', () => {
+    for (const bad of [
+      { sessionInstanceId: '' },
+      { runtimeEpoch: '' },
+      { agentType: '' },
+      { providerFamily: '' },
+    ]) {
+      const f = coordinatorBoundTask(`coord-bound-observational-${Object.keys(bad)[0]}`);
+      expect(f.registry.finishAssignmentAsProjectBrain({
+        assignmentId: f.auditorAssignmentId, callerProjectName: PROJECT,
+        callerIdentity: { ...f.brainA, ...bad } as never, now: 110,
+      })).toMatchObject({ ok: true, value: { status: 'finalized' } });
+      f.registry.close();
+    }
   });
 
   it('still refuses a foreign project outright', () => {

@@ -93,8 +93,11 @@ export interface SupervisionVisibilityItem {
 export function supervisionCallerParticipates(
   item: SupervisionVisibilityItem | undefined,
   callerIdentity: Partial<SupervisionPersistentIdentity> | undefined,
+  callerProjectName?: string | null,
 ): boolean {
-  return isSupervisionTaskParticipant(item?.assignments as never, callerIdentity);
+  return Boolean(item?.projectName && callerProjectName
+    && item.projectName === callerProjectName
+    && isSupervisionTaskParticipant(item.assignments as never, callerIdentity));
 }
 
 export type SupervisionOwnerScope =
@@ -329,7 +332,9 @@ export function createSupervisionMcpToolHandlers(
       const requestedAssignmentId = input.assignmentId === undefined ? undefined : String(input.assignmentId);
       const intent = String(input.intent ?? '');
       const callerAssignments = (task?.assignments ?? []).filter(
-        (assignment) => supervisionIdentityMatches(assignment.identity, callerIdentity()) && assignment.assignmentId,
+        (assignment) => task?.projectName === caller.projectName
+          && supervisionIdentityMatches(assignment.identity, callerIdentity())
+          && assignment.assignmentId,
       );
       const callerBoundAssignmentId = requestedAssignmentId
         ? callerAssignments.find((assignment) => assignment.assignmentId === requestedAssignmentId)?.assignmentId
@@ -536,7 +541,7 @@ export function createSupervisionMcpToolHandlers(
       // Post-filter: an explicit owner filter must never widen visibility beyond
       // the tasks this caller actually participates in.
       const identity = callerIdentity();
-      const tasks = rows.filter((row) => supervisionCallerParticipates(row, identity));
+      const tasks = rows.filter((row) => supervisionCallerParticipates(row, identity, caller.projectName));
       return ok({
         tasks,
         count: tasks.length,
@@ -557,7 +562,7 @@ export function createSupervisionMcpToolHandlers(
         : '';
       const brainMayRead = Boolean(task && caller.projectName && isProjectBrain(caller)
         && taskProjectName === caller.projectName);
-      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, callerIdentity()))) {
+      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, callerIdentity(), caller.projectName))) {
         return err('identity_rejected', 'task is not visible to this caller');
       }
       return ok({ task });

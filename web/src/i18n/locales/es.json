@@ -3019,6 +3019,7 @@
       "task_id": "ID de tarea",
       "assignment_id": "ID de asignación",
       "execution": "Se ejecuta en",
+      "execution_identity": "{{label}} ({{sessionName}})",
       "diagnostics": "Diagnóstico"
     },
     "picker": {

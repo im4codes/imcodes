@@ -55,6 +55,7 @@ describe('buildSupervisionExecutionSummary', () => {
     });
     expect(summary).toEqual({
       sessionName: 'deck_cd_w1',
+      label: 'worker one',
       agentType: 'claude-code-sdk',
       providerFamily: 'anthropic',
       model: 'claude-opus-5',
@@ -63,6 +64,15 @@ describe('buildSupervisionExecutionSummary', () => {
       assignmentStatus: 'delegated',
       source: 'assignment',
     });
+  });
+
+  it('does not guess a display label when one bound session name has duplicate live projections', () => {
+    const summary = buildSupervisionExecutionSummary({
+      binding: BINDING,
+      candidates: [live({ label: 'Cx1' }), live({ label: 'duplicate Cx1' })],
+    });
+    expect(summary).toMatchObject({ sessionName: 'deck_cd_w1', source: 'assignment' });
+    expect(summary).not.toHaveProperty('label');
   });
 
   it('carries the pool through for an economy binding', () => {

@@ -5,6 +5,11 @@ import type { SupervisionAutomationPoolGateReason } from '../../shared/supervisi
 import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../shared/delegation-availability.js';
 import { getSession, listSessions, upsertSession, type SessionRecord } from '../store/session-store.js';
 import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
+import {
+  IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT,
+  parkTransientRuntimeExhaustedOnce,
+  resolveImplementationHeartbeatDelivery,
+} from './supervision-participant-delivery.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { validateBrainAuditRoute } from './peer-audit-candidates.js';
 import {
@@ -1081,7 +1086,9 @@ class SupervisionAutomation {
       registry.convergeLifecycle(now, {
         // Production wiring: a stale coordinator epoch is repaired against the
         // daemon's own live session registry, with no model or heartbeat.
-        resolveAuthoritativeBrain: (projectName) => resolveAuthoritativeBrainIdentity(projectName),
+        resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
+          projectName, undefined, sessionName,
+        ),
         inspectAssignmentWorktree: (assignment) => {
           const inspected = inspectSupervisionAssignmentWorktree({
             sessionName: assignment.identity.sessionName,
@@ -1123,26 +1130,63 @@ class SupervisionAutomation {
           && event.payload?.source === 'implementation_watchdog'
           && event.createdAt > progressAt
         ));
-        const latestReminder = reminders.at(-1);
-        const cooldown = latestReminder
+        const runtimeRetries = assignmentEvents.filter((event) => (
+          event.eventType === 'implementation_heartbeat'
+          && event.payload?.source === 'implementation_watchdog_runtime_unavailable'
+          && event.createdAt > progressAt
+        ));
+        const attempts = [...reminders, ...runtimeRetries].sort((left, right) => left.createdAt - right.createdAt);
+        const latestAttempt = attempts.at(-1);
+        const cooldown = latestAttempt
           ? Math.min(
-              IMPLEMENTATION_IDLE_REMINDER_MS * (2 ** Math.min(reminders.length - 1, 6)),
+              IMPLEMENTATION_IDLE_REMINDER_MS * (2 ** Math.min(attempts.length - 1, 6)),
               IMPLEMENTATION_REMINDER_MAX_BACKOFF_MS,
             )
           : IMPLEMENTATION_IDLE_REMINDER_MS;
-        const dueAt = latestReminder
-          ? latestReminder.createdAt + cooldown
+        const dueAt = latestAttempt
+          ? latestAttempt.createdAt + cooldown
           : progressAt + IMPLEMENTATION_IDLE_REMINDER_MS;
         if (now < dueAt) continue;
 
-        const runtime = getTransportRuntime(assignment.identity.sessionName);
+        // A reusable session name is not delivery authority. Resolve the exact
+        // live participant and atomically converge permitted epoch/legacy
+        // metadata drift before looking up its runtime. Unresolved ownership is
+        // parked durably by the shared gate, so later ticks cannot wake-loop.
+        try {
+          const authority = resolveImplementationHeartbeatDelivery({
+            taskId: task.taskId,
+            assignmentId: assignment.assignmentId,
+            targetSessionName: assignment.identity.sessionName,
+            now,
+          });
+          if (authority.status === 'transient_unavailable') {
+            const retryNumber = runtimeRetries.length + 1;
+            if (retryNumber >= IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT) {
+              parkTransientRuntimeExhaustedOnce({
+                taskId: task.taskId,
+                assignmentId: assignment.assignmentId,
+                retryCount: retryNumber,
+                now,
+              });
+            } else {
+              registry.recordImplementationHeartbeatUnavailable({
+                assignmentId: assignment.assignmentId,
+                retryNumber,
+                now,
+              });
+            }
+            continue;
+          }
+          if (authority.status !== 'authorized') continue;
+        } catch (error) {
+          logger.warn({ err: error, taskId: task.taskId, assignmentId: assignment.assignmentId },
+            'Supervision implementation heartbeat authority resolution failed');
+          continue;
+        }
+        const rebound = registry.getAssignment(assignment.assignmentId);
+        if (!rebound) continue;
+        const runtime = getTransportRuntime(rebound.identity.sessionName);
         if (!runtime) continue;
-        const activity = runtime.getDiagnosticSnapshot(now);
-        if (activity.status !== 'idle'
-          || activity.sending
-          || activity.pendingCount > 0
-          || activity.activeDispatchCount > 0
-          || activity.blockingWorkCount > 0) continue;
         // Durable FIFO can retain an append while the provider remains busy or
         // disconnected. Never enqueue a second watchdog reminder behind the
         // first one: cooldown controls cadence, this queue check provides the
@@ -1168,7 +1212,7 @@ class SupervisionAutomation {
           action: 'advance_safe_unfinished',
         });
         timelineEmitter.emit(
-          assignment.identity.sessionName,
+          rebound.identity.sessionName,
           'user.message',
           {
             text: prompt,
@@ -1190,7 +1234,7 @@ class SupervisionAutomation {
           logger.warn({
             taskId: task.taskId,
             assignmentId: assignment.assignmentId,
-            session: assignment.identity.sessionName,
+            session: rebound.identity.sessionName,
             err: error,
           }, 'Supervision implementation heartbeat dispatch failed');
         }
@@ -2669,6 +2713,9 @@ class SupervisionAutomation {
     }
 
     if (event.type === 'assistant.text' && this.isEligibleAssistantCompletionPayload(event.payload)) {
+      // `payload.text` is the trusted assistant-authored boundary. Delegation
+      // claims and other host-rendered dispatch metadata remain sibling fields;
+      // never concatenate them into marker authority.
       const text = typeof event.payload.text === 'string' ? event.payload.text : '';
       const completionKey = this.timelineCompletionKey(event.sessionId, event);
       this.latestAssistantTexts.set(event.sessionId, { text, sequence, completionKey });
