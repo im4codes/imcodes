@@ -688,20 +688,27 @@ export function createSupervisionMcpToolHandlers(
           && Boolean(beforeAssignment.leaseId)
           && beforeAssignment.auditRevision === toRevision
           && beforeAssignment.verdict?.trim().toUpperCase() === 'REWORK';
-        // An exact REWORK receipt is stronger than caller-supplied recovery
-        // metadata. Repair the same implementation object first; if it closes
-        // the split there is no revision rebind left to perform.
-        const converged = reg.convergeExactReworkAssignment?.({ taskId, assignmentId });
-        const after = reg.get(taskId);
-        const repaired = after?.status === 'rework' && after.assignments?.some((candidate) => (
-          candidate.assignmentId === assignmentId && candidate.status === 'rework'
-        ));
-        if (converged && repaired) {
-          return ok({
-            taskId, assignmentId, toRevision,
-            replay: alreadyRepaired,
-            converged: 'exact_rework_receipt',
-          });
+        // An exact REWORK receipt may repair a split only within the revision
+        // that already owns it. A predecessor receipt must never short-circuit
+        // the explicit successor bind below.
+        if (task.currentRevision === toRevision) {
+          const converged = reg.convergeExactReworkAssignment?.({ taskId, assignmentId });
+          const after = reg.get(taskId);
+          const repaired = after?.status === 'rework'
+            && after.currentRevision === toRevision
+            && after.assignments?.some((candidate) => (
+              candidate.assignmentId === assignmentId
+              && candidate.status === 'rework'
+              && candidate.auditRevision === toRevision
+              && candidate.verdict?.trim().toUpperCase() === 'REWORK'
+            ));
+          if (converged && repaired) {
+            return ok({
+              taskId, assignmentId, toRevision,
+              replay: alreadyRepaired,
+              converged: 'exact_rework_receipt',
+            });
+          }
         }
         const rebound = reg.rebindTaskAssignmentRevision?.({
           taskId, assignmentId,
@@ -716,6 +723,20 @@ export function createSupervisionMcpToolHandlers(
         });
         if (!rebound) return err('unavailable', 'revision recovery is not bound');
         if (!rebound.ok) return err(rebound.reason, `revision recovery rejected: ${rebound.reason}`);
+        const reboundTask = reg.get(taskId);
+        const reboundAssignment = reboundTask?.assignments?.find((candidate) => (
+          candidate.assignmentId === assignmentId
+        ));
+        const successorBound = reboundTask?.currentRevision === toRevision
+          && reboundAssignment?.auditRevision === toRevision
+          && !reboundAssignment.auditAttemptId
+          && !reboundAssignment.verdict;
+        if (!successorBound) {
+          return err(
+            'invalid_transition',
+            'revision recovery postcondition failed: authoritative successor state is not bound',
+          );
+        }
         return ok({ taskId, assignmentId, ...(fromRevision ? { fromRevision } : {}), toRevision, replay: rebound.replay === true });
       }
       const coordinationOverrideRequested = Boolean(

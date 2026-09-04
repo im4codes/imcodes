@@ -57,8 +57,10 @@ class FakeRegistry implements SupervisionRegistryPort {
   ]);
   assignmentStates = new Map<string, Array<{
     assignmentId: string; role: string; status: string; leaseId: string; auditAttemptId?: string;
+    auditRevision?: string; verdict?: string;
     identity: { sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; agentType?: string; providerFamily?: string };
   }>>();
+  currentRevisions = new Map<string, string>();
   applied: any[] = [];
   recovered: any[] = [];
   rebound: any[] = [];
@@ -75,6 +77,7 @@ class FakeRegistry implements SupervisionRegistryPort {
       projectName: 'codedeck',
       classification: this.classifications.get(taskId),
       status: this.statuses.get(taskId),
+      currentRevision: this.currentRevisions.get(taskId),
       assignments: explicit ?? (this.participants.get(taskId) ?? []).map((sessionName, index) => ({
         assignmentId: `${taskId}-assignment-${index}`,
         role: 'implementer', status: this.statuses.get(taskId) ?? 'planned', leaseId: 'lease',
@@ -107,6 +110,19 @@ class FakeRegistry implements SupervisionRegistryPort {
   }
   rebindTaskAssignmentRevision(input: any) {
     this.revisionRebound.push(input);
+    this.currentRevisions.set(input.taskId, input.toRevision);
+    const assignments = this.item(input.taskId).assignments.map((assignment) => (
+      assignment.assignmentId === input.assignmentId
+        ? {
+          ...assignment,
+          status: 'implementing',
+          auditRevision: input.toRevision,
+          auditAttemptId: undefined,
+          verdict: undefined,
+        }
+        : assignment
+    ));
+    this.assignmentStates.set(input.taskId, assignments as NonNullable<ReturnType<FakeRegistry['item']>['assignments']> as never);
     return { ok: true as const, value: { taskId: input.taskId } };
   }
   coordinateTaskAssignment(input: any) {
@@ -696,6 +712,156 @@ describe('administrative recover', () => {
       idempotencyKey: 'cross-project-refused', reason: 'must stay project-scoped',
     })).toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.coordinated).toEqual([]);
+  });
+
+  it('does not let an exact predecessor REWORK receipt short-circuit a successor revision bind', async () => {
+    const assignmentId = 'successor-recovery-assignment';
+    let state: any = {
+      taskId: 'successor-recovery-task', projectName: 'codedeck', status: 'rework', currentRevision: 'revision-r1',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditAttemptId: 'audit-r1', auditRevision: 'revision-r1', verdict: 'REWORK',
+        identity: testIdentity('deck_successor_worker'),
+      }],
+    };
+    const convergeExactReworkAssignment = vi.fn(() => {
+      state = { ...state, assignments: state.assignments.map((item: any) => (
+        item.assignmentId === assignmentId ? { ...item, status: 'rework', leaseId: 'lease-r1' } : item
+      )) };
+      return { ok: true };
+    });
+    const rebindTaskAssignmentRevision = vi.fn((input: any) => {
+      state = {
+        ...state, currentRevision: input.toRevision,
+        assignments: state.assignments.map((item: any) => item.assignmentId === assignmentId ? {
+          ...item, status: 'implementing', leaseId: 'lease-r2', auditRevision: input.toRevision,
+          auditAttemptId: undefined, verdict: undefined,
+        } : item),
+      };
+      return { ok: true as const };
+    });
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      convergeExactReworkAssignment, rebindTaskAssignmentRevision,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId, fromRevision: 'revision-r1', toRevision: 'revision-r2',
+      leaseAction: 'renew', idempotencyKey: 'bind-successor-r2', reason: 'bind the successor revision',
+    })).resolves.toMatchObject({
+      status: 'ok', taskId: state.taskId, assignmentId,
+      fromRevision: 'revision-r1', toRevision: 'revision-r2', replay: false,
+    });
+    expect(convergeExactReworkAssignment).not.toHaveBeenCalled();
+    expect(rebindTaskAssignmentRevision).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when a successful revision rebind does not satisfy authoritative postconditions', async () => {
+    const assignmentId = 'false-success-assignment';
+    const state = {
+      taskId: 'false-success-task', projectName: 'codedeck', status: 'rework', currentRevision: 'revision-r1',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'rework', leaseId: 'lease-r1',
+        auditAttemptId: 'audit-r1', auditRevision: 'revision-r1', verdict: 'REWORK',
+        identity: testIdentity('deck_false_success_worker'),
+      }],
+    };
+    const rebindTaskAssignmentRevision = vi.fn(() => ({ ok: true as const }));
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      rebindTaskAssignmentRevision,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId, fromRevision: 'revision-r1', toRevision: 'revision-r2',
+      leaseAction: 'renew', idempotencyKey: 'false-success-r2', reason: 'reject a false successful rebind',
+    })).resolves.toEqual({
+      status: 'error', reason: 'invalid_transition',
+      detail: 'revision recovery postcondition failed: authoritative successor state is not bound',
+    });
+    expect(rebindTaskAssignmentRevision).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['task revision', 'revision-r1', 'revision-r2', undefined, undefined],
+    ['assignment revision', 'revision-r2', 'revision-r1', undefined, undefined],
+    ['predecessor audit evidence', 'revision-r2', 'revision-r2', 'audit-r1', 'REWORK'],
+  ])('checks the authoritative %s after a successful revision rebind', async (
+    _postcondition, currentRevision, auditRevision, auditAttemptId, verdict,
+  ) => {
+    const assignmentId = `postread-${_postcondition}`;
+    let reads = 0;
+    const before = {
+      taskId: 'postread-task', projectName: 'codedeck', status: 'rework', currentRevision: 'revision-r1',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'rework', leaseId: 'lease-r1',
+        auditAttemptId: 'audit-r1', auditRevision: 'revision-r1', verdict: 'REWORK',
+        identity: testIdentity('deck_postread_worker'),
+      }],
+    };
+    const after = {
+      ...before, currentRevision,
+      assignments: [{ ...before.assignments[0], auditRevision, auditAttemptId, verdict }],
+    };
+    const port = {
+      getStatus: () => before.status, applyIntent: () => undefined,
+      list: () => [before], get: () => reads++ === 0 ? before : after, recover: () => undefined,
+      rebindTaskAssignmentRevision: () => ({ ok: true as const }),
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: before.taskId, assignmentId, fromRevision: 'revision-r1', toRevision: 'revision-r2',
+      leaseAction: 'renew', idempotencyKey: `postread-${_postcondition}`,
+      reason: `reject incomplete ${_postcondition} postcondition`,
+    })).resolves.toMatchObject({ status: 'error', reason: 'invalid_transition' });
+  });
+
+  it('keeps same-revision exact REWORK receipt convergence idempotent', async () => {
+    const assignmentId = 'same-revision-assignment';
+    let state: any = {
+      taskId: 'same-revision-task', projectName: 'codedeck', status: 'rework', currentRevision: 'revision-r1',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditAttemptId: 'audit-r1', auditRevision: 'revision-r1', verdict: undefined,
+        identity: testIdentity('deck_same_revision_worker'),
+      }],
+    };
+    const convergeExactReworkAssignment = vi.fn(() => {
+      state = { ...state, assignments: [{
+        ...state.assignments[0], status: 'rework', leaseId: 'lease-r1', verdict: 'REWORK',
+      }] };
+      return { ok: true };
+    });
+    const rebindTaskAssignmentRevision = vi.fn();
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      convergeExactReworkAssignment, rebindTaskAssignmentRevision,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId, fromRevision: 'revision-r1', toRevision: 'revision-r1',
+      leaseAction: 'renew', idempotencyKey: 'same-revision-r1', reason: 'repair the current revision split',
+    })).resolves.toMatchObject({
+      status: 'ok', taskId: state.taskId, assignmentId,
+      toRevision: 'revision-r1', converged: 'exact_rework_receipt', replay: false,
+    });
+    expect(convergeExactReworkAssignment).toHaveBeenCalledTimes(1);
+    expect(rebindTaskAssignmentRevision).not.toHaveBeenCalled();
   });
 
   it('rebinds one same-object revision only through Brain/admin authority and the strict production schema', async () => {
