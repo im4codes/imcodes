@@ -37,10 +37,13 @@ import {
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   AGENT_DELEGATION_PURPOSES,
+  SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
+  SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
   buildAgentDelegationBlockerReportInstruction,
   isAgentDelegationOpaqueId,
   isDelegationReplyCapableAgentType,
   type AgentDelegationAuditRequest,
+  type SupervisionBlockerEscalationReport,
 } from '../../shared/agent-delegation.js';
 import {
   SUPERVISION_MODE,
@@ -445,6 +448,28 @@ export interface SendToolDeps {
    * only genuinely live omissions; explicit stopped/error records still win.
    */
   isSessionAuthoritativelyActive?: (session: SessionRecord) => boolean | Promise<boolean>;
+}
+
+function uniqueAuthoritativeProjectBrain(
+  projectName: string,
+  sessions: readonly SessionRecord[],
+): SessionRecord | undefined {
+  const brains = sessions.filter((session) => (
+    session.role === 'brain'
+    && !session.parentSession
+    && session.state !== 'stopped'
+    && resolveEffectiveProjectName(session, sessions) === projectName
+  ));
+  return brains.length === 1 ? brains[0] : undefined;
+}
+
+function isUniqueAuthoritativeProjectBrainCaller(
+  caller: SessionRecord | undefined,
+  projectName: string,
+  sessions: readonly SessionRecord[],
+): boolean {
+  const brain = uniqueAuthoritativeProjectBrain(projectName, sessions);
+  return Boolean(brain && caller?.name === brain.name);
 }
 
 /** Request passed to the injectable {@link SendToolDeps.createExecutionClone} hook. */
@@ -1391,18 +1416,24 @@ export async function dispatchSendMessage(
     let taskId: string;
     if (requestedTaskId) {
       const existing = registry.get(requestedTaskId);
+      const legacyBrainMayCoordinate = Boolean(
+        existing
+        && existing.projectName === callerProjectName
+        && !existing.assignments.some((assignment) => assignment.role === 'coordinator')
+        && isUniqueAuthoritativeProjectBrainCaller(callerRecord, callerProjectName, allSessions),
+      );
       // Explicit task ids are references, never create requests. Keep missing
       // and unauthorized indistinguishable so send_message is not a task-id
-      // existence oracle. Project/role alone is not ownership: even a Brain
-      // may continue only a task to which the registry authoritatively binds
-      // its exact session identity.
+      // existence oracle. Project/role alone is not ownership. The sole legacy
+      // exception is one unique live project Brain when the task has no
+      // coordinator row at all; ambiguity still fails closed.
       if (!existing
         || existing.projectName !== callerProjectName
-        || !supervisionCallerParticipates(
-          existing,
-          callerRecord ? supervisionTaskIdentityForTarget(callerRecord) : undefined,
-          callerProjectName,
-        )) {
+        || (!legacyBrainMayCoordinate && !supervisionCallerParticipates(
+            existing,
+            callerRecord ? supervisionTaskIdentityForTarget(callerRecord) : undefined,
+            callerProjectName,
+          ))) {
         return {
           status: 'error',
           reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -1951,6 +1982,130 @@ export async function dispatchSendMessage(
     }
   }
   return accepted;
+}
+
+export type ImplementationBlockerEscalationResult =
+  | { status: 'waiting'; report: SupervisionBlockerEscalationReport; replay: boolean }
+  | { status: 'needs_input'; report: SupervisionBlockerEscalationReport; replay: boolean }
+  | { status: 'ignored'; reason: string };
+
+function readMatchingBlockerEscalation(
+  blocker: string | undefined,
+  fingerprint: string,
+): SupervisionBlockerEscalationReport | undefined {
+  if (!blocker?.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(blocker) as Partial<SupervisionBlockerEscalationReport>;
+    return parsed.blockerFingerprint === fingerprint ? parsed as SupervisionBlockerEscalationReport : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Convert one completed no-progress heartbeat into one durable, actionable
+ * disposition. Persistence happens before delivery, so a daemon restart or a
+ * later watchdog tick cannot emit another refusal/no-op for the same state.
+ */
+export async function reportImplementationNoProgressBlocker(
+  input: { taskId: string; assignmentId: string },
+  deps: SendToolDeps = {},
+): Promise<ImplementationBlockerEscalationResult> {
+  const registry = getSupervisionTaskRegistry();
+  const task = registry.get(input.taskId);
+  const assignment = task?.assignments.find((candidate) => candidate.assignmentId === input.assignmentId);
+  if (!task || !assignment || assignment.role !== 'implementer') {
+    return { status: 'ignored', reason: 'exact_implementer_not_found' };
+  }
+  if (isTerminalSupervisionTaskStatus(task.status) || isTerminalSupervisionTaskStatus(assignment.status)) {
+    return { status: 'ignored', reason: 'terminal' };
+  }
+
+  const sessions = (deps.listSessions ?? listSessions)();
+  const reporter = sessions.find((session) => (
+    session.name === assignment.identity.sessionName
+    && session.state !== 'stopped'
+    && resolveEffectiveProjectName(session, sessions) === task.projectName
+  ));
+  const brain = uniqueAuthoritativeProjectBrain(task.projectName, sessions);
+  const fingerprint = createHash('sha256').update(JSON.stringify({
+    taskId: task.taskId,
+    assignmentId: assignment.assignmentId,
+    revision: task.currentRevision ?? assignment.auditRevision ?? '',
+    status: assignment.status,
+    exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+  })).digest('hex');
+  const replay = readMatchingBlockerEscalation(assignment.blocker, fingerprint);
+  if (replay) {
+    return replay.disposition === SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
+      ? { status: 'waiting', report: replay, replay: true }
+      : { status: 'needs_input', report: replay, replay: true };
+  }
+
+  const brainCanResolve = Boolean(reporter && brain);
+  const report: SupervisionBlockerEscalationReport = {
+    taskId: task.taskId,
+    assignmentId: assignment.assignmentId,
+    exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+    completedSafeWork: 'one bounded implementation heartbeat completed; no lifecycle, Git, or replacement-object side effect was inferred',
+    options: brainCanResolve
+      ? ['repair_same_object_authority', 'resume_exact_assignment']
+      : ['provide_missing_external_authority', 'select_one_authoritative_project_brain'],
+    recommendedNextAction: brainCanResolve
+      ? 'the authoritative Brain must repair and resume this same task and assignment in place'
+      : 'provide the missing external authority or identify one authoritative Brain for this project',
+    blockerFingerprint: fingerprint,
+    disposition: brainCanResolve
+      ? SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
+      : SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.NEEDS_INPUT,
+    reporter: {
+      label: reporter?.label?.trim() || assignment.identity.sessionName,
+      sessionName: assignment.identity.sessionName,
+    },
+    ...(brain ? { brain: { label: brain.label?.trim() || brain.name, sessionName: brain.name } } : {}),
+    ...(brainCanResolve ? {} : { missing: 'one live authoritative same-project Brain or external authorization' }),
+  };
+  const persisted = registry.updateAssignment({
+    assignmentId: assignment.assignmentId,
+    identity: assignment.identity,
+    blocker: JSON.stringify(report),
+    now: (deps.now ?? Date.now)(),
+  });
+  if (!persisted.ok) return { status: 'ignored', reason: `blocker_persist_failed:${persisted.reason}` };
+
+  if (!brainCanResolve || !reporter || !brain) {
+    return { status: 'needs_input', report, replay: false };
+  }
+  const messageId = deterministicSendMessageId(`implementation-blocker:${fingerprint}`);
+  if (!(deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(brain.name, messageId)) {
+    const dispatched = await dispatchSendMessage({
+      userId: reporter.name,
+      sessionName: reporter.name,
+      projectName: task.projectName,
+      projectRoot: reporter.projectDir,
+    }, {
+      target: brain.name,
+      message: JSON.stringify(report),
+      idempotencyKey: `implementation-blocker:${fingerprint}`,
+      internalMessageId: messageId,
+      internalDurableQueue: true,
+    }, deps);
+    if (dispatched.status !== 'accepted') {
+      const failedReport: SupervisionBlockerEscalationReport = {
+        ...report,
+        disposition: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.NEEDS_INPUT,
+        missing: `Brain escalation delivery failed: ${dispatched.status === 'error' ? dispatched.error : dispatched.reason}`,
+      };
+      registry.updateAssignment({
+        assignmentId: assignment.assignmentId,
+        identity: assignment.identity,
+        blocker: JSON.stringify(failedReport),
+        now: (deps.now ?? Date.now)(),
+      });
+      return { status: 'needs_input', report: failedReport, replay: false };
+    }
+  }
+  return { status: 'waiting', report, replay: false };
 }
 
 export type ReadyAuditDispatchResult =

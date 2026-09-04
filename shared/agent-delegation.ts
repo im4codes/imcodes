@@ -78,8 +78,31 @@ export const AGENT_DELEGATION_BLOCKER_REPORT_FIELDS = [
   'assignmentId',
   'exactError',
   'completedSafeWork',
+  'options',
   'recommendedNextAction',
 ] as const;
+
+export const SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS = {
+  WAITING_FOR_BRAIN: 'waiting_for_brain',
+  NEEDS_INPUT: 'needs_input',
+} as const;
+
+export const SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR =
+  'implementation heartbeat completed without durable progress or structured escalation' as const;
+
+export interface SupervisionBlockerEscalationReport {
+  taskId: string;
+  assignmentId: string;
+  exactError: string;
+  completedSafeWork: string;
+  options: string[];
+  recommendedNextAction: string;
+  blockerFingerprint: string;
+  disposition: (typeof SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS)[keyof typeof SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS];
+  reporter: { label: string; sessionName: string };
+  brain?: { label: string; sessionName: string };
+  missing?: string;
+}
 
 export const AGENT_DELEGATION_CONTRACT_REFS = [SUPERVISION_CONTRACT_IDS.MESSAGING] as const;
 

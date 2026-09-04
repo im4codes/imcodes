@@ -934,6 +934,7 @@ class SupervisionAutomation {
   private heartbeatPausedForNeedsInput = new Set<string>();
   private emittedAuditResultAttemptIds: string[] = [];
   private emittedAuditResultAttemptIdSet = new Set<string>();
+  private implementationBlockerEscalationsInFlight = new Set<string>();
   private implementationWatchdogTimer?: NodeJS.Timeout;
   /** Monotonic even across cancellation, so an old async verdict cannot match a replacement run. */
   private nextRunGeneration = 0;
@@ -1193,6 +1194,39 @@ class SupervisionAutomation {
         // independent hard bound of one pending reminder per assignment.
         const reminderIdPrefix = `supervision-implementation-heartbeat:${assignment.assignmentId}:`;
         if (runtime.pendingEntries.some((entry) => entry.clientMessageId.startsWith(reminderIdPrefix))) continue;
+        // One unanswered heartbeat is the bounded liveness probe. A second
+        // equivalent prompt would only solicit another refusal/no-op. Convert
+        // that state into one durable structured escalation instead; the
+        // persisted blocker above stops later ticks and process restarts.
+        if (reminders.length > 0) {
+          const escalationKey = `${task.taskId}\0${assignment.assignmentId}`;
+          if (this.implementationBlockerEscalationsInFlight.has(escalationKey)) continue;
+          this.implementationBlockerEscalationsInFlight.add(escalationKey);
+          void import('./send-tool.js')
+            .then(({ reportImplementationNoProgressBlocker }) => (
+              reportImplementationNoProgressBlocker({
+                taskId: task.taskId,
+                assignmentId: assignment.assignmentId,
+              })
+            ))
+            .then((result) => {
+              if (result.status === 'ignored') return;
+              const actor = `${result.report.reporter.label} (${result.report.reporter.sessionName})`;
+              if (result.status === 'waiting') {
+                this.emitStatus(rebound.identity.sessionName, 'supervision_waiting_for_brain',
+                  `${actor}: waiting for authoritative Brain repair on the same object.`);
+              } else {
+                this.emitStatus(rebound.identity.sessionName, 'supervision_needs_input',
+                  `${actor}: NEEDS_INPUT — ${result.report.missing ?? 'external information or authorization is missing'}.`);
+              }
+            })
+            .catch((error) => {
+              logger.warn({ err: error, taskId: task.taskId, assignmentId: assignment.assignmentId },
+                'Supervision implementation blocker escalation failed');
+            })
+            .finally(() => this.implementationBlockerEscalationsInFlight.delete(escalationKey));
+          continue;
+        }
         const reminderNumber = reminders.length + 1;
         const clientMessageId = `${reminderIdPrefix}${reminderNumber}`;
         const recorded = registry.recordImplementationHeartbeat({
@@ -1980,6 +2014,7 @@ class SupervisionAutomation {
     this.pendingTaskIntents.clear();
     this.recentTaskCandidates.clear();
     this.latestAssistantTexts.clear();
+    this.implementationBlockerEscalationsInFlight.clear();
     this.restorePersistedWaitStates();
   }
 

@@ -5729,6 +5729,53 @@ describe('SupervisionAutomation', () => {
       }));
     });
 
+    it('escalates one structured blocker instead of sending a second no-progress heartbeat', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-noop-escalation-task';
+      const assignmentId = 'watchdog-noop-escalation-implementer';
+      const identity = liveWorkerIdentity('deck_noop_worker');
+      upsertSession({
+        name: 'deck_alpha_brain', label: 'Brain', projectName: 'alpha', role: 'brain',
+        agentType: 'codex-sdk', runtimeType: 'transport', providerId: 'codex-sdk',
+        projectDir: '/work/watchdog', state: 'idle', restarts: 0, restartTimestamps: [],
+        createdAt: Date.now(), updatedAt: Date.now(),
+      } as never);
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'never repeat no-op heartbeats', now: 1_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity, scopeFiles: ['src/noop.ts'], now: 2_000,
+      })).toMatchObject({ ok: true });
+      mockTransportRuntime.send.mockClear();
+      mockTransportRuntimeWorking = false;
+
+      const firstDue = 2_000 + 10 * 60_000;
+      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      mockTransportRuntime.pendingEntries.length = 0;
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 10 * 60_000);
+      await sleep(25);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      const blocker = JSON.parse(registry.getAssignment(assignmentId)!.blocker!);
+      expect(blocker).toMatchObject({
+        taskId, assignmentId,
+        exactError: 'implementation heartbeat completed without durable progress or structured escalation',
+        completedSafeWork: expect.any(String),
+        options: expect.any(Array),
+        recommendedNextAction: expect.any(String),
+      });
+
+      const eventsAfterEscalation = registry.listEvents(taskId).length;
+      supervisionAutomation.__simulateProcessRestartForTests();
+      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 24 * 60 * 60_000);
+      await sleep(25);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(registry.listEvents(taskId)).toHaveLength(eventsAfterEscalation);
+      removeSession('deck_alpha_brain');
+    });
+
     it('deduplicates and backs off reminders, resets on progress, and stops permanently after FINISHED handoff', () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-one-task';

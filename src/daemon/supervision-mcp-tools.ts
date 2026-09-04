@@ -330,9 +330,20 @@ export function createSupervisionMcpToolHandlers(
   // The caller's LIVE identity, resolved from the daemon session store. Caller
   // fields alone never establish authority, and an unresolvable caller fails
   // closed at every participant gate below.
-  const callerIdentity = (): SupervisionPersistentIdentity | undefined => (
+  const callerIdentity = () => (
     callerSession ? deps.resolveSessionIdentity?.(callerSession) : undefined
   );
+  const callerAuthority = () => {
+    const identity = callerIdentity();
+    return {
+      identity,
+      // The daemon-resolved project is the durable scope. A sub-session's raw
+      // MCP project field may still be its generated session namespace before
+      // the first task intent; read and write gates must not disagree on that
+      // pre-start projection.
+      projectName: identity?.projectName?.trim() || caller.projectName?.trim() || '',
+    };
+  };
   const need = (): SupervisionRegistryPort | undefined => registry;
 
   return {
@@ -342,11 +353,12 @@ export function createSupervisionMcpToolHandlers(
       if (!reg) return err('unavailable', 'supervision registry not bound');
       const taskId = String(input.taskId ?? '');
       const task = reg.get(taskId);
+      const authority = callerAuthority();
       const requestedAssignmentId = input.assignmentId === undefined ? undefined : String(input.assignmentId);
       const intent = String(input.intent ?? '');
       const callerAssignments = (task?.assignments ?? []).filter(
-        (assignment) => task?.projectName === caller.projectName
-          && supervisionIdentityMatches(assignment.identity, callerIdentity())
+        (assignment) => task?.projectName === authority.projectName
+          && supervisionIdentityMatches(assignment.identity, authority.identity)
           && assignment.assignmentId,
       );
       const callerBoundAssignmentId = requestedAssignmentId
@@ -359,8 +371,8 @@ export function createSupervisionMcpToolHandlers(
       const coordinatorMayAct = Boolean(
         requestedAssignmentId
         && task?.projectName
-        && caller.projectName === task.projectName
-        && isSupervisionTaskCoordinator(task.assignments as never, callerIdentity())
+        && authority.projectName === task.projectName
+        && isSupervisionTaskCoordinator(task.assignments as never, authority.identity)
         && task.assignments?.some((assignment) => assignment.assignmentId === requestedAssignmentId),
       );
       const boundAssignmentId = callerBoundAssignmentId
@@ -517,7 +529,8 @@ export function createSupervisionMcpToolHandlers(
         ...(input.cursor === undefined ? {} : { cursor: String(input.cursor) }),
         ...(input.limit === undefined ? {} : { limit: Number(input.limit) }),
       };
-      const projectName = caller.projectName?.trim() || '';
+      const authority = callerAuthority();
+      const projectName = authority.projectName;
       if (projectName && isProjectBrain(caller)) {
         const explicitOwner = input.ownerSessionName === undefined
           ? input.target === undefined ? undefined : String(input.target)
@@ -553,8 +566,8 @@ export function createSupervisionMcpToolHandlers(
       });
       // Post-filter: an explicit owner filter must never widen visibility beyond
       // the tasks this caller actually participates in.
-      const identity = callerIdentity();
-      const tasks = rows.filter((row) => supervisionCallerParticipates(row, identity, caller.projectName));
+      const identity = authority.identity;
+      const tasks = rows.filter((row) => supervisionCallerParticipates(row, identity, authority.projectName));
       return ok({
         tasks,
         count: tasks.length,
@@ -567,15 +580,16 @@ export function createSupervisionMcpToolHandlers(
       const reg = need();
       if (!reg) return err('unavailable', 'supervision registry not bound');
       const task = reg.get(String(input.taskId ?? ''));
+      const authority = callerAuthority();
       // Deliberately the SAME refusal for "does not exist" and "exists but you
       // are not a participant". Distinguishing them would turn this tool into an
       // existence oracle for other coordinators' task ids.
       const taskProjectName = typeof (task as { projectName?: unknown } | undefined)?.projectName === 'string'
         ? String((task as { projectName: string }).projectName)
         : '';
-      const brainMayRead = Boolean(task && caller.projectName && isProjectBrain(caller)
-        && taskProjectName === caller.projectName);
-      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, callerIdentity(), caller.projectName))) {
+      const brainMayRead = Boolean(task && authority.projectName && isProjectBrain(caller)
+        && taskProjectName === authority.projectName);
+      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, authority.identity, authority.projectName))) {
         return err('identity_rejected', 'task is not visible to this caller');
       }
       return ok({ task });

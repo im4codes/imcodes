@@ -12,6 +12,7 @@ import {
   dispatchSendMessage,
   dispatchSendStop,
   listSendTargets,
+  reportImplementationNoProgressBlocker,
 } from '../../src/daemon/send-tool.js';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
@@ -343,6 +344,159 @@ describe('send-tool', () => {
     expect(execution?.model).not.toBe('gpt-5.6-live');
     expect(execution?.agentType).not.toBe('codex-sdk');
     resetSupervisionTaskRegistryForTests();
+  });
+
+  it('lets the unique authoritative project Brain continue a same-project legacy task without a coordinator row', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'legacy-no-coordinator-task';
+    const assignmentId = 'legacy-no-coordinator-implementer';
+    const target = session({
+      name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit', backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1', maxParseRetries: 1, maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const competingBrain = session({
+      name: 'deck_alpha_brain_2', projectName: 'alpha', role: 'brain', label: 'Other Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'legacy continuation',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: target.name, sessionInstanceId: target.sessionInstanceId!, runtimeEpoch: target.runtimeEpoch!,
+        agentType: target.agentType, providerFamily: 'openai',
+      },
+      executionBinding: {
+        pool: 'primary', origin: 'reused',
+        requested: {
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+        actual: {
+          sessionName: target.name, sessionInstanceId: target.sessionInstanceId!, runtimeEpoch: target.runtimeEpoch!,
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    try {
+      await expect(dispatchSendMessage(caller, {
+        target: target.name,
+        message: 'must fail closed while Brain authority is ambiguous',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, { listSessions: () => [brain, competingBrain, target], dispatchMessage }))
+        .resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+      const result = await dispatchSendMessage(caller, {
+        target: target.name,
+        message: 'resume the exact legacy assignment',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, {
+        listSessions: () => [brain, target],
+        dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/.imcodes/asg', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      });
+      expect(result).toMatchObject({ status: 'accepted', taskId, assignmentId });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('durably reports one Brain-resolvable blocker with readable and internal identities', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'one-structured-blocker-task';
+    const assignmentId = 'one-structured-blocker-assignment';
+    const worker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1' });
+    const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Project Brain' });
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'escalate once',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    const deps = {
+      listSessions: () => [brain, worker], dispatchMessage,
+      hasDeliveryEvidence: () => false,
+    };
+    try {
+      const first = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, deps);
+      const second = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, deps);
+      expect(first).toMatchObject({ status: 'waiting', replay: false });
+      expect(second).toMatchObject({ status: 'waiting', replay: true });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+      const report = JSON.parse(dispatchMessage.mock.calls[0]![1]);
+      expect(report).toMatchObject({
+        taskId, assignmentId, disposition: 'waiting_for_brain',
+        reporter: { label: 'CC1', sessionName: worker.name },
+        brain: { label: 'Project Brain', sessionName: brain.name },
+      });
+      expect(report.options).toEqual(expect.arrayContaining(['repair_same_object_authority']));
+      expect(report).not.toHaveProperty('missing');
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toEqual(report);
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('uses NEEDS_INPUT only when no unique same-project Brain can resolve the blocker', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'external-input-blocker-task';
+    const assignmentId = 'external-input-blocker-assignment';
+    const worker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1' });
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'need external input',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn();
+    try {
+      const result = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, {
+        listSessions: () => [worker], dispatchMessage,
+      });
+      expect(result).toMatchObject({
+        status: 'needs_input', replay: false,
+        report: { disposition: 'needs_input', missing: expect.stringContaining('authoritative same-project Brain') },
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
   });
 
   it('carries the executor on a queued delivery too, not just an accepted one', async () => {
@@ -829,4 +983,3 @@ describe('send-tool', () => {
     });
   });
 });
-

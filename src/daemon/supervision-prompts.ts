@@ -1,4 +1,6 @@
 import {
+  AGENT_DELEGATION_BLOCKER_REPORT_FIELDS,
+  SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
   buildAgentDelegationAuditEnvelope,
 } from '../../shared/agent-delegation.js';
 import {
@@ -427,7 +429,13 @@ export function buildSupervisionMessagingContract(): string {
       failure: 'Brain_same_object_manual_exact_route',
       successChatter: false,
     },
-    blocker: { immediateReply: true, fields: ['taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'options', 'recommendedNextAction'] },
+    blocker: { immediateReply: true, fields: AGENT_DELEGATION_BLOCKER_REPORT_FIELDS },
+    noOp: {
+      repeat: 'forbidden',
+      dedupe: 'durable_fingerprint',
+      brain: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN,
+      external: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.NEEDS_INPUT,
+    },
     // A sub-session that hits real uncertainty owns the duty to SPEAK. Going
     // quiet, writing a local-only blocker, or re-heartbeating the same state
     // all look like progress and are not; guessing is worse. Exactly one

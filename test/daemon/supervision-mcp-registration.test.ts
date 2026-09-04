@@ -566,6 +566,37 @@ describe('list/get visibility guards', () => {
     expect(registry.listCalls[0]).toMatchObject({ ownerSessionName: 'deck_cd_brain' });
   });
 
+  it('uses one durable participant predicate before a delegated implementer starts', async () => {
+    const taskId = 'legacy-delegated-readable';
+    const assignmentId = 'legacy-delegated-readable-implementer';
+    const sessionName = 'deck_sub_cc1';
+    registry.statuses.set(taskId, 'delegated');
+    registry.participants.set(taskId, [sessionName]);
+    registry.assignmentStates.set(taskId, [{
+      assignmentId, role: 'implementer', status: 'delegated', leaseId: 'legacy-lease',
+      identity: testIdentity(sessionName),
+    }]);
+    const caller = { ...CALLER, sessionName, projectName: sessionName };
+    const handlers = createSupervisionMcpToolHandlers(caller, {
+      registry,
+      resolveSessionIdentity: (name) => name === sessionName
+        ? { ...testIdentity(sessionName), projectName: 'codedeck' }
+        : undefined,
+    });
+
+    const beforeGet = await handlers[SUPERVISION_MCP_TOOLS.GET]({ taskId });
+    const beforeList: any = await handlers[SUPERVISION_MCP_TOOLS.LIST]({});
+    expect(beforeGet).toMatchObject({
+      status: 'ok',
+      task: { taskId, status: 'delegated', assignments: [expect.objectContaining({ assignmentId, status: 'delegated' })] },
+    });
+    expect(beforeList.tasks.map((task: any) => task.taskId)).toContain(taskId);
+
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'start', taskId, assignmentId,
+    })).resolves.toMatchObject({ status: 'ok', fromStatus: 'delegated', toStatus: 'implementing' });
+  });
+
   it('gives the live project Brain the project-wide authority used by the console snapshot', async () => {
     const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry,
       isProjectBrain: () => true,

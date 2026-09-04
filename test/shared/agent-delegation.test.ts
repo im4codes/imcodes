@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   AGENT_DELEGATION_ERROR_CODES,
+  AGENT_DELEGATION_BLOCKER_REPORT_FIELDS,
   AGENT_DELEGATION_CONTEXT_HEADER,
   AGENT_DELEGATION_CONTEXT_OMITTED_MARKER,
   AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER,
@@ -8,6 +9,7 @@ import {
   AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER,
   AGENT_DELEGATION_REPLY_VERSION,
   AGENT_DELEGATION_TARGET_FIELD,
+  SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
   DELEGATION_REPLY_CAPABLE_AGENT_TYPES,
   DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES,
   DELEGATION_EMPTY_TASK,
@@ -47,6 +49,14 @@ const expectInvalid = (value: unknown) => {
 };
 
 describe('agent delegation shared contract', () => {
+  it('defines one complete structured blocker shape and two exclusive dispositions', () => {
+    expect(AGENT_DELEGATION_BLOCKER_REPORT_FIELDS).toEqual([
+      'taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'options', 'recommendedNextAction',
+    ]);
+    expect(SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS).toEqual({
+      WAITING_FOR_BRAIN: 'waiting_for_brain', NEEDS_INPUT: 'needs_input',
+    });
+  });
   it('exports the top-level delegate target field name', () => {
     expect(AGENT_DELEGATION_TARGET_FIELD).toBe('delegateTarget');
     expect(hasAgentDelegationTargetField({ delegateTarget: { session: 'deck_repo_w1' } })).toBe(true);

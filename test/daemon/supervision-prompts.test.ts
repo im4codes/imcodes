@@ -652,8 +652,14 @@ describe('supervision user authority clause', () => {
     });
     expect(messaging.blocker.immediateReply).toBe(true);
     expect(messaging.blocker.fields).toEqual(expect.arrayContaining([
-      'taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'options',
+      'taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'options', 'recommendedNextAction',
     ]));
+    expect(messaging.noOp).toEqual({
+      repeat: 'forbidden',
+      dedupe: 'durable_fingerprint',
+      brain: 'waiting_for_brain',
+      external: 'needs_input',
+    });
     expect(messaging.heartbeat).toEqual({ reminderOnly: true, substitutesReply: false });
     expect(messaging.gate).toBe('tool_schema+authority_handler');
     // automaticAudit no longer restates target/ignore/order; it POINTS at the
