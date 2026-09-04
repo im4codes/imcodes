@@ -1499,7 +1499,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     },
 
     [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['taskId', 'topLevelTaskId', 'classification', 'role', 'objective', 'acceptance', 'scopeFiles', 'claimMode', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['taskId', 'topLevelTaskId', 'classification', 'role', 'objective', 'acceptance', 'scopeFiles', 'idempotencyKey']);
       const identity = await supervisionTaskIdentity();
       if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
       const registry = getSupervisionTaskRegistry();
@@ -1558,7 +1558,6 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         role: requestedRole as never,
         identity,
         scopeFiles: stringArrayArg(args, 'scopeFiles'),
-        claimMode: typeof args.claimMode === 'string' ? args.claimMode as never : undefined,
         idempotencyKey: stringArg(args, 'idempotencyKey'),
       });
       if (!assignment.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `assignment rejected: ${assignment.reason}`);
@@ -2214,7 +2213,7 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: z.object({
     taskId: z.string().optional(), topLevelTaskId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
     role: z.enum(['coordinator', 'integration_owner', 'implementer', 'auditor']), objective: z.string(), acceptance: z.array(z.string()).optional(),
-    scopeFiles: z.array(z.string()).optional(), claimMode: z.enum(['exclusive', 'shared', 'read_only']).optional(), idempotencyKey: z.string().optional(),
+    scopeFiles: z.array(z.string()).optional(), idempotencyKey: z.string().optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: z.object({ assignmentId: z.string(), revision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(), verdict: z.string().optional(), blocker: z.string().optional(), externalRunId: z.string().optional(), externalHeadSha: z.string().optional(), externalTaskId: z.string().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: legacySupervisionFinishSchema,

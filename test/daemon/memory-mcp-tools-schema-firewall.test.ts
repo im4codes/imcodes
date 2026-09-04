@@ -103,6 +103,12 @@ describe('memory MCP tool schema firewall', () => {
     rmSync(shortRefDir, { recursive: true, force: true });
   });
 
+  it('publishes task-start paths as evidence and removes legacy claim admission', () => {
+    const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START];
+    expect(contract.inputSchema.properties?.scopeFiles?.description).toContain('never an implementation ACL');
+    expect(contract.inputSchema.properties).not.toHaveProperty('claimMode');
+  });
+
   it('rejects partial structured integration finalization instead of falling back to legacy prose finish', async () => {
     const handlers = createMemoryMcpToolHandlers(caller());
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({

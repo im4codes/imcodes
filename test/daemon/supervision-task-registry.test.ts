@@ -5614,6 +5614,8 @@ describe('SupervisionTaskRegistry', () => {
   it('publishes the caller-reported-only file tracking limitation in the machine contract', () => {
     expect(SUPERVISION_TASK_REGISTRY_CONTRACT.fileTracking).toStrictEqual({
       mode: 'caller_reported_only',
+      ownedFilesSemantics: 'observed_delivery_evidence_not_acl',
+      implementationAdmission: 'isolated_worktree',
       automaticProviderToolHook: false,
       filesystemOrGitScanner: false,
       reconciliationMode: 'caller_supplied_observations_only',
@@ -5852,6 +5854,208 @@ describe('SupervisionTaskRegistry', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('atomically invalidates live validation when the observed delivery set changes', () => {
+    const registry = makeRegistry();
+    const taskId = 'observed-set-invalidates-pass';
+    const owner = identity('deck_observed_worker');
+    const fromRevision = 'observed-r1';
+    const toRevision = 'observed-r2';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'invalidate stale audit', currentRevision: fromRevision,
+    })).toMatchObject({ ok: true });
+    const assignment = registry.createAssignment({
+      taskId, role: 'implementer', identity: owner, scopeFiles: ['src/initial.ts', 'src/removed.ts'],
+      auditAttemptId: 'observed-r1-audit', auditRevision: fromRevision,
+    });
+    if (!assignment.ok) throw new Error(assignment.reason);
+    for (const path of ['src/initial.ts', 'src/removed.ts']) {
+      expect(registry.recordFileEvent({
+        assignmentId: assignment.value.assignmentId, identity: owner,
+        path, operation: 'modify', beforeHash: `before-${path}`, afterHash: `after-${path}`,
+      })).toMatchObject({ ok: true });
+    }
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: assignment.value.assignmentId, identity: owner, status,
+        revision: fromRevision, auditAttemptId: 'observed-r1-audit', auditRevision: fromRevision,
+        ...(status === 'passed' ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+      }), status).toMatchObject({ ok: true });
+    }
+    const before = registry.get(taskId);
+    expect(registry.reconcileScope({
+      taskId, assignmentId: assignment.value.assignmentId,
+      trackedPaths: ['src/initial.ts'], currentRevision: fromRevision,
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    expect(registry.get(taskId)).toEqual(before);
+
+    expect(registry.reconcileScope({
+      taskId, assignmentId: assignment.value.assignmentId,
+      trackedPaths: ['src/initial.ts'], currentRevision: toRevision,
+    })).toMatchObject({
+      ok: true,
+      value: {
+        status: 'implementing', currentRevision: toRevision,
+        assignments: [expect.objectContaining({
+          assignmentId: assignment.value.assignmentId,
+          status: 'implementing', auditRevision: toRevision,
+          scopeFiles: ['src/initial.ts'],
+        })],
+      },
+    });
+    expect(registry.getAssignment(assignment.value.assignmentId)).not.toHaveProperty('auditAttemptId');
+    expect(registry.getAssignment(assignment.value.assignmentId)).not.toHaveProperty('verdict');
+    expect(registry.listEvents(taskId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        assignmentId: assignment.value.assignmentId,
+        eventType: 'recovered',
+        payload: expect.objectContaining({ auditInvalidated: true, observedFiles: ['src/initial.ts'] }),
+      }),
+    ]));
+    registry.close();
+  });
+
+  it('invalidates a stale PASS through the authenticated file-event production handler', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'production-file-event-invalidates-pass';
+    const owner = identity('deck_alpha_w1');
+    const revision = 'production-file-event-r1';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'invalidate stale PASS from the public file-event path', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const assignment = registry.createAssignment({
+      taskId, role: 'implementer', identity: owner, scopeFiles: ['src/initial.ts'],
+      auditAttemptId: 'production-file-event-audit-r1', auditRevision: revision,
+    });
+    if (!assignment.ok) throw new Error(assignment.reason);
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed'] as const) {
+      expect(registry.updateTask({ taskId, status, currentRevision: revision }), status).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: assignment.value.assignmentId, identity: owner, status,
+        auditAttemptId: 'production-file-event-audit-r1', auditRevision: revision,
+        ...(status === 'passed' ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+      }), status).toMatchObject({ ok: true });
+    }
+
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: owner.sessionName, projectName: 'alpha', projectRoot: '/work/alpha' },
+      { sendDeps: { listSessions: () => [session(owner.sessionName)] } },
+    );
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]({
+      assignmentId: assignment.value.assignmentId,
+      filePath: 'src/discovered.ts', operation: 'create', afterHash: 'discovered-hash',
+      idempotencyKey: 'discovered-create',
+    })).resolves.toMatchObject({
+      status: 'ok',
+      item: {
+        status: 'implementing',
+        scopeFiles: ['src/discovered.ts', 'src/initial.ts'],
+      },
+    });
+    expect(registry.get(taskId)).toMatchObject({
+      status: 'implementing', currentRevision: revision,
+      assignments: [expect.objectContaining({
+        assignmentId: assignment.value.assignmentId,
+        status: 'implementing',
+        scopeFiles: ['src/discovered.ts', 'src/initial.ts'],
+      })],
+    });
+    const invalidated = registry.getAssignment(assignment.value.assignmentId);
+    expect(invalidated).not.toHaveProperty('auditAttemptId');
+    expect(invalidated).not.toHaveProperty('auditRevision');
+    expect(invalidated).not.toHaveProperty('verdict');
+    expect(invalidated).not.toHaveProperty('crossVendorAuditPassed');
+    expect(registry.listFileEvents(taskId)).toHaveLength(1);
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]({
+      assignmentId: assignment.value.assignmentId,
+      filePath: 'src/discovered.ts', operation: 'create', afterHash: 'discovered-hash',
+      idempotencyKey: 'discovered-create',
+    })).resolves.toMatchObject({ status: 'ok', item: { status: 'implementing' } });
+    expect(registry.listFileEvents(taskId)).toHaveLength(1);
+  });
+
+  it.each([
+    ['ready_for_integration', ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration']],
+    ['committed', ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration', 'integrating', 'final_audit', 'passed', 'finalizing', 'committed']],
+    ['pushed', ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration', 'integrating', 'final_audit', 'passed', 'finalizing', 'committed', 'pushed']],
+    ['finalized', ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration', 'integrating', 'final_audit', 'passed', 'finalizing', 'committed', 'pushed', 'finalized']],
+    ['cancelled', ['implementing', 'cancelled']],
+  ] as const)('does not reopen %s delivery evidence from file events or reconciliation', (closedStatus, statuses) => {
+    const registry = makeRegistry();
+    const taskId = `closed-scope-${closedStatus}`;
+    const owner = identity(`deck_${closedStatus}_worker`);
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'keep closed delivery evidence immutable', currentRevision: 'closed-r1',
+    })).toMatchObject({ ok: true });
+    const assignment = registry.createAssignment({
+      taskId, role: 'implementer', identity: owner, scopeFiles: ['src/closed.ts'],
+      auditAttemptId: 'closed-audit-r1', auditRevision: 'closed-r1',
+    });
+    if (!assignment.ok) throw new Error(assignment.reason);
+    for (const status of statuses) {
+      expect(registry.updateAssignment({
+        assignmentId: assignment.value.assignmentId, identity: owner, status,
+        auditAttemptId: 'closed-audit-r1', auditRevision: 'closed-r1',
+        ...(status === 'passed' || status === 'ready_for_integration'
+          ? { verdict: 'PASS', crossVendorAuditPassed: true }
+          : {}),
+      }), `${closedStatus}:${status}`).toMatchObject({ ok: true });
+    }
+    const beforeTask = registry.getTaskRecord(taskId);
+    const beforeAssignment = registry.getAssignment(assignment.value.assignmentId);
+    const eventCount = registry.listFileEvents(taskId).length;
+    expect(beforeAssignment?.status).toBe(closedStatus);
+
+    expect(registry.recordFileEvent({
+      assignmentId: assignment.value.assignmentId, identity: owner,
+      path: 'src/brand-new.ts', operation: 'create', afterHash: 'new',
+    })).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(taskId)).toEqual(beforeTask);
+    expect(registry.getAssignment(assignment.value.assignmentId)).toEqual(beforeAssignment);
+    expect(registry.listFileEvents(taskId)).toHaveLength(eventCount + 1);
+
+    expect(registry.reconcileScope({
+      taskId, assignmentId: assignment.value.assignmentId,
+      trackedPaths: ['src/brand-new.ts', 'src/closed.ts'], currentRevision: 'closed-r2',
+    })).toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(registry.getTaskRecord(taskId)).toEqual(beforeTask);
+    expect(registry.getAssignment(assignment.value.assignmentId)).toEqual(beforeAssignment);
+    expect(registry.listFileEvents(taskId)).toHaveLength(eventCount + 1);
+    registry.close();
+  });
+
+  it('keeps structured finalization immutable through the authenticated file-event handler', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'closed-production-file-event');
+    expect(registry.finalizeIntegration({ ...shape.finalization, identity: shape.owner.identity }))
+      .toMatchObject({ ok: true, value: { status: 'finalized', archivedAt: expect.any(Number) } });
+    const beforeTask = registry.getTaskRecord(shape.taskId);
+    const beforeAssignment = registry.getAssignment(shape.owner.assignmentId);
+    const eventCount = registry.listFileEvents(shape.taskId).length;
+    const handlers = createMemoryMcpToolHandlers(
+      {
+        userId: 'u', sessionName: shape.owner.identity.sessionName,
+        projectName: 'alpha', projectRoot: '/work/alpha',
+      },
+      { sendDeps: { listSessions: () => [session(shape.owner.identity.sessionName)] } },
+    );
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]({
+      assignmentId: shape.owner.assignmentId,
+      filePath: 'src/post-finalization.ts', operation: 'create', afterHash: 'post-finalization',
+    })).resolves.toMatchObject({ status: 'ok', item: { status: 'finalized' } });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]({
+      assignmentId: shape.owner.assignmentId,
+      filePath: shape.files[0], operation: 'modify', beforeHash: 'before', afterHash: 'after',
+    })).resolves.toMatchObject({ status: 'ok', item: { status: 'finalized' } });
+    expect(registry.getTaskRecord(shape.taskId)).toEqual(beforeTask);
+    expect(registry.getAssignment(shape.owner.assignmentId)).toEqual(beforeAssignment);
+    expect(registry.listFileEvents(shape.taskId)).toHaveLength(eventCount + 2);
   });
 
   it('keeps one session with two queued assignments attributable only by assignmentId', () => {

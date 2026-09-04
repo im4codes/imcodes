@@ -709,6 +709,8 @@ export type SupervisionTaskFileOperation = typeof SUPERVISION_TASK_FILE_OPERATIO
 
 export const SUPERVISION_TASK_FILE_TRACKING_MODE = 'caller_reported_only' as const;
 export const SUPERVISION_TASK_SCOPE_RECONCILIATION_MODE = 'caller_supplied_observations_only' as const;
+export const SUPERVISION_TASK_OWNED_FILES_SEMANTICS = 'observed_delivery_evidence_not_acl' as const;
+export const SUPERVISION_TASK_IMPLEMENTATION_ADMISSION_MODE = 'isolated_worktree' as const;
 
 export const SUPERVISION_TASK_REGISTRY_EVENT_TYPES = [
   'created',
@@ -764,7 +766,9 @@ export interface SupervisionTaskMetadata {
   classification?: SupervisionTaskClassification | null;
   objective?: string | null;
   acceptance?: readonly string[] | null;
+  /** Proposed/observed delivery evidence. Never an implementation-write ACL. */
   ownedFiles?: readonly string[] | null;
+  /** Coordination evidence for later exact-set integration, not admission authority. */
   sharedFiles?: readonly string[] | null;
   dependencies?: readonly string[] | null;
   integrationOwner?: string | null;
@@ -795,6 +799,8 @@ export const SUPERVISION_TASK_REGISTRY_CONTRACT = {
   fileOperations: SUPERVISION_TASK_FILE_OPERATIONS,
   fileTracking: {
     mode: SUPERVISION_TASK_FILE_TRACKING_MODE,
+    ownedFilesSemantics: SUPERVISION_TASK_OWNED_FILES_SEMANTICS,
+    implementationAdmission: SUPERVISION_TASK_IMPLEMENTATION_ADMISSION_MODE,
     automaticProviderToolHook: false,
     filesystemOrGitScanner: false,
     reconciliationMode: SUPERVISION_TASK_SCOPE_RECONCILIATION_MODE,

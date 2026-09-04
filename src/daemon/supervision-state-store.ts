@@ -928,6 +928,38 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function assignmentHasLiveValidationOrAudit(
+  assignment: PersistedSupervisionTaskAssignment,
+): boolean {
+  // REWORK is already an invalidated round. Additional observed paths remain
+  // evidence and must not manufacture a new lifecycle transition.
+  if (assignment.status === 'rework') return false;
+  return !['delegated', 'implementing', 'retrying_external_ci'].includes(assignment.status)
+    || Boolean(assignment.auditAttemptId || assignment.verdict
+      || assignment.primaryReviewPassed || assignment.crossVendorAuditPassed);
+}
+
+const SCOPE_EVIDENCE_CLOSED_ASSIGNMENT_STATUSES = new Set<SupervisionTaskLifecycleStatus>([
+  'ready_for_integration', 'integrating', 'final_audit', 'finalizing',
+  'committed', 'pushed', 'recovered', 'finalized', 'blocked', 'cancelled',
+]);
+const SCOPE_EVIDENCE_CLOSED_TASK_STATUSES = new Set<SupervisionTaskLifecycleStatus>([
+  'integrating', 'final_audit', 'finalizing', 'committed', 'pushed',
+  'recovered', 'finalized', 'blocked', 'cancelled',
+]);
+
+function scopeEvidenceRoundIsClosed(
+  task: PersistedSupervisionTaskRecord,
+  assignment: PersistedSupervisionTaskAssignment,
+): boolean {
+  return task.archivedAt !== undefined
+    || task.finalization !== undefined
+    || task.commitSha !== undefined
+    || task.pushRemoteRef !== undefined
+    || SCOPE_EVIDENCE_CLOSED_TASK_STATUSES.has(task.status)
+    || SCOPE_EVIDENCE_CLOSED_ASSIGNMENT_STATUSES.has(assignment.status);
+}
+
 function sameWorktreeManifest(
   left: unknown,
   right: readonly SupervisionWorktreeSnapshot['files'][number][],
@@ -3949,9 +3981,6 @@ export class SupervisionTaskRegistry {
         assignment.role === 'coordinator'
         && assignment.identity.sessionName === owner.identity.sessionName
       ));
-      const staleOwnerHasClaims = staleOwner
-        ? this.listFileClaims(task.taskId).some((claim) => claim.assignmentId === staleOwner.assignmentId)
-        : false;
       const exactStaleRuntimeOwner = Boolean(
         staleOwner
         && staleOwner.role === 'integration_owner'
@@ -3960,7 +3989,6 @@ export class SupervisionTaskRegistry {
         && !runtimeIdentityMetadataMatches(staleOwner.identity, owner.identity)
         && staleOwner.status === 'ready_for_integration'
         && staleOwner.leaseId === ''
-        && !staleOwnerHasClaims
         && staleOwner.auditRevision === revision
         && staleOwner.auditAttemptId === auditAttemptId
         && staleOwner.verdict?.trim().toUpperCase() === 'PASS'
@@ -6999,68 +7027,200 @@ export class SupervisionTaskRegistry {
   }
 
   recordFileEvent(input: SupervisionTaskFileEventInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
-    const assignment = this.getAssignment(input.assignmentId);
-    if (!assignment) return { ok: false, reason: 'not_found' };
-    if (!identityMatches(assignment.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
-    if (assignment.role === 'auditor') return { ok: false, reason: 'role_forbidden' };
     const path = normalizeTaskString(input.path);
     if (!path || !validRepoPath(path)) return { ok: false, reason: 'invalid' };
     const now = input.now ?? Date.now();
     const key = normalizeTaskString(input.idempotencyKey);
-    const idem = key ? `file_event\0${assignment.assignmentId}\0${key}` : '';
-    if (idem) {
-      const row = this.#db.prepare('SELECT assignment_id AS assignmentId FROM supervision_task_idempotency WHERE idempotency_key = ?').get(idem) as { assignmentId?: unknown } | undefined;
-      if (typeof row?.assignmentId === 'string') return { ok: true, value: assignment, replay: true };
-    }
-    const declaredInAssignment = assignment.scopeFiles.includes(path);
-    // A late transport/file event is evidence, not lifecycle authority. Once
-    // the assignment is terminal it may be recorded, but it must not expand
-    // scope, refresh updatedAt, revive a lease or alter the cancelled object.
-    const immutableAssignment = isTerminalSupervisionTaskStatus(assignment.status);
-    const recordedAssignment = declaredInAssignment || immutableAssignment ? assignment : {
-      ...assignment,
-      scopeFiles: normalizeTaskArray([...assignment.scopeFiles, path]),
-      updatedAt: now,
-    };
-    this.#db.prepare(`INSERT INTO supervision_task_file_events (task_id, assignment_id, file_path, operation, before_hash, after_hash, tool, source, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(assignment.taskId, assignment.assignmentId, path, input.operation, normalizeTaskString(input.beforeHash) ?? null, normalizeTaskString(input.afterHash) ?? null, normalizeTaskString(input.tool) ?? null, normalizeTaskString(input.source) ?? null, input.identity.sessionName, input.identity.sessionInstanceId, input.identity.runtimeEpoch, input.identity.agentType, input.identity.providerFamily, JSON.stringify({ declaredInAssignment }), now);
-    if (declaredInAssignment || immutableAssignment) {
-      this.#appendEvent(assignment.taskId, assignment.assignmentId, 'file_event', assignment.status, {
-        path, operation: input.operation, declaredInAssignment,
-        ...(immutableAssignment ? { terminalEvidenceOnly: true } : {}),
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const assignment = this.getAssignment(input.assignmentId);
+      if (!assignment) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (!identityMatches(assignment.identity, input.identity)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'owner_mismatch' };
+      }
+      if (assignment.role === 'auditor') {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'role_forbidden' };
+      }
+      const idem = key ? `file_event\0${assignment.assignmentId}\0${key}` : '';
+      if (idem) {
+        const row = this.#db.prepare('SELECT assignment_id AS assignmentId FROM supervision_task_idempotency WHERE idempotency_key = ?').get(idem) as { assignmentId?: unknown } | undefined;
+        if (typeof row?.assignmentId === 'string') {
+          this.#db.exec('COMMIT');
+          return { ok: true, value: assignment, replay: true };
+        }
+      }
+      const task = this.getTaskRecord(assignment.taskId);
+      if (!task) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      const evidenceOnly = scopeEvidenceRoundIsClosed(task, assignment);
+      const listedInInitialEvidence = assignment.scopeFiles.includes(path);
+      const observedFiles = listedInInitialEvidence
+        ? assignment.scopeFiles
+        : normalizeTaskArray([...assignment.scopeFiles, path]);
+      const auditInvalidated = !evidenceOnly && !listedInInitialEvidence
+        && assignmentHasLiveValidationOrAudit(assignment);
+      const recorded = !evidenceOnly && !listedInInitialEvidence ? {
+        ...assignment,
+        scopeFiles: observedFiles,
+        generation: assignment.generation + 1,
+        ...(auditInvalidated ? {
+          status: 'implementing' as const,
+          auditAttemptId: undefined,
+          auditRevision: undefined,
+          verdict: undefined,
+          blocker: undefined,
+          externalRunId: undefined,
+          externalHeadSha: undefined,
+          externalTaskId: undefined,
+          primaryReviewPassed: undefined,
+          crossVendorAuditPassed: undefined,
+          auditRoutingReason: undefined,
+          auditDegradedReason: undefined,
+        } : {}),
+        updatedAt: now,
+      } : { ...assignment, updatedAt: now };
+      this.#db.prepare(`INSERT INTO supervision_task_file_events (task_id, assignment_id, file_path, operation, before_hash, after_hash, tool, source, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(assignment.taskId, assignment.assignmentId, path, input.operation, normalizeTaskString(input.beforeHash) ?? null, normalizeTaskString(input.afterHash) ?? null, normalizeTaskString(input.tool) ?? null, normalizeTaskString(input.source) ?? null, input.identity.sessionName, input.identity.sessionInstanceId, input.identity.runtimeEpoch, input.identity.agentType, input.identity.providerFamily, JSON.stringify({ listedInInitialEvidence }), now);
+      if (!evidenceOnly && !listedInInitialEvidence) {
+        this.#writeAssignment(recorded, 'recovered', {
+          source: 'file_event_observed_delivery',
+          priorObservedFiles: assignment.scopeFiles,
+          observedFiles,
+          auditInvalidated,
+        });
+        if (auditInvalidated) {
+          this.#writeTask({ ...task, status: 'implementing', blocker: undefined, updatedAt: now }, 'recovered', {
+            source: 'file_event_observed_delivery',
+            assignmentId: assignment.assignmentId,
+            observedFiles,
+            auditInvalidated: true,
+          });
+        }
+      }
+      this.#appendEvent(assignment.taskId, assignment.assignmentId, 'file_event', recorded.status, {
+        path, operation: input.operation, listedInInitialEvidence, auditInvalidated,
+        ...(evidenceOnly ? { terminalEvidenceOnly: true } : {}),
       }, now);
-    } else {
-      this.#writeAssignment(recordedAssignment, 'file_event', {
-        path, operation: input.operation, declaredInAssignment, observedFileSetExpanded: true,
-      });
+      if (idem) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, assignment_id, created_at) VALUES (?, ?, ?, ?)').run(idem, assignment.taskId, assignment.assignmentId, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: recorded };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
     }
-    if (idem) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, assignment_id, created_at) VALUES (?, ?, ?, ?)').run(idem, assignment.taskId, assignment.assignmentId, now);
-    return { ok: true, value: immutableAssignment ? recordedAssignment : { ...recordedAssignment, updatedAt: now } };
   }
 
   reconcileScope(input: SupervisionTaskScopeReconcileInput): SupervisionTaskRegistryResult<SupervisionTaskSnapshot> {
-    const task = this.getTaskRecord(input.taskId);
-    if (!task) return { ok: false, reason: 'not_found' };
-    const observedPaths = normalizeTaskArray([
-      ...(input.trackedPaths ?? []), ...(input.untrackedPaths ?? []), ...(input.deletedPaths ?? []),
-    ]).filter(validRepoPath);
-    const now = input.now ?? Date.now();
-    const assignmentFilter = normalizeTaskString(input.assignmentId);
-    for (const assignment of this.listAssignments(task.taskId)) {
-      if (assignment.role === 'auditor' || (assignmentFilter && assignment.assignmentId !== assignmentFilter)) continue;
-      const expanded = normalizeTaskArray([...assignment.scopeFiles, ...observedPaths]);
-      if (sameStringArray(expanded, assignment.scopeFiles)) continue;
-      this.#writeAssignment({ ...assignment, scopeFiles: expanded, updatedAt: now }, 'file_event', {
-        source: 'scope_reconcile_observation', observedPaths,
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(input.taskId);
+      if (!task) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      const actual = normalizeTaskArray([...(input.trackedPaths ?? []), ...(input.untrackedPaths ?? []), ...(input.deletedPaths ?? [])]);
+      const now = input.now ?? Date.now();
+      const assignmentFilter = normalizeTaskString(input.assignmentId);
+      const assignment = assignmentFilter ? this.getAssignment(assignmentFilter) : undefined;
+      if (assignmentFilter && (!assignment || assignment.taskId !== task.taskId || assignment.role === 'auditor')) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: assignment?.role === 'auditor' ? 'role_forbidden' : 'not_found' };
+      }
+      // Legacy callers reconcile task-wide observations. Preserve that
+      // provenance-only behavior, but never rewrite a closed round.
+      if (!assignmentFilter) {
+        for (const candidate of this.listAssignments(task.taskId)) {
+          if (candidate.role === 'auditor' || scopeEvidenceRoundIsClosed(task, candidate)) continue;
+          const expanded = normalizeTaskArray([...candidate.scopeFiles, ...actual]);
+          if (sameStringArray(expanded, candidate.scopeFiles)) continue;
+          this.#writeAssignment({ ...candidate, scopeFiles: expanded, updatedAt: now }, 'file_event', {
+            source: 'scope_reconcile_observation', observedPaths: actual,
+          });
+        }
+        const revision = normalizeTaskString(input.currentRevision);
+        const updated = revision && revision !== task.currentRevision
+          && !SCOPE_EVIDENCE_CLOSED_TASK_STATUSES.has(task.status)
+          ? { ...task, currentRevision: revision, updatedAt: now }
+          : task;
+        if (updated !== task) this.#writeTask(updated, task.status as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, {
+          source: 'scope_reconcile', observedPaths: actual,
+        });
+        const snapshot = this.get(task.taskId);
+        this.#db.exec('COMMIT');
+        return snapshot ? { ok: true, value: snapshot } : { ok: false, reason: 'not_found' };
+      }
+      if (assignment && scopeEvidenceRoundIsClosed(task, assignment)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      const observedSetChanged = Boolean(assignment && !sameStringArray(assignment.scopeFiles, actual));
+      const events = this.listFileEvents(task.taskId).filter((event) => !assignmentFilter || event.assignmentId === assignmentFilter);
+      const missingHook = actual.find((path) => !events.some((event) => event.path === path));
+      if (missingHook) {
+        const blocked = { ...task, status: 'blocked' as const, blocker: `missing_hook_event:${missingHook}`, updatedAt: now };
+        this.#writeTask(blocked, 'scope_violation', { path: missingHook, source: 'scope_reconcile' });
+        this.#db.exec('COMMIT');
+        return { ok: false, reason: 'manifest_mismatch' };
+      }
+      const revision = normalizeTaskString(input.currentRevision);
+      const hasLiveValidationOrAudit = Boolean(assignment
+        && assignmentHasLiveValidationOrAudit(assignment));
+      if (observedSetChanged && hasLiveValidationOrAudit
+        && (!revision || revision === task.currentRevision || revision === assignment?.auditRevision)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'old_revision' };
+      }
+      if (assignment && observedSetChanged) {
+        const invalidated = hasLiveValidationOrAudit;
+        const nextAssignment: PersistedSupervisionTaskAssignment = {
+          ...assignment,
+          scopeFiles: actual,
+          generation: assignment.generation + 1,
+          ...(invalidated ? {
+            status: 'implementing' as const,
+            auditAttemptId: undefined,
+            verdict: undefined,
+            blocker: undefined,
+            externalRunId: undefined,
+            externalHeadSha: undefined,
+            externalTaskId: undefined,
+            primaryReviewPassed: undefined,
+            crossVendorAuditPassed: undefined,
+            auditRoutingReason: undefined,
+            auditDegradedReason: undefined,
+          } : {}),
+          ...(revision ? { auditRevision: revision } : {}),
+          updatedAt: now,
+        };
+        this.#writeAssignment(nextAssignment, 'recovered', {
+          source: 'scope_reconcile_observed_delivery',
+          priorObservedFiles: assignment.scopeFiles,
+          observedFiles: actual,
+          auditInvalidated: invalidated,
+          ...(revision ? { revision } : {}),
+        });
+      }
+      const taskInvalidated = observedSetChanged && hasLiveValidationOrAudit;
+      const updated = revision && revision !== task.currentRevision
+        ? { ...task, currentRevision: revision, ...(taskInvalidated ? { status: 'implementing' as const, blocker: undefined } : {}), updatedAt: now }
+        : taskInvalidated ? { ...task, status: 'implementing' as const, blocker: undefined, updatedAt: now } : task;
+      if (updated !== task) this.#writeTask(updated, taskInvalidated ? 'recovered' : task.status as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, {
+        source: 'scope_reconcile', observedFiles: actual, auditInvalidated: taskInvalidated,
       });
+      const snapshot = this.get(task.taskId);
+      this.#db.exec('COMMIT');
+      return snapshot ? { ok: true, value: snapshot } : { ok: false, reason: 'not_found' };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
     }
-    const revision = normalizeTaskString(input.currentRevision);
-    const updated = revision && revision !== task.currentRevision ? { ...task, currentRevision: revision, updatedAt: now } : task;
-    if (updated !== task) this.#writeTask(updated, task.status as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, {
-      source: 'scope_reconcile', observedPaths,
-    });
-    const snapshot = this.get(task.taskId);
-    return snapshot ? { ok: true, value: snapshot } : { ok: false, reason: 'not_found' };
   }
 
   clear(): void {

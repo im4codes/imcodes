@@ -1666,7 +1666,6 @@ export async function dispatchSendMessage(
           role: input.audit ? 'auditor' : 'implementer',
           identity: targetIdentity,
           scopeFiles: [...(input.task.ownedFiles ?? []), ...(input.task.sharedFiles ?? [])],
-          claimMode: input.audit ? 'read_only' : 'exclusive',
           auditAttemptId: input.task.auditAttemptId ?? input.audit?.attemptId,
           auditRevision: input.task.auditRevision ?? input.task.currentRevision,
           ...(executionBinding ? { executionBinding } : {}),
