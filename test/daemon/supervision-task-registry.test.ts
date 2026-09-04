@@ -7341,6 +7341,66 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('continues past full project pages before recovering the observed legacy UUID row', () => {
+    const database = new DatabaseSync(':memory:');
+    const liveIdentity = identity('deck_cd_brain');
+    const registry = new SupervisionTaskRegistry({
+      database,
+      resolveLiveParticipants: (projectName) => projectName === 'cd' ? [liveIdentity] : [],
+    });
+    const taskId = 'supervision_task_d7f73972-b5f0-4c5b-8335-93eb3de9ef7a';
+    const assignmentId = 'supervision_assignment_d0d3e64a-263f-412c-9742-199cf6723186';
+    try {
+      for (const suffix of ['a', 'b']) {
+        expect(registry.createOrGet({
+          taskId: `project-page-${suffix}`, projectName: 'cd', objective: `project page ${suffix}`,
+        })).toMatchObject({ ok: true });
+      }
+      expect(registry.createOrGet({ taskId, projectName: 'cd', objective: 'legacy UUID heartbeat' }))
+        .toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: liveIdentity,
+      })).toMatchObject({ ok: true });
+
+      const stored = database.prepare(
+        'SELECT payload_json AS payload FROM supervision_tasks WHERE task_id = ?',
+      ).get(taskId) as { payload: string };
+      database.prepare(
+        'UPDATE supervision_tasks SET project_name = NULL, payload_json = ? WHERE task_id = ?',
+      ).run(JSON.stringify({ ...JSON.parse(stored.payload), projectName: '' }), taskId);
+
+      // The observed first bounded page legitimately has no orphan action; its
+      // cursor is the authority to keep scanning rather than redispatching the
+      // invisible binding unchanged.
+      const first = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'cd', limit: 1 });
+      expect(first).toMatchObject({ scanned: 1, hasMore: true, actionCounts: {} });
+      expect(first.nextCursor).not.toMatch(/^orphan:/);
+      const second = registry.reconcileHousekeeping({
+        mode: 'dryRun', projectName: 'cd', cursor: first.nextCursor, limit: 1,
+      });
+      expect(second).toMatchObject({ scanned: 1, hasMore: true, nextCursor: 'orphan:', actionCounts: {} });
+
+      const orphan = registry.reconcileHousekeeping({
+        mode: 'dryRun', projectName: 'cd', cursor: second.nextCursor, limit: 1,
+      });
+      expect(orphan.actions).toEqual([expect.objectContaining({
+        taskId, kind: 'backfill_orphan_project', projectName: 'cd', reason: 'unique_live_session_lineage',
+      })]);
+      expect(orphan.orphanDiagnostics).toEqual([expect.objectContaining({
+        taskId, reason: 'orphan_project_backfill_ready', assignmentIds: [assignmentId],
+      })]);
+
+      registry.reconcileHousekeeping({
+        mode: 'apply', projectName: 'cd', cursor: second.nextCursor, limit: 1,
+      });
+      expect(registry.getTaskRecord(taskId)).toMatchObject({ projectName: 'cd' });
+      expect(registry.getAssignment(assignmentId)?.identity.sessionName).toBe('deck_cd_brain');
+    } finally {
+      registry.close();
+      database.close();
+    }
+  });
+
   it('retires and archives a legacy active projection only when immutable finalization consumed its exact PASS', () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });

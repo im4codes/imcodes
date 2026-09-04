@@ -225,10 +225,10 @@ describe('task visibility is bound to durable project/session identity', () => {
   const workerLive = { ...brain('deck_alpha_reader'), role: 'w1' as const };
   const taskId = 'visibility-exact-identity';
 
-  function handlersFor(caller: { name: string }, sessions: unknown[]) {
+  function handlersFor(caller: { name: string }, sessions: unknown[], callerProjectName = PROJECT) {
     listSessionsMock.mockReturnValue(sessions);
     return createSupervisionMcpToolHandlers(
-      { sessionName: caller.name, projectName: PROJECT } as never,
+      { sessionName: caller.name, projectName: callerProjectName } as never,
       {
         registry: createSupervisionRegistryPort(),
         isProjectBrain: () => false,
@@ -236,7 +236,7 @@ describe('task visibility is bound to durable project/session identity', () => {
           const s = (sessions as { name: string; sessionInstanceId: string; runtimeEpoch: string; agentType: string }[])
             .find((c) => c.name === name);
           if (!s) return undefined;
-          return { ...identityOf(s as never), projectName: PROJECT };
+          return { ...identityOf(s as never), projectName: callerProjectName };
         },
       } as never,
     );
@@ -272,6 +272,14 @@ describe('task visibility is bound to durable project/session identity', () => {
     const handlers = handlersFor(workerLive, [brainA, replacement]);
     const res = await handlers[SUPERVISION_MCP_TOOLS.LIST]({}) as { tasks?: unknown[] };
     expect(res.tasks ?? []).toEqual(expect.arrayContaining([expect.objectContaining({ taskId })]));
+  });
+
+  it('still refuses the same session name from a different project', async () => {
+    const handlers = handlersFor(workerLive, [brainA, replacement], 'other-project');
+    expect(await handlers[SUPERVISION_MCP_TOOLS.GET]({ taskId }))
+      .toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    const listed = await handlers[SUPERVISION_MCP_TOOLS.LIST]({}) as { tasks?: unknown[] };
+    expect(listed.tasks ?? []).toHaveLength(0);
   });
 
   it('still lets the exact live participant read', async () => {
