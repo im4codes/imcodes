@@ -24,30 +24,95 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
   const resultMarker = '__IMCODES_SESSION_STORE_RESULT__';
   const moduleUrl = new URL('../../src/store/session-store.ts', import.meta.url).href;
   const script = `
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { homedir } = await import('node:os');
+    const childHome = homedir();
+    const childStorePath = join(childHome, '.imcodes', 'sessions.json');
+    const readStoreSnapshot = () => {
+      try {
+        return { content: readFileSync(childStorePath, 'utf8') };
+      } catch (error) {
+        return { error: { code: error?.code, message: error?.message } };
+      }
+    };
+    const beforeLoad = readStoreSnapshot();
     const store = await import(process.env.IMCODES_TEST_SESSION_STORE_MODULE_URL);
     await store.loadStore();
     await store.flushStore();
-    console.log(${JSON.stringify(resultMarker)} + JSON.stringify(store.getSession(${JSON.stringify(sessionName)})));
+    console.log(${JSON.stringify(resultMarker)} + JSON.stringify({
+      session: store.getSession(${JSON.stringify(sessionName)}) ?? null,
+      diagnostics: {
+        envHome: process.env.HOME,
+        homedir: childHome,
+        storePath: childStorePath,
+        beforeLoad,
+        afterFlush: readStoreSnapshot(),
+      },
+    }));
   `;
-  const { stdout } = await execFileAsync(process.execPath, [
-    '--import',
-    'tsx',
-    '--input-type=module',
-    '--eval',
-    script,
-  ], {
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      HOME: tempDir,
-      IMCODES_TEST_SESSION_STORE_MODULE_URL: moduleUrl,
-    },
-  });
+  let stdout = '';
+  let stderr = '';
+  let exit: string | number = 0;
+  try {
+    ({ stdout, stderr } = await execFileAsync(process.execPath, [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      script,
+    ], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        IMCODES_TEST_SESSION_STORE_MODULE_URL: moduleUrl,
+      },
+    }));
+  } catch (error) {
+    const childError = error as {
+      code?: string | number;
+      signal?: string;
+      stdout?: string;
+      stderr?: string;
+    };
+    stdout = childError.stdout ?? stdout;
+    stderr = childError.stderr ?? stderr;
+    exit = childError.code ?? childError.signal ?? 'unknown';
+    const actualStore = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')
+      .catch((readError: unknown) => `[unreadable: ${String(readError)}]`);
+    throw new Error(
+      `fresh session-store process failed; exit=${String(exit)}; stdout=${JSON.stringify(stdout)}; `
+      + `stderr=${JSON.stringify(stderr)}; actual sessions.json=${JSON.stringify(actualStore)}`,
+    );
+  }
   const resultLine = stdout.split(/\r?\n/).find((line) => line.startsWith(resultMarker));
   if (!resultLine) {
-    throw new Error(`fresh session-store process did not emit its result: ${stdout}`);
+    const actualStore = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')
+      .catch((error: unknown) => `[unreadable: ${String(error)}]`);
+    throw new Error(
+      `fresh session-store process did not emit its result; exit=${String(exit)}; stdout=${JSON.stringify(stdout)}; `
+      + `stderr=${JSON.stringify(stderr)}; actual sessions.json=${JSON.stringify(actualStore)}`,
+    );
   }
-  return JSON.parse(resultLine.slice(resultMarker.length)) as {
+  const payload = JSON.parse(resultLine.slice(resultMarker.length)) as {
+    session: {
+      sessionInstanceId?: string;
+      runtimeEpoch?: string;
+    } | null;
+    diagnostics: object;
+  };
+  if (!payload.session) {
+    const actualStore = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')
+      .catch((error: unknown) => `[unreadable: ${String(error)}]`);
+    throw new Error(
+      `fresh session-store process lost ${JSON.stringify(sessionName)}; exit=${String(exit)}; `
+      + `stdout=${JSON.stringify(stdout)}; stderr=${JSON.stringify(stderr)}; `
+      + `child=${JSON.stringify(payload.diagnostics)}; `
+      + `actual sessions.json=${JSON.stringify(actualStore)}`,
+    );
+  }
+  return payload.session as {
     sessionInstanceId?: string;
     runtimeEpoch?: string;
   };
@@ -173,7 +238,7 @@ describe('session-store', () => {
   });
 
   describe('loadStore reconcile (runtimeType backfill + error recovery)', () => {
-    async function writeSessionsFixture(content: object): Promise<void> {
+    async function writeSessionsFixture(content: object, root = tempDir): Promise<void> {
       // Full-suite workers can be reused after files that register partial
       // `node:fs/promises` mocks. A normal dynamic import can inherit that
       // worker-local mock, turning this fixture write into a no-op while the
@@ -181,7 +246,7 @@ describe('session-store', () => {
       // Vitest's mock registry so the parent and child always observe the same
       // on-disk sessions.json.
       const { mkdir, writeFile } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-      const dir = join(tempDir, '.imcodes');
+      const dir = join(root, '.imcodes');
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, 'sessions.json'), JSON.stringify(content), 'utf8');
     }
@@ -198,6 +263,21 @@ describe('session-store', () => {
       } finally {
         vi.doUnmock('node:fs/promises');
       }
+    });
+
+    it('reports child and disk evidence when a fresh process cannot find the requested session', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_present_brain: {
+            name: 'deck_present_brain', projectName: 'present', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/present',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+      await expect(loadStoreInFreshProcess('deck_missing_brain')).rejects.toThrow(
+        /lost "deck_missing_brain"; exit=0; stdout=.*stderr=.*child=.*actual sessions\.json=.*deck_present_brain/,
+      );
     });
 
     it('backfills runtimeType=transport for SDK sessions persisted before the field existed', async () => {
@@ -292,6 +372,67 @@ describe('session-store', () => {
       expect(getSession('b')?.restarts).toBe(1);
       expect(getSession('c')?.state).toBe('stopped');
       expect(getSession('c')?.restarts).toBe(2);
+    });
+
+    it('keeps a delayed startup probe write bound to the store path it loaded', async () => {
+      const firstHome = tempDir;
+      const secondHome = mkdtempSync(join(tmpdir(), 'deck-test-next-'));
+      let releaseDetection!: (state: 'idle' | 'running') => void;
+      const detection = new Promise<'idle' | 'running'>((resolve) => {
+        releaseDetection = resolve;
+      });
+      let observeEmit!: () => void;
+      const emitted = new Promise<void>((resolve) => {
+        observeEmit = resolve;
+      });
+      vi.doMock('../../src/agent/detect.js', () => ({
+        detectStatusAsync: vi.fn(() => detection),
+      }));
+      vi.doMock('../../src/daemon/timeline-emitter.js', () => ({
+        timelineEmitter: { emit: vi.fn(() => observeEmit()) },
+      }));
+      try {
+        await writeSessionsFixture({
+          sessions: {
+            deck_probe_brain: {
+              name: 'deck_probe_brain', projectName: 'probe', role: 'brain',
+              agentType: 'claude-code', projectDir: '/tmp/probe',
+              state: 'running', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+            },
+          },
+        });
+        const store = await importSessionStore();
+        await store.loadStore();
+
+        vi.stubEnv('HOME', secondHome);
+        await writeSessionsFixture({
+          sessions: {
+            deck_next_brain: {
+              name: 'deck_next_brain', projectName: 'next', role: 'brain',
+              agentType: 'claude-code', projectDir: '/tmp/next',
+              state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 2, updatedAt: 2,
+            },
+          },
+        }, secondHome);
+
+        releaseDetection('idle');
+        await emitted;
+        await store.flushStore();
+
+        const secondStore = JSON.parse(
+          await readFile(join(secondHome, '.imcodes', 'sessions.json'), 'utf8'),
+        ) as { sessions: Record<string, unknown> };
+        expect(Object.keys(secondStore.sessions)).toEqual(['deck_next_brain']);
+        const firstStore = JSON.parse(
+          await readFile(join(firstHome, '.imcodes', 'sessions.json'), 'utf8'),
+        ) as { sessions: Record<string, { state?: string }> };
+        expect(firstStore.sessions.deck_probe_brain?.state).toBe('idle');
+      } finally {
+        vi.doUnmock('../../src/agent/detect.js');
+        vi.doUnmock('../../src/daemon/timeline-emitter.js');
+        vi.stubEnv('HOME', firstHome);
+        rmSync(secondHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
     });
 
     it('migrates missing identities once and preserves them across daemon reload', async () => {

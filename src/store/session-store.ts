@@ -231,10 +231,15 @@ function pruneNonPersistableSessions(): boolean {
 }
 
 export async function loadStore(options: LoadStoreOptions = {}): Promise<SessionStore> {
+  // Bind every asynchronous consequence of this load to the same store path.
+  // HOME is stable in production, but test workers deliberately rotate it;
+  // a delayed startup probe must never write an old snapshot into the next
+  // authority's sessions.json after that rotation.
+  const targetPath = storePath();
   await drainPendingWritesForRead();
-  await mkdir(storeDir(), { recursive: true });
+  await mkdir(dirname(targetPath), { recursive: true });
   try {
-    const raw = await readFile(storePath(), 'utf8');
+    const raw = await readFile(targetPath, 'utf8');
     store = JSON.parse(raw) as SessionStore;
   } catch (err) {
     // Reset to an empty store ONLY when the file genuinely doesn't exist. A
@@ -255,12 +260,12 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   // the daemon's external writes — intermittently dropping a just-added session
   // and failing send_message (flaky CI at the memory-mcp send-refresh path).
   if (options.probe === false) return store;
-  if (pruneNonPersistableSessions()) scheduleWrite();
-  if (reconcilePersistedSessions()) scheduleWrite();
+  if (pruneNonPersistableSessions()) scheduleWrite(targetPath);
+  if (reconcilePersistedSessions()) scheduleWrite(targetPath);
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
-  void probeSessionStates();
+  void probeSessionStates(targetPath);
   return store;
 }
 
@@ -315,7 +320,7 @@ function reconcilePersistedSessions(): boolean {
 }
 
 /** After loadStore, detect actual state of each session from terminal and emit corrections. */
-async function probeSessionStates(): Promise<void> {
+async function probeSessionStates(targetPath: string): Promise<void> {
   try {
     const { detectStatusAsync } = await import('../agent/detect.js');
     const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
@@ -341,13 +346,13 @@ async function probeSessionStates(): Promise<void> {
         try { timelineEmitter.emit(s.name, 'session.state', { state: newState }); } catch { /* emitter may not be ready */ }
       }
     }
-    if (mutated) scheduleWrite();
+    if (mutated) scheduleWrite(targetPath);
   } catch { /* probeSessionStates is best-effort — don't crash daemon */ }
 }
 
-function scheduleWrite(): void {
+function scheduleWrite(targetPath = storePath()): void {
   if (writeTimer) clearTimeout(writeTimer);
-  writeTimerPath = storePath();
+  writeTimerPath = targetPath;
   writeTimer = setTimeout(() => {
     const targetPath = writeTimerPath ?? storePath();
     writeTimer = null;
