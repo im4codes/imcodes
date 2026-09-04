@@ -142,6 +142,13 @@ function recordDirectFileTransferMetric(metric: DirectFileTransferClientMetric, 
   try { console.debug('[direct-file-transfer]', { metric, ...fields }); } catch { /* no console */ }
 }
 
+function reportProbeStage(
+  onDiagnostics: ((diagnostics: DirectConnectivityProbeDiagnostics) => void) | undefined,
+  stage: DirectConnectivityProbeDiagnostics['stage'],
+): void {
+  onDiagnostics?.({ stage, browserCandidateTypes: [], daemonCandidateTypes: [] });
+}
+
 export class DirectFileTransferFailure extends Error {
   constructor(
     readonly code: string,
@@ -201,8 +208,9 @@ type Lease = {
   iceRestartedGeneration: number | null;
   peerCreating: Promise<void> | null;
   /** Daemon generation the live peer was negotiated against. A warm transport
-   *  outlives lease authority, so after a daemon restart the far side of that
-   *  ICE/DTLS association is gone and reusing it would hang every new channel. */
+   *  is valid only for the lease that created it. After lease expiry or a
+   *  daemon restart the far side is gone and reusing it would hang every new
+   *  channel. */
   peerDaemonGeneration: number | null;
   leaseSignalRequestId: string | null;
   /**
@@ -506,10 +514,12 @@ function armLeaseIdleTimer(lease: Lease): void {
       disposeLease(lease);
       return;
     }
-    // A mounted File Browser keeps only the broker reference alive. Its inert
-    // peer/lease must still match the daemon's five-minute lease TTL, so the
-    // next explicit click re-initializes rather than hitting an expired lease.
+    // The daemon destroys the peer together with this lease. The browser must
+    // do the same: an apparently-open SCTP channel from the expired lease
+    // cannot carry a HEALTH_PROBE for the next lease identity. Rewarm now when
+    // an attachment surface is still mounted so the next click remains hot.
     clearLeaseBinding(lease);
+    if (lease.prewarmRefs > 0) queueMicrotask(() => warmRetainedLease(lease));
   }, delay);
 }
 
@@ -723,17 +733,23 @@ function startControlWait<T extends DirectFileTransferServerMessage>(
   return { promise, cancel };
 }
 
-async function ensureLease(lease: Lease): Promise<void> {
+async function ensureLease(
+  lease: Lease,
+  onDiagnostics?: (diagnostics: DirectConnectivityProbeDiagnostics) => void,
+): Promise<void> {
   // A fresh daemon capability snapshot starts rebind asynchronously. Do not
   // race a new offer/operation against the Server's PREPARE acknowledgement.
   if (lease.rebinding) await lease.rebinding;
   if (lease.leaseId && lease.leaseGeneration && lease.daemonGeneration
     && lease.expiresAt > Date.now() && lease.idleExpiresAt > Date.now()) {
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.LEASE_REUSED, { reused: true });
-    await ensureLeasePeer(lease);
+    await ensureLeasePeer(lease, onDiagnostics);
     return;
   }
-  if (lease.creating) return lease.creating;
+  if (lease.creating) {
+    await lease.creating;
+    return ensureLeasePeer(lease, onDiagnostics);
+  }
   const epoch = lease.controlEpoch;
   const signal = lease.controlAbort.signal;
   let creating!: Promise<void>;
@@ -770,7 +786,7 @@ async function ensureLease(lease: Lease): Promise<void> {
     assertCurrentControl(lease, epoch);
     leaseFromReady(lease, message);
     if (!lease.leaseId) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
-    await ensureLeasePeer(lease);
+    await ensureLeasePeer(lease, onDiagnostics);
   })().finally(() => {
     if (lease.creating === creating) lease.creating = null;
   });
@@ -870,20 +886,17 @@ function closePeer(lease: Lease): void {
 }
 
 /**
- * Expire the lease AUTHORITY while leaving a healthy transport warm.
+ * Retire one lease identity and the transport negotiated for it.
  *
- * This used to call `closePeer` first, so the daemon's five-minute lease TTL
- * also tore down the ICE/DTLS association. Opening a server and uploading a few
- * minutes later therefore paid for a full renegotiation even though the
- * connectivity probe had already established a working path and nothing about
- * the network had changed.
- *
- * Authority and transport are separate concerns: only the binding below
- * expires. The peer is released by `disposeLease` (server close/switch, tab
- * cleanup, LRU eviction) or by `ensureLeasePeer` when it is unhealthy or its
- * daemon generation no longer matches.
+ * The daemon scopes its RTCPeerConnection to leaseId + leaseGeneration and
+ * destroys both at idle expiry. Keeping the browser peer while clearing only
+ * those fields creates a split identity: the channel still opens locally, but
+ * the old daemon peer rejects the next lease's HEALTH_PROBE. On a long-lived
+ * mobile app that presented as a permanent 6/7 "verifying" stall until the app
+ * was restarted. A new lease must always negotiate a new peer.
  */
 function clearLeaseBinding(lease: Lease): void {
+  closePeer(lease);
   lease.leaseId = null;
   lease.leaseGeneration = null;
   lease.daemonGeneration = null;
@@ -912,11 +925,6 @@ function invalidateLeaseControl(lease: Lease): void {
     // RTCPeerConnection is both cheaper and safer than trying to infer whether
     // a mobile WebView's old association is still viable.
     //
-    // The closePeer is explicit now: `clearLeaseBinding` only expires AUTHORITY
-    // so that a five-minute lease TTL cannot destroy a healthy warm transport.
-    // Losing the daemon is a different event — its identity changed, so the far
-    // end of this association is gone and the peer must go with it.
-    closePeer(lease);
     clearLeaseBinding(lease);
     return;
   }
@@ -975,43 +983,28 @@ function leaseSignalMatches(
 }
 
 /**
- * Restore one stable signalling identity when a live transport is carried
- * across an authority expiry. `clearLeaseBinding` deliberately keeps that
- * peer but clears its request id; without this re-arm, outbound candidates use
- * unrelated random ids while inbound candidates are still filtered by the old
- * negotiation id.
- */
-function rearmLeaseSignalling(lease: Lease, peer: RTCPeerConnection): void {
-  const requestId = crypto.randomUUID();
-  lease.leaseSignalRequestId = requestId;
-  lease.leaseIceOff?.();
-  lease.leaseIceOff = lease.ws.onMessage((raw) => {
-    const message = parseMatchingControl(raw, requestId);
-    if (!message
-      || message.type !== DIRECT_FILE_TRANSFER_MSG.LEASE_ICE
-      || !leaseSignalMatches(message, lease, requestId)) return;
-    void peer.addIceCandidate({ candidate: message.candidate, sdpMid: message.mid })
-      .catch(() => undefined);
-  });
-}
-
-/**
  * Establish the file-agnostic lease peer.  This is deliberately separate from
  * operation authorization: File Browser prewarming sends only a tab/daemon
  * lease binding and SDP/ICE, never a path, preview handle, session name, or
  * file authority.
  */
-async function ensureLeasePeer(lease: Lease): Promise<void> {
+async function ensureLeasePeer(
+  lease: Lease,
+  onDiagnostics?: (diagnostics: DirectConnectivityProbeDiagnostics) => void,
+): Promise<void> {
   if (!hasLeaseBinding(lease)) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
   // A second caller must join the negotiation already in flight. The cold
   // peer is assigned before its offer/answer settles, so inspecting it first
   // would mistake `new` plus a connecting bootstrap channel for reusable
   // transport and open an operation channel on an unnegotiated association.
   if (lease.peerCreating) {
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
       reason: DIRECT_FILE_TRANSFER_PEER_REASON.JOINED_PENDING,
     });
-    return lease.peerCreating;
+    await lease.peerCreating;
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN);
+    return;
   }
   // Mobile WebViews commonly leave a WebRTC peer in `disconnected` after a
   // long background suspension while the browser-server WebSocket recovers.
@@ -1031,10 +1024,10 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
     && lease.peer.connectionState !== 'disconnected'
     && lease.peer.connectionState !== 'closed') {
     if (lease.peerDaemonGeneration === null) lease.peerDaemonGeneration = lease.daemonGeneration;
-    if (lease.leaseSignalRequestId === null) rearmLeaseSignalling(lease, lease.peer);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
       reason: DIRECT_FILE_TRANSFER_PEER_REASON.REUSED,
     });
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN);
     return;
   }
   if (lease.peer && (!generationMatches
@@ -1048,6 +1041,20 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
     // open budget. Rebuild now; do not spend a retry on the known-dead peer.
     closePeer(lease);
   }
+  const peerNeedsIceRestart = lease.peer?.connectionState === 'failed'
+    || lease.peer?.connectionState === 'disconnected';
+  if (peerNeedsIceRestart && lease.iceRestartedGeneration === lease.leaseGeneration) {
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
+      reason: DIRECT_FILE_TRANSFER_PEER_REASON.LEASE_REINIT,
+    });
+    // Re-enter before claiming peerCreating. The old implementation did this
+    // inside the peerCreating promise; the replacement ensureLeasePeer then
+    // joined that same promise and awaited itself forever. On a mobile app's
+    // second background disconnect this left diagnostics stuck at 1/7 until
+    // the process was killed.
+    clearLeaseBinding(lease);
+    return ensureLease(lease, onDiagnostics);
+  }
   const epoch = lease.controlEpoch;
   const signal = lease.controlAbort.signal;
   let peerCreating!: Promise<void>;
@@ -1056,18 +1063,8 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
     if (!hasLeaseBinding(lease)) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
     const restarting = lease.peer?.connectionState === 'failed'
       || lease.peer?.connectionState === 'disconnected';
-    if (restarting && lease.iceRestartedGeneration === lease.leaseGeneration) {
-      recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
-        reason: DIRECT_FILE_TRANSFER_PEER_REASON.LEASE_REINIT,
-      });
-      // This branch is only reached with an already failed/disconnected peer
-      // whose one ICE restart is spent, so the transport is genuinely unhealthy
-      // and must be dropped explicitly rather than via clearLeaseBinding.
-      closePeer(lease);
-      clearLeaseBinding(lease);
-      return ensureLease(lease);
-    }
     let peer = lease.peer;
+    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.PEER, {
       reason: restarting
         ? DIRECT_FILE_TRANSFER_PEER_REASON.ICE_RESTART
@@ -1161,6 +1158,7 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
           requestId,
           sdp: offer.sdp ?? '',
         });
+        reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES);
       } catch (error) {
         answer.cancel(error);
         await answer.promise;
@@ -1170,12 +1168,14 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
       assertCurrentControl(lease, epoch);
       await leasePeer.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
       await candidates.flush((candidate) => leasePeer.addIceCandidate(candidate));
+      reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING);
       const bootstrap = lease.bootstrapChannel;
       if (!bootstrap) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
       // SDP/ICE signalling completion is not transport readiness. The old
       // prewarm resolved here while SCTP was still connecting, so uploads
       // appeared "prewarmed" but paid the full channel-open timeout anyway.
       await waitForChannelOpen(bootstrap, leasePeer, signal);
+      reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN);
     } catch (error) {
       if (lease.controlEpoch === epoch) {
         closePeer(lease);
@@ -2334,7 +2334,7 @@ export async function probeDirectConnectivity(
   const { lease, release } = acquireLease(ws, serverId);
   const probeControlEpoch = lease.controlEpoch;
   try {
-    await ensureLease(lease);
+    await ensureLease(lease, onDiagnostics);
     const result = await probeLeasePeer(lease, onDiagnostics);
     onDiagnostics?.({ stage: DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE, browserCandidateTypes: [], daemonCandidateTypes: [] });
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: result.route });

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_CONNECTION_STATUS,
   DIRECT_FILE_TRANSFER_DIRECTION,
@@ -1582,9 +1583,23 @@ describe('direct file transfer v2 browser broker', () => {
   it('establishes and then reuses an inert v2 lease for explicit diagnostics without file authority', async () => {
     const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities);
+    const stages: string[] = [];
 
+    await expect(probeDirectConnectivity(
+      ws,
+      (diagnostics) => stages.push(diagnostics.stage),
+      'server-1',
+    )).resolves.toMatchObject({ route: 'lan_direct' });
     await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
-    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+
+    expect(stages).toEqual([
+      DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER,
+      DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES,
+      DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING,
+      DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN,
+      DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING,
+      DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE,
+    ]);
 
     // Normal WsClient.send is deliberately a silent no-op while foreground
     // liveness is being probed. Direct request/response control must use the
@@ -1705,6 +1720,27 @@ describe('direct file transfer v2 browser broker', () => {
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
   });
 
+  it('re-initializes after a second mobile disconnect without awaiting its own peer promise', async () => {
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    const expiredPeer = FakePeerConnection.instances.at(-1)!;
+
+    expiredPeer.connectionState = 'disconnected';
+    expiredPeer.dispatchEvent(new Event('connectionstatechange'));
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    expect(expiredPeer.restartIce).toHaveBeenCalledOnce();
+
+    expiredPeer.connectionState = 'disconnected';
+    expiredPeer.dispatchEvent(new Event('connectionstatechange'));
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+
+    expect(expiredPeer.connectionState).toBe('closed');
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+  });
+
   it('does not misreport a lagging peer connection state as an unavailable runtime', async () => {
     const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
     const { ws } = createWs(directCapabilities);
@@ -1714,30 +1750,20 @@ describe('direct file transfer v2 browser broker', () => {
     expect(FakePeerConnection.instances.at(-1)?.connectionState).toBe('new');
   });
 
-  /**
-   * CONTRACT CHANGE: the idle window retires AUTHORITY, not the transport.
-   *
-   * This case previously asserted two RTCPeerConnections — the five-minute
-   * lease TTL tore down the ICE/DTLS association along with the binding. That
-   * made "open a server, upload a few minutes later" pay for a full
-   * renegotiation the connectivity probe had already completed, which is the
-   * reported slow-establishment symptom. The lease re-init is still expected
-   * and still asserted (LEASE_INIT twice); what must NOT happen any more is
-   * discarding a healthy peer with it.
-   *
-   * A cold rebuild is still required, and covered elsewhere, when the peer is
-   * unhealthy, the daemon generation/identity changes, or the lease is disposed
-   * by an explicit close, tab cleanup or LRU eviction.
-   */
-  it('retires only the authority after five minutes and re-binds onto the warm transport', async () => {
+  it('retires the lease-bound peer after five minutes and automatically prewarms its replacement', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities);
     const release = prewarmDirectFileLease(ws, 'server-1');
     await vi.advanceTimersByTimeAsync(0);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    const expiredPeer = FakePeerConnection.instances[0]!;
 
-    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(expiredPeer.connectionState).toBe('closed');
+    expect(FakePeerConnection.instances).toHaveLength(2);
+
     const bytes = new TextEncoder().encode('after-idle');
     const file = {
       name: 'after-idle.txt', type: 'text/plain', size: bytes.byteLength,
@@ -1747,14 +1773,14 @@ describe('direct file transfer v2 browser broker', () => {
     await vi.advanceTimersByTimeAsync(0);
     await expect(pending).resolves.toMatchObject({ ok: true });
 
-    // Authority really did expire and was re-initialised...
+    // The mounted surface already rebuilt the exact lease+peer pair, so the
+    // upload neither waits for expiry recovery nor opens a third peer.
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
-    // ...but the transport the prewarm established was kept and reused.
-    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(FakePeerConnection.instances).toHaveLength(2);
     release?.();
   });
 
-  it('re-arms one current signalling identity when authority expiry retains the warm peer', async () => {
+  it('binds trickled ICE to the replacement lease and never the expired peer', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws, sent, emit } = createWs(directCapabilities, 'success', {
@@ -1763,6 +1789,11 @@ describe('direct file transfer v2 browser broker', () => {
     const release = prewarmDirectFileLease(ws, 'server-1');
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1);
+
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    const expiredPeer = FakePeerConnection.instances[0]!;
+    const peer = FakePeerConnection.instances[1]!;
+    expect(expiredPeer.connectionState).toBe('closed');
 
     const second = uploadFileDirect(
       ws,
@@ -1777,9 +1808,8 @@ describe('direct file transfer v2 browser broker', () => {
     await vi.advanceTimersByTimeAsync(0);
     await expect(second).resolves.toMatchObject({ ok: true });
 
-    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(FakePeerConnection.instances).toHaveLength(2);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
-    const peer = FakePeerConnection.instances[0]!;
     const before = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE).length;
     peer.emitIceCandidate('candidate:31 1 UDP 1 10.0.0.2 5001 typ host');
     peer.emitIceCandidate('candidate:32 1 UDP 1 10.0.0.3 5002 typ host');
@@ -2174,13 +2204,8 @@ describe('direct file transfer v2 browser broker', () => {
    * documented state transitions and asserts the REASON the peer was reused or
    * rebuilt, which is the thing that actually differs.
    */
-  /**
-   * The warm transport survives authority expiry, but it must NOT survive the
-   * daemon changing underneath it: after a daemon restart the far end of that
-   * ICE/DTLS association no longer exists, and reusing it would hang every new
-   * channel instead of failing fast.
-   */
-  it('rebuilds the transport when the re-bound lease reports a different daemon generation', async () => {
+  /** A new daemon generation makes the expired-peer boundary explicit. */
+  it('rebuilds the transport when the replacement lease reports a different daemon generation', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
     const { DIRECT_FILE_TRANSFER_CLIENT_METRIC, DIRECT_FILE_TRANSFER_PEER_REASON } = await import('../src/direct-file-transfer.js');
@@ -2199,6 +2224,12 @@ describe('direct file transfer v2 browser broker', () => {
 
       // Authority expires; the daemon comes back as a different generation.
       await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1_000);
+      expect(
+        peerReasons,
+        'lease expiry must cold-build the replacement while the surface remains mounted',
+      ).toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
+      expect(FakePeerConnection.instances.length).toBeGreaterThan(peersAfterPrewarm);
+
       const before = peerReasons.length;
       await uploadFileWithDirectFallback({
         ws,
@@ -2208,9 +2239,8 @@ describe('direct file transfer v2 browser broker', () => {
 
       expect(
         peerReasons.slice(before),
-        'a transport negotiated against the old daemon must not be reused',
-      ).toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
-      expect(FakePeerConnection.instances.length).toBeGreaterThan(peersAfterPrewarm);
+        'the upload should use the already-prewarmed replacement peer',
+      ).toContain(DIRECT_FILE_TRANSFER_PEER_REASON.REUSED);
     } finally {
       debugSpy.mockRestore();
       release?.();
@@ -2778,19 +2808,11 @@ describe('direct file transfer v2 browser broker', () => {
   });
 
   /**
-   * A — the state actually lost between opening a server and uploading.
-   *
-   * A probe leaves a healthy peer, but the lease arms an idle timer
-   * (LEASE_IDLE_TTL_MS) as soon as nothing references it. Once that fires the
-   * binding is cleared, so an upload started later cannot reuse the transport
-   * the probe already paid for: it re-runs LEASE_INIT, SDP and ICE. That is the
-   * gap between "connectivity check is instant" and "the upload takes ages to
-   * connect" on the very same machine.
-   *
-   * This asserts the reason, so a regression cannot hide behind a passing
-   * transfer that merely got slower.
+   * A mounted surface must refresh the complete lease+peer pair at expiry.
+   * Reusing only the browser half leaves an open-looking channel whose remote
+   * peer was deleted by the daemon, causing the mobile 6/7 verification stall.
    */
-  it('keeps the probe transport across authority expiry and only re-binds the lease', async () => {
+  it('automatically replaces the probe transport at authority expiry', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
     const { DIRECT_FILE_TRANSFER_CLIENT_METRIC, DIRECT_FILE_TRANSFER_PEER_REASON } = await import('../src/direct-file-transfer.js');
@@ -2813,6 +2835,10 @@ describe('direct file transfer v2 browser broker', () => {
 
       // Authority expires while the server stays open.
       await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1_000);
+      expect(
+        FakePeerConnection.instances.length,
+        'the expired browser peer must be replaced together with the daemon peer',
+      ).toBe(peersAfterProbe + 1);
 
       const before = peerReasons.length;
       await uploadFileWithDirectFallback({
@@ -2822,19 +2848,11 @@ describe('direct file transfer v2 browser broker', () => {
       });
       const duringUpload = peerReasons.slice(before);
 
-      // Letting the AUTHORITY expire is correct and expected — the daemon lease
-      // really is five minutes. Re-initialising it (lease_reinit) is therefore
-      // allowed. What must not happen is throwing away a healthy ICE/DTLS
-      // transport along with it: that is what turns "open the server, upload a
-      // few minutes later" into a full renegotiation the probe already paid for.
       expect(
         duringUpload,
-        `upload rebuilt the transport the probe had already established (reasons=${JSON.stringify(duringUpload)})`,
-      ).not.toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
-      expect(
-        FakePeerConnection.instances.length,
-        'a second RTCPeerConnection means the probe transport was thrown away',
-      ).toBe(peersAfterProbe);
+        `upload did not reuse the automatically refreshed peer (reasons=${JSON.stringify(duringUpload)})`,
+      ).toContain(DIRECT_FILE_TRANSFER_PEER_REASON.REUSED);
+      expect(duringUpload).not.toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
     } finally {
       debugSpy.mockRestore();
       release?.();
