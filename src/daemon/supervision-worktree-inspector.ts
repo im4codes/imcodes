@@ -19,6 +19,9 @@ export interface SupervisionWorktreeSnapshot {
   stagedPaths: string[];
   conflictedPaths: string[];
   untrackedPaths: string[];
+  /** Remote authority whose committed bytes exactly match every manifest row. */
+  matchingRemoteCommitSha?: string;
+  matchingRemoteRef?: string;
 }
 
 export type SupervisionWorktreeInspectionResult =
@@ -60,6 +63,36 @@ function fileSha256(path: string): string {
   } finally {
     closeSync(fd);
   }
+}
+
+function matchingRemoteDelivery(
+  worktreePath: string,
+  files: readonly SupervisionWorktreeFileSnapshot[],
+): { matchingRemoteCommitSha: string; matchingRemoteRef: string } | undefined {
+  if (files.length === 0) return undefined;
+  const refs = lines(git(worktreePath, ['for-each-ref', '--format=%(refname)', 'refs/remotes']))
+    .sort((left, right) => Number(right === 'refs/remotes/origin/dev') - Number(left === 'refs/remotes/origin/dev'));
+  for (const ref of refs.slice(0, 64)) {
+    let matches = true;
+    for (const file of files) {
+      const shown = spawnSync('git', ['-C', worktreePath, 'show', `${ref}:${file.path}`], {
+        stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024,
+      });
+      if (file.deleted === true) {
+        if (!shown.error && shown.status === 0) { matches = false; break; }
+        continue;
+      }
+      if (shown.error || shown.status !== 0 || !Buffer.isBuffer(shown.stdout)
+        || createHash('sha256').update(shown.stdout).digest('hex') !== file.sha256) {
+        matches = false;
+        break;
+      }
+    }
+    if (!matches) continue;
+    const commitSha = git(worktreePath, ['rev-parse', `${ref}^{commit}`]).trim().toLowerCase();
+    if (COMMIT_RE.test(commitSha)) return { matchingRemoteCommitSha: commitSha, matchingRemoteRef: ref };
+  }
+  return undefined;
 }
 
 export function resolveSupervisionAssignmentWorktree(input: {
@@ -125,6 +158,7 @@ export function inspectSupervisionAssignmentWorktree(input: {
       ok: true,
       snapshot: {
         worktreePath, headSha, files, stagedPaths, conflictedPaths, untrackedPaths,
+        ...matchingRemoteDelivery(worktreePath, files),
       },
     };
   } catch {

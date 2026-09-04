@@ -50,6 +50,7 @@ import {
   AGENT_DELEGATION_REPLY_RESULT_BYTES,
 } from './agent-delegation.js';
 import {
+  SUPERVISION_CI_SMOKE_STATUSES,
   SUPERVISION_TASK_AUDIT_POLICIES,
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
@@ -146,7 +147,6 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
 export const SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS = [
   'assignmentId', 'revision', 'auditAttemptId', 'auditRevision', 'verdict',
   'integrationOwner', 'commitSha', 'pushResult', 'pushRemoteRef',
-  'externalRunId', 'externalHeadSha', 'ciResult',
 ] as const;
 
 export const SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS = [
@@ -631,7 +631,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
-    description: 'Atomically finalize one exact audited integration from integration-owner Git, push, and successful CI evidence.',
+    description: 'Atomically finalize one exact audited integration. PASS plus exact Git/push evidence is the finalization authority; CI is optional descriptive smoke.',
     inputSchema: objectSchema({
       assignmentId: stringSchema('Caller-bound integration owner assignment.'),
       revision: stringSchema('Exact combined revision.'),
@@ -647,10 +647,14 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       stagedPaths: { description: 'Caller-reported staged data; unusable values are ignored.' },
       conflictedPaths: { description: 'Caller-reported conflict data; unusable values are ignored.' },
       untrackedOtherOwnerPaths: { description: 'Caller-reported untracked data; unusable values are ignored.' },
-      externalRunId: stringSchema('Successful CI run id.'),
-      externalHeadSha: stringSchema('CI head SHA.', { pattern: '^[0-9a-f]{40}$' }),
+      externalRunId: stringSchema('Optional current-commit CI run id; required only when ciResult describes a queried run.'),
+      externalHeadSha: stringSchema('Optional queried CI run head SHA.', { pattern: '^[0-9a-f]{40}$' }),
       externalTaskId: stringSchema('Optional external workflow id.'),
-      ciResult: { type: 'string', enum: ['success'] },
+      ciResult: {
+        type: 'string',
+        enum: [...SUPERVISION_CI_SMOKE_STATUSES],
+        description: 'Optional CI smoke state; every outcome including failure is descriptive and non-blocking.',
+      },
       evidence: stringSchema('Bounded structured-finalization note.'),
     }, SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS),
     outputSchema: statusSchema,

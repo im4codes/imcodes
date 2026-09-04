@@ -96,6 +96,7 @@ import {
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
 import {
+  SUPERVISION_CI_SMOKE_STATUSES,
   SUPERVISION_TASK_AUDIT_POLICIES,
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
@@ -133,6 +134,7 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
+import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
@@ -192,10 +194,10 @@ const integrationFinalizationSchema = z.object({
   stagedPaths: recordOnlyPathArraySchema,
   conflictedPaths: recordOnlyPathArraySchema,
   untrackedOtherOwnerPaths: recordOnlyPathArraySchema,
-  externalRunId: z.string().min(1),
-  externalHeadSha: z.string().regex(/^[0-9a-f]{40}$/),
+  externalRunId: z.string().min(1).optional(),
+  externalHeadSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
   externalTaskId: z.string().min(1).optional(),
-  ciResult: z.literal('success'),
+  ciResult: z.enum(SUPERVISION_CI_SMOKE_STATUSES).optional(),
   evidence: z.string().optional(),
 }).strict();
 
@@ -1601,6 +1603,27 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const registry = getSupervisionTaskRegistry();
       const existing = registry.getAssignment(mapped.assignmentId);
       if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: not_found');
+      if (existing.status === 'cancelled' && existing.role !== 'auditor' && existing.role !== 'coordinator') {
+        const inspected = inspectSupervisionAssignmentWorktree({
+          sessionName: existing.identity.sessionName,
+          assignmentId: existing.assignmentId,
+        });
+        if (!inspected.ok || inspected.snapshot.files.length === 0) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED,
+            `task_finish rejected: ${inspected.ok ? 'manifest_mismatch' : inspected.reason}`);
+        }
+        const evidence = registry.recordCancelledCompletionEvidence({
+          taskId: existing.taskId,
+          assignmentId: existing.assignmentId,
+          identity,
+          revision: mapped.metadata.revision ?? existing.auditRevision,
+          worktreeSnapshot: inspected.snapshot,
+          evidence: mapped.metadata.evidence,
+        });
+        return evidence.ok
+          ? { status: 'ok', item: evidence.value }
+          : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${evidence.reason}`);
+      }
       const updated = registry.finishAssignment({
         assignmentId: mapped.assignmentId,
         identity,

@@ -50,6 +50,7 @@ import {
   isSupervisionTaskAuditPolicy,
   readSupervisionSnapshotFromTransportConfig,
   supervisionTaskAuditPolicyFromSnapshot,
+  type SessionSupervisionSnapshot,
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
@@ -116,7 +117,10 @@ import {
 import { getDelegationReplyStore } from './delegation-reply-store.js';
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
-import { resolveSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
+import {
+  inspectSupervisionAssignmentWorktree,
+  resolveSupervisionAssignmentWorktree,
+} from './supervision-worktree-inspector.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
@@ -594,6 +598,7 @@ const HOOK_WORKTREE_RECOVERY_STATUSES = new Set([
 ]);
 
 const AUDITOR_REDELIVERY_STATUS = 'delegated';
+const AUDITOR_STALE_REDELIVERY_MS = 10 * 60_000;
 /**
  * Audit states that must never accept a redelivery. `passed` is included on
  * purpose: a returned verdict is authority, and re-routing to it would let a
@@ -900,8 +905,7 @@ export function listSendTargets(
   const query = typeof input.query === 'string' ? input.query.trim().toLowerCase() : '';
   const rawLimit = typeof input.limit === 'number' && Number.isFinite(input.limit) ? Math.floor(input.limit) : DEFAULT_TARGET_LIST_LIMIT;
   const limit = Math.max(0, Math.min(MAX_TARGET_LIST_LIMIT, rawLimit));
-  const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
-  const executionPools = readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig).executionPools;
+  const executionPools = resolveProjectAuthoritativeSupervisionPools(callerProjectName, allSessions);
   const requestedPool = input.executionPool;
   // Default discovery remains the ordinary-messaging surface: every scoped,
   // discoverable sibling. Pool filtering is explicit and fail-closed for a
@@ -947,6 +951,40 @@ export function listSendTargets(
       executionPools.state === 'configured' ? eligiblePools : undefined,
     )),
   };
+}
+
+/**
+ * Read the one project-owned execution-pool snapshot for every legitimate
+ * project participant. Read authority is project membership; only mutation of
+ * the snapshot remains Brain-owned. Falling back to a sub-session's private
+ * snapshot made the same target alternately configured/unconfigured depending
+ * on who called send_list_targets (tsk_79u).
+ *
+ * Multiple active Brain snapshots are accepted only when byte-equivalent;
+ * disagreement is genuine authority ambiguity and fails closed as
+ * legacy_unconfigured rather than selecting by array order.
+ */
+export function resolveProjectAuthoritativeSupervisionSnapshot(
+  projectName: string,
+  sessions: readonly SessionRecord[],
+): SessionSupervisionSnapshot {
+  const fallback = readSupervisionSnapshotFromTransportConfig(undefined);
+  const brains = sessions.filter((session) => (
+    session.role === 'brain'
+    && !session.parentSession
+    && resolveEffectiveProjectName(session, sessions) === projectName
+  ));
+  if (brains.length === 0) return fallback;
+  const snapshots = brains.map((brain) => readSupervisionSnapshotFromTransportConfig(brain.transportConfig));
+  const encoded = new Set(snapshots.map((snapshot) => JSON.stringify(snapshot)));
+  return encoded.size === 1 ? snapshots[0]! : fallback;
+}
+
+export function resolveProjectAuthoritativeSupervisionPools(
+  projectName: string,
+  sessions: readonly SessionRecord[],
+): SupervisionExecutionPoolsConfig {
+  return resolveProjectAuthoritativeSupervisionSnapshot(projectName, sessions).executionPools;
 }
 
 function supervisionObservedIdentityForTarget(
@@ -1356,14 +1394,17 @@ export async function dispatchSendMessage(
     const targetIdentity = supervisionTaskIdentityForTarget(targetRecord);
     if (!targetIdentity) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'task target identity is unavailable' };
     // Task metadata turns both implementation AND audit sends into supervised
-    // execution. Validate the exact target against the caller's current pool
+    // execution. Validate the exact target against the project's authoritative pool
     // before touching the registry, claims, reply authority or transport.
     // Audit eligibility is an additional gate below, never a pool bypass.
     const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
-    const callerSupervisionSnapshot = readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig);
+    const callerSupervisionSnapshot = resolveProjectAuthoritativeSupervisionSnapshot(
+      callerProjectName,
+      allSessions,
+    );
     const actual = supervisionObservedIdentityForTarget(targetRecord);
     const pool = input.task.executionPool ?? 'primary';
-    const pools = callerSupervisionSnapshot.executionPools;
+    const pools = resolveProjectAuthoritativeSupervisionPools(callerProjectName, allSessions);
     const checked = evaluateSupervisionExecutionBinding({
       pools,
       pool,
@@ -1982,6 +2023,11 @@ export interface ReadyAuditDispatchDeps {
   /** Internal boot-sweep marker: prior-process handoffs are abandoned. */
   recoverRestartHandoffs?: boolean;
   now?: () => number;
+  inspectAssignmentWorktree?: (
+    assignment: PersistedSupervisionTaskAssignment,
+  ) => import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined;
+  /** Test seam for the existing bounded, persistent housekeeping scheduler. */
+  runScheduledWorktreeGcBatch?: (now: number) => Promise<unknown>;
 }
 
 function automaticAuditAttemptId(taskId: string, revision: string): string {
@@ -2098,7 +2144,11 @@ function mayFallbackToBusyAfterProvision(result: SendMessageResult): boolean {
     && AUTOMATIC_AUDIT_BUSY_FALLBACK_REASONS.has(result.provisioning!.failureReason!);
 }
 
-function boundedAuditBrief(task: SupervisionTaskSnapshot, revision: string): string {
+function boundedAuditBrief(
+  task: SupervisionTaskSnapshot,
+  revision: string,
+  authoritativeWorktree: string,
+): string {
   const shorten = (value: string, max = 800) => value.length <= max ? value : `${value.slice(0, max - 1)}…`;
   const files = task.touchedFiles.length > 0
     ? task.touchedFiles
@@ -2109,11 +2159,13 @@ function boundedAuditBrief(task: SupervisionTaskSnapshot, revision: string): str
     `revision=${revision}`,
     `classification=${task.classification}`,
     `objective=${shorten(task.objective)}`,
+    `Authoritative implementer worktree: ${authoritativeWorktree}`,
     '',
     'Acceptance:',
     ...task.acceptance.slice(0, 20).map((item) => `- ${shorten(item, 500)}`),
     '',
     'Evidence-first independent audit. Verify the exact revision and return one final PASS/REWORK via peer_audit_reply.',
+    'Reconstruct and inspect the frozen bytes from the authoritative implementer worktree above. Do not inspect the auditor worktree as a substitute.',
     'Do not edit code, stage, commit, push, deploy, install, upgrade, restart, or create a replacement task/audit.',
     'On PASS, integrationOwner is the same-project Brain; on failure report bounded concrete findings.',
     ...(files.length > 0 ? ['', 'Referenced files:', ...[...new Set(files)].sort().slice(0, 40).map((file) => `- ${file}`)] : []),
@@ -2157,6 +2209,69 @@ async function reportAutomaticAuditBlocker(
     target: target.name,
     message: automaticBlockerMessage({ taskId: task.taskId, assignmentId: implementer.assignmentId, exactError }),
     idempotencyKey: `auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`,
+    internalMessageId: messageId,
+    internalDurableQueue: true,
+  });
+  return dispatched.status === 'accepted';
+}
+
+interface CancelledCompletionEvidenceDecisionRequest {
+  kind: 'cancelled_completion_evidence_conflict';
+  actionRequired: 'adopt_or_discard';
+  evidenceId: string;
+  sourceAssignmentId: string;
+  successorAssignmentId: string;
+  revision: string;
+  manifestSha256: string;
+  worktreePath: string;
+}
+
+function cancelledCompletionEvidenceDecisionRequest(
+  task: SupervisionTaskSnapshot,
+): CancelledCompletionEvidenceDecisionRequest | undefined {
+  if (!task.blocker) return undefined;
+  try {
+    const parsed = JSON.parse(task.blocker) as Partial<CancelledCompletionEvidenceDecisionRequest>;
+    if (parsed.kind !== 'cancelled_completion_evidence_conflict'
+      || parsed.actionRequired !== 'adopt_or_discard'
+      || !parsed.evidenceId || !parsed.sourceAssignmentId || !parsed.successorAssignmentId
+      || !parsed.revision || !parsed.manifestSha256 || !parsed.worktreePath) return undefined;
+    return parsed as CancelledCompletionEvidenceDecisionRequest;
+  } catch {
+    return undefined;
+  }
+}
+
+async function reportCancelledCompletionEvidenceDecision(
+  task: SupervisionTaskSnapshot,
+  deps: ReadyAuditDispatchDeps,
+): Promise<boolean> {
+  const request = cancelledCompletionEvidenceDecisionRequest(task);
+  if (!request) return false;
+  const sessions = (deps.listSessions ?? listSessions)();
+  const coordinators = task.assignments.flatMap((assignment) => {
+    if (assignment.role !== 'coordinator') return [];
+    const live = exactLiveSessionForAssignment(assignment, sessions);
+    return live?.role === 'brain' ? [live] : [];
+  });
+  const successor = task.assignments.find((assignment) => (
+    assignment.assignmentId === request.successorAssignmentId
+  ));
+  const origin = successor ? exactLiveSessionForAssignment(successor, sessions) : undefined;
+  if (coordinators.length !== 1 || !origin) return false;
+  const target = coordinators[0]!;
+  const messageId = deterministicSendMessageId(`cancelled-completion-decision:${request.evidenceId}`);
+  const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
+  if (hasEvidence(target.name, messageId)) return true;
+  const dispatched = await (deps.dispatch ?? dispatchSendMessage)({
+    userId: origin.name,
+    sessionName: origin.name,
+    projectName: task.projectName,
+    projectRoot: origin.projectDir,
+  }, {
+    target: target.name,
+    message: JSON.stringify({ taskId: task.taskId, ...request }),
+    idempotencyKey: `cancelled-completion-decision:${request.evidenceId}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
   });
@@ -2313,8 +2428,24 @@ export async function dispatchReadyAudit(
     }
     const messageId = deterministicSendMessageId(`auto-audit:${existingAudit.assignmentId}:${attemptId}`);
     const recoveredHandoff = recoverAutomaticAuditHandoff(target.name, messageId, deps);
-    if (!recoveredHandoff && (deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(target.name, messageId)) {
-      return { status: 'replayed', assignmentId: existingAudit.assignmentId, attemptId, messageId };
+    const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
+    if (!recoveredHandoff && hasEvidence(target.name, messageId)) {
+      const now = deps.now?.() ?? Date.now();
+      const staleDelegated = existingAudit.status === AUDITOR_REDELIVERY_STATUS
+        && now - existingAudit.updatedAt >= AUDITOR_STALE_REDELIVERY_MS;
+      if (!staleDelegated) {
+        return { status: 'replayed', assignmentId: existingAudit.assignmentId, attemptId, messageId };
+      }
+      const redeliveryMessageId = deterministicSendMessageId(
+        `auto-audit-redelivery:${existingAudit.assignmentId}:${attemptId}`,
+      );
+      if (hasEvidence(target.name, redeliveryMessageId)) {
+        return {
+          status: 'replayed', assignmentId: existingAudit.assignmentId, attemptId,
+          messageId: redeliveryMessageId,
+        };
+      }
+      recoveredExistingMessageId = redeliveryMessageId;
     }
     if (recoveredHandoff) recoveredExistingMessageId = messageId;
   }
@@ -2354,12 +2485,17 @@ export async function dispatchReadyAudit(
     projectName: task.projectName,
     projectRoot: brain.projectDir,
   };
+  const authoritativeWorktree = inspectAssignmentForConvergence(implementer, deps)?.worktreePath
+    ?? resolveSupervisionAssignmentWorktree({
+      sessionName: implementer.identity.sessionName,
+      assignmentId: implementer.assignmentId,
+    });
   const buildInput = (target?: string, autoProvision = false): SendMessageInput => ({
     ...(target ? { target } : {}),
-    message: boundedAuditBrief(task, revision),
+    message: boundedAuditBrief(task, revision, authoritativeWorktree),
     reply: true,
     idempotencyKey: `auto-audit:${task.taskId}:${revision}`,
-    newWorkload: true,
+    ...(existingAudit ? {} : { newWorkload: true }),
     automaticSupervision: true,
     ...(recoveredExistingMessageId ? { internalMessageId: recoveredExistingMessageId } : {}),
     internalDurableQueue: true,
@@ -2371,6 +2507,7 @@ export async function dispatchReadyAudit(
     },
     task: {
       taskId: task.taskId,
+      ...(existingAudit ? { assignmentId: existingAudit.assignmentId } : {}),
       currentRevision: revision,
       auditRevision: revision,
       auditAttemptId: attemptId,
@@ -2396,6 +2533,217 @@ export async function dispatchReadyAudit(
   const messageId = result.messageId
     ?? deterministicSendMessageId(`auto-audit:${result.assignmentId}:${attemptId}`);
   return { status: 'dispatched', assignmentId: result.assignmentId, attemptId, messageId };
+}
+
+export type DeterministicContinuationDispatchResult =
+  | { status: 'ignored'; reason: string }
+  | { status: 'replayed'; assignmentId: string; messageId: SendMessageId }
+  | { status: 'dispatched'; assignmentId: string; messageId: SendMessageId }
+  | { status: 'blocked'; reason: string; reported: boolean };
+
+function inspectAssignmentForConvergence(
+  assignment: PersistedSupervisionTaskAssignment,
+  deps: ReadyAuditDispatchDeps,
+): import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined {
+  if (deps.inspectAssignmentWorktree) return deps.inspectAssignmentWorktree(assignment);
+  const inspected = inspectSupervisionAssignmentWorktree({
+    sessionName: assignment.identity.sessionName,
+    assignmentId: assignment.assignmentId,
+  });
+  return inspected.ok ? inspected.snapshot : undefined;
+}
+
+/** Deliver one exact REWORK receipt back to the same implementation object. */
+export async function dispatchReadyRework(
+  taskId: string,
+  deps: ReadyAuditDispatchDeps = {},
+): Promise<DeterministicContinuationDispatchResult> {
+  const registry = deps.registry ?? getSupervisionTaskRegistry();
+  const task = registry.get(taskId);
+  if (!task || task.status !== 'rework') return { status: 'ignored', reason: 'not_ready_for_rework' };
+  const revision = task.currentRevision?.trim();
+  if (!revision) return { status: 'blocked', reason: 'missing_current_revision', reported: false };
+  const candidates = task.assignments.filter((assignment) => (
+    assignment.required && assignment.role === 'implementer' && assignment.status === 'rework'
+    && assignment.auditRevision === revision && Boolean(assignment.auditAttemptId)
+    && assignment.verdict?.trim().toUpperCase() === 'REWORK'
+  ));
+  if (candidates.length !== 1) {
+    return { status: 'blocked', reason: 'rework requires one exact implementer', reported: false };
+  }
+  const implementer = candidates[0]!;
+  const receipt = (task.auditReceipts ?? []).filter((item) => (
+    item.attemptId === implementer.auditAttemptId && item.revision === revision
+    && item.receiptKind === 'final' && item.verdict === 'REWORK'
+  ));
+  if (receipt.length !== 1) return { status: 'blocked', reason: 'exact REWORK receipt unavailable', reported: false };
+  const sessions = (deps.listSessions ?? listSessions)();
+  const target = sessions.find((session) => session.name === implementer.identity.sessionName);
+  const targetIdentity = target && supervisionTaskIdentityForTarget(target);
+  if (!target || !targetIdentity) return { status: 'blocked', reason: 'implementer runtime unavailable', reported: false };
+  const liveBrains = task.assignments
+    .filter((assignment) => assignment.role === 'coordinator')
+    .flatMap((assignment) => {
+      const session = exactLiveSessionForAssignment(assignment, sessions);
+      return session?.role === 'brain' ? [session] : [];
+    });
+  if (liveBrains.length !== 1) {
+    return { status: 'blocked', reason: 'rework requires one exact live Brain coordinator', reported: false };
+  }
+  const brain = liveBrains[0]!;
+  const messageId = deterministicSendMessageId(`auto-rework:${task.taskId}:${revision}:${implementer.auditAttemptId}`);
+  const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
+  if (hasEvidence(target.name, messageId)) return { status: 'replayed', assignmentId: implementer.assignmentId, messageId };
+  const findings = receipt[0]!.findings.trim();
+  const caller = {
+    userId: brain.name, sessionName: brain.name, projectName: task.projectName, projectRoot: brain.projectDir,
+  };
+  const result = await (deps.dispatch ?? dispatchSendMessage)(caller, {
+    target: target.name,
+    message: [
+      '[Daemon-resolved exact REWORK continuation]',
+      `taskId=${task.taskId}`,
+      `assignmentId=${implementer.assignmentId}`,
+      `revision=${revision}`,
+      `attemptId=${implementer.auditAttemptId}`,
+      '',
+      findings,
+      '',
+      'Resume the same assignment and worktree. Repair only these exact findings, then re-freeze and validate; do not create a replacement task or assignment.',
+    ].join('\n'),
+    idempotencyKey: `auto-rework:${task.taskId}:${revision}:${implementer.auditAttemptId}`,
+    internalMessageId: messageId,
+    internalDurableQueue: true,
+    task: {
+      taskId: task.taskId,
+      assignmentId: implementer.assignmentId,
+      currentRevision: revision,
+      auditRevision: revision,
+      auditAttemptId: implementer.auditAttemptId,
+      executionPool: 'primary',
+    },
+  });
+  if (result.status !== 'accepted') {
+    return { status: 'blocked', reason: result.status === 'error' ? result.error : `rework dispatch ${result.status}`, reported: false };
+  }
+  const resumed = registry.updateAssignment({
+    assignmentId: implementer.assignmentId,
+    identity: targetIdentity,
+    status: 'implementing',
+    revision,
+    auditAttemptId: implementer.auditAttemptId,
+    auditRevision: revision,
+    blocker: findings,
+  });
+  if (!resumed.ok) return { status: 'blocked', reason: `rework resume rejected: ${resumed.reason}`, reported: false };
+  return { status: 'dispatched', assignmentId: implementer.assignmentId, messageId };
+}
+
+/** Materialize and directly dispatch the unique integration owner after PASS. */
+export async function dispatchReadyIntegration(
+  taskId: string,
+  deps: ReadyAuditDispatchDeps = {},
+): Promise<DeterministicContinuationDispatchResult> {
+  const registry = deps.registry ?? getSupervisionTaskRegistry();
+  const task = registry.get(taskId);
+  if (!task || task.status !== 'ready_for_integration' || task.finalization) {
+    return { status: 'ignored', reason: 'not_ready_for_integration' };
+  }
+  const revision = task.currentRevision?.trim();
+  if (!revision) return { status: 'blocked', reason: 'missing_current_revision', reported: false };
+  const implementers = task.assignments.filter((assignment) => (
+    assignment.required && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+    && assignment.status === 'ready_for_integration'
+    && assignment.auditRevision === revision && Boolean(assignment.auditAttemptId)
+    && assignment.verdict?.trim().toUpperCase() === 'PASS'
+    && assignment.crossVendorAuditPassed === true
+  ));
+  if (implementers.length !== 1) {
+    return { status: 'blocked', reason: 'integration requires one exact PASS artifact owner', reported: false };
+  }
+  const implementer = implementers[0]!;
+  const receipts = (task.auditReceipts ?? []).filter((item) => (
+    item.attemptId === implementer.auditAttemptId && item.revision === revision
+    && item.receiptKind === 'final' && item.verdict === 'PASS'
+  ));
+  if (receipts.length !== 1) return { status: 'blocked', reason: 'exact PASS receipt unavailable', reported: false };
+  const sessions = (deps.listSessions ?? listSessions)();
+  const coordinators = task.assignments.filter((assignment) => assignment.role === 'coordinator');
+  const liveCoordinators = coordinators.flatMap((assignment) => {
+    const session = exactLiveSessionForAssignment(assignment, sessions);
+    return session?.role === 'brain' ? [{ assignment, session }] : [];
+  });
+  if (liveCoordinators.length !== 1) {
+    return { status: 'blocked', reason: 'integration requires one exact live Brain coordinator', reported: false };
+  }
+  const { assignment: coordinator, session: brain } = liveCoordinators[0]!;
+  const snapshot = inspectAssignmentForConvergence(implementer, deps);
+  if (!snapshot || snapshot.stagedPaths.length > 0 || snapshot.conflictedPaths.length > 0) {
+    return { status: 'blocked', reason: 'authoritative implementation manifest unavailable', reported: false };
+  }
+  const existingOwners = task.assignments.filter((assignment) => (
+    assignment.role === 'integration_owner' && assignment.status !== 'cancelled'
+    && assignment.status !== 'finalized' && (!assignment.auditRevision || assignment.auditRevision === revision)
+  ));
+  if (existingOwners.length > 1) return { status: 'blocked', reason: 'multiple live integration owners', reported: false };
+  let owner = existingOwners[0];
+  if (!owner) {
+    const created = registry.createAssignment({
+      taskId: task.taskId,
+      role: 'integration_owner',
+      identity: coordinator.identity,
+      scopeFiles: snapshot.files.map((file) => file.path),
+      required: true,
+      auditAttemptId: implementer.auditAttemptId,
+      auditRevision: revision,
+      idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
+      now: (deps.now ?? Date.now)(),
+    });
+    if (!created.ok) return { status: 'blocked', reason: `integration owner materialization rejected: ${created.reason}`, reported: false };
+    owner = created.value;
+  }
+  if (owner.verdict?.trim().toUpperCase() !== 'PASS' || owner.crossVendorAuditPassed !== true) {
+    const bound = registry.updateAssignment({
+      assignmentId: owner.assignmentId,
+      identity: coordinator.identity,
+      auditAttemptId: implementer.auditAttemptId,
+      auditRevision: revision,
+      verdict: 'PASS',
+      crossVendorAuditPassed: true,
+    });
+    if (!bound.ok) return { status: 'blocked', reason: `integration owner PASS bind rejected: ${bound.reason}`, reported: false };
+    owner = bound.value;
+  }
+  const messageId = deterministicSendMessageId(`auto-integration:${owner.assignmentId}:${revision}:${implementer.auditAttemptId}`);
+  const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
+  if (hasEvidence(brain.name, messageId)) return { status: 'replayed', assignmentId: owner.assignmentId, messageId };
+  const origin = exactLiveSessionForAssignment(implementer, sessions) ?? brain;
+  const result = await (deps.dispatch ?? dispatchSendMessage)({
+    userId: origin.name, sessionName: origin.name, projectName: task.projectName, projectRoot: origin.projectDir,
+  }, {
+    target: brain.name,
+    message: [
+      '[Daemon-resolved exact PASS integration]',
+      `taskId=${task.taskId}`,
+      `assignmentId=${owner.assignmentId}`,
+      `implementerAssignmentId=${implementer.assignmentId}`,
+      `revision=${revision}`,
+      `attemptId=${implementer.auditAttemptId}`,
+      `authoritativeWorktree=${snapshot.worktreePath}`,
+      '',
+      'Exact pathspec:',
+      ...snapshot.files.map((file) => `- ${file.path}`),
+      '',
+      'Integrate only these frozen bytes. Record real commit/push evidence; if already present, record that fact. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
+    ].join('\n'),
+    idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
+    internalMessageId: messageId,
+    internalDurableQueue: true,
+  });
+  if (result.status !== 'accepted') {
+    return { status: 'blocked', reason: result.status === 'error' ? result.error : `integration dispatch ${result.status}`, reported: false };
+  }
+  return { status: 'dispatched', assignmentId: owner.assignmentId, messageId };
 }
 
 /**
@@ -2459,6 +2807,8 @@ export function legacyExplicitAuditRecoveryAttempt(
 export interface SupervisionConvergenceTickResult {
   converged: SupervisionLifecycleConvergenceAction[];
   audits: ReadyAuditDispatchResult[];
+  reworks?: DeterministicContinuationDispatchResult[];
+  integrations?: DeterministicContinuationDispatchResult[];
   /** True when a previous tick was still running and this one yielded. */
   skipped?: boolean;
 }
@@ -2503,9 +2853,27 @@ export async function runSupervisionConvergenceTick(
           projectName,
           (deps.listSessions ?? listSessions)(),
         ),
+        inspectAssignmentWorktree: (assignment) => {
+          const inspected = inspectSupervisionAssignmentWorktree({
+            sessionName: assignment.identity.sessionName,
+            assignmentId: assignment.assignmentId,
+          });
+          return inspected.ok ? inspected.snapshot : undefined;
+        },
       });
     } catch (error) {
       logger.warn({ err: error }, 'supervision lifecycle convergence failed');
+    }
+    // Conflicting successor bytes are the one cancellation-evidence shape the
+    // daemon cannot decide. Keep the request durable and deterministic: scan
+    // the persisted blocker on every bounded tick so a crash between the
+    // atomic registry write and delivery is recovered, while delivery evidence
+    // makes all later ticks a no-op.
+    const decisionRequests = registry.list()
+      .filter((task) => Boolean(cancelledCompletionEvidenceDecisionRequest(task)))
+      .slice(0, deps.limit ?? 100);
+    for (const task of decisionRequests) {
+      await reportCancelledCompletionEvidenceDecision(task, deps);
     }
     // `dispatchReadyAudit` already refuses a task without an auditPolicy
     // (`manual_policy`) and derives its attempt id canonically from
@@ -2515,10 +2883,33 @@ export async function runSupervisionConvergenceTick(
       .filter((task) => Boolean(task.auditPolicy)
         || Boolean(legacyExplicitAuditRecoveryAttempt(task, registry)));
     const audits: ReadyAuditDispatchResult[] = [];
+    const reworks: DeterministicContinuationDispatchResult[] = [];
+    for (const task of registry.list({ status: 'rework' })) {
+      reworks.push(await dispatchReadyRework(task.taskId, deps));
+    }
     for (const task of ready) {
       audits.push(await dispatchReadyAudit(task.taskId, { ...deps, registry }));
     }
-    return { converged, audits };
+    const integrations: DeterministicContinuationDispatchResult[] = [];
+    for (const task of registry.list({ status: 'ready_for_integration' })) {
+      integrations.push(await dispatchReadyIntegration(task.taskId, { ...deps, registry }));
+    }
+    try {
+      if (deps.runScheduledWorktreeGcBatch) {
+        await deps.runScheduledWorktreeGcBatch(now);
+      } else {
+        const { runScheduledSupervisionWorktreeGcBatch } = await import('./supervision-registry-port.js');
+        await runScheduledSupervisionWorktreeGcBatch(now);
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'Scheduled supervision worktree GC failed');
+    }
+    return {
+      converged,
+      audits,
+      ...(reworks.length > 0 ? { reworks } : {}),
+      ...(integrations.length > 0 ? { integrations } : {}),
+    };
   } finally {
     supervisionConvergenceTickRunning = false;
   }

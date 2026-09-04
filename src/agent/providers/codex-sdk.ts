@@ -137,6 +137,7 @@ const CODEX_TURN_HEARTBEAT_START_GRACE_MS = 15_000;
 const CODEX_TURN_HEARTBEAT_PROVIDER_CAP = 2;
 const CODEX_TURN_HEARTBEAT_MAX_TURNS = 100;
 const CODEX_AUTH_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT = 1;
 const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
@@ -2715,13 +2716,32 @@ export class CodexSdkProvider implements TransportProvider {
     state.authRecoveryPending = false;
     state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
     state.authRecoveryReplayUnsafe = false;
-    await this.startTurn(
-      sessionId,
-      state,
-      payload,
-      turnDispatchGeneration,
-      CODEX_AUTH_RECOVERY_RETRY_LIMIT,
-    );
+    let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
+    for (;;) {
+      try {
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          CODEX_AUTH_RECOVERY_RETRY_LIMIT,
+        );
+        break;
+      } catch (error) {
+        if (!(error instanceof ImcodesDelegationUnavailableError)
+          || delegationRecoveryRetriesRemaining <= 0
+          || state.cancelled
+          || this.sessions.get(sessionId) !== state
+          || state.turnDispatchGeneration !== turnDispatchGeneration) throw error;
+        delegationRecoveryRetriesRemaining -= 1;
+        // The readiness failure happens before turn/start, provider output, or
+        // any tool side effect. Restarting is therefore replay-safe. Preserve
+        // the SAME durable session/thread identity, rehydrate it on the fresh
+        // app-server, and retry exactly once; persistent outages still surface
+        // to the durable caller instead of polling forever.
+        await this.restartAppServerPreservingSessions('im-delegation-unavailable', sessionId);
+      }
+    }
   }
 
   async notifyActiveDelegation(

@@ -17,7 +17,12 @@ import type {
   SupervisionRegistryPort,
 } from './supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
-import { runSupervisionWorktreeGc } from './supervision-worktree-gc.js';
+import {
+  SUPERVISION_WORKTREE_GC_DEFAULT_LIMIT,
+  runSupervisionWorktreeGc,
+  type SupervisionWorktreeGcDeps,
+  type SupervisionWorktreeGcResult,
+} from './supervision-worktree-gc.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-ingress.js';
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
@@ -107,6 +112,24 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
         identity: callerIdentity,
       });
     },
+    convergeValidatedAssignment: ({ taskId, assignmentId }) => {
+      const registry = getSupervisionTaskRegistry();
+      const assignment = registry.getAssignment(assignmentId);
+      if (!assignment || assignment.taskId !== taskId) return [];
+      return registry.convergeValidatedAssignment(assignmentId, Date.now(), (candidate) => {
+        const inspected = inspectSupervisionAssignmentWorktree({
+          sessionName: candidate.identity.sessionName,
+          assignmentId: candidate.assignmentId,
+        });
+        return inspected.ok ? inspected.snapshot : undefined;
+      });
+    },
+    convergeExactReworkAssignment: ({ taskId, assignmentId }) => {
+      const registry = getSupervisionTaskRegistry();
+      const assignment = registry.getAssignment(assignmentId);
+      if (!assignment || assignment.taskId !== taskId) return undefined;
+      return registry.convergeExactReworkAssignment(assignmentId);
+    },
     list: (filter) => getSupervisionTaskRegistry().list(filter as never) as never,
     get: (taskId) => getSupervisionTaskRegistry().get(taskId) as never,
     recover: (input) => {
@@ -126,8 +149,124 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       return registry.rebindTaskAssignmentRevision({ ...input, worktreeSnapshot: inspected.snapshot });
     },
     coordinateTaskAssignment: (input) => getSupervisionTaskRegistry().coordinateTaskAssignment(input),
+    resolveCompletionEvidence: (input) => (
+      getSupervisionTaskRegistry().resolveCancelledCompletionEvidence(input)
+    ),
     housekeeping: (input) => getSupervisionTaskRegistry().reconcileHousekeeping(input),
   };
+}
+
+function resolveWorktreeRegistryReference(assignmentId: string, expectedTaskId?: string) {
+  try {
+    const registry = getSupervisionTaskRegistry();
+    const assignment = registry.getAssignment(assignmentId);
+    if (!assignment || (expectedTaskId && assignment.taskId !== expectedTaskId)) return { available: true };
+    const task = registry.get(assignment.taskId);
+    if (!task) return { available: true };
+    return {
+      available: true,
+      assignment: {
+        assignmentId: assignment.assignmentId,
+        taskId: assignment.taskId,
+        status: assignment.status,
+        leaseId: assignment.leaseId,
+        role: assignment.role,
+        ...(assignment.auditAttemptId ? { auditAttemptId: assignment.auditAttemptId } : {}),
+        ...(assignment.auditRevision ? { auditRevision: assignment.auditRevision } : {}),
+        ...(assignment.verdict ? { verdict: assignment.verdict } : {}),
+      },
+      task: {
+        taskId: task.taskId,
+        projectName: task.projectName,
+        status: task.status,
+        ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
+        ...(task.commitSha ? { commitSha: task.commitSha } : {}),
+        ...(task.pushRemoteRef ? { pushRemoteRef: task.pushRemoteRef } : {}),
+        ...(task.finalization ? { finalization: task.finalization } : {}),
+        assignments: task.assignments.map((candidate) => ({
+          assignmentId: candidate.assignmentId,
+          status: candidate.status,
+          leaseId: candidate.leaseId,
+          role: candidate.role,
+          ...(candidate.auditAttemptId ? { auditAttemptId: candidate.auditAttemptId } : {}),
+          ...(candidate.auditRevision ? { auditRevision: candidate.auditRevision } : {}),
+          ...(candidate.verdict ? { verdict: candidate.verdict } : {}),
+        })),
+      },
+      claims: task.fileClaims.map((claim) => ({
+        assignmentId: claim.assignmentId,
+        path: claim.path,
+      })),
+      auditReceipts: (task.auditReceipts ?? []).map((receipt) => ({
+        assignmentId: receipt.assignmentId,
+        attemptId: receipt.attemptId,
+        revision: receipt.revision,
+        receiptKind: receipt.receiptKind,
+        ...(receipt.verdict ? { verdict: receipt.verdict } : {}),
+      })),
+      completionEvidence: (task.completionEvidence ?? []).map((record) => ({
+        sourceAssignmentId: record.sourceAssignmentId,
+        status: record.status,
+        ...(record.adoptedByAssignmentId ? { adoptedByAssignmentId: record.adoptedByAssignmentId } : {}),
+        revision: record.revision,
+        files: record.files,
+      })),
+    };
+  } catch {
+    return { available: false };
+  }
+}
+
+export function createSupervisionWorktreeGcDeps(): SupervisionWorktreeGcDeps {
+  return {
+    resolveRegistryReference: (metadata) => (
+      resolveWorktreeRegistryReference(metadata.assignmentId, metadata.taskId)
+    ),
+    resolveRegistryReferenceByAssignment: ({ assignmentId }) => (
+      resolveWorktreeRegistryReference(assignmentId)
+    ),
+    protectedPaths: [process.cwd(), ...listSessions().map((session) => session.projectDir)],
+  };
+}
+
+/** One restart-safe, cursor-persisted GC page scheduled by the daemon tick. */
+export async function runScheduledSupervisionWorktreeGcBatch(
+  now = Date.now(),
+  options: {
+    registry?: ReturnType<typeof getSupervisionTaskRegistry>;
+    worktreesRoot?: string;
+    deps?: SupervisionWorktreeGcDeps;
+  } = {},
+): Promise<SupervisionWorktreeGcResult | undefined> {
+  if (process.env.VITEST && !options.worktreesRoot) return undefined;
+  const registry = options.registry ?? getSupervisionTaskRegistry();
+  const state = registry.nextWorktreeGcBatch(now);
+  if (!state) return undefined;
+  const result = await runSupervisionWorktreeGc({
+    projectName: state.projectName,
+    mode: 'apply',
+    ...(options.worktreesRoot ? { worktreesRoot: options.worktreesRoot } : {}),
+    ...(state.cursor ? { cursor: state.cursor } : {}),
+    limit: SUPERVISION_WORKTREE_GC_DEFAULT_LIMIT,
+  }, options.deps ?? createSupervisionWorktreeGcDeps());
+  registry.recordWorktreeGcBatch({
+    projectName: state.projectName,
+    ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
+    hasMore: result.hasMore,
+    result: {
+      scanned: result.scanned,
+      deleted: result.deleted,
+      retained: result.retained,
+      releasedBytes: result.releasedBytes,
+      entries: result.entries.map((entry) => ({
+        assignmentId: entry.assignmentId,
+        action: entry.action,
+        reason: entry.reason,
+      })),
+    },
+    now,
+  });
+  return result;
 }
 
 export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
@@ -173,49 +312,7 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         projectName,
       };
     },
-    worktreeGc: async (input) => runSupervisionWorktreeGc(input, {
-      // Every lookup resolves the live singleton at call time. A closed or
-      // replaced SQLite handle therefore fails closed rather than authorizing
-      // deletion from a captured, stale snapshot.
-      resolveRegistryReference: (metadata) => {
-        try {
-          const registry = getSupervisionTaskRegistry();
-          const assignment = registry.getAssignment(metadata.assignmentId);
-          const task = registry.get(metadata.taskId);
-          if (!assignment || !task) return { available: true };
-          return {
-            available: true,
-            assignment: {
-              assignmentId: assignment.assignmentId,
-              taskId: assignment.taskId,
-              status: assignment.status,
-              leaseId: assignment.leaseId,
-            },
-            task: {
-              taskId: task.taskId,
-              projectName: task.projectName,
-              status: task.status,
-              ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
-              assignments: task.assignments.map((candidate) => ({
-                assignmentId: candidate.assignmentId,
-                status: candidate.status,
-                leaseId: candidate.leaseId,
-              })),
-            },
-            claims: task.fileClaims.map((claim) => ({
-              assignmentId: claim.assignmentId,
-              path: claim.path,
-            })),
-          };
-        } catch {
-          return { available: false };
-        }
-      },
-      // A live session cwd is a second, independent authority signal. Even a
-      // corrupt terminal registry row cannot make the directory currently in
-      // use by an agent eligible for deletion.
-      protectedPaths: [process.cwd(), ...listSessions().map((session) => session.projectDir)],
-    }),
+    worktreeGc: async (input) => runSupervisionWorktreeGc(input, createSupervisionWorktreeGcDeps()),
     dispatchReadyAudit: async (taskId) => {
       const { dispatchReadyAudit } = await import('./send-tool.js');
       return dispatchReadyAudit(taskId);

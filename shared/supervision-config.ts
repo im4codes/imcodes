@@ -467,6 +467,16 @@ export const SUPERVISION_TASK_LIFECYCLE_STATUSES = [
 export type SupervisionTaskLifecycleStatus = typeof SUPERVISION_TASK_LIFECYCLE_STATUSES[number];
 
 /**
+ * PASS plus exact audited Git/push (or already-present ancestor) evidence grants
+ * finalization authority. Every CI value here, including failure, is descriptive
+ * optional smoke and cannot block or grant supervision finalization.
+ */
+export const SUPERVISION_CI_SMOKE_STATUSES = [
+  'success', 'ci_not_configured', 'ci_unavailable', 'pending', 'failure',
+] as const;
+export type SupervisionCiSmokeStatus = typeof SUPERVISION_CI_SMOKE_STATUSES[number];
+
+/**
  * @deprecated Historical name. Identical to SUPERVISION_TASK_LIFECYCLE_STATUSES
  * by construction, so the two can no longer drift.
  */
@@ -492,6 +502,11 @@ export const SUPERVISION_RECOVERY_LEASE_ACTIONS = [
 ] as const;
 export type SupervisionRecoveryLeaseAction =
   typeof SUPERVISION_RECOVERY_LEASE_ACTIONS[number];
+
+/** Explicit Brain decisions for immutable output produced after cancellation. */
+export const SUPERVISION_COMPLETION_EVIDENCE_DECISIONS = ['adopt', 'discard'] as const;
+export type SupervisionCompletionEvidenceDecision =
+  typeof SUPERVISION_COMPLETION_EVIDENCE_DECISIONS[number];
 
 /** Bump only alongside a schema migration that maps every prior status forward. */
 export const SUPERVISION_TASK_STATUS_CONTRACT_VERSION = 1;

@@ -134,13 +134,15 @@ export interface SupervisionBrokerDeps {
   resolveProvider?: (backend: SharedContextRuntimeBackend) => Promise<TransportProvider>;
   now?: () => number;
   waitForRetry?: (delayMs: number) => Promise<void>;
+  random?: () => number;
 }
 
 const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'waiting', 'ask_human']);
 const AUDIT_DEPTHS = new Set<SupervisionAuditDepth>(['standard', 'narrow']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
 const MAX_RECOVERABLE_PROVIDER_RETRIES = 2;
-const PROVIDER_RETRY_DELAYS_MS = [250, 750] as const;
+const PROVIDER_RETRY_BASE_MS = 250;
+const PROVIDER_RETRY_CAP_MS = 2_000;
 const SUPERVISOR_SESSION_IDLE_TTL_MS = 48 * 60 * 60 * 1_000;
 const NON_RETRYABLE_PROVIDER_ERROR_CODES = new Set<string>([
   PROVIDER_ERROR_CODES.AUTH_FAILED,
@@ -155,6 +157,7 @@ type SupervisionExecutionError = Error & {
   supervisionProviderCode?: string;
   supervisionProviderRetryable?: boolean;
   supervisionProviderAttempts?: number;
+  supervisionProviderRetryAfterMs?: number;
 };
 
 interface RetainedSupervisorRuntime {
@@ -222,11 +225,19 @@ function normalizeProviderExecutionError(error: unknown): SupervisionExecutionEr
   // retrying that generic shape in a fresh session is safe and avoids turning a
   // single provider hiccup into a false terminal automation failure.
   const retryable = !code || !NON_RETRYABLE_PROVIDER_ERROR_CODES.has(code);
+  const details = errorRecord(record?.details);
+  const rawRetryAfter = record?.retryAfterMs ?? details?.retryAfterMs ?? details?.retryAfter;
+  const retryAfterMs = typeof rawRetryAfter === 'number' && Number.isFinite(rawRetryAfter)
+    ? Math.max(0, Math.floor(rawRetryAfter))
+    : typeof rawRetryAfter === 'string' && /^\d+(?:\.\d+)?$/.test(rawRetryAfter.trim())
+      ? Math.max(0, Math.ceil(Number(rawRetryAfter) * 1_000))
+      : undefined;
 
   return Object.assign(new Error(message), {
     supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
     ...(code ? { supervisionProviderCode: code } : {}),
     supervisionProviderRetryable: retryable,
+    ...(retryAfterMs !== undefined ? { supervisionProviderRetryAfterMs: retryAfterMs } : {}),
   });
 }
 
@@ -457,6 +468,7 @@ export class SupervisionBroker {
   private readonly resolveProvider: (backend: SharedContextRuntimeBackend) => Promise<TransportProvider>;
   private readonly now: () => number;
   private readonly waitForRetry: (delayMs: number) => Promise<void>;
+  private readonly random: () => number;
   private readonly queueChains = new Map<string, Promise<void>>();
   private readonly retainedTargets = new Map<string, RetainedSupervisorTarget>();
 
@@ -466,6 +478,7 @@ export class SupervisionBroker {
     this.waitForRetry = deps.waitForRetry ?? ((delayMs) => new Promise((resolve) => {
       setTimeout(resolve, delayMs);
     }));
+    this.random = deps.random ?? Math.random;
   }
 
   async decide(request: SupervisionBrokerRequest): Promise<SupervisionDecision> {
@@ -633,12 +646,17 @@ export class SupervisionBroker {
         const normalized = normalizeProviderExecutionError(error);
         normalized.supervisionProviderAttempts = providerAttempts;
         const retryIndex = providerAttempts - 1;
-        const delayMs = PROVIDER_RETRY_DELAYS_MS[retryIndex];
+        const exponentialCeiling = Math.min(
+          PROVIDER_RETRY_CAP_MS,
+          PROVIDER_RETRY_BASE_MS * (2 ** retryIndex),
+        );
+        const random = Math.max(0, Math.min(1, this.random()));
+        const jitterDelayMs = Math.floor(exponentialCeiling * random);
+        const delayMs = Math.max(jitterDelayMs, normalized.supervisionProviderRetryAfterMs ?? 0);
         const remainingBudget = deadlineAt - this.now();
         const canRetry = normalized.supervisionUnavailableReason === SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR
           && normalized.supervisionProviderRetryable === true
           && providerAttempts <= MAX_RECOVERABLE_PROVIDER_RETRIES
-          && delayMs !== undefined
           && remainingBudget > delayMs + MIN_SUPERVISION_EXECUTION_BUDGET_MS;
         if (!canRetry) throw normalized;
 

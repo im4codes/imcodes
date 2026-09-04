@@ -5626,6 +5626,40 @@ describe('SupervisionAutomation', () => {
       expect(registry.getAssignment(assignmentId)!.blocker).toBe('needs Brain adjudication');
     });
 
+    it('wakes an idle delegated assignment on the same object before its first progress event', () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-delegated-task';
+      const assignmentId = 'watchdog-delegated-implementer';
+      const identity = {
+        sessionName: 'deck_watchdog_worker', sessionInstanceId: 'watchdog-instance', runtimeEpoch: 'watchdog-epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+      };
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'wake never-started work', now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity, scopeFiles: ['src/wake.ts'], now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      mockTransportRuntime.send.mockClear();
+      mockTransportRuntimeWorking = false;
+
+      supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
+
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(mockTransportRuntime.send).toHaveBeenCalledWith(
+        expect.stringContaining(`"mode":"continue_existing","taskId":"${taskId}","assignmentId":"${assignmentId}"`),
+        `supervision-implementation-heartbeat:${assignmentId}:1`,
+        undefined,
+        undefined,
+        expect.objectContaining({ timelineCommitted: true, deliveryMode: 'append' }),
+      );
+      expect(registry.getAssignment(assignmentId)).toMatchObject({ status: 'delegated' });
+      expect(registry.listEvents(taskId)).toContainEqual(expect.objectContaining({
+        assignmentId, eventType: 'implementation_heartbeat', status: 'delegated',
+      }));
+    });
+
     it('deduplicates and backs off reminders, resets on progress, and stops permanently after FINISHED handoff', () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-one-task';

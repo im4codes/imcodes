@@ -39,7 +39,18 @@ describe('memory MCP shared contracts', () => {
       required: [...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS],
     });
     expect(finalization.properties?.verdict?.enum).toEqual(['PASS']);
-    expect(finalization.properties?.ciResult?.enum).toEqual(['success']);
+    expect(finalization.properties?.ciResult?.enum).toEqual([
+      'success', 'ci_not_configured', 'ci_unavailable', 'pending', 'failure',
+    ]);
+    expect(finalization.properties?.ciResult?.description).toContain(
+      'including failure is descriptive and non-blocking',
+    );
+    expect(MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE
+    ].description).toContain('PASS plus exact Git/push evidence is the finalization authority');
+    expect(finalization.required).not.toContain('ciResult');
+    expect(finalization.required).not.toContain('externalRunId');
+    expect(finalization.required).not.toContain('externalHeadSha');
     expect(finalization.properties?.pushResult?.enum).toEqual(['pushed', 'already_present']);
     for (const field of SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS) {
       expect(finalization.required).not.toContain(field);

@@ -14,9 +14,11 @@ import type { SessionRecord } from '../../src/store/session-store.js';
 import {
   clearSendIdempotencyCacheForTests,
   dispatchReadyAudit,
+  dispatchReadyIntegration,
   dispatchReadyAuditSweep,
   runSupervisionConvergenceTick,
   legacyExplicitAuditRecoveryAttempt,
+  listSendTargets,
   __resetSupervisionConvergenceTickForTests,
   dispatchSendMessage,
   type SendMessageInput,
@@ -170,6 +172,213 @@ beforeEach(() => {
 });
 
 describe('automatic supervision audit materialization', () => {
+  function settleReadyTask(verdict: 'PASS' | 'REWORK', taskId?: string) {
+    const shape = makeReadyTask({
+      taskId: taskId ?? `daemon-first-${verdict.toLowerCase()}`,
+      auditPolicy: 'auto_strict_cross_vendor',
+    });
+    const attemptId = automaticAttempt(shape.taskId, shape.revision);
+    const auditor = shape.registry.createAssignment({
+      taskId: shape.taskId, role: 'auditor', required: false,
+      identity: identity(`deck_alpha_${verdict.toLowerCase()}_auditor`, 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: shape.revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(shape.registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: shape.revision,
+    })).toMatchObject({ ok: true });
+    expect(shape.registry.appendMatchingAuditReceipt({
+      taskId: shape.taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity, auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision: shape.revision, receiptKind: 'final', verdict,
+      findings: verdict === 'PASS' ? 'exact bytes pass' : 'repair exact finding', validations: [],
+    })).toMatchObject({ ok: true });
+    expect(shape.registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision: shape.revision,
+    })).toMatchObject({ ok: true });
+    return { ...shape, attemptId, auditor: auditor.value };
+  }
+
+  it('exposes one project-authoritative primary pool to Brain and ordinary sub-sessions', () => {
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic');
+    const selected = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+      runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+    };
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) }],
+            controls: { maxSpawned: 1 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    worker.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit', executionPools: { state: 'legacy_unconfigured' },
+      }),
+    };
+    const sessions = [brain, worker, auditor];
+    const fromBrain = listSendTargets({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, { executionPool: 'primary' }, { listSessions: () => sessions });
+    const fromWorker = listSendTargets({
+      userId: worker.name, sessionName: worker.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, { executionPool: 'primary' }, { listSessions: () => sessions });
+    expect(fromBrain).toMatchObject({ status: 'ok', executionPoolsState: 'configured' });
+    expect(fromWorker).toMatchObject({ status: 'ok', executionPoolsState: 'configured' });
+    if (fromBrain.status !== 'ok' || fromWorker.status !== 'ok') throw new Error('expected target list');
+    expect(fromBrain.items.map((item) => item.target)).toEqual([auditor.name]);
+    expect(fromWorker.items.map((item) => item.target)).toEqual([auditor.name]);
+  });
+
+  it('dispatches exact REWORK to the same implementer object and never creates a replacement', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const shape = settleReadyTask('REWORK');
+    expect(shape.registry.get(shape.taskId)).toMatchObject({ status: 'rework' });
+    const worker = session('deck_alpha_worker', 'w1');
+    const dispatch = vi.fn().mockResolvedValue({
+      status: 'accepted', dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000031',
+      messageId: 'send_message_00000000-0000-5000-a000-000000000031',
+      deliveries: [{ target: worker.name, status: 'queued' }],
+    });
+    const beforeIds = shape.registry.get(shape.taskId)!.assignments.map((assignment) => assignment.assignmentId);
+    await expect(runSupervisionConvergenceTick({
+      registry: shape.registry, listSessions: () => [session('deck_alpha_brain', 'brain'), worker],
+      dispatch, hasDeliveryEvidence: () => false,
+    })).resolves.toMatchObject({
+      reworks: [expect.objectContaining({ status: 'dispatched', assignmentId: shape.worker.assignmentId })],
+    });
+    expect(shape.registry.getAssignment(shape.worker.assignmentId)).toMatchObject({
+      status: 'implementing', auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+    });
+    expect(shape.registry.get(shape.taskId)!.assignments.map((assignment) => assignment.assignmentId)).toEqual(beforeIds);
+    expect(dispatch.mock.calls[0]![0]).toMatchObject({ sessionName: 'deck_alpha_brain' });
+    expect(dispatch.mock.calls[0]![1].message).toContain(`assignmentId=${shape.worker.assignmentId}`);
+    expect(dispatch.mock.calls[0]![1].task).toMatchObject({
+      taskId: shape.taskId, assignmentId: shape.worker.assignmentId,
+      currentRevision: shape.revision, auditRevision: shape.revision,
+      auditAttemptId: shape.attemptId, executionPool: 'primary',
+    });
+  });
+
+  it('materializes one integration owner and directly delivers the exact authoritative pathspec after PASS', async () => {
+    const shape = settleReadyTask('PASS');
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    let delivered = false;
+    const dispatch = vi.fn().mockImplementation(async () => {
+      delivered = true;
+      return {
+        status: 'accepted', dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000032',
+        messageId: 'send_message_00000000-0000-5000-a000-000000000032',
+        deliveries: [{ target: brain.name, status: 'queued' }],
+      };
+    });
+    const deps = {
+      registry: shape.registry,
+      listSessions: () => [brain, worker],
+      dispatch,
+      hasDeliveryEvidence: () => delivered,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/authoritative-worker/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
+    };
+    const first = await dispatchReadyIntegration(shape.taskId, deps);
+    expect(first).toMatchObject({ status: 'dispatched' });
+    const owners = shape.registry.get(shape.taskId)!.assignments.filter((assignment) => assignment.role === 'integration_owner');
+    expect(owners).toHaveLength(1);
+    expect(owners[0]).toMatchObject({
+      identity: identity('deck_alpha_brain'), auditRevision: shape.revision,
+      auditAttemptId: shape.attemptId,
+    });
+    expect(dispatch.mock.calls[0]![1].message).toContain('authoritativeWorktree=/tmp/authoritative-worker/repo');
+    expect(dispatch.mock.calls[0]![1].message).toContain('- src/exact.ts');
+    await expect(dispatchReadyIntegration(shape.taskId, deps)).resolves.toMatchObject({ status: 'replayed' });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(shape.registry.get(shape.taskId)!.assignments.filter((assignment) => assignment.role === 'integration_owner')).toHaveLength(1);
+  });
+
+  it('redelivers an already-present PASS artifact already owned by the exact integration owner', async () => {
+    const shape = settleReadyTask('PASS', 'tsk_79u-owner-projection');
+    const brain = session('deck_alpha_brain', 'brain');
+    const owner = shape.registry.createAssignment({
+      taskId: shape.taskId, role: 'integration_owner', identity: identity(brain.name),
+      required: true, auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+    });
+    if (!owner.ok) throw new Error(owner.reason);
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
+      expect(shape.registry.updateAssignment({
+        assignmentId: owner.value.assignmentId, identity: owner.value.identity, status,
+        auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+        ...(status === 'passed' || status === 'ready_for_integration'
+          ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+      })).toMatchObject({ ok: true });
+    }
+    expect(shape.registry.applyTaskIntent({
+      taskId: shape.taskId, assignmentId: shape.worker.assignmentId,
+      intent: 'cancel', toStatus: 'cancelled', note: 'already-present owner is authoritative',
+    })).toMatchObject({ ok: true });
+    const dispatch = vi.fn().mockResolvedValue({
+      status: 'accepted',
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000079',
+      messageId: 'send_message_00000000-0000-5000-a000-000000000079',
+      deliveries: [{ target: brain.name, status: 'queued' }],
+    });
+
+    await expect(dispatchReadyIntegration(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [brain, session('deck_alpha_worker', 'w1')],
+      dispatch, hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/tsk_79u/asg_owner/repo', headSha: '4'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+        matchingRemoteCommitSha: '4a6b85dd50870edb2223ddbcbd6c8f7a9df3b534',
+        matchingRemoteRef: 'refs/remotes/origin/dev',
+      }),
+    })).resolves.toMatchObject({ status: 'dispatched', assignmentId: owner.value.assignmentId });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch.mock.calls[0]![1].message).toContain('CI is optional smoke only');
+  });
+
+  it.each(['tsk_4d0', 'tsk_5o7', 'tsk_6xo', 'tsk_73e'])(
+    'drives the observed %s ready_for_integration projection instead of heartbeating it',
+    async (taskId) => {
+      __resetSupervisionConvergenceTickForTests();
+      const shape = settleReadyTask('PASS', taskId);
+      const dispatch = vi.fn().mockResolvedValue({
+        status: 'accepted', dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000033',
+        messageId: 'send_message_00000000-0000-5000-a000-000000000033',
+        deliveries: [{ target: 'deck_alpha_brain', status: 'queued' }],
+      });
+      await expect(runSupervisionConvergenceTick({
+        registry: shape.registry,
+        listSessions: () => [session('deck_alpha_brain', 'brain'), session('deck_alpha_worker', 'w1')],
+        dispatch,
+        hasDeliveryEvidence: () => false,
+        inspectAssignmentWorktree: () => ({
+          worktreePath: `/tmp/${taskId}/repo`, headSha: 'a'.repeat(40),
+          files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+          stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+        }),
+      })).resolves.toMatchObject({
+        integrations: [expect.objectContaining({ status: 'dispatched' })],
+      });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('snapshots supervised_audit policy on a new auditable task without preallocating an auditor', async () => {
     const selected = {
       agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
@@ -397,6 +606,8 @@ describe('automatic supervision audit materialization', () => {
         attemptId: automaticAttempt(taskId, revision),
         auditedSessionName: 'deck_alpha_worker',
       });
+      expect(input.message).toContain('Authoritative implementer worktree: /tmp/authoritative-auto-audit/repo');
+      expect(input.message).toContain('Do not inspect the auditor worktree');
       const created = registry.createAssignment({
         taskId,
         role: 'auditor',
@@ -422,6 +633,12 @@ describe('automatic supervision audit materialization', () => {
       listTargets: listTargetRecords(sessions[2]!),
       dispatch,
       hasDeliveryEvidence: () => hasEvidence,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/authoritative-auto-audit/repo',
+        headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
     };
 
     const first = await dispatchReadyAudit(taskId, deps);
@@ -1388,6 +1605,116 @@ describe('periodic supervision convergence tick', () => {
     ]);
   });
 
+  it('redelivers one stale delegated auditor to the exact same assignment and attempt', async () => {
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    const attemptId = automaticAttempt(taskId, revision);
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: revision,
+      idempotencyKey: `send:auto-audit:${taskId}:${revision}`,
+      now: 100,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    let evidenceChecks = 0;
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => ({
+      status: 'accepted' as const,
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000099' as const,
+      messageId: input.internalMessageId!,
+      deliveries: [{ target: sessions[2]!.name, status: 'queued' as const }],
+      taskId,
+      assignmentId: auditor.value.assignmentId,
+    }));
+
+    await expect(dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!),
+      dispatch,
+      now: () => 100 + 11 * 60_000,
+      // The original exact delivery was consumed; the distinct deterministic
+      // redelivery id has no receipt yet.
+      hasDeliveryEvidence: () => ++evidenceChecks === 1,
+    })).resolves.toMatchObject({
+      status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId,
+    });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch.mock.calls[0]![1]).toMatchObject({
+      target: sessions[2]!.name,
+      task: { assignmentId: auditor.value.assignmentId, auditAttemptId: attemptId, auditRevision: revision },
+      audit: { attemptId },
+    });
+  });
+
+  it('routes tsk_79u from the authoritative coordinator pool instead of the worker legacy snapshot', async () => {
+    const { registry, taskId, revision } = makeReadyTask({
+      taskId: 'tsk_79u', auditPolicy: 'auto_strict_cross_vendor',
+    });
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic');
+    worker.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit', executionPools: { state: 'legacy_unconfigured' },
+      }),
+    };
+    const selected = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+      runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+    };
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) }],
+            controls: { maxSpawned: 1 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const sessions = [brain, worker, auditor];
+    const listTargets = vi.fn((caller: SendRuntimeCaller) => {
+      if (caller.sessionName !== brain.name) {
+        return { status: 'ok' as const, executionPoolsState: 'legacy_unconfigured' as const, items: [] };
+      }
+      return listTargetRecords(auditor)();
+    });
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity(auditor.name, 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId, auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000079' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000079' as SendMessageId,
+        deliveries: [{ target: auditor.name, status: 'queued' as const }],
+        taskId, assignmentId: created.value.assignmentId,
+      };
+    });
+
+    await expect(dispatchReadyAudit(taskId, {
+      registry, listSessions: () => sessions, listTargets, dispatch,
+      hasDeliveryEvidence: () => false,
+    })).resolves.toMatchObject({ status: 'dispatched' });
+    expect(listTargets).toHaveBeenCalledTimes(1);
+    expect(listTargets.mock.calls[0]![0]).toMatchObject({ sessionName: brain.name });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls[0]![0]).toMatchObject({ sessionName: brain.name });
+    expect(dispatch.mock.calls[0]![1]).toMatchObject({ target: auditor.name });
+  });
+
   it('dispatches a ready_for_audit task from the periodic tick, not only the boot sweep', async () => {
     __resetSupervisionConvergenceTickForTests();
     const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
@@ -1547,6 +1874,89 @@ describe('periodic supervision convergence tick', () => {
     expect(result.audits).toEqual([]);
     expect(dispatch).not.toHaveBeenCalled();
     expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+  });
+
+  it('delivers one durable structured Brain request for conflicting cancelled completion evidence', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const taskId = 'cancelled-evidence-conflict-wire';
+    expect(registry.createOrGet({ taskId, projectName: 'alpha', objective: 'preserve late frozen bytes' }))
+      .toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', required: false, identity: identity('deck_alpha_brain'),
+    })).toMatchObject({ ok: true });
+    const source = registry.createAssignment({
+      taskId, role: 'implementer', required: true, identity: identity('deck_alpha_old'),
+    });
+    if (!source.ok) throw new Error(source.reason);
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: source.value.assignmentId, intent: 'cancel', toStatus: 'cancelled', now: 10,
+    })).toMatchObject({ ok: true });
+    const recorded = registry.recordCancelledCompletionEvidence({
+      taskId, assignmentId: source.value.assignmentId, identity: source.value.identity,
+      revision: 'late-r1', now: 20,
+      worktreeSnapshot: {
+        worktreePath: '/tmp/cancelled-source/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/late.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      },
+    });
+    if (!recorded.ok) throw new Error(recorded.reason);
+    const successor = registry.createAssignment({
+      taskId, role: 'implementer', required: true, identity: identity('deck_alpha_successor'),
+    });
+    if (!successor.ok) throw new Error(successor.reason);
+    expect(registry.convergeLifecycle(30, {
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/successor/repo', headSha: 'b'.repeat(40),
+        files: [{ path: 'src/late.ts', sha256: '9'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
+    })).toContainEqual(expect.objectContaining({ action: 'request_cancelled_completion_evidence_decision' }));
+
+    let delivered = false;
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      expect(input.target).toBe('deck_alpha_brain');
+      expect(JSON.parse(input.message)).toMatchObject({
+        taskId, actionRequired: 'adopt_or_discard', evidenceId: recorded.value.evidenceId,
+        successorAssignmentId: successor.value.assignmentId,
+      });
+      delivered = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000042' as const,
+        messageId: input.internalMessageId!,
+        deliveries: [{ target: input.target!, status: 'queued' as const }],
+      };
+    });
+    const deps = {
+      registry,
+      listSessions: () => [
+        session('deck_alpha_brain', 'brain'), session('deck_alpha_successor', 'w2'),
+      ],
+      dispatch,
+      hasDeliveryEvidence: () => delivered,
+      runScheduledWorktreeGcBatch: vi.fn().mockResolvedValue({ status: 'cooldown' }),
+    };
+    await runSupervisionConvergenceTick(deps);
+    await runSupervisionConvergenceTick(deps);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    registry.close();
+  });
+
+  it('wires every bounded convergence tick to the existing persistent worktree GC scheduler', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const runScheduledWorktreeGcBatch = vi.fn().mockResolvedValue({ status: 'cooldown' });
+    await expect(runSupervisionConvergenceTick({
+      registry,
+      now: () => 79,
+      listSessions: () => [],
+      runScheduledWorktreeGcBatch,
+    })).resolves.toMatchObject({ converged: [], audits: [] });
+    expect(runScheduledWorktreeGcBatch).toHaveBeenCalledOnce();
+    expect(runScheduledWorktreeGcBatch).toHaveBeenCalledWith(79);
+    registry.close();
   });
 
   it('is re-entrancy guarded so overlapping ticks cannot double dispatch', async () => {

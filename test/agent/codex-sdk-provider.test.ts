@@ -2299,6 +2299,24 @@ describe('CodexSdkProvider', () => {
     expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
   });
 
+  it('restarts and rehydrates the same Brain session once when authoritative IM delegation recovers', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'c1-rehydrate-im', cwd: '/tmp/project' });
+    mcpStatusPages = [
+      { data: [{ name: 'imcodes-memory', runtimeStatus: 'starting', tools: {} }], nextCursor: null },
+      connectedPage,
+    ];
+
+    await provider.send('c1-rehydrate-im', brainPayload('c1-rehydrate-im'));
+
+    expect(childProcessMock.children).toHaveLength(2);
+    expect(childProcessMock.children[0]!.requests.map((request) => request.method))
+      .not.toContain('turn/start');
+    expect(childProcessMock.children[1]!.requests.map((request) => request.method)
+      .filter((method) => method === 'turn/start')).toHaveLength(1);
+  });
+
   it('does not consult the delegation inventory for a non-Brain session', async () => {
     // Control: the gate is scoped to Brains, so a worker turn must not pay for
     // it -- and this proves the assertions above are about the role.

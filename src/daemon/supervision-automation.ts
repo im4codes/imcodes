@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type { SupervisionAutomationPoolGateReason } from '../../shared/supervision-execution-pool.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
+import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { validateBrainAuditRoute } from './peer-audit-candidates.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
@@ -1055,6 +1056,13 @@ class SupervisionAutomation {
         // Production wiring: a stale coordinator epoch is repaired against the
         // daemon's own live session registry, with no model or heartbeat.
         resolveAuthoritativeBrain: (projectName) => resolveAuthoritativeBrainIdentity(projectName),
+        inspectAssignmentWorktree: (assignment) => {
+          const inspected = inspectSupervisionAssignmentWorktree({
+            sessionName: assignment.identity.sessionName,
+            assignmentId: assignment.assignmentId,
+          });
+          return inspected.ok ? inspected.snapshot : undefined;
+        },
       });
     } catch (error) {
       logger.warn({ err: error }, 'Supervision lifecycle convergence failed');
@@ -1070,7 +1078,8 @@ class SupervisionAutomation {
     for (const task of registry.list()) {
       const events = registry.listEvents(task.taskId);
       for (const assignment of task.assignments) {
-        if (assignment.role !== 'implementer' || assignment.status !== 'implementing') continue;
+        if (assignment.role !== 'implementer'
+          || (assignment.status !== 'delegated' && assignment.status !== 'implementing')) continue;
         // A durable blocker is already the visible, actionable state. The
         // worker has no authority to clear it, so another heartbeat cannot
         // produce progress -- it only burns quota and hides the blocker behind

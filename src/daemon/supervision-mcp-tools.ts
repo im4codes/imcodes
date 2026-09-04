@@ -26,11 +26,13 @@ import {
   SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
+  SUPERVISION_COMPLETION_EVIDENCE_DECISIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   isSupervisionTaskLifecycleStatus,
   type SupervisionTaskRecoveryTargetStatus,
   type SupervisionBrainCoordinationRecoveryStatus,
   type SupervisionRecoveryLeaseAction,
+  type SupervisionCompletionEvidenceDecision,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
@@ -61,12 +63,15 @@ export interface SupervisionVisibilityItem {
   projectName?: string;
   classification?: string;
   status?: string;
+  currentRevision?: string;
   assignments?: ReadonlyArray<{
     assignmentId?: string;
     role?: string;
     status?: string;
     leaseId?: string;
     auditAttemptId?: string;
+    auditRevision?: string;
+    verdict?: string;
     identity?: { sessionName?: string };
   }>;
 }
@@ -139,6 +144,8 @@ export interface SupervisionRegistryPort {
     };
     rebindProjectName?: string;
   }): { ok: true; value: unknown; replay?: boolean } | { ok: false; reason: string };
+  convergeValidatedAssignment?(input: { taskId: string; assignmentId: string }): unknown;
+  convergeExactReworkAssignment?(input: { taskId: string; assignmentId: string }): unknown;
   list(filter: {
     projectName?: string; status?: string; topLevelTaskId?: string; ownerSessionName?: string;
     includeArchived?: boolean; history?: boolean; cursor?: string; limit?: number;
@@ -185,6 +192,13 @@ export interface SupervisionRegistryPort {
       agentType: string; providerFamily: string;
     };
     idempotencyKey: string;
+    reason: string;
+  }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
+  resolveCompletionEvidence?(input: {
+    taskId: string;
+    evidenceId: string;
+    targetAssignmentId: string;
+    decision: SupervisionCompletionEvidenceDecision;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   housekeeping(input: { mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number }): unknown;
@@ -265,6 +279,9 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     leaseAction: z.enum([...SUPERVISION_RECOVERY_LEASE_ACTIONS]).optional(),
     idempotencyKey: z.string().min(1).max(200).optional(),
     reason: z.string().min(1).max(2000),
+    completionEvidenceDecision: z.enum([...SUPERVISION_COMPLETION_EVIDENCE_DECISIONS]).optional(),
+    evidenceId: z.string().min(1).optional(),
+    targetAssignmentId: z.string().min(1).optional(),
   },
   [SUPERVISION_MCP_TOOLS.HOUSEKEEPING]: {
     mode: z.enum(['dryRun', 'apply']),
@@ -430,6 +447,19 @@ export function createSupervisionMcpToolHandlers(
         note: input.note === undefined ? undefined : String(input.note),
       });
       if (applied && !applied.ok) return err(applied.reason, `task intent rejected: ${applied.reason}`);
+      if (outcome.intent === 'record_validation' && outcome.validationState === 'passed'
+        && intentAssignmentId) {
+        // Validation is the event that makes FINISHED/open_audit uniquely
+        // decidable. Converge the exact object immediately; the periodic tick
+        // is only a restart backstop, never the primary production wire.
+        reg.convergeValidatedAssignment?.({ taskId, assignmentId: intentAssignmentId });
+        try {
+          await deps.dispatchReadyAudit?.(taskId);
+        } catch {
+          // The validation and handoff commits remain authoritative. The
+          // deterministic dispatcher records its own blocker and can replay.
+        }
+      }
       if (outcome.intent === 'open_audit') {
         try {
           await deps.dispatchReadyAudit?.(taskId);
@@ -441,7 +471,10 @@ export function createSupervisionMcpToolHandlers(
       }
       return ok({
         intent: outcome.intent, fromStatus: outcome.fromStatus,
-        toStatus: outcome.toStatus ?? null, validationState: outcome.validationState,
+        toStatus: outcome.intent === 'record_validation' && outcome.validationState === 'passed'
+          ? reg.getStatus(taskId) ?? outcome.toStatus ?? null
+          : outcome.toStatus ?? null,
+        validationState: outcome.validationState,
       });
     },
 
@@ -551,12 +584,45 @@ export function createSupervisionMcpToolHandlers(
       const idempotencyKey = String(input.idempotencyKey ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
+      const completionEvidenceDecision = String(input.completionEvidenceDecision ?? '').trim();
+      if (completionEvidenceDecision) {
+        const evidenceId = String(input.evidenceId ?? '').trim();
+        const targetAssignmentId = String(input.targetAssignmentId ?? '').trim();
+        if (!SUPERVISION_COMPLETION_EVIDENCE_DECISIONS.includes(
+          completionEvidenceDecision as SupervisionCompletionEvidenceDecision,
+        ) || !evidenceId || !targetAssignmentId || !reason
+          || assignmentId || rebindSessionName || fromRevision || toRevision
+          || taskStatus || assignmentStatus || scopeFiles.length > 0 || leaseAction
+          || idempotencyKey || input.toStatus !== undefined) {
+          return err('validation_failed', 'completion evidence resolution requires only taskId, evidenceId, targetAssignmentId, completionEvidenceDecision and reason');
+        }
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        const authorized = isAdmin(caller) || Boolean(
+          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
+        );
+        if (!task || !authorized) return err('forbidden', 'completion evidence resolution requires the authoritative project Brain or administrator');
+        const resolved = reg.resolveCompletionEvidence?.({
+          taskId, evidenceId, targetAssignmentId,
+          decision: completionEvidenceDecision as SupervisionCompletionEvidenceDecision,
+          reason,
+        });
+        if (!resolved) return err('unavailable', 'completion evidence resolution is not bound');
+        if (!resolved.ok) return err(resolved.reason, `completion evidence resolution rejected: ${resolved.reason}`);
+        return ok({ taskId, evidenceId, targetAssignmentId, decision: completionEvidenceDecision, replay: resolved.replay === true });
+      }
       const revisionRecoveryRequested = Boolean(fromRevision || toRevision);
       if (revisionRecoveryRequested) {
+        const compatibleProjectionStatus = (value: unknown) => (
+          value === undefined || String(value).trim() === 'rework'
+        );
         if (!assignmentId || !toRevision
           || !reason || !idempotencyKey
           || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(leaseAction as SupervisionRecoveryLeaseAction)
-          || rebindSessionName || taskStatus || assignmentStatus || input.toStatus !== undefined) {
+          || rebindSessionName
+          || !compatibleProjectionStatus(input.taskStatus)
+          || !compatibleProjectionStatus(input.assignmentStatus)
+          || !compatibleProjectionStatus(input.toStatus)) {
           return err('validation_failed', 'revision recovery requires assignmentId, toRevision, leaseAction, idempotencyKey and reason; fromRevision/ownedFiles/scopeFiles/evidenceManifestSha256 are optional metadata');
         }
         const task = reg.get(taskId);
@@ -566,6 +632,28 @@ export function createSupervisionMcpToolHandlers(
         );
         if (!task || !authorized) {
           return err('forbidden', 'revision recovery requires the authoritative project Brain or administrator');
+        }
+        const beforeAssignment = task.assignments?.find((candidate) => candidate.assignmentId === assignmentId);
+        const alreadyRepaired = task.status === 'rework'
+          && task.currentRevision === toRevision
+          && beforeAssignment?.status === 'rework'
+          && Boolean(beforeAssignment.leaseId)
+          && beforeAssignment.auditRevision === toRevision
+          && beforeAssignment.verdict?.trim().toUpperCase() === 'REWORK';
+        // An exact REWORK receipt is stronger than caller-supplied recovery
+        // metadata. Repair the same implementation object first; if it closes
+        // the split there is no revision rebind left to perform.
+        const converged = reg.convergeExactReworkAssignment?.({ taskId, assignmentId });
+        const after = reg.get(taskId);
+        const repaired = after?.status === 'rework' && after.assignments?.some((candidate) => (
+          candidate.assignmentId === assignmentId && candidate.status === 'rework'
+        ));
+        if (converged && repaired) {
+          return ok({
+            taskId, assignmentId, toRevision,
+            replay: alreadyRepaired,
+            converged: 'exact_rework_receipt',
+          });
         }
         const rebound = reg.rebindTaskAssignmentRevision?.({
           taskId, assignmentId,

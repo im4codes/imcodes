@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   lstat,
   open,
@@ -26,7 +26,7 @@ export const SUPERVISION_WORKTREE_GC_MAX_ASSIGNMENTS = 512 as const;
 export const SUPERVISION_WORKTREE_GC_MAX_COMMON_DIRS = 4 as const;
 export const SUPERVISION_WORKTREE_GC_LOCK_STALE_MS = 10 * 60_000;
 
-const ASSIGNMENT_NAME = /^supervision_assignment_[0-9a-z-]+$/;
+const ASSIGNMENT_NAME = /^(?:supervision_assignment_[0-9a-z-]+|asg_[0-9a-z]+)$/;
 const SESSION_NAME = /^deck_[0-9a-z_-]+$/i;
 const EVIDENCE_NAME = /^evidence(?:-[0-9a-z_.-]+)?$/i;
 const METADATA_MAX_BYTES = 16 * 1024;
@@ -45,6 +45,9 @@ export const SUPERVISION_WORKTREE_GC_REASONS = Object.freeze({
   ACTIVE_REFERENCE: 'active_reference',
   ACTIVE_LEASE: 'active_lease',
   ACTIVE_CLAIMS: 'active_claims',
+  INCOMPLETE_AUTHORITY: 'incomplete_authority',
+  PENDING_COMPLETION_EVIDENCE: 'pending_completion_evidence',
+  MANIFEST_MISMATCH: 'manifest_mismatch',
   INVALID_LAYOUT: 'invalid_layout',
   UNIQUE_EVIDENCE: 'unique_evidence',
   UNKNOWN_CONTENT: 'unknown_content',
@@ -81,15 +84,54 @@ export interface SupervisionWorktreeRegistryReference {
     taskId: string;
     status: string;
     leaseId: string;
+    role?: string;
+    auditAttemptId?: string;
+    auditRevision?: string;
+    verdict?: string;
   };
   task?: {
     taskId: string;
     projectName: string;
     status: string;
     archivedAt?: number;
-    assignments: ReadonlyArray<{ assignmentId: string; status: string; leaseId: string }>;
+    commitSha?: string;
+    pushRemoteRef?: string;
+    finalization?: {
+      revision: string;
+      auditAttemptId: string;
+      auditRevision: string;
+      verdict: string;
+      integrationManifest: ReadonlyArray<{ path: string; sha256: string }>;
+      commitSha: string;
+      pushResult: string;
+      pushRemoteRef: string;
+      ciResult?: import('../../shared/supervision-config.js').SupervisionCiSmokeStatus;
+    };
+    assignments: ReadonlyArray<{
+      assignmentId: string;
+      status: string;
+      leaseId: string;
+      role?: string;
+      auditAttemptId?: string;
+      auditRevision?: string;
+      verdict?: string;
+    }>;
   };
   claims?: ReadonlyArray<{ assignmentId: string; path: string }>;
+  auditReceipts?: ReadonlyArray<{
+    assignmentId: string;
+    attemptId: string;
+    revision: string;
+    receiptKind: string;
+    verdict?: string;
+  }>;
+  completionEvidence?: ReadonlyArray<{
+    sourceAssignmentId: string;
+    status: string;
+    adoptedByAssignmentId?: string;
+    revision?: string;
+    files?: ReadonlyArray<{ path: string; sha256?: string; deleted?: true }>;
+  }>;
 }
 
 export interface SupervisionWorktreeGitInspection {
@@ -102,6 +144,8 @@ export interface SupervisionWorktreeGitInspection {
   untracked?: boolean;
   branchOnly?: boolean;
   unpushed?: boolean;
+  /** Test/embedding seam: caller already verified the immutable finalization. */
+  finalizationVerified?: boolean;
 }
 
 export interface SupervisionWorktreeGcEntry {
@@ -122,6 +166,7 @@ export interface SupervisionWorktreeGcResult {
   scanned: number;
   mutations: number;
   deleted: number;
+  releasedBytes: number;
   retained: number;
   hasMore: boolean;
   nextCursor?: string;
@@ -146,6 +191,11 @@ export interface SupervisionWorktreeGcDeps {
   resolveRegistryReference: (
     metadata: SupervisionWorktreeMetadata,
   ) => Promise<SupervisionWorktreeRegistryReference> | SupervisionWorktreeRegistryReference;
+  resolveRegistryReferenceByAssignment?: (input: {
+    assignmentId: string;
+    sessionName: string;
+    repoPath: string;
+  }) => Promise<SupervisionWorktreeRegistryReference> | SupervisionWorktreeRegistryReference;
   protectedPaths?: readonly string[];
   now?: () => number;
   pid?: number;
@@ -155,6 +205,11 @@ export interface SupervisionWorktreeGcDeps {
   removeRegisteredWorktree?: (inspection: SupervisionWorktreeGitInspection, repoPath: string) => Promise<boolean>;
   pruneRegistrations?: (commonDir: string, apply: boolean) => Promise<string[]>;
   removeDirectory?: (path: string) => Promise<void>;
+  verifyFinalization?: (
+    repoPath: string,
+    finalization: NonNullable<NonNullable<SupervisionWorktreeRegistryReference['task']>['finalization']>,
+  ) => Promise<boolean>;
+  measureDirectoryBytes?: (path: string) => Promise<number>;
   onScanOperation?: (operation: 'project' | 'session' | 'assignment' | 'registry' | 'git') => void;
 }
 
@@ -163,6 +218,7 @@ interface CandidatePath {
   assignmentId: string;
   candidatePath: string;
   repoPath: string;
+  sessionName: string;
 }
 
 interface GcJournal {
@@ -175,8 +231,10 @@ interface GcJournal {
   taskId: string;
   projectName: string;
   metadataText: string;
+  sessionName?: string;
   quarantinePath?: string;
   updatedAt: number;
+  candidateBytes?: number;
 }
 
 function defaultWorktreesRoot(): string {
@@ -225,6 +283,103 @@ async function runGit(cwd: string, args: readonly string[]): Promise<GitRunResul
       stderr: typeof candidate.stderr === 'string' ? candidate.stderr : '',
     };
   }
+}
+
+async function verifyCommittedFinalization(
+  repoPath: string,
+  finalization: NonNullable<NonNullable<SupervisionWorktreeRegistryReference['task']>['finalization']>,
+): Promise<boolean> {
+  if (!/^[0-9a-f]{40}$/.test(finalization.commitSha)
+    || finalization.integrationManifest.length === 0) return false;
+  for (const entry of finalization.integrationManifest) {
+    if (!entry.path || entry.path.startsWith('/') || entry.path.split('/').includes('..')
+      || !/^[0-9a-f]{64}$/.test(entry.sha256)) return false;
+    try {
+      const result = await execFileAsync('git', ['show', `${finalization.commitSha}:${entry.path}`], {
+        cwd: repoPath,
+        timeout: 10_000,
+        maxBuffer: 16 * 1024 * 1024,
+        encoding: 'buffer',
+      });
+      const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout);
+      const digest = createHash('sha256').update(stdout).digest('hex');
+      if (digest !== entry.sha256) return false;
+    } catch { return false; }
+  }
+  const pushed = await runGit(repoPath, ['for-each-ref', '--format=%(refname)', '--contains', finalization.commitSha, 'refs/remotes']);
+  return pushed.ok && pushed.stdout.trim().length > 0;
+}
+
+async function directoryBytes(path: string): Promise<number> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink()) return info.size;
+  if (!info.isDirectory()) return info.size;
+  let total = info.size;
+  const handle = await opendir(path);
+  try {
+    for await (const entry of handle) total += await directoryBytes(join(path, entry.name));
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  return total;
+}
+
+function registryAuthorityReason(
+  reference: SupervisionWorktreeRegistryReference,
+  assignmentId: string,
+): SupervisionWorktreeGcReason | undefined {
+  const assignment = reference.assignment;
+  const task = reference.task;
+  const finalization = task?.finalization;
+  if (!assignment || !task || !finalization) return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
+  const sourceEvidence = (reference.completionEvidence ?? []).filter((record) => (
+    record.sourceAssignmentId === assignmentId
+  ));
+  if (sourceEvidence.some((record) => (
+    record.sourceAssignmentId === assignmentId && record.status === 'pending'
+  ))) return SUPERVISION_WORKTREE_GC_REASONS.PENDING_COMPLETION_EVIDENCE;
+  if (finalization.verdict !== 'PASS'
+    || !['pushed', 'already_present'].includes(finalization.pushResult)
+    || finalization.revision !== finalization.auditRevision
+    || task.commitSha !== finalization.commitSha
+    || task.pushRemoteRef !== finalization.pushRemoteRef
+    || finalization.integrationManifest.length === 0) {
+    return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
+  }
+  const directConsumed = assignment.auditRevision === finalization.revision
+    && assignment.auditAttemptId === finalization.auditAttemptId
+    && assignment.verdict === 'PASS';
+  const resolvedEvidenceConsumed = sourceEvidence.some((record) => {
+    if ((record.status !== 'adopted' && record.status !== 'discarded')
+      || !record.adoptedByAssignmentId) return false;
+    const target = task.assignments.find((candidate) => (
+      candidate.assignmentId === record.adoptedByAssignmentId
+    ));
+    if (!target || target.auditRevision !== finalization.revision
+      || target.auditAttemptId !== finalization.auditAttemptId || target.verdict !== 'PASS') return false;
+    if (record.status === 'discarded') return true;
+    const manifest = new Map(finalization.integrationManifest.map((entry) => [entry.path, entry.sha256]));
+    return Boolean(record.files?.length) && record.files!.every((file) => (
+      file.deleted !== true && Boolean(file.sha256) && manifest.get(file.path) === file.sha256
+    ));
+  });
+  if (!directConsumed && !resolvedEvidenceConsumed) {
+    return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
+  }
+  const exactPass = (reference.auditReceipts ?? []).filter((receipt) => (
+    receipt.attemptId === finalization.auditAttemptId
+    && receipt.revision === finalization.revision
+    && receipt.receiptKind === 'final'
+    && receipt.verdict === 'PASS'
+  ));
+  if (exactPass.length !== 1) return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
+  const activeSameEvidence = task.assignments.some((candidate) => (
+    candidate.assignmentId !== assignmentId
+    && ACTIVE_ASSIGNMENT.has(candidate.status)
+    && (candidate.role === 'auditor' || !candidate.auditRevision
+      || candidate.auditRevision === finalization.revision)
+  ));
+  return activeSameEvidence ? SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE : undefined;
 }
 
 async function worktreeBlock(porcelain: string, repoPath: string): Promise<string | undefined> {
@@ -427,7 +582,10 @@ async function scanCandidatePaths(
               if (!candidateStat?.isDirectory() || candidateStat.isSymbolicLink()) continue;
               const repoPath = join(candidatePath, 'repo');
               const key = [projectEntry.name, sessionEntry.name, assignmentEntry.name].join('/');
-              candidates.push({ key, assignmentId: assignmentEntry.name, candidatePath, repoPath });
+              candidates.push({
+                key, assignmentId: assignmentEntry.name, candidatePath, repoPath,
+                sessionName: sessionEntry.name,
+              });
             }
           } finally {
             await assignmentHandle.close().catch(() => {});
@@ -456,7 +614,12 @@ async function evaluateCandidate(
   candidate: CandidatePath,
   projectName: string,
   deps: SupervisionWorktreeGcDeps,
-): Promise<{ entry: SupervisionWorktreeGcEntry; metadataText?: string; inspection?: SupervisionWorktreeGitInspection }> {
+): Promise<{
+  entry: SupervisionWorktreeGcEntry;
+  metadataText?: string;
+  inspection?: SupervisionWorktreeGitInspection;
+  repoMissing?: boolean;
+}> {
   const retain = (reason: SupervisionWorktreeGcReason, taskId?: string, detail?: string) => ({
     entry: {
       key: candidate.key,
@@ -472,52 +635,83 @@ async function evaluateCandidate(
   if (protectedCandidate(candidate.candidatePath, deps.protectedPaths ?? [process.cwd()])) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.PROTECTED_PATH);
   }
-  let parsed: Awaited<ReturnType<typeof readMetadata>>;
-  try { parsed = await readMetadata(candidate.candidatePath); } catch { return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT); }
+  const parsed = await readMetadata(candidate.candidatePath).catch(() => undefined);
+  const candidateRepoPath = await realpath(candidate.repoPath).catch(() => undefined);
   const metadataRepoPath = parsed
     ? await realpath(parsed.metadata.repoPath).catch(() => undefined)
-    : undefined;
-  const candidateRepoPath = await realpath(candidate.repoPath).catch(() => undefined);
-  if (!parsed
-    || parsed.metadata.assignmentId !== candidate.assignmentId
-    || !metadataRepoPath || metadataRepoPath !== candidateRepoPath
-    || parsed.metadata.sessionName !== basename(dirname(candidate.candidatePath))) {
+    : candidateRepoPath;
+  const missingRepoMetadataMatches = parsed
+    && !candidateRepoPath
+    && resolve(parsed.metadata.repoPath) === resolve(candidate.repoPath);
+  if (parsed && (
+    parsed.metadata.assignmentId !== candidate.assignmentId
+    || ((!metadataRepoPath || metadataRepoPath !== candidateRepoPath) && !missingRepoMetadataMatches)
+    || parsed.metadata.sessionName !== candidate.sessionName
+  )) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT);
   }
-  const taskId = parsed.metadata.taskId;
   let reference: SupervisionWorktreeRegistryReference;
   try {
     deps.onScanOperation?.('registry');
-    reference = await deps.resolveRegistryReference(parsed.metadata);
+    if (parsed) reference = await deps.resolveRegistryReference(parsed.metadata);
+    else if (deps.resolveRegistryReferenceByAssignment) {
+      reference = await deps.resolveRegistryReferenceByAssignment({
+        assignmentId: candidate.assignmentId,
+        sessionName: candidate.sessionName,
+        repoPath: candidate.repoPath,
+      });
+    } else return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT);
   } catch {
-    return retain(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, taskId);
+    return retain(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, parsed?.metadata.taskId);
   }
+  const taskId = parsed?.metadata.taskId ?? reference.assignment?.taskId;
   if (!reference.available) return retain(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, taskId);
   if (!reference.assignment || !reference.task
-    || reference.assignment.assignmentId !== parsed.metadata.assignmentId
+    || reference.assignment.assignmentId !== candidate.assignmentId
     || reference.assignment.taskId !== taskId
     || reference.task.taskId !== taskId
-    || !reference.task.assignments.some((assignment) => assignment.assignmentId === parsed.metadata.assignmentId)) {
+    || !reference.task.assignments.some((assignment) => assignment.assignmentId === candidate.assignmentId)
+    || (!parsed && reference.assignment.assignmentId !== candidate.assignmentId)) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_OWNER, taskId);
   }
   if (reference.task.projectName !== projectName) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.PROJECT_MISMATCH, taskId);
   }
   if (reference.assignment.leaseId) return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_LEASE, taskId);
-  if ((reference.claims ?? []).some((claim) => claim.assignmentId === parsed.metadata.assignmentId)) {
+  if ((reference.claims ?? []).some((claim) => claim.assignmentId === candidate.assignmentId)) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_CLAIMS, taskId);
   }
-  const taskArchived = Number.isFinite(reference.task.archivedAt);
   if (ACTIVE_ASSIGNMENT.has(reference.assignment.status)
-    || reference.task.assignments.some((assignment) => ACTIVE_ASSIGNMENT.has(assignment.status))
-    || (!TERMINAL_ASSIGNMENT.has(reference.assignment.status) && !taskArchived)) {
+    || !TERMINAL_ASSIGNMENT.has(reference.assignment.status)) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, taskId);
   }
+  const authorityReason = registryAuthorityReason(reference, candidate.assignmentId);
+  if (authorityReason) return retain(authorityReason, taskId);
   let contentReason: SupervisionWorktreeGcReason | undefined;
-  try { contentReason = await inspectCandidateContents(candidate.candidatePath, true); } catch {
+  try { contentReason = await inspectCandidateContents(candidate.candidatePath, Boolean(candidateRepoPath)); } catch {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, taskId);
   }
   if (contentReason) return retain(contentReason, taskId);
+  // Legacy/partially-completed GC layouts can retain only the assignment shell
+  // after Git already removed `repo/`. Query the registry by immutable
+  // assignment id and apply every authority/evidence/lease/content gate above;
+  // an empty shell is then recoverable work, not a permanent invalid_layout.
+  if (!candidateRepoPath) {
+    return {
+      entry: {
+        key: candidate.key,
+        assignmentId: candidate.assignmentId,
+        taskId,
+        path: candidate.candidatePath,
+        repoPath: candidate.repoPath,
+        action: 'delete',
+        reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE,
+        detail: 'legacy_shell_without_repo',
+      },
+      metadataText: parsed?.text ?? '',
+      repoMissing: true,
+    };
+  }
   const repoStat = await lstat(candidate.repoPath).catch(() => undefined);
   if (!repoStat?.isDirectory() || repoStat.isSymbolicLink()) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, taskId);
@@ -531,6 +725,11 @@ async function evaluateCandidate(
   if (inspection.dirty) return retain(SUPERVISION_WORKTREE_GC_REASONS.DIRTY, taskId);
   if (inspection.branchOnly) return retain(SUPERVISION_WORKTREE_GC_REASONS.BRANCH_ONLY, taskId);
   if (inspection.unpushed) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId);
+  const finalization = reference.task.finalization!;
+  if (inspection.finalizationVerified !== true
+    && !await (deps.verifyFinalization ?? verifyCommittedFinalization)(candidate.repoPath, finalization)) {
+    return retain(SUPERVISION_WORKTREE_GC_REASONS.MANIFEST_MISMATCH, taskId);
+  }
   return {
     entry: {
       key: candidate.key,
@@ -541,7 +740,7 @@ async function evaluateCandidate(
       action: 'delete',
       reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE,
     },
-    metadataText: parsed.text,
+    metadataText: parsed?.text ?? '',
     inspection,
   };
 }
@@ -628,9 +827,17 @@ async function postGitRemoveCandidate(
   if (!candidateStat) return true;
   if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink()) return false;
   const parsed = await readMetadata(candidatePath).catch(() => undefined);
-  if (!parsed || parsed.text !== journal.metadataText || parsed.metadata.taskId !== journal.taskId
-    || parsed.metadata.assignmentId !== journal.assignmentId) return false;
-  const reference = await Promise.resolve(deps.resolveRegistryReference(parsed.metadata))
+  if (journal.metadataText
+    ? (!parsed || parsed.text !== journal.metadataText || parsed.metadata.taskId !== journal.taskId
+      || parsed.metadata.assignmentId !== journal.assignmentId)
+    : Boolean(parsed)) return false;
+  const reference = await Promise.resolve(parsed
+    ? deps.resolveRegistryReference(parsed.metadata)
+    : deps.resolveRegistryReferenceByAssignment?.({
+      assignmentId: journal.assignmentId,
+      sessionName: journal.sessionName ?? basename(dirname(candidatePath)),
+      repoPath: journal.repoPath,
+    }) ?? { available: false })
     .catch((): SupervisionWorktreeRegistryReference => ({ available: false }));
   if (!reference.available || !reference.assignment || !reference.task
     || reference.assignment.assignmentId !== journal.assignmentId
@@ -640,8 +847,8 @@ async function postGitRemoveCandidate(
     || !reference.task.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
     || reference.assignment.leaseId
     || ACTIVE_ASSIGNMENT.has(reference.assignment.status)
-    || reference.task.assignments.some((assignment) => ACTIVE_ASSIGNMENT.has(assignment.status))
-    || (!TERMINAL_ASSIGNMENT.has(reference.assignment.status) && !Number.isFinite(reference.task.archivedAt))
+    || !TERMINAL_ASSIGNMENT.has(reference.assignment.status)
+    || registryAuthorityReason(reference, journal.assignmentId)
     || (reference.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId)) return false;
   if (await lstat(journal.repoPath).then(() => true, () => false)) return false;
   const contentReason = await inspectCandidateContents(candidatePath, false).catch(
@@ -669,11 +876,11 @@ async function recoverInterruptedApply(
   worktreesRoot: string,
   projectName: string,
   deps: SupervisionWorktreeGcDeps,
-): Promise<{ ok: boolean; deleted: number; mutations: number; assignmentId?: string }> {
+): Promise<{ ok: boolean; deleted: number; mutations: number; releasedBytes: number; assignmentId?: string }> {
   const journal = await readJournal(journalPath);
-  if (!journal) return { ok: true, deleted: 0, mutations: 0 };
+  if (!journal) return { ok: true, deleted: 0, mutations: 0, releasedBytes: 0 };
   if (journal.projectName !== projectName) {
-    return { ok: false, deleted: 0, mutations: 0, assignmentId: journal.assignmentId };
+    return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
   }
   if (journal.state === 'planned') {
     const repoExists = await lstat(journal.repoPath).then(() => true, () => false);
@@ -681,18 +888,18 @@ async function recoverInterruptedApply(
       const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(journal.repoPath)
         .catch((): SupervisionWorktreeGitInspection => ({ ok: false }));
       if (!inspection.ok || !inspection.registered) {
-        return { ok: false, deleted: 0, mutations: 0, assignmentId: journal.assignmentId };
+        return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
       }
       await unlink(journalPath).catch(() => {});
-      return { ok: true, deleted: 0, mutations: 1 };
+      return { ok: true, deleted: 0, mutations: 1, releasedBytes: 0 };
     }
     const promoted = { ...journal, state: 'git_removed' as const };
     const removed = await postGitRemoveCandidate(
       journalPath, promoted, worktreesRoot, projectName, deps,
     ).catch(() => false);
-    if (!removed) return { ok: false, deleted: 0, mutations: 0, assignmentId: journal.assignmentId };
+    if (!removed) return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
     await unlink(journalPath).catch(() => {});
-    return { ok: true, deleted: 1, mutations: 1, assignmentId: journal.assignmentId };
+    return { ok: true, deleted: 1, mutations: 1, releasedBytes: journal.candidateBytes ?? 0, assignmentId: journal.assignmentId };
   }
   if (journal.state === 'quarantined' && journal.quarantinePath) {
     const root = await realpath(worktreesRoot).catch(() => resolve(worktreesRoot));
@@ -700,21 +907,28 @@ async function recoverInterruptedApply(
     const expectedQuarantine = `${resolve(journal.candidatePath)}.gc-${journal.runId}`;
     if (quarantinePath !== expectedQuarantine || relative(root, quarantinePath).startsWith('..')
       || await lstat(journal.candidatePath).then(() => true, () => false)) {
-      return { ok: false, deleted: 0, mutations: 0, assignmentId: journal.assignmentId };
+      return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
     }
     const quarantineStat = await lstat(journal.quarantinePath).catch(() => undefined);
     if (!quarantineStat) {
       await unlink(journalPath).catch(() => {});
-      return { ok: true, deleted: 1, mutations: 1, assignmentId: journal.assignmentId };
+      return { ok: true, deleted: 1, mutations: 1, releasedBytes: journal.candidateBytes ?? 0, assignmentId: journal.assignmentId };
     }
     const parsed = await readMetadata(journal.quarantinePath).catch(() => undefined);
-    const reference = parsed
-      ? await Promise.resolve(deps.resolveRegistryReference(parsed.metadata))
+    const metadataMatches = journal.metadataText ? Boolean(parsed && parsed.text === journal.metadataText) : !parsed;
+    const reference = metadataMatches
+      ? await Promise.resolve(parsed
+        ? deps.resolveRegistryReference(parsed.metadata)
+        : deps.resolveRegistryReferenceByAssignment?.({
+          assignmentId: journal.assignmentId,
+          sessionName: journal.sessionName ?? basename(dirname(journal.candidatePath)),
+          repoPath: journal.repoPath,
+        }) ?? { available: false })
         .catch((): SupervisionWorktreeRegistryReference => ({ available: false }))
       : undefined;
     if (!quarantineStat.isDirectory() || quarantineStat.isSymbolicLink()
-      || !parsed || parsed.text !== journal.metadataText
-      || parsed.metadata.assignmentId !== journal.assignmentId || parsed.metadata.taskId !== journal.taskId
+      || !metadataMatches
+      || (parsed && (parsed.metadata.assignmentId !== journal.assignmentId || parsed.metadata.taskId !== journal.taskId))
       || !reference?.available || !reference.assignment || !reference.task
       || reference.assignment.assignmentId !== journal.assignmentId
       || reference.assignment.taskId !== journal.taskId
@@ -722,20 +936,20 @@ async function recoverInterruptedApply(
       || !reference.task.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
       || reference.assignment.leaseId
       || ACTIVE_ASSIGNMENT.has(reference.assignment.status)
-      || reference.task.assignments.some((assignment) => ACTIVE_ASSIGNMENT.has(assignment.status))
-      || (!TERMINAL_ASSIGNMENT.has(reference.assignment.status) && !Number.isFinite(reference.task.archivedAt))
+      || !TERMINAL_ASSIGNMENT.has(reference.assignment.status)
+      || registryAuthorityReason(reference, journal.assignmentId)
       || (reference.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId)
       || await inspectCandidateContents(journal.quarantinePath, false).catch(() => SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_CONTENT)) {
-      return { ok: false, deleted: 0, mutations: 0, assignmentId: journal.assignmentId };
+      return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
     }
     await (deps.removeDirectory ?? ((path) => rm(path, { recursive: true, force: false })))(journal.quarantinePath);
     await unlink(journalPath).catch(() => {});
-    return { ok: true, deleted: 1, mutations: 1, assignmentId: journal.assignmentId };
+    return { ok: true, deleted: 1, mutations: 1, releasedBytes: journal.candidateBytes ?? 0, assignmentId: journal.assignmentId };
   }
   const removed = await postGitRemoveCandidate(journalPath, journal, worktreesRoot, projectName, deps).catch(() => false);
-  if (!removed) return { ok: false, deleted: 0, mutations: 0, assignmentId: journal.assignmentId };
+  if (!removed) return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
   await unlink(journalPath).catch(() => {});
-  return { ok: true, deleted: 1, mutations: 1, assignmentId: journal.assignmentId };
+  return { ok: true, deleted: 1, mutations: 1, releasedBytes: journal.candidateBytes ?? 0, assignmentId: journal.assignmentId };
 }
 
 export async function runSupervisionWorktreeGc(
@@ -749,7 +963,7 @@ export async function runSupervisionWorktreeGc(
   const now = deps.now?.() ?? Date.now();
   const diagnostics: SupervisionWorktreeGcResult['diagnostics'] = [];
   const empty = (reason: SupervisionWorktreeGcReason, lock: SupervisionWorktreeGcResult['lock']): SupervisionWorktreeGcResult => ({
-    mode, runId, root, scanned: 0, mutations: 0, deleted: 0,
+    mode, runId, root, scanned: 0, mutations: 0, deleted: 0, releasedBytes: 0,
     retained: reason === SUPERVISION_WORKTREE_GC_REASONS.CONCURRENT_RUN ? 1 : 0,
     hasMore: false, lock, registryAvailable: reason !== SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE,
     entries: reason === SUPERVISION_WORKTREE_GC_REASONS.CONCURRENT_RUN ? [{
@@ -782,6 +996,7 @@ export async function runSupervisionWorktreeGc(
   try {
     let recoveredDeleted = 0;
     let recoveredMutations = 0;
+    let releasedBytes = 0;
     if (mode === 'apply') {
       const recovery = await recoverInterruptedApply(journalPath, root, input.projectName, deps);
       if (!recovery.ok) {
@@ -796,6 +1011,7 @@ export async function runSupervisionWorktreeGc(
       }
       recoveredDeleted = recovery.deleted;
       recoveredMutations = recovery.mutations;
+      releasedBytes = recovery.releasedBytes;
     }
 
     if (mode === 'apply' && recoveredMutations >= limit) {
@@ -809,6 +1025,7 @@ export async function runSupervisionWorktreeGc(
         scanned: 0,
         mutations: recoveredMutations,
         deleted: recoveredDeleted,
+        releasedBytes,
         retained: 0,
         hasMore: true,
         lock: 'acquired',
@@ -865,7 +1082,9 @@ export async function runSupervisionWorktreeGc(
 
     for (const { candidate, evaluated } of evaluatedBatch) {
       if (mode === 'apply' && !registryAvailable) break;
-      if (mode === 'dryRun' || evaluated.entry.action !== 'delete' || !evaluated.inspection || !evaluated.metadataText) {
+      if (mode === 'dryRun' || evaluated.entry.action !== 'delete'
+        || (!evaluated.inspection && !evaluated.repoMissing)
+        || evaluated.metadataText === undefined) {
         entries.push(evaluated.entry);
         continue;
       }
@@ -873,7 +1092,9 @@ export async function runSupervisionWorktreeGc(
       // Repeat every registry, evidence and Git admission gate immediately
       // before mutation. A dirty/re-activated candidate is retained.
       const revalidated = await evaluateCandidate(candidate, input.projectName, deps);
-      if (revalidated.entry.action !== 'delete' || !revalidated.inspection || !revalidated.metadataText) {
+      if (revalidated.entry.action !== 'delete'
+        || (!revalidated.inspection && !revalidated.repoMissing)
+        || revalidated.metadataText === undefined) {
         entries.push(revalidated.entry);
         await (deps.yieldControl ?? nextTurn)();
         continue;
@@ -881,20 +1102,21 @@ export async function runSupervisionWorktreeGc(
       const journal: GcJournal = {
         version: JOURNAL_VERSION,
         runId,
-        state: 'planned',
+        state: revalidated.repoMissing ? 'git_removed' : 'planned',
         candidatePath: candidate.candidatePath,
         repoPath: candidate.repoPath,
         assignmentId: candidate.assignmentId,
         taskId: revalidated.entry.taskId!,
         projectName: input.projectName,
         metadataText: revalidated.metadataText,
+        sessionName: candidate.sessionName,
+        candidateBytes: Math.max(0, await (deps.measureDirectoryBytes ?? directoryBytes)(candidate.candidatePath)),
         updatedAt: deps.now?.() ?? Date.now(),
       };
       mutations += 1;
       await writeJsonAtomic(journalPath, journal, runId);
-      const removedGit = await (deps.removeRegisteredWorktree ?? removeRegisteredGitWorktree)(
-        revalidated.inspection,
-        candidate.repoPath,
+      const removedGit = revalidated.repoMissing || await (deps.removeRegisteredWorktree ?? removeRegisteredGitWorktree)(
+        revalidated.inspection!, candidate.repoPath,
       );
       if (!removedGit) {
         diagnostics.push({ code: 'git_worktree_remove_failed', assignmentId: candidate.assignmentId });
@@ -929,6 +1151,7 @@ export async function runSupervisionWorktreeGc(
       }
       await unlink(journalPath).catch(() => {});
       deleted += 1;
+      releasedBytes += journal.candidateBytes ?? 0;
       entries.push(revalidated.entry);
       await (deps.yieldControl ?? nextTurn)();
     }
@@ -947,6 +1170,7 @@ export async function runSupervisionWorktreeGc(
       scanned: batch.length,
       mutations,
       deleted,
+      releasedBytes,
       retained: entries.filter((entry) => entry.action === 'retain').length,
       hasMore,
       ...(hasMore && batch.length ? { nextCursor: batch.at(-1)!.key } : {}),

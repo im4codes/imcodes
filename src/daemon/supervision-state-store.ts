@@ -24,9 +24,11 @@ import {
   SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
+  SUPERVISION_COMPLETION_EVIDENCE_DECISIONS,
   type SupervisionTaskArchiveReason,
   type SupervisionBrainCoordinationRecoveryStatus,
   type SupervisionRecoveryLeaseAction,
+  type SupervisionCompletionEvidenceDecision,
   type SupervisionTaskAuditPolicy,
   type SessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
@@ -369,10 +371,10 @@ export interface PersistedSupervisionIntegrationFinalization {
   pushResult: 'pushed' | 'already_present';
   pushRemoteRef: string;
   stagedPaths: string[];
-  externalRunId: string;
-  externalHeadSha: string;
+  externalRunId?: string;
+  externalHeadSha?: string;
   externalTaskId?: string;
-  ciResult: 'success';
+  ciResult?: import('../../shared/supervision-config.js').SupervisionCiSmokeStatus;
   finalizedAt: number;
 }
 
@@ -474,6 +476,26 @@ export interface PersistedSupervisionTaskFileEvent {
   createdAt: number;
 }
 
+export type PersistedSupervisionCompletionEvidenceStatus = 'pending' | 'adopted' | 'discarded';
+
+/** Frozen implementation evidence observed after the worker was cancelled. */
+export interface PersistedSupervisionCompletionEvidence {
+  evidenceId: string;
+  taskId: string;
+  sourceAssignmentId: string;
+  revision: string;
+  manifestSha256: string;
+  worktreePath: string;
+  headSha: string;
+  files: SupervisionWorktreeSnapshot['files'];
+  evidence?: string;
+  status: PersistedSupervisionCompletionEvidenceStatus;
+  adoptedByAssignmentId?: string;
+  resolutionReason?: string;
+  createdAt: number;
+  resolvedAt?: number;
+}
+
 /** One same-object forward step taken by {@link SupervisionTaskRegistry.convergeLifecycle}. */
 /** Why a receipt may not bind to an auditor. */
 export type SupervisionAuditReceiptAuthorityRejection =
@@ -530,17 +552,26 @@ export interface SupervisionLifecycleConvergenceAction {
   assignmentId?: string;
   action: 'retire_consumed_slice'
     | 'align_revision_projection'
+    | 'bind_zero_byte_base_revision'
+    | 'restore_exact_rework_implementer'
     | 'project_validated_handoff'
     | 'close_recorded_audit_receipt'
     | 'rebind_stale_coordinator'
     | 'retire_consumed_finalized_implementer'
     | 'retire_stale_finalized_owner_projection'
-    | 'clear_consumed_finalized_owner_pointer';
+    | 'clear_consumed_finalized_owner_pointer'
+    | 'adopt_cancelled_completion_evidence'
+    | 'request_cancelled_completion_evidence_decision'
+    | 'record_already_present_delivery';
 }
 
 /** Runtime authority the registry cannot know by itself. */
 export interface SupervisionLifecycleConvergenceOptions {
   limit?: number;
+  /** Read-only inspection of the assignment's authoritative worktree. */
+  inspectAssignmentWorktree?: (
+    assignment: PersistedSupervisionTaskAssignment,
+  ) => SupervisionWorktreeSnapshot | undefined;
   /**
    * The daemon's CURRENT authoritative Brain for a project. Convergence only
    * ever rebinds a coordinator onto this identity, and only when it is the same
@@ -669,6 +700,16 @@ export interface SupervisionTaskAssignmentFinishInput {
   now?: number;
 }
 
+export interface SupervisionCancelledCompletionEvidenceInput {
+  taskId: string;
+  assignmentId: string;
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  revision?: string | null;
+  worktreeSnapshot: SupervisionWorktreeSnapshot;
+  evidence?: string | null;
+  now?: number;
+}
+
 export interface SupervisionIntegrationFinalizationInput {
   assignmentId: string;
   identity: PersistedSupervisionTaskAssignmentIdentity;
@@ -685,10 +726,10 @@ export interface SupervisionIntegrationFinalizationInput {
   stagedPaths: readonly string[];
   conflictedPaths: readonly string[];
   untrackedOtherOwnerPaths: readonly string[];
-  externalRunId: string;
-  externalHeadSha: string;
+  externalRunId?: string;
+  externalHeadSha?: string;
   externalTaskId?: string;
-  ciResult: 'success';
+  ciResult?: import('../../shared/supervision-config.js').SupervisionCiSmokeStatus;
   evidence?: string;
   now?: number;
 }
@@ -722,11 +763,13 @@ export interface SupervisionTaskSnapshot extends PersistedSupervisionTaskRecord 
   touchedFiles: string[];
   events?: PersistedSupervisionTaskEvent[];
   auditReceipts?: PersistedSupervisionAuditReceipt[];
+  completionEvidence?: PersistedSupervisionCompletionEvidence[];
 }
 
 export type SupervisionHousekeepingMode = 'dryRun' | 'apply';
 export type SupervisionHousekeepingActionKind =
   | 'release_terminal_assignment'
+  | 'retire_consumed_assignment'
   | 'repair_aggregate'
   | 'repair_revision'
   | 'archive_terminal'
@@ -977,6 +1020,15 @@ function parseAssignmentRow(row: Record<string, unknown>): PersistedSupervisionT
   return payload as unknown as PersistedSupervisionTaskAssignment;
 }
 
+function parseCompletionEvidenceRow(row: Record<string, unknown>): PersistedSupervisionCompletionEvidence | undefined {
+  const payload = safeJsonParseObject(typeof row.payloadJson === 'string' ? row.payloadJson : undefined);
+  if (!payload || typeof payload.evidenceId !== 'string' || typeof payload.taskId !== 'string'
+    || typeof payload.sourceAssignmentId !== 'string' || typeof payload.revision !== 'string'
+    || typeof payload.manifestSha256 !== 'string' || !Array.isArray(payload.files)
+    || !['pending', 'adopted', 'discarded'].includes(String(payload.status))) return undefined;
+  return payload as unknown as PersistedSupervisionCompletionEvidence;
+}
+
 function parseEventRow(row: Record<string, unknown>): PersistedSupervisionTaskEvent {
   const payload = safeJsonParseObject(typeof row.payloadJson === 'string' ? row.payloadJson : undefined);
   const assignmentId = normalizeTaskString(row.assignmentId as string | undefined);
@@ -1173,6 +1225,24 @@ export class SupervisionTaskRegistry {
         ON supervision_audit_receipts(attempt_id, revision, sequence);
       CREATE INDEX IF NOT EXISTS supervision_audit_receipts_task_idx
         ON supervision_audit_receipts(task_id, created_at);
+      CREATE TABLE IF NOT EXISTS supervision_task_completion_evidence (
+        evidence_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        source_assignment_id TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending','adopted','discarded')),
+        adopted_by_assignment_id TEXT,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        UNIQUE(source_assignment_id, revision, manifest_sha256),
+        FOREIGN KEY(task_id) REFERENCES supervision_tasks(task_id) ON DELETE RESTRICT,
+        FOREIGN KEY(source_assignment_id) REFERENCES supervision_task_assignments(assignment_id) ON DELETE RESTRICT,
+        FOREIGN KEY(adopted_by_assignment_id) REFERENCES supervision_task_assignments(assignment_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX IF NOT EXISTS supervision_task_completion_evidence_task_idx
+        ON supervision_task_completion_evidence(task_id, status, created_at);
       CREATE TABLE IF NOT EXISTS supervision_convergence_cursor (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         task_id TEXT NOT NULL DEFAULT '',
@@ -1185,6 +1255,13 @@ export class SupervisionTaskRegistry {
         apply_authorized INTEGER NOT NULL DEFAULT 0,
         cursor TEXT,
         next_due_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS supervision_worktree_gc_state (
+        project_name TEXT PRIMARY KEY,
+        cursor TEXT,
+        next_due_at INTEGER NOT NULL DEFAULT 0,
+        last_result_json TEXT,
         updated_at INTEGER NOT NULL DEFAULT 0
       );
     `);
@@ -1372,12 +1449,27 @@ export class SupervisionTaskRegistry {
     }
   }
 
+  #writeCompletionEvidence(record: PersistedSupervisionCompletionEvidence): void {
+    this.#db.prepare(
+      `UPDATE supervision_task_completion_evidence
+       SET status = ?, adopted_by_assignment_id = ?, payload_json = ?, resolved_at = ?
+       WHERE evidence_id = ?`,
+    ).run(record.status, record.adoptedByAssignmentId ?? null, JSON.stringify(record),
+      record.resolvedAt ?? null, record.evidenceId);
+  }
+
   #requestHousekeeping(projectName: string, now: number): void {
     this.#db.prepare(
       `UPDATE supervision_housekeeping_state
        SET next_due_at = CASE WHEN next_due_at = 0 THEN 0 ELSE MIN(next_due_at, ?) END,
            updated_at = ? WHERE project_name = ?`,
     ).run(now, now, projectName);
+    this.#db.prepare(
+      `INSERT INTO supervision_worktree_gc_state (project_name, cursor, next_due_at, updated_at)
+       VALUES (?, NULL, ?, ?)
+       ON CONFLICT(project_name) DO UPDATE SET
+         next_due_at = MIN(next_due_at, excluded.next_due_at), updated_at = excluded.updated_at`,
+    ).run(projectName, now, now);
   }
 
   get(taskId: string): SupervisionTaskSnapshot | undefined {
@@ -1387,7 +1479,12 @@ export class SupervisionTaskRegistry {
     const fileClaims = this.listFileClaims(taskId);
     const touchedFiles = [...new Set(this.listFileEvents(taskId).map((event) => event.path))].sort();
     const auditReceipts = this.listAuditReceipts(taskId);
-    return { ...task, assignments, fileClaims, touchedFiles, ...(auditReceipts.length > 0 ? { auditReceipts } : {}) };
+    const completionEvidence = this.listCompletionEvidence(taskId);
+    return {
+      ...task, assignments, fileClaims, touchedFiles,
+      ...(auditReceipts.length > 0 ? { auditReceipts } : {}),
+      ...(completionEvidence.length > 0 ? { completionEvidence } : {}),
+    };
   }
 
   getTaskRecord(taskId: string): PersistedSupervisionTaskRecord | undefined {
@@ -1482,6 +1579,16 @@ export class SupervisionTaskRegistry {
     });
   }
 
+  listCompletionEvidence(taskId: string): PersistedSupervisionCompletionEvidence[] {
+    if (this.#closed) return [];
+    return (this.#db.prepare(
+      `SELECT payload_json AS payloadJson FROM supervision_task_completion_evidence
+       WHERE task_id = ? ORDER BY created_at ASC, evidence_id ASC`,
+    ).all(taskId) as Array<Record<string, unknown>>)
+      .map(parseCompletionEvidenceRow)
+      .filter((record): record is PersistedSupervisionCompletionEvidence => record !== undefined);
+  }
+
   listFileClaims(taskId: string): PersistedSupervisionTaskFileClaim[] {
     void taskId;
     return [];
@@ -1561,7 +1668,24 @@ export class SupervisionTaskRegistry {
       const reworkProjectionRepair = this.#planReworkProjectionRepair(task, assignments);
       if (reworkProjectionRepair) actions.push(reworkProjectionRepair);
 
-      const terminalAggregate = deterministicTerminalAggregate(assignments);
+      const consumedLegacyAssignments = assignments.filter((assignment) => (
+        this.#isLegacyAssignmentConsumedByFinalization(task, assignment)
+      ));
+      for (const assignment of consumedLegacyAssignments) {
+        actions.push({
+          taskId: task.taskId,
+          assignmentId: assignment.assignmentId,
+          kind: 'retire_consumed_assignment',
+        });
+      }
+      const projectedAssignments = consumedLegacyAssignments.length === 0
+        ? assignments
+        : assignments.map((assignment) => (
+          consumedLegacyAssignments.some((candidate) => candidate.assignmentId === assignment.assignmentId)
+            ? { ...assignment, status: 'finalized' as const, leaseId: '' }
+            : assignment
+        ));
+      const terminalAggregate = deterministicTerminalAggregate(projectedAssignments);
       if (terminalAggregate && terminalAggregate !== task.status) {
         actions.push({
           taskId: task.taskId,
@@ -1572,7 +1696,7 @@ export class SupervisionTaskRegistry {
       }
 
       const effectiveStatus = terminalAggregate ?? task.status;
-      const effectiveLeases = assignments.some((assignment) => (
+      const effectiveLeases = projectedAssignments.some((assignment) => (
         Boolean(assignment.leaseId) && !HOUSEKEEPING_ASSIGNMENT_TERMINAL.has(assignment.status)
       ));
       const oldEnough = now - task.updatedAt >= SUPERVISION_TASK_ARCHIVE_GRACE_MS;
@@ -1674,6 +1798,42 @@ export class SupervisionTaskRegistry {
     });
   }
 
+  nextWorktreeGcBatch(now = Date.now()): { projectName: string; cursor?: string } | undefined {
+    if (this.#closed) return undefined;
+    const row = this.#db.prepare(
+      `SELECT project_name AS projectName, cursor
+       FROM supervision_worktree_gc_state
+       WHERE next_due_at <= ?
+       ORDER BY next_due_at ASC, project_name ASC LIMIT 1`,
+    ).get(now) as { projectName?: unknown; cursor?: unknown } | undefined;
+    if (typeof row?.projectName !== 'string' || !row.projectName) return undefined;
+    return {
+      projectName: row.projectName,
+      ...(typeof row.cursor === 'string' && row.cursor ? { cursor: row.cursor } : {}),
+    };
+  }
+
+  recordWorktreeGcBatch(input: {
+    projectName: string;
+    nextCursor?: string;
+    hasMore: boolean;
+    result: unknown;
+    now?: number;
+  }): void {
+    const projectName = normalizeTaskString(input.projectName);
+    if (!projectName || this.#closed) return;
+    const now = input.now ?? Date.now();
+    this.#db.prepare(
+      `INSERT INTO supervision_worktree_gc_state
+         (project_name, cursor, next_due_at, last_result_json, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(project_name) DO UPDATE SET cursor = excluded.cursor,
+         next_due_at = excluded.next_due_at, last_result_json = excluded.last_result_json,
+         updated_at = excluded.updated_at`,
+    ).run(projectName, input.hasMore ? normalizeTaskString(input.nextCursor) ?? null : null,
+      now + (input.hasMore ? 60_000 : 10 * 60_000), JSON.stringify(input.result), now);
+  }
+
   #canonicalVisibilityCounts(projectName: string): { activeCount: number; archivedCount: number } {
     const row = this.#db.prepare(
       `SELECT
@@ -1688,6 +1848,22 @@ export class SupervisionTaskRegistry {
   }
 
   #applyHousekeepingAction(action: SupervisionHousekeepingAction, now: number): void {
+    if (action.kind === 'retire_consumed_assignment' && action.assignmentId) {
+      const task = this.getTaskRecord(action.taskId);
+      const assignment = this.getAssignment(action.assignmentId);
+      if (!task || !assignment || !this.#isLegacyAssignmentConsumedByFinalization(task, assignment)) return;
+      this.#writeAssignment({
+        ...assignment, status: 'finalized', leaseId: '', blocker: undefined,
+        cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION, updatedAt: now,
+      }, 'finalized', {
+        source: 'housekeeping_consumed_finalization_projection',
+        finalizedRevision: task.finalization!.revision,
+        finalizedAuditAttemptId: task.finalization!.auditAttemptId,
+      });
+      this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE assignment_id = ?')
+        .run(assignment.assignmentId);
+      return;
+    }
     if (action.kind === 'release_terminal_assignment' && action.assignmentId) {
       const assignment = this.getAssignment(action.assignmentId);
       const implementationFinished = assignment?.status === 'ready_for_audit'
@@ -1795,6 +1971,32 @@ export class SupervisionTaskRegistry {
     }
   }
 
+  #isLegacyAssignmentConsumedByFinalization(
+    task: PersistedSupervisionTaskRecord,
+    assignment: PersistedSupervisionTaskAssignment,
+  ): boolean {
+    const finalization = task.finalization;
+    if (!finalization || !assignment.required
+      || (assignment.role !== 'implementer' && assignment.role !== 'integration_owner')
+      || isTerminalSupervisionTaskStatus(assignment.status)
+      || assignment.auditRevision !== finalization.revision
+      || assignment.auditAttemptId !== finalization.auditAttemptId
+      || assignment.verdict?.trim().toUpperCase() !== 'PASS'
+      || assignment.crossVendorAuditPassed !== true) return false;
+    const receipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.receiptKind === 'final' && receipt.verdict === 'PASS'
+      && receipt.revision === finalization.revision
+      && receipt.attemptId === finalization.auditAttemptId
+    ));
+    if (receipts.length !== 1) return false;
+    const auditor = this.getAssignment(receipts[0]!.assignmentId);
+    return Boolean(auditor && auditor.role === 'auditor' && auditor.status === 'finalized'
+      && !auditor.leaseId && auditor.auditRevision === finalization.revision
+      && auditor.auditAttemptId === finalization.auditAttemptId
+      && auditor.verdict?.trim().toUpperCase() === 'PASS'
+      && auditor.identity.providerFamily !== assignment.identity.providerFamily);
+  }
+
   /**
    * Persist one implementation watchdog dispatch without pretending that the
    * reminder itself is implementation progress. The event is the durable
@@ -1825,7 +2027,8 @@ export class SupervisionTaskRegistry {
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskEvent> {
     const assignment = this.getAssignment(input.assignmentId);
     if (!assignment) return { ok: false, reason: 'not_found' };
-    if (assignment.role !== 'implementer' || assignment.status !== 'implementing') {
+    if (assignment.role !== 'implementer'
+      || (assignment.status !== 'delegated' && assignment.status !== 'implementing')) {
       return { ok: false, reason: 'invalid_transition' };
     }
     const now = input.now ?? Date.now();
@@ -2490,6 +2693,169 @@ export class SupervisionTaskRegistry {
    * destination and revokes this assignment's lease in one SQLite transaction.
    * Scope metadata is never treated as audit evidence or an admission lock.
    */
+  recordCancelledCompletionEvidence(
+    input: SupervisionCancelledCompletionEvidenceInput,
+  ): SupervisionTaskRegistryResult<PersistedSupervisionCompletionEvidence> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const requestedRevision = normalizeTaskString(input.revision);
+    const assignment = assignmentId ? this.getAssignment(assignmentId) : undefined;
+    if (!taskId || !assignmentId || !assignment || assignment.taskId !== taskId) {
+      return { ok: false, reason: 'not_found' };
+    }
+    if (!identityMatches(assignment.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
+    if (assignment.role === 'auditor' || assignment.role === 'coordinator') {
+      return { ok: false, reason: 'role_forbidden' };
+    }
+    const worktree = input.worktreeSnapshot;
+    if (!worktree || !Array.isArray(worktree.files) || !Array.isArray(worktree.stagedPaths)
+      || !Array.isArray(worktree.conflictedPaths) || !Array.isArray(worktree.untrackedPaths)) {
+      return { ok: false, reason: 'manifest_mismatch' };
+    }
+    const files = [...worktree.files].sort((left, right) => left.path.localeCompare(right.path));
+    const paths = files.map((file) => file.path);
+    if (!FINALIZATION_COMMIT_RE.test(worktree.headSha)
+      || !normalizeTaskString(worktree.worktreePath)?.startsWith('/')
+      || worktree.stagedPaths.length !== 0 || worktree.conflictedPaths.length !== 0
+      || paths.length !== new Set(paths).size
+      || files.length === 0
+      || files.some((file) => !validRepoPath(file.path)
+        || (file.deleted === true ? file.sha256 !== undefined
+          : !file.sha256 || !FINALIZATION_SHA256_RE.test(file.sha256)))
+      || worktree.untrackedPaths.some((path) => !paths.includes(path))) {
+      return { ok: false, reason: 'manifest_mismatch' };
+    }
+    const frozenDigest = createHash('sha256').update(JSON.stringify({
+      headSha: worktree.headSha, files,
+    })).digest('hex');
+    const revision = requestedRevision ?? `late-completion-${frozenDigest.slice(0, 12)}`;
+    const manifestSha256 = createHash('sha256').update(JSON.stringify({ revision, frozenDigest })).digest('hex');
+    const evidenceId = `completion_evidence_${manifestSha256.slice(0, 24)}`;
+    const existing = this.#db.prepare(
+      `SELECT payload_json AS payloadJson FROM supervision_task_completion_evidence
+       WHERE source_assignment_id = ? AND revision = ? AND manifest_sha256 = ?`,
+    ).get(assignmentId, revision, manifestSha256) as Record<string, unknown> | undefined;
+    if (existing) {
+      const replay = parseCompletionEvidenceRow(existing);
+      return replay ? { ok: true, value: replay, replay: true } : { ok: false, reason: 'conflicting_replay' };
+    }
+    const now = input.now ?? Date.now();
+    const record: PersistedSupervisionCompletionEvidence = {
+      evidenceId, taskId, sourceAssignmentId: assignmentId, revision, manifestSha256,
+      worktreePath: worktree.worktreePath, headSha: worktree.headSha, files,
+      ...(normalizeTaskString(input.evidence) ? { evidence: normalizeTaskString(input.evidence) } : {}),
+      status: 'pending', createdAt: now,
+    };
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const locked = this.getAssignment(assignmentId);
+      // This atomic locked-state check is the sole cancelled-only authority
+      // gate. Keeping an equivalent preflight check above made one safety
+      // predicate untestable while adding no protection against cancellation
+      // races; the transaction must decide from the current row either way.
+      if (!locked || locked.taskId !== taskId || locked.status !== 'cancelled'
+        || !identityMatches(locked.identity, input.identity)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      this.#db.prepare(
+        `INSERT INTO supervision_task_completion_evidence
+          (evidence_id, task_id, source_assignment_id, revision, manifest_sha256, status,
+           adopted_by_assignment_id, payload_json, created_at, resolved_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)`,
+      ).run(evidenceId, taskId, assignmentId, revision, manifestSha256, record.status,
+        JSON.stringify(record), now);
+      this.#appendEvent(taskId, assignmentId, 'implementation_finished', 'cancelled', {
+        source: 'cancelled_assignment_completion_evidence', evidenceId, revision, manifestSha256,
+        worktreeHeadSha: worktree.headSha, worktreeManifest: files,
+      }, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: record };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  resolveCancelledCompletionEvidence(input: {
+    taskId: string;
+    evidenceId: string;
+    targetAssignmentId: string;
+    decision: SupervisionCompletionEvidenceDecision;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionCompletionEvidence> {
+    const task = this.getTaskRecord(normalizeTaskString(input.taskId) ?? '');
+    const evidenceId = normalizeTaskString(input.evidenceId);
+    const targetAssignmentId = normalizeTaskString(input.targetAssignmentId);
+    const reason = normalizeTaskString(input.reason);
+    if (!task || !evidenceId || !targetAssignmentId || !reason
+      || !SUPERVISION_COMPLETION_EVIDENCE_DECISIONS.includes(input.decision)) return { ok: false, reason: 'invalid' };
+    const evidence = this.listCompletionEvidence(task.taskId)
+      .find((record) => record.evidenceId === evidenceId);
+    const target = this.getAssignment(targetAssignmentId);
+    if (!evidence || !target || target.taskId !== task.taskId || target.role !== 'implementer') {
+      return { ok: false, reason: 'not_found' };
+    }
+    const expectedStatus = input.decision === 'adopt' ? 'adopted' : 'discarded';
+    if (evidence.status !== 'pending') {
+      return evidence.status === expectedStatus && evidence.adoptedByAssignmentId === targetAssignmentId
+        ? { ok: true, value: evidence, replay: true }
+        : { ok: false, reason: 'conflicting_replay' };
+    }
+    if (isTerminalSupervisionTaskStatus(target.status)) return { ok: false, reason: 'invalid_transition' };
+    const now = input.now ?? Date.now();
+    const resolved: PersistedSupervisionCompletionEvidence = {
+      ...evidence,
+      status: expectedStatus,
+      adoptedByAssignmentId: targetAssignmentId,
+      resolutionReason: reason,
+      resolvedAt: now,
+    };
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const locked = this.listCompletionEvidence(task.taskId)
+        .find((record) => record.evidenceId === evidenceId);
+      if (!locked || locked.status !== 'pending') {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
+      this.#writeCompletionEvidence(resolved);
+      const blocker = input.decision === 'adopt' ? JSON.stringify({
+        kind: 'cancelled_completion_evidence', actionRequired: 'adopt',
+        evidenceId, sourceAssignmentId: evidence.sourceAssignmentId,
+        revision: evidence.revision, manifestSha256: evidence.manifestSha256,
+        worktreePath: evidence.worktreePath,
+      }) : undefined;
+      this.#writeAssignment({
+        ...target,
+        ...(input.decision === 'adopt' ? {
+          scopeFiles: normalizeTaskArray([...target.scopeFiles, ...evidence.files.map((file) => file.path)]),
+        } : {}),
+        blocker,
+        updatedAt: now,
+      }, this.#taskEventFor(target.status), {
+        source: 'completion_evidence_resolution', evidenceId, decision: input.decision, reason,
+      });
+      const lockedTask = this.getTaskRecord(task.taskId) ?? task;
+      const conflictBlocker = safeJsonParseObject(lockedTask.blocker);
+      if (conflictBlocker?.kind === 'cancelled_completion_evidence_conflict'
+        && conflictBlocker.evidenceId === evidenceId) {
+        const previousBlocker = typeof conflictBlocker.previousBlocker === 'string'
+          ? conflictBlocker.previousBlocker
+          : undefined;
+        this.#writeTask({ ...lockedTask, blocker: previousBlocker, updatedAt: now }, this.#taskEventFor(lockedTask.status), {
+          source: 'completion_evidence_resolution', evidenceId, decision: input.decision,
+        });
+      }
+      this.#db.exec('COMMIT');
+      return { ok: true, value: resolved };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   finishAssignment(input: SupervisionTaskAssignmentFinishInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const existing = this.getAssignment(input.assignmentId);
     if (!existing) return { ok: false, reason: 'not_found' };
@@ -2991,12 +3357,15 @@ export class SupervisionTaskRegistry {
   }
 
   /**
-   * Finalize one exact audited integration from structured Git/CI evidence.
+   * Finalize one exact audited integration from structured Git evidence and
+   * optional exact-commit CI evidence.
    *
    * This is intentionally separate from finishAssignment: a normal worker or
    * auditor may close only its own assignment, while the canonical
    * integration owner may advance the whole task only after the authoritative
-   * audit/Git/CI identities agree. Caller path metadata is recorded but never
+   * audit/Git identities agree. CI is consumed only when it identifies this
+   * exact commit; every outcome, including failure, is auxiliary smoke and
+   * never a finalization gate. Caller path metadata is recorded but never
    * grants or vetoes finalization. All checks run before BEGIN IMMEDIATE; the status
    * chain, provenance, lease cleanup, claim cleanup and archive projection are
    * then one idempotent transaction.
@@ -3020,6 +3389,7 @@ export class SupervisionTaskRegistry {
     const externalRunId = normalizeTaskString(input.externalRunId);
     const externalHeadSha = normalizeTaskString(input.externalHeadSha)?.toLowerCase();
     const externalTaskId = normalizeTaskString(input.externalTaskId);
+    const ciResult = input.ciResult;
     const ownedFiles = normalizeTaskArray(input.ownedFiles);
     const stagedPaths = normalizeTaskArray(input.stagedPaths);
     const manifest = [...input.integrationManifest]
@@ -3032,13 +3402,19 @@ export class SupervisionTaskRegistry {
       && assignment.status !== 'cancelled'
       && assignment.status !== 'recovered'
     ));
+    const hasExactCiRun = ciResult === 'success' || ciResult === 'pending' || ciResult === 'failure';
+    // An exact queried run must bind to this commit so stale CI cannot leak
+    // across revisions. Its outcome is deliberately absent from the authority
+    // predicate below: PASS plus exact Git/push evidence controls finalization.
+    const ciEvidenceValid = hasExactCiRun
+      ? Boolean(externalRunId && externalHeadSha
+        && FINALIZATION_COMMIT_RE.test(externalHeadSha!))
+      : !externalRunId && !externalHeadSha && !externalTaskId;
     const structurallyValid = Boolean(
       revision && auditAttemptId && auditRevision && integrationOwner && commitSha
-      && pushRemoteRef && externalRunId && externalHeadSha
-      && input.verdict === 'PASS' && input.ciResult === 'success'
+      && pushRemoteRef && input.verdict === 'PASS' && ciEvidenceValid
       && (input.pushResult === 'pushed' || input.pushResult === 'already_present')
       && FINALIZATION_COMMIT_RE.test(commitSha)
-      && FINALIZATION_COMMIT_RE.test(externalHeadSha)
       && pushRemoteRef.startsWith('refs/')
     );
     if (!structurallyValid) return { ok: false, reason: 'invalid' };
@@ -3056,10 +3432,10 @@ export class SupervisionTaskRegistry {
       pushResult: input.pushResult,
       pushRemoteRef: pushRemoteRef!,
       stagedPaths,
-      externalRunId: externalRunId!,
-      externalHeadSha: externalHeadSha!,
+      ...(externalRunId ? { externalRunId } : {}),
+      ...(externalHeadSha ? { externalHeadSha } : {}),
       ...(externalTaskId ? { externalTaskId } : {}),
-      ciResult: 'success',
+      ...(ciResult ? { ciResult } : {}),
       finalizedAt,
     };
     if (task.status === 'finalized') {
@@ -3091,9 +3467,12 @@ export class SupervisionTaskRegistry {
     if (owner.auditAttemptId !== auditAttemptId || owner.verdict?.trim().toUpperCase() !== 'PASS') {
       return { ok: false, reason: 'old_audit_attempt' };
     }
-    if (owner.externalRunId !== externalRunId || owner.externalHeadSha?.toLowerCase() !== externalHeadSha
+    if (hasExactCiRun && (owner.externalRunId !== externalRunId
+      || owner.externalHeadSha?.toLowerCase() !== externalHeadSha
       || (externalTaskId && owner.externalTaskId !== externalTaskId)
-      || externalHeadSha !== commitSha) return { ok: false, reason: 'manifest_mismatch' };
+      || externalHeadSha !== commitSha)) {
+      return { ok: false, reason: 'manifest_mismatch' };
+    }
     // A daemon restart changes the runtime identity tuple while preserving the
     // durable Brain session name. task_start therefore creates a fresh owner
     // assignment, but older registries leave the task pointer on the previous
@@ -3222,7 +3601,11 @@ export class SupervisionTaskRegistry {
           } : {}),
           ...(status === 'committed' ? { commitSha } : {}),
           ...(status === 'pushed' ? { pushResult: input.pushResult, pushRemoteRef } : {}),
-          ...(status === 'finalized' ? { externalRunId, externalHeadSha, ciResult: 'success' } : {}),
+          ...(status === 'finalized' ? {
+            ...(externalRunId ? { externalRunId } : {}),
+            ...(externalHeadSha ? { externalHeadSha } : {}),
+            ...(ciResult ? { ciResult } : {}),
+          } : {}),
         };
         this.#writeAssignment(ownerRecord, this.#taskEventFor(status), payload);
         this.#writeTask(taskRecord, this.#taskEventFor(status), payload);
@@ -4404,13 +4787,21 @@ export class SupervisionTaskRegistry {
     if (activeAuditor) return undefined;
     const retiredMatches = assignments.filter((assignment) => (
       assignment.role === 'auditor'
-      && assignment.status === 'cancelled'
+      && (assignment.status === 'cancelled' || assignment.status === 'finalized')
       && !assignment.leaseId
       && assignment.auditAttemptId === attemptId
       && assignment.auditRevision === revision
       && assignment.verdict?.trim().toUpperCase() === 'REWORK'
     ));
     if (retiredMatches.length !== 1) return undefined;
+    const exactReworkReceipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.assignmentId === retiredMatches[0]!.assignmentId
+      && receipt.attemptId === attemptId
+      && receipt.revision === revision
+      && receipt.receiptKind === 'final'
+      && receipt.verdict === 'REWORK'
+    ));
+    if (exactReworkReceipts.length !== 1) return undefined;
 
     const assignmentPass = assignments.some((assignment) => (
       assignment.auditRevision === revision
@@ -4953,19 +5344,369 @@ export class SupervisionTaskRegistry {
       // A record state is a projection of durable authority, never a gate the
       // model must unlock in a fixed order. Each branch below closes a specific
       // way a task can otherwise sit still forever.
-      for (const step of [
-        this.#convergeStaleCoordinator(task, now, options.resolveAuthoritativeBrain),
-        this.#convergeRevisionProjection(task, now),
-        this.#convergeValidatedHandoff(task, now),
-        this.#convergeRecordedAuditReceipt(task, now),
-        this.#convergeConsumedFinalizedImplementer(task, now),
-        this.#convergeStaleFinalizedOwnerProjection(task, now),
-        this.#convergeConsumedFinalizedOwnerPointer(task, now),
-      ]) {
-        if (step) actions.push(step);
+      // Every convergence branch may atomically rewrite the task aggregate.
+      // Evaluate sequentially against a fresh row; eagerly evaluating the old
+      // array against `task` let a later projection spread a stale snapshot
+      // over a just-committed zero-byte base bind in the same tick.
+      const steps = [
+        (current: PersistedSupervisionTaskRecord) => this.#convergeCancelledCompletionEvidence(
+          current, now, options.inspectAssignmentWorktree,
+        ),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeAlreadyPresentDelivery(
+          current, now, options.inspectAssignmentWorktree,
+        ),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeStaleCoordinator(
+          current, now, options.resolveAuthoritativeBrain,
+        ),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeExactReworkTarget(current, now),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeZeroByteBaseRevision(
+          current, now, options.inspectAssignmentWorktree,
+        ),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeRevisionProjection(current, now),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeValidatedHandoff(current, now),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeRecordedAuditReceipt(current, now),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeConsumedFinalizedImplementer(current, now),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeStaleFinalizedOwnerProjection(current, now),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeConsumedFinalizedOwnerPointer(current, now),
+      ];
+      let current = task;
+      for (const runStep of steps) {
+        if (isTerminalSupervisionTaskStatus(current.status)) break;
+        const step = runStep(current);
+        if (!step) continue;
+        actions.push(step);
+        // A returned action is the branch's durable mutation signal. Refresh
+        // only at that boundary: this prevents a later branch from spreading
+        // a stale aggregate over the mutation without multiplying read/inspect
+        // work by every no-op step in a bounded backlog scan.
+        const refreshed = this.getTaskRecord(candidateId);
+        if (!refreshed || isTerminalSupervisionTaskStatus(refreshed.status)) break;
+        current = refreshed;
       }
     }
     return actions;
+  }
+
+  /**
+   * Event-driven convergence for one freshly validated assignment. Periodic
+   * scanning remains a restart backstop, but a unique next step must not wait
+   * for its cursor or heartbeat interval.
+   */
+  convergeValidatedAssignment(
+    assignmentId: string,
+    now = Date.now(),
+    inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
+  ): SupervisionLifecycleConvergenceAction[] {
+    const assignment = this.getAssignment(assignmentId);
+    const task = assignment ? this.getTaskRecord(assignment.taskId) : undefined;
+    if (!assignment || !task || assignment.validationState !== 'passed') return [];
+    const actions: SupervisionLifecycleConvergenceAction[] = [];
+    const zeroByte = this.#convergeZeroByteBaseRevision(task, now, inspect);
+    if (zeroByte) actions.push(zeroByte);
+    const refreshedTask = this.getTaskRecord(task.taskId);
+    if (!refreshedTask) return actions;
+    const handoff = this.#convergeValidatedHandoff(refreshedTask, now);
+    if (handoff) actions.push(handoff);
+    return actions;
+  }
+
+  /** Event-driven exact-object repair used by the Brain recovery ingress. */
+  convergeExactReworkAssignment(
+    assignmentId: string,
+    now = Date.now(),
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const assignment = this.getAssignment(assignmentId);
+    const task = assignment ? this.getTaskRecord(assignment.taskId) : undefined;
+    if (!task) return undefined;
+    const converged = this.#convergeExactReworkTarget(task, now, assignmentId);
+    if (converged) return converged;
+    const refreshed = this.getAssignment(assignmentId);
+    const refreshedTask = this.getTaskRecord(task.taskId);
+    const revision = normalizeTaskString(refreshedTask?.currentRevision);
+    if (!refreshed || !refreshedTask || !revision
+      || refreshedTask.status !== 'rework' || refreshed.status !== 'rework'
+      || !refreshed.leaseId || refreshed.auditRevision !== revision
+      || !refreshed.auditAttemptId || refreshed.verdict?.trim().toUpperCase() !== 'REWORK') return undefined;
+    const receipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.revision === revision && receipt.attemptId === refreshed.auditAttemptId
+      && receipt.receiptKind === 'final' && receipt.verdict === 'REWORK'
+    ));
+    if (receipts.length !== 1) return undefined;
+    const auditor = this.getAssignment(receipts[0]!.assignmentId);
+    if (!auditor || auditor.role !== 'auditor'
+      || !['cancelled', 'finalized'].includes(auditor.status)
+      || auditor.leaseId) return undefined;
+    return { taskId: task.taskId, assignmentId, action: 'restore_exact_rework_implementer' };
+  }
+
+  #convergeCancelledCompletionEvidence(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+    inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    if (!inspect) return undefined;
+    const pending = this.listCompletionEvidence(task.taskId)
+      .filter((record) => record.status === 'pending');
+    if (pending.length !== 1) return undefined;
+    const evidence = pending[0]!;
+    const source = this.getAssignment(evidence.sourceAssignmentId);
+    if (!source || source.status !== 'cancelled') return undefined;
+    const successors = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.assignmentId !== source.assignmentId
+      && assignment.required
+      && assignment.role === 'implementer'
+      && !isTerminalSupervisionTaskStatus(assignment.status)
+      && !this.#assignmentConsumedByFinalization(task, assignment)
+    ));
+    if (successors.length !== 1) return undefined;
+    const successor = successors[0]!;
+    const snapshot = inspect(successor);
+    if (!snapshot) return undefined;
+    const successorHasFileEvents = this.listFileEvents(task.taskId)
+      .some((event) => event.assignmentId === successor.assignmentId);
+    if (snapshot.files.length === 0 && !successorHasFileEvents) {
+      if (successor.blocker && !successor.blocker.includes(evidence.evidenceId)) return undefined;
+      const adopted: PersistedSupervisionCompletionEvidence = {
+        ...evidence,
+        status: 'adopted',
+        adoptedByAssignmentId: successor.assignmentId,
+        resolutionReason: 'replacement_worktree_untouched',
+        resolvedAt: now,
+      };
+      const blocker = JSON.stringify({
+        kind: 'cancelled_completion_evidence', actionRequired: 'adopt',
+        evidenceId: evidence.evidenceId, sourceAssignmentId: source.assignmentId,
+        revision: evidence.revision, manifestSha256: evidence.manifestSha256,
+        worktreePath: evidence.worktreePath,
+      });
+      this.#db.exec('BEGIN IMMEDIATE');
+      try {
+        const locked = this.listCompletionEvidence(task.taskId)
+          .find((record) => record.evidenceId === evidence.evidenceId);
+        const lockedSuccessor = this.getAssignment(successor.assignmentId);
+        if (!locked || locked.status !== 'pending' || !lockedSuccessor
+          || isTerminalSupervisionTaskStatus(lockedSuccessor.status)) {
+          this.#db.exec('ROLLBACK');
+          return undefined;
+        }
+        this.#writeCompletionEvidence(adopted);
+        this.#writeAssignment({
+          ...lockedSuccessor,
+          scopeFiles: normalizeTaskArray([...lockedSuccessor.scopeFiles, ...evidence.files.map((file) => file.path)]),
+          blocker,
+          updatedAt: now,
+        }, this.#taskEventFor(lockedSuccessor.status), {
+          source: 'lifecycle_convergence_cancelled_completion_adoption',
+          evidenceId: evidence.evidenceId,
+        });
+        this.#db.exec('COMMIT');
+      } catch (error) {
+        this.#db.exec('ROLLBACK');
+        throw error;
+      }
+      return {
+        taskId: task.taskId,
+        assignmentId: successor.assignmentId,
+        action: 'adopt_cancelled_completion_evidence',
+      };
+    }
+
+    const existingConflict = safeJsonParseObject(task.blocker);
+    if (existingConflict?.kind === 'cancelled_completion_evidence_conflict'
+      && existingConflict.evidenceId === evidence.evidenceId) return undefined;
+    const blocker = JSON.stringify({
+      kind: 'cancelled_completion_evidence_conflict', actionRequired: 'adopt_or_discard',
+      evidenceId: evidence.evidenceId, sourceAssignmentId: source.assignmentId,
+      successorAssignmentId: successor.assignmentId, revision: evidence.revision,
+      manifestSha256: evidence.manifestSha256, worktreePath: evidence.worktreePath,
+      ...(task.blocker ? { previousBlocker: task.blocker } : {}),
+    });
+    this.#writeTask({ ...task, blocker, updatedAt: now }, this.#taskEventFor(task.status), {
+      source: 'lifecycle_convergence_cancelled_completion_conflict',
+      evidenceId: evidence.evidenceId,
+      successorAssignmentId: successor.assignmentId,
+    });
+    return {
+      taskId: task.taskId,
+      assignmentId: successor.assignmentId,
+      action: 'request_cancelled_completion_evidence_decision',
+    };
+  }
+
+  /**
+   * Restore the unique implementation object named by an immutable exact
+   * REWORK receipt. This closes the tsk_73i split (task=rework while its sole
+   * implementer remained ready_for_audit) without minting a replacement.
+   */
+  #convergeExactReworkTarget(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+    requestedAssignmentId?: string,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    if (!['validated', 'ready_for_audit', 'rework'].includes(task.status)) return undefined;
+    const revision = normalizeTaskString(task.currentRevision);
+    if (!revision) return undefined;
+    const implementers = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.required && assignment.role === 'implementer'
+      && assignment.status !== 'cancelled' && assignment.status !== 'finalized'
+      && (!requestedAssignmentId || assignment.assignmentId === requestedAssignmentId)
+    ));
+    if (implementers.length !== 1) return undefined;
+    const implementer = implementers[0]!;
+    if (!['validated', 'ready_for_audit'].includes(implementer.status)
+      || (normalizeTaskString(implementer.auditRevision)
+        && normalizeTaskString(implementer.auditRevision) !== revision)) return undefined;
+    const receipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.revision === revision && receipt.receiptKind === 'final'
+    ));
+    if (receipts.length !== 1 || receipts[0]!.verdict !== 'REWORK') return undefined;
+    const receipt = receipts[0]!;
+    if (normalizeTaskString(implementer.auditAttemptId)
+      && normalizeTaskString(implementer.auditAttemptId) !== receipt.attemptId) return undefined;
+    const auditor = this.getAssignment(receipt.assignmentId);
+    if (!auditor || auditor.role !== 'auditor'
+      || !['cancelled', 'finalized'].includes(auditor.status)
+      || Boolean(auditor.leaseId)
+      || auditor.auditRevision !== revision
+      || auditor.auditAttemptId !== receipt.attemptId
+      || auditor.verdict?.trim().toUpperCase() !== 'REWORK') return undefined;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedTask = this.getTaskRecord(task.taskId);
+      const lockedImplementer = this.getAssignment(implementer.assignmentId);
+      const lockedReceipts = this.listAuditReceipts(task.taskId).filter((candidate) => (
+        candidate.revision === revision && candidate.receiptKind === 'final'
+      ));
+      if (!lockedTask || !lockedImplementer
+        || !['validated', 'ready_for_audit'].includes(lockedImplementer.status)
+        || lockedReceipts.length !== 1
+        || lockedReceipts[0]!.receiptId !== receipt.receiptId
+        || lockedReceipts[0]!.verdict !== 'REWORK') {
+        this.#db.exec('ROLLBACK');
+        return undefined;
+      }
+      const leaseId = lockedImplementer.leaseId || this.#mintLeaseId();
+      this.#writeAssignment({
+        ...lockedImplementer,
+        status: 'rework',
+        leaseId,
+        generation: lockedImplementer.leaseId
+          ? lockedImplementer.generation : lockedImplementer.generation + 1,
+        auditAttemptId: receipt.attemptId,
+        auditRevision: revision,
+        verdict: 'REWORK',
+        blocker: receipt.findings,
+        updatedAt: now,
+      }, 'rework', {
+        source: 'lifecycle_convergence_exact_rework_receipt',
+        receiptId: receipt.receiptId,
+        auditAttemptId: receipt.attemptId,
+        revision,
+      });
+      if (lockedTask.status !== 'rework') {
+        this.#writeTask({ ...lockedTask, status: 'rework', updatedAt: now }, 'rework', {
+          source: 'lifecycle_convergence_exact_rework_receipt',
+          assignmentId: lockedImplementer.assignmentId,
+          receiptId: receipt.receiptId,
+          auditAttemptId: receipt.attemptId,
+          revision,
+        });
+      }
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+    return {
+      taskId: task.taskId,
+      assignmentId: implementer.assignmentId,
+      action: 'restore_exact_rework_implementer',
+    };
+  }
+
+  #convergeAlreadyPresentDelivery(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+    inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    if (!inspect || !['implementing', 'passed', 'ready_for_integration'].includes(task.status)
+      || task.finalization) return undefined;
+    const revision = normalizeTaskString(task.currentRevision);
+    if (!revision) return undefined;
+    const candidates = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.required && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+      && ['implementing', 'passed', 'ready_for_integration'].includes(assignment.status)
+      && assignment.auditRevision === revision
+      && Boolean(assignment.auditAttemptId)
+      && assignment.verdict?.trim().toUpperCase() === 'PASS'
+      && assignment.crossVendorAuditPassed === true
+    ));
+    if (candidates.length !== 1) return undefined;
+    const assignment = candidates[0]!;
+    const passReceipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.receiptKind === 'final' && receipt.verdict === 'PASS'
+      && receipt.revision === revision && receipt.attemptId === assignment.auditAttemptId
+    ));
+    if (passReceipts.length !== 1) return undefined;
+    const auditor = this.getAssignment(passReceipts[0]!.assignmentId);
+    if (!auditor || auditor.role !== 'auditor' || auditor.status !== 'finalized'
+      || auditor.auditRevision !== revision || auditor.auditAttemptId !== assignment.auditAttemptId
+      || auditor.verdict?.trim().toUpperCase() !== 'PASS' || auditor.leaseId
+      || auditor.identity.providerFamily === assignment.identity.providerFamily) return undefined;
+    const snapshot = inspect(assignment);
+    if (!snapshot?.matchingRemoteCommitSha || !snapshot.matchingRemoteRef
+      || !FINALIZATION_COMMIT_RE.test(snapshot.matchingRemoteCommitSha)) return undefined;
+    const blocker = JSON.stringify({
+      kind: 'already_present_delivery', missingEvidence: 'structured_finalization_receipt',
+      assignmentId: assignment.assignmentId, revision,
+      auditAttemptId: assignment.auditAttemptId,
+      commitSha: snapshot.matchingRemoteCommitSha,
+      pushRemoteRef: snapshot.matchingRemoteRef,
+    });
+    if (task.commitSha === snapshot.matchingRemoteCommitSha
+      && task.pushRemoteRef === snapshot.matchingRemoteRef
+      && task.blocker === blocker) return undefined;
+    if ((task.commitSha && task.commitSha !== snapshot.matchingRemoteCommitSha)
+      || (task.pushRemoteRef && task.pushRemoteRef !== snapshot.matchingRemoteRef)
+      || (task.blocker && task.blocker !== blocker)) return undefined;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedTask = this.getTaskRecord(task.taskId);
+      const lockedAssignment = this.getAssignment(assignment.assignmentId);
+      const lockedReceipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+        receipt.receiptKind === 'final' && receipt.verdict === 'PASS'
+        && receipt.revision === revision && receipt.attemptId === assignment.auditAttemptId
+      ));
+      if (!lockedTask || lockedTask.updatedAt !== task.updatedAt || lockedTask.finalization
+        || !lockedAssignment || lockedAssignment.updatedAt !== assignment.updatedAt
+        || lockedReceipts.length !== 1 || lockedReceipts[0]!.receiptId !== passReceipts[0]!.receiptId) {
+        this.#db.exec('ROLLBACK');
+        return undefined;
+      }
+      this.#writeAssignment({
+        ...lockedAssignment, status: 'ready_for_integration', leaseId: '', blocker: undefined, updatedAt: now,
+      }, 'ready_for_integration', {
+        source: 'lifecycle_convergence_already_present_delivery', revision,
+        commitSha: snapshot.matchingRemoteCommitSha, pushRemoteRef: snapshot.matchingRemoteRef,
+      });
+      this.#writeTask({
+        ...lockedTask,
+        status: 'ready_for_integration',
+        commitSha: snapshot.matchingRemoteCommitSha,
+        pushRemoteRef: snapshot.matchingRemoteRef,
+        blocker,
+        updatedAt: now,
+      }, 'ready_for_integration', {
+        source: 'lifecycle_convergence_already_present_delivery',
+        assignmentId: assignment.assignmentId,
+        revision,
+      });
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+    return { taskId: task.taskId, assignmentId: assignment.assignmentId, action: 'record_already_present_delivery' };
   }
 
   /**
@@ -5053,6 +5794,85 @@ export class SupervisionTaskRegistry {
   }
 
   /**
+   * Bind a genuinely zero-byte reviewed task to the Git object it actually
+   * reviewed.  This is not a synthetic revision: `headSha` comes from a
+   * read-only inspection of the assignment's authoritative worktree.  The
+   * transaction is deliberately narrow and fail-closed on any changed byte,
+   * revision disagreement, finalization evidence, or ambiguous implementer.
+   *
+   * This closes the tsk_7ax shape where validation was durable but FINISHED
+   * returned `old_revision` forever because neither projection carried a
+   * revision.  A no-op review still has an immutable Git object and can proceed
+   * through the same audit protocol as a byte-changing revision.
+   */
+  #convergeZeroByteBaseRevision(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+    inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    if (!inspect || normalizeTaskString(task.currentRevision)
+      || task.finalization || task.commitSha || task.pushRemoteRef) return undefined;
+    const candidates = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.required
+      && assignment.role === 'implementer'
+      && assignment.validationState === 'passed'
+      && assignment.status === 'validated'
+      && !normalizeTaskString(assignment.auditRevision)
+    ));
+    if (candidates.length !== 1) return undefined;
+    const assignment = candidates[0]!;
+    const snapshot = inspect(assignment);
+    if (!snapshot || !FINALIZATION_COMMIT_RE.test(snapshot.headSha)
+      || snapshot.files.length !== 0
+      || snapshot.stagedPaths.length !== 0
+      || snapshot.conflictedPaths.length !== 0
+      || snapshot.untrackedPaths.length !== 0
+      || (normalizeTaskString(task.baseRevision)
+        && normalizeTaskString(task.baseRevision) !== snapshot.headSha)) return undefined;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedTask = this.getTaskRecord(task.taskId);
+      const lockedAssignment = this.getAssignment(assignment.assignmentId);
+      if (!lockedTask || !lockedAssignment
+        || normalizeTaskString(lockedTask.currentRevision)
+        || normalizeTaskString(lockedAssignment.auditRevision)
+        || lockedAssignment.status !== 'validated'
+        || lockedAssignment.validationState !== 'passed') {
+        this.#db.exec('ROLLBACK');
+        return undefined;
+      }
+      this.#writeTask({
+        ...lockedTask,
+        baseRevision: normalizeTaskString(lockedTask.baseRevision) ?? snapshot.headSha,
+        currentRevision: snapshot.headSha,
+        updatedAt: now,
+      }, this.#taskEventFor(lockedTask.status), {
+        source: 'lifecycle_convergence_zero_byte_base_revision',
+        revision: snapshot.headSha,
+        worktreePath: snapshot.worktreePath,
+      });
+      this.#writeAssignment({
+        ...lockedAssignment,
+        auditRevision: snapshot.headSha,
+        updatedAt: now,
+      }, this.#taskEventFor(lockedAssignment.status), {
+        source: 'lifecycle_convergence_zero_byte_base_revision',
+        revision: snapshot.headSha,
+        worktreePath: snapshot.worktreePath,
+      });
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+    return {
+      taskId: task.taskId,
+      assignmentId: assignment.assignmentId,
+      action: 'bind_zero_byte_base_revision',
+    };
+  }
+
+  /**
    * A recorded `validationState: passed` is the durable fact. Requiring the
    * model to re-issue record_validation before anything may move is exactly the
    * ordering gate that strands tasks, so project it forward instead.
@@ -5065,14 +5885,27 @@ export class SupervisionTaskRegistry {
       assignment.role !== 'auditor'
       && assignment.role !== 'coordinator'
       && assignment.validationState === 'passed'
+      && assignment.status !== 'ready_for_audit'
       && canTransitionSupervisionTaskStatus(assignment.status, 'ready_for_audit')
     ));
     if (!target) return undefined;
     // Passed validation is the durable fact; waiting for a separate open_audit
-    // call is the ordering gate that strands the object.
-    this.#writeAssignment({ ...target, status: 'ready_for_audit', updatedAt: now }, 'ready_for_audit', {
-      source: 'lifecycle_convergence_validated_handoff',
+    // call is the ordering gate that strands the object. Use the ordinary
+    // atomic FINISHED transition so task + assignment + lease + revision move
+    // together. Writing only the assignment produced the tsk_79u split:
+    // task=validated while assignment=ready_for_audit.
+    const refreshedTask = this.getTaskRecord(task.taskId);
+    const refreshedTarget = this.getAssignment(target.assignmentId);
+    const revision = normalizeTaskString(refreshedTarget?.auditRevision)
+      ?? normalizeTaskString(refreshedTask?.currentRevision);
+    if (!refreshedTarget || !revision) return undefined;
+    const finished = this.finishAssignment({
+      assignmentId: refreshedTarget.assignmentId,
+      identity: refreshedTarget.identity,
+      revision,
+      now,
     });
+    if (!finished.ok) return undefined;
     return { taskId: task.taskId, assignmentId: target.assignmentId, action: 'project_validated_handoff' };
   }
 
@@ -5394,11 +6227,12 @@ export class SupervisionTaskRegistry {
     if (!parent || parent.status !== 'finalized') return undefined;
     const finalization = parent.finalization;
     if (!finalization?.externalRunId || !finalization.externalHeadSha) return undefined;
+    const externalHeadSha = finalization.externalHeadSha;
 
     const delivered = this.listAssignments(task.taskId).filter((assignment) => (
       assignment.role === 'implementer'
       && assignment.externalRunId === finalization.externalRunId
-      && assignment.externalHeadSha?.toLowerCase() === finalization.externalHeadSha.toLowerCase()
+      && assignment.externalHeadSha?.toLowerCase() === externalHeadSha.toLowerCase()
     ));
     if (delivered.length !== 1) return undefined;
 
@@ -5484,16 +6318,21 @@ export class SupervisionTaskRegistry {
       if (typeof row?.assignmentId === 'string') return { ok: true, value: assignment, replay: true };
     }
     const declaredInAssignment = assignment.scopeFiles.includes(path);
-    const recordedAssignment = declaredInAssignment ? assignment : {
+    // A late transport/file event is evidence, not lifecycle authority. Once
+    // the assignment is terminal it may be recorded, but it must not expand
+    // scope, refresh updatedAt, revive a lease or alter the cancelled object.
+    const immutableAssignment = isTerminalSupervisionTaskStatus(assignment.status);
+    const recordedAssignment = declaredInAssignment || immutableAssignment ? assignment : {
       ...assignment,
       scopeFiles: normalizeTaskArray([...assignment.scopeFiles, path]),
       updatedAt: now,
     };
     this.#db.prepare(`INSERT INTO supervision_task_file_events (task_id, assignment_id, file_path, operation, before_hash, after_hash, tool, source, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(assignment.taskId, assignment.assignmentId, path, input.operation, normalizeTaskString(input.beforeHash) ?? null, normalizeTaskString(input.afterHash) ?? null, normalizeTaskString(input.tool) ?? null, normalizeTaskString(input.source) ?? null, input.identity.sessionName, input.identity.sessionInstanceId, input.identity.runtimeEpoch, input.identity.agentType, input.identity.providerFamily, JSON.stringify({ declaredInAssignment }), now);
-    if (declaredInAssignment) {
+    if (declaredInAssignment || immutableAssignment) {
       this.#appendEvent(assignment.taskId, assignment.assignmentId, 'file_event', assignment.status, {
         path, operation: input.operation, declaredInAssignment,
+        ...(immutableAssignment ? { terminalEvidenceOnly: true } : {}),
       }, now);
     } else {
       this.#writeAssignment(recordedAssignment, 'file_event', {
@@ -5501,7 +6340,7 @@ export class SupervisionTaskRegistry {
       });
     }
     if (idem) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, assignment_id, created_at) VALUES (?, ?, ?, ?)').run(idem, assignment.taskId, assignment.assignmentId, now);
-    return { ok: true, value: { ...recordedAssignment, updatedAt: now } };
+    return { ok: true, value: immutableAssignment ? recordedAssignment : { ...recordedAssignment, updatedAt: now } };
   }
 
   reconcileScope(input: SupervisionTaskScopeReconcileInput): SupervisionTaskRegistryResult<SupervisionTaskSnapshot> {
@@ -5531,7 +6370,7 @@ export class SupervisionTaskRegistry {
 
   clear(): void {
     if (this.#closed) return;
-    this.#db.exec('DELETE FROM supervision_audit_attestations; DELETE FROM supervision_task_events; DELETE FROM supervision_task_file_events; DELETE FROM supervision_task_file_claims; DELETE FROM supervision_task_idempotency; DELETE FROM supervision_task_assignments; DELETE FROM supervision_tasks;');
+    this.#db.exec('DELETE FROM supervision_worktree_gc_state; DELETE FROM supervision_task_completion_evidence; DELETE FROM supervision_audit_receipts; DELETE FROM supervision_audit_attestations; DELETE FROM supervision_task_events; DELETE FROM supervision_task_file_events; DELETE FROM supervision_task_file_claims; DELETE FROM supervision_task_idempotency; DELETE FROM supervision_task_assignments; DELETE FROM supervision_tasks;');
   }
 }
 

@@ -31,6 +31,7 @@ import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 import { advanceSupervisionTaskAfterAuditReceipt } from './supervision-convergence-wire.js';
+import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const inFlight = new Map<string, Promise<DelegationReplyIngressResult>>();
@@ -507,6 +508,39 @@ export async function submitDelegationReply(input: {
           ? AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH
           : AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID;
     return { ok: false, error };
+  }
+  // The reply is durable before this observation. A worker cancelled in the
+  // race between its final tool call and completion cannot update lifecycle,
+  // but its immutable worktree manifest must remain adoptable by the same task.
+  if (received.record.taskId && received.record.assignmentId) {
+    try {
+      const registry = getSupervisionTaskRegistry();
+      const assignment = registry.getAssignment(received.record.assignmentId);
+      if (assignment?.taskId === received.record.taskId
+        && assignment.status === 'cancelled'
+        && assignment.role !== 'auditor'
+        && assignment.role !== 'coordinator') {
+        const inspected = inspectSupervisionAssignmentWorktree({
+          sessionName: assignment.identity.sessionName,
+          assignmentId: assignment.assignmentId,
+        });
+        if (inspected.ok && inspected.snapshot.files.length > 0) {
+          const recorded = registry.recordCancelledCompletionEvidence({
+            taskId: assignment.taskId,
+            assignmentId: assignment.assignmentId,
+            identity: assignment.identity,
+            revision: assignment.auditRevision,
+            worktreeSnapshot: inspected.snapshot,
+            evidence: 'task-bound delegation reply observed after cancellation',
+          });
+          if (!recorded.ok) logger.warn({ assignmentId: assignment.assignmentId, reason: recorded.reason },
+            'Late cancelled assignment completion evidence was retained only in its worktree');
+        }
+      }
+    } catch (error) {
+      logger.warn({ error, assignmentId: received.record.assignmentId },
+        'Late cancelled assignment completion evidence observation failed');
+    }
   }
   const currentOrigin = boundIdentity(getSession(received.record.origin.sessionName));
   const currentTarget = boundIdentity(getSession(received.record.target.sessionName));

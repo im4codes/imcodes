@@ -1140,6 +1140,7 @@ describe('SupervisionBroker', () => {
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
       waitForRetry,
+      random: () => 1,
     });
     const snapshot = normalizeSessionSupervisionSnapshot({
       mode: SUPERVISION_MODE.SUPERVISED,
@@ -1163,6 +1164,46 @@ describe('SupervisionBroker', () => {
     expect(provider.createSession.mock.calls[0]?.[0].sessionKey)
       .not.toBe(provider.createSession.mock.calls[1]?.[0].sessionKey);
     expect(provider.endSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses bounded exponential full jitter, respects retry-after, and stops after the retry limit', async () => {
+    class RateLimitedProvider extends FakeProvider {
+      override send = vi.fn(async (sessionId: string): Promise<void> => {
+        queueMicrotask(() => {
+          for (const cb of this.errorHandlers) cb(sessionId, {
+            code: PROVIDER_ERROR_CODES.RATE_LIMITED,
+            message: 'API Error: 529 Overloaded',
+            recoverable: true,
+            details: { retryAfterMs: 400 },
+          });
+        });
+      });
+    }
+    const provider = new RateLimitedProvider([]);
+    const waitForRetry = vi.fn(async () => {});
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      waitForRetry,
+      random: () => 0.5,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 5_000,
+      promptVersion: 'supervision_decision_v1', maxParseRetries: 1,
+      auditMode: 'audit', maxAuditLoops: 2, taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await expect(broker.decide({
+      snapshot, taskRequest: 'continue exact task', assistantResponse: 'unfinished',
+    })).resolves.toMatchObject({
+      decision: 'ask_human',
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailure: { code: PROVIDER_ERROR_CODES.RATE_LIMITED, attempts: 3 },
+    });
+    // Full-jitter ceilings are 250 then 500. Retry-After=400 is a floor, so
+    // both waits are 400; a third retry is never scheduled.
+    expect(waitForRetry.mock.calls.map(([delay]) => delay)).toEqual([400, 400]);
+    expect(provider.createSession).toHaveBeenCalledTimes(3);
   });
 
   it('does not retry permanent supervisor authentication failures', async () => {
@@ -1221,6 +1262,7 @@ describe('SupervisionBroker', () => {
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
       now: () => now,
+      random: () => 1,
       waitForRetry: async () => { now += 29_750; },
     });
     const snapshot = normalizeSessionSupervisionSnapshot({

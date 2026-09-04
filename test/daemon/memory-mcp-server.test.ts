@@ -329,7 +329,10 @@ describe('memory MCP stdio server', () => {
       expect(Object.keys(finishSchema?.properties ?? {}).sort()).toEqual([
         ...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
         ...SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
+        'externalRunId',
+        'externalHeadSha',
         'externalTaskId',
+        'ciResult',
         'evidence',
       ].sort());
       const sendSchema = listed.tools.find(
