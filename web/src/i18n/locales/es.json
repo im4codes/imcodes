@@ -3490,6 +3490,7 @@
     "actual_size": "Tamaño real",
     "fullscreen": "Pantalla completa",
     "video_label": "Escritorio en vivo de {{machine}}",
+    "media_recovering": "Restaurando la imagen en vivo · se muestra el último fotograma recibido",
     "connecting": "Conectando al escritorio de Windows…",
     "connection_progress": "Progreso de la conexión",
     "connection_retrying": "Reintento {{count}} en cola; preparando una nueva negociación",

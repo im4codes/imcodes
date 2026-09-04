@@ -3490,6 +3490,7 @@
     "actual_size": "Actual size",
     "fullscreen": "Fullscreen",
     "video_label": "Live desktop of {{machine}}",
+    "media_recovering": "Restoring the live picture · showing the last received frame",
     "connecting": "Connecting to the Windows desktop…",
     "connection_progress": "Connection progress",
     "connection_retrying": "Reconnect {{count}} is queued; preparing a new handshake",

@@ -3490,6 +3490,7 @@
     "actual_size": "實際大小",
     "fullscreen": "全螢幕",
     "video_label": "{{machine}} 的即時桌面",
+    "media_recovering": "正在恢復即時畫面 · 目前顯示最後收到的畫面",
     "connecting": "正在連線至 Windows 桌面…",
     "connection_progress": "連線進度",
     "connection_retrying": "第 {{count}} 次重連已排程，準備重新握手",

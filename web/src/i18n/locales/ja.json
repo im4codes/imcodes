@@ -3489,6 +3489,7 @@
     "actual_size": "実寸",
     "fullscreen": "全画面",
     "video_label": "{{machine}} のライブデスクトップ",
+    "media_recovering": "ライブ映像を復旧中 · 最後に受信したフレームを表示しています",
     "connecting": "Windows デスクトップに接続中…",
     "connection_progress": "接続の進行状況",
     "connection_retrying": "再接続 {{count}} 回目を待機中。ハンドシェイクをやり直します",

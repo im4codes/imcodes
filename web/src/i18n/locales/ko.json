@@ -3489,6 +3489,7 @@
     "actual_size": "실제 크기",
     "fullscreen": "전체 화면",
     "video_label": "{{machine}}의 실시간 데스크톱",
+    "media_recovering": "실시간 화면 복구 중 · 마지막으로 수신한 프레임을 표시합니다",
     "connecting": "Windows 데스크톱에 연결 중…",
     "connection_progress": "연결 진행 상황",
     "connection_retrying": "{{count}}번째 재연결 대기 중 · 핸드셰이크를 다시 시작합니다",

@@ -9411,7 +9411,8 @@ button.quick-agent-delegation-preset.active {
   .cron-history-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cron-execution-output-body { padding: 13px 12px 22px; font-size: 12px; }
 }
-/* Production remote desktop: native video, no canvas/frame polling. */
+/* Production remote desktop keeps native video as the live path. A bounded
+   last-presented-frame canvas is used only during an explicit media gap. */
 .remote-desktop-floating-shell {
   min-width: min(640px, 100vw);
   min-height: min(420px, 100vh);
@@ -10179,11 +10180,15 @@ button.quick-agent-delegation-preset.active {
   justify-content: flex-start;
 }
 
-.remote-desktop-stage video {
+.remote-desktop-stage video,
+.remote-desktop-last-frame {
   display: block;
   flex: none;
   max-width: none;
   max-height: none;
+}
+
+.remote-desktop-stage video {
   background: #000;
   /* The video is a presentation surface, never an input surface. Native video
      elements do not deliver uncaptured hover movement consistently across
@@ -10192,6 +10197,46 @@ button.quick-agent-delegation-preset.active {
   pointer-events: none;
   user-select: none;
   -webkit-user-drag: none;
+}
+
+/* The native video remains the live fast path. This canvas contains one
+   bounded last-presented sample and is composited only while the browser says
+   its live media surface is temporarily unavailable. */
+.remote-desktop-last-frame {
+  position: absolute;
+  z-index: 2;
+  opacity: 0;
+  object-fit: contain;
+  pointer-events: none;
+  filter: brightness(.72) blur(1.25px);
+  transition: opacity 160ms ease-out, filter 220ms ease-out;
+}
+
+.remote-desktop-stage.is-fit .remote-desktop-last-frame {
+  width: 100%;
+  height: 100%;
+}
+
+.remote-desktop-last-frame.is-visible {
+  opacity: 1;
+}
+
+.remote-desktop-media-recovery {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 18px;
+  translate: -50% 0;
+  max-width: calc(100% - 32px);
+  padding: 7px 11px;
+  border: 1px solid rgb(126 206 239 / 34%);
+  border-radius: 999px;
+  color: #d9f5ff;
+  background: rgb(4 19 30 / 78%);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 28%);
+  font-size: 12px;
+  pointer-events: none;
+  backdrop-filter: blur(8px);
 }
 
 /* Keep a regular HTML hit surface above the native video compositor. Some

@@ -37,6 +37,11 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { PendingWebRtcCandidates, toWebRtcIceServers } from '@shared/webrtc-connectivity.js';
 import type { RemoteDesktopBootstrapProof } from '@shared/remote-desktop-access.js';
 import { apiFetch, getApiBaseUrl } from './api.js';
+import {
+  REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
+  recordRemoteDesktopBrowserDiagnostic,
+  type RemoteDesktopBrowserDiagnosticInput,
+} from './remote-desktop-browser-diagnostics.js';
 
 const DATA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 /**
@@ -483,6 +488,7 @@ export class RemoteDesktopClient {
     timer: ReturnType<typeof setTimeout>;
   }>();
   private controlRejectionId = 0;
+  private diagnosticTrackCleanup: (() => void) | null = null;
   private snapshot: RemoteDesktopSnapshot = {
     state: REMOTE_DESKTOP_STATE.AUTHORIZING,
     mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
@@ -506,6 +512,10 @@ export class RemoteDesktopClient {
 
   current(): Readonly<RemoteDesktopSnapshot> {
     return this.snapshot;
+  }
+
+  private recordBrowserDiagnostic(event: RemoteDesktopBrowserDiagnosticInput): void {
+    recordRemoteDesktopBrowserDiagnostic(this.serverId, event);
   }
 
   async start(reconnectAttempt = 0): Promise<void> {
@@ -1109,6 +1119,33 @@ export class RemoteDesktopClient {
     if (capabilities) applyH264ReceiveCodecPreference(transceiver, capabilities.codecs);
     this.createDataChannels(peer);
     peer.addEventListener('track', (event) => {
+      this.diagnosticTrackCleanup?.();
+      const track = event.track;
+      const recordTrackState = (
+        type: typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK
+          | typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_MUTE
+          | typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_UNMUTE
+          | typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_ENDED,
+      ) => {
+        if (this.stopped || this.peer !== peer) return;
+        this.recordBrowserDiagnostic({
+          type,
+          trackMuted: track.muted,
+          trackReadyState: track.readyState,
+        });
+      };
+      const onMute = () => recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_MUTE);
+      const onUnmute = () => recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_UNMUTE);
+      const onEnded = () => recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_ENDED);
+      track.addEventListener('mute', onMute);
+      track.addEventListener('unmute', onUnmute);
+      track.addEventListener('ended', onEnded);
+      this.diagnosticTrackCleanup = () => {
+        track.removeEventListener('mute', onMute);
+        track.removeEventListener('unmute', onUnmute);
+        track.removeEventListener('ended', onEnded);
+      };
+      recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK);
       const stream = event.streams[0] ?? new MediaStream([event.track]);
       this.publish({ stream });
     });
@@ -1128,6 +1165,12 @@ export class RemoteDesktopClient {
     });
     peer.addEventListener('connectionstatechange', () => {
       if (this.peer !== peer) return;
+      this.recordBrowserDiagnostic({
+        type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_CONNECTION_STATE,
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState,
+      });
       if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
         if (peer.connectionState === 'failed') void this.restartIce(peer);
         else this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
@@ -1148,6 +1191,24 @@ export class RemoteDesktopClient {
         this.iceRestartInFlight = false;
         this.startStats(peer);
       }
+    });
+    peer.addEventListener('iceconnectionstatechange', () => {
+      if (this.stopped || this.peer !== peer) return;
+      this.recordBrowserDiagnostic({
+        type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_ICE_STATE,
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState,
+      });
+    });
+    peer.addEventListener('signalingstatechange', () => {
+      if (this.stopped || this.peer !== peer) return;
+      this.recordBrowserDiagnostic({
+        type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_SIGNALING_STATE,
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState,
+      });
     });
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
@@ -1373,6 +1434,32 @@ export class RemoteDesktopClient {
       });
       const inbound = entries.find((value) => value.type === 'inbound-rtp'
         && (value.kind === 'video' || value.mediaType === 'video'));
+      if (inbound) {
+        const diagnosticNumber = (name: string, multiplier = 1): number | undefined => {
+          const value = inbound[name];
+          return typeof value === 'number' && Number.isFinite(value)
+            ? Math.max(0, Math.round(value * multiplier))
+            : undefined;
+        };
+        this.recordBrowserDiagnostic({
+          type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.INBOUND_STATS,
+          connectionState: peer.connectionState,
+          iceConnectionState: peer.iceConnectionState,
+          signalingState: peer.signalingState,
+          bytesReceived: diagnosticNumber('bytesReceived'),
+          packetsReceived: diagnosticNumber('packetsReceived'),
+          framesReceived: diagnosticNumber('framesReceived'),
+          framesDecoded: diagnosticNumber('framesDecoded'),
+          keyFramesDecoded: diagnosticNumber('keyFramesDecoded'),
+          framesDropped: diagnosticNumber('framesDropped'),
+          freezeCount: diagnosticNumber('freezeCount'),
+          totalFreezesDurationMs: diagnosticNumber('totalFreezesDuration', 1_000),
+          jitterBufferDelayMs: diagnosticNumber('jitterBufferDelay', 1_000),
+          jitterBufferEmittedCount: diagnosticNumber('jitterBufferEmittedCount'),
+          documentVisible: this.deps.isDocumentVisible?.()
+            ?? (typeof document === 'undefined' || document.visibilityState === 'visible'),
+        });
+      }
       const quality = this.snapshot.quality;
       const durationMs = Math.max(0, (this.deps.now?.() ?? Date.now()) - this.startedAt);
       if (!inbound || !quality) {
@@ -1755,6 +1842,8 @@ export class RemoteDesktopClient {
     this.keyboardChannel = null;
     this.pointerChannel = null;
     this.peer = null;
+    this.diagnosticTrackCleanup?.();
+    this.diagnosticTrackCleanup = null;
     this.channelsReady = false;
     this.workerInputEnabled = false;
     if (this.statsTimer) clearInterval(this.statsTimer);

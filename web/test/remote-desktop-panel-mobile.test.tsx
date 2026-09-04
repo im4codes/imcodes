@@ -184,6 +184,11 @@ vi.mock('../src/components/FileBrowser.js', () => ({
 import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
 import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 import {
+  REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
+  clearRemoteDesktopBrowserDiagnostics,
+  readRemoteDesktopBrowserDiagnostics,
+} from '../src/remote-desktop-browser-diagnostics.js';
+import {
   DIRECT_FILE_TRANSFER_ERROR,
   DirectFileTransferFailure,
 } from '../src/direct-file-transfer.js';
@@ -341,6 +346,142 @@ async function renderPanel(
 }
 
 describe('RemoteDesktopPanel mobile gestures', () => {
+  it('shows a dimmed last presented frame during a transient media gap and clears it at authority loss', async () => {
+    let presentedCallback: VideoFrameRequestCallback | undefined;
+    const requestFrame = vi.fn((callback: VideoFrameRequestCallback) => {
+      presentedCallback = callback;
+      return 71;
+    });
+    const cancelFrame = vi.fn();
+    const drawImage = vi.fn();
+    const clearRect = vi.fn();
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue({ drawImage, clearRect } as unknown as CanvasRenderingContext2D);
+    Object.defineProperties(HTMLVideoElement.prototype, {
+      requestVideoFrameCallback: { configurable: true, value: requestFrame },
+      cancelVideoFrameCallback: { configurable: true, value: cancelFrame },
+    });
+    clearRemoteDesktopBrowserDiagnostics('server-1');
+    try {
+      const track = Object.assign(new EventTarget(), {
+        muted: false,
+        readyState: 'live' as MediaStreamTrackState,
+      });
+      const stream = {
+        getVideoTracks: () => [track],
+      } as unknown as MediaStream;
+      const rendered = await renderPanel();
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        inputEnabled: true,
+        route: 'direct',
+        displays: [{
+          id: 'display-primary', label: 'Display 1', primary: true, available: true,
+          width: 1920, height: 1080, dpiScale: 2.25, rotation: 0,
+        }],
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 1,
+        stream,
+      }));
+      act(() => presentedCallback?.(100, {} as VideoFrameCallbackMetadata));
+      expect(drawImage).toHaveBeenCalled();
+
+      track.muted = true;
+      act(() => track.dispatchEvent(new Event('mute')));
+      const fallback = rendered.container.querySelector('.remote-desktop-last-frame');
+      expect(fallback?.classList.contains('is-visible')).toBe(true);
+      expect(rendered.container.querySelector('.remote-desktop-media-recovery')?.textContent)
+        .toBe('remote_desktop.media_recovering');
+
+      track.muted = false;
+      act(() => track.dispatchEvent(new Event('unmute')));
+      expect(fallback?.classList.contains('is-visible')).toBe(true);
+      act(() => presentedCallback?.(200, {} as VideoFrameCallbackMetadata));
+      expect(fallback?.classList.contains('is-visible')).toBe(false);
+      act(() => rendered.video.dispatchEvent(new Event('waiting')));
+      expect(fallback?.classList.contains('is-visible')).toBe(true);
+      act(() => presentedCallback?.(1_200, {} as VideoFrameCallbackMetadata));
+      expect(fallback?.classList.contains('is-visible')).toBe(false);
+      expect(readRemoteDesktopBrowserDiagnostics('server-1').map((event) => event.type))
+        .toEqual(expect.arrayContaining([
+          REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FRAME,
+          REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_SHOWN,
+          REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_HIDDEN,
+        ]));
+
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.FAILED,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        inputEnabled: false,
+        displays: [],
+        layoutRevision: 1,
+        // Preserve the MediaStream object to prove the terminal authority
+        // gate itself clears pixels; stream replacement has a separate RED.
+        stream,
+        terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+      }));
+      expect(fallback?.classList.contains('is-visible')).toBe(false);
+      expect(clearRect).toHaveBeenCalled();
+      expect((fallback as HTMLCanvasElement).width).toBe(1);
+    } finally {
+      getContext.mockRestore();
+      delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).requestVideoFrameCallback;
+      delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).cancelVideoFrameCallback;
+    }
+  });
+
+  it('never carries a cached sensitive frame across a route stream replacement', async () => {
+    let presentedCallback: VideoFrameRequestCallback | undefined;
+    Object.defineProperties(HTMLVideoElement.prototype, {
+      requestVideoFrameCallback: {
+        configurable: true,
+        value: (callback: VideoFrameRequestCallback) => { presentedCallback = callback; return 81; },
+      },
+      cancelVideoFrameCallback: { configurable: true, value: vi.fn() },
+    });
+    const clearRect = vi.fn();
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      drawImage: vi.fn(), clearRect,
+    } as unknown as CanvasRenderingContext2D);
+    try {
+      const firstTrack = Object.assign(new EventTarget(), { muted: false, readyState: 'live' });
+      const first = { getVideoTracks: () => [firstTrack] } as unknown as MediaStream;
+      const second = { getVideoTracks: () => [Object.assign(new EventTarget(), {
+        muted: false, readyState: 'live',
+      })] } as unknown as MediaStream;
+      const rendered = await renderPanel();
+      const snapshot = {
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 0,
+        inputEnabled: false,
+        route: 'direct',
+        displays: [],
+        layoutRevision: 1,
+      };
+      act(() => clientHooks[0]!.onSnapshot({ ...snapshot, stream: first }));
+      act(() => presentedCallback?.(100, {} as VideoFrameCallbackMetadata));
+      firstTrack.muted = true;
+      act(() => firstTrack.dispatchEvent(new Event('mute')));
+      await act(async () => { await Promise.resolve(); });
+      expect(rendered.container.querySelector('.remote-desktop-last-frame')?.classList
+        .contains('is-visible')).toBe(true);
+
+      act(() => clientHooks[0]!.onSnapshot({ ...snapshot, stream: second }));
+      const fallback = rendered.container.querySelector('.remote-desktop-last-frame') as HTMLCanvasElement;
+      expect(fallback.classList.contains('is-visible')).toBe(false);
+      expect(fallback.width).toBe(1);
+      expect(clearRect).toHaveBeenCalled();
+    } finally {
+      getContext.mockRestore();
+      delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).requestVideoFrameCallback;
+      delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).cancelVideoFrameCallback;
+    }
+  });
+
   it('clears only the affected workspace host when Server authority is terminally lost', async () => {
     const onAuthorityLost = vi.fn();
     render(<RemoteDesktopPanel
@@ -1459,6 +1600,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       return 41;
     });
     const cancelFrame = vi.fn();
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      drawImage: vi.fn(), clearRect: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
     Object.defineProperties(HTMLVideoElement.prototype, {
       requestVideoFrameCallback: { configurable: true, value: requestFrame },
       cancelVideoFrameCallback: { configurable: true, value: cancelFrame },
@@ -1470,6 +1614,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(requestFrame).toHaveBeenCalledTimes(2);
     rendered.unmount();
     expect(cancelFrame).toHaveBeenCalledWith(41);
+    getContext.mockRestore();
     delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).requestVideoFrameCallback;
     delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).cancelVideoFrameCallback;
   });

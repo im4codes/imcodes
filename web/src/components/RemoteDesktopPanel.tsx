@@ -51,6 +51,11 @@ import { formatByteRate, formatByteSize } from '../util/byte-size.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
+import {
+  REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
+  recordRemoteDesktopBrowserDiagnostic,
+  type RemoteDesktopBrowserDiagnosticEvent,
+} from '../remote-desktop-browser-diagnostics.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { FileBrowser } from './FileBrowser.js';
@@ -325,12 +330,15 @@ export function RemoteDesktopPanel({
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
   const [mediaPresented, setMediaPresented] = useState(false);
+  const [mediaRecovering, setMediaRecovering] = useState(false);
+  const [hasCachedFrame, setHasCachedFrame] = useState(false);
   const [desktopMaximized, setDesktopMaximized] = useState(false);
   const [controlNotice, setControlNotice] = useState<{ id: number; text: string } | null>(null);
   const clientRef = useRef<RemoteDesktopManagedConnection | null>(null);
   const ownedConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   const presentationRef = useRef<object>({});
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const lastFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -369,11 +377,115 @@ export function RemoteDesktopPanel({
   const suppressDisplayTabClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousInputEnabledRef = useRef(false);
   const mediaPresentedRef = useRef(false);
+  const mediaRecoveringRef = useRef(false);
+  const hasCachedFrameRef = useRef(false);
+  const lastCachedFrameAtRef = useRef(Number.NEGATIVE_INFINITY);
+  const lastVideoDiagnosticAtRef = useRef(Number.NEGATIVE_INFINITY);
   const forwardedCommandCodesRef = useRef(new Set<string>());
   const suppressedCommandCodesRef = useRef(new Set<string>());
   const syntheticCommandControlRef = useRef(false);
   const commandMiddleDragPointerRef = useRef<number | null>(null);
   const forwardedPasteShortcutAtRef = useRef(0);
+
+  const recordVideoDiagnostic = useCallback((
+    type: RemoteDesktopBrowserDiagnosticEvent,
+    callbackNowMs?: number,
+    metadata?: VideoFrameCallbackMetadata,
+  ) => {
+    const video = videoRef.current;
+    recordRemoteDesktopBrowserDiagnostic(machine.serverId, {
+      type,
+      videoReadyState: video?.readyState,
+      videoNetworkState: video?.networkState,
+      videoCurrentTimeMs: video && Number.isFinite(video.currentTime)
+        ? Math.max(0, Math.round(video.currentTime * 1_000))
+        : undefined,
+      videoWidth: video?.videoWidth,
+      videoHeight: video?.videoHeight,
+      callbackNowMs: callbackNowMs === undefined ? undefined : Math.round(callbackNowMs),
+      mediaTimeMs: metadata && Number.isFinite(metadata.mediaTime)
+        ? Math.max(0, Math.round(metadata.mediaTime * 1_000))
+        : undefined,
+      presentedFrames: metadata && Number.isFinite(metadata.presentedFrames)
+        ? Math.max(0, Math.round(metadata.presentedFrames))
+        : undefined,
+      documentVisible: document.visibilityState === 'visible',
+    });
+  }, [machine.serverId]);
+
+  const clearCachedFrame = useCallback(() => {
+    const canvas = lastFrameCanvasRef.current;
+    const hadFrame = hasCachedFrameRef.current;
+    if (canvas && hadFrame) {
+      canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+      // Resetting the backing store releases the pixel buffer immediately;
+      // hiding a canvas alone would retain the last remote desktop in memory.
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+    hasCachedFrameRef.current = false;
+    const wasRecovering = mediaRecoveringRef.current;
+    mediaRecoveringRef.current = false;
+    lastCachedFrameAtRef.current = Number.NEGATIVE_INFINITY;
+    if (hadFrame) setHasCachedFrame(false);
+    if (wasRecovering) setMediaRecovering(false);
+    if (hadFrame) {
+      recordVideoDiagnostic(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_CLEARED);
+    }
+  }, [recordVideoDiagnostic]);
+
+  const showCachedFrame = useCallback((type: RemoteDesktopBrowserDiagnosticEvent) => {
+    recordVideoDiagnostic(type);
+    if (!hasCachedFrameRef.current || mediaRecoveringRef.current) return;
+    mediaRecoveringRef.current = true;
+    setMediaRecovering(true);
+    recordVideoDiagnostic(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_SHOWN);
+  }, [recordVideoDiagnostic]);
+
+  const cachePresentedFrame = useCallback((
+    video: HTMLVideoElement,
+    callbackNowMs: number,
+    metadata: VideoFrameCallbackMetadata,
+  ) => {
+    if (video.videoWidth <= 0 || video.videoHeight <= 0) return;
+    if (!hasCachedFrameRef.current
+      || callbackNowMs - lastCachedFrameAtRef.current >= 250) {
+      const canvas = lastFrameCanvasRef.current;
+      const context = canvas?.getContext('2d');
+      if (canvas && context) {
+        const scale = Math.min(1, 1_280 / video.videoWidth, 720 / video.videoHeight);
+        const width = Math.max(1, Math.round(video.videoWidth * scale));
+        const height = Math.max(1, Math.round(video.videoHeight * scale));
+        if (canvas.width !== width) canvas.width = width;
+        if (canvas.height !== height) canvas.height = height;
+        try {
+          context.drawImage(video, 0, 0, width, height);
+          lastCachedFrameAtRef.current = callbackNowMs;
+          if (!hasCachedFrameRef.current) {
+            hasCachedFrameRef.current = true;
+            setHasCachedFrame(true);
+          }
+        } catch {
+          // A browser may temporarily refuse a draw while the decoder changes
+          // surfaces. Keep the already cached frame; never replace it with
+          // blank pixels merely because this refresh failed.
+        }
+      }
+    }
+    if (callbackNowMs - lastVideoDiagnosticAtRef.current >= 1_000) {
+      lastVideoDiagnosticAtRef.current = callbackNowMs;
+      recordVideoDiagnostic(
+        REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FRAME,
+        callbackNowMs,
+        metadata,
+      );
+    }
+    if (mediaRecoveringRef.current) {
+      mediaRecoveringRef.current = false;
+      setMediaRecovering(false);
+      recordVideoDiagnostic(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_HIDDEN);
+    }
+  }, [recordVideoDiagnostic]);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
   const supportsPathHandleTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_PATH_HANDLE_CAPABILITY));
   const fetchSourcePath = supportsPathHandleTransfer
@@ -498,21 +610,77 @@ export function RemoteDesktopPanel({
   }, [displayModeMenu]);
 
   useEffect(() => {
+    // A new MediaStream can represent another execution route. Never carry a
+    // cached screen across that authority boundary, even if both routes point
+    // at the same display.
+    clearCachedFrame();
     mediaPresentedRef.current = false;
     setMediaPresented(false);
     if (videoRef.current && videoRef.current.srcObject !== snapshot.stream) {
       videoRef.current.srcObject = snapshot.stream;
     }
-  }, [snapshot.stream]);
+    const track = snapshot.stream
+      && typeof snapshot.stream.getVideoTracks === 'function'
+      ? snapshot.stream.getVideoTracks()[0]
+      : undefined;
+    if (!track) return;
+    const onMute = () => showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_WAITING);
+    const onEnded = () => clearCachedFrame();
+    track.addEventListener('mute', onMute);
+    track.addEventListener('ended', onEnded);
+    return () => {
+      track.removeEventListener('mute', onMute);
+      track.removeEventListener('ended', onEnded);
+    };
+  }, [clearCachedFrame, showCachedFrame, snapshot.stream]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onWaiting = () => showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_WAITING);
+    const onStalled = () => showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_STALLED);
+    const onEmptied = () => snapshot.stream
+      ? showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_EMPTIED)
+      : clearCachedFrame();
+    const onPlaying = () => recordVideoDiagnostic(
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_PLAYING,
+    );
+    video.addEventListener('waiting', onWaiting);
+    video.addEventListener('stalled', onStalled);
+    video.addEventListener('emptied', onEmptied);
+    video.addEventListener('playing', onPlaying);
+    return () => {
+      video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('stalled', onStalled);
+      video.removeEventListener('emptied', onEmptied);
+      video.removeEventListener('playing', onPlaying);
+    };
+  }, [clearCachedFrame, recordVideoDiagnostic, showCachedFrame, snapshot.stream]);
+
+  useEffect(() => {
+    if (snapshot.state === REMOTE_DESKTOP_STATE.STOPPING
+      || snapshot.state === REMOTE_DESKTOP_STATE.STOPPED
+      || snapshot.state === REMOTE_DESKTOP_STATE.FAILED
+      || snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED
+      || snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY
+      || snapshot.error === REMOTE_DESKTOP_ERROR.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.ACCESS_DENIED) {
+      clearCachedFrame();
+    }
+  }, [clearCachedFrame, snapshot.error, snapshot.state, snapshot.terminalReason]);
+
+  useEffect(() => () => clearCachedFrame(), [clearCachedFrame]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video || typeof video.requestVideoFrameCallback !== 'function') return;
     let disposed = false;
     let callbackId: number | null = null;
-    const onPresentedFrame = () => {
+    const onPresentedFrame: VideoFrameRequestCallback = (now, metadata) => {
       if (disposed) return;
       if (video.videoWidth > 0 && video.videoHeight > 0) {
+        cachePresentedFrame(video, now, metadata);
         if (!mediaPresentedRef.current) {
           mediaPresentedRef.current = true;
           setMediaPresented(true);
@@ -524,9 +692,9 @@ export function RemoteDesktopPanel({
     callbackId = video.requestVideoFrameCallback(onPresentedFrame);
     return () => {
       disposed = true;
-      if (callbackId !== null) video.cancelVideoFrameCallback(callbackId);
+      if (callbackId !== null) video.cancelVideoFrameCallback?.(callbackId);
     };
-  }, []);
+  }, [cachePresentedFrame]);
 
   useEffect(() => {
     const refresh = () => setViewportGeometryRevision((current) => current + 1);
@@ -1957,6 +2125,7 @@ export function RemoteDesktopPanel({
         <div
           ref={stageRef}
           class={`remote-desktop-stage is-${viewScale} ${snapshot.inputEnabled ? 'is-controlling' : 'is-viewing'}`}
+          aria-busy={mediaRecovering || undefined}
           tabIndex={snapshot.inputEnabled ? 0 : -1}
           onPointerMove={onStagePointerMove}
           onMouseMove={onStageMouseMove}
@@ -2016,6 +2185,9 @@ export function RemoteDesktopPanel({
             muted
             draggable={false}
             onLoadedData={() => {
+              recordVideoDiagnostic(
+                REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_LOADED_DATA,
+              );
               if (!mediaPresentedRef.current) {
                 mediaPresentedRef.current = true;
                 setMediaPresented(true);
@@ -2030,7 +2202,24 @@ export function RemoteDesktopPanel({
             }}
             aria-label={t('remote_desktop.video_label', { machine: machine.displayName })}
           />
-          {currentStreamPresented && (
+          <canvas
+            ref={lastFrameCanvasRef}
+            class={`remote-desktop-last-frame ${mediaRecovering && hasCachedFrame ? 'is-visible' : ''}`.trim()}
+            style={{
+              ...(viewScale === 'actual' && selectedDisplay
+                ? { width: `${selectedDisplay.width}px`, height: `${selectedDisplay.height}px` }
+                : {}),
+              transform: `translate3d(${viewport.x}px, ${viewport.y}px, 0) scale(${viewport.scale})`,
+              transformOrigin: 'center center',
+            }}
+            aria-hidden="true"
+          />
+          {mediaRecovering && hasCachedFrame && (
+            <div class="remote-desktop-media-recovery" role="status" aria-live="polite">
+              {t('remote_desktop.media_recovering')}
+            </div>
+          )}
+          {currentStreamPresented && !mediaRecovering && (
             <div
               class="remote-desktop-input-surface"
               data-testid="remote-desktop-input-surface"

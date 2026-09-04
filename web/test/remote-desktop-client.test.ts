@@ -23,6 +23,11 @@ import {
   isRemoteDesktopKeyAllowed,
   prioritizeH264ReceiveCodecs,
 } from '../src/remote-desktop-client.js';
+import {
+  REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
+  clearRemoteDesktopBrowserDiagnostics,
+  readRemoteDesktopBrowserDiagnostics,
+} from '../src/remote-desktop-browser-diagnostics.js';
 
 function videoCodec(mimeType: string, sdpFmtpLine?: string): RTCRtpCodec {
   return { mimeType, clockRate: 90_000, sdpFmtpLine };
@@ -132,6 +137,8 @@ class FakePeer extends EventTarget {
   localDescription: RTCSessionDescription | null = null;
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
+  iceConnectionState: RTCIceConnectionState = 'new';
+  signalingState: RTCSignalingState = 'stable';
   channels = new Map<string, FakeDataChannel>();
   candidates: RTCIceCandidateInit[] = [];
   failRemoteDescription = false;
@@ -187,6 +194,100 @@ beforeEach(() => {
 });
 
 describe('RemoteDesktopClient', () => {
+  it('records track, peer/ICE and decoded-frame evidence in one bounded browser ring', async () => {
+    vi.useFakeTimers();
+    clearRemoteDesktopBrowserDiagnostics('controlled-win');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-diagnostics',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_diagnos1',
+      capability: 'd'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+
+    const track = Object.assign(new EventTarget(), {
+      id: 'track-is-not-recorded', muted: false, readyState: 'live' as MediaStreamTrackState,
+    });
+    peer.dispatchEvent(Object.assign(new Event('track'), {
+      track,
+      streams: [{ id: 'stream-is-not-recorded' }],
+    }));
+    track.muted = true;
+    track.dispatchEvent(new Event('mute'));
+    track.muted = false;
+    track.dispatchEvent(new Event('unmute'));
+    peer.connectionState = 'connected';
+    peer.iceConnectionState = 'connected';
+    peer.dispatchEvent(new Event('connectionstatechange'));
+    peer.dispatchEvent(new Event('iceconnectionstatechange'));
+    peer.stats = [{
+      type: 'inbound-rtp', kind: 'video', bytesReceived: 12_345,
+      packetsReceived: 234, framesReceived: 120, framesDecoded: 119,
+      keyFramesDecoded: 3, framesDropped: 1, freezeCount: 2,
+      totalFreezesDuration: 1.25, jitterBufferDelay: 0.75,
+      jitterBufferEmittedCount: 118, timestamp: 2_000,
+    }];
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const events = readRemoteDesktopBrowserDiagnostics('controlled-win');
+    expect(events.map((event) => event.type)).toEqual(expect.arrayContaining([
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK,
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_MUTE,
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_UNMUTE,
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_CONNECTION_STATE,
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_ICE_STATE,
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.INBOUND_STATS,
+    ]));
+    expect(events.find((event) => (
+      event.type === REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.INBOUND_STATS
+    ))).toMatchObject({
+      bytesReceived: 12_345,
+      packetsReceived: 234,
+      framesReceived: 120,
+      framesDecoded: 119,
+      keyFramesDecoded: 3,
+      framesDropped: 1,
+      freezeCount: 2,
+      totalFreezesDurationMs: 1_250,
+      jitterBufferDelayMs: 750,
+      jitterBufferEmittedCount: 118,
+    });
+    expect(JSON.stringify(events)).not.toContain('track-is-not-recorded');
+    expect(JSON.stringify(events)).not.toContain('stream-is-not-recorded');
+    const eventCountAtStop = events.length;
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    track.muted = true;
+    track.dispatchEvent(new Event('mute'));
+    peer.connectionState = 'failed';
+    peer.dispatchEvent(new Event('connectionstatechange'));
+    expect(readRemoteDesktopBrowserDiagnostics('controlled-win')).toHaveLength(eventCountAtStop);
+    vi.useRealTimers();
+  });
+
   it('retries a weak signaling path and resumes the same peer without remounting its stream', async () => {
     vi.useFakeTimers();
     try {
