@@ -62,6 +62,10 @@ describe('quick phrase suggestions', () => {
   it('opens only when a hash is the first composer character', () => {
     expect(matchQuickPhraseTrigger('#')).toBe('');
     expect(matchQuickPhraseTrigger('#err')).toBe('err');
+    expect(matchQuickPhraseTrigger('#1')).toBe('1');
+    expect(matchQuickPhraseTrigger('#1:')).toBeNull();
+    expect(matchQuickPhraseTrigger('#1:(/tmp/upload.png)')).toBeNull();
+    expect(matchQuickPhraseTrigger('#12:(C:\\Users\\me\\upload.png)')).toBeNull();
     expect(matchQuickPhraseTrigger('please #err')).toBeNull();
     expect(matchQuickPhraseTrigger(' #err')).toBeNull();
     expect(matchQuickPhraseTrigger('#err\nnext')).toBeNull();

@@ -1188,9 +1188,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
+  // Quick phrases are user-input affordances. Programmatic composer writes and
+  // paste may contain attachment-like `#...` text, so suppress their one
+  // corresponding input event without disabling later keyboard edits.
+  const quickPhraseInputSuppressRef = useRef(false);
   const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | 'model' | null>(null);
   const [quickSuggestionQuery, setQuickSuggestionQuery] = useState('');
   const [quickSuggestionHighlightIdx, setQuickSuggestionHighlightIdx] = useState(0);
+  const closeQuickSuggestions = useCallback(() => {
+    setQuickSuggestionKind(null);
+    setQuickSuggestionQuery('');
+    setQuickSuggestionHighlightIdx(0);
+  }, []);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);
@@ -1601,15 +1610,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // pending-prefill effect uses.
       el.dispatchEvent(new Event('input', { bubbles: true }));
     };
+    const handleNativeBlur = () => {
+      setComposerFocused(false);
+      closeQuickSuggestions();
+    };
     el.addEventListener('compositionstart', handleCompositionStart);
     el.addEventListener('compositionupdate', markImeActivity);
     el.addEventListener('compositionend', handleCompositionEnd);
+    el.addEventListener('blur', handleNativeBlur);
     return () => {
       el.removeEventListener('compositionstart', handleCompositionStart);
       el.removeEventListener('compositionupdate', markImeActivity);
       el.removeEventListener('compositionend', handleCompositionEnd);
+      el.removeEventListener('blur', handleNativeBlur);
     };
-  }, []);
+  }, [closeQuickSuggestions]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1621,6 +1636,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (!pendingPrefillText || !divRef.current) return;
     const nextText = `${readComposerElementText(divRef.current)}${pendingPrefillText}`;
+    quickPhraseInputSuppressRef.current = true;
+    closeQuickSuggestions();
     setComposerElementText(divRef.current, nextText);
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
@@ -1635,7 +1652,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       sel?.addRange(range);
     } catch { /* ignore selection API failures */ }
     onPendingPrefillApplied?.();
-  }, [pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
+  }, [closeQuickSuggestions, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
 
   const clearSendWarning = useCallback(() => {
     if (sendWarningTimerRef.current) {
@@ -1717,6 +1734,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => {
     attachmentDraftRef.current = attachments;
+    closeQuickSuggestions();
     if (!attachmentDraftKey || hydratedAttachmentDraftKey !== attachmentDraftKey) return;
     try {
       if (attachments.length > 0) sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachments));
@@ -1724,7 +1742,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch {
       /* ignore */
     }
-  }, [attachmentDraftKey, attachments, hydratedAttachmentDraftKey]);
+  }, [attachmentDraftKey, attachments, closeQuickSuggestions, hydratedAttachmentDraftKey]);
 
   useEffect(() => subscribeComposerUploadSnapshot(composerUploadKey, setUploadSnapshot), [composerUploadKey]);
 
@@ -2043,6 +2061,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     quickSuggestionQuery,
   ]);
   const quickSuggestionPickerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (quickSuggestionKind === 'phrase' && quickSuggestions.length === 0) {
+      closeQuickSuggestions();
+    }
+  }, [closeQuickSuggestions, quickSuggestionKind, quickSuggestions.length]);
   useEffect(() => {
     if (quickSuggestionKind === null || quickSuggestions.length === 0) return;
     const highlighted = quickSuggestionPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
@@ -2734,6 +2757,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const appendToInput = (paths: string[]) => {
     if (!paths.length) return;
+    closeQuickSuggestions();
     const suffix = paths.join(' ');
     let nextText = suffix;
     if (divRef.current) {
@@ -4248,6 +4272,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       onConfirmedAccepted?: () => void;
     },
   ): 'accepted' | 'pending' | 'rejected' => {
+    closeQuickSuggestions();
     if (!payload) return 'rejected';
     const validationError = getSendValidationError(payload);
     if (validationError) {
@@ -4270,7 +4295,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return 'pending';
     }
     return finalizeSend(payload, options);
-  }, [clearSendWarning, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
+  }, [clearSendWarning, closeQuickSuggestions, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
   const handleSend = useCallback(() => {
     requestSend(buildSendPayload(), { clearComposer: true });
@@ -4622,6 +4647,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleBlur = () => {
     setComposerFocused(false);
+    closeQuickSuggestions();
   };
 
   const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
@@ -4728,6 +4754,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [t]);
 
   const handleRemoveAttachment = useCallback(async (attachment: ComposerAttachmentRecord) => {
+    closeQuickSuggestions();
     const attachmentKey = attachment.id ?? attachment.path;
     if (deletingAttachmentKeys.has(attachmentKey)) return;
     const inferredId = attachment.id ?? attachment.path.split(/[\\/]/).pop();
@@ -4752,12 +4779,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return next;
       });
     }
-  }, [activeSession?.name, composerUploadKey, deletingAttachmentKeys, isShareScopedSession, serverId, t]);
+  }, [activeSession?.name, closeQuickSuggestions, composerUploadKey, deletingAttachmentKeys, isShareScopedSession, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    closeQuickSuggestions();
     await uploadAttachmentFiles(Array.from(files));
-  }, [uploadAttachmentFiles]);
+  }, [closeQuickSuggestions, uploadAttachmentFiles]);
 
   const handleFileDragEnter = useCallback((e: DragEvent) => {
     if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;
@@ -4812,6 +4840,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
     const ce = e as ClipboardEvent;
+    closeQuickSuggestions();
     const files = ce.clipboardData?.files;
     if (files && files.length > 0) {
       e.preventDefault();
@@ -4842,7 +4871,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // input (paste must never open either picker).
     aliasPasteSuppressRef.current = true;
     machinePasteSuppressRef.current = true;
+    quickPhraseInputSuppressRef.current = true;
     document.execCommand('insertText', false, text);
+    queueMicrotask(() => { quickPhraseInputSuppressRef.current = false; });
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
 
@@ -6478,7 +6509,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           />
         )}
 
-        {quickSuggestionKind !== null && activeSession && (
+        {quickSuggestionKind !== null
+          && activeSession
+          && (quickSuggestionKind !== 'phrase' || quickSuggestions.length > 0) && (
           <div
             ref={quickSuggestionPickerRef}
             class="controls-slash-picker"
@@ -6666,7 +6699,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onFocus={handleFocus}
             onBlur={handleBlur}
-            onInput={() => {
+            onInput={(event) => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());
               publishComposerText(currentText);
@@ -6678,9 +6711,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               }
               // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
               const text = currentText;
+              const inputIsComposing = imeComposingRef.current
+                || (event as InputEvent).isComposing === true;
+              const suppressQuickPhrase = quickPhraseInputSuppressRef.current;
+              quickPhraseInputSuppressRef.current = false;
 
-              const modelTrigger = imeComposingRef.current ? null : matchModelCommandTrigger(text);
-              const slashTrigger = imeComposingRef.current ? null : matchSlashCommandTrigger(text);
+              const modelTrigger = inputIsComposing ? null : matchModelCommandTrigger(text);
+              const slashTrigger = inputIsComposing ? null : matchSlashCommandTrigger(text);
               if (modelTrigger !== null) {
                 setQuickSuggestionKind('model');
                 setQuickSuggestionQuery(modelTrigger);
@@ -6690,14 +6727,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 setQuickSuggestionQuery(slashTrigger);
                 setQuickSuggestionHighlightIdx(0);
               } else {
-                const phraseTrigger = imeComposingRef.current ? null : matchQuickPhraseTrigger(text);
-                if (phraseTrigger !== null) {
+                const phraseTrigger = inputIsComposing || suppressQuickPhrase
+                  ? null
+                  : matchQuickPhraseTrigger(text);
+                const hasPhraseSuggestions = phraseTrigger !== null
+                  && getQuickPhraseSuggestions(quickData.data.phrases, phraseTrigger).length > 0;
+                if (phraseTrigger !== null && hasPhraseSuggestions) {
                   setQuickSuggestionKind('phrase');
                   setQuickSuggestionQuery(phraseTrigger);
                   setQuickSuggestionHighlightIdx(0);
                 } else if (quickSuggestionKind !== null) {
-                  setQuickSuggestionKind(null);
-                  setQuickSuggestionQuery('');
+                  closeQuickSuggestions();
                 }
               }
 

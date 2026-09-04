@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { CONTROLLED_NODE_ID_MAX, CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
 
 vi.mock('react-i18next', () => ({
@@ -69,6 +69,7 @@ vi.mock('../../src/hooks/useMachines.js', () => ({
 
 vi.mock('../../src/api.js', () => ({
   uploadFile: vi.fn(),
+  deleteAttachment: vi.fn().mockResolvedValue(undefined),
   fetchSessionSupervisorDefaults: vi.fn().mockResolvedValue(null),
   saveSessionSupervisorDefaults: vi.fn().mockResolvedValue({}),
   getUserPref: vi.fn().mockResolvedValue(null),
@@ -107,6 +108,7 @@ const makeQuickData = () => ({
 
 describe('SessionControls quick input integration', () => {
   beforeEach(() => {
+    sessionStorage.clear();
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 900 });
   });
@@ -468,6 +470,261 @@ describe('SessionControls quick input integration', () => {
 
     input.textContent = 'text #err';
     fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
+
+  it('does not treat attachment references or unmatched hashes as quick phrases', () => {
+    const { container } = render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+
+    for (const text of [
+      '#1',
+      '#1:',
+      '#1:(/home/ai/.imcodes/uploads/image.png)',
+      '#12:(C:\\Users\\me\\image.png)',
+      '#phrase-that-does-not-exist',
+    ]) {
+      input.textContent = text;
+      fireEvent.input(input);
+      expect(container.querySelector('.controls-slash-picker')).toBeNull();
+    }
+  });
+
+  it('opens quick phrases only for active user input, not prefill or paste, and reopens on the next typed edit', async () => {
+    const quickData = {
+      ...makeQuickData(),
+      data: { history: [], sessionHistory: {}, commands: [], phrases: ['error recovery'] },
+    };
+    const applied = vi.fn();
+    const props = {
+      ws: { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any,
+      activeSession: makeSession(),
+      quickData,
+      sessions: [],
+      subSessions: [],
+      serverId: 'srv-1',
+      onPendingPrefillApplied: applied,
+    };
+    const { container, rerender } = render(<SessionControls {...props} />);
+    const input = screen.getByRole('textbox');
+
+    input.textContent = '#er';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-quick-phrase="error recovery"]')).toBeTruthy();
+
+    rerender(<SessionControls {...props} pendingPrefillText="r" />);
+    await waitFor(() => expect(applied).toHaveBeenCalledTimes(1));
+    expect(input.textContent).toBe('#err');
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    input.textContent = '';
+    document.execCommand = vi.fn(() => true);
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [],
+        getData: (type: string) => type === 'text/plain' ? '#err' : '',
+      },
+    });
+    input.textContent = '#err';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    input.textContent = '#erro';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-quick-phrase="error recovery"]')).toBeTruthy();
+  });
+
+  it('keeps IME-owned hashes closed until composition commits, then preserves keyboard selection', () => {
+    const quickData = {
+      ...makeQuickData(),
+      data: { history: [], sessionHistory: {}, commands: [], phrases: ['修复错误'] },
+    };
+    const { container } = render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={quickData}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+    input.focus();
+    input.textContent = '#修';
+    fireEvent.compositionStart(input);
+    fireEvent.input(input, { isComposing: true });
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    fireEvent.compositionEnd(input);
+    fireEvent.input(input, { isComposing: false });
+    expect(container.querySelector('[data-quick-phrase="修复错误"]')).toBeTruthy();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(input.textContent).toBe('修复错误');
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
+
+  it('closes a matching phrase panel when appendToInput inserts a programmatic reference', async () => {
+    let emitMessage: ((message: any) => void) | undefined;
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      fsListDir: vi.fn(() => 'openspec-request'),
+      onMessage: vi.fn((callback: (message: any) => void) => {
+        emitMessage = callback;
+        return () => {};
+      }),
+    } as any;
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession({ agentType: 'codex', projectDir: '/repo' })}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+    input.textContent = '#err';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-quick-phrase="check errors"]')).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle('OpenSpec changes'));
+    emitMessage?.({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'attachment-fix', path: '/repo/openspec/changes/attachment-fix', isDir: true, hidden: false },
+      ],
+    });
+    const changeButton = await screen.findByRole('button', { name: 'attachment-fix' });
+    expect(container.querySelector('[data-quick-phrase="check errors"]')).toBeTruthy();
+
+    fireEvent.click(changeButton);
+    expect(input.textContent).toBe('#err @openspec/changes/attachment-fix');
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
+
+  it('closes quick phrase suggestions on blur and active-session changes', () => {
+    const props = {
+      ws: { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any,
+      quickData: makeQuickData(),
+      sessions: [],
+      subSessions: [],
+      serverId: 'srv-1',
+    };
+    const { container, rerender } = render(
+      <SessionControls {...props} activeSession={makeSession()} />,
+    );
+    const input = screen.getByRole('textbox');
+    input.focus();
+    input.textContent = '#err';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeTruthy();
+    fireEvent.blur(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    fireEvent.focus(input);
+    input.textContent = '#err';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeTruthy();
+    rerender(<SessionControls {...props} activeSession={makeSession({ name: 'deck_other' })} />);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
+
+  it('closes quick phrase suggestions on Escape and explicit send', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+
+    input.textContent = '#err';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    input.textContent = '#err';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
+
+  it('uses the same attachment guard and compact no-match behavior on mobile', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+
+    input.textContent = '#12:(/home/ai/.imcodes/uploads/mobile.png)';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    input.textContent = '#err';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-quick-phrase="check errors"]')).toBeTruthy();
+
+    input.textContent = '#no-mobile-match';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
+
+  it('closes an open quick phrase list when repeated attachment badges are removed', async () => {
+    sessionStorage.setItem('rcc_draft_attachments_session:deck_main', JSON.stringify([
+      { path: '/tmp/first/same.png', name: 'same.png', seq: 1, id: 'first.png', serverId: 'srv-1' },
+      { path: '/tmp/second/same.png', name: 'same.png', seq: 2, id: 'second.png', serverId: 'srv-1' },
+    ]));
+    const { container } = render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    await waitFor(() => expect(container.querySelectorAll('[data-attachment-seq]')).toHaveLength(2));
+    const input = screen.getByRole('textbox');
+    input.textContent = '#err';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeTruthy();
+
+    fireEvent.click(container.querySelector('[data-attachment-seq="1"] .attachment-badge-remove')!);
+    await waitFor(() => expect(container.querySelectorAll('[data-attachment-seq]')).toHaveLength(1));
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
   });
 });

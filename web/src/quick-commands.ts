@@ -82,7 +82,12 @@ export function matchSlashCommandTrigger(text: string): string | null {
 /** Match a quick phrase query only when `#` is the first composer character. */
 export function matchQuickPhraseTrigger(text: string): string | null {
   const match = /^#([^\r\n]*)$/u.exec(text);
-  return match ? match[1] : null;
+  if (!match) return null;
+  const query = match[1];
+  // Composer attachments use `#<sequence>:(<path>)`. A colon-bearing partial
+  // or complete attachment reference is data, not a quick-phrase trigger.
+  if (/^\d+:/u.test(query)) return null;
+  return query;
 }
 
 /** Match the second level of `/model`, including its initial trailing space. */
