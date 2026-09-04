@@ -171,6 +171,18 @@ export interface SupervisionRegistryPort {
     callerProjectName: string;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
+  rebindValidatedImplementerAssignment?(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: {
+      sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
+      agentType: string; providerFamily: string;
+    };
+    expectedRevision: string;
+    ownedFiles: string[];
+    evidenceManifestSha256: string;
+    reason: string;
+  }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   rebindTaskAssignmentRevision?(input: {
     taskId: string;
     assignmentId: string;
@@ -272,6 +284,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     toStatus: z.enum([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]).optional(),
     assignmentId: z.string().min(1).optional(),
     rebindSessionName: z.string().min(1).optional(),
+    expectedRevision: z.string().min(1).optional(),
     fromRevision: z.string().min(1).optional(),
     toRevision: z.string().min(1).optional(),
     ownedFiles: z.unknown().optional(),
@@ -574,6 +587,7 @@ export function createSupervisionMcpToolHandlers(
       if (!reg) return err('unavailable', 'supervision registry not bound');
       const assignmentId = String(input.assignmentId ?? '').trim();
       const rebindSessionName = String(input.rebindSessionName ?? '').trim();
+      const expectedRevision = String(input.expectedRevision ?? '').trim();
       const fromRevision = String(input.fromRevision ?? '').trim();
       const toRevision = String(input.toRevision ?? '').trim();
       const ownedFiles = Array.isArray(input.ownedFiles)
@@ -589,6 +603,35 @@ export function createSupervisionMcpToolHandlers(
       const idempotencyKey = String(input.idempotencyKey ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
+      const validatedImplementerRecoveryRequested = Boolean(
+        expectedRevision || (rebindSessionName && (ownedFiles.length > 0 || evidenceManifestSha256)),
+      );
+      if (validatedImplementerRecoveryRequested) {
+        if (!assignmentId || !rebindSessionName || !expectedRevision || ownedFiles.length === 0
+          || !evidenceManifestSha256 || fromRevision || toRevision || input.toStatus !== undefined) {
+          return err('validation_failed', 'implementer identity recovery requires assignmentId, rebindSessionName, expectedRevision, ownedFiles, evidenceManifestSha256 and reason only');
+        }
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        const authorized = isAdmin(caller) || Boolean(
+          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
+        );
+        if (!task || !authorized) {
+          return err('forbidden', 'implementer identity recovery requires the authoritative project Brain or administrator');
+        }
+        const identity = deps.resolveSessionIdentity?.(rebindSessionName);
+        if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
+        const rebound = reg.rebindValidatedImplementerAssignment?.({
+          taskId, assignmentId, identity, expectedRevision, ownedFiles,
+          evidenceManifestSha256, reason,
+        });
+        if (!rebound) return err('unavailable', 'implementer identity recovery is not bound');
+        if (!rebound.ok) return err(rebound.reason, `implementer identity recovery rejected: ${rebound.reason}`);
+        return ok({
+          taskId, assignmentId, rebindSessionName, expectedRevision,
+          replay: rebound.replay === true,
+        });
+      }
       const completionEvidenceDecision = String(input.completionEvidenceDecision ?? '').trim();
       if (completionEvidenceDecision) {
         const evidenceId = String(input.evidenceId ?? '').trim();

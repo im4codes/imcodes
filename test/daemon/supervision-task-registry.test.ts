@@ -81,6 +81,9 @@ function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
     list: (filter: never) => registry().list(filter) as never,
     get: (taskId: string) => registry().get(taskId) as never,
     recover: (input: Parameters<SupervisionTaskRegistry['recoverTask']>[0]) => registry().recoverTask(input),
+    rebindValidatedImplementerAssignment: (
+      input: Parameters<SupervisionTaskRegistry['rebindValidatedImplementerAssignment']>[0],
+    ) => registry().rebindValidatedImplementerAssignment(input),
     coordinateTaskAssignment: (input: Parameters<SupervisionTaskRegistry['coordinateTaskAssignment']>[0]) => (
       registry().coordinateTaskAssignment(input)
     ),
@@ -178,6 +181,61 @@ const ensureTestAssignmentWorktree = async (input: { assignmentId: string }) => 
   baseRevision: 'a'.repeat(40),
   created: true,
 });
+
+function prepareValidatedStaleImplementerShape(
+  registry: SupervisionTaskRegistry,
+  taskId: string,
+  options: { readyForAudit?: boolean; addAmbiguousImplementer?: boolean } = {},
+) {
+  const revision = `${taskId}-r2`;
+  const files = ['src/recovery-a.ts', 'test/recovery-a.test.ts'];
+  const oldIdentity = identity(`${taskId}-worker`);
+  const currentIdentity = {
+    ...oldIdentity,
+    sessionInstanceId: `${taskId}-current-instance`,
+    runtimeEpoch: `${taskId}-current-epoch`,
+  };
+  expect(registry.createOrGet({
+    taskId, projectName: 'alpha', classification: 'independent_top_level',
+    objective: 'recover one stale validated implementer runtime', currentRevision: revision,
+  })).toMatchObject({ ok: true });
+  const implementer = registry.createAssignment({
+    assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
+    identity: oldIdentity, scopeFiles: files, required: true, auditRevision: revision,
+  });
+  if (!implementer.ok) throw new Error(implementer.reason);
+  expect(registry.updateTask({ taskId, status: 'implementing', currentRevision: revision }))
+    .toMatchObject({ ok: true });
+  for (const status of ['implementing', 'validated'] as const) {
+    expect(registry.updateAssignment({
+      assignmentId: implementer.value.assignmentId, identity: oldIdentity,
+      status, revision, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+  }
+  expect(registry.updateTask({ taskId, status: 'validated', currentRevision: revision }))
+    .toMatchObject({ ok: true });
+  if (options.readyForAudit) {
+    expect(registry.updateAssignment({
+      assignmentId: implementer.value.assignmentId, identity: oldIdentity,
+      status: 'ready_for_audit', revision, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'ready_for_audit', currentRevision: revision }))
+      .toMatchObject({ ok: true });
+  }
+  if (options.addAmbiguousImplementer) {
+    const duplicateIdentity = identity(`${taskId}-duplicate`);
+    const duplicate = registry.createAssignment({
+      assignmentId: `${taskId}-duplicate`, taskId, role: 'implementer',
+      identity: duplicateIdentity, scopeFiles: files, required: true, auditRevision: revision,
+    });
+    if (!duplicate.ok) throw new Error(duplicate.reason);
+  }
+  return {
+    taskId, revision, files, oldIdentity, currentIdentity,
+    evidenceManifestSha256: 'c'.repeat(64), implementer: implementer.value,
+  };
+}
+
 
 function prepareStructuredFinalizationShape(
   registry: SupervisionTaskRegistry,
@@ -1634,6 +1692,243 @@ describe('SupervisionTaskRegistry', () => {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('atomically rebinds one stale validated implementer runtime and preserves the same object across restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-validated-runtime-recovery-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      const shape = prepareValidatedStaleImplementerShape(registry, 'validated-runtime-recovery');
+      const before = registry.getAssignment(shape.implementer.assignmentId)!;
+      const assignmentCount = registry.listAssignments(shape.taskId).length;
+      const eventCount = registry.listEvents(shape.taskId).length;
+      const request = {
+        taskId: shape.taskId,
+        assignmentId: shape.implementer.assignmentId,
+        identity: shape.currentIdentity,
+        expectedRevision: shape.revision,
+        ownedFiles: shape.files,
+        evidenceManifestSha256: shape.evidenceManifestSha256,
+        reason: 'daemon observed the same logical worker after restart',
+        now: 500,
+      };
+
+      const rebound = registry.rebindValidatedImplementerAssignment(request);
+      expect(rebound.ok, JSON.stringify({ rebound, task: registry.get(shape.taskId) })).toBe(true);
+      expect(rebound).toMatchObject({
+        ok: true,
+        value: {
+          assignmentId: shape.implementer.assignmentId,
+          taskId: shape.taskId,
+          identity: shape.currentIdentity,
+          status: 'validated',
+          leaseId: before.leaseId,
+          auditRevision: shape.revision,
+          generation: before.generation + 1,
+        },
+      });
+      expect(registry.get(shape.taskId)).toMatchObject({
+        taskId: shape.taskId, status: 'validated', currentRevision: shape.revision,
+      });
+      expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
+      expect(registry.listFileClaims(shape.taskId)).toEqual([]);
+      expect(registry.listEvents(shape.taskId).slice(eventCount)).toEqual([
+        expect.objectContaining({
+          assignmentId: shape.implementer.assignmentId,
+          eventType: 'recovered', status: 'validated',
+          payload: expect.objectContaining({
+            source: 'brain_authorized_implementer_identity_rebind',
+            priorIdentity: shape.oldIdentity,
+            targetIdentity: shape.currentIdentity,
+            revision: shape.revision,
+            ownedFiles: shape.files,
+            evidenceManifestSha256: shape.evidenceManifestSha256,
+          }),
+        }),
+      ]);
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const persistedEvents = registry.listEvents(shape.taskId).length;
+      expect(registry.rebindValidatedImplementerAssignment({ ...request, now: 900 }))
+        .toMatchObject({ ok: true, replay: true, value: { identity: shape.currentIdentity } });
+      expect(registry.listEvents(shape.taskId)).toHaveLength(persistedEvents);
+      const nextIdentity = {
+        ...shape.currentIdentity,
+        sessionInstanceId: `${shape.taskId}-next-instance`,
+        runtimeEpoch: `${shape.taskId}-next-epoch`,
+      };
+      const nextRequest = {
+        ...request,
+        identity: nextIdentity,
+        reason: 'same logical worker restarted again',
+        now: 950,
+      };
+      expect(registry.rebindValidatedImplementerAssignment(nextRequest)).toMatchObject({
+        ok: true, value: { identity: nextIdentity, generation: before.generation + 2 },
+      });
+      expect(registry.rebindValidatedImplementerAssignment({ ...request, now: 960 }))
+        .toEqual({ ok: false, reason: 'conflicting_replay' });
+      expect(registry.updateAssignment({
+        assignmentId: shape.implementer.assignmentId,
+        identity: shape.oldIdentity,
+        status: 'ready_for_audit', revision: shape.revision, auditRevision: shape.revision,
+      })).toMatchObject({ ok: true, value: { status: 'ready_for_audit' } });
+      expect(registry.updateAssignment({
+        assignmentId: shape.implementer.assignmentId,
+        identity: nextIdentity,
+        status: 'ready_for_audit', revision: shape.revision, auditRevision: shape.revision,
+      })).toMatchObject({ ok: true, value: { status: 'ready_for_audit' } });
+      expect(registry.updateTask({
+        taskId: shape.taskId, status: 'ready_for_audit', currentRevision: shape.revision,
+      })).toMatchObject({ ok: true });
+      const beforeReadyReplay = registry.listEvents(shape.taskId).length;
+      expect(registry.rebindValidatedImplementerAssignment({ ...nextRequest, now: 1_000 }))
+        .toMatchObject({ ok: true, replay: true, value: { status: 'ready_for_audit' } });
+      expect(registry.listEvents(shape.taskId)).toHaveLength(beforeReadyReplay);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects validated runtime recovery when a finalized same-revision PASS exists only on an assignment', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      const shape = prepareValidatedStaleImplementerShape(
+        registry, 'runtime-recovery-finalized-assignment-pass',
+      );
+      const auditorIdentity = identity('runtime-recovery-finalized-assignment-pass-auditor');
+      const auditor = registry.createAssignment({
+        assignmentId: 'runtime-recovery-finalized-assignment-pass-auditor',
+        taskId: shape.taskId,
+        role: 'auditor',
+        identity: auditorIdentity,
+        auditAttemptId: 'assignment-only-pass-attempt',
+        auditRevision: shape.revision,
+      });
+      if (!auditor.ok) throw new Error(auditor.reason);
+      expect(registry.updateAssignment({
+        assignmentId: auditor.value.assignmentId,
+        identity: auditorIdentity,
+        status: 'auditing',
+        auditAttemptId: 'assignment-only-pass-attempt',
+        auditRevision: shape.revision,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: auditor.value.assignmentId,
+        identity: auditorIdentity,
+        status: 'passed',
+        auditAttemptId: 'assignment-only-pass-attempt',
+        auditRevision: shape.revision,
+        verdict: 'PASS',
+        crossVendorAuditPassed: true,
+      })).toMatchObject({ ok: true });
+      expect(registry.finishAssignment({
+        assignmentId: auditor.value.assignmentId,
+        identity: auditorIdentity,
+        revision: shape.revision,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', verdict: 'PASS' } });
+
+      // Legacy assignment provenance can predate both receipt tables. It still
+      // represents an authoritative PASS and must close the zero-PASS rebind.
+      expect(registry.listAuditReceipts(shape.taskId)).toEqual([]);
+      expect(database.prepare(
+        'SELECT COUNT(*) AS count FROM supervision_audit_attestations WHERE task_id = ?',
+      ).get(shape.taskId)).toEqual({ count: 0 });
+      const before = registry.get(shape.taskId);
+      const eventCount = registry.listEvents(shape.taskId).length;
+
+      expect(registry.rebindValidatedImplementerAssignment({
+        taskId: shape.taskId,
+        assignmentId: shape.implementer.assignmentId,
+        identity: shape.currentIdentity,
+        expectedRevision: shape.revision,
+        ownedFiles: shape.files,
+        evidenceManifestSha256: shape.evidenceManifestSha256,
+        reason: 'must not launder finalized assignment-only PASS provenance',
+      })).toEqual({ ok: false, reason: 'invalid_transition' });
+      expect(registry.get(shape.taskId)).toEqual(before);
+      expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
+    } finally {
+      registry.close();
+      database.close();
+    }
+  });
+
+  it('fails closed for current, cross-session, ambiguous, scope, revision, audit, claim, and terminal implementer recovery shapes', () => {
+    const makeRequest = (shape: ReturnType<typeof prepareValidatedStaleImplementerShape>) => ({
+      taskId: shape.taskId,
+      assignmentId: shape.implementer.assignmentId,
+      identity: shape.currentIdentity,
+      expectedRevision: shape.revision,
+      ownedFiles: shape.files,
+      evidenceManifestSha256: shape.evidenceManifestSha256,
+      reason: 'strict stale runtime recovery',
+    });
+
+    const currentRegistry = makeRegistry();
+    const current = prepareValidatedStaleImplementerShape(currentRegistry, 'runtime-recovery-current');
+    expect(currentRegistry.rebindValidatedImplementerAssignment({
+      ...makeRequest(current), identity: current.oldIdentity,
+    })).toEqual({ ok: false, reason: 'invalid_transition' });
+    currentRegistry.close();
+
+    const crossRegistry = makeRegistry();
+    const cross = prepareValidatedStaleImplementerShape(crossRegistry, 'runtime-recovery-cross-session');
+    expect(crossRegistry.rebindValidatedImplementerAssignment({
+      ...makeRequest(cross), identity: identity('different-session'),
+    })).toEqual({ ok: false, reason: 'owner_mismatch' });
+    expect(crossRegistry.rebindValidatedImplementerAssignment({
+      ...makeRequest(cross), identity: { ...cross.currentIdentity, runtimeEpoch: '' },
+    })).toEqual({ ok: false, reason: 'invalid' });
+    crossRegistry.close();
+
+    const ambiguousRegistry = makeRegistry();
+    const ambiguous = prepareValidatedStaleImplementerShape(
+      ambiguousRegistry, 'runtime-recovery-ambiguous', { addAmbiguousImplementer: true },
+    );
+    expect(ambiguousRegistry.rebindValidatedImplementerAssignment(makeRequest(ambiguous)))
+      .toEqual({ ok: false, reason: 'ambiguous_assignment' });
+    ambiguousRegistry.close();
+
+    const mismatchRegistry = makeRegistry();
+    const mismatch = prepareValidatedStaleImplementerShape(mismatchRegistry, 'runtime-recovery-mismatch');
+    expect(mismatchRegistry.rebindValidatedImplementerAssignment({
+      ...makeRequest(mismatch), ownedFiles: [mismatch.files[0]!],
+    })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+    expect(mismatchRegistry.rebindValidatedImplementerAssignment({
+      ...makeRequest(mismatch), expectedRevision: 'other-revision',
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    expect(mismatchRegistry.updateAssignment({
+      assignmentId: mismatch.implementer.assignmentId, identity: mismatch.oldIdentity,
+      auditAttemptId: 'unexpected-audit', verdict: 'PASS',
+    })).toMatchObject({ ok: true });
+    expect(mismatchRegistry.rebindValidatedImplementerAssignment(makeRequest(mismatch)))
+      .toEqual({ ok: false, reason: 'invalid_transition' });
+    mismatchRegistry.close();
+
+    const claimDb = new DatabaseSync(':memory:');
+    const claimRegistry = new SupervisionTaskRegistry({ database: claimDb });
+    const claim = prepareValidatedStaleImplementerShape(claimRegistry, 'runtime-recovery-claim');
+    claimDb.prepare(`INSERT INTO supervision_task_file_claims
+      (task_id, assignment_id, file_path, claim_mode, created_at)
+      VALUES (?, ?, ?, 'exclusive', 10)`)
+      .run(claim.taskId, claim.implementer.assignmentId, claim.files[0]);
+    expect(claimRegistry.rebindValidatedImplementerAssignment(makeRequest(claim)))
+      .toEqual({ ok: false, reason: 'invalid_transition' });
+    claimRegistry.close();
+    claimDb.close();
+
+    const terminalRegistry = makeRegistry();
+    const terminal = prepareValidatedStaleImplementerShape(terminalRegistry, 'runtime-recovery-terminal');
+    expect(terminalRegistry.updateTask({ taskId: terminal.taskId, status: 'cancelled' }))
+      .toMatchObject({ ok: true });
+    expect(terminalRegistry.rebindValidatedImplementerAssignment(makeRequest(terminal)))
+      .toEqual({ ok: false, reason: 'invalid_transition' });
+    terminalRegistry.close();
   });
 
   it('atomically binds an R1 REWORK implementer to its sole finalized matching R2 PASS without fabricating completion', () => {

@@ -137,6 +137,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     },
     cancelStaleAuditorAsProjectBrain: (input) => getSupervisionTaskRegistry().cancelStaleAuditorAsProjectBrain(input),
     rebindAuditAssignment: (input) => getSupervisionTaskRegistry().rebindAuditAssignment(input),
+    rebindValidatedImplementerAssignment: (input) => getSupervisionTaskRegistry().rebindValidatedImplementerAssignment(input),
     rebindTaskAssignmentRevision: (input) => {
       const registry = getSupervisionTaskRegistry();
       const assignment = registry.getAssignment(input.assignmentId);

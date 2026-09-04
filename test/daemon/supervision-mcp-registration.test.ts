@@ -62,6 +62,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   applied: any[] = [];
   recovered: any[] = [];
   rebound: any[] = [];
+  implementerRebound: any[] = [];
   revisionRebound: any[] = [];
   coordinated: any[] = [];
   finished: any[] = [];
@@ -98,6 +99,10 @@ class FakeRegistry implements SupervisionRegistryPort {
   recover(input: any) { this.recovered.push(input); this.statuses.set(input.taskId, input.toStatus); }
   rebindAuditAssignment(input: any) {
     this.rebound.push(input);
+    return { ok: true as const, value: { assignmentId: input.assignmentId } };
+  }
+  rebindValidatedImplementerAssignment(input: any) {
+    this.implementerRebound.push(input);
     return { ok: true as const, value: { assignmentId: input.assignmentId } };
   }
   rebindTaskAssignmentRevision(input: any) {
@@ -274,7 +279,6 @@ describe('production MCP registration', () => {
     }]);
     const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'dispatched' });
     const handlers = createSupervisionMcpToolHandlers(CALLER, {
-      resolveSessionIdentity: testResolveSessionIdentity,
       resolveSessionIdentity: testResolveSessionIdentity,
       registry: directRegistry,
       dispatchReadyAudit,
@@ -637,7 +641,7 @@ describe('administrative recover', () => {
       .toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.coordinated).toEqual([]);
 
-    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
+    const brain = createSupervisionMcpToolHandlers(CALLER, { registry, isProjectBrain: () => true,
       resolveSessionIdentity: (name) => name === liveIdentity.sessionName ? liveIdentity : undefined,
     });
     expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toEqual({
@@ -668,7 +672,7 @@ describe('administrative recover', () => {
     expect(registry.coordinated).toEqual([]);
 
     const foreignIdentity = { ...liveIdentity, sessionName: 'deck_foreign_worker', projectName: 'other-project' };
-    const crossProjectTargetBrain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true,
+    const crossProjectTargetBrain = createSupervisionMcpToolHandlers(CALLER, { registry, isProjectBrain: () => true,
       resolveSessionIdentity: () => foreignIdentity,
     });
     expect(await crossProjectTargetBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
@@ -814,8 +818,7 @@ describe('administrative recover', () => {
         }),
       } as unknown as SupervisionRegistryPort;
       const production = createSupervisionMcpToolHandlers(CALLER, {
-      resolveSessionIdentity: testResolveSessionIdentity,
-      resolveSessionIdentity: testResolveSessionIdentity,
+        resolveSessionIdentity: testResolveSessionIdentity,
         registry: productionRegistry, isProjectBrain: () => true,
       });
       expect(await production[SUPERVISION_MCP_TOOLS.RECOVER]({
@@ -849,7 +852,7 @@ describe('administrative recover', () => {
       sessionName: 'deck_sub_rebound', sessionInstanceId: 'instance-rebound', runtimeEpoch: 'epoch-rebound',
       agentType: 'codex-sdk', providerFamily: 'openai', projectName: 'codedeck',
     };
-    const participant = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry,
+    const participant = createSupervisionMcpToolHandlers(CALLER, { registry,
       resolveSessionIdentity: () => liveIdentity,
     });
     expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER]({
@@ -858,7 +861,7 @@ describe('administrative recover', () => {
     })).toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.rebound).toEqual([]);
 
-    const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry,
+    const brain = createSupervisionMcpToolHandlers(CALLER, { registry,
       isProjectBrain: () => true,
       resolveSessionIdentity: (name) => name === liveIdentity.sessionName ? liveIdentity : undefined,
     });
@@ -887,6 +890,60 @@ describe('administrative recover', () => {
       callerProjectName: 'codedeck',
       reason: 'authorized device replacement',
     }]);
+  });
+
+  it('rebinds a validated required implementer through the live same-session identity and frozen evidence', async () => {
+    const liveIdentity = {
+      sessionName: 'deck_cd_brain', sessionInstanceId: 'instance-restarted', runtimeEpoch: 'epoch-restarted',
+      agentType: 'codex-sdk', providerFamily: 'openai',
+    };
+    const request = {
+      taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+      rebindSessionName: liveIdentity.sessionName,
+      expectedRevision: 'validated-r2',
+      ownedFiles: ['src/daemon/supervision-state-store.ts'],
+      evidenceManifestSha256: 'b'.repeat(64),
+      reason: 'same object stale runtime recovery',
+    };
+    const participant = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      resolveSessionIdentity: () => liveIdentity,
+    });
+    expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER](request))
+      .toMatchObject({ status: 'error', reason: 'forbidden' });
+    expect(registry.implementerRebound).toEqual([]);
+
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === liveIdentity.sessionName ? liveIdentity : undefined,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({ ...request, rebindSessionName: 'missing' }))
+      .toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toEqual({
+      status: 'ok', taskId: request.taskId, assignmentId: request.assignmentId,
+      rebindSessionName: liveIdentity.sessionName, expectedRevision: request.expectedRevision,
+      replay: false,
+    });
+    expect(registry.implementerRebound).toEqual([{
+      taskId: request.taskId, assignmentId: request.assignmentId, identity: liveIdentity,
+      expectedRevision: request.expectedRevision, ownedFiles: request.ownedFiles,
+      evidenceManifestSha256: request.evidenceManifestSha256, reason: request.reason,
+    }]);
+
+    registry.implementerRebound = [];
+    for (const missing of ['assignmentId', 'rebindSessionName', 'expectedRevision', 'ownedFiles', 'evidenceManifestSha256'] as const) {
+      const malformed = { ...request } as Record<string, unknown>;
+      delete malformed[missing];
+      const result: any = await client.callTool({
+        name: SUPERVISION_MCP_TOOLS.RECOVER, arguments: malformed,
+      });
+      const business = result.content?.find((entry: { type?: string }) => entry.type === 'text')?.text;
+      const rejected = result.isError === true
+        || (typeof business === 'string' && JSON.parse(business).status === 'error');
+      expect(rejected, `${missing}: ${JSON.stringify(result)}`).toBe(true);
+    }
+    expect(registry.implementerRebound).toEqual([]);
   });
 
   it('is authorized, enum-restricted and transition-checked', async () => {
@@ -1024,6 +1081,7 @@ describe('published schema enums match the fixed constants exactly', () => {
     expect(byName.get(SUPERVISION_MCP_TOOLS.RECOVER).properties).toEqual(expect.objectContaining({
       fromRevision: expect.any(Object),
       toRevision: expect.any(Object),
+      expectedRevision: expect.any(Object),
       ownedFiles: expect.any(Object),
       evidenceManifestSha256: expect.any(Object),
       scopeFiles: expect.any(Object),

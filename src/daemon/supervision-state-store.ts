@@ -4204,6 +4204,172 @@ export class SupervisionTaskRegistry {
   }
 
   /**
+   * Rebind a stale runtime on the one validated required implementer without
+   * changing its lifecycle, lease, scope, revision, or assignment identity.
+   * The live identity is daemon-observed by the MCP ingress; this transaction
+   * only accepts the exact same logical session and frozen evidence binding.
+   */
+  rebindValidatedImplementerAssignment(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: PersistedSupervisionTaskAssignmentIdentity;
+    expectedRevision: string;
+    ownedFiles: readonly string[];
+    evidenceManifestSha256: string;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const expectedRevision = normalizeTaskString(input.expectedRevision);
+    const ownedFiles = normalizeTaskArray(input.ownedFiles);
+    const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
+    const reason = normalizeTaskString(input.reason);
+    const targetIdentity: PersistedSupervisionTaskAssignmentIdentity = {
+      sessionName: normalizeTaskString(input.identity.sessionName) ?? '',
+      sessionInstanceId: normalizeTaskString(input.identity.sessionInstanceId) ?? '',
+      runtimeEpoch: normalizeTaskString(input.identity.runtimeEpoch) ?? '',
+      agentType: normalizeTaskString(input.identity.agentType) ?? '',
+      providerFamily: normalizeTaskString(input.identity.providerFamily) ?? '',
+    };
+    if (!taskId || !assignmentId || !expectedRevision || !reason
+      || !evidenceManifestSha256 || !FINALIZATION_SHA256_RE.test(evidenceManifestSha256)
+      || ownedFiles.length === 0 || ownedFiles.length !== input.ownedFiles.length
+      || !ownedFiles.every(validRepoPath)
+      || Object.values(targetIdentity).some((value) => !value)) return { ok: false, reason: 'invalid' };
+
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(taskId);
+      const assignment = this.getAssignment(assignmentId);
+      if (!task || !assignment || assignment.taskId !== taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+
+      const recoveryEvents = this.listEvents(taskId).filter((event) => (
+        event.assignmentId === assignmentId
+        && event.eventType === 'recovered'
+        && event.payload?.source === 'brain_authorized_implementer_identity_rebind'
+        && event.payload?.revision === expectedRevision
+        && event.payload?.evidenceManifestSha256 === evidenceManifestSha256
+        && sameStringArray(
+          Array.isArray(event.payload?.ownedFiles)
+            ? event.payload.ownedFiles.map((path) => String(path))
+            : [],
+          ownedFiles,
+        )
+      ));
+      const priorTargetingRequestedIdentity = recoveryEvents.some((event) => {
+        const target = event.payload?.targetIdentity as Partial<PersistedSupervisionTaskAssignmentIdentity> | undefined;
+        return Boolean(target && runtimeIdentityMetadataMatches(
+          target as PersistedSupervisionTaskAssignmentIdentity,
+          targetIdentity,
+        ));
+      });
+      const identityAlreadyCurrent = runtimeIdentityMetadataMatches(assignment.identity, targetIdentity);
+
+      const assignments = this.listAssignments(taskId);
+      const activeImplementers = assignments.filter((candidate) => (
+        candidate.required
+        && candidate.role === 'implementer'
+        && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+      ));
+      const activeAuditor = assignments.some((candidate) => (
+        candidate.role === 'auditor'
+        && !['cancelled', 'finalized'].includes(candidate.status)
+      ));
+      const exactLifecycle = (task.status === 'validated' || task.status === 'ready_for_audit')
+        && assignment.status === task.status;
+      const exactIdentityFamily = assignment.identity.sessionName === targetIdentity.sessionName;
+      const conflictingPassAssignment = assignments.some((candidate) => (
+        candidate.auditRevision === expectedRevision
+        && candidate.verdict?.trim().toUpperCase() === 'PASS'
+      ));
+      const conflictingAuditEvidence = Boolean(
+        assignment.auditAttemptId
+        || assignment.verdict
+        || assignment.primaryReviewPassed
+        || assignment.crossVendorAuditPassed
+        || conflictingPassAssignment
+        || this.listAuditReceipts(taskId).length > 0
+        || this.#db.prepare(
+          'SELECT 1 AS ok FROM supervision_audit_attestations WHERE task_id = ? AND revision = ? LIMIT 1',
+        ).get(taskId, expectedRevision),
+      );
+      // Claims are retired from the public projection, but a legacy/corrupt
+      // row must still block identity recovery rather than being laundered by
+      // the compatibility `listFileClaims()` empty view.
+      const legacyClaim = this.#db.prepare(
+        'SELECT 1 AS ok FROM supervision_task_file_claims WHERE task_id = ? LIMIT 1',
+      ).get(taskId) as { ok?: number } | undefined;
+      const exactShape = Boolean(
+        task.classification !== 'integration_slice'
+        && assignment.role === 'implementer'
+        && assignment.required
+        && exactLifecycle
+        && task.currentRevision === expectedRevision
+        && assignment.auditRevision === expectedRevision
+        && Boolean(assignment.leaseId)
+        && activeImplementers.length === 1
+        && activeImplementers[0]?.assignmentId === assignmentId
+        && !activeAuditor
+        && !conflictingAuditEvidence
+        && exactIdentityFamily
+        && sameStringArray(assignment.scopeFiles, ownedFiles)
+        && !task.commitSha
+        && !task.pushRemoteRef
+        && !task.finalization
+        && !task.archivedAt
+        && legacyClaim?.ok !== 1
+      );
+      if (!exactShape) {
+        this.#db.exec('ROLLBACK');
+        return activeImplementers.length > 1 ? { ok: false, reason: 'ambiguous_assignment' }
+          : !exactIdentityFamily ? { ok: false, reason: 'owner_mismatch' }
+            : !sameStringArray(assignment.scopeFiles, ownedFiles) ? { ok: false, reason: 'manifest_mismatch' }
+              : task.currentRevision !== expectedRevision || assignment.auditRevision !== expectedRevision
+                ? { ok: false, reason: 'old_revision' }
+                : ['committed', 'pushed', 'finalized'].includes(task.status) || Boolean(task.finalization)
+                  ? { ok: false, reason: 'receipt_closed' }
+                  : { ok: false, reason: 'invalid_transition' };
+      }
+      if (identityAlreadyCurrent) {
+        this.#db.exec('ROLLBACK');
+        return priorTargetingRequestedIdentity
+          ? { ok: true, value: assignment, replay: true }
+          : { ok: false, reason: 'invalid_transition' };
+      }
+      if (priorTargetingRequestedIdentity) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
+
+      const rebound: PersistedSupervisionTaskAssignment = {
+        ...assignment,
+        identity: targetIdentity,
+        generation: assignment.generation + 1,
+        updatedAt: now,
+      };
+      this.#writeAssignment(rebound, 'recovered', {
+        source: 'brain_authorized_implementer_identity_rebind',
+        reason,
+        priorIdentity: assignment.identity,
+        targetIdentity,
+        revision: expectedRevision,
+        ownedFiles,
+        evidenceManifestSha256,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: rebound };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
    * Brain/admin-authorized recovery for one frozen revision on the SAME task
    * and required implementer assignment. Historical audit rows and events are
    * append-only; only the live revision binding is cleared and rebound.
