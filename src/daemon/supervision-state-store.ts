@@ -774,6 +774,7 @@ export type SupervisionHousekeepingActionKind =
   | 'repair_revision'
   | 'archive_terminal'
   | 'archive_abandoned'
+  | 'archive_superseded'
   | 'mark_duplicate_candidate';
 
 export interface SupervisionHousekeepingAction {
@@ -1719,6 +1720,13 @@ export class SupervisionTaskRegistry {
         }
       }
 
+      if (!task.archivedAt) {
+        const supersededBy = this.#supersedingFinalizedTaskId(task, projectedAssignments);
+        if (supersededBy) {
+          actions.push({ taskId: task.taskId, kind: 'archive_superseded', relatedTaskId: supersededBy });
+        }
+      }
+
       if (!task.archivedAt && !task.duplicateCandidate && task.objective.trim()) {
         const familyRows = this.#db.prepare(
           `SELECT payload_json AS payloadJson FROM supervision_tasks
@@ -1953,6 +1961,45 @@ export class SupervisionTaskRegistry {
       });
       return;
     }
+    if (action.kind === 'archive_superseded' && action.relatedTaskId) {
+      // The planner decided on a snapshot taken before this write. Anything can
+      // have happened since: a worker can claim the aggregate, a lease can be
+      // taken, bytes can be recorded. Re-checking only `archivedAt` would catch
+      // none of that and would archive a row that is now actively referenced --
+      // the console would simply lose it.
+      //
+      // So the COMPLETE evidence is re-read and re-planned inside the same
+      // transaction that writes, and the result must still name the very same
+      // successor the plan named. Anything else and we write nothing at all.
+      // `reconcileHousekeeping` plans the whole batch BEFORE opening its
+      // transaction and then applies inside it, so this runs in that same
+      // BEGIN IMMEDIATE. No nested transaction is opened -- one already owns
+      // this write, and re-reading here is what makes the decision atomic with
+      // it rather than with the stale plan.
+      const locked = this.getTaskRecord(action.taskId);
+      if (!locked || locked.archivedAt) return;
+      const stillSuperseded = this.#supersedingFinalizedTaskId(
+        locked,
+        this.listAssignments(action.taskId),
+      );
+      // Re-planned from scratch, and it must still name the SAME successor the
+      // plan named. A different answer means the world moved: write nothing.
+      if (!stillSuperseded || stillSuperseded !== action.relatedTaskId) return;
+      this.#writeTask({
+        ...locked,
+        archivedAt: now,
+        archiveReason: 'superseded',
+        supersededBy: stillSuperseded,
+        cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
+        updatedAt: now,
+      }, this.#taskEventFor(locked.status), {
+        source: 'housekeeping_archive',
+        archiveReason: 'superseded',
+        supersededBy: stillSuperseded,
+        provenanceDeleted: false,
+      });
+      return;
+    }
     if ((action.kind === 'archive_terminal' || action.kind === 'archive_abandoned') && !task.archivedAt) {
       const archiveReason: SupervisionTaskArchiveReason = action.kind === 'archive_abandoned'
         ? 'abandoned_planned'
@@ -1969,6 +2016,78 @@ export class SupervisionTaskRegistry {
         provenanceDeleted: false,
       });
     }
+  }
+
+  /**
+   * The task that DEMONSTRABLY superseded this stale aggregate, or undefined.
+   *
+   * Stale rows pile up whenever work is redone: an aggregate is abandoned
+   * mid-flight and a successor ships the same change. The old row then sits in
+   * the console for ever looking actionable, and a human has to re-decide it
+   * every time. Archiving is the right answer, but ONLY against evidence that
+   * cannot later turn out to be wrong.
+   *
+   * The evidence is a FINALIZED successor in the same family carrying a real
+   * commit. Finalization is immutable here and already required a cross-vendor
+   * PASS plus push evidence, so "somebody else shipped this" is a durable fact
+   * rather than an inference. CI is deliberately NOT consulted: it is optional
+   * smoke in this project, and a repository with no CI configured must still be
+   * able to converge.
+   *
+   * Fail closed -- returns undefined, leaving the row exactly as it is -- on
+   * every shape where archiving could hide something real:
+   *   * the stale task shipped something itself (commit/push/finalization), in
+   *     which case terminal retention owns it, not supersession;
+   *   * any lease is still held, or any assignment is still non-terminal. A row
+   *     something is actively working on is not stale;
+   *   * the stale aggregate recorded file events the successor's manifest does
+   *     NOT cover. Those bytes were never integrated by anyone, and hiding the
+   *     only record of them is how work silently disappears;
+   *   * anything other than exactly one finalized successor. Two candidates
+   *     cannot both be "the" shipment, and picking one would be a guess.
+   */
+  #supersedingFinalizedTaskId(
+    task: PersistedSupervisionTaskRecord,
+    projectedAssignments: readonly PersistedSupervisionTaskAssignment[],
+  ): string | undefined {
+    if (task.archivedAt) return undefined;
+    if (task.finalization || normalizeTaskString(task.commitSha)
+      || normalizeTaskString(task.pushRemoteRef)) return undefined;
+    // Any non-terminal assignment blocks. This deliberately SUBSUMES the
+    // lease check the sibling archive branches use: `effectiveLeases` is
+    // (leaseId && !terminal), so every leased row it could flag is already
+    // non-terminal here. Carrying it as well would be a branch no test could
+    // ever distinguish.
+    if (projectedAssignments.some((assignment) => (
+      !HOUSEKEEPING_ASSIGNMENT_TERMINAL.has(assignment.status)
+    ))) return undefined;
+
+    const objective = normalizeObjectiveForHousekeeping(task.objective);
+    if (!objective) return undefined;
+    const familyRows = this.#db.prepare(
+      `SELECT payload_json AS payloadJson FROM supervision_tasks
+       WHERE project_name = ? AND top_level_task_id = ? AND classification = ? AND task_id != ?
+       ORDER BY created_at ASC, task_id ASC LIMIT 101`,
+    ).all(task.projectName, task.topLevelTaskId, task.classification, task.taskId) as Array<Record<string, unknown>>;
+    // A family larger than the bounded page is not evidence -- it is an
+    // unscanned tail, and deciding from a partial view is a guess.
+    if (familyRows.length > 100) return undefined;
+    const successors = familyRows
+      .map(parseTaskRow)
+      .filter((candidate): candidate is PersistedSupervisionTaskRecord => candidate !== undefined
+        && normalizeObjectiveForHousekeeping(candidate.objective) === objective
+        && Boolean(candidate.finalization)
+        && FINALIZATION_COMMIT_RE.test(normalizeTaskString(candidate.finalization?.commitSha) ?? ''));
+    if (successors.length !== 1) return undefined;
+    const successor = successors[0]!;
+
+    const shipped = new Set<string>([
+      ...(successor.finalization?.integrationManifest ?? []).map((entry) => entry.path),
+      ...(successor.finalization?.ownedFiles ?? []),
+    ]);
+    const stalePaths = [...new Set(this.listFileEvents(task.taskId).map((event) => event.path))];
+    if (stalePaths.some((path) => !shipped.has(path))) return undefined;
+    return successor.taskId;
   }
 
   #isLegacyAssignmentConsumedByFinalization(
