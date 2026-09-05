@@ -101,6 +101,14 @@ interface SubscriberState {
   snapshotPending: boolean;
   rawBuffer: Buffer[];
   rawBufferBytes: number;
+  /**
+   * Set when the first-paint capture blew its deadline. A capture that settles
+   * afterwards must not publish: the stall re-probe has already repainted with
+   * newer content, and a late full frame would rewrite the pane from cursor
+   * home and regress it -- the same staleness the re-probe's rawGuardSince
+   * barrier prevents.
+   */
+  firstPaintAbandoned?: boolean;
 }
 
 interface PipeState {
@@ -232,6 +240,7 @@ export class TerminalStreamer {
       snapshotPending: hasPipe,
       rawBuffer: [],
       rawBufferBytes: 0,
+      firstPaintAbandoned: false,
     };
     subs.set(subscriber, subState);
 
@@ -291,7 +300,42 @@ export class TerminalStreamer {
     // 1. Take snapshot. A thrown capture (e.g. tmux "can't find pane") is NOT a
     //    blank snapshot; it is treated as 'failed' so the deadline re-probe
     //    below can decide between repaint and restart.
-    const firstSnapshot = await this.captureAndSendSnapshot(sessionName, subscriber);
+    // Bounded first paint.
+    //
+    // `tmuxRun` uses execFile with no timeout, so a wedged `capture-pane`
+    // settles neither way. Both the `snapshotPending = false` release and the
+    // stall-watch arming below sit after this await, so an unbounded wait left
+    // the subscriber buffering raw silently forever -- a blank pane that
+    // reopening the window could not fix, because the pipe still existed and
+    // every new subscriber wedged identically. Only a daemon restart cleared it.
+    //
+    // This is NOT a longer timeout or a retry: it converts an unbounded wait
+    // into the 'failed' outcome the existing deadline re-probe already handles,
+    // which repaints a live pane and restarts a genuinely dead one.
+    //
+    // SCOPE, stated plainly: the bound is on the CONSUMER, not the child. A
+    // wedged `tmux capture-pane` process is not killed here and may still be
+    // running; execFile owns that lifetime. What this guarantees is that the
+    // daemon never waits on it unboundedly and never spawns captures in a loop
+    // because of it -- bootstrap issues at most one capture plus one re-probe
+    // capture, then reports through the existing stall path.
+    let firstPaintDeadline: ReturnType<typeof setTimeout> | undefined;
+    const firstSnapshot = await Promise.race([
+      this.captureAndSendSnapshot(sessionName, subscriber).finally(() => {
+        // Clear the deadline as soon as the capture settles. Leaving it armed
+        // would let an orphan timer flip firstPaintAbandoned on a subscriber
+        // whose first paint SUCCEEDED, poisoning healthy state 1.5s later --
+        // the same class of latent wedge this whole fix exists to remove.
+        if (firstPaintDeadline !== undefined) clearTimeout(firstPaintDeadline);
+      }),
+      new Promise<'failed'>((resolve) => {
+        firstPaintDeadline = setTimeout(() => {
+          const liveState = this.subscribers.get(sessionName)?.get(subscriber);
+          if (liveState) liveState.firstPaintAbandoned = true;
+          resolve('failed');
+        }, BLANK_BOOTSTRAP_STALL_MS);
+      }),
+    ]);
     const snapshotWasBlank = firstSnapshot === 'blank';
     const snapshotFailed = firstSnapshot === 'failed';
 
@@ -363,7 +407,18 @@ export class TerminalStreamer {
           // watch start as the raw guard so a byte arriving during the async
           // capture suppresses the now-stale frame instead of clobbering it
           // (at this point lastStreamRawAt is known < bootstrapWatchStartedAt).
-          const probe = await this.captureAndSendSnapshot(sessionName, subscriber, bootstrapWatchStartedAt);
+          // Bounded here too. The re-probe is the RECOVERY path, so if it awaits
+          // the same wedged capture it inherits the identical unbounded wait and
+          // the stall signal is never delivered -- the first-paint bound alone
+          // would move the hang one level down instead of removing it.
+          let probeDeadline: ReturnType<typeof setTimeout> | undefined;
+          const probe = await Promise.race([
+            this.captureAndSendSnapshot(sessionName, subscriber, bootstrapWatchStartedAt)
+              .finally(() => { if (probeDeadline !== undefined) clearTimeout(probeDeadline); }),
+            new Promise<'failed'>((resolve) => {
+              probeDeadline = setTimeout(() => resolve('failed'), BLANK_BOOTSTRAP_STALL_MS);
+            }),
+          ]);
           if (probe === 'sent') return;
           if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
           if ((this.lastStreamRawAt.get(sessionName) ?? 0) >= bootstrapWatchStartedAt) return;
@@ -413,7 +468,10 @@ export class TerminalStreamer {
         newLineCount: 0,
       };
 
-      if (!this.subscribers.get(sessionName)?.has(subscriber)) return blank ? 'blank' : 'sent';
+      const liveState = this.subscribers.get(sessionName)?.get(subscriber);
+      if (!liveState) return blank ? 'blank' : 'sent';
+      // A capture that came back after its deadline is stale by definition.
+      if (rawGuardSince === undefined && liveState.firstPaintAbandoned) return blank ? 'blank' : 'sent';
       subscriber.send(diff);
       return blank ? 'blank' : 'sent';
     } catch (err) {

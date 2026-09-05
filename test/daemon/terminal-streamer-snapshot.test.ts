@@ -438,6 +438,156 @@ describe('TerminalStreamer — snapshot behavior', () => {
     expect(stalled).toHaveBeenCalledWith('snapshot_failed');
   });
 
+  it('signals bootstrap stall when the snapshot capture never settles (hung tmux, not a rejection)', async () => {
+    // Field failure after R1: Sh1 renders completely blank, reopening the window
+    // does not help, and only a daemon restart cures it.
+    //
+    // R1 covers a capture that THROWS and a capture that returns BLANK. It does
+    // not cover a capture that never settles. `tmuxRun` calls execFile with no
+    // timeout (src/agent/tmux.ts), so a wedged `capture-pane` returns neither
+    // value nor error. bootstrapSubscriber awaits it at the top, and BOTH the
+    // `snapshotPending = false` release and the stall-watch arming sit AFTER
+    // that await -- so nothing is ever armed and the subscriber buffers raw
+    // silently forever.
+    //
+    // Reopening the window does not help because the pipe still exists, so the
+    // new subscriber starts snapshotPending=true and wedges identically. Only a
+    // daemon restart drops the pipe map. A bounded bootstrap must refuse to wait
+    // forever, whatever shape the failure takes.
+    const stalled = vi.fn();
+    mockCapture.mockReturnValue(new Promise(() => { /* never settles */ }));
+
+    streamer.subscribe({
+      sessionName: 'hung-capture-session',
+      send: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(
+      stalled,
+      'a capture that never settles must not leave the subscriber wedged with no bounded signal',
+    ).toHaveBeenCalled();
+  });
+
+  it('a fast successful first paint is not abandoned by an orphan deadline timer', async () => {
+    // Negative control for the bound. The deadline timer must be cleared when
+    // the capture wins the race; otherwise it fires 1.5s later and flips
+    // firstPaintAbandoned on a HEALTHY subscriber, poisoning good state exactly
+    // the way the original wedge did.
+    const stalled = vi.fn();
+    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    mockCapture.mockResolvedValue('alive0\nalive1\nalive2\nalive3');
+
+    streamer.subscribe({
+      sessionName: 'fast-success-session',
+      send: (d) => received.push(d),
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    const afterPaint = received.length;
+    expect(afterPaint, 'the healthy first paint must publish').toBeGreaterThan(0);
+
+    // Advance well past the deadline the race armed.
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(stalled, 'a healthy fast paint must never signal a stall').not.toHaveBeenCalled();
+    expect(
+      received.length,
+      'no extra frame may appear from an orphan deadline firing after success',
+    ).toBe(afterPaint);
+  });
+
+  it('clears the first-paint deadline timer once the capture settles', async () => {
+    // Directly observes the orphan: the flag it would set has no consumer after
+    // bootstrap, so the only faithful assertion is that the timer is not left
+    // armed. An armed deadline after a successful paint is the defect.
+    mockCapture.mockResolvedValue('alive0\nalive1\nalive2\nalive3');
+
+    // Measure only the timers THIS subscribe introduces. vi.getTimerCount() is
+    // a global: unrelated legitimate timers (graced pipe stop, idle watch, or a
+    // leftover from an earlier test in the file) make an absolute
+    // `toBe(0)` pass or fail on ordering and ambient state rather than on the
+    // defect. A delta isolates the first-paint deadline and stays load-bearing:
+    // an orphan left armed shows up as +1.
+    const before = vi.getTimerCount();
+
+    streamer.subscribe({
+      sessionName: 'timer-hygiene-session',
+      send: () => {},
+      onBootstrapStalled: vi.fn(),
+    });
+    await flush();
+
+    expect(
+      vi.getTimerCount() - before,
+      'the first-paint deadline must be cleared when the capture wins the race',
+    ).toBe(0);
+  });
+
+  it('bounds capture spawning: a wedged capture is not retried in a loop', async () => {
+    // The bound is on the consumer, not the child: a hung `tmux capture-pane`
+    // is not killed. What must hold is that the daemon does not keep spawning
+    // captures because of it. Bootstrap issues at most the first paint plus one
+    // deadline re-probe, then reports through the existing stall path.
+    mockCapture.mockReturnValue(new Promise(() => { /* never settles */ }));
+
+    streamer.subscribe({
+      sessionName: 'no-spawn-loop-session',
+      send: () => {},
+      onBootstrapStalled: vi.fn(),
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(
+      mockCapture.mock.calls.length,
+      'a wedged capture must not cause repeated unbounded capture spawning',
+    ).toBeLessThanOrEqual(2);
+  });
+
+  it('does not publish a first-paint capture that settles after its deadline', async () => {
+    // Bounding the first paint creates a new hazard: the abandoned capture can
+    // still settle later. By then the deadline re-probe has repainted with
+    // NEWER content, so publishing the old full frame would rewrite the pane
+    // from cursor home and regress the screen -- the same staleness the
+    // re-probe's rawGuardSince barrier already prevents.
+    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    let releaseStale: ((v: string) => void) | undefined;
+    mockCapture
+      .mockReturnValueOnce(new Promise<string>((resolve) => { releaseStale = resolve; }))
+      .mockResolvedValue('fresh0\nfresh1\nfresh2\nfresh3');
+
+    streamer.subscribe({
+      sessionName: 'late-capture-session',
+      send: (d) => received.push(d),
+      onBootstrapStalled: vi.fn(),
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const beforeLate = received.length;
+    expect(
+      received.some((d) => d.lines.some(([, text]) => text.startsWith('fresh'))),
+      'the re-probe must have repainted with fresh content',
+    ).toBe(true);
+
+    // The abandoned capture finally returns, carrying the OLD screen.
+    releaseStale?.('stale0\nstale1\nstale2\nstale3');
+    await flush();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(
+      received.slice(beforeLate).some((d) => d.lines.some(([, text]) => text.startsWith('stale'))),
+      'a capture that settled after its deadline must never be published',
+    ).toBe(false);
+  });
+
   it('repaints and does NOT restart when a failed snapshot recovers by the deadline (transient error, healthy shell)', async () => {
     const stalled = vi.fn();
     const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
