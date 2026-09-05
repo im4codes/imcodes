@@ -97,7 +97,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
-import type { LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
+import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
 import type { QueueDeliveryFact, QueueSnapshot } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 import {
@@ -1259,6 +1259,23 @@ export class TransportSessionRuntime implements SessionRuntime {
     return store.queueBelongsTo(this.sessionKey, this.queueRecipient);
   }
 
+  /**
+   * Destructive self-heal for a same-name queue bound to a different canonical
+   * recipient. This preserves the ownership invariant by never draining stale
+   * rows into this runtime; it clears them and binds an empty durable queue so
+   * the session can reconnect/send instead of remaining permanently unavailable.
+   */
+  discardDurableQueueStateForRecipientConflict(
+    recipient?: QueueRecipientIdentity,
+  ): DiscardTransportQueueStateResult | undefined {
+    const targetRecipient = recipient ?? this.queueRecipient;
+    if (!targetRecipient) return undefined;
+    const discarded = getTransportQueueStore().discardSessionQueueState(this.sessionKey, targetRecipient);
+    this.queueRecipient = targetRecipient;
+    this._queueRecipientRecoveryChanged = true;
+    return discarded;
+  }
+
   /** Update the live runtime after the store rotated only its runtime epoch. */
   rebindQueueRecipient(expected: QueueRecipientIdentity, next: QueueRecipientIdentity): boolean {
     if (!this.queueRecipient
@@ -1276,7 +1293,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     // same-named successor must not recover it; legacy rows carrying no identity
     // are quarantined by the same gate.
     if (this.queueRecipient && !store.queueBelongsTo(this.sessionKey, this.queueRecipient)) {
-      if (!this.adoptLegacyQueueRecipient()) return 0;
+      if (!this.adoptLegacyQueueRecipient()) {
+        const discarded = this.discardDurableQueueStateForRecipientConflict();
+        logger.warn({ session: this.sessionKey, discarded }, 'Discarded stale transport queue state during rehydrate ownership recovery');
+        return 0;
+      }
     }
     // A callback that died with the previous runtime leaves a leased row. Once
     // that lease expires it becomes retryable under the SAME clientMessageId;

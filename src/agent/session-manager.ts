@@ -1523,8 +1523,11 @@ async function recoverPersistedTransportQueue(
   const recipient = runtime.recipientIdentity;
   const hadLegacyRows = getTransportQueueStore().hasLegacyRecipientRows(sessionName);
   if (recipient && !runtime.adoptLegacyQueueRecipient()) {
-    logger.warn({ session: sessionName, context }, 'Transport queue recovery refused ambiguous recipient ownership');
-    return 0;
+    const discarded = runtime.discardDurableQueueStateForRecipientConflict();
+    logger.warn(
+      { session: sessionName, context, discarded },
+      'Transport queue recovery discarded stale recipient ownership instead of blocking session',
+    );
   }
   getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now(), { includeUnexpired: true });
   await drainTransportResendQueueIntoRuntime(runtime, sessionName, context);
@@ -3279,7 +3282,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       // then add yet another epoch to the same aggregate, making cards visible
       // but neither drainable nor cancellable.
       if (runtime.recipientIdentity && !runtime.adoptLegacyQueueRecipient()) {
-        throw new Error('transport queue canonical recipient recovery rejected');
+        const discarded = runtime.discardDurableQueueStateForRecipientConflict();
+        logger.warn(
+          { session: name, discarded },
+          'Transport queue canonical recipient recovery discarded stale ownership instead of rejecting launch',
+        );
       }
       upsertSession(record);
       const persistedRecord = getSession(name);
@@ -3289,7 +3296,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         && (runtimeRecipient.sessionInstanceId !== persistedRecipient.sessionInstanceId
           || runtimeRecipient.runtimeEpoch !== persistedRecipient.runtimeEpoch)) {
         if (!runtime.rebindQueueRecipient(runtimeRecipient, persistedRecipient)) {
-          throw new Error('transport queue recipient rotation rejected');
+          const discarded = runtime.discardDurableQueueStateForRecipientConflict(persistedRecipient);
+          logger.warn(
+            { session: name, discarded },
+            'Transport queue recipient rotation discarded stale ownership instead of rejecting launch',
+          );
         }
       }
       emitSessionPersist(persistedRecord ?? record, name);

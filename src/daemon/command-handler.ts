@@ -4949,6 +4949,24 @@ async function resolveProcessRecallQueryContext(
   };
 }
 
+function discardStaleTransportQueueOwnership(
+  sessionName: string,
+  runtime: {
+    recipientIdentity?: QueueRecipientIdentity;
+    discardDurableQueueStateForRecipientConflict?: () => unknown;
+  },
+  context: string,
+): void {
+  const recipient = runtime.recipientIdentity ?? null;
+  const discarded = typeof runtime.discardDurableQueueStateForRecipientConflict === 'function'
+    ? runtime.discardDurableQueueStateForRecipientConflict()
+    : getTransportQueueStore().discardSessionQueueState(sessionName, recipient);
+  logger.warn(
+    { sessionName, context, discarded },
+    'Transport queue command discarded stale recipient ownership instead of leaving queue unavailable',
+  );
+}
+
 async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
   const clientMessageId = typeof cmd.clientMessageId === 'string' ? cmd.clientMessageId.trim() : '';
@@ -5035,8 +5053,18 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     // but name equality alone is never authority. Let the runtime prove and
     // complete its bounded adoption before any status or private-data mutation.
     if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queue ownership changed' });
-      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queue ownership changed' });
+      discardStaleTransportQueueOwnership(sessionName, runtime, 'undo_queued_message_adopt_failed');
+      const queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+        sessionName,
+        runtime.recipientIdentity,
+        'undo_queued_message_stale_discard',
+      );
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...transportQueueSnapshotToPayload(queueSnapshot),
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
       return;
     }
     const removed = runtime.removePendingMessage(clientMessageId);
@@ -5104,11 +5132,15 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
         (runtime as { recipientIdentity?: QueueRecipientIdentity }).recipientIdentity ?? null,
       );
       if (cancellation.status === 'identity_mismatch') {
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queue ownership changed' });
-        emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queue ownership changed' });
-        return;
+        discardStaleTransportQueueOwnership(sessionName, runtime, 'undo_queued_message_identity_mismatch');
+        queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+          sessionName,
+          runtime.recipientIdentity ?? null,
+          'undo_queued_message_identity_discard',
+        );
+      } else {
+        queueSnapshot = cancellation.snapshot;
       }
-      queueSnapshot = cancellation.snapshot;
     } catch (err) {
       // The SQLite row is the queue authority. If cancellation threw, the row is
       // STILL THERE — the delete did NOT happen — so we must NOT ack success
@@ -5165,7 +5197,17 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
   const release = await getMutex(sessionName).acquire();
   try {
     if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
-      reject('Queue ownership changed');
+      discardStaleTransportQueueOwnership(sessionName, runtime, 'append_queued_messages_adopt_failed');
+      const queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+        sessionName,
+        runtime.recipientIdentity,
+        'append_queued_messages_stale_discard',
+      );
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...transportQueueSnapshotToPayload(queueSnapshot),
+      }, { source: 'daemon', confidence: 'high' });
+      reject('Queued message state was stale and discarded');
       return;
     }
     // Same bounded recovery boundary as the delete path: append reads the

@@ -1288,12 +1288,14 @@ describe('handleWebCommand transport queue behavior', () => {
     }
   });
 
-  it('undo_queued_message fails closed when legacy ownership cannot be proven', async () => {
+  it('undo_queued_message discards stale queue state when legacy ownership cannot be proven', async () => {
     const cancelSpy = vi.spyOn(getTransportQueueStore(), 'cancelQueuedMessage');
+    const discardDurableQueueStateForRecipientConflict = vi.fn();
     getTransportRuntimeMock.mockReturnValue({
       removePendingMessage: vi.fn(() => null),
       recipientIdentity: { sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch' },
       adoptLegacyQueueRecipient: vi.fn(() => false),
+      discardDurableQueueStateForRecipientConflict,
       pendingCount: 0,
       sending: false,
     });
@@ -1305,8 +1307,9 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(cancelSpy).not.toHaveBeenCalled();
+    expect(discardDurableQueueStateForRecipientConflict).toHaveBeenCalledTimes(1);
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      commandId: 'cmd-legacy-ambiguous-delete', status: 'error', error: 'Queue ownership changed',
+      commandId: 'cmd-legacy-ambiguous-delete', status: 'accepted',
     }));
     cancelSpy.mockRestore();
   });
@@ -1443,10 +1446,11 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(survivors.length, 'a live handoff must not be silently dropped').toBe(1);
   });
 
-  // R2 P1 continuation: the delete path must also prove the LIVE runtime identity.
-  // Otherwise a same-named successor B, which cannot DRAIN A's queued work, could
-  // still DESTROY it through undo.
-  it('undo_queued_message does not let a same-name NEW instance drop another instance\'s row', async () => {
+  // If the live runtime proves a different canonical identity, the daemon must
+  // still avoid mis-delivery: B never drains A's private row. It may discard the
+  // stale aggregate so the reusable session name can recover instead of leaving
+  // the transport queue permanently unavailable.
+  it('undo_queued_message lets a same-name NEW instance self-heal by discarding the stale aggregate', async () => {
     const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
     const B = { sessionInstanceId: 'instance-B', runtimeEpoch: 'epoch-B' };
     getTransportQueueStore().enqueue({
@@ -1473,8 +1477,13 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(
       getTransportQueueStore().readSnapshot('deck_transport_brain')
         .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-owned-by-a'),
-      "B must not destroy A's queued work",
-    ).toBe(true);
+      "B must not drain A's queued work; the stale aggregate is discarded instead",
+    ).toBe(false);
+    expect(getTransportQueueStore().queueBelongsTo('deck_transport_brain', B)).toBe(true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-undo-foreign',
+      status: 'accepted',
+    }));
   });
 
   it('undo_queued_message still lets the exact live owner drop its own row', async () => {
@@ -5060,11 +5069,13 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('does not append or expose a legacy row when ownership adoption is ambiguous', async () => {
+  it('does not append and clears stale queue state when ownership adoption is ambiguous', async () => {
     const appendPendingMessagesToActiveTurn = vi.fn();
+    const discardDurableQueueStateForRecipientConflict = vi.fn();
     getTransportRuntimeMock.mockReturnValue({
       recipientIdentity: { sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch' },
       adoptLegacyQueueRecipient: vi.fn(() => false),
+      discardDurableQueueStateForRecipientConflict,
       rehydratePendingFromStore: vi.fn(),
       appendPendingMessagesToActiveTurn,
       sending: true,
@@ -5082,8 +5093,9 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+    expect(discardDurableQueueStateForRecipientConflict).toHaveBeenCalledTimes(1);
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      commandId: 'cmd-legacy-ambiguous-append', status: 'error', error: 'Queue ownership changed',
+      commandId: 'cmd-legacy-ambiguous-append', status: 'error', error: 'Queued message state was stale and discarded',
     }));
   });
 

@@ -95,6 +95,15 @@ export interface AdoptLegacyRecipientResult {
   purged?: number;
 }
 
+export interface DiscardTransportQueueStateResult {
+  queueEntries: number;
+  privateMaterials: number;
+  deliveryTombstones: number;
+  cancellationTombstones: number;
+  queueMeta: number;
+  rebound: boolean;
+}
+
 export interface HandoffTransportQueueEntry {
   entry: QueueProjectionEntry;
   handoffId: string;
@@ -355,6 +364,49 @@ export class TransportQueueStore {
     }
   }
 
+  private deleteSessionQueueStateRows(sessionName: string): Omit<DiscardTransportQueueStateResult, 'rebound'> {
+    return {
+      queueEntries: Number(this.db.prepare('DELETE FROM queue_entries WHERE session_name = ?').run(sessionName).changes ?? 0),
+      privateMaterials: Number(this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ?').run(sessionName).changes ?? 0),
+      deliveryTombstones: Number(this.db.prepare('DELETE FROM queue_delivery_tombstones WHERE session_name = ?').run(sessionName).changes ?? 0),
+      cancellationTombstones: Number(this.db.prepare('DELETE FROM queue_cancellation_tombstones WHERE session_name = ?').run(sessionName).changes ?? 0),
+      queueMeta: Number(this.db.prepare('DELETE FROM queue_meta WHERE session_name = ?').run(sessionName).changes ?? 0),
+    };
+  }
+
+  /**
+   * Last-resort self-healing for a reusable session name whose durable queue is
+   * owned by a different canonical recipient. We still never hand the old rows
+   * to the new runtime; instead we drop that session's queue authority and, when
+   * possible, immediately bind an empty queue to the current recipient so future
+   * sends/reconnects cannot stay wedged on the stale owner.
+   */
+  discardSessionQueueState(
+    sessionNameInput: string,
+    recipient?: QueueRecipientIdentity | null,
+    now = Date.now(),
+  ): DiscardTransportQueueStateResult {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const bound = normalizeQueueRecipient(recipient);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const discarded = this.deleteSessionQueueStateRows(sessionName);
+      if (bound) {
+        this.db.prepare(`
+          INSERT INTO queue_meta (
+            session_name, queue_epoch, queue_authority_id, pending_message_version, next_ordinal, updated_at,
+            recipient_session_instance_id, recipient_runtime_epoch
+          ) VALUES (?, ?, ?, 1, 0, ?, ?, ?)
+        `).run(sessionName, randomUUID(), randomUUID(), now, bound.sessionInstanceId, bound.runtimeEpoch);
+      }
+      this.db.exec('COMMIT');
+      return { ...discarded, rebound: Boolean(bound) };
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
   private ensureMeta(
     sessionName: string,
     now = Date.now(),
@@ -375,8 +427,8 @@ export class TransportQueueStore {
     if (existing) {
       // Adopt an identity only for a row that has none (a legacy row, or one
       // minted before the recipient was known). An existing DIFFERENT identity is
-      // never overwritten here -- that is a new instance taking the name, and
-      // `queueBelongsTo` refuses it.
+      // not overwritten here -- startup/recovery may discard that stale queue,
+      // but ordinary metadata reads must not silently drain another runtime.
       if (bound && !existing.recipientSessionInstanceId && !existing.recipientRuntimeEpoch) {
         this.db.prepare(`
           UPDATE queue_meta SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?, updated_at = ?
@@ -433,7 +485,7 @@ export class TransportQueueStore {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const recipient = normalizeQueueRecipient(input.recipient);
-      const meta = this.ensureMeta(sessionName, now, recipient);
+      let meta = this.ensureMeta(sessionName, now, recipient);
       this.db.prepare('DELETE FROM queue_cancellation_tombstones WHERE created_at < ?')
         .run(now - QUEUE_CANCELLATION_TOMBSTONE_TTL_MS);
       // Deletion may overtake the async send path even though the browser put
@@ -465,7 +517,13 @@ export class TransportQueueStore {
       `).get(sessionName) as { sessionInstanceId?: string | null } | undefined;
       if (recipient && metaRecipient?.sessionInstanceId
         && metaRecipient.sessionInstanceId !== recipient.sessionInstanceId) {
-        throw new Error('transport queue recipient instance mismatch');
+        // A same-name replacement must not enter the old aggregate or be stuck
+        // forever behind it. Drop the stale queue state and continue with a
+        // freshly-bound empty queue for the current recipient. This may lose old
+        // queued rows/tombstones for this session name, but never delivers them
+        // to the wrong runtime.
+        this.deleteSessionQueueStateRows(sessionName);
+        meta = this.ensureMeta(sessionName, now, recipient);
       }
       if (evictClientMessageId) {
         this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
@@ -1535,6 +1593,7 @@ export class TransportQueueStore {
       this.db.prepare('DELETE FROM queue_entries WHERE session_name = ?').run(sessionName);
       this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ?').run(sessionName);
       this.db.prepare('DELETE FROM queue_delivery_tombstones WHERE session_name = ?').run(sessionName);
+      this.db.prepare('DELETE FROM queue_cancellation_tombstones WHERE session_name = ?').run(sessionName);
       const queueEpoch = randomUUID();
       const queueAuthorityId = randomUUID();
       this.db.prepare(`

@@ -989,14 +989,56 @@ describe('recipient-sensitive store operations are identity-gated', () => {
     expect(store.readPrivateDispatchMaterial(NAME, 'm-a', rotated)).toBeUndefined();
 
     const reusedName = { sessionInstanceId: 'different-instance', runtimeEpoch: 'epoch-A-current' };
-    expect(() => store.enqueueWithCapacityEviction({
+    const replacement = store.enqueueWithCapacityEviction({
       sessionName: NAME,
       recipient: reusedName,
       clientMessageId: 'm-a',
-      text: 'different instance must not enter the old aggregate',
+      text: 'different instance starts fresh after old aggregate is discarded',
       now: 23,
-    })).toThrow('recipient instance mismatch');
-    expect(store.readSnapshot(NAME).pendingMessageEntries).toEqual([]);
+    });
+    expect(replacement.cancelled).toBeUndefined();
+    expect(replacement.queueSnapshot.pendingMessageEntries)
+      .toEqual([expect.objectContaining({ clientMessageId: 'm-a' })]);
+    expect(store.queueBelongsTo(NAME, reusedName)).toBe(true);
+    expect(store.queueBelongsTo(NAME, rotated)).toBe(false);
+  });
+
+  it('can destructively discard stale queue state and rebound an empty queue to the current recipient', () => {
+    store.enqueue({
+      sessionName: NAME,
+      recipient: A,
+      clientMessageId: 'live',
+      text: 'live private text',
+      now: 10,
+      privateMaterialJson: JSON.stringify({ text: 'live private text' }),
+    });
+    store.enqueue({
+      sessionName: NAME,
+      recipient: A,
+      clientMessageId: 'sent',
+      text: 'sent private text',
+      now: 11,
+      privateMaterialJson: JSON.stringify({ text: 'sent private text' }),
+    });
+    expect(store.markHandoffInFlight(NAME, ['sent'], 60_000, 12, A)).toHaveLength(1);
+    store.finalizeSentBatch(NAME, ['sent'], 'frame-sent', 13, A);
+    expect(store.cancelQueuedMessage(NAME, 'cancelled-before-enqueue', A, 14).status).toBe('accepted');
+
+    const discarded = store.discardSessionQueueState(NAME, B, 20);
+
+    expect(discarded).toEqual({
+      queueEntries: 1,
+      privateMaterials: 1,
+      deliveryTombstones: 1,
+      cancellationTombstones: 1,
+      queueMeta: 1,
+      rebound: true,
+    });
+    expect(store.queueBelongsTo(NAME, A)).toBe(false);
+    expect(store.queueBelongsTo(NAME, B)).toBe(true);
+    expect(store.readSnapshotForRecipient(NAME, B).pendingMessageEntries).toEqual([]);
+    expect(store.readPrivateDispatchMaterial(NAME, 'live', A)).toBeUndefined();
+    expect(store.hasDeliveryTombstone(NAME, 'sent')).toBe(false);
   });
 
   it('does not let a replacement instance tombstone or delete another instance queue row', () => {
