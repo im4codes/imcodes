@@ -14,7 +14,10 @@ import {
   openComputerUseCallArgs,
   openComputerUseCandidateBinariesForTest,
   openComputerUseEnv,
+  resolveOpenComputerUseBinaryForCurrentProcessForTest,
+  resolveOpenComputerUseBinaryForTest,
   selectOpenComputerUseBinaryForTest,
+  verifyOpenComputerUseBinaryForLaunchForTest,
 } from '../../src/node/computer-use-runner.js';
 
 describe('computer use runner open-computer-use CLI', () => {
@@ -102,6 +105,94 @@ describe('computer use runner open-computer-use CLI', () => {
     }
   });
 
+  it('resolves the signed packaged macOS app from the module layout when PATH has no helper', async () => {
+    const packaged = resolve('/tmp/imcodes-fixture/dist/computer-use-helper/darwin-arm64/Open Computer Use.app/Contents/MacOS/OpenComputerUse');
+    const verify = vi.fn(async (candidate: string) => candidate === packaged);
+
+    await expect(resolveOpenComputerUseBinaryForTest({
+      platform: 'darwin',
+      arch: 'arm64',
+      moduleFilePath: resolve('/tmp/imcodes-fixture/dist/src/node/computer-use-runner.js'),
+      entryFilePath: resolve('/tmp/unrelated/imcodes'),
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/unrelated',
+      fileExists: async (candidate) => candidate === packaged,
+      verifyTrustedArtifact: verify,
+    })).resolves.toBe(packaged);
+    expect(verify).toHaveBeenCalledWith(packaged);
+  });
+
+  it('wires the running module location into production resolution instead of relying on cwd or PATH', async () => {
+    const packaged = resolve('dist/computer-use-helper/darwin-arm64/Open Computer Use.app/Contents/MacOS/OpenComputerUse');
+    const exists = vi.fn(async (candidate: string) => candidate === packaged);
+    const verify = vi.fn(async (candidate: string) => exists(candidate));
+
+    const selected = await resolveOpenComputerUseBinaryForCurrentProcessForTest({
+      platform: 'darwin',
+      arch: 'arm64',
+      entryFilePath: '/tmp/unrelated/imcodes',
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/unrelated',
+      fileExists: exists,
+      verifyTrustedArtifact: verify,
+    });
+    expect(selected).toBe(packaged);
+  });
+
+  it('uses the verified persistent macOS runtime after restart without PATH fallback', async () => {
+    const runtime = '/Library/Application Support/imcodes-node-computer-use/Open Computer Use.app/Contents/MacOS/OpenComputerUse';
+    const verify = vi.fn(async (candidate: string) => candidate === runtime);
+    const options = {
+      platform: 'darwin' as const,
+      arch: 'arm64',
+      moduleFilePath: resolve('/tmp/missing/dist/src/node/computer-use-runner.js'),
+      entryFilePath: resolve('/tmp/missing/imcodes'),
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/missing',
+      fileExists: async (candidate: string) => candidate === runtime,
+      verifyTrustedArtifact: verify,
+    };
+
+    await expect(resolveOpenComputerUseBinaryForTest(options)).resolves.toBe(runtime);
+    await expect(resolveOpenComputerUseBinaryForTest(options)).resolves.toBe(runtime);
+    expect(verify).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails with a typed actionable macOS error when packaged candidates are missing or corrupt', async () => {
+    const app = resolve('/tmp/imcodes-fixture/dist/computer-use-helper/darwin-arm64/Open Computer Use.app/Contents/MacOS/OpenComputerUse');
+    const base = {
+      platform: 'darwin' as const,
+      arch: 'arm64',
+      moduleFilePath: resolve('/tmp/imcodes-fixture/dist/src/node/computer-use-runner.js'),
+      entryFilePath: resolve('/tmp/unrelated/imcodes'),
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/unrelated',
+    };
+    await expect(resolveOpenComputerUseBinaryForTest({
+      ...base,
+      fileExists: async () => false,
+      verifyTrustedArtifact: async () => true,
+    })).rejects.toThrow('signed_macos_open_computer_use_helper_unavailable');
+    await expect(resolveOpenComputerUseBinaryForTest({
+      ...base,
+      fileExists: async (candidate) => candidate === app,
+      verifyTrustedArtifact: async () => false,
+    })).rejects.toThrow('signed_macos_open_computer_use_helper_unavailable');
+  });
+
+  it('re-verifies the selected macOS app at every helper process start', async () => {
+    const binary = '/signed/Open Computer Use.app/Contents/MacOS/OpenComputerUse';
+    const verify = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('signature changed'));
+
+    await expect(verifyOpenComputerUseBinaryForLaunchForTest(binary, 'darwin', verify))
+      .resolves.toBeUndefined();
+    await expect(verifyOpenComputerUseBinaryForLaunchForTest(binary, 'darwin', verify))
+      .rejects.toThrow('signature changed');
+    expect(verify).toHaveBeenCalledTimes(2);
+  });
+
   it('production Windows selection rejects PATH and unsigned helpers before choosing the anchored candidate', async () => {
     const exists = vi.fn(async (path: string) => path !== 'C:\\missing.exe');
     const verify = vi.fn(async (path: string) => path === 'C:\\signed.exe');
@@ -135,6 +226,14 @@ describe('computer use runner open-computer-use CLI', () => {
     });
     expect(openComputerUseEnv('click', { PATH: 'x' }, 'win32')).toBeUndefined();
     expect(openComputerUseEnv('type_text', { PATH: 'x' }, 'darwin')).toBeUndefined();
+  });
+
+  it('turns the typed macOS helper failure into an actionable unavailable state', () => {
+    expect(normalizeComputerUseErrorForTest(
+      'list_apps',
+      'signed_macos_open_computer_use_helper_unavailable',
+      'darwin',
+    ).error).toContain('signed Open Computer Use app is unavailable');
   });
 
   it('makes Windows fast coordinate pointer actions per-monitor DPI-aware before geometry calls', () => {

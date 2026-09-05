@@ -13,7 +13,7 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
   controlledNodeComputerUseHelperFilename,
   CONTROLLED_NODE_OS_MAC,
@@ -80,7 +80,7 @@ async function defaultVerifyCodeSignature(path: string, deep: boolean): Promise<
   ]);
 }
 
-async function defaultVerifyAppBundle(path: string): Promise<void> {
+export async function verifyMacosComputerUseAppBundle(path: string): Promise<void> {
   await defaultVerifyCodeSignature(path, true);
   const details = await new Promise<string>((resolve, reject) => {
     execFile('/usr/bin/codesign', ['-dv', '--verbose=4', path], { encoding: 'utf8', timeout: 15_000 }, (error, stdout, stderr) => {
@@ -97,6 +97,39 @@ async function defaultVerifyAppBundle(path: string): Promise<void> {
     && details.includes(`TeamIdentifier=${MACOS_AIDESK_TEAM_ID}`);
   if ((!legacy && !aiDesk) || !details.includes('Authority=Developer ID Application:')) {
     throw new Error('computer_use_app_untrusted_signature');
+  }
+}
+
+export function macosComputerUseAppBundleForExecutable(executablePath: string): string | null {
+  const appPath = dirname(dirname(dirname(resolve(executablePath))));
+  const appName = basename(appPath);
+  const executable = appName === MACOS_AIDESK_APP_NAME
+    ? MACOS_AIDESK_EXECUTABLE
+    : appName === MACOS_COMPUTER_USE_APP_NAME
+      ? MACOS_COMPUTER_USE_EXECUTABLE
+      : null;
+  if (!executable) return null;
+  return resolve(executablePath) === join(appPath, 'Contents', 'MacOS', executable)
+    ? appPath
+    : null;
+}
+
+export async function verifyMacosComputerUseExecutable(
+  executablePath: string,
+  verifyAppBundle: (path: string) => Promise<void> = verifyMacosComputerUseAppBundle,
+): Promise<void> {
+  const appPath = macosComputerUseAppBundleForExecutable(executablePath);
+  if (!appPath || !await isRegularFile(executablePath)) {
+    throw new Error('signed_macos_open_computer_use_helper_authenticity_failed');
+  }
+  const appStat = await lstat(appPath).catch(() => null);
+  if (!appStat?.isDirectory() || appStat.isSymbolicLink()) {
+    throw new Error('signed_macos_open_computer_use_helper_authenticity_failed');
+  }
+  try {
+    await verifyAppBundle(appPath);
+  } catch {
+    throw new Error('signed_macos_open_computer_use_helper_authenticity_failed');
   }
 }
 
@@ -246,7 +279,7 @@ export async function prepareMacosComputerUseRuntime(
 ): Promise<MacosComputerUseRuntime> {
   const runtimeRoot = options.runtimeRoot ?? MACOS_COMPUTER_USE_RUNTIME_ROOT;
   const verifyCodeSignature = options.verifyCodeSignature ?? defaultVerifyCodeSignature;
-  const verifyAppBundle = options.verifyAppBundle ?? defaultVerifyAppBundle;
+  const verifyAppBundle = options.verifyAppBundle ?? verifyMacosComputerUseAppBundle;
   const extractAppArchive = options.extractAppArchive ?? defaultExtractAppArchive;
   const helperExecutable = join(runtimeRoot, 'imcodes-computer-use-helper');
   let appPath = join(runtimeRoot, MACOS_AIDESK_APP_NAME);

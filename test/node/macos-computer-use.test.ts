@@ -4,8 +4,10 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   MACOS_AIDESK_APP_NAME,
+  macosComputerUseAppBundleForExecutable,
   prepareMacosComputerUseRuntime,
   validateMacosComputerUseArchiveEntries,
+  verifyMacosComputerUseExecutable,
   type MacosComputerUseRuntime,
   type MacosConsoleUser,
 } from '../../src/node/macos-computer-use.js';
@@ -42,6 +44,42 @@ afterEach(async () => {
 });
 
 describe('macOS Computer Use runtime boundary', () => {
+  it('accepts only the exact executable inside a regular verified supported app bundle', async () => {
+    const dir = await tempDir();
+    await writeExtractedApp(dir, 'ocu-v1');
+    const app = join(dir, 'Open Computer Use.app');
+    const executable = join(app, 'Contents', 'MacOS', 'OpenComputerUse');
+    const other = join(app, 'Contents', 'MacOS', 'other');
+    await writeFile(other, 'not-the-authorized-entrypoint', { mode: 0o755 });
+    const verify = vi.fn(async () => {});
+
+    expect(macosComputerUseAppBundleForExecutable(executable)).toBe(app);
+    await expect(verifyMacosComputerUseExecutable(executable, verify)).resolves.toBeUndefined();
+    expect(verify).toHaveBeenCalledWith(app);
+    await expect(verifyMacosComputerUseExecutable(other, verify))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+  });
+
+  it('rejects a missing, corrupt, or symlinked packaged app helper', async () => {
+    const dir = await tempDir();
+    await writeExtractedApp(dir, 'ocu-v1');
+    const app = join(dir, 'Open Computer Use.app');
+    const executable = join(app, 'Contents', 'MacOS', 'OpenComputerUse');
+
+    await expect(verifyMacosComputerUseExecutable(executable, async () => {
+      throw new Error('bad signature');
+    })).rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+    await rm(executable);
+    await expect(verifyMacosComputerUseExecutable(executable, async () => {}))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+
+    await rm(app, { recursive: true, force: true });
+    await writeExtractedApp(join(dir, 'real'), 'ocu-v2');
+    await symlink(join(dir, 'real', 'Open Computer Use.app'), app);
+    await expect(verifyMacosComputerUseExecutable(executable, async () => {}))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+  });
+
   it('migrates the legacy OCU runtime to the unified aiDesk.to application', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');

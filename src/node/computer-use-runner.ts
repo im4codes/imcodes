@@ -3,6 +3,7 @@ import { access, mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, win32 as pathWin32 } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
@@ -24,6 +25,12 @@ import {
   WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
   verifyWindowsAuthenticodeSigners,
 } from './windows-artifact-trust.js';
+import {
+  MACOS_AIDESK_APP_NAME,
+  MACOS_COMPUTER_USE_APP_NAME,
+  MACOS_COMPUTER_USE_RUNTIME_ROOT,
+  verifyMacosComputerUseExecutable,
+} from './macos-computer-use.js';
 
 export const WINDOWS_DEFAULT_OCU_DIR = 'C:\\ProgramData\\imcodes-node\\computer-use-helper';
 const WINDOWS_DEFAULT_OCU_EXE = `${WINDOWS_DEFAULT_OCU_DIR}\\open-computer-use.exe`;
@@ -31,10 +38,16 @@ const SHELL_SESSION1_OUTPUT_MAX_BYTES = 96 * 1024;
 const OPEN_COMPUTER_USE_STDOUT_MAX_BYTES = 24 * 1024 * 1024;
 const OPEN_COMPUTER_USE_BINARY = process.platform === 'win32' ? 'open-computer-use.exe' : 'open-computer-use';
 const MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE = join(
-  'Open Computer Use.app',
+  MACOS_COMPUTER_USE_APP_NAME,
   'Contents',
   'MacOS',
   'OpenComputerUse',
+);
+const MACOS_AIDESK_APP_EXECUTABLE = join(
+  MACOS_AIDESK_APP_NAME,
+  'Contents',
+  'MacOS',
+  'aidesk-agent',
 );
 
 function platformArchKey(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
@@ -61,53 +74,84 @@ async function fileExists(path: string): Promise<boolean> {
   try { await access(path); return true; } catch { return false; }
 }
 
-export function openComputerUseCandidateBinariesForTest(moduleFilePath?: string, entryFilePath?: string): string[] {
-  return openComputerUseCandidateBinaries({ moduleFilePath, entryFilePath });
+export function openComputerUseCandidateBinariesForTest(
+  moduleFilePath?: string,
+  entryFilePath?: string,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string[] {
+  return openComputerUseCandidateBinaries({ moduleFilePath, entryFilePath, platform, arch });
 }
 
-function pushPackagedHelperCandidates(candidates: Array<string | undefined>, baseDir: string, key: string): void {
+function pushPackagedHelperCandidates(
+  candidates: Array<string | undefined>,
+  baseDir: string,
+  key: string,
+  platform: NodeJS.Platform,
+  binary: string,
+): void {
   const helperRoots = [
     resolve(baseDir, '..', 'computer-use-helper', key),
     resolve(baseDir, '..', '..', 'computer-use-helper', key),
     resolve(baseDir, '..', '..', 'dist', 'computer-use-helper', key),
   ];
-  if (process.platform === 'darwin') {
+  if (platform === 'darwin') {
     candidates.push(...helperRoots.map((root) => join(root, MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE)));
   }
   candidates.push(
     // npm package layout: dist/src/index.js -> dist/computer-use-helper/<platform-arch>/...
-    join(helperRoots[0]!, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[0]!, binary),
     // module layout: dist/src/node/computer-use-runner.js -> dist/computer-use-helper/<platform-arch>/...
-    join(helperRoots[1]!, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[1]!, binary),
     // source/dev checkout layout: src/... -> dist/computer-use-helper/<platform-arch>/...
-    join(helperRoots[2]!, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[2]!, binary),
   );
 }
 
-function openComputerUseCandidateBinaries(options: { moduleFilePath?: string; entryFilePath?: string } = {}): string[] {
-  const key = platformArchKey();
-  const helperDir = process.env.IMCODES_COMPUTER_USE_HELPER_DIR?.trim();
+interface OpenComputerUseResolutionOptions {
+  moduleFilePath?: string;
+  entryFilePath?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}
+
+function openComputerUseCandidateBinaries(options: OpenComputerUseResolutionOptions = {}): string[] {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const key = platformArchKey(platform, arch);
+  const binary = platform === 'win32' ? 'open-computer-use.exe' : 'open-computer-use';
+  const helperDir = env.IMCODES_COMPUTER_USE_HELPER_DIR?.trim();
   const candidates: Array<string | undefined> = [
-    process.env.IMCODES_COMPUTER_USE_EXE?.trim(),
-    helperDir ? join(helperDir, OPEN_COMPUTER_USE_BINARY) : undefined,
+    env.IMCODES_COMPUTER_USE_EXE?.trim(),
+    platform === 'darwin' && helperDir ? join(helperDir, MACOS_AIDESK_APP_EXECUTABLE) : undefined,
+    platform === 'darwin' && helperDir ? join(helperDir, MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE) : undefined,
+    helperDir ? join(helperDir, binary) : undefined,
   ];
 
   if (options.moduleFilePath) {
-    pushPackagedHelperCandidates(candidates, dirname(resolve(options.moduleFilePath)), key);
+    pushPackagedHelperCandidates(candidates, dirname(resolve(options.moduleFilePath)), key, platform, binary);
   }
-  const entryFilePath = options.entryFilePath ?? process.argv[1];
+  const entryFilePath = options.entryFilePath === undefined ? process.argv[1] : options.entryFilePath;
   if (entryFilePath) {
-    pushPackagedHelperCandidates(candidates, dirname(resolve(entryFilePath)), key);
+    pushPackagedHelperCandidates(candidates, dirname(resolve(entryFilePath)), key, platform, binary);
   }
   candidates.push(
+    ...(platform === 'darwin' ? [
+      join(MACOS_COMPUTER_USE_RUNTIME_ROOT, MACOS_AIDESK_APP_EXECUTABLE),
+      join(MACOS_COMPUTER_USE_RUNTIME_ROOT, MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE),
+    ] : []),
     // Build-tree fallback for local development and tests.
-    resolve(process.cwd(), 'dist', 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
-    resolve(process.cwd(), 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
+    resolve(cwd, 'dist', 'computer-use-helper', key, binary),
+    resolve(cwd, 'computer-use-helper', key, binary),
     // controlled-node / manually-installed sidecar next to the running executable.
-    join(dirname(process.execPath), 'computer-use-helper', OPEN_COMPUTER_USE_BINARY),
-    join(dirname(process.execPath), 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
-    process.platform === 'win32' ? WINDOWS_DEFAULT_OCU_EXE : undefined,
-    OPEN_COMPUTER_USE_BINARY,
+    join(dirname(process.execPath), 'computer-use-helper', binary),
+    join(dirname(process.execPath), 'computer-use-helper', key, binary),
+    platform === 'win32' ? WINDOWS_DEFAULT_OCU_EXE : undefined,
+    binary,
   );
 
   const unique = new Set<string>();
@@ -118,18 +162,54 @@ function openComputerUseCandidateBinaries(options: { moduleFilePath?: string; en
   });
 }
 
-async function resolveOpenComputerUseBinary(): Promise<string> {
-  const candidates = openComputerUseCandidateBinaries();
-  const signedWindowsRelease = process.platform === 'win32'
+export async function resolveOpenComputerUseBinaryForTest(options: OpenComputerUseResolutionOptions & {
+  fileExists: (path: string) => Promise<boolean>;
+  verifyTrustedArtifact: (path: string) => Promise<boolean>;
+}): Promise<string> {
+  const platform = options.platform ?? process.platform;
+  const candidates = openComputerUseCandidateBinaries(options);
+  const signedWindowsRelease = platform === 'win32'
     && /^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256);
+  const requireTrustedArtifact = signedWindowsRelease || platform === 'darwin';
   return selectOpenComputerUseBinaryForTest(candidates, {
-    requireReleaseSignature: signedWindowsRelease,
-    explicitOverride: process.env.IMCODES_COMPUTER_USE_EXE?.trim(),
+    requireReleaseSignature: requireTrustedArtifact,
+    explicitOverride: options.env?.IMCODES_COMPUTER_USE_EXE?.trim(),
+    fileExists: options.fileExists,
+    verifySignature: options.verifyTrustedArtifact,
+    unavailableError: platform === 'darwin'
+      ? 'signed_macos_open_computer_use_helper_unavailable'
+      : 'signed_open_computer_use_helper_unavailable',
+  });
+}
+
+async function resolveOpenComputerUseBinary(): Promise<string> {
+  return resolveOpenComputerUseBinaryForCurrentProcessForTest({
+    platform: process.platform,
+    arch: process.arch,
+    env: process.env,
+    cwd: process.cwd(),
     fileExists,
-    verifySignature: (candidate) => verifyWindowsAuthenticodeSigners(
-      [candidate],
-      WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
-    ),
+    verifyTrustedArtifact: async (candidate) => {
+      if (process.platform === 'darwin') {
+        try {
+          await verifyMacosComputerUseExecutable(candidate);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      return verifyWindowsAuthenticodeSigners([candidate], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256);
+    },
+  });
+}
+
+export async function resolveOpenComputerUseBinaryForCurrentProcessForTest(options: Omit<
+  Parameters<typeof resolveOpenComputerUseBinaryForTest>[0],
+  'moduleFilePath'
+>): Promise<string> {
+  return resolveOpenComputerUseBinaryForTest({
+    ...options,
+    moduleFilePath: fileURLToPath(import.meta.url),
   });
 }
 
@@ -140,6 +220,7 @@ export async function selectOpenComputerUseBinaryForTest(
     explicitOverride?: string;
     fileExists: (path: string) => Promise<boolean>;
     verifySignature: (path: string) => Promise<boolean>;
+    unavailableError?: string;
   },
 ): Promise<string> {
   for (let index = 0; index < candidates.length; index++) {
@@ -159,16 +240,31 @@ export async function selectOpenComputerUseBinaryForTest(
     if (candidate === OPEN_COMPUTER_USE_BINARY) return candidate;
     if (await options.fileExists(candidate)) return candidate;
   }
-  if (options.requireReleaseSignature) throw new Error('signed_open_computer_use_helper_unavailable');
+  if (options.requireReleaseSignature) {
+    throw new Error(options.unavailableError ?? 'signed_open_computer_use_helper_unavailable');
+  }
   return OPEN_COMPUTER_USE_BINARY;
 }
 
-async function verifyOpenComputerUseBinaryForLaunch(binary: string): Promise<void> {
-  if (process.platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
+export async function verifyOpenComputerUseBinaryForLaunchForTest(
+  binary: string,
+  platform: NodeJS.Platform = process.platform,
+  verifyMacos: (path: string) => Promise<void> = verifyMacosComputerUseExecutable,
+  verifyWindows: (paths: readonly string[], signerSha256: string) => Promise<boolean> = verifyWindowsAuthenticodeSigners,
+): Promise<void> {
+  if (platform === 'darwin') {
+    await verifyMacos(binary);
+    return;
+  }
+  if (platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
   if (!pathWin32.isAbsolute(binary)
-    || !await verifyWindowsAuthenticodeSigners([binary], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) {
+    || !await verifyWindows([binary], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) {
     throw new Error('signed_open_computer_use_helper_authenticity_failed');
   }
+}
+
+async function verifyOpenComputerUseBinaryForLaunch(binary: string): Promise<void> {
+  await verifyOpenComputerUseBinaryForLaunchForTest(binary);
 }
 
 interface ComputerUseReturnOptions {
@@ -864,6 +960,12 @@ function actionableComputerUseError(
   }
   if (platform === 'linux' && /Namespace Atspi not available|No module named ['"]pyatspi['"]/.test(text)) {
     return 'Desktop app control is unavailable because this Linux host is missing AT-SPI accessibility support or a graphical desktop session. Browser automation is separate: install Google Chrome, Chromium, or Microsoft Edge and use a browser_* tool.';
+  }
+  if (platform === 'darwin' && text.includes('signed_macos_open_computer_use_helper_unavailable')) {
+    return 'Desktop app control is unavailable because the packaged signed Open Computer Use app is unavailable or failed verification. Reinstall or repair the signed IM.codes package; no PATH helper was executed.';
+  }
+  if (platform === 'darwin' && text.includes('signed_macos_open_computer_use_helper_authenticity_failed')) {
+    return 'Desktop app control is unavailable because the packaged Open Computer Use app failed signature verification. Reinstall or repair the signed IM.codes package; no unverified helper was executed.';
   }
   return text;
 }
