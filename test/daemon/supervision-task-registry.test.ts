@@ -7,6 +7,8 @@ import { describe, expect, it, beforeEach, vi } from 'vitest';
 
 import {
   SupervisionTaskRegistry,
+  SUPERVISION_ORPHAN_QUARANTINE_SCOPE,
+  isReservedSupervisionProjectScope,
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
   type PersistedSupervisionTaskAssignmentIdentity,
@@ -9550,5 +9552,189 @@ describe('cancelled implementation evidence adoption', () => {
     expect(registry.getAssignment(worker.value.assignmentId)?.auditRevision).toBeUndefined();
     registry.close();
     database.close();
+  });
+
+  it('applies a mixed orphan batch: valid backfills land, quarantine satisfies the project guard, and progress is recorded', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-hk-orphan-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+
+    // Orphans predate MIGRATION_3's project guard, which is why they exist at
+    // all. The guard refuses to CREATE one, so the fixture reproduces the
+    // legacy shape by lifting the trigger exactly as history did.
+    const makeOrphan = (taskId: string) => {
+      db.exec('DROP TRIGGER IF EXISTS supervision_tasks_project_guard_update');
+      db.prepare('UPDATE supervision_tasks SET project_name = NULL WHERE task_id = ?').run(taskId);
+      db.exec(`CREATE TRIGGER supervision_tasks_project_guard_update
+               BEFORE UPDATE ON supervision_tasks
+               FOR EACH ROW WHEN NEW.project_name IS NULL OR trim(NEW.project_name) = ''
+               BEGIN SELECT RAISE(ABORT, 'supervision task project scope is required'); END;`);
+    };
+    const mkTask = (taskId: string, topLevelTaskId: string) => {
+      const created = registry.createOrGet({
+        taskId, topLevelTaskId, projectName: 'alpha',
+        classification: topLevelTaskId === taskId ? 'independent_top_level' : 'integration_slice',
+        objective: `objective ${taskId}`, now: 1_000,
+      });
+      expect(created).toMatchObject({ ok: true });
+    };
+
+    mkTask('hk-parent', 'hk-parent');           // keeps its scope; provides lineage
+    mkTask('hk-backfill', 'hk-parent');         // orphan WITH lineage -> backfill
+    mkTask('hk-quarantine', 'hk-quarantine');   // orphan WITHOUT lineage -> quarantine
+    mkTask('hk-live', 'hk-live');               // orphan with a live assignment -> skipped
+    const live = registry.createAssignment({
+      taskId: 'hk-live', assignmentId: 'hk-live-asg', role: 'implementer',
+      identity: identity('deck_hk_live'), now: 2_000,
+    });
+    if (!live.ok) throw new Error(live.reason);
+
+    makeOrphan('hk-backfill');
+    makeOrphan('hk-quarantine');
+    makeOrphan('hk-live');
+
+    const now = 5_000;
+    // Today this throws 'supervision task project scope is required' from the
+    // SQLite guard, discarding the backfill that had already succeeded.
+    const applied = registry.reconcileHousekeeping({
+      projectName: 'alpha', mode: 'apply', cursor: 'orphan:', limit: 25, now,
+    });
+
+    expect(applied.failedActions, 'no planned action may be unexecutable').toEqual([]);
+
+    const scopeOf = (taskId: string) => (db
+      .prepare('SELECT project_name AS projectName, status FROM supervision_tasks WHERE task_id = ?')
+      .get(taskId) as { projectName: string | null; status: string });
+
+    expect(
+      scopeOf('hk-backfill'),
+      'a backfill with authoritative lineage must land even though the batch also held a quarantine',
+    ).toMatchObject({ projectName: 'alpha' });
+
+    const quarantined = scopeOf('hk-quarantine');
+    expect(
+      quarantined.projectName,
+      'quarantine must name the reserved scope so it satisfies the project guard',
+    ).toBe(SUPERVISION_ORPHAN_QUARANTINE_SCOPE);
+    expect(quarantined.status).toBe('blocked');
+    expect(isReservedSupervisionProjectScope(quarantined.projectName)).toBe(true);
+    expect(
+      isReservedSupervisionProjectScope('alpha'),
+      'the reserved scope must not be addressable as a caller project',
+    ).toBe(false);
+
+    expect(
+      scopeOf('hk-live').projectName,
+      'an orphan still holding a live assignment must not be quarantined',
+    ).toBeNull();
+
+    // Behavioural proof that the reserved scope does not route as a project:
+    // a later pass scoped to the caller's real project no longer sees the
+    // quarantined task at all.
+    const rescan = registry.reconcileHousekeeping({
+      projectName: 'alpha', mode: 'dryRun', cursor: 'orphan:', limit: 25, now: now + 1,
+    });
+    expect(
+      [...rescan.actions.map((a) => a.taskId), ...rescan.orphanDiagnostics.map((d) => d.taskId)],
+      'a quarantined task must leave the calling project surface entirely',
+    ).not.toContain('hk-quarantine');
+
+    const due = db.prepare(
+      'SELECT next_due_at AS nextDueAt FROM supervision_housekeeping_state WHERE project_name = ?',
+    ).get('alpha') as { nextDueAt: number } | undefined;
+    expect(
+      due?.nextDueAt ?? 0,
+      'a pass that made progress must advance next_due_at or the scheduler re-picks it forever',
+    ).toBeGreaterThan(now);
+
+    db.close();
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('lets one unexecutable action fail alone: the rest still commit and the pass still records progress', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-hk-isolation-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+
+    const makeOrphan = (taskId: string) => {
+      db.exec('DROP TRIGGER IF EXISTS supervision_tasks_project_guard_update');
+      db.prepare('UPDATE supervision_tasks SET project_name = NULL WHERE task_id = ?').run(taskId);
+      db.exec(`CREATE TRIGGER supervision_tasks_project_guard_update
+               BEFORE UPDATE ON supervision_tasks
+               FOR EACH ROW WHEN NEW.project_name IS NULL OR trim(NEW.project_name) = ''
+               BEGIN SELECT RAISE(ABORT, 'supervision task project scope is required'); END;`);
+    };
+    const mkTask = (taskId: string, topLevelTaskId: string) => {
+      expect(registry.createOrGet({
+        taskId, topLevelTaskId, projectName: 'gamma',
+        classification: topLevelTaskId === taskId ? 'independent_top_level' : 'integration_slice',
+        objective: `objective ${taskId}`, now: 1_000,
+      })).toMatchObject({ ok: true });
+    };
+
+    mkTask('iso-parent', 'iso-parent');
+    mkTask('iso-good', 'iso-parent');     // orphan with lineage -> backfill, must land
+    mkTask('iso-poison', 'iso-poison');   // orphan without lineage -> quarantine, forced to fail
+    makeOrphan('iso-good');
+    makeOrphan('iso-poison');
+
+    // A failure whose cause is INDEPENDENT of anything this change touches, so
+    // the test proves the isolation contract itself rather than the quarantine
+    // fix a second time. Any per-row write failure must behave this way.
+    db.exec(`CREATE TRIGGER iso_poison_guard
+             BEFORE UPDATE ON supervision_tasks
+             FOR EACH ROW WHEN NEW.task_id = 'iso-poison'
+             BEGIN SELECT RAISE(ABORT, 'poisoned row'); END;`);
+
+    const now = 7_000;
+    const applied = registry.reconcileHousekeeping({
+      projectName: 'gamma', mode: 'apply', cursor: 'orphan:', limit: 25, now,
+    });
+
+    expect(
+      applied.failedActions.map((failure) => failure.taskId),
+      'the poisoned action must be reported, not thrown away and not thrown',
+    ).toEqual(['iso-poison']);
+
+    const good = db.prepare('SELECT project_name AS projectName FROM supervision_tasks WHERE task_id = ?')
+      .get('iso-good') as { projectName: string | null };
+    expect(
+      good.projectName,
+      'a valid action must not be rolled back by an unrelated failure in the same batch',
+    ).toBe('gamma');
+
+    const due = db.prepare(
+      'SELECT next_due_at AS nextDueAt FROM supervision_housekeeping_state WHERE project_name = ?',
+    ).get('gamma') as { nextDueAt: number } | undefined;
+    expect(
+      due?.nextDueAt ?? 0,
+      'a failed action must not freeze the schedule',
+    ).toBeGreaterThan(now);
+
+    db.close();
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports housekeeping authorization and feasibility as separate facts', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-hk-feasible-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    expect(registry.createOrGet({
+      taskId: 'hk-feasible', topLevelTaskId: 'hk-feasible', projectName: 'beta',
+      classification: 'independent_top_level', objective: 'feasibility', now: 1_000,
+    })).toMatchObject({ ok: true });
+
+    const dry = registry.reconcileHousekeeping({ projectName: 'beta', mode: 'dryRun', limit: 25, now: 2_000 });
+    // Nothing has authorized this project to apply yet...
+    expect(dry.applyAuthorized, 'authorization is about the caller').toBe(false);
+    // ...but the plan it produced is executable, which is a different question.
+    expect(dry.applyFeasible, 'feasibility is about the plan').toBe(true);
+
+    registry.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 });

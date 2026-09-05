@@ -847,6 +847,37 @@ export interface SupervisionHousekeepingAction {
   reason?: string;
 }
 
+/**
+ * The scope a quarantined orphan is parked under.
+ *
+ * The SQLite guard installed by MIGRATION_3 refuses any supervision_tasks row
+ * whose project_name is null or blank, and that guard is correct: an
+ * unscoped task is exactly what housekeeping exists to eliminate. Quarantine
+ * therefore has to name a scope, and it must not be a GUESS at a real project
+ * — an orphan reached quarantine precisely because no authoritative lineage
+ * could be established, so inventing one would launder an unknown into a
+ * claim.
+ *
+ * This reserved value follows the `__…__` convention already used for
+ * `__legacy_unscoped__`. It is not derivable from any session name (project
+ * scope comes from `deck_{project}_{role}`, which cannot produce leading or
+ * trailing underscores of this shape), so it cannot collide with, or be
+ * addressed as, a caller's project.
+ */
+export const SUPERVISION_ORPHAN_QUARANTINE_SCOPE = '__orphan_quarantine__';
+
+/** True for scopes that exist for bookkeeping and must never route as a project. */
+export function isReservedSupervisionProjectScope(value: string | null | undefined): boolean {
+  return value === SUPERVISION_ORPHAN_QUARANTINE_SCOPE;
+}
+
+/** An action that was planned but could not be applied, kept per action. */
+export interface SupervisionHousekeepingActionFailure {
+  taskId: string;
+  kind: SupervisionHousekeepingActionKind;
+  error: string;
+}
+
 export interface SupervisionHousekeepingDiagnostic {
   taskId: string;
   reason: 'orphan_project_backfill_ready' | 'orphan_project_ambiguous' | 'orphan_project_quarantine_ready';
@@ -865,7 +896,16 @@ export interface SupervisionHousekeepingResult {
   actionCounts: Partial<Record<SupervisionHousekeepingActionKind, number>>;
   actions: SupervisionHousekeepingAction[];
   orphanDiagnostics: SupervisionHousekeepingDiagnostic[];
+  /** Whether this caller is PERMITTED to apply. Says nothing about whether the
+   *  planned actions can actually execute. */
   applyAuthorized: boolean;
+  /** Whether every planned action is executable. A dryRun that reports
+   *  authorized-but-not-feasible is telling the caller that applying would
+   *  fail, which is exactly what the two fields being conflated used to hide. */
+  applyFeasible: boolean;
+  /** Actions that were attempted and failed, one entry each. Their failure did
+   *  not discard the actions that succeeded. */
+  failedActions: SupervisionHousekeepingActionFailure[];
 }
 
 /**
@@ -1923,10 +1963,34 @@ export class SupervisionTaskRegistry {
       }
     }
 
+    const failedActions: SupervisionHousekeepingActionFailure[] = [];
     if (mode === 'apply') {
       this.#db.exec('BEGIN IMMEDIATE');
       try {
-        for (const action of actions) this.#applyHousekeepingAction(action, now);
+        // Per-action isolation. One unexecutable action used to abort the whole
+        // batch, and the rollback discarded every action that had already
+        // succeeded AND the cursor/next_due_at advance — so the scheduler
+        // re-selected the same project and the same cursor forever. A savepoint
+        // per action bounds the damage to that action: the rest still commit,
+        // the pass still records progress, and the failure is reported instead
+        // of being thrown away.
+        for (let index = 0; index < actions.length; index++) {
+          const action = actions[index]!;
+          const savepoint = `hk_${index}`;
+          this.#db.exec(`SAVEPOINT ${savepoint}`);
+          try {
+            this.#applyHousekeepingAction(action, now);
+            this.#db.exec(`RELEASE ${savepoint}`);
+          } catch (error) {
+            this.#db.exec(`ROLLBACK TO ${savepoint}`);
+            this.#db.exec(`RELEASE ${savepoint}`);
+            failedActions.push({
+              taskId: action.taskId,
+              kind: action.kind,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
         this.#db.prepare(
           `INSERT INTO supervision_housekeeping_state
              (project_name, apply_authorized, cursor, next_due_at, updated_at)
@@ -1964,6 +2028,11 @@ export class SupervisionTaskRegistry {
       actions,
       orphanDiagnostics,
       applyAuthorized: mode === 'apply' || this.housekeepingApplyAuthorized(projectName),
+      // Feasibility is about the PLAN, authorization is about the CALLER. They
+      // are reported separately because conflating them is what let a dryRun
+      // advertise actions whose apply was impossible.
+      applyFeasible: actions.every((action) => this.#housekeepingActionFeasible(action)),
+      failedActions,
     };
   }
 
@@ -2033,6 +2102,23 @@ export class SupervisionTaskRegistry {
     };
   }
 
+  /**
+   * Can this planned action actually execute?
+   *
+   * Deliberately a statement-shape question, not a permission question. A
+   * backfill needs a project name to write; a quarantine needs the reserved
+   * scope to exist so the row it targets can satisfy the project guard.
+   */
+  #housekeepingActionFeasible(action: SupervisionHousekeepingAction): boolean {
+    if (action.kind === 'backfill_orphan_project') {
+      return Boolean(action.projectName && action.projectName.trim());
+    }
+    if (action.kind === 'quarantine_orphan') {
+      return SUPERVISION_ORPHAN_QUARANTINE_SCOPE.trim().length > 0;
+    }
+    return true;
+  }
+
   #applyHousekeepingAction(action: SupervisionHousekeepingAction, now: number): void {
     if (action.kind === 'backfill_orphan_project' && action.projectName) {
       const row = this.#db.prepare(
@@ -2080,16 +2166,22 @@ export class SupervisionTaskRegistry {
       if (hasLiveReference || hasDurableEvidence) return;
       const quarantined: PersistedSupervisionTaskRecord = {
         ...task,
+        projectName: SUPERVISION_ORPHAN_QUARANTINE_SCOPE,
         status: 'blocked',
         blocker: 'orphan_project_unresolved',
         cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
         updatedAt: now,
       };
+      // The row being quarantined is, by selection, one the project guard
+      // refuses to leave unscoped. Writing the reserved scope in the SAME
+      // statement is what lets the update through: previously the SET omitted
+      // project_name while the WHERE targeted `project_name IS NULL`, so
+      // NEW.project_name stayed null and the guard aborted every single time.
       this.#db.prepare(
         `UPDATE supervision_tasks
-         SET status = ?, blocker = ?, payload_json = ?, updated_at = ?
+         SET status = ?, blocker = ?, payload_json = ?, project_name = ?, updated_at = ?
          WHERE task_id = ? AND project_name IS NULL`,
-      ).run(quarantined.status, quarantined.blocker ?? 'orphan_project_unresolved', JSON.stringify(quarantined), now, task.taskId);
+      ).run(quarantined.status, quarantined.blocker ?? 'orphan_project_unresolved', JSON.stringify(quarantined), SUPERVISION_ORPHAN_QUARANTINE_SCOPE, now, task.taskId);
       this.#appendEvent(task.taskId, undefined, 'blocked', 'blocked', {
         source: 'housekeeping_orphan_quarantine',
         reason: 'no_authoritative_project_lineage',
