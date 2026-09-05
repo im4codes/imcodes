@@ -17,14 +17,42 @@ import { describe, expect, it } from 'vitest';
  * a newly added config is covered the moment it exists, without needing anyone
  * to remember to run it.
  */
-// vitest runs with cwd at the web project root. `import.meta.url` is not
-// usable here: Vite rewrites it to a `/@fs/...` specifier that fs cannot read.
-const WEB_ROOT = process.cwd();
+const CONFIG_NAME = /^vitest\..*config\.ts$/;
+
+function configsIn(dir: string): string[] {
+  try {
+    return readdirSync(dir).filter((name) => CONFIG_NAME.test(name)).sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Locate the web project by probing, not by assuming a cwd.
+ *
+ * The per-config web runs have cwd at `web/`, but `npm run test:coverage` runs
+ * from the repo root with `--project web` — where the same relative read finds
+ * the ROOT's two vitest configs and silently guards the wrong directory.
+ * `import.meta.url` is not an escape hatch either: Vite rewrites it to a
+ * `/@fs/...` specifier that fs cannot open.
+ *
+ * The probe keys on the very thing being counted, so there is no second marker
+ * to drift out of sync with a rename.
+ */
+function resolveWebRoot(): string {
+  const cwd = process.cwd();
+  const candidates = [cwd, join(cwd, 'web')];
+  let best = cwd;
+  for (const candidate of candidates) {
+    if (configsIn(candidate).length > configsIn(best).length) best = candidate;
+  }
+  return best;
+}
+
+const WEB_ROOT = resolveWebRoot();
 
 function webVitestConfigs(): string[] {
-  return readdirSync(WEB_ROOT)
-    .filter((name) => /^vitest\..*config\.ts$/.test(name) || name === 'vitest.config.ts')
-    .sort();
+  return configsIn(WEB_ROOT);
 }
 
 describe('web vitest configs', () => {
