@@ -35,7 +35,11 @@ import {
 } from '@shared/transport-queue-reducer.js';
 import { reduceTimelineActivity } from '@shared/session-activity-types.js';
 import type { QueueEvent, QueueProjectionEntry, QueueSnapshot } from '@shared/transport-queue-types.js';
-import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../local-storage-quota.js';
+import {
+  TIMELINE_SNAPSHOT_STORAGE_PREFIX,
+  safeLocalStorageRemoveItem,
+  safeLocalStorageSetItem,
+} from '../local-storage-quota.js';
 
 /** Map an AckFailureReason to a localized message suitable for failureReason payload. */
 function localizedAckFailureReason(reason: AckFailureReason): string {
@@ -644,7 +648,16 @@ function loadPersistedTimelineSnapshotWithFallback(
   // raw entry. localStorage.setItem can throw on quota; if it does we
   // still return the raw events so the user sees them.
   try {
+    // Deliberately a PLAIN setItem, not the quota-aware writer used for the
+    // tail below. On quota that writer calls evictVolatileLocalStorageEntries,
+    // which deletes every volatile key except the one being written — and the
+    // raw key we are migrating FROM matches the snapshot prefix, so the
+    // eviction would destroy this session's only stored copy while the move is
+    // still in flight. Here a failed write must simply leave both keys alone:
+    // the raw entry stays readable and the fallback read above already
+    // surfaced the events to the user.
     localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(raw));
+    // Only reached when the write above did not throw.
     localStorage.removeItem(getTimelineSnapshotStorageKey(rawSessionId));
   } catch {
     /* ignore — fallback read still surfaced the events */
@@ -684,16 +697,28 @@ function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: 
 function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): void {
   try {
     if (tail.length === 0) {
-      localStorage.removeItem(getTimelineSnapshotStorageKey(cacheKey));
+      safeLocalStorageRemoveItem(getTimelineSnapshotStorageKey(cacheKey));
       lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
       return;
     }
-    localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(tail));
-    lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
+    // Quota-aware write. The origin gets ~5 MB and one session's tail runs
+    // 0.5-1 MB, so a raw setItem starts throwing after roughly five sessions
+    // and every session after that silently keeps NO snapshot — which is the
+    // "open a chat and it is blank until the network answers" report, since
+    // the synchronous first-paint seed reads exactly this key.
+    // safeLocalStorageSetItem evicts the largest OTHER volatile entries
+    // (other sessions' tails, file-browser, terminal frames) and retries.
+    const written = safeLocalStorageSetItem(
+      getTimelineSnapshotStorageKey(cacheKey),
+      JSON.stringify(tail),
+    );
+    // Record ONLY a write that landed: areTimelineSnapshotTailsSame() skips a
+    // write whose tail matches the last recorded one, so remembering a failed
+    // write would strand this session without a snapshot until its tail
+    // changed again.
+    if (written) lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
   } catch {
-    // best-effort — quota / private mode / JSON encode failure all land here.
-    // A follow-up should add quota-driven LRU eviction; for now we lose the
-    // tail write on failure but never corrupt the on-disk snapshot.
+    // JSON encode failure only — storage quota is handled above.
   }
 }
 

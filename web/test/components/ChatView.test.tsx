@@ -280,6 +280,47 @@ describe('ChatView', () => {
     expect(screen.getByText('message-0')).toBeTruthy();
   });
 
+  it('keeps cached messages on screen while a background refresh is still loading', () => {
+    const events = [
+      { eventId: 'u1', type: 'user.message', ts: 1_700_000_000_000, payload: { text: 'cached-question' } },
+      { eventId: 'a1', type: 'assistant.text', ts: 1_700_000_000_001, payload: { text: 'cached-answer' } },
+    ];
+
+    render(
+      <ChatView
+        events={events as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cached_refresh_brain"
+      />,
+    );
+
+    // `loading` means "a refresh is in flight", NOT "there is nothing to show".
+    // History restored from the local cache must paint immediately. The list
+    // used to be gated behind `!loading`, so a pane whose events were already
+    // in state was blanked and replaced by the spinner until the network
+    // answered — the reported "open a chat and it's empty for a while".
+    expect(screen.getByText('cached-question')).toBeTruthy();
+    expect(screen.getByText('cached-answer')).toBeTruthy();
+    expect(screen.queryByText('chat.loading')).toBeNull();
+  });
+
+  it('shows the loading placeholder only when nothing is cached yet', () => {
+    render(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cold_open_brain"
+      />,
+    );
+
+    // The spinner still has a job: a genuinely cold pane. And it must not be
+    // mistaken for "no messages" — that placeholder is a different claim.
+    expect(screen.getByText('chat.loading')).toBeTruthy();
+    expect(screen.queryByText('chat.no_events')).toBeNull();
+  });
+
   it('reveals locally cached older messages at the top while preserving the reading position', async () => {
     const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
       eventId: `user-${index}`,

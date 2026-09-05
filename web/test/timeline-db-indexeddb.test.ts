@@ -93,4 +93,109 @@ describe('TimelineDB — real IndexedDB (fake-indexeddb)', () => {
     expect(got.map((e) => e.eventId)).toEqual(['e1']);
     expect(db.memoryOnly).toBe(false);
   });
+
+  /**
+   * Cost contract for the chat-open path.
+   *
+   * Opening a chat restores the last `MAX_MEMORY_EVENTS` events from IDB. That
+   * read used to be `index.getAll(wholeSessionRange)` followed by
+   * `slice(-limit)`, so it structured-cloned EVERY event the session had ever
+   * stored and then discarded all but the tail. Nothing prunes that store in
+   * production, so the time to open a chat grew with total history forever, and
+   * every mounted timeline (open pane, each sub-session card preview, pinned
+   * panels) paid it against one shared connection.
+   *
+   * Correctness alone cannot catch a regression here — returning the right 50
+   * events is equally true whether 50 or 50,000 rows were deserialized to get
+   * them. So these tests assert the COST: how many records the read is allowed
+   * to materialize. Reverting to the whole-range getAll makes them fail.
+   */
+  function instrumentIdbReads() {
+    const proto = IDBIndex.prototype as unknown as Record<string, (...args: unknown[]) => IDBRequest>;
+    const originalGetAll = proto.getAll;
+    const originalOpenCursor = proto.openCursor;
+    const stats = { getAllResultSizes: [] as number[], cursorRecords: 0 };
+    proto.getAll = function patchedGetAll(this: IDBIndex, ...args: unknown[]) {
+      const req = originalGetAll.apply(this, args);
+      req.addEventListener('success', () => {
+        stats.getAllResultSizes.push(Array.isArray(req.result) ? req.result.length : 0);
+      });
+      return req;
+    };
+    proto.openCursor = function patchedOpenCursor(this: IDBIndex, ...args: unknown[]) {
+      const req = originalOpenCursor.apply(this, args);
+      req.addEventListener('success', () => { if (req.result) stats.cursorRecords += 1; });
+      return req;
+    };
+    return {
+      stats,
+      restore: (): void => { proto.getAll = originalGetAll; proto.openCursor = originalOpenCursor; },
+    };
+  }
+
+  it('restores the newest page without materializing the whole stored history', async () => {
+    const db = new TimelineDB();
+    const total = 1200;
+    const limit = 50;
+    await db.putEvents(Array.from({ length: total }, (_, i) => ev(`e${i + 1}`, 's', i + 1)));
+
+    const probe = instrumentIdbReads();
+    let got: TimelineEvent[];
+    try {
+      got = await db.getRecentEvents('s', { limit });
+    } finally {
+      probe.restore();
+    }
+
+    // Behaviour: the newest `limit` events, still oldest-first.
+    expect(got).toHaveLength(limit);
+    expect(got[0]!.eventId).toBe(`e${total - limit + 1}`);
+    expect(got[limit - 1]!.eventId).toBe(`e${total}`);
+    expect(got.map((e) => e.seq)).toEqual([...got.map((e) => e.seq)].sort((a, b) => a - b));
+
+    // Cost: nothing may deserialize more than the page we asked for. The old
+    // whole-range getAll reported 1200 here.
+    const largestGetAll = probe.stats.getAllResultSizes.reduce((a, b) => Math.max(a, b), 0);
+    expect(largestGetAll).toBeLessThanOrEqual(limit);
+    expect(probe.stats.cursorRecords).toBeLessThanOrEqual(limit);
+  });
+
+  it('caps an epoch page read at the requested limit', async () => {
+    const db = new TimelineDB();
+    await db.putEvents(Array.from({ length: 400 }, (_, i) => ev(`e${i + 1}`, 's', i + 1)));
+
+    const probe = instrumentIdbReads();
+    let got: TimelineEvent[];
+    try {
+      got = await db.getEvents('s', 1, { limit: 25, afterSeq: 0 });
+    } finally {
+      probe.restore();
+    }
+
+    expect(got).toHaveLength(25);
+    expect(got[0]!.eventId).toBe('e1');
+    const largestGetAll = probe.stats.getAllResultSizes.reduce((a, b) => Math.max(a, b), 0);
+    expect(largestGetAll).toBeLessThanOrEqual(25);
+  });
+
+  it('prunes to the newest N without cloning the payloads it deletes', async () => {
+    const db = new TimelineDB();
+    await db.putEvents(Array.from({ length: 300 }, (_, i) => ev(`e${i + 1}`, 's', i + 1)));
+
+    const probe = instrumentIdbReads();
+    try {
+      await db.pruneOldEvents('s', 40);
+    } finally {
+      probe.restore();
+    }
+
+    const kept = await db.getRecentEvents('s', { limit: 1000 });
+    expect(kept).toHaveLength(40);
+    expect(kept[0]!.eventId).toBe('e261');
+    expect(kept[39]!.eventId).toBe('e300');
+    // Deleting needs keys, not payloads: getAllKeys returns key lists, never
+    // record objects, so no getAll may report cloned rows here.
+    const largestGetAll = probe.stats.getAllResultSizes.reduce((a, b) => Math.max(a, b), 0);
+    expect(largestGetAll).toBe(0);
+  });
 });

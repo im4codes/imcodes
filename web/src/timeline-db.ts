@@ -257,12 +257,12 @@ export class TimelineDB {
         const upper = [sessionId, epoch, Infinity];
         const range = IDBKeyRange.bound(lower, upper);
 
-        // getAll is a single IDB round-trip — much faster than cursor iteration
-        const req = index.getAll(range);
-        req.onsuccess = () => {
-          const all = req.result as TimelineEvent[];
-          resolve(limit < all.length ? all.slice(0, limit) : all);
-        };
+        // `getAll(range, count)` stops the clone at `count` records. Passing
+        // the limit to IDB rather than slicing afterwards matters because
+        // getAll structured-clones every record it returns: slicing after the
+        // fact still paid the full deserialization cost for rows we discard.
+        const req = Number.isFinite(limit) ? index.getAll(range, limit) : index.getAll(range);
+        req.onsuccess = () => resolve(req.result as TimelineEvent[]);
         req.onerror = () => reject(req.error);
       });
     } catch {
@@ -305,11 +305,37 @@ export class TimelineDB {
       const upper = [sessionId, Infinity];
       const range = IDBKeyRange.bound(lower, upper);
 
-      // getAll is a single IDB round-trip — much faster than cursor iteration
-      const req = index.getAll(range);
+      // An unbounded read still wants the single-round-trip getAll.
+      if (!Number.isFinite(limit)) {
+        const req = index.getAll(range);
+        req.onsuccess = () => resolve(req.result as TimelineEvent[]);
+        req.onerror = () => reject(req.error);
+        return;
+      }
+
+      // Bounded read: walk newest-first and stop at `limit`.
+      //
+      // This used to be `getAll(range)` followed by `slice(-limit)`. getAll
+      // structured-clones EVERY record in the range, so restoring the last 300
+      // events deserialized the session's entire stored history — and nothing
+      // ever prunes that store, so opening a chat got monotonically slower the
+      // longer the session had been used. Every mounted useTimeline (the open
+      // pane, every SubSessionCard preview, pinned panels) paid it against one
+      // shared connection. A 'prev' cursor clones only the records we keep, so
+      // the cost is O(limit) instead of O(total stored events).
+      //
+      // `getAll(range, count)` is not usable here: count takes from the START
+      // of the range and we need the END.
+      const out: TimelineEvent[] = [];
+      const req = index.openCursor(range, 'prev');
       req.onsuccess = () => {
-        const all = req.result as TimelineEvent[];
-        resolve(limit < all.length ? all.slice(-limit) : all);
+        const cursor = req.result;
+        if (!cursor) { out.reverse(); resolve(out); return; }
+        out.push(cursor.value as TimelineEvent);
+        // Ascending order is the contract callers merge against, so undo the
+        // newest-first walk before handing the page back.
+        if (out.length >= limit) { out.reverse(); resolve(out); return; }
+        cursor.continue();
       };
       req.onerror = () => reject(req.error);
     });
@@ -438,24 +464,27 @@ export class TimelineDB {
     }
 
     try {
-      // Get all events for session, ordered by ts
-      const all = await new Promise<TimelineEvent[]>((resolve, reject) => {
+      // Primary keys only, ordered by ts. Deleting needs the key and nothing
+      // else, so `getAllKeys` avoids structured-cloning payloads we are about
+      // to throw away — the old `getAll` made pruning cost as much as the
+      // unbounded read it exists to prevent.
+      const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('session_ts');
         const lower = [sessionId, 0];
         const upper = [sessionId, Infinity];
         const range = IDBKeyRange.bound(lower, upper);
-        const req = index.getAll(range);
-        req.onsuccess = () => resolve(req.result as TimelineEvent[]);
+        const req = index.getAllKeys(range);
+        req.onsuccess = () => resolve(req.result as IDBValidKey[]);
         req.onerror = () => reject(req.error);
       });
 
-      if (all.length <= keepCount) return;
+      if (keys.length <= keepCount) return;
 
-      const toDelete = all.slice(0, all.length - keepCount);
+      const toDelete = keys.slice(0, keys.length - keepCount);
       await txWrite(db, STORE_NAME, (store) => {
-        for (const e of toDelete) store.delete(e.eventId);
+        for (const key of toDelete) store.delete(key);
       });
     } catch {
       // best-effort

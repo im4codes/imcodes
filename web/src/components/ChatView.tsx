@@ -3492,7 +3492,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           } : undefined}
         >
           {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
-          {loading ? (
+          {/* The spinner is for an EMPTY pane only. It used to be an exclusive
+           *  branch on `loading` alone, which — together with the `!loading`
+           *  guard on the message list below — blanked a pane whose cached
+           *  events were already in state, purely because a background
+           *  refresh was in flight. Cached history must stay on screen while
+           *  the network catches up. */}
+          {loading && viewItems.length === 0 ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (
             // Suppress the "no events" placeholder while history bootstrap
@@ -3574,7 +3580,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               </button>
             </div>
           )}
-          {!loading && renderedViewItems.map((item) => {
+          {/* No `loading` guard: whatever is already restored renders now. */}
+          {renderedViewItems.map((item) => {
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock

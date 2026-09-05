@@ -765,6 +765,41 @@ describe('useTimeline global cache bounds', () => {
     expect(localStorage.getItem(`rcc_timeline_snapshot:${sessionName}`)).toBeNull();
   });
 
+  it('keeps the raw snapshot when the scoped rewrite cannot be stored', () => {
+    // Data-loss guard for the same migration. It used to depend on setItem
+    // THROWING in order to skip the follow-up remove. The quota-aware writer
+    // reports failure by RETURNING FALSE instead, so an unguarded remove would
+    // delete the only surviving copy of this session's local history the first
+    // time the origin is full — the user opens the chat and the cache is gone
+    // permanently, not just this once.
+    const sessionName = `deck_ls_quota_${Date.now()}`;
+    const serverId = `srv-ls-quota-${Date.now()}`;
+    const events = makeEvents(sessionName, 3);
+    const rawKey = `rcc_timeline_snapshot:${sessionName}`;
+    localStorage.setItem(rawKey, JSON.stringify(events));
+    localStorage.removeItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`);
+
+    // Full origin: eviction cannot free enough either, so every write fails.
+    const setItemSpy = vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
+      throw new DOMException('exceeded', 'QuotaExceededError');
+    });
+
+    try {
+      function Probe() {
+        const { events: seen } = useTimeline(sessionName, null, serverId);
+        return h('div', { 'data-testid': 'ls-quota-probe' }, String(seen.length));
+      }
+      render(h(Probe));
+      // The user still sees their history on this open...
+      expect(screen.getByTestId('ls-quota-probe').textContent).toBe('3');
+    } finally {
+      setItemSpy.mockRestore();
+    }
+
+    // ...and the only copy of it is still on disk for the next one.
+    expect(localStorage.getItem(rawKey)).toBeTruthy();
+  });
+
   it('stays idle for shell/script sessions with history disabled', async () => {
     const sessionName = `deck_shell_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
