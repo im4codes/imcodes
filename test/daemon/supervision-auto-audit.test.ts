@@ -1685,21 +1685,36 @@ describe('automatic supervision audit materialization', () => {
       }) as never,
     });
 
-    // The policy-less task must not be SELECTED by the sweep at all. Asserting
-    // only "no auditor was created" is vacuous: dispatchReadyAudit independently
-    // rejects a policy-less task with manual_policy, so that assertion holds even
-    // if the sweep wrongly selects it. Pin the selection itself.
-    expect(swept).toHaveLength(1);
-    expect(swept.some((result) => result.reason === 'manual_policy')).toBe(false);
+    // CONTRACT REVISED (tsk_byk). This used to assert the policy-less task was
+    // not SELECTED at all. An actionable dead end is now deliberately selected,
+    // so it can be REPORTED once instead of sitting silently stuck. The
+    // load-bearing half is unchanged and still pinned below: selection must
+    // never turn into an auditor. Selection is reported, never materialised.
+    expect(swept).toHaveLength(2);
+    const manualResult = swept.find((result) => result.status === 'blocked'
+      && result.reason === 'missing_audit_policy');
+    expect(manualResult, 'the actionable dead end is selected and reported').toBeTruthy();
+    expect(
+      swept.some((result) => result.status === 'dispatched' || result.status === 'replayed'
+        ? false
+        : result.status === 'blocked' && result.reason === 'manual_policy'),
+      'a selected task is never reported as manual_policy',
+    ).toBe(false);
     const auditors = manual.registry.get(manual.taskId)?.assignments
       .filter((assignment) => assignment.role === 'auditor') ?? [];
     expect(auditors, 'boot sweep must not create an auditor without a policy').toEqual([]);
   });
 
   it('leaves legacy/manual tasks and a Brain-routed live fallback untouched', async () => {
+    // CONTRACT REVISED (tsk_byk): this shape is an ACTIONABLE dead end, so it
+    // is reported rather than silently ignored. With no live sessions supplied
+    // there is no coordinator to notify, which is why reported is false -- the
+    // task is still stuck, and saying so is the point. A genuinely manual or
+    // non-actionable task keeps `ignored`/`manual_policy`; that is pinned in
+    // "actionable missing audit policy emits one durable blocker" below.
     const legacy = makeReadyTask();
     await expect(dispatchReadyAudit(legacy.taskId, { registry: legacy.registry }))
-      .resolves.toEqual({ status: 'ignored', reason: 'manual_policy' });
+      .resolves.toEqual({ status: 'blocked', reason: 'missing_audit_policy', reported: false });
 
     const automatic = makeReadyTask({ taskId: 'manual-fallback-task', auditPolicy: 'auto_allow_degraded' });
     const manual = automatic.registry.createAssignment({
@@ -2293,7 +2308,18 @@ describe('periodic supervision convergence tick', () => {
       session('deck_alpha_worker', 'w1'),
       session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
     ];
-    const dispatch = vi.fn(async () => { throw new Error('must not dispatch without a policy'); });
+    // CONTRACT REVISED (tsk_byk) in form, NOT in substance. The invariant this
+    // test exists for -- a policy-less task never gets an auditor minted or an
+    // audit dispatched -- is unchanged and asserted below. What changed is that
+    // an actionable dead end now emits one durable BLOCKER to Brain, so the
+    // mock records calls instead of throwing on any call at all, and the
+    // assertion distinguishes an audit dispatch from a blocker report.
+    const dispatch = vi.fn(async () => ({
+      status: 'accepted' as const,
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000c1',
+      messageId: 'send_message_00000000-0000-5000-a000-0000000000c1' as SendMessageId,
+      deliveries: [{ target: 'deck_alpha_brain', status: 'queued' as const }],
+    }));
     const deps = {
       registry, listSessions: () => sessions,
       listTargets: listTargetRecords(sessions[2]!),
@@ -2303,8 +2329,14 @@ describe('periodic supervision convergence tick', () => {
 
     const result = await runSupervisionConvergenceTick(deps);
 
-    expect(result.audits).toEqual([]);
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(
+      result.audits.some((audit) => audit.status === 'dispatched' || audit.status === 'replayed'),
+      'no audit may be dispatched without a policy',
+    ).toBe(false);
+    expect(
+      dispatch.mock.calls.some((call) => Boolean((call as unknown as [unknown, { audit?: unknown }])[1]?.audit)),
+      'any dispatch here must be a blocker report, never an audit',
+    ).toBe(false);
     expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
   });
 
@@ -2762,5 +2794,540 @@ describe('R5: deterministic implementer/revision alignment before materializatio
     expect(result).toMatchObject({ status: 'blocked' });
     expect(dispatch.mock.calls.some((call) => Boolean(call[1].audit))).toBe(false);
     expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+  });
+});
+
+/**
+ * tsk_byk behaviour 1 — an actionable ready_for_audit dead end.
+ *
+ * A validated task that reaches ready_for_audit with NO auditPolicy was
+ * refused SILENTLY: dispatchReadyAudit returned ignored/manual_policy and the
+ * sweep pre-filtered the task out entirely, so neither the event-driven wire
+ * nor the periodic tick ever reported it. Neither refusal is wrong in
+ * isolation -- the defect is that the only path able to SUPPLY the missing
+ * policy is unreachable in that state, so the task sits forever with no
+ * auditor and no signal. It now emits exactly one durable, Brain-resolvable
+ * blocker, while a genuinely manual or not-yet-actionable task keeps the old
+ * silent `ignored` semantics.
+ */
+describe('actionable missing audit policy emits one durable blocker', () => {
+  const brain = () => session('deck_alpha_brain', 'brain');
+  const worker = () => session('deck_alpha_worker', 'w1');
+
+  function acceptedDispatch() {
+    return vi.fn().mockResolvedValue({
+      status: 'accepted',
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000b1',
+      messageId: 'send_message_00000000-0000-5000-a000-0000000000b1',
+      deliveries: [{ target: 'deck_alpha_brain', status: 'queued' }],
+    });
+  }
+
+  it('reports missing_audit_policy instead of silently ignoring the task', async () => {
+    const shape = makeReadyTask({ taskId: 'byk-actionable' });
+    const dispatch = acceptedDispatch();
+    const result = await dispatchReadyAudit(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [brain(), worker()],
+      dispatch,
+      hasDeliveryEvidence: () => false,
+    });
+    expect(result, 'an actionable dead end must not be reported as ignored')
+      .toMatchObject({ status: 'blocked', reason: 'missing_audit_policy', reported: true });
+    expect(dispatch, 'exactly one durable blocker').toHaveBeenCalledTimes(1);
+    const sent = dispatch.mock.calls[0]![1];
+    expect(sent.target).toBe('deck_alpha_brain');
+    expect(sent.message).toContain(shape.taskId);
+    expect(sent.message).toContain('missing_audit_policy');
+    expect(sent.internalDurableQueue).toBe(true);
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'auditor'))
+      .toEqual([]);
+  });
+
+  it('emits the blocker only once when durable delivery evidence already exists', async () => {
+    const shape = makeReadyTask({ taskId: 'byk-once' });
+    const dispatch = acceptedDispatch();
+    const deps = {
+      registry: shape.registry,
+      listSessions: () => [brain(), worker()],
+      dispatch,
+      hasDeliveryEvidence: () => true,
+    };
+    const first = await dispatchReadyAudit(shape.taskId, deps);
+    const second = await dispatchReadyAudit(shape.taskId, deps);
+    expect(first).toMatchObject({ status: 'blocked', reason: 'missing_audit_policy', reported: true });
+    expect(second).toMatchObject({ status: 'blocked', reason: 'missing_audit_policy', reported: true });
+    expect(dispatch, 'delivery evidence must suppress a repeat blocker').not.toHaveBeenCalled();
+  });
+
+  it('keeps silent ignored semantics for a NON-actionable policy-less task', async () => {
+    // Not ready_for_audit: nothing is owed here, so a blocker would be noise.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    expect(registry.createOrGet({
+      taskId: 'byk-not-actionable', projectName: 'alpha', classification: 'integration_task',
+      objective: 'idle', acceptance: ['none'], currentRevision: 'r1',
+    })).toMatchObject({ ok: true });
+    const dispatch = acceptedDispatch();
+    const result = await dispatchReadyAudit('byk-not-actionable', {
+      registry, listSessions: () => [brain(), worker()], dispatch, hasDeliveryEvidence: () => false,
+    });
+    expect(result).toMatchObject({ status: 'ignored' });
+    expect(dispatch, 'a non-actionable task must emit no blocker').not.toHaveBeenCalled();
+  });
+
+  it('stays silent once an auditor already exists for the exact revision', async () => {
+    const shape = makeReadyTask({ taskId: 'byk-has-auditor' });
+    const auditor = shape.registry.createAssignment({
+      taskId: shape.taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: 'manual-attempt-1', auditRevision: shape.revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    const dispatch = acceptedDispatch();
+    const result = await dispatchReadyAudit(shape.taskId, {
+      registry: shape.registry, listSessions: () => [brain(), worker()], dispatch,
+      hasDeliveryEvidence: () => false,
+    });
+    expect(result, 'a live auditor means nothing is stuck')
+      .not.toMatchObject({ reason: 'missing_audit_policy' });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('sweep SELECTS the actionable dead end and reports it', async () => {
+    const shape = makeReadyTask({ taskId: 'byk-sweep-actionable' });
+    const dispatch = acceptedDispatch();
+    const swept = await dispatchReadyAuditSweep({
+      registry: shape.registry,
+      listSessions: () => [brain(), worker()],
+      dispatch,
+      hasDeliveryEvidence: () => false,
+    });
+    expect(
+      swept.some((r) => r.status === 'blocked' && r.reason === 'missing_audit_policy'),
+      'the sweep must SELECT the actionable dead end, not pre-filter it away',
+    ).toBe(true);
+  });
+});
+
+/**
+ * tsk_byk behaviour 2 — legacy exact-PASS tasks stranded with ZERO coordinators.
+ *
+ * dispatchReadyIntegration hard-required exactly one live Brain coordinator
+ * before it would materialise the integration owner. Legacy tasks created
+ * before coordinator attribution existed have an exact current-revision final
+ * PASS receipt, one required cross-vendor-PASS implementer and a clean
+ * worktree, but ZERO coordinator rows -- so they can never integrate and
+ * nothing reports why.
+ *
+ * The recovery is deliberately last: every existing PASS / revision / attempt /
+ * receipt / clean-worktree gate runs FIRST and unchanged, and only then, when
+ * there are no coordinator rows at all and exactly one compatible project Brain
+ * exists, is a single non-required coordinator minted with a deterministic
+ * idempotency key. The unchanged integration-owner path then runs. Ambiguous or
+ * absent Brain, slices, missing PASS, and a dirty worktree create nothing.
+ */
+describe('zero-coordinator legacy integration recovery', () => {
+  function zeroCoordinatorPassShape(taskId: string) {
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const revision = `${taskId}-r1`;
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'legacy integration with no coordinator row',
+      acceptance: ['integrate exact PASS bytes'], currentRevision: revision,
+      auditPolicy: 'auto_strict_cross_vendor',
+    })).toMatchObject({ ok: true });
+    // NOTE: deliberately NO coordinator assignment is created.
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
+      auditRevision: revision, scopeFiles: ['src/exact.ts'],
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    for (const [intent, toStatus, validationState] of [
+      ['start', 'implementing', undefined],
+      ['record_validation', 'validated', 'passed'],
+      ['open_audit', 'ready_for_audit', undefined],
+    ] as const) {
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
+        ...(validationState ? { validationState } : {}),
+      })).toMatchObject({ ok: true });
+    }
+    const attemptId = automaticAttempt(taskId, revision);
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_pass_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity, auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision, receiptKind: 'final', verdict: 'PASS',
+      findings: 'exact bytes pass', validations: [],
+    })).toMatchObject({ ok: true });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision,
+    })).toMatchObject({ ok: true });
+    expect(
+      registry.listAssignments(taskId).filter((a) => a.role === 'coordinator'),
+      'fixture must have ZERO coordinator rows',
+    ).toEqual([]);
+    return { registry, taskId, revision, attemptId, worker: worker.value };
+  }
+
+  const cleanWorktree = () => ({
+    worktreePath: '/tmp/legacy/repo', headSha: 'a'.repeat(40),
+    files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+    stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+  });
+
+  function acceptedDispatch() {
+    return vi.fn().mockResolvedValue({
+      status: 'accepted',
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000b2',
+      messageId: 'send_message_00000000-0000-5000-a000-0000000000b2',
+      deliveries: [{ target: 'deck_alpha_brain', status: 'queued' }],
+    });
+  }
+
+  it('recovers the sole project Brain coordinator and runs the unchanged owner path', async () => {
+    const shape = zeroCoordinatorPassShape('byk-legacy-zero-coord');
+    const brain = session('deck_alpha_brain', 'brain');
+    const result = await dispatchReadyIntegration(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [brain, session('deck_alpha_worker', 'w1')],
+      dispatch: acceptedDispatch(),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: cleanWorktree,
+    });
+    expect(result, 'a legacy zero-coordinator PASS task must integrate').toMatchObject({ status: 'dispatched' });
+    const coordinators = shape.registry.listAssignments(shape.taskId)
+      .filter((a) => a.role === 'coordinator');
+    expect(coordinators, 'exactly one recovered coordinator').toHaveLength(1);
+    expect(coordinators[0]).toMatchObject({
+      identity: expect.objectContaining({ sessionName: 'deck_alpha_brain' }),
+      required: false,
+    });
+    const owners = shape.registry.listAssignments(shape.taskId)
+      .filter((a) => a.role === 'integration_owner');
+    expect(owners).toHaveLength(1);
+    expect(owners[0]).toMatchObject({
+      auditRevision: shape.revision, auditAttemptId: shape.attemptId,
+      status: 'ready_for_integration', verdict: 'PASS', crossVendorAuditPassed: true,
+    });
+  });
+
+  it('creates no duplicate coordinator or owner on replay', async () => {
+    const shape = zeroCoordinatorPassShape('byk-legacy-replay');
+    const brain = session('deck_alpha_brain', 'brain');
+    let delivered = false;
+    const deps = {
+      registry: shape.registry,
+      listSessions: () => [brain, session('deck_alpha_worker', 'w1')],
+      dispatch: vi.fn(async () => {
+        delivered = true;
+        return {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000b3',
+          messageId: 'send_message_00000000-0000-5000-a000-0000000000b3' as SendMessageId,
+          deliveries: [{ target: brain.name, status: 'queued' as const }],
+        };
+      }),
+      hasDeliveryEvidence: () => delivered,
+      inspectAssignmentWorktree: cleanWorktree,
+    };
+    await expect(dispatchReadyIntegration(shape.taskId, deps as never)).resolves.toMatchObject({ status: 'dispatched' });
+    await expect(dispatchReadyIntegration(shape.taskId, deps as never)).resolves.toMatchObject({ status: 'replayed' });
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator')).toHaveLength(1);
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'integration_owner')).toHaveLength(1);
+  });
+
+  it('fails closed and creates nothing when the project Brain is ambiguous', async () => {
+    const shape = zeroCoordinatorPassShape('byk-legacy-ambiguous');
+    const result = await dispatchReadyIntegration(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [
+        session('deck_alpha_brain', 'brain'),
+        session('deck_alpha_brain_two', 'brain'),
+        session('deck_alpha_worker', 'w1'),
+      ],
+      dispatch: acceptedDispatch(),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: cleanWorktree,
+    });
+    expect(result).toMatchObject({ status: 'blocked' });
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator')).toEqual([]);
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'integration_owner')).toEqual([]);
+  });
+
+  it('fails closed and creates nothing when no project Brain exists', async () => {
+    const shape = zeroCoordinatorPassShape('byk-legacy-no-brain');
+    const result = await dispatchReadyIntegration(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [session('deck_alpha_worker', 'w1')],
+      dispatch: acceptedDispatch(),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: cleanWorktree,
+    });
+    expect(result).toMatchObject({ status: 'blocked' });
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator')).toEqual([]);
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'integration_owner')).toEqual([]);
+  });
+
+  it('creates NOTHING when the worktree is dirty, even with a valid Brain', async () => {
+    // Ordering guard. The coordinator gate sits ABOVE the manifest gate, so a
+    // naive fix would mint a coordinator before discovering the worktree is
+    // unusable. Recovery must run only after every existing gate has passed.
+    const shape = zeroCoordinatorPassShape('byk-legacy-dirty');
+    const result = await dispatchReadyIntegration(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [session('deck_alpha_brain', 'brain'), session('deck_alpha_worker', 'w1')],
+      dispatch: acceptedDispatch(),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: () => ({
+        ...cleanWorktree(), stagedPaths: ['src/exact.ts'],
+      }),
+    });
+    expect(result).toMatchObject({ status: 'blocked', reason: 'authoritative implementation manifest unavailable' });
+    expect(
+      shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator'),
+      'a dirty worktree must not mint a coordinator',
+    ).toEqual([]);
+  });
+
+  it('never enters the fallback when a live coordinator already exists', async () => {
+    const shape = zeroCoordinatorPassShape('byk-legacy-has-coord');
+    expect(shape.registry.createAssignment({
+      taskId: shape.taskId, role: 'coordinator', required: false,
+      identity: identity('deck_alpha_brain'),
+    })).toMatchObject({ ok: true });
+    const brain = session('deck_alpha_brain', 'brain');
+    await expect(dispatchReadyIntegration(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [brain, session('deck_alpha_worker', 'w1')],
+      dispatch: acceptedDispatch(),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: cleanWorktree,
+    })).resolves.toMatchObject({ status: 'dispatched' });
+    expect(
+      shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator'),
+      'the pre-existing coordinator must be reused, never duplicated',
+    ).toHaveLength(1);
+  });
+
+  it('mints the recovered coordinator with the exact deterministic idempotency key', async () => {
+    // R1 shipped this key UNPROVEN: stripping it left every test green, because
+    // the created coordinator row itself makes the next call take the live
+    // path, so replay never re-exercises the key through behaviour alone. The
+    // key is still the guard for a crash between the registry write and the
+    // next read, so it is asserted where it is actually observable -- on the
+    // create INPUT at the production call site -- rather than inferred from a
+    // downstream row count that cannot see it.
+    const shape = zeroCoordinatorPassShape('byk-legacy-idempotency-key');
+    const creates: Array<Record<string, unknown>> = [];
+    const recordingRegistry = new Proxy(shape.registry, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (prop === 'createAssignment' && typeof value === 'function') {
+          return (input: Record<string, unknown>) => {
+            creates.push(input);
+            return (value as (arg: unknown) => unknown).call(target, input);
+          };
+        }
+        return typeof value === 'function' ? (value as () => unknown).bind(target) : value;
+      },
+    }) as typeof shape.registry;
+
+    const brain = session('deck_alpha_brain', 'brain');
+    await expect(dispatchReadyIntegration(shape.taskId, {
+      registry: recordingRegistry,
+      listSessions: () => [brain, session('deck_alpha_worker', 'w1')],
+      dispatch: vi.fn().mockResolvedValue({
+        status: 'accepted',
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000b6',
+        messageId: 'send_message_00000000-0000-5000-a000-0000000000b6',
+        deliveries: [{ target: brain.name, status: 'queued' }],
+      }),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: cleanWorktree,
+    })).resolves.toMatchObject({ status: 'dispatched' });
+
+    const coordinatorCreate = creates.find((input) => input.role === 'coordinator');
+    expect(coordinatorCreate, 'the recovery must go through registry.createAssignment').toBeTruthy();
+    expect(
+      coordinatorCreate!.idempotencyKey,
+      'a recovered coordinator must carry the exact deterministic key, so a replay '
+        + 'that races the row read cannot mint a second coordinator',
+    ).toBe(`auto-integration-coordinator:${shape.taskId}:${shape.revision}`);
+    expect(coordinatorCreate!.required, 'recovered coordinator is non-blocking').toBe(false);
+  });
+});
+
+describe('zero-coordinator recovery refuses conflicting historical provenance', () => {
+  it('creates nothing when another live Brain already appears in the task lineage', async () => {
+    // Exactly ONE Brain owns project alpha, so uniqueAuthoritativeProjectBrain
+    // resolves cleanly and the ambiguity gate does NOT fire. What blocks here is
+    // provenance: the task's own lineage names a different live Brain (one that
+    // owns another project), so adopting the alpha Brain would silently rewrite
+    // whose authority this task executed under.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const taskId = 'byk-legacy-provenance';
+    const revision = `${taskId}-r1`;
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'legacy task whose lineage names a foreign Brain',
+      acceptance: ['refuse silent re-attribution'], currentRevision: revision,
+      auditPolicy: 'auto_strict_cross_vendor',
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_beta_brain'),
+      auditRevision: revision, scopeFiles: ['src/exact.ts'],
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    for (const [intent, toStatus, validationState] of [
+      ['start', 'implementing', undefined],
+      ['record_validation', 'validated', 'passed'],
+      ['open_audit', 'ready_for_audit', undefined],
+    ] as const) {
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
+        ...(validationState ? { validationState } : {}),
+      })).toMatchObject({ ok: true });
+    }
+    const attemptId = automaticAttempt(taskId, revision);
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_pass_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity, auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision, receiptKind: 'final', verdict: 'PASS',
+      findings: 'exact bytes pass', validations: [],
+    })).toMatchObject({ ok: true });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'coordinator')).toEqual([]);
+
+    // One alpha Brain (the only candidate) plus a live Brain owning project
+    // beta, whose session name appears in this task's implementer lineage.
+    const alphaBrain = session('deck_alpha_brain', 'brain');
+    const betaBrain = { ...session('deck_beta_brain', 'brain'), projectName: 'beta' } as SessionRecord;
+    const result = await dispatchReadyIntegration(taskId, {
+      registry,
+      listSessions: () => [alphaBrain, betaBrain],
+      dispatch: vi.fn().mockResolvedValue({
+        status: 'accepted',
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000b4',
+        messageId: 'send_message_00000000-0000-5000-a000-0000000000b4',
+        deliveries: [{ target: 'deck_alpha_brain', status: 'queued' }],
+      }),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/legacy/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
+    });
+    expect(result).toMatchObject({ status: 'blocked' });
+    expect(
+      registry.listAssignments(taskId).filter((a) => a.role === 'coordinator'),
+      'conflicting provenance must never mint a coordinator',
+    ).toEqual([]);
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'integration_owner')).toEqual([]);
+  });
+});
+
+describe('zero-coordinator recovery is limited to the ZERO-row legacy shape', () => {
+  it('stays closed when coordinator rows exist but none are live', async () => {
+    // Distinct from the legacy shape. A task that HAS coordinator attribution
+    // whose Brain is merely offline is NOT a legacy zero-row task: adopting a
+    // different Brain here would re-attribute live authority rather than
+    // recover missing authority. It must stay blocked and mint nothing, even
+    // though exactly one other project Brain is available to adopt.
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const taskId = 'byk-legacy-stale-coord';
+    const revision = `${taskId}-r1`;
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'coordinator row exists but its Brain is offline',
+      acceptance: ['never re-attribute live authority'], currentRevision: revision,
+      auditPolicy: 'auto_strict_cross_vendor',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', required: false, identity: identity('deck_alpha_offline_brain'),
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
+      auditRevision: revision, scopeFiles: ['src/exact.ts'],
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    for (const [intent, toStatus, validationState] of [
+      ['start', 'implementing', undefined],
+      ['record_validation', 'validated', 'passed'],
+      ['open_audit', 'ready_for_audit', undefined],
+    ] as const) {
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
+        ...(validationState ? { validationState } : {}),
+      })).toMatchObject({ ok: true });
+    }
+    const attemptId = automaticAttempt(taskId, revision);
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_pass_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity, auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision, receiptKind: 'final', verdict: 'PASS',
+      findings: 'exact bytes pass', validations: [],
+    })).toMatchObject({ ok: true });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision,
+    })).toMatchObject({ ok: true });
+
+    // The recorded coordinator's Brain is absent; a DIFFERENT alpha Brain is live.
+    const result = await dispatchReadyIntegration(taskId, {
+      registry,
+      listSessions: () => [session('deck_alpha_brain', 'brain'), session('deck_alpha_worker', 'w1')],
+      dispatch: vi.fn().mockResolvedValue({
+        status: 'accepted',
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000b5',
+        messageId: 'send_message_00000000-0000-5000-a000-0000000000b5',
+        deliveries: [{ target: 'deck_alpha_brain', status: 'queued' }],
+      }),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/legacy/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
+    });
+    expect(result).toMatchObject({
+      status: 'blocked', reason: 'integration requires one exact live Brain coordinator',
+    });
+    expect(
+      registry.listAssignments(taskId).filter((a) => a.role === 'coordinator'),
+      'an existing coordinator row must never be supplemented by a recovered one',
+    ).toHaveLength(1);
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'integration_owner')).toEqual([]);
   });
 });

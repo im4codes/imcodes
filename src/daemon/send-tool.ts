@@ -2420,6 +2420,46 @@ async function reportCancelledCompletionEvidenceDecision(
  * calls, concurrent post-open hooks, and boot recovery converge on the same
  * assignment, attempt, and transport message id.
  */
+/**
+ * True when a policy-less task is genuinely STUCK rather than merely manual.
+ *
+ * `manual_policy` conflates two very different states: a task nobody intends to
+ * auto-audit, and a validated task that reached `ready_for_audit`, cannot
+ * materialise an auditor because it has no policy, and has no in-band way to
+ * acquire one. The first is silence by design; the second is a dead end that
+ * previously produced no signal at all.
+ *
+ * Deliberately narrow: it requires the task to be genuinely owed an audit --
+ * one live required implementer, no auditor already holding this revision, and
+ * no settled verdict -- so a manual or already-decided task is never reported.
+ */
+function isActionableMissingAuditPolicy(
+  task: SupervisionTaskSnapshot,
+  registry: ReturnType<typeof getSupervisionTaskRegistry>,
+  revision: string,
+): boolean {
+  if (task.status !== 'ready_for_audit') return false;
+  if (!isAuditableSupervisionTaskClassification(task.classification)) return false;
+  const assignments = registry.listAssignments(task.taskId);
+  const implementers = assignments.filter((assignment) => (
+    assignment.role === 'implementer'
+    && assignment.required
+    && assignment.status !== 'cancelled'
+    && assignment.status !== 'finalized'
+  ));
+  if (implementers.length !== 1) return false;
+  const liveAuditor = assignments.some((assignment) => (
+    assignment.role === 'auditor'
+    && assignment.auditRevision?.trim() === revision
+    && assignment.status !== 'cancelled'
+    && assignment.status !== 'finalized'
+  ));
+  if (liveAuditor) return false;
+  return !registry.listAuditReceipts(task.taskId).some((receipt) => (
+    receipt.revision === revision && receipt.receiptKind === 'final'
+  ));
+}
+
 export async function dispatchReadyAudit(
   taskId: string,
   deps: ReadyAuditDispatchDeps = {},
@@ -2431,7 +2471,10 @@ export async function dispatchReadyAudit(
   // a pre-existing explicit attempt that is already bound to this revision:
   // routing it is recovery, not automatic materialisation.
   const recoveredAttemptId = task.auditPolicy ? undefined : legacyExplicitAuditRecoveryAttempt(task, registry);
-  if (!task.auditPolicy && !recoveredAttemptId) return { status: 'ignored', reason: 'manual_policy' };
+  // Deferred rather than returned here: deciding between "manual" and "stuck"
+  // needs the resolved revision and the live coordinator, which are only
+  // available further down. Non-actionable tasks still end at `manual_policy`.
+  const missingAuditPolicy = !task.auditPolicy && !recoveredAttemptId;
   if (!isAuditableSupervisionTaskClassification(task.classification)) {
     return { status: 'ignored', reason: 'classification_not_auditable' };
   }
@@ -2459,6 +2502,22 @@ export async function dispatchReadyAudit(
     const reported = reporter && coordinator
       ? await reportBlocker(reporter, reason)
       : false;
+    return { status: 'blocked', reason, reported };
+  }
+
+  if (missingAuditPolicy) {
+    // A task nobody intends to auto-audit stays silent, exactly as before.
+    if (!isActionableMissingAuditPolicy(task, registry, revision)) {
+      return { status: 'ignored', reason: 'manual_policy' };
+    }
+    // Stuck: no policy, no auditor, and no in-band way to acquire one. Report
+    // it exactly once. reportAutomaticAuditBlocker derives a deterministic
+    // messageId and short-circuits on durable delivery evidence, so repeated
+    // ticks cannot turn this into a per-tick notification. A missing live
+    // coordinator means there is nobody to notify, not that the task is fine,
+    // so the blocked status still stands with reported=false.
+    const reason = 'missing_audit_policy';
+    const reported = reporter && coordinator ? await reportBlocker(reporter, reason) : false;
     return { status: 'blocked', reason, reported };
   }
 
@@ -2815,14 +2874,71 @@ export async function dispatchReadyIntegration(
     const session = exactLiveSessionForAssignment(assignment, sessions);
     return session?.role === 'brain' ? [{ assignment, session }] : [];
   });
+  // Legacy tasks predating coordinator attribution carry an exact PASS receipt
+  // and a clean worktree but ZERO coordinator rows, so this gate stranded them
+  // permanently. Recovery is DEFERRED rather than decided here: minting a
+  // coordinator now would create a row for a task whose worktree may still turn
+  // out to be unusable, and every existing PASS/revision/attempt/receipt and
+  // manifest gate must pass FIRST. Nothing is created on this line.
+  let recoveredBrain: SessionRecord | undefined;
   if (liveCoordinators.length !== 1) {
-    return { status: 'blocked', reason: 'integration requires one exact live Brain coordinator', reported: false };
+    // Only the zero-row legacy shape is recoverable. A task that HAS coordinator
+    // rows but none live is a different, non-legacy condition and stays closed.
+    if (coordinators.length > 0) {
+      return { status: 'blocked', reason: 'integration requires one exact live Brain coordinator', reported: false };
+    }
+    // Resolves undefined unless EXACTLY one non-child, non-stopped Brain owns
+    // this project, so ambiguous and absent Brains both fail closed here.
+    const candidate = uniqueAuthoritativeProjectBrain(task.projectName, sessions);
+    // Conflicting historical provenance: another live Brain already appears in
+    // this task's assignment lineage. Adopting a different Brain would rewrite
+    // whose authority the task was executed under, so refuse rather than guess.
+    const conflictingProvenance = candidate
+      ? task.assignments.some((assignment) => (
+        assignment.identity.sessionName !== candidate.name
+        && sessions.some((live) => live.role === 'brain' && live.name === assignment.identity.sessionName)
+      ))
+      : false;
+    if (!candidate || conflictingProvenance) {
+      return { status: 'blocked', reason: 'integration requires one exact live Brain coordinator', reported: false };
+    }
+    recoveredBrain = candidate;
   }
-  const { assignment: coordinator, session: brain } = liveCoordinators[0]!;
   const snapshot = inspectAssignmentForConvergence(implementer, deps);
   if (!snapshot || snapshot.stagedPaths.length > 0 || snapshot.conflictedPaths.length > 0) {
     return { status: 'blocked', reason: 'authoritative implementation manifest unavailable', reported: false };
   }
+  // Every pre-existing gate has now passed, so the legacy recovery is safe to
+  // materialise. Deterministic key: a replay reuses the same row rather than
+  // minting a second coordinator.
+  let recoveredCoordinator: PersistedSupervisionTaskAssignment | undefined;
+  if (recoveredBrain) {
+    // A Brain whose runtime identity cannot be resolved cannot carry authority.
+    const recoveredIdentity = supervisionTaskIdentityForTarget(recoveredBrain);
+    if (!recoveredIdentity) {
+      return { status: 'blocked', reason: 'integration requires one exact live Brain coordinator', reported: false };
+    }
+    const createdCoordinator = registry.createAssignment({
+      taskId: task.taskId,
+      role: 'coordinator',
+      identity: recoveredIdentity,
+      scopeFiles: [],
+      required: false,
+      idempotencyKey: `auto-integration-coordinator:${task.taskId}:${revision}`,
+      now: (deps.now ?? Date.now)(),
+    });
+    if (!createdCoordinator.ok) {
+      return {
+        status: 'blocked',
+        reason: `integration coordinator recovery rejected: ${createdCoordinator.reason}`,
+        reported: false,
+      };
+    }
+    recoveredCoordinator = createdCoordinator.value;
+  }
+  const { assignment: coordinator, session: brain } = recoveredCoordinator && recoveredBrain
+    ? { assignment: recoveredCoordinator, session: recoveredBrain }
+    : liveCoordinators[0]!;
   const existingOwners = task.assignments.filter((assignment) => (
     assignment.role === 'integration_owner' && assignment.status !== 'cancelled'
     && assignment.status !== 'finalized' && (!assignment.auditRevision || assignment.auditRevision === revision)
@@ -3027,13 +3143,21 @@ export async function runSupervisionConvergenceTick(
     for (const task of decisionRequests) {
       await reportCancelledCompletionEvidenceDecision(task, deps);
     }
-    // `dispatchReadyAudit` already refuses a task without an auditPolicy
-    // (`manual_policy`) and derives its attempt id canonically from
+    // `dispatchReadyAudit` derives its attempt id canonically from
     // (taskId, currentRevision), so a missing stored attempt is recomputed and
     // an older revision's attempt can never be reused here.
+    //
+    // Policy-less tasks are admitted ONLY when they are an actionable dead end
+    // (validated, owed an audit, no auditor, no settled verdict). Selecting
+    // them is what lets the dispatcher report `missing_audit_policy` once
+    // instead of leaving them silently stuck; a genuinely manual task is still
+    // filtered out here and never reaches the dispatcher. Fixing the
+    // dispatcher without this filter would be a no-op, because the sweep would
+    // never call it for exactly these tasks.
     const ready = registry.list({ status: 'ready_for_audit' })
       .filter((task) => Boolean(task.auditPolicy)
-        || Boolean(legacyExplicitAuditRecoveryAttempt(task, registry)));
+        || Boolean(legacyExplicitAuditRecoveryAttempt(task, registry))
+        || isActionableMissingAuditPolicy(task, registry, task.currentRevision?.trim() ?? ''));
     const audits: ReadyAuditDispatchResult[] = [];
     const reworks: DeterministicContinuationDispatchResult[] = [];
     for (const task of registry.list({ status: 'rework' })) {
