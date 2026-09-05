@@ -36,7 +36,7 @@ describe('SessionControls Quick static migration guards', () => {
     const peerBtnIdx = source.indexOf('class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"');
     const autoBtnIdx = source.indexOf('class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}');
     const peerGateIdx = source.lastIndexOf('{canQuickPeerAudit && (', peerBtnIdx);
-    const autoGateIdx = source.lastIndexOf('{canQuickControlSupervision && <>', autoBtnIdx);
+    const autoGateIdx = source.lastIndexOf('{canQuickViewSupervision && <>', autoBtnIdx);
     expect(peerGateIdx).toBeLessThan(peerBtnIdx);
     expect(autoGateIdx).toBeGreaterThan(peerBtnIdx);
     expect(autoGateIdx).toBeLessThan(autoBtnIdx);
