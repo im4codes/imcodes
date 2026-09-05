@@ -839,44 +839,42 @@ describe('useTimeline global cache bounds', () => {
   });
 
   it('keeps the raw snapshot when the scoped rewrite cannot be stored', () => {
-    // Data-loss guard for the same migration. It used to depend on setItem
-    // THROWING in order to skip the follow-up remove. The quota-aware writer
-    // reports failure by RETURNING FALSE instead, so an unguarded remove would
-    // delete the only surviving copy of this session's local history the first
-    // time the origin is full — the user opens the chat and the cache is gone
-    // permanently, not just this once.
-    // Fake timers on purpose: the debounced (750ms) tail write goes through the
-    // quota-aware writer, whose eviction sweep clears OTHER volatile keys to
-    // make room — including this session's legacy bare-key snapshot. That is a
-    // separate, acceptable behaviour (IndexedDB still holds the events), but if
-    // it is allowed to race the assertion the test passes alone and fails under
-    // full-suite load, which is exactly how it first escaped review.
-    vi.useFakeTimers();
-    const sessionName = `deck_ls_quota_${Date.now()}`;
-    const serverId = `srv-ls-quota-${Date.now()}`;
+    // Data-loss guard for the raw->scoped snapshot migration. It used to depend
+    // on setItem THROWING in order to skip the follow-up remove. Porting it to
+    // the quota-aware writer, which reports failure by RETURNING FALSE, would
+    // delete the only surviving copy of this session's local history.
+    //
+    // The failure injected here is a SecurityError, not QuotaExceededError, and
+    // that distinction is the whole reason this test is deterministic: only a
+    // quota failure triggers safeLocalStorageSetItem's eviction sweep, which
+    // clears every other volatile key -- this session's bare-key snapshot
+    // included -- and would mask what the migration itself did. A blocked or
+    // private-mode store fails without evicting, so the migration's own
+    // behaviour is the only thing that can remove the key.
+    const sessionName = `deck_ls_denied_${Date.now()}`;
+    const serverId = `srv-ls-denied-${Date.now()}`;
     const events = makeEvents(sessionName, 3);
     const rawKey = `rcc_timeline_snapshot:${sessionName}`;
     localStorage.setItem(rawKey, JSON.stringify(events));
     localStorage.removeItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`);
 
-    // Full origin: eviction cannot free enough either, so every write fails.
     const setItemSpy = vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
-      throw new DOMException('exceeded', 'QuotaExceededError');
+      throw new DOMException('storage is blocked', 'SecurityError');
     });
 
     try {
       function Probe() {
-        const { events: seen } = useTimeline(sessionName, null, serverId);
-        return h('div', { 'data-testid': 'ls-quota-probe' }, String(seen.length));
+        const { events: seen } = useTimeline(sessionName, null, serverId, { isActiveSession: false });
+        return h('div', { 'data-testid': 'ls-denied-probe' }, String(seen.length));
       }
       render(h(Probe));
       // The user still sees their history on this open...
-      expect(screen.getByTestId('ls-quota-probe').textContent).toBe('3');
+      expect(screen.getByTestId('ls-denied-probe').textContent).toBe('3');
     } finally {
       setItemSpy.mockRestore();
     }
 
-    // ...and the only copy of it is still on disk for the next one.
+    // ...and the only copy of it is still there for the next one.
     expect(localStorage.getItem(rawKey)).toBeTruthy();
   });
 
