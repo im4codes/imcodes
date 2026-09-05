@@ -537,7 +537,7 @@ function scheduleLocalHistoryPrune(cacheKey: string, writtenEvents: number, forc
     }
     localPruneWriteCounts.set(cacheKey, 0);
   }
-  sharedDb.pruneOldEvents(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION).catch(() => {});
+  sharedDb.pruneSessionHistory(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION).catch(() => {});
 }
 
 /** Test hook: page-session prune bookkeeping is module state. */

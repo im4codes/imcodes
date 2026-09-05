@@ -178,6 +178,89 @@ describe('TimelineDB — real IndexedDB (fake-indexeddb)', () => {
     expect(largestGetAll).toBeLessThanOrEqual(25);
   });
 
+  it('collapses last-value churn so a bounded read returns the conversation', async () => {
+    // Modelled on a real store: session.state was ~67% of all events and the
+    // whole last-value group ~84%, so the newest 60 RAW events of a busy agent
+    // session held as little as ONE actual message. A page counted in raw
+    // events was therefore mostly counting churn, and the chat looked empty.
+    const db = new TimelineDB();
+    const events: TimelineEvent[] = [];
+    let seq = 0;
+    const push = (type: string, id: string): void => {
+      seq += 1;
+      events.push({ ...ev(id, 's', seq), type } as TimelineEvent);
+    };
+    // 8 real messages, buried under state churn at roughly the measured ratio.
+    for (let round = 0; round < 8; round += 1) {
+      push('user.message', `u${round}`);
+      for (let i = 0; i < 3; i += 1) push('tool.call', `tc${round}-${i}`);
+      push('assistant.text', `a${round}`);
+      for (let i = 0; i < 25; i += 1) push('session.state', `st${round}-${i}`);
+      push('agent.status', `ag${round}`);
+      push('usage.update', `us${round}`);
+    }
+    await db.putEvents(events);
+
+    const beforeTypes = (await db.getRecentEvents('s', { limit: 60 })).map((e) => e.type);
+    // Documents the defect this change exists for. The newest 60 RAW events are
+    // dominated by churn, and the conversation does not fit inside them — which
+    // is why a reader bounded at 60 showed almost nothing. (Measured on real
+    // sessions: 1-4 messages in the newest 60.)
+    expect(beforeTypes.filter((t) => t === 'session.state').length).toBeGreaterThan(40);
+    expect(beforeTypes.filter((t) => t === 'assistant.text').length).toBeLessThan(8);
+
+    const result = await db.pruneSessionHistory('s', 1000);
+    expect(result).not.toBeNull();
+    expect(result!.deleted).toBeGreaterThan(0);
+
+    const after = await db.getRecentEvents('s', { limit: 60 });
+    const afterTypes = after.map((e) => e.type);
+    // The whole conversation is now inside a 60-event page...
+    expect(afterTypes.filter((t) => t === 'assistant.text').length).toBe(8);
+    expect(afterTypes.filter((t) => t === 'user.message').length).toBe(8);
+    expect(afterTypes.filter((t) => t === 'tool.call').length).toBe(24);
+    // ...and each last-value signal survives exactly once, so the state line
+    // and token counter still render after a reload.
+    expect(afterTypes.filter((t) => t === 'session.state').length).toBe(1);
+    expect(afterTypes.filter((t) => t === 'agent.status').length).toBe(1);
+    expect(afterTypes.filter((t) => t === 'usage.update').length).toBe(1);
+    // The survivor must be the NEWEST of its type, not an arbitrary one.
+    expect(after.find((e) => e.type === 'session.state')!.eventId).toBe('st7-24');
+    expect(after.find((e) => e.type === 'usage.update')!.eventId).toBe('us7');
+  });
+
+  it('retains unclassified event types as history rather than deleting them', async () => {
+    // Fail-safe direction: only the short last-value allowlist is collapsed, so
+    // a newly added event type nobody classified is KEPT. Getting this backwards
+    // would silently delete data the moment a new type shipped.
+    const db = new TimelineDB();
+    const events: TimelineEvent[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      events.push({ ...ev(`novel-${i}`, 's', i + 1), type: 'some.future.event' } as unknown as TimelineEvent);
+    }
+    await db.putEvents(events);
+
+    await db.pruneSessionHistory('s', 1000);
+
+    const kept = await db.getRecentEvents('s', { limit: 100 });
+    expect(kept).toHaveLength(5);
+  });
+
+  it('prunes only the requested session', async () => {
+    const db = new TimelineDB();
+    const noise: TimelineEvent[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      noise.push({ ...ev(`a-st${i}`, 'sa', i + 1), type: 'session.state' } as TimelineEvent);
+      noise.push({ ...ev(`b-st${i}`, 'sb', i + 1), type: 'session.state' } as TimelineEvent);
+    }
+    await db.putEvents(noise);
+
+    await db.pruneSessionHistory('sa', 1000);
+
+    expect(await db.getRecentEvents('sa', { limit: 100 })).toHaveLength(1);
+    expect(await db.getRecentEvents('sb', { limit: 100 })).toHaveLength(20);
+  });
+
   it('prunes to the newest N without cloning the payloads it deletes', async () => {
     const db = new TimelineDB();
     await db.putEvents(Array.from({ length: 300 }, (_, i) => ev(`e${i + 1}`, 's', i + 1)));

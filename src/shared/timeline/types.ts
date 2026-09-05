@@ -61,6 +61,35 @@ export type TimelineEventType =
   // Lets orchestrators stop waiting on a worker that ended without a reply.
   | typeof EXECUTION_CLONE_TIMELINE.TERMINAL;
 
+/**
+ * Timeline events that are LAST-VALUE signals, not conversation.
+ *
+ * Only the newest instance of each is ever meaningful — the session state line,
+ * the token counter, the agent status pill all show "now", never a history of
+ * superseded values. They are also overwhelmingly the bulk of the stream:
+ * `session.state` alone is roughly two thirds of all stored events, and this
+ * whole group is ~84%, so retaining every superseded copy costs storage and
+ * page budget for rows that can never be rendered.
+ *
+ * Membership is deliberately a SHORT allowlist rather than "everything that is
+ * not conversation": anything not named here is retained as history. A new
+ * event type must therefore be opted IN to being discarded, so forgetting to
+ * classify one keeps data instead of deleting it.
+ */
+export const TIMELINE_LAST_VALUE_TYPES = [
+  'session.state',
+  'mode.state',
+  'agent.status',
+  'usage.update',
+  'memory.context',
+  'terminal.snapshot',
+  'command.ack',
+] as const satisfies readonly TimelineEventType[];
+
+export function isLastValueTimelineEventType(type: string): boolean {
+  return (TIMELINE_LAST_VALUE_TYPES as readonly string[]).includes(type);
+}
+
 export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'user.message',
   'assistant.text',

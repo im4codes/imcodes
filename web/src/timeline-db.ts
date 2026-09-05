@@ -24,6 +24,7 @@
 
 import type { TimelineEvent } from './ws-client.js';
 import { preferTimelineEvent } from '../../src/shared/timeline/merge.js';
+import { isLastValueTimelineEventType } from '../../src/shared/timeline/types.js';
 
 const DB_NAME = 'imcodes-timeline';
 const DB_VERSION = 1;
@@ -488,6 +489,72 @@ export class TimelineDB {
       });
     } catch {
       // best-effort
+    }
+  }
+
+  /**
+   * Trim a session to what can actually be rendered, in one newest-first pass.
+   *
+   * Two different retention rules, because the stream holds two different kinds
+   * of record:
+   *   - History (the conversation) keeps the newest `keepHistoryEvents`.
+   *   - Last-value signals (session state, token usage, agent status, ...) keep
+   *     exactly ONE row each: only the newest is ever displayed, so every older
+   *     copy is storage and page budget spent on something unrenderable.
+   *
+   * That second rule is what makes a bounded read useful. Measured on a real
+   * store, `session.state` alone was ~67% of all events and the whole
+   * last-value group ~84%, so the newest 60 raw events of a busy agent session
+   * contained as few as ONE actual message — a page counted in raw events was
+   * mostly counting churn.
+   *
+   * Fail-safe by construction: only the short explicit last-value allowlist is
+   * collapsed. An unclassified (e.g. newly added) event type is treated as
+   * history and kept.
+   *
+   * Returns null when the store is unavailable — pruning is best-effort and
+   * must never be attempted against the memory fallback, where the DB cannot
+   * report what is actually on disk.
+   */
+  async pruneSessionHistory(sessionId: string, keepHistoryEvents: number): Promise<{ deleted: number } | null> {
+    const db = await this.ensureOpen();
+    if (!db) return null;
+    try {
+      return await new Promise<{ deleted: number }>((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const index = tx.objectStore(STORE_NAME).index('session_ts');
+        const range = IDBKeyRange.bound([sessionId, 0], [sessionId, Infinity]);
+        const keptLastValueTypes = new Set<string>();
+        let historyKept = 0;
+        let deleted = 0;
+        const req = index.openCursor(range, 'prev');
+        req.onsuccess = () => {
+          const cursor = req.result;
+          // Walk finished; tx.oncomplete settles once the deletes commit.
+          if (!cursor) return;
+          const type = String((cursor.value as TimelineEvent).type ?? '');
+          let drop: boolean;
+          if (isLastValueTimelineEventType(type)) {
+            // Newest-first, so the FIRST one seen for a type is the survivor.
+            drop = keptLastValueTypes.has(type);
+            if (!drop) keptLastValueTypes.add(type);
+          } else {
+            historyKept += 1;
+            drop = historyKept > keepHistoryEvents;
+          }
+          if (drop) {
+            cursor.delete();
+            deleted += 1;
+          }
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error);
+        tx.oncomplete = () => resolve({ deleted });
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      });
+    } catch {
+      return null;
     }
   }
 
