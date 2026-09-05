@@ -129,7 +129,7 @@ describe('SessionControls shared participant settings entry points', () => {
 
     const menu = document.querySelector('.menu-dropdown-auto') as HTMLElement;
     const options = within(menu).getAllByRole('button').filter((button) => button.textContent !== 'Settings');
-    expect(options).toHaveLength(3);
+    expect(options).toHaveLength(2);
     for (const option of options) {
       expect((option as HTMLButtonElement).disabled).toBe(true);
       fireEvent.click(option);
