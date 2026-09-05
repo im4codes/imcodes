@@ -572,7 +572,13 @@ describe('direct file transfer v2 browser broker', () => {
     );
   });
 
-  it('forces one HTTP fallback when direct upload has not connected within 20 seconds', async () => {
+  it('falls back quickly for a small upload instead of holding the full connect ceiling', async () => {
+    // Measured on a real device: a 14.7 kB upload sat the entire 20 s ceiling in
+    // the connecting state, failed having moved zero bytes, and the HTTP
+    // fallback then delivered it in about 300 ms. The ceiling assumed a hung
+    // path would report `failed` in well under a second; this one reported
+    // nothing at all, so the whole budget was spent on a connection that was
+    // never going to open.
     vi.useFakeTimers();
     const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities, 'hold');
@@ -584,16 +590,39 @@ describe('direct file transfer v2 browser broker', () => {
       onMode: (mode) => modes.push(mode),
     });
 
-    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS - 1);
+    const floor = DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS;
+    await vi.advanceTimersByTimeAsync(floor - 1);
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
 
     await expect(upload).resolves.toMatchObject({ attachment: { id: 'relay-attachment' } });
+    // Well inside the old ceiling, which is the whole point.
+    expect(floor).toBeLessThan(DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
     const directAttempts = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
     expect(directAttempts.length).toBeGreaterThan(0);
     expect(directAttempts.length).toBeLessThanOrEqual(DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS);
     expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
     expect(modes).toEqual(['connecting', 'falling_back', 'relay']);
+  });
+
+  it('still spends the full connect ceiling when the payload is worth a direct path', async () => {
+    // The short deadline must be earned by the payload, not applied blanket:
+    // for a large file a direct path is worth waiting tens of seconds for.
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities, 'hold');
+    const file = new File(['big'], 'big.bin', { type: 'application/octet-stream' });
+    // Declared size only: the direct path never connects in this test, and the
+    // HTTP fallback is mocked, so no real bytes are needed.
+    Object.defineProperty(file, 'size', { value: 512 * 1024 * 1024, configurable: true });
+    const upload = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS - 1);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(upload).resolves.toMatchObject({ attachment: { id: 'relay-attachment' } });
+    expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
   });
 
   it('cancels immediately while authority-free lease setup is still pending', async () => {

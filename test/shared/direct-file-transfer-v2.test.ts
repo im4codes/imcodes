@@ -8,6 +8,7 @@ import {
   DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
+  uploadDirectConnectFallbackMs,
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -72,6 +73,42 @@ function downloadInit() {
 }
 
 describe('direct file transfer v2 shared protocol', () => {
+  describe('upload direct-connect fallback deadline', () => {
+    const { UPLOAD_DIRECT_CONNECT_FALLBACK_MS, UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS } = DIRECT_FILE_TRANSFER_LIMITS;
+
+    it('does not make a small upload wait the full direct-connect ceiling', () => {
+      // Measured on a real device: a 14.7 kB upload spent the whole 20 s
+      // ceiling in the connecting state, failed having moved zero bytes, and
+      // the HTTP fallback then delivered it in about 300 ms. Waiting twenty
+      // seconds to maybe save a fraction of one is not a trade.
+      const small = uploadDirectConnectFallbackMs(14_700);
+      expect(small).toBe(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
+      expect(small).toBeLessThan(UPLOAD_DIRECT_CONNECT_FALLBACK_MS / 4);
+    });
+
+    it('still spends the full budget when a direct path is actually worth winning', () => {
+      expect(uploadDirectConnectFallbackMs(200 * 1024 * 1024)).toBe(UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
+    });
+
+    it('scales between the floor and the ceiling with payload size', () => {
+      const oneMb = uploadDirectConnectFallbackMs(1024 * 1024);
+      const fourMb = uploadDirectConnectFallbackMs(4 * 1024 * 1024);
+      expect(oneMb).toBeGreaterThan(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
+      expect(fourMb).toBeGreaterThan(oneMb);
+      expect(fourMb).toBeLessThanOrEqual(UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
+    });
+
+    it('never returns a nonsensical deadline for a nonsensical size', () => {
+      // A missing or bogus size must not disable the direct path outright, nor
+      // hand it an unbounded wait.
+      for (const size of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const ms = uploadDirectConnectFallbackMs(size);
+        expect(ms).toBeGreaterThanOrEqual(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
+        expect(ms).toBeLessThanOrEqual(UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
+      }
+    });
+  });
+
   it('advertises independent v2 lease, upload recovery, and preview-download capabilities', () => {
     expect(DIRECT_FILE_TRANSFER_LEASE_CAPABILITY).toBe('file.transfer.direct.lease.v2');
     expect(DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY).toBe('file.transfer.direct.upload_recovery.v2');

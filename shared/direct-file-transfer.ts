@@ -226,8 +226,17 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
    * connection phase on a path that is still negotiating. This deadline is
    * measured only until the direct data plane accepts the upload; once bytes
    * start flowing, the normal no-progress watchdog owns the transfer.
+   *
+   * This is the CEILING, for a transfer large enough that winning a direct path
+   * is worth waiting for. See `uploadDirectConnectFallbackMs` — spending the
+   * full budget on a small file is a pure loss, because the HTTP fallback would
+   * have finished many times over inside it.
    */
   UPLOAD_DIRECT_CONNECT_FALLBACK_MS: 20 * 1000,
+  /** Floor: below this, no path can be judged, so never fall back faster. */
+  UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS: 2_500,
+  /** How much connect time each megabyte of payload is allowed to justify. */
+  UPLOAD_DIRECT_CONNECT_BUDGET_PER_MB_MS: 4_000,
   NEGOTIATION_TIMEOUT_MS: 8 * 1000,
   /**
    * How long a data channel may take to report `open`.
@@ -254,6 +263,30 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   PROBE_CANDIDATE_TYPE_BYTES: 64,
   PROBE_TIMEOUT_MS: 8 * 1000,
 } as const;
+
+/**
+ * How long an upload may sit in the connecting phase before taking HTTP.
+ *
+ * Scaled by payload, because that is what the wait is being spent to save. A
+ * direct path is worth several seconds of negotiation for a large file and
+ * worth almost nothing for a small one: measured on a real device, a 14.7 kB
+ * upload spent the full 20 s ceiling connecting, failed with zero bytes, and
+ * the HTTP fallback then delivered it in about 300 ms.
+ *
+ * The fixed ceiling rested on an assumption the logs disprove — that "a path
+ * that cannot work says so in well under a second, so only a path still making
+ * progress ever reaches the tail of this window". A path can do neither: the
+ * peer never reported `failed` and never moved a byte, so the deadline was
+ * reached by a connection that was simply hung, not by one about to succeed.
+ */
+export function uploadDirectConnectFallbackMs(sizeBytes: number): number {
+  const megabytes = Math.max(0, Number.isFinite(sizeBytes) ? sizeBytes : 0) / (1024 * 1024);
+  const earned = megabytes * DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_BUDGET_PER_MB_MS;
+  return Math.min(
+    DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS,
+    Math.max(DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS, earned),
+  );
+}
 
 export const DIRECT_FILE_TRANSFER_ICE_SERVERS = [
   'stun:stun.cloudflare.com:3478',

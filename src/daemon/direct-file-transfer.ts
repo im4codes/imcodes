@@ -608,6 +608,10 @@ async function failTransfer(
 ): Promise<void> {
   if (transfer.settled) return;
   transfer.settled = true;
+  // `error` and `detail` are the whole reason this metric exists. Without them
+  // every failure looked identical in the logs -- direction, attempt, retryable,
+  // zero bytes -- so a 3ms channel_closed and a 20s no_progress_timeout, which
+  // have nothing in common and need opposite fixes, were indistinguishable.
   directFileMetric(
     error === DIRECT_FILE_TRANSFER_ERROR.CANCELED ? 'canceled' : 'attempt_failed',
     {
@@ -615,6 +619,12 @@ async function failTransfer(
       attempt: transfer.authority.attempt,
       retryable,
       bytes: transfer.received,
+      // The enum only. `detail` is deliberately NOT logged: on the write-failure
+      // paths it carries an underlying error string that can contain a
+      // filesystem path, and this metric is asserted elsewhere to leak neither
+      // paths nor authority. The enum is a closed vocabulary and is all the
+      // diagnosis needed.
+      error,
     },
   );
   putLedger(transfer.authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.FAILED, DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED, undefined, error);

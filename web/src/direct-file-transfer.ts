@@ -12,6 +12,7 @@ import {
   DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
+  uploadDirectConnectFallbackMs,
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_OPERATION_STATE,
   DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
@@ -2096,7 +2097,7 @@ export async function uploadFileWithDirectFallback(options: {
       if (directConnected) return;
       directConnectTimedOut = true;
       directAbort.abort();
-    }, DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
+    }, uploadDirectConnectFallbackMs(options.file.size));
     try {
       const direct = await uploadFileDirect(
         options.ws,

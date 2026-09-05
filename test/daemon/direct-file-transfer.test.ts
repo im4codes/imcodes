@@ -1289,6 +1289,29 @@ describe('daemon direct file transfer v2 lease broker', () => {
       error: DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
       retryable: true,
     })));
+    // The failure metric must name the cause. Without it every failure logged
+    // identically -- direction, attempt, retryable, zero bytes -- so a channel
+    // that closed in 3ms and a path that hung for 20s were the same line, and
+    // production logs could not tell which bug was being looked at.
+    expect(directLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'direct_file_v2.attempt_failed',
+        error: DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
+        retryable: true,
+        bytes: 0,
+      }),
+      'Direct file transfer v2 metric',
+    );
+    // `detail` carries an underlying error string that can include a filesystem
+    // path on the write-failure routes, so it must never reach the metric.
+    const metricCalls = directLogger.info.mock.calls.filter(
+      ([fields]) => typeof fields === 'object' && fields !== null
+        && String((fields as { event?: unknown }).event ?? '').startsWith('direct_file_v2.'),
+    );
+    expect(metricCalls.length).toBeGreaterThan(0);
+    for (const [fields] of metricCalls) {
+      expect(fields).not.toHaveProperty('detail');
+    }
     await direct.shutdownDirectFileTransfers();
   });
 
