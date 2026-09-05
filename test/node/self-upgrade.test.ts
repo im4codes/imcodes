@@ -20,9 +20,11 @@ import {
   buildWindowsControlledNodeUpgradeScript,
   CONTROLLED_NODE_UPGRADE_DIR_PREFIX,
   CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER,
+  CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
   CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS,
   controlledNodeArtifactTarget,
   controlledNodeArtifactUpgradeUrl,
+  downloadControlledNodeExecutable,
   downloadControlledNodeRemoteDesktopWorker,
   scheduleLinuxControlledNodeUpgrade,
   scheduleWindowsControlledNodeUpgrade,
@@ -130,6 +132,13 @@ async function createOwnedUpgradeDir(input: {
 }
 
 describe('controlled-node self-upgrade', () => {
+  it('keeps the production controlled-node bundle independent of the native addon that requires quiesce', async () => {
+    const { stdout } = await execFileAsync(process.execPath, ['scripts/check-node-exe-deps.mjs'], {
+      cwd: process.cwd(),
+    });
+    expect(stdout).toContain('node-datachannel excluded');
+  });
+
   it('maps only canonical platform artifacts', () => {
     expect(controlledNodeArtifactTarget('win32', 'x64')).toEqual({ os: 'win', arch: 'x64' });
     expect(controlledNodeArtifactTarget('darwin', 'arm64')).toEqual({ os: 'mac', arch: 'universal' });
@@ -149,6 +158,124 @@ describe('controlled-node self-upgrade', () => {
     expect(url).toBe(`https://im.example${CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH}?serverId=srv-1&os=win&arch=x64`);
     const helperUrl = controlledNodeArtifactUpgradeUrl(credential, { os: 'win', arch: 'x64' }, CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER);
     expect(helperUrl).toBe(`https://im.example${CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH}?serverId=srv-1&os=win&arch=x64&asset=computer-use-helper`);
+  });
+
+  it('streams the controlled-node executable to disk without buffering the whole response body', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-streaming-download-test-'));
+    dirs.push(dir);
+    const chunks = [
+      Buffer.alloc(64 * 1024, 0x61),
+      Buffer.alloc(64 * 1024, 0x62),
+      Buffer.from('final-chunk'),
+    ];
+    const size = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    const hash = createHash('sha256');
+    chunks.forEach((chunk) => hash.update(chunk));
+    const sha256 = hash.digest('hex');
+    let nextChunk = 0;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[nextChunk++];
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    }), {
+      status: 200,
+      headers: {
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: sha256,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(size),
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.1',
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+      },
+    });
+    const wholeBodyRead = vi.fn(async () => {
+      throw new Error('whole_body_buffered');
+    });
+    Object.defineProperty(response, 'arrayBuffer', { value: wholeBodyRead });
+
+    const downloaded = await downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => response) as unknown as typeof fetch,
+    });
+
+    expect(wholeBodyRead).not.toHaveBeenCalled();
+    expect(downloaded).toMatchObject({ sha256, sizeBytes: size });
+    expect(await readFile(downloaded!.artifactPath)).toEqual(Buffer.concat(chunks));
+  });
+
+  it('removes a rejected streamed download without replacing an existing artifact', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-streaming-reject-test-'));
+    dirs.push(dir);
+    const artifactPath = join(dir, 'imcodes-node.exe');
+    await writeFile(artifactPath, 'existing verified artifact');
+    const bytes = Buffer.from('corrupt replacement');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => new Response(bytes, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: 'a'.repeat(64),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.1',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+        },
+      })) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_sha256_mismatch');
+
+    expect(await readFile(artifactPath, 'utf8')).toBe('existing verified artifact');
+    expect(await readdir(dir)).toEqual(['imcodes-node.exe']);
+  });
+
+  it('leaves a durable phase trail when the artifact body aborts before its first chunk', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-node-download-phase-test-'));
+    dirs.push(root);
+    const bytes = Buffer.from('unread artifact');
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('asset=')) return new Response(null, { status: 404 });
+      return new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.error(new Error('simulated_body_read_abort'));
+        },
+      }), {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(bytes).digest('hex'),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.1',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.9.1', {
+      fetchImpl,
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      tmpdir: () => root,
+      removeUpgradeDir: async () => {},
+    })).rejects.toThrow('simulated_body_read_abort');
+
+    const stagingDirs = await readdir(root);
+    expect(stagingDirs).toHaveLength(1);
+    const progress = (await readFile(join(
+      root,
+      stagingDirs[0]!,
+      CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
+    ), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { phase: string });
+    expect(progress.map(({ phase }) => phase)).toEqual([
+      'staging_created',
+      'artifact_request_started',
+      'artifact_response_open',
+    ]);
   });
 
   it('downloads the Windows remote-desktop worker only with its matching pinned manifest', async () => {
@@ -387,6 +514,20 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain(`$stagingOwnershipMarker = '${ownershipMarkerPath}'`);
     expect(script).toContain(`$stagingOwnerToken = '${ownershipMarker.ownerToken}'`);
     expect(script).toContain('$stagingMarkerState.pid = $PID');
+    const progress = (await readFile(join(
+      dirname(result.scriptPath!),
+      CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
+    ), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { phase: string });
+    expect(progress.map(({ phase }) => phase)).toEqual([
+      'staging_created',
+      'artifact_request_started',
+      'artifact_response_open',
+      'artifact_first_chunk',
+      'artifact_body_complete',
+      'artifact_verified',
+      'artifact_published',
+      'handoff_ready',
+    ]);
     expect(script.indexOf('$stagingMarkerState.pid = $PID'))
       .toBeLessThan(script.indexOf('Get-AuthenticodeSignature -LiteralPath $src'));
     expect(script).toContain('Stop-ScheduledTask');

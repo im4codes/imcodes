@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, opendir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, win32 as pathWin32 } from 'node:path';
 import {
@@ -53,11 +53,13 @@ import logger from '../util/logger.js';
 
 export const CONTROLLED_NODE_UPGRADE_DIR_PREFIX = 'imcodes-node-upgrade-';
 export const CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER = '.imcodes-controlled-node-upgrade.json';
+export const CONTROLLED_NODE_UPGRADE_PROGRESS_FILE = '.imcodes-controlled-node-upgrade.progress.jsonl';
 export const CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 const CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE = 128;
 const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 64;
 const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 32;
 const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 8;
+const CONTROLLED_NODE_ARTIFACT_IO_BUFFER_BYTES = 64 * 1024;
 const CONTROLLED_NODE_UPGRADE_PRODUCT = 'imcodes-controlled-node-upgrade';
 const CONTROLLED_NODE_UPGRADE_DIR_PATTERN = /^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$/;
 const CONTROLLED_NODE_UPGRADE_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -347,6 +349,71 @@ function readHeader(headers: Headers, name: string): string | null {
   return headers.get(name) ?? headers.get(name.toLowerCase()) ?? headers.get(name.toUpperCase());
 }
 
+async function streamResponseBodyToFile(input: {
+  response: Response;
+  path: string;
+  mode: number;
+  expectedSize: number | null;
+  onFirstChunk?: () => Promise<void>;
+}): Promise<{ sha256: string; sizeBytes: number }> {
+  if (!input.response.body) throw new Error('download_missing_body');
+  const reader = input.response.body.getReader();
+  const file = await open(input.path, 'wx', input.mode);
+  const hash = createHash('sha256');
+  let sizeBytes = 0;
+  let firstChunkRecorded = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) throw new Error('download_invalid_body');
+      if (!firstChunkRecorded && value.byteLength > 0) {
+        await input.onFirstChunk?.();
+        firstChunkRecorded = true;
+      }
+      sizeBytes += value.byteLength;
+      if (!Number.isSafeInteger(sizeBytes)
+        || (input.expectedSize !== null && sizeBytes > input.expectedSize)) {
+        throw new Error('artifact_size_mismatch');
+      }
+      hash.update(value);
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const { bytesWritten } = await file.write(value.subarray(offset));
+        if (bytesWritten <= 0) throw new Error('artifact_write_failed');
+        offset += bytesWritten;
+      }
+    }
+    await file.sync();
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+    await file.close();
+  }
+  if (input.expectedSize !== null && sizeBytes !== input.expectedSize) {
+    throw new Error('artifact_size_mismatch');
+  }
+  return { sha256: hash.digest('hex'), sizeBytes };
+}
+
+async function sha256File(path: string): Promise<string> {
+  const file = await open(path, 'r');
+  const hash = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(CONTROLLED_NODE_ARTIFACT_IO_BUFFER_BYTES);
+  try {
+    while (true) {
+      const { bytesRead } = await file.read(buffer, 0, buffer.byteLength, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await file.close();
+  }
+  return hash.digest('hex');
+}
+
 async function downloadArtifact(input: {
   credential: ArtifactDownloadCredential;
   target: ControlledNodeArtifactTarget;
@@ -356,8 +423,10 @@ async function downloadArtifact(input: {
   expectedFileName?: string;
   expectedVersion?: string;
   fileMode?: number;
+  onProgress?: (phase: ControlledNodeArtifactDownloadPhase) => Promise<void>;
 }): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string }> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
+  await input.onProgress?.('artifact_request_started');
   const response = await input.fetchImpl(controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset), {
     headers: {
       Authorization: `Bearer ${input.credential.token}`,
@@ -376,35 +445,50 @@ async function downloadArtifact(input: {
     CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
   )?.trim().toLowerCase();
   if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) throw new Error('missing_artifact_sha256');
-  const bytes = Buffer.from(await response.arrayBuffer());
-  const actualSha = createHash('sha256').update(bytes).digest('hex');
-  if (actualSha !== expectedSha.toLowerCase()) throw new Error('artifact_sha256_mismatch');
-  const expectedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : bytes.length;
-  if (!Number.isSafeInteger(expectedSize) || expectedSize !== bytes.length) throw new Error('artifact_size_mismatch');
-  if (input.expectedVersion && versionHeader !== input.expectedVersion) throw new Error('artifact_version_mismatch');
-  if (input.target.os === CONTROLLED_NODE_OS_WIN && asset === CONTROLLED_NODE_ARTIFACT_ASSETS.NODE
-    && (!authenticodeSignerSha256 || !/^[0-9a-f]{64}$/.test(authenticodeSignerSha256))) {
-    throw new Error('missing_artifact_authenticode_signer_sha256');
-  }
+  const expectedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : null;
+  if (expectedSize !== null && !Number.isSafeInteger(expectedSize)) throw new Error('artifact_size_mismatch');
   const artifactPath = join(input.dir, basename(filename));
+  const partialArtifactPath = `${artifactPath}.download-${randomUUID()}`;
   const manifestPath = `${artifactPath}.manifest.json`;
   const fileMode = input.fileMode ?? 0o755;
-  await writeFile(artifactPath, bytes, { mode: fileMode });
-  if (process.platform !== 'win32') await chmod(artifactPath, fileMode).catch(() => {});
-  // Re-read what actually LANDED. The check above proves the download was
-  // intact in memory, not that those bytes survived the write — and the manifest
-  // below records `actualSha` as fact, so an unverified write lets a corrupted
-  // artifact ship with a manifest that vouches for it.
-  const landedSha = createHash('sha256').update(await readFile(artifactPath)).digest('hex');
-  if (landedSha !== actualSha) throw new Error('artifact_write_sha256_mismatch');
+  let downloaded: { sha256: string; sizeBytes: number } | null = null;
+  try {
+    await input.onProgress?.('artifact_response_open');
+    downloaded = await streamResponseBodyToFile({
+      response,
+      path: partialArtifactPath,
+      mode: fileMode,
+      expectedSize,
+      onFirstChunk: async () => input.onProgress?.('artifact_first_chunk'),
+    });
+    await input.onProgress?.('artifact_body_complete');
+    if (downloaded.sha256 !== expectedSha.toLowerCase()) throw new Error('artifact_sha256_mismatch');
+    if (input.expectedVersion && versionHeader !== input.expectedVersion) throw new Error('artifact_version_mismatch');
+    if (input.target.os === CONTROLLED_NODE_OS_WIN && asset === CONTROLLED_NODE_ARTIFACT_ASSETS.NODE
+      && (!authenticodeSignerSha256 || !/^[0-9a-f]{64}$/.test(authenticodeSignerSha256))) {
+      throw new Error('missing_artifact_authenticode_signer_sha256');
+    }
+    if (process.platform !== 'win32') await chmod(partialArtifactPath, fileMode).catch(() => {});
+    // Re-read what actually LANDED with the same fixed-size buffer. The first
+    // digest proves the response stream, not the file; neither pass may retain
+    // an entire native executable in a memory-constrained node process.
+    const landedSha = await sha256File(partialArtifactPath);
+    if (landedSha !== downloaded.sha256) throw new Error('artifact_write_sha256_mismatch');
+    await input.onProgress?.('artifact_verified');
+    await rename(partialArtifactPath, artifactPath);
+    await input.onProgress?.('artifact_published');
+  } catch (error) {
+    await rm(partialArtifactPath, { force: true }).catch(() => {});
+    throw error;
+  }
   await writeFile(manifestPath, `${JSON.stringify({
     schemaVersion: 1,
     artifact: {
       fileName: basename(filename),
       os: input.target.os === CONTROLLED_NODE_OS_MAC ? 'darwin' : input.target.os === CONTROLLED_NODE_OS_WIN ? 'win32' : input.target.os,
       arch: input.target.arch,
-      size: bytes.length,
-      sha256: actualSha,
+      size: downloaded.sizeBytes,
+      sha256: downloaded.sha256,
       ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
     },
     build: {
@@ -415,12 +499,20 @@ async function downloadArtifact(input: {
   return {
     artifactPath,
     manifestPath,
-    sha256: actualSha,
-    sizeBytes: bytes.length,
+    sha256: downloaded.sha256,
+    sizeBytes: downloaded.sizeBytes,
     filename: basename(filename),
     ...(versionHeader ? { version: versionHeader } : {}),
   };
 }
+
+type ControlledNodeArtifactDownloadPhase =
+  | 'artifact_request_started'
+  | 'artifact_response_open'
+  | 'artifact_first_chunk'
+  | 'artifact_body_complete'
+  | 'artifact_verified'
+  | 'artifact_published';
 
 function controlledNodePlatformArchKey(target: ControlledNodeArtifactTarget): string {
   const platform = target.os === CONTROLLED_NODE_OS_WIN
@@ -1194,6 +1286,27 @@ export async function startControlledNodeSelfUpgrade(
     const ownershipMarkerPath = join(updateDir, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
     const writeUpgradeFile = deps.writeUpgradeFile ?? writeFile;
     await writeUpgradeFile(ownershipMarkerPath, `${JSON.stringify(ownership)}\n`, { mode: 0o600 });
+    const progressPath = join(updateDir, CONTROLLED_NODE_UPGRADE_PROGRESS_FILE);
+    const recordProgress = async (phase: 'staging_created' | 'handoff_ready' | ControlledNodeArtifactDownloadPhase): Promise<void> => {
+      try {
+        await appendFile(progressPath, `${JSON.stringify({
+          schemaVersion: 1,
+          product: CONTROLLED_NODE_UPGRADE_PRODUCT,
+          ownerToken: ownership.ownerToken,
+          targetVersion,
+          phase,
+          recordedAt: deps.now?.() ?? Date.now(),
+          pid: process.pid,
+        })}\n`, { encoding: 'utf8', mode: 0o600, flag: 'a' });
+      } catch (error) {
+        logger.warn({
+          event: 'controlled_node_upgrade_progress_write_failed',
+          phase,
+          code: cleanupErrorCode(error),
+        }, 'controlled node upgrade progress write failed');
+      }
+    };
+    await recordProgress('staging_created');
 
     const downloaded = await downloadArtifact({
       credential,
@@ -1201,6 +1314,7 @@ export async function startControlledNodeSelfUpgrade(
       dir: updateDir,
       fetchImpl,
       ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
+      onProgress: recordProgress,
     });
     if (!downloaded.version) throw new Error('missing_artifact_version');
     const helper = await downloadControlledNodeComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
@@ -1271,6 +1385,7 @@ export async function startControlledNodeSelfUpgrade(
     if (platform === 'win32') {
       const taskXmlPath = join(updateDir, 'upgrade-task.xml');
       await writeUpgradeFile(taskXmlPath, encodeWindowsScheduledTaskXml(windowsControlledNodeUpgradeTaskXml(scriptPath)));
+      await recordProgress('handoff_ready');
       const scheduleWindowsUpgrade = deps.scheduleWindowsUpgrade ?? ((taskName: string, taskXmlPath: string) => {
         scheduleWindowsControlledNodeUpgrade(taskName, taskXmlPath, undefined, (error) => {
           emitCleanupDiagnostic({
@@ -1284,9 +1399,11 @@ export async function startControlledNodeSelfUpgrade(
       scheduleWindowsUpgrade(windowsUpgradeTaskName!, taskXmlPath);
     } else if (platform === 'linux') {
       const scheduleLinuxUpgrade = deps.scheduleLinuxUpgrade ?? scheduleLinuxControlledNodeUpgrade;
+      await recordProgress('handoff_ready');
       scheduleLinuxUpgrade(`${CONTROLLED_NODE_SERVICE.LINUX_UNIT.replace(/\.service$/, '')}-upgrade-${randomUUID()}`, scriptPath);
     } else {
       const spawnDetached = deps.spawnDetached ?? defaultSpawnDetached;
+      await recordProgress('handoff_ready');
       spawnDetached('/bin/sh', [scriptPath], {});
     }
     return {
