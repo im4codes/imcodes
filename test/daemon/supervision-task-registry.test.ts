@@ -9738,3 +9738,474 @@ describe('cancelled implementation evidence adoption', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('authoritative mid-lifecycle aggregate convergence', () => {
+  const rewriteTask = (db: InstanceType<typeof DatabaseSync>, taskId: string, patch: Record<string, unknown>) => {
+    const row = db.prepare('SELECT payload_json AS payload FROM supervision_tasks WHERE task_id = ?')
+      .get(taskId) as { payload: string };
+    const payload = { ...JSON.parse(row.payload), ...patch };
+    db.prepare(`UPDATE supervision_tasks SET status = ?, current_revision = ?, blocker = ?, payload_json = ?, updated_at = ?
+                WHERE task_id = ?`).run(payload.status, payload.currentRevision ?? null, payload.blocker ?? null,
+      JSON.stringify(payload), payload.updatedAt, taskId);
+  };
+  const rewriteAssignment = (
+    db: InstanceType<typeof DatabaseSync>, assignmentId: string, patch: Record<string, unknown>,
+  ) => {
+    const row = db.prepare('SELECT payload_json AS payload FROM supervision_task_assignments WHERE assignment_id = ?')
+      .get(assignmentId) as { payload: string };
+    const payload = { ...JSON.parse(row.payload), ...patch };
+    db.prepare(`UPDATE supervision_task_assignments SET status = ?, lease_id = ?, heartbeat_at = ?, audit_attempt_id = ?,
+                  audit_revision = ?, verdict = ?, blocker = ?, payload_json = ?, updated_at = ? WHERE assignment_id = ?`)
+      .run(payload.status, payload.leaseId ?? '', payload.heartbeatAt ?? null, payload.auditAttemptId ?? null,
+        payload.auditRevision ?? null, payload.verdict ?? null, payload.blocker ?? null,
+        JSON.stringify(payload), payload.updatedAt, assignmentId);
+  };
+  const createOwner = (registry: SupervisionTaskRegistry, taskId: string, owner = identity(`deck_${taskId}_worker`)) => {
+    expect(registry.createOrGet({ taskId, projectName: 'alpha', objective: taskId,
+      classification: 'independent_top_level', currentRevision: `${taskId}-r1`, now: 100 })).toMatchObject({ ok: true });
+    const created = registry.createAssignment({
+      taskId, assignmentId: `${taskId}-impl`, role: 'implementer', identity: owner, now: 110,
+    });
+    if (!created.ok) throw new Error(created.reason);
+    return created.value;
+  };
+
+  it('shares the required-implementer ready_for_audit decision between write-time derivation and housekeeping', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-mid-aggregate-ready-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const writeOwner = createOwner(registry, 'write-ready');
+      expect(registry.updateTask({ taskId: 'write-ready', status: 'delegated', now: 120 })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId: 'write-ready', status: 'implementing', now: 130 })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({ assignmentId: writeOwner.assignmentId, identity: writeOwner.identity,
+        status: 'validated', revision: 'write-ready-r1', auditRevision: 'write-ready-r1', now: 140 })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({ assignmentId: writeOwner.assignmentId, identity: writeOwner.identity,
+        status: 'ready_for_audit', auditRevision: 'write-ready-r1', now: 150 })).toMatchObject({ ok: true });
+      expect(registry.getTaskRecord('write-ready')).toMatchObject({ status: 'ready_for_audit' });
+
+      const sweptOwner = createOwner(registry, 'swept-ready');
+      rewriteAssignment(db, sweptOwner.assignmentId, {
+        status: 'ready_for_audit', leaseId: '', auditRevision: 'swept-ready-r1', updatedAt: 200,
+      });
+      rewriteTask(db, 'swept-ready', { status: 'implementing', currentRevision: 'swept-ready-r1', updatedAt: 210 });
+      const dry = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 25, now: 300 });
+      expect(dry.actions).toEqual(expect.arrayContaining([expect.objectContaining({
+        taskId: 'swept-ready', kind: 'repair_aggregate', fromStatus: 'implementing', toStatus: 'ready_for_audit',
+      })]));
+      registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 300 });
+      expect(registry.getTaskRecord('swept-ready')).toMatchObject({ status: 'ready_for_audit' });
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('parks missing and exact-stale authority as structured blocked recovery without event growth', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-mid-aggregate-authority-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const exactLive = identity('deck_live_worker');
+    const rotatedLive = { ...identity('deck_stale_worker'), runtimeEpoch: 'epoch-after-restart' };
+    const registry = new SupervisionTaskRegistry({ dbPath, resolveLiveParticipants: () => [exactLive, rotatedLive] });
+    const db = new DatabaseSync(dbPath);
+    try {
+      expect(registry.createOrGet({ taskId: 'missing-authority', projectName: 'alpha', objective: 'missing',
+        classification: 'independent_top_level', now: 100 })).toMatchObject({ ok: true });
+      const coordinator = registry.createAssignment({ taskId: 'missing-authority', assignmentId: 'missing-coordinator',
+        role: 'coordinator', identity: identity('deck_alpha_brain'), required: false, now: 110 });
+      if (!coordinator.ok) throw new Error(coordinator.reason);
+      rewriteTask(db, 'missing-authority', { status: 'implementing', updatedAt: 120 });
+
+      const stale = createOwner(registry, 'stale-authority', identity('deck_stale_worker'));
+      rewriteAssignment(db, stale.assignmentId, { status: 'implementing', leaseId: 'stale-lease', heartbeatAt: 100, updatedAt: 130 });
+      rewriteTask(db, 'stale-authority', { status: 'implementing', updatedAt: 140 });
+      const live = createOwner(registry, 'live-authority', exactLive);
+      rewriteAssignment(db, live.assignmentId, { status: 'implementing', leaseId: 'live-lease', heartbeatAt: 130, updatedAt: 150 });
+      rewriteTask(db, 'live-authority', { status: 'implementing', updatedAt: 160 });
+
+      const dry = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 25, now: 1_000 });
+      expect(dry.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ taskId: 'missing-authority', kind: 'repair_aggregate', toStatus: 'blocked',
+          reason: 'missing_required_authority' }),
+        expect.objectContaining({ taskId: 'stale-authority', kind: 'repair_aggregate', toStatus: 'blocked',
+          reason: 'stale_required_authority', assignmentId: stale.assignmentId }),
+      ]));
+      expect(dry.actions.some((action) => action.taskId === 'live-authority' && action.kind === 'repair_aggregate')).toBe(false);
+      registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 1_000 });
+      for (const [taskId, reason] of [['missing-authority', 'missing_required_authority'],
+        ['stale-authority', 'stale_required_authority']] as const) {
+        const task = registry.getTaskRecord(taskId)!;
+        expect(task.status).toBe('blocked');
+        expect(JSON.parse(task.blocker ?? '{}')).toMatchObject({ kind: 'supervision_authority_recovery_required', reason });
+      }
+      expect(registry.getTaskRecord('live-authority')).toMatchObject({ status: 'implementing' });
+      const counts = new Map(['missing-authority', 'stale-authority'].map((taskId) => [taskId, registry.listEvents(taskId).length]));
+      const replay = registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 2_000 });
+      expect(replay.actions.some((action) => counts.has(action.taskId) && action.kind === 'repair_aggregate')).toBe(false);
+      for (const [taskId, count] of counts) expect(registry.listEvents(taskId)).toHaveLength(count);
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not project ready_for_audit from a required implementer on a stale audit revision', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-mid-aggregate-stale-revision-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const owner = createOwner(registry, 'stale-ready-revision');
+      rewriteAssignment(db, owner.assignmentId, {
+        status: 'ready_for_audit', leaseId: '', auditRevision: 'predecessor-r0', updatedAt: 200,
+      });
+      rewriteTask(db, 'stale-ready-revision', {
+        status: 'implementing', currentRevision: 'stale-ready-revision-r1', updatedAt: 210,
+      });
+      const dry = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 25, now: 300 });
+      expect(dry.actions.some((action) => action.taskId === 'stale-ready-revision'
+        && action.kind === 'repair_aggregate')).toBe(false);
+      registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 300 });
+      expect(registry.getTaskRecord('stale-ready-revision')).toMatchObject({ status: 'implementing' });
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('parks required assignments with no continuation authority and preserves REWORK verdict projection', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-mid-aggregate-no-continuation-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath, resolveLiveParticipants: () => [] });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const missing = createOwner(registry, 'no-continuation');
+      rewriteAssignment(db, missing.assignmentId, {
+        status: 'auditing', leaseId: '', auditRevision: 'no-continuation-r1', updatedAt: 200,
+      });
+      rewriteTask(db, 'no-continuation', { status: 'implementing', updatedAt: 210 });
+
+      const rework = createOwner(registry, 'verdict-rework');
+      rewriteAssignment(db, rework.assignmentId, {
+        status: 'implementing', leaseId: '', verdict: 'REWORK', auditRevision: 'verdict-rework-r1', updatedAt: 220,
+      });
+      rewriteTask(db, 'verdict-rework', { status: 'delegated', updatedAt: 230 });
+
+      const dry = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 25, now: 300 });
+      expect(dry.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ taskId: 'no-continuation', kind: 'repair_aggregate', toStatus: 'blocked',
+          reason: 'missing_required_authority' }),
+        expect.objectContaining({ taskId: 'verdict-rework', kind: 'repair_aggregate', toStatus: 'rework' }),
+      ]));
+      registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 300 });
+      expect(JSON.parse(registry.getTaskRecord('no-continuation')?.blocker ?? '{}')).toMatchObject({
+        kind: 'supervision_authority_recovery_required', reason: 'missing_required_authority',
+      });
+      expect(registry.getTaskRecord('verdict-rework')).toMatchObject({ status: 'rework' });
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('re-reads the aggregate inside the housekeeping transaction before writing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-mid-aggregate-race-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const owner = createOwner(registry, 'aggregate-race');
+      rewriteAssignment(db, owner.assignmentId, { status: 'ready_for_audit', leaseId: '', auditRevision: 'aggregate-race-r1', updatedAt: 200 });
+      const terminal = registry.createAssignment({ taskId: 'aggregate-race', assignmentId: 'aggregate-race-old-auditor',
+        role: 'auditor', identity: identity('deck_old_auditor'), auditAttemptId: 'old-attempt', auditRevision: 'old-r0', now: 210 });
+      if (!terminal.ok) throw new Error(terminal.reason);
+      rewriteAssignment(db, terminal.value.assignmentId, { status: 'finalized', leaseId: 'stale-terminal-lease', updatedAt: 220 });
+      rewriteTask(db, 'aggregate-race', { status: 'implementing', currentRevision: 'aggregate-race-r1', updatedAt: 230 });
+      db.exec(`CREATE TRIGGER aggregate_race_after_release AFTER UPDATE ON supervision_task_assignments
+               FOR EACH ROW WHEN NEW.assignment_id = 'aggregate-race-old-auditor' AND NEW.lease_id = '' BEGIN
+                 UPDATE supervision_task_assignments SET status = 'blocked',
+                   payload_json = json_set(payload_json, '$.status', 'blocked')
+                 WHERE assignment_id = 'aggregate-race-impl'; END;`);
+      const applied = registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 1_000 });
+      expect(applied.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ taskId: 'aggregate-race', kind: 'release_terminal_assignment' }),
+        expect.objectContaining({ taskId: 'aggregate-race', kind: 'repair_aggregate', toStatus: 'ready_for_audit' }),
+      ]));
+      expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'blocked' });
+      expect(registry.getTaskRecord('aggregate-race')).toMatchObject({ status: 'implementing' });
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not apply a stale blocker action when the in-transaction reason changes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-mid-aggregate-reason-race-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath, resolveLiveParticipants: () => [] });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const first = createOwner(registry, 'aggregate-reason-race', identity('deck_reason_first'));
+      const second = registry.createAssignment({ taskId: 'aggregate-reason-race', assignmentId: 'aggregate-reason-second',
+        role: 'implementer', identity: identity('deck_reason_second'), now: 120 });
+      const terminal = registry.createAssignment({ taskId: 'aggregate-reason-race', assignmentId: 'aggregate-reason-terminal',
+        role: 'auditor', identity: identity('deck_reason_terminal'), auditAttemptId: 'terminal-attempt',
+        auditRevision: 'terminal-r0', now: 130 });
+      if (!second.ok || !terminal.ok) throw new Error('reason race assignments should create');
+      rewriteAssignment(db, first.assignmentId, { status: 'implementing', leaseId: 'first-lease', updatedAt: 200 });
+      rewriteAssignment(db, second.value.assignmentId, { status: 'implementing', leaseId: 'second-lease', updatedAt: 210 });
+      rewriteAssignment(db, terminal.value.assignmentId, { status: 'finalized', leaseId: 'terminal-lease', updatedAt: 220 });
+      rewriteTask(db, 'aggregate-reason-race', { status: 'implementing', updatedAt: 230 });
+      db.exec(`CREATE TRIGGER aggregate_reason_race AFTER UPDATE ON supervision_task_assignments
+               FOR EACH ROW WHEN NEW.assignment_id = 'aggregate-reason-terminal' AND NEW.lease_id = '' BEGIN
+                 UPDATE supervision_task_assignments SET status = 'ready_for_audit', audit_revision = 'stale-r0',
+                   payload_json = json_set(payload_json, '$.status', 'ready_for_audit', '$.auditRevision', 'stale-r0')
+                 WHERE assignment_id IN ('aggregate-reason-race-impl', 'aggregate-reason-second'); END;`);
+      const applied = registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 1_000 });
+      expect(applied.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ taskId: 'aggregate-reason-race', kind: 'release_terminal_assignment' }),
+        expect.objectContaining({ taskId: 'aggregate-reason-race', kind: 'repair_aggregate', toStatus: 'blocked',
+          reason: 'stale_required_authority' }),
+      ]));
+      expect(registry.getTaskRecord('aggregate-reason-race')).toMatchObject({ status: 'implementing' });
+      expect(registry.getTaskRecord('aggregate-reason-race')?.blocker).toBeUndefined();
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Brain-approved stale closed-attempt auditor retirement', () => {
+  it('retires the exact R3 auditor carrying an immutable closed R2 attempt and frees fresh materialization', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-stale-closed-attempt-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    const R2 = 'state-store-r2-4c2222fde34d';
+    const R3 = 'state-store-r3-e6f85061c7cb';
+    try {
+      expect(registry.createOrGet({ taskId: 'tsk-bzk-shape', projectName: 'alpha', objective: 'bzk stale auditor',
+        classification: 'independent_top_level', auditPolicy: 'auto_strict_cross_vendor', currentRevision: R2, now: 100 }))
+        .toMatchObject({ ok: true });
+      const impl = registry.createAssignment({ taskId: 'tsk-bzk-shape', assignmentId: 'asg-bzn-shape',
+        role: 'implementer', identity: identity('deck_alpha_impl'), now: 110 });
+      if (!impl.ok) throw new Error(impl.reason);
+      const auditor = registry.createAssignment({ taskId: 'tsk-bzk-shape', assignmentId: 'asg-ccg-shape', role: 'auditor',
+        identity: identity('deck_alpha_auditor'), auditAttemptId: 'closed-r2-attempt', auditRevision: R2, now: 120 });
+      if (!auditor.ok) throw new Error(auditor.reason);
+      expect(registry.appendMatchingAuditReceipt({ taskId: 'tsk-bzk-shape', auditorAssignmentId: auditor.value.assignmentId,
+        auditorIdentity: auditor.value.identity, auditorSessionName: auditor.value.identity.sessionName,
+        attemptId: 'closed-r2-attempt', revision: R2, receiptKind: 'final', verdict: 'REWORK',
+        findings: 'immutable R2 finding', validations: [], now: 130 })).toMatchObject({ ok: true });
+      const readPayload = (table: string, idColumn: string, id: string) => JSON.parse((db.prepare(
+        `SELECT payload_json AS payload FROM ${table} WHERE ${idColumn} = ?`,
+      ).get(id) as { payload: string }).payload) as Record<string, unknown>;
+      const implPayload = { ...readPayload('supervision_task_assignments', 'assignment_id', impl.value.assignmentId),
+        status: 'ready_for_audit', leaseId: '', auditRevision: R3, updatedAt: 200 };
+      db.prepare(`UPDATE supervision_task_assignments SET status = 'ready_for_audit', lease_id = '', audit_revision = ?,
+                    payload_json = ?, updated_at = 200 WHERE assignment_id = ?`).run(R3, JSON.stringify(implPayload), impl.value.assignmentId);
+      const originalBlocker = 'preserve this diagnostic';
+      const auditorPayload = { ...readPayload('supervision_task_assignments', 'assignment_id', auditor.value.assignmentId),
+        status: 'implementing', leaseId: 'stale-r2-lease', auditRevision: R3, auditAttemptId: 'closed-r2-attempt',
+        verdict: 'REWORK', blocker: originalBlocker, updatedAt: 210 };
+      db.prepare(`UPDATE supervision_task_assignments SET status = 'implementing', lease_id = 'stale-r2-lease',
+                    audit_attempt_id = 'closed-r2-attempt', audit_revision = ?, verdict = 'REWORK', blocker = ?,
+                    payload_json = ?, updated_at = 210 WHERE assignment_id = ?`)
+        .run(R3, originalBlocker, JSON.stringify(auditorPayload), auditor.value.assignmentId);
+      const taskPayload = { ...readPayload('supervision_tasks', 'task_id', 'tsk-bzk-shape'),
+        status: 'ready_for_audit', currentRevision: R3, updatedAt: 220 };
+      db.prepare(`UPDATE supervision_tasks SET status = 'ready_for_audit', current_revision = ?, payload_json = ?,
+                    updated_at = 220 WHERE task_id = 'tsk-bzk-shape'`).run(R3, JSON.stringify(taskPayload));
+
+      const before = registry.getAssignment(auditor.value.assignmentId)!;
+      const receipts = registry.listAuditReceipts('tsk-bzk-shape');
+      const dry = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 25, now: 300 });
+      expect(dry.actions).toEqual(expect.arrayContaining([expect.objectContaining({ taskId: 'tsk-bzk-shape',
+        assignmentId: auditor.value.assignmentId, kind: 'retire_closed_attempt_auditor', fromRevision: R2, toRevision: R3 })]));
+      registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 300 });
+      expect(registry.getAssignment(auditor.value.assignmentId)).toEqual(expect.objectContaining({
+        ...before, status: 'cancelled', leaseId: '', updatedAt: 300,
+      }));
+      expect(registry.getAssignment(auditor.value.assignmentId)?.blocker).toBe(originalBlocker);
+      expect(registry.listAuditReceipts('tsk-bzk-shape')).toEqual(receipts);
+      expect(registry.getTaskRecord('tsk-bzk-shape')).toMatchObject({ status: 'ready_for_audit', currentRevision: R3 });
+      const eventCount = registry.listEvents('tsk-bzk-shape').length;
+      const replay = registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 400 });
+      expect(replay.actions.some((action) => action.kind === 'retire_closed_attempt_auditor')).toBe(false);
+      expect(registry.listEvents('tsk-bzk-shape')).toHaveLength(eventCount);
+      expect(registry.createAssignment({ taskId: 'tsk-bzk-shape', assignmentId: 'asg-fresh-r3', role: 'auditor',
+        identity: identity('deck_alpha_fresh_auditor'), auditAttemptId: 'deterministic-r3-attempt', auditRevision: R3 }))
+        .toMatchObject({ ok: true });
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rechecks closed-attempt authority after earlier housekeeping writes in the same pass', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-stale-attempt-race-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    const R2 = 'race-r2';
+    const R3 = 'race-r3';
+    try {
+      expect(registry.createOrGet({ taskId: 'closed-attempt-race', projectName: 'alpha', objective: 'race',
+        classification: 'independent_top_level', currentRevision: R2, now: 100 })).toMatchObject({ ok: true });
+      const impl = registry.createAssignment({ taskId: 'closed-attempt-race', assignmentId: 'race-impl',
+        role: 'implementer', identity: identity('deck_race_impl'), now: 110 });
+      const auditor = registry.createAssignment({ taskId: 'closed-attempt-race', assignmentId: 'race-auditor',
+        role: 'auditor', identity: identity('deck_race_auditor'), auditAttemptId: 'race-r2-attempt',
+        auditRevision: R2, now: 120 });
+      const terminal = registry.createAssignment({ taskId: 'closed-attempt-race', assignmentId: 'race-terminal-owner',
+        role: 'integration_owner', identity: identity('deck_race_owner'), required: false, now: 125 });
+      if (!impl.ok || !auditor.ok || !terminal.ok) throw new Error('race assignments should create');
+      expect(registry.appendMatchingAuditReceipt({ taskId: 'closed-attempt-race',
+        auditorAssignmentId: auditor.value.assignmentId, auditorIdentity: auditor.value.identity,
+        auditorSessionName: auditor.value.identity.sessionName, attemptId: 'race-r2-attempt', revision: R2,
+        receiptKind: 'final', verdict: 'REWORK', findings: 'closed R2', validations: [], now: 130 }))
+        .toMatchObject({ ok: true });
+      const rewrite = (table: string, idColumn: string, id: string, patch: Record<string, unknown>) => {
+        const row = db.prepare(`SELECT payload_json AS payload FROM ${table} WHERE ${idColumn} = ?`).get(id) as { payload: string };
+        return JSON.stringify({ ...JSON.parse(row.payload), ...patch });
+      };
+      db.prepare(`UPDATE supervision_task_assignments SET status = 'ready_for_audit', lease_id = '',
+                    audit_revision = ?, payload_json = ?, updated_at = 200 WHERE assignment_id = 'race-impl'`)
+        .run(R3, rewrite('supervision_task_assignments', 'assignment_id', 'race-impl',
+          { status: 'ready_for_audit', leaseId: '', auditRevision: R3, updatedAt: 200 }));
+      db.prepare(`UPDATE supervision_task_assignments SET status = 'implementing', lease_id = 'race-stale-lease',
+                    audit_attempt_id = 'race-r2-attempt', audit_revision = ?, verdict = 'REWORK', payload_json = ?,
+                    updated_at = 210 WHERE assignment_id = 'race-auditor'`)
+        .run(R3, rewrite('supervision_task_assignments', 'assignment_id', 'race-auditor',
+          { status: 'implementing', leaseId: 'race-stale-lease', auditAttemptId: 'race-r2-attempt',
+            auditRevision: R3, verdict: 'REWORK', updatedAt: 210 }));
+      db.prepare(`UPDATE supervision_task_assignments SET status = 'finalized', lease_id = 'terminal-lease',
+                    payload_json = ?, updated_at = 220 WHERE assignment_id = 'race-terminal-owner'`)
+        .run(rewrite('supervision_task_assignments', 'assignment_id', 'race-terminal-owner',
+          { status: 'finalized', leaseId: 'terminal-lease', updatedAt: 220 }));
+      db.prepare(`UPDATE supervision_tasks SET status = 'ready_for_audit', current_revision = ?, payload_json = ?,
+                    updated_at = 230 WHERE task_id = 'closed-attempt-race'`)
+        .run(R3, rewrite('supervision_tasks', 'task_id', 'closed-attempt-race',
+          { status: 'ready_for_audit', currentRevision: R3, updatedAt: 230 }));
+      db.exec(`CREATE TRIGGER closed_attempt_race AFTER UPDATE ON supervision_task_assignments
+               FOR EACH ROW WHEN NEW.assignment_id = 'race-terminal-owner' AND NEW.lease_id = '' BEGIN
+                 UPDATE supervision_task_assignments SET audit_revision = 'race-r4',
+                   payload_json = json_set(payload_json, '$.auditRevision', 'race-r4')
+                 WHERE assignment_id = 'race-auditor';
+                 UPDATE supervision_tasks SET current_revision = 'race-r4',
+                   payload_json = json_set(payload_json, '$.currentRevision', 'race-r4')
+                 WHERE task_id = 'closed-attempt-race'; END;`);
+      const result = registry.reconcileHousekeeping({ mode: 'apply', projectName: 'alpha', limit: 25, now: 1_000 });
+      expect(result.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ taskId: 'closed-attempt-race', kind: 'release_terminal_assignment' }),
+        expect.objectContaining({ taskId: 'closed-attempt-race', kind: 'retire_closed_attempt_auditor' }),
+      ]));
+      expect(registry.getAssignment('race-auditor')).toMatchObject({ status: 'implementing', leaseId: 'race-stale-lease' });
+      expect(registry.getTaskRecord('closed-attempt-race')).toMatchObject({ currentRevision: 'race-r4' });
+      expect(registry.listAuditReceipts('closed-attempt-race')).toHaveLength(1);
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a positive control while failing closed for every stale-attempt ambiguity', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-stale-closed-attempt-negatives-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    const db = new DatabaseSync(dbPath);
+    const R2 = 'closed-r2';
+    const R3 = 'current-r3';
+    const seed = (taskId: string, variant: 'control' | 'progress' | 'same_revision' | 'attempt_mismatch'
+      | 'foreign_assignment' | 'current_authority' | 'ambiguous' | 'other_auditor_revision' | 'duplicate_final') => {
+      expect(registry.createOrGet({ taskId, projectName: 'alpha', objective: taskId,
+        classification: 'independent_top_level', currentRevision: variant === 'same_revision' ? R3 : R2, now: 100 }))
+        .toMatchObject({ ok: true });
+      const impl = registry.createAssignment({ taskId, assignmentId: `${taskId}-impl`, role: 'implementer',
+        identity: identity(`deck_${taskId}_impl`), now: 110 });
+      if (!impl.ok) throw new Error(impl.reason);
+      const receiptOwner = registry.createAssignment({ taskId, assignmentId: `${taskId}-receipt-owner`, role: 'auditor',
+        identity: identity(`deck_${taskId}_receipt`), auditAttemptId: `${taskId}-attempt`,
+        auditRevision: variant === 'same_revision' ? R3 : R2, now: 120 });
+      if (!receiptOwner.ok) throw new Error(receiptOwner.reason);
+      expect(registry.appendMatchingAuditReceipt({ taskId, auditorAssignmentId: receiptOwner.value.assignmentId,
+        auditorIdentity: receiptOwner.value.identity, auditorSessionName: receiptOwner.value.identity.sessionName,
+        attemptId: `${taskId}-attempt`, revision: variant === 'same_revision' ? R3 : R2,
+        receiptKind: variant === 'progress' ? 'progress' : 'final',
+        ...(variant === 'progress' ? {} : { verdict: 'REWORK' as const }), findings: variant, validations: [], now: 130 }))
+        .toMatchObject({ ok: true });
+
+      if (variant === 'duplicate_final') {
+        db.prepare(`INSERT INTO supervision_audit_receipts
+          (receipt_id, task_id, assignment_id, attempt_id, revision, sequence, receipt_kind, verdict, findings,
+           validations_json, receipt_digest, supersedes_receipt_id, sender_identity_json, created_at)
+          SELECT receipt_id || '-duplicate', task_id, assignment_id, attempt_id, revision, sequence + 1,
+                 receipt_kind, verdict, findings || '-duplicate', validations_json, receipt_digest || '-duplicate',
+                 receipt_id, sender_identity_json, created_at + 1
+          FROM supervision_audit_receipts WHERE task_id = ? AND assignment_id = ?`)
+          .run(taskId, receiptOwner.value.assignmentId);
+        expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+      }
+
+      const read = (table: string, idColumn: string, id: string) => JSON.parse((db.prepare(
+        `SELECT payload_json AS payload FROM ${table} WHERE ${idColumn} = ?`,
+      ).get(id) as { payload: string }).payload) as Record<string, unknown>;
+      const ownerPayload = read('supervision_task_assignments', 'assignment_id', receiptOwner.value.assignmentId);
+      const targetId = variant === 'foreign_assignment' ? `${taskId}-target` : receiptOwner.value.assignmentId;
+      if (variant === 'foreign_assignment') {
+        db.prepare(`UPDATE supervision_task_assignments SET status = 'cancelled', lease_id = '',
+                      payload_json = json_set(payload_json, '$.status', 'cancelled', '$.leaseId', '')
+                    WHERE assignment_id = ?`).run(receiptOwner.value.assignmentId);
+        const target = registry.createAssignment({ taskId, assignmentId: targetId, role: 'auditor',
+          identity: identity(`deck_${taskId}_target`), auditAttemptId: `${taskId}-attempt`, auditRevision: R3, now: 140 });
+        if (!target.ok) throw new Error(target.reason);
+      }
+      const targetRevision = variant === 'other_auditor_revision' ? 'other-r4' : R3;
+      const targetPayload = { ...(variant === 'foreign_assignment'
+        ? read('supervision_task_assignments', 'assignment_id', targetId)
+        : ownerPayload), status: 'implementing', leaseId: `${taskId}-lease`, auditRevision: targetRevision,
+        auditAttemptId: variant === 'attempt_mismatch' ? `${taskId}-different-attempt` : `${taskId}-attempt`, updatedAt: 200 };
+      db.prepare(`UPDATE supervision_task_assignments SET status = 'implementing', lease_id = ?, audit_attempt_id = ?,
+                    audit_revision = ?, payload_json = ?, updated_at = 200 WHERE assignment_id = ?`)
+        .run(`${taskId}-lease`, targetPayload.auditAttemptId, targetRevision, JSON.stringify(targetPayload), targetId);
+      const implPayload = { ...read('supervision_task_assignments', 'assignment_id', impl.value.assignmentId),
+        status: 'ready_for_audit', leaseId: '', auditRevision: R3, updatedAt: 200 };
+      db.prepare(`UPDATE supervision_task_assignments SET status = 'ready_for_audit', lease_id = '', audit_revision = ?,
+                    payload_json = ?, updated_at = 200 WHERE assignment_id = ?`).run(R3, JSON.stringify(implPayload), impl.value.assignmentId);
+      const taskPayload = { ...read('supervision_tasks', 'task_id', taskId),
+        status: 'ready_for_audit', currentRevision: R3, updatedAt: 210 };
+      db.prepare(`UPDATE supervision_tasks SET status = 'ready_for_audit', current_revision = ?, payload_json = ?,
+                    updated_at = 210 WHERE task_id = ?`).run(R3, JSON.stringify(taskPayload), taskId);
+
+      if (variant === 'current_authority') {
+        db.prepare(`INSERT INTO supervision_audit_attestations
+          (attempt_id, task_id, assignment_id, revision, verdict, auditor_session_name, findings, created_at)
+          VALUES (?, ?, ?, ?, 'PASS', 'deck_current_auditor', 'current authority', 220)`)
+          .run(`${taskId}-current-attempt`, taskId, impl.value.assignmentId, R3);
+      }
+      if (variant === 'ambiguous') {
+        const clone = { ...targetPayload, assignmentId: `${taskId}-other`,
+          identity: identity(`deck_${taskId}_other`), leaseId: `${taskId}-other-lease`, updatedAt: 220 };
+        db.prepare(`INSERT INTO supervision_task_assignments
+          (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch, agent_type,
+           provider_family, lease_id, generation, validation_state, audit_attempt_id, audit_revision, verdict,
+           blocker, heartbeat_at, payload_json, created_at, updated_at)
+          VALUES (?, ?, 'auditor', 'implementing', ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, NULL, NULL, NULL, ?, 220, 220)`)
+          .run(clone.assignmentId, taskId, clone.identity.sessionName, clone.identity.sessionInstanceId,
+            clone.identity.runtimeEpoch, clone.identity.agentType, clone.identity.providerFamily, clone.leaseId,
+            clone.auditAttemptId, clone.auditRevision, JSON.stringify(clone));
+      }
+    };
+
+    try {
+      const variants = ['control', 'progress', 'same_revision', 'attempt_mismatch', 'foreign_assignment',
+        'current_authority', 'ambiguous', 'other_auditor_revision', 'duplicate_final'] as const;
+      for (const variant of variants) seed(`negative-${variant}`, variant);
+      const dry = registry.reconcileHousekeeping({ mode: 'dryRun', projectName: 'alpha', limit: 100, now: 1_000 });
+      expect(dry.actions).toEqual(expect.arrayContaining([expect.objectContaining({
+        taskId: 'negative-control', kind: 'retire_closed_attempt_auditor', fromRevision: R2, toRevision: R3,
+      })]));
+      for (const variant of variants) {
+        if (variant === 'control') continue;
+        expect(dry.actions.some((action) => action.taskId === `negative-${variant}`
+          && action.kind === 'retire_closed_attempt_auditor'), variant).toBe(false);
+      }
+    } finally {
+      db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

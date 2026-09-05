@@ -827,6 +827,7 @@ export type SupervisionHousekeepingActionKind =
   | 'quarantine_orphan'
   | 'release_terminal_assignment'
   | 'retire_consumed_assignment'
+  | 'retire_closed_attempt_auditor'
   | 'repair_aggregate'
   | 'repair_revision'
   | 'archive_terminal'
@@ -1225,6 +1226,104 @@ function deterministicTerminalAggregate(
   if (required.some((assignment) => assignment.status === 'pushed')) return 'pushed';
   if (required.some((assignment) => assignment.status === 'committed')) return 'committed';
   return 'cancelled';
+}
+
+const MID_LIFECYCLE_AUTHORITY_REQUIRED = new Set<SupervisionTaskLifecycleStatus>([
+  'delegated', 'implementing', 'retrying_external_ci', 'auditing',
+]);
+
+type AuthoritativeAggregateDecision = {
+  toStatus: SupervisionTaskLifecycleStatus;
+  assignmentId?: string;
+  reason?: 'missing_required_authority' | 'stale_required_authority';
+};
+
+/**
+ * The single task-aggregate authority used after ordinary writes and by the
+ * bounded housekeeping reconciler. It projects lifecycle from required work,
+ * never from coordinators, labels, or whichever same-name runtime happens to
+ * be newest. When a live-runtime view is supplied, an active projection is
+ * allowed to remain active only when its exact persisted identity still
+ * exists; otherwise the task is parked for explicit recovery, never completed.
+ */
+function authoritativeAggregateDecision(input: {
+  task: PersistedSupervisionTaskRecord;
+  assignments: readonly PersistedSupervisionTaskAssignment[];
+  liveParticipants?: readonly PersistedSupervisionTaskAssignmentIdentity[];
+  includeTerminalAggregate?: boolean;
+  repairMissingAuthority?: boolean;
+}): AuthoritativeAggregateDecision | undefined {
+  const { task, assignments } = input;
+  if (input.includeTerminalAggregate) {
+    const terminal = deterministicTerminalAggregate(assignments);
+    if (terminal) return terminal === task.status ? undefined : { toStatus: terminal };
+  }
+
+  const requiredImplementers = assignments.filter((assignment) => (
+    assignment.required && assignment.role === 'implementer' && assignment.status !== 'cancelled'
+  ));
+  const requiredOwners = assignments.filter((assignment) => (
+    assignment.required && assignment.role === 'integration_owner' && assignment.status !== 'cancelled'
+  ));
+  const required = requiredImplementers.length > 0 ? requiredImplementers : requiredOwners;
+  if (required.length === 0) {
+    return input.repairMissingAuthority && MID_LIFECYCLE_AUTHORITY_REQUIRED.has(task.status)
+      ? { toStatus: 'blocked', reason: 'missing_required_authority' }
+      : undefined;
+  }
+
+  const next = required.every((assignment) => assignment.status === 'finalized')
+    ? 'finalized'
+    : required.every((assignment) => assignment.status === 'recovered' || assignment.status === 'finalized')
+      ? 'recovered'
+      : required.every((assignment) => assignment.status === 'ready_for_integration' || assignment.status === 'passed')
+        ? 'ready_for_integration'
+        : required.some((assignment) => (
+            assignment.status === 'rework' || assignment.verdict?.trim().toUpperCase() === 'REWORK'
+          ))
+            ? 'rework'
+            : required.every((assignment) => (
+                assignment.status === 'ready_for_audit'
+                && Boolean(normalizeTaskString(assignment.auditRevision))
+                && assignment.auditRevision === task.currentRevision
+              ))
+              ? 'ready_for_audit'
+              : required.some((assignment) => assignment.status === 'blocked')
+                ? 'blocked'
+                : required.some((assignment) => assignment.status === 'retrying_external_ci')
+                  ? 'retrying_external_ci'
+                  : task.status;
+  // A task already carrying its immutable PASS aggregate must not be moved
+  // backwards to the pre-integration projection by a later housekeeping pass.
+  if (task.status === 'passed' && next === 'ready_for_integration') return undefined;
+  if (next !== task.status && canTransitionSupervisionTaskStatus(task.status, next)) {
+    return { toStatus: next };
+  }
+
+  if (!input.repairMissingAuthority
+    || !input.liveParticipants
+    || !MID_LIFECYCLE_AUTHORITY_REQUIRED.has(task.status)) return undefined;
+  const activeAuthority = task.status === 'auditing'
+    ? assignments.filter((assignment) => (
+        assignment.role === 'auditor'
+        && !SUPERVISION_AUDITOR_TERMINAL_STATUSES.has(assignment.status)
+        && assignment.auditRevision === task.currentRevision
+      ))
+    : required.filter((assignment) => SUPERVISION_IMPLEMENTATION_CONTINUATION_STATUSES.has(assignment.status));
+  if (activeAuthority.length === 0) {
+    return { toStatus: 'blocked', reason: 'missing_required_authority' };
+  }
+  const live = activeAuthority.filter((assignment) => input.liveParticipants!.some((candidate) => (
+    runtimeIdentityMetadataMatches(assignment.identity, candidate)
+  )));
+  if (live.length === 0) {
+    return {
+      toStatus: 'blocked',
+      reason: 'stale_required_authority',
+      ...(activeAuthority.length === 1 ? { assignmentId: activeAuthority[0]!.assignmentId } : {}),
+    };
+  }
+  return undefined;
 }
 
 export class SupervisionTaskRegistry {
@@ -1879,6 +1978,9 @@ export class SupervisionTaskRegistry {
       const reworkProjectionRepair = this.#planReworkProjectionRepair(task, assignments);
       if (reworkProjectionRepair) actions.push(reworkProjectionRepair);
 
+      const staleClosedAttemptAuditor = this.#planClosedAttemptAuditorRetirement(task, assignments);
+      if (staleClosedAttemptAuditor) actions.push(staleClosedAttemptAuditor);
+
       const consumedLegacyAssignments = assignments.filter((assignment) => (
         this.#isLegacyAssignmentConsumedByFinalization(task, assignment)
       ));
@@ -1896,17 +1998,29 @@ export class SupervisionTaskRegistry {
             ? { ...assignment, status: 'finalized' as const, leaseId: '' }
             : assignment
         ));
-      const terminalAggregate = deterministicTerminalAggregate(projectedAssignments);
-      if (terminalAggregate && terminalAggregate !== task.status) {
+      const aggregateDecision = reworkProjectionRepair
+        ? undefined
+        : authoritativeAggregateDecision({
+            task,
+            assignments: projectedAssignments,
+            includeTerminalAggregate: true,
+            repairMissingAuthority: true,
+            ...(this.#resolveLiveParticipants
+              ? { liveParticipants: this.#resolveLiveParticipants(task.projectName) }
+              : {}),
+          });
+      if (aggregateDecision) {
         actions.push({
           taskId: task.taskId,
           kind: 'repair_aggregate',
           fromStatus: task.status,
-          toStatus: terminalAggregate,
+          toStatus: aggregateDecision.toStatus,
+          ...(aggregateDecision.assignmentId ? { assignmentId: aggregateDecision.assignmentId } : {}),
+          ...(aggregateDecision.reason ? { reason: aggregateDecision.reason } : {}),
         });
       }
 
-      const effectiveStatus = terminalAggregate ?? task.status;
+      const effectiveStatus = aggregateDecision?.toStatus ?? task.status;
       const effectiveLeases = projectedAssignments.some((assignment) => (
         Boolean(assignment.leaseId) && !HOUSEKEEPING_ASSIGNMENT_TERMINAL.has(assignment.status)
       ));
@@ -2224,9 +2338,40 @@ export class SupervisionTaskRegistry {
       this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE assignment_id = ?').run(assignment.assignmentId);
       return;
     }
+    if (action.kind === 'retire_closed_attempt_auditor' && action.assignmentId) {
+      const task = this.getTaskRecord(action.taskId);
+      if (!task) return;
+      // The plan was made before BEGIN IMMEDIATE. Re-derive the complete closed
+      // attempt mismatch now, under the transaction, so a current receipt or a
+      // competing auditor that arrived meanwhile makes this a no-op.
+      const repair = this.#planClosedAttemptAuditorRetirement(task, this.listAssignments(task.taskId));
+      if (!repair
+        || repair.assignmentId !== action.assignmentId
+        || repair.fromRevision !== action.fromRevision
+        || repair.toRevision !== action.toRevision) return;
+      const auditor = this.getAssignment(action.assignmentId);
+      if (!auditor) return;
+      this.#writeAssignment({
+        ...auditor,
+        status: 'cancelled',
+        leaseId: '',
+        cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
+        updatedAt: now,
+      }, 'cancelled', {
+        source: 'housekeeping_closed_attempt_auditor_retirement',
+        closedAttemptId: auditor.auditAttemptId,
+        closedAttemptRevision: repair.fromRevision,
+        currentRevision: repair.toRevision,
+        provenancePreserved: true,
+      });
+      this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE assignment_id = ?')
+        .run(auditor.assignmentId);
+      return;
+    }
     const task = this.getTaskRecord(action.taskId);
     if (!task) return;
-    if ((action.kind === 'repair_revision' || action.kind === 'repair_aggregate')
+    if ((action.kind === 'repair_revision'
+      || (action.kind === 'repair_aggregate' && action.toStatus === 'rework'))
       && action.assignmentId) {
       // The planner ran before BEGIN IMMEDIATE. Re-evaluate the complete
       // evidence shape while holding the write transaction so an auditor or a
@@ -2269,15 +2414,42 @@ export class SupervisionTaskRegistry {
       return;
     }
     if (action.kind === 'repair_aggregate' && action.toStatus) {
+      // This is the same decision used by write-time derivation, re-evaluated
+      // inside the write transaction. The pre-transaction plan is not write
+      // authority: every field, including the exact stale assignment and
+      // structured blocker reason, must still agree.
+      const decision = authoritativeAggregateDecision({
+        task,
+        assignments: this.listAssignments(task.taskId),
+        includeTerminalAggregate: true,
+        repairMissingAuthority: true,
+        ...(this.#resolveLiveParticipants
+          ? { liveParticipants: this.#resolveLiveParticipants(task.projectName) }
+          : {}),
+      });
+      if (!decision
+        || decision.toStatus !== action.toStatus
+        || decision.assignmentId !== action.assignmentId
+        || decision.reason !== action.reason) return;
+      const blocker = decision.toStatus === 'blocked' && decision.reason
+        ? JSON.stringify({
+            kind: 'supervision_authority_recovery_required',
+            reason: decision.reason,
+            ...(decision.assignmentId ? { assignmentId: decision.assignmentId } : {}),
+          })
+        : undefined;
       this.#writeTask({
         ...task,
         status: action.toStatus,
+        blocker,
         cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
         updatedAt: now,
       }, this.#taskEventFor(action.toStatus), {
         source: 'housekeeping_aggregate_repair',
         fromStatus: action.fromStatus,
         toStatus: action.toStatus,
+        ...(decision.reason ? { reason: decision.reason } : {}),
+        ...(decision.assignmentId ? { assignmentId: decision.assignmentId } : {}),
       });
       return;
     }
@@ -5452,6 +5624,62 @@ export class SupervisionTaskRegistry {
     }
   }
 
+  /**
+   * Recognise only the corrupt successor shape where the sole active auditor
+   * advertises the task's CURRENT revision but still points at one immutable
+   * FINAL attempt from a DIFFERENT revision. Project housekeeping is exposed
+   * only through the existing Brain/admin-authorized ingress; this method adds
+   * no general auditor mutation authority.
+   */
+  #planClosedAttemptAuditorRetirement(
+    task: PersistedSupervisionTaskRecord,
+    assignments: readonly PersistedSupervisionTaskAssignment[],
+  ): SupervisionHousekeepingAction | undefined {
+    const currentRevision = normalizeTaskString(task.currentRevision);
+    if (task.status !== 'ready_for_audit'
+      || !currentRevision
+      || task.commitSha
+      || task.pushRemoteRef
+      || task.finalization
+      || task.archivedAt) return undefined;
+    const activeAuditors = assignments.filter((assignment) => (
+      assignment.role === 'auditor'
+      && !SUPERVISION_AUDITOR_TERMINAL_STATUSES.has(assignment.status)
+    ));
+    if (activeAuditors.length !== 1) return undefined;
+    const auditor = activeAuditors[0]!;
+    const attemptId = normalizeTaskString(auditor.auditAttemptId);
+    if (!attemptId || auditor.auditRevision !== currentRevision) return undefined;
+
+    const finalAttemptReceipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.assignmentId === auditor.assignmentId
+      && receipt.attemptId === auditor.auditAttemptId
+      && receipt.receiptKind === 'final'
+    ));
+    if (finalAttemptReceipts.length !== 1) return undefined;
+    const receipt = finalAttemptReceipts[0]!;
+
+    // Any current-revision final authority means this is no longer merely a
+    // stale slot. It must be reconciled by the normal receipt path, never
+    // retired by housekeeping.
+    const currentReceipt = this.listAuditReceipts(task.taskId).some((candidate) => (
+      candidate.receiptKind === 'final' && candidate.revision === currentRevision
+    ));
+    const currentAttestation = this.#db.prepare(
+      'SELECT 1 AS ok FROM supervision_audit_attestations WHERE task_id = ? AND revision = ? LIMIT 1',
+    ).get(task.taskId, currentRevision) as { ok?: number } | undefined;
+    if (currentReceipt || currentAttestation?.ok === 1) return undefined;
+
+    return {
+      taskId: task.taskId,
+      assignmentId: auditor.assignmentId,
+      kind: 'retire_closed_attempt_auditor',
+      fromRevision: receipt.revision,
+      toRevision: currentRevision,
+      reason: 'closed_attempt_revision_mismatch',
+    };
+  }
+
   #deriveTaskStatus(taskId: string, now: number): void {
     const task = this.getTaskRecord(taskId);
     if (!task) return;
@@ -5461,36 +5689,12 @@ export class SupervisionTaskRegistry {
       this.#applyHousekeepingAction(reworkProjectionRepair, now);
       return;
     }
-    // Pre-integration aggregate authority belongs to required implementers.
-    // A coordinator is an observer/orchestrator and an auditor is represented
-    // by its authenticated receipt; stale rows in either role must not hold an
-    // otherwise matching implementation PASS at ready_for_audit forever.
-    const requiredImplementers = assignments.filter((assignment) => (
-      assignment.required && assignment.role === 'implementer' && assignment.status !== 'cancelled'
-    ));
-    const required = requiredImplementers.length > 0
-      ? requiredImplementers
-      : assignments.filter((assignment) => (
-          assignment.required && assignment.role === 'integration_owner' && assignment.status !== 'cancelled'
-        ));
-    if (required.length === 0) return;
-    const next = required.every((assignment) => assignment.status === 'finalized')
-      ? 'finalized'
-      : required.every((assignment) => assignment.status === 'recovered' || assignment.status === 'finalized')
-        ? 'recovered'
-        : required.every((assignment) => assignment.status === 'ready_for_integration' || assignment.status === 'passed')
-          ? 'ready_for_integration'
-          : requiredImplementers.length === 0
-              && required.every((assignment) => assignment.status === 'ready_for_audit')
-            ? 'ready_for_audit'
-            : required.some((assignment) => assignment.status === 'rework')
-              ? 'rework'
-              : required.some((assignment) => assignment.status === 'blocked')
-                ? 'blocked'
-                : required.some((assignment) => assignment.status === 'retrying_external_ci')
-                  ? 'retrying_external_ci'
-                  : task.status;
-    if (next !== task.status && canTransitionSupervisionTaskStatus(task.status, next)) {
+    const decision = authoritativeAggregateDecision({
+      task,
+      assignments,
+    });
+    if (decision) {
+      const next = decision.toStatus;
       const aggregateEvent = next === 'ready_for_integration' ? 'ready_for_integration'
         : next === 'ready_for_audit' ? 'ready_for_audit'
         : next === 'rework' ? 'rework'
@@ -5499,7 +5703,18 @@ export class SupervisionTaskRegistry {
               : next === 'recovered' ? 'recovered'
                 : next === 'finalized' ? 'finalized'
                   : 'validated';
-      this.#writeTask({ ...task, status: next, updatedAt: now }, aggregateEvent, { source: 'aggregate_status' });
+      const blocker = next === 'blocked' && decision.reason
+        ? JSON.stringify({
+            kind: 'supervision_authority_recovery_required',
+            reason: decision.reason,
+            ...(decision.assignmentId ? { assignmentId: decision.assignmentId } : {}),
+          })
+        : undefined;
+      this.#writeTask({ ...task, status: next, blocker, updatedAt: now }, aggregateEvent, {
+        source: 'aggregate_status',
+        ...(decision.reason ? { reason: decision.reason } : {}),
+        ...(decision.assignmentId ? { assignmentId: decision.assignmentId } : {}),
+      });
     }
   }
 
