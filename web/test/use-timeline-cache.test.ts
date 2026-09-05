@@ -845,6 +845,13 @@ describe('useTimeline global cache bounds', () => {
     // delete the only surviving copy of this session's local history the first
     // time the origin is full — the user opens the chat and the cache is gone
     // permanently, not just this once.
+    // Fake timers on purpose: the debounced (750ms) tail write goes through the
+    // quota-aware writer, whose eviction sweep clears OTHER volatile keys to
+    // make room — including this session's legacy bare-key snapshot. That is a
+    // separate, acceptable behaviour (IndexedDB still holds the events), but if
+    // it is allowed to race the assertion the test passes alone and fails under
+    // full-suite load, which is exactly how it first escaped review.
+    vi.useFakeTimers();
     const sessionName = `deck_ls_quota_${Date.now()}`;
     const serverId = `srv-ls-quota-${Date.now()}`;
     const events = makeEvents(sessionName, 3);
