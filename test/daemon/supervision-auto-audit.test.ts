@@ -172,10 +172,15 @@ beforeEach(() => {
 });
 
 describe('automatic supervision audit materialization', () => {
-  function settleReadyTask(verdict: 'PASS' | 'REWORK', taskId?: string) {
+  function settleReadyTask(
+    verdict: 'PASS' | 'REWORK',
+    taskId?: string,
+    registry?: SupervisionTaskRegistry,
+  ) {
     const shape = makeReadyTask({
       taskId: taskId ?? `daemon-first-${verdict.toLowerCase()}`,
       auditPolicy: 'auto_strict_cross_vendor',
+      ...(registry ? { registry } : {}),
     });
     const attemptId = automaticAttempt(shape.taskId, shape.revision);
     const auditor = shape.registry.createAssignment({
@@ -198,6 +203,47 @@ describe('automatic supervision audit materialization', () => {
       assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision: shape.revision,
     })).toMatchObject({ ok: true });
     return { ...shape, attemptId, auditor: auditor.value };
+  }
+
+  async function passAuthorizedReplayShape(taskId: string) {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = settleReadyTask('PASS', taskId, registry);
+    const brain = session('deck_alpha_brain', 'brain');
+    await expect(dispatchReadyIntegration(shape.taskId, {
+      registry,
+      listSessions: () => [brain, session('deck_alpha_worker', 'w1')],
+      dispatch: vi.fn().mockResolvedValue({
+        status: 'accepted',
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000091',
+        messageId: 'send_message_00000000-0000-5000-a000-000000000091',
+        deliveries: [{ target: brain.name, status: 'queued' }],
+      }),
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: `/tmp/${taskId}/repo`, headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
+    })).resolves.toMatchObject({ status: 'dispatched' });
+    const owner = registry.get(taskId)!.assignments.find(
+      (assignment) => assignment.role === 'integration_owner',
+    )!;
+    const demote = () => {
+      const task = registry.getTaskRecord(taskId)!;
+      const demotedTask = { ...task, status: 'implementing' as const, updatedAt: task.updatedAt + 1 };
+      database.prepare(
+        'UPDATE supervision_tasks SET status = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
+      ).run(demotedTask.status, JSON.stringify(demotedTask), demotedTask.updatedAt, taskId);
+      const currentOwner = registry.getAssignment(owner.assignmentId)!;
+      const demotedOwner = {
+        ...currentOwner, status: 'implementing' as const, updatedAt: currentOwner.updatedAt + 1,
+      };
+      database.prepare(
+        'UPDATE supervision_task_assignments SET status = ?, payload_json = ?, updated_at = ? WHERE assignment_id = ?',
+      ).run(demotedOwner.status, JSON.stringify(demotedOwner), demotedOwner.updatedAt, owner.assignmentId);
+    };
+    return { database, registry, shape, owner, demote };
   }
 
   it('exposes one project-authoritative primary pool to Brain and ordinary sub-sessions', () => {
@@ -334,6 +380,365 @@ describe('automatic supervision audit materialization', () => {
       status: 'ready_for_integration', auditAttemptId: shape.attemptId,
       auditRevision: shape.revision, verdict: 'PASS', crossVendorAuditPassed: true,
     });
+  });
+
+  it.each(['start', 'heartbeat', 'checkpoint'] as const)(
+    'keeps an exact PASS integration round finalizable across %s and heals its stale projection',
+    async (intent) => {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      const shape = settleReadyTask('PASS', `pass-owner-${intent}`, registry);
+      const brain = session('deck_alpha_brain', 'brain');
+      await expect(dispatchReadyIntegration(shape.taskId, {
+        registry,
+        listSessions: () => [brain, session('deck_alpha_worker', 'w1')],
+        dispatch: vi.fn().mockResolvedValue({
+          status: 'accepted',
+          dispatchId: `send_dispatch_00000000-0000-4000-8000-0000000000${intent.length}`,
+          messageId: `send_message_00000000-0000-5000-a000-0000000000${intent.length}`,
+          deliveries: [{ target: brain.name, status: 'queued' }],
+        }),
+        hasDeliveryEvidence: () => false,
+        inspectAssignmentWorktree: () => ({
+          worktreePath: `/tmp/${shape.taskId}/repo`, headSha: 'a'.repeat(40),
+          files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+          stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+        }),
+      })).resolves.toMatchObject({ status: 'dispatched' });
+
+      const owner = registry.get(shape.taskId)!.assignments.find(
+        (assignment) => assignment.role === 'integration_owner',
+      )!;
+      const receiptCount = registry.listAuditReceipts(shape.taskId).length;
+      const coherentEventCount = registry.listEvents(shape.taskId).length;
+      expect(registry.applyTaskIntent({
+        taskId: shape.taskId,
+        assignmentId: owner.assignmentId,
+        intent,
+        toStatus: intent === 'start' ? 'implementing' : null,
+      })).toMatchObject({ ok: true, value: { status: 'ready_for_integration' } });
+      expect(registry.get(shape.taskId)).toMatchObject({ status: 'ready_for_integration' });
+      expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'ready_for_integration' });
+      if (intent === 'start') expect(registry.listEvents(shape.taskId)).toHaveLength(coherentEventCount);
+      if (intent === 'heartbeat') {
+        expect(registry.listEvents(shape.taskId)).toHaveLength(coherentEventCount + 1);
+        expect(registry.getAssignment(owner.assignmentId)?.heartbeatAt).toEqual(expect.any(Number));
+      }
+      if (intent === 'checkpoint') {
+        expect(registry.listEvents(shape.taskId).some(
+          (event) => event.eventType === 'implementation_progress' && event.assignmentId === owner.assignmentId,
+        )).toBe(true);
+      }
+
+      const task = registry.getTaskRecord(shape.taskId)!;
+      const demotedTask = { ...task, status: 'implementing' as const, updatedAt: task.updatedAt + 1 };
+      database.prepare(
+        'UPDATE supervision_tasks SET status = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
+      ).run(demotedTask.status, JSON.stringify(demotedTask), demotedTask.updatedAt, shape.taskId);
+      const currentOwner = registry.getAssignment(owner.assignmentId)!;
+      const demotedOwner = {
+        ...currentOwner, status: 'implementing' as const, updatedAt: currentOwner.updatedAt + 1,
+      };
+      database.prepare(
+        'UPDATE supervision_task_assignments SET status = ?, payload_json = ?, updated_at = ? WHERE assignment_id = ?',
+      ).run(demotedOwner.status, JSON.stringify(demotedOwner), demotedOwner.updatedAt, owner.assignmentId);
+
+      if (intent === 'start') {
+        const conflictingTask = {
+          ...demotedTask, commitSha: 'b'.repeat(40), updatedAt: demotedTask.updatedAt + 1,
+        };
+        database.prepare(
+          'UPDATE supervision_tasks SET payload_json = ?, updated_at = ? WHERE task_id = ?',
+        ).run(JSON.stringify(conflictingTask), conflictingTask.updatedAt, shape.taskId);
+        expect(registry.applyTaskIntent({
+          taskId: shape.taskId, assignmentId: owner.assignmentId, intent, toStatus: 'implementing',
+        })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+        database.prepare(
+          'UPDATE supervision_tasks SET payload_json = ?, updated_at = ? WHERE task_id = ?',
+        ).run(JSON.stringify(demotedTask), demotedTask.updatedAt, shape.taskId);
+      } else if (intent === 'heartbeat') {
+        const unauditedOwner = {
+          ...demotedOwner, verdict: undefined, crossVendorAuditPassed: undefined,
+          updatedAt: demotedOwner.updatedAt + 1,
+        };
+        database.prepare(
+          'UPDATE supervision_task_assignments SET payload_json = ?, updated_at = ? WHERE assignment_id = ?',
+        ).run(JSON.stringify(unauditedOwner), unauditedOwner.updatedAt, owner.assignmentId);
+        expect(registry.applyTaskIntent({
+          taskId: shape.taskId, assignmentId: owner.assignmentId, intent, toStatus: null,
+        })).toMatchObject({ ok: true, value: { status: 'implementing' } });
+        expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'implementing' });
+        database.prepare(
+          'UPDATE supervision_task_assignments SET payload_json = ?, updated_at = ? WHERE assignment_id = ?',
+        ).run(JSON.stringify(demotedOwner), demotedOwner.updatedAt, owner.assignmentId);
+      }
+
+      expect(registry.applyTaskIntent({
+        taskId: shape.taskId,
+        assignmentId: owner.assignmentId,
+        intent,
+        toStatus: intent === 'start' ? 'implementing' : null,
+      })).toMatchObject({ ok: true, value: { status: 'ready_for_integration' } });
+      expect(registry.get(shape.taskId)).toMatchObject({ status: 'ready_for_integration' });
+      expect(registry.getAssignment(owner.assignmentId)).toMatchObject({
+        status: 'ready_for_integration',
+        auditAttemptId: shape.attemptId,
+        auditRevision: shape.revision,
+        verdict: 'PASS',
+        crossVendorAuditPassed: true,
+      });
+      expect(registry.listAuditReceipts(shape.taskId)).toHaveLength(receiptCount);
+    },
+  );
+
+  it('refuses replay authority from a same-provider finalized auditor', async () => {
+    const { database, registry, shape, owner, demote } = await passAuthorizedReplayShape(
+      'pass-owner-same-provider-auditor',
+    );
+    const auditor = registry.getAssignment(shape.auditor.assignmentId)!;
+    const sameProviderAuditor = {
+      ...auditor,
+      identity: { ...auditor.identity, providerFamily: owner.identity.providerFamily },
+      updatedAt: auditor.updatedAt + 1,
+    };
+    database.prepare(
+      'UPDATE supervision_task_assignments SET provider_family = ?, payload_json = ?, updated_at = ? WHERE assignment_id = ?',
+    ).run(sameProviderAuditor.identity.providerFamily, JSON.stringify(sameProviderAuditor),
+      sameProviderAuditor.updatedAt, auditor.assignmentId);
+    demote();
+
+    expect(registry.applyTaskIntent({
+      taskId: shape.taskId, assignmentId: owner.assignmentId, intent: 'start', toStatus: 'implementing',
+    })).toMatchObject({ ok: true, value: { status: 'implementing' } });
+    expect(registry.getTaskRecord(shape.taskId)).toMatchObject({ status: 'implementing' });
+    expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'implementing' });
+  });
+
+  it('refuses replay when required lineage disagrees on the audited revision', async () => {
+    const { database, registry, shape, owner, demote } = await passAuthorizedReplayShape(
+      'pass-owner-lineage-mismatch',
+    );
+    const worker = registry.getAssignment(shape.worker.assignmentId)!;
+    const mismatchedWorker = {
+      ...worker, auditRevision: 'different-required-revision', updatedAt: worker.updatedAt + 1,
+    };
+    database.prepare(
+      'UPDATE supervision_task_assignments SET audit_revision = ?, payload_json = ?, updated_at = ? WHERE assignment_id = ?',
+    ).run(mismatchedWorker.auditRevision, JSON.stringify(mismatchedWorker),
+      mismatchedWorker.updatedAt, worker.assignmentId);
+    demote();
+
+    expect(registry.applyTaskIntent({
+      taskId: shape.taskId, assignmentId: owner.assignmentId, intent: 'start', toStatus: 'implementing',
+    })).toMatchObject({ ok: true, value: { status: 'implementing' } });
+    expect(registry.getTaskRecord(shape.taskId)).toMatchObject({ status: 'implementing' });
+    expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'implementing' });
+  });
+
+  it('fails closed when two live required integration owners are ambiguous', async () => {
+    const { database, registry, shape, owner, demote } = await passAuthorizedReplayShape(
+      'pass-owner-ambiguous-live-owners',
+    );
+    const second = registry.createAssignment({
+      taskId: shape.taskId, role: 'integration_owner', required: true,
+      identity: identity('deck_alpha_other_brain'),
+      auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+    });
+    if (!second.ok) throw new Error(second.reason);
+    const liveSecond = {
+      ...second.value,
+      status: 'implementing' as const,
+      verdict: 'PASS',
+      crossVendorAuditPassed: true,
+      updatedAt: second.value.updatedAt + 1,
+    };
+    database.prepare(
+      'UPDATE supervision_task_assignments SET status = ?, verdict = ?, payload_json = ?, updated_at = ? WHERE assignment_id = ?',
+    ).run(liveSecond.status, liveSecond.verdict, JSON.stringify(liveSecond),
+      liveSecond.updatedAt, second.value.assignmentId);
+    demote();
+
+    expect(registry.applyTaskIntent({
+      taskId: shape.taskId, assignmentId: owner.assignmentId, intent: 'start', toStatus: 'implementing',
+    })).toEqual({ ok: false, reason: 'ambiguous_assignment' });
+    expect(registry.getTaskRecord(shape.taskId)).toMatchObject({ status: 'implementing' });
+    expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'implementing' });
+  });
+
+  it('aligns one validated R1/R2 split before the ordinary finish handoff and keeps stale finish rejected', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'validated-revision-split';
+    const r1 = 'validated-r1';
+    const r2 = 'validated-r2';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'align exact validated successor', currentRevision: r2,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', required: true, identity: identity('deck_alpha_worker'),
+      scopeFiles: ['src/exact.ts'], auditRevision: r2,
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId,
+      intent: 'start', toStatus: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId,
+      intent: 'record_validation', toStatus: 'validated', validationState: 'passed',
+    })).toMatchObject({ ok: true });
+    const currentTask = registry.getTaskRecord(taskId)!;
+    const splitTask = {
+      ...currentTask, status: 'validated' as const, currentRevision: r1,
+      validationState: 'passed' as const, updatedAt: currentTask.updatedAt + 1,
+    };
+    database.prepare(
+      'UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
+    ).run(splitTask.status, r1, JSON.stringify(splitTask), splitTask.updatedAt, taskId);
+
+    expect(registry.finishAssignment({
+      assignmentId: worker.value.assignmentId, identity: worker.value.identity, revision: r2,
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    expect(registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 1))
+      .toEqual([
+        { taskId, assignmentId: worker.value.assignmentId, action: 'align_validated_revision' },
+        { taskId, assignmentId: worker.value.assignmentId, action: 'project_validated_handoff' },
+      ]);
+    expect(registry.getTaskRecord(taskId)).toMatchObject({
+      status: 'ready_for_audit', currentRevision: r2, validationState: 'passed',
+    });
+    expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({
+      status: 'ready_for_audit', auditRevision: r2, validationState: 'passed', leaseId: '',
+    });
+    expect(registry.finishAssignment({
+      assignmentId: worker.value.assignmentId, identity: worker.value.identity, revision: r1,
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    const eventCount = registry.listEvents(taskId).length;
+    expect(registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 2)).toEqual([]);
+    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+  });
+
+  it.each(['ambiguous implementer', 'conflicting external evidence'] as const)(
+    'leaves a validated revision split untouched with %s',
+    (conflict) => {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      const taskId = `validated-revision-split-${conflict.replaceAll(' ', '-')}`;
+      const r1 = 'validated-r1';
+      const r2 = 'validated-r2';
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'leave ambiguous successor untouched', currentRevision: r2,
+      })).toMatchObject({ ok: true });
+      const worker = registry.createAssignment({
+        taskId, role: 'implementer', required: true, identity: identity('deck_alpha_worker'),
+        scopeFiles: ['src/exact.ts'], auditRevision: r2,
+      });
+      if (!worker.ok) throw new Error(worker.reason);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
+      })).toMatchObject({ ok: true });
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent: 'record_validation',
+        toStatus: 'validated', validationState: 'passed',
+      })).toMatchObject({ ok: true });
+      if (conflict === 'ambiguous implementer') {
+        expect(registry.createAssignment({
+          taskId, role: 'implementer', required: true, identity: identity('deck_alpha_worker-two'),
+          scopeFiles: ['src/other.ts'], auditRevision: r2,
+        })).toMatchObject({ ok: true });
+      } else {
+        const current = registry.getAssignment(worker.value.assignmentId)!;
+        const conflicted = { ...current, externalRunId: 'run-from-another-round' };
+        database.prepare(
+          'UPDATE supervision_task_assignments SET payload_json = ? WHERE assignment_id = ?',
+        ).run(JSON.stringify(conflicted), current.assignmentId);
+      }
+      const currentTask = registry.getTaskRecord(taskId)!;
+      const splitTask = {
+        ...currentTask, status: 'validated' as const, currentRevision: r1,
+        validationState: 'passed' as const, updatedAt: currentTask.updatedAt + 1,
+      };
+      database.prepare(
+        'UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
+      ).run(splitTask.status, r1, JSON.stringify(splitTask), splitTask.updatedAt, taskId);
+
+      expect(registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 1)).toEqual([]);
+      expect(registry.getTaskRecord(taskId)).toMatchObject({ status: 'validated', currentRevision: r1 });
+      expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({ status: 'validated', auditRevision: r2 });
+    },
+  );
+
+  it('repairs the exact validated revision split in the bounded sweep and is replay-idempotent', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'validated-revision-split-sweep';
+    const r1 = 'validated-sweep-r1';
+    const r2 = 'validated-sweep-r2';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'bounded split repair', currentRevision: r2,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', required: true, identity: identity('deck_alpha_worker'),
+      scopeFiles: ['src/exact.ts'], auditRevision: r2,
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'record_validation',
+      toStatus: 'validated', validationState: 'passed',
+    })).toMatchObject({ ok: true });
+    const task = registry.getTaskRecord(taskId)!;
+    const split = {
+      ...task, currentRevision: r1, status: 'validated' as const,
+      validationState: 'passed' as const, updatedAt: task.updatedAt + 1,
+    };
+    database.prepare(
+      'UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
+    ).run(split.status, r1, JSON.stringify(split), split.updatedAt, taskId);
+
+    expect(registry.convergeLifecycle(split.updatedAt + 1, { limit: 1 })).toEqual([
+      { taskId, assignmentId: worker.value.assignmentId, action: 'align_validated_revision' },
+      { taskId, assignmentId: worker.value.assignmentId, action: 'project_validated_handoff' },
+    ]);
+    const eventCount = registry.listEvents(taskId).length;
+    expect(registry.convergeLifecycle(split.updatedAt + 2, { limit: 1 })).toEqual([]);
+    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+  });
+
+  it('clears external execution evidence with the existing coordination audit reset', () => {
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const taskId = 'coordination-reset-external-evidence';
+    const revision = 'coordination-reset-r1';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'reset stale round metadata', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', required: true, identity: identity('deck_alpha_worker'),
+      auditRevision: revision,
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    expect(registry.updateAssignment({
+      assignmentId: worker.value.assignmentId, identity: worker.value.identity,
+      status: 'implementing', revision, auditAttemptId: 'stale-attempt',
+      externalRunId: 'run-stale', externalHeadSha: 'a'.repeat(40), externalTaskId: 'job-stale',
+    })).toMatchObject({ ok: true });
+    expect(registry.coordinateTaskAssignment({
+      taskId, assignmentId: worker.value.assignmentId,
+      taskStatus: 'implementing', assignmentStatus: 'rework', leaseAction: 'renew',
+      idempotencyKey: 'reset-stale-round', reason: 'authorized same-object repair',
+    })).toMatchObject({ ok: true });
+    const reset = registry.getAssignment(worker.value.assignmentId)!;
+    expect(reset).toMatchObject({ status: 'rework' });
+    for (const field of [
+      'auditAttemptId', 'auditRevision', 'verdict', 'externalRunId', 'externalHeadSha',
+      'externalTaskId', 'crossVendorAuditPassed',
+    ]) expect(reset).not.toHaveProperty(field);
   });
 
   it('redelivers an already-present PASS artifact already owned by the exact integration owner', async () => {

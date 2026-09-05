@@ -607,6 +607,7 @@ export interface SupervisionLifecycleConvergenceAction {
   assignmentId?: string;
   action: 'retire_consumed_slice'
     | 'align_revision_projection'
+    | 'align_validated_revision'
     | 'bind_zero_byte_base_revision'
     | 'restore_exact_rework_implementer'
     | 'project_validated_handoff'
@@ -5014,6 +5015,9 @@ export class SupervisionTaskRegistry {
           auditAttemptId: undefined,
           auditRevision: undefined,
           verdict: undefined,
+          externalRunId: undefined,
+          externalHeadSha: undefined,
+          externalTaskId: undefined,
           primaryReviewPassed: undefined,
           crossVendorAuditPassed: undefined,
           auditRoutingReason: undefined,
@@ -5505,6 +5509,186 @@ export class SupervisionTaskRegistry {
   }
 
   /**
+   * A stale task projection must not let an intent revoke an already accepted
+   * integration round. The generic intent transition is intentionally unable
+   * to manufacture PASS authority, so this recovery is anchored to the exact
+   * integration owner, final receipt and closed cross-vendor auditor that are
+   * already durable for the task's current revision.
+   *
+   * This is deliberately narrower than aggregate derivation: it only handles
+   * the non-demoting intent replay, never selects a different revision/attempt,
+   * never creates an owner, and refuses ambiguous or conflicting Git state.
+   */
+  #resolvePassAuthorizedIntegration(
+    task: PersistedSupervisionTaskRecord,
+  ): {
+    kind: 'authorized';
+    owner: PersistedSupervisionTaskAssignment;
+    revision: string;
+    attemptId: string;
+  } | { kind: 'conflict'; reason: 'ambiguous_assignment' | 'manifest_mismatch' } | undefined {
+    if (task.finalization
+      || !['implementing', 'recovered', 'passed', 'ready_for_integration'].includes(task.status)) {
+      return undefined;
+    }
+    const revision = normalizeTaskString(task.currentRevision);
+    if (!revision) return undefined;
+    const assignments = this.listAssignments(task.taskId);
+    const liveOwners = assignments.filter((assignment) => (
+      assignment.role === 'integration_owner'
+      && assignment.required
+      && ['implementing', 'passed', 'ready_for_integration'].includes(assignment.status)
+    ));
+    if (liveOwners.length !== 1) {
+      return liveOwners.length > 1 ? { kind: 'conflict', reason: 'ambiguous_assignment' } : undefined;
+    }
+    const owner = liveOwners[0]!;
+    if (owner.assignmentId !== task.integrationOwnerAssignmentId
+      || owner.auditRevision !== revision
+      || !owner.auditAttemptId
+      || owner.verdict?.trim().toUpperCase() !== 'PASS'
+      || owner.crossVendorAuditPassed !== true) return undefined;
+
+    const requiredLineage = assignments.filter((assignment) => (
+      assignment.required
+      && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+      && assignment.status !== 'cancelled'
+      && assignment.status !== 'recovered'
+    ));
+    if (requiredLineage.length === 0 || requiredLineage.some((assignment) => (
+      assignment.auditRevision !== revision
+      || assignment.auditAttemptId !== owner.auditAttemptId
+      || assignment.verdict?.trim().toUpperCase() !== 'PASS'
+      || assignment.crossVendorAuditPassed !== true
+    ))) return undefined;
+
+    const receipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.receiptKind === 'final'
+      && receipt.verdict === 'PASS'
+      && receipt.revision === revision
+      && receipt.attemptId === owner.auditAttemptId
+    ));
+    if (receipts.length !== 1) return undefined;
+    const auditor = assignments.find((assignment) => assignment.assignmentId === receipts[0]!.assignmentId);
+    if (!auditor || auditor.role !== 'auditor' || auditor.status !== 'finalized'
+      || auditor.leaseId || auditor.auditRevision !== revision
+      || auditor.auditAttemptId !== owner.auditAttemptId
+      || auditor.verdict?.trim().toUpperCase() !== 'PASS'
+      || auditor.identity.providerFamily === owner.identity.providerFamily) return undefined;
+
+    const hasCommit = Boolean(task.commitSha);
+    const hasPush = Boolean(task.pushRemoteRef);
+    if (hasCommit !== hasPush
+      || (task.commitSha && !FINALIZATION_COMMIT_RE.test(task.commitSha))
+      || (task.pushRemoteRef && !task.pushRemoteRef.startsWith('refs/'))
+      || (owner.externalHeadSha && task.commitSha && owner.externalHeadSha !== task.commitSha)) {
+      return { kind: 'conflict', reason: 'manifest_mismatch' };
+    }
+    return { kind: 'authorized', owner, revision, attemptId: owner.auditAttemptId };
+  }
+
+  #convergePassAuthorizedIntegrationIntent(
+    task: PersistedSupervisionTaskRecord,
+    input: { intent: string; toStatus: SupervisionTaskLifecycleStatus | null },
+  ): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> | undefined {
+    if (!['start', 'heartbeat', 'checkpoint'].includes(input.intent)
+      || (input.intent === 'start' && input.toStatus !== 'implementing')
+      || (input.intent !== 'start' && input.toStatus !== null)
+    ) {
+      return undefined;
+    }
+    const plan = this.#resolvePassAuthorizedIntegration(task);
+    if (!plan) return undefined;
+    if (plan.kind === 'conflict') return { ok: false, reason: plan.reason };
+    const { owner, revision, attemptId } = plan;
+
+    if (task.status === 'ready_for_integration' && owner.status === 'ready_for_integration') {
+      // Ordinary heartbeat/checkpoint handling still owns its observability
+      // event. Only start is a true replay when the accepted projection is
+      // already coherent.
+      return input.intent === 'start' ? { ok: true, value: task, replay: true } : undefined;
+    }
+    const now = Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedTask = this.getTaskRecord(task.taskId);
+      const lockedPlan = lockedTask ? this.#resolvePassAuthorizedIntegration(lockedTask) : undefined;
+      if (!lockedTask || !lockedPlan || lockedPlan.kind !== 'authorized'
+        || lockedPlan.owner.assignmentId !== owner.assignmentId
+        || lockedPlan.revision !== revision || lockedPlan.attemptId !== attemptId) {
+        this.#db.exec('ROLLBACK');
+        return lockedPlan?.kind === 'conflict'
+          ? { ok: false, reason: lockedPlan.reason }
+          : { ok: false, reason: 'conflicting_replay' };
+      }
+      const lockedOwner = lockedPlan.owner;
+      if (input.intent === 'heartbeat') {
+        if (lockedOwner.status === 'ready_for_integration') {
+          this.#appendEvent(task.taskId, lockedOwner.assignmentId, 'implementation_heartbeat',
+            lockedOwner.status, {
+              source: 'pass_authorized_integration_intent_replay',
+              substantiveProgress: false,
+            }, now);
+          this.#recordAssignmentHeartbeat(lockedOwner, now);
+        } else {
+          this.#writeAssignment({
+            ...lockedOwner,
+            status: 'ready_for_integration',
+            heartbeatAt: now,
+            blocker: undefined,
+            updatedAt: now,
+          }, 'implementation_heartbeat', {
+            source: 'pass_authorized_integration_intent_replay',
+            substantiveProgress: false,
+            revision,
+            auditAttemptId: attemptId,
+          });
+        }
+      } else if (input.intent === 'checkpoint') {
+        this.#writeAssignment({
+          ...lockedOwner,
+          status: 'ready_for_integration',
+          blocker: undefined,
+          updatedAt: now,
+        }, 'implementation_progress', {
+          source: 'pass_authorized_integration_intent_replay',
+          substantiveProgress: true,
+          revision,
+          auditAttemptId: attemptId,
+        });
+      } else if (lockedOwner.status !== 'ready_for_integration') {
+        this.#writeAssignment({
+          ...lockedOwner,
+          status: 'ready_for_integration',
+          blocker: undefined,
+          updatedAt: now,
+        }, 'ready_for_integration', {
+          source: 'pass_authorized_integration_intent_replay',
+          revision,
+          auditAttemptId: attemptId,
+        });
+      }
+      const repaired: PersistedSupervisionTaskRecord = {
+        ...lockedTask,
+        status: 'ready_for_integration',
+        blocker: undefined,
+        updatedAt: now,
+      };
+      this.#writeTask(repaired, 'ready_for_integration', {
+        source: 'pass_authorized_integration_intent_replay',
+        integrationOwnerAssignmentId: owner.assignmentId,
+        revision,
+        auditAttemptId: attemptId,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: repaired };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
    * Persist a task-level status DECIDED by the audited intent state machine.
    *
    * Validation deliberately lives in the caller: resolveSupervisionIntent() owns
@@ -5570,6 +5754,8 @@ export class SupervisionTaskRegistry {
       ));
       if (!historicalAudit) return { ok: false, reason: 'role_forbidden' };
     }
+    const preservedIntegration = this.#convergePassAuthorizedIntegrationIntent(task, input);
+    if (preservedIntegration) return preservedIntegration;
     if (input.intent === 'cancel' && input.toStatus === 'cancelled' && input.assignmentId) {
       const assignment = this.getAssignment(input.assignmentId);
       if (!assignment || assignment.taskId !== input.taskId) return { ok: false, reason: 'not_found' };
@@ -6037,6 +6223,7 @@ export class SupervisionTaskRegistry {
           current, now, options.inspectAssignmentWorktree,
         ),
         (current: PersistedSupervisionTaskRecord) => this.#convergeRevisionProjection(current, now),
+        (current: PersistedSupervisionTaskRecord) => this.#convergeValidatedRevisionSplit(current, now),
         (current: PersistedSupervisionTaskRecord) => this.#convergeValidatedHandoff(current, now),
         (current: PersistedSupervisionTaskRecord) => this.#convergeRecordedAuditReceipt(current, now),
         (current: PersistedSupervisionTaskRecord) => this.#convergeConsumedFinalizedImplementer(current, now),
@@ -6143,7 +6330,11 @@ export class SupervisionTaskRegistry {
     const task = assignment ? this.getTaskRecord(assignment.taskId) : undefined;
     if (!assignment || !task || assignment.validationState !== 'passed') return [];
     const actions: SupervisionLifecycleConvergenceAction[] = [];
-    const zeroByte = this.#convergeZeroByteBaseRevision(task, now, inspect);
+    const aligned = this.#convergeValidatedRevisionSplit(task, now);
+    if (aligned) actions.push(aligned);
+    const alignedTask = this.getTaskRecord(task.taskId);
+    if (!alignedTask) return actions;
+    const zeroByte = this.#convergeZeroByteBaseRevision(alignedTask, now, inspect);
     if (zeroByte) actions.push(zeroByte);
     const refreshedTask = this.getTaskRecord(task.taskId);
     if (!refreshedTask) return actions;
@@ -6611,6 +6802,90 @@ export class SupervisionTaskRegistry {
       assignmentId: assignment.assignmentId,
       action: 'bind_zero_byte_base_revision',
     };
+  }
+
+  /**
+   * Repair only the observed validated successor split: the aggregate still
+   * names R1 while its sole required, validated implementer already names R2.
+   * The strict finish equality remains untouched; this atomically advances the
+   * aggregate authority first, and ordinary finish then performs the handoff.
+   */
+  #resolveValidatedRevisionSplit(
+    task: PersistedSupervisionTaskRecord,
+  ): { assignmentId: string; fromRevision: string; toRevision: string } | undefined {
+    const fromRevision = normalizeTaskString(task.currentRevision);
+    if (task.status !== 'validated' || task.validationState !== 'passed' || !fromRevision
+      || task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt
+      || task.integrationOwnerAssignmentId || task.blocker
+      || this.listAuditReceipts(task.taskId).length > 0) return undefined;
+
+    const assignments = this.listAssignments(task.taskId);
+    const implementers = assignments.filter((assignment) => (
+      assignment.role === 'implementer'
+      && assignment.required
+      && !isTerminalSupervisionTaskStatus(assignment.status)
+    ));
+    if (implementers.length !== 1) return undefined;
+    const target = implementers[0]!;
+    const toRevision = normalizeTaskString(target.auditRevision);
+    if (target.status !== 'validated' || target.validationState !== 'passed'
+      || !target.leaseId || target.scopeFiles.length === 0 || !toRevision
+      || toRevision === fromRevision || target.auditAttemptId || target.verdict
+      || target.primaryReviewPassed || target.crossVendorAuditPassed
+      || target.auditRoutingReason || target.auditDegradedReason
+      || target.externalRunId || target.externalHeadSha || target.externalTaskId) return undefined;
+
+    const conflictingAuthority = assignments.some((assignment) => (
+      assignment.assignmentId !== target.assignmentId
+      && ((assignment.role === 'implementer' && assignment.required
+          && !isTerminalSupervisionTaskStatus(assignment.status))
+        || (assignment.role === 'integration_owner'
+          && !isTerminalSupervisionTaskStatus(assignment.status))
+        || (assignment.role === 'auditor'
+          && (Boolean(assignment.auditAttemptId)
+            || !isTerminalSupervisionTaskStatus(assignment.status))))
+    ));
+    if (conflictingAuthority) return undefined;
+    return { assignmentId: target.assignmentId, fromRevision, toRevision };
+  }
+
+  #convergeValidatedRevisionSplit(
+    task: PersistedSupervisionTaskRecord,
+    now: number,
+  ): SupervisionLifecycleConvergenceAction | undefined {
+    const plan = this.#resolveValidatedRevisionSplit(task);
+    if (!plan) return undefined;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedTask = this.getTaskRecord(task.taskId);
+      const lockedPlan = lockedTask ? this.#resolveValidatedRevisionSplit(lockedTask) : undefined;
+      if (!lockedTask || !lockedPlan
+        || lockedPlan.assignmentId !== plan.assignmentId
+        || lockedPlan.fromRevision !== plan.fromRevision
+        || lockedPlan.toRevision !== plan.toRevision) {
+        this.#db.exec('ROLLBACK');
+        return undefined;
+      }
+      this.#writeTask({
+        ...lockedTask,
+        currentRevision: plan.toRevision,
+        updatedAt: now,
+      }, 'validated', {
+        source: 'lifecycle_convergence_validated_revision_split',
+        assignmentId: plan.assignmentId,
+        fromRevision: plan.fromRevision,
+        toRevision: plan.toRevision,
+      });
+      this.#db.exec('COMMIT');
+      return {
+        taskId: task.taskId,
+        assignmentId: plan.assignmentId,
+        action: 'align_validated_revision',
+      };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /**
