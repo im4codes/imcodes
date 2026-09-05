@@ -354,6 +354,10 @@ describe('automatic supervision audit materialization', () => {
     });
     expect(dispatch.mock.calls[0]![1].message).toContain('authoritativeWorktree=/tmp/authoritative-worker/repo');
     expect(dispatch.mock.calls[0]![1].message).toContain('- src/exact.ts');
+    expect(dispatch.mock.calls[0]![1].internalQueueSupervisionReference).toEqual({
+      kind: 'exact_integration', taskId: shape.taskId,
+      assignmentId: owners[0]!.assignmentId, revision: shape.revision,
+    });
     const receiptCount = shape.registry.listAuditReceipts(shape.taskId).length;
     await expect(dispatchReadyIntegration(shape.taskId, deps)).resolves.toMatchObject({ status: 'replayed' });
     expect(dispatch).toHaveBeenCalledTimes(1);
@@ -2840,6 +2844,10 @@ describe('actionable missing audit policy emits one durable blocker', () => {
     expect(sent.message).toContain(shape.taskId);
     expect(sent.message).toContain('missing_audit_policy');
     expect(sent.internalDurableQueue).toBe(true);
+    expect(sent.internalQueueSupervisionReference).toEqual({
+      kind: 'implementation_blocker', taskId: shape.taskId,
+      assignmentId: expect.any(String), revision: shape.revision, exactError: 'missing_audit_policy',
+    });
     expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'auditor'))
       .toEqual([]);
   });

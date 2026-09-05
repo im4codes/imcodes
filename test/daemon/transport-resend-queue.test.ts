@@ -46,6 +46,19 @@ describe('transport-resend-queue', () => {
     )).toMatchObject({ deliveryMode: 'append' });
   });
 
+  it('persists typed supervision authority separately from display text', () => {
+    const supervisionReference = {
+      kind: 'exact_integration' as const, taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'rev-1',
+    };
+    enqueueResend('s-supervision', {
+      text: 'arbitrary localized display wording', commandId: 'cmd-supervision',
+      clientMessageId: 'msg-supervision', supervisionReference, queuedAt: Date.now(),
+    });
+
+    expect(getTransportQueueStore().readSnapshot('s-supervision').pendingMessageEntries[0]?.supervisionReference)
+      .toEqual(supervisionReference);
+  });
+
   it('fails closed when SQLite enqueue fails', () => {
     getTransportQueueStore().close();
 

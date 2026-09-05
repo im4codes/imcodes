@@ -1,11 +1,27 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { TransportQueueStore } from '../../src/daemon/transport-queue-store.js';
+import {
+  getTransportQueueStore,
+  resetTransportQueueStoreForTests,
+  TransportQueueStore,
+} from '../../src/daemon/transport-queue-store.js';
+import {
+  buildTransportQueueSnapshot,
+  reconcileObsoleteSupervisionQueueFailures,
+  resolveLegacySupervisionQueueReference,
+  shouldDismissObsoleteSupervisionQueueEntry,
+} from '../../src/daemon/transport-queue-projection.js';
+import { deterministicSendMessageId } from '../../shared/send-message-id.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -24,6 +40,226 @@ afterEach(() => {
 });
 
 describe('TransportQueueStore', () => {
+  it('derives the queue action matrix only from typed durable supervision references', () => {
+    const integration = {
+      kind: 'exact_integration' as const, taskId: 'tsk_done', assignmentId: 'asg_owner', revision: 'rev-1',
+    };
+    const blocker = {
+      kind: 'implementation_blocker' as const, taskId: 'tsk_wait', assignmentId: 'asg_worker',
+      revision: 'rev-1',
+      exactError: 'waiting for Brain',
+    };
+
+    expect(shouldDismissObsoleteSupervisionQueueEntry(integration!, {
+      taskId: 'tsk_done', status: 'finalized', currentRevision: 'rev-1',
+      assignments: [{
+        taskId: 'tsk_done', assignmentId: 'asg_owner', status: 'finalized', auditRevision: 'rev-1',
+      }],
+    })).toBe(true);
+    expect(shouldDismissObsoleteSupervisionQueueEntry(integration!, {
+      taskId: 'tsk_done', status: 'ready_for_integration', currentRevision: 'rev-1',
+      assignments: [{
+        taskId: 'tsk_done', assignmentId: 'asg_owner', status: 'ready_for_integration', auditRevision: 'rev-1',
+      }],
+    })).toBe(false);
+    expect(shouldDismissObsoleteSupervisionQueueEntry(integration!, {
+      taskId: 'tsk_done', status: 'ready_for_integration', currentRevision: 'rev-2',
+      assignments: [{
+        taskId: 'tsk_done', assignmentId: 'asg_owner', status: 'ready_for_integration', auditRevision: 'rev-2',
+      }],
+    })).toBe(true);
+    expect(shouldDismissObsoleteSupervisionQueueEntry(blocker!, {
+      taskId: 'tsk_wait', status: 'implementing', currentRevision: 'rev-1',
+      assignments: [{
+        taskId: 'tsk_wait', assignmentId: 'asg_worker', status: 'implementing', blocker: 'waiting for Brain',
+      }],
+    })).toBe(false);
+    expect(shouldDismissObsoleteSupervisionQueueEntry(blocker!, {
+      taskId: 'tsk_wait', status: 'rework', currentRevision: 'rev-2',
+      assignments: [{
+        taskId: 'tsk_wait', assignmentId: 'asg_worker', status: 'implementing', blocker: 'new audit REWORK',
+      }],
+    })).toBe(true);
+    expect(shouldDismissObsoleteSupervisionQueueEntry(blocker!, {
+      taskId: 'tsk_wait', status: 'implementing', currentRevision: 'rev-2',
+      assignments: [{
+        taskId: 'tsk_wait', assignmentId: 'asg_worker', status: 'implementing',
+        auditRevision: 'rev-1', blocker: 'waiting for Brain',
+      }],
+    }), 'an old structured blocker cannot survive a successor revision').toBe(true);
+    expect(shouldDismissObsoleteSupervisionQueueEntry(integration!, undefined)).toBe(false);
+  });
+
+  it('durably dismisses only obsolete supervision failures and is version-idempotent on restart/replay', () => {
+    const obsoleteText = [
+      '[Daemon-resolved exact PASS integration]',
+      'taskId=tsk_finalized',
+      'assignmentId=asg_finalized',
+      'revision=rev-final',
+    ].join('\n');
+    for (const [id, text, supervisionReference] of [
+      ['obsolete', 'wording is not queue authority', {
+        kind: 'exact_integration', taskId: 'tsk_finalized', assignmentId: 'asg_finalized', revision: 'rev-final',
+      }],
+      ['live', 'this body can change without changing lifecycle', {
+        kind: 'exact_integration', taskId: 'tsk_live', assignmentId: 'asg_live', revision: 'rev-live',
+      }],
+      ['ordinary', obsoleteText, undefined],
+    ] as const) {
+      store.enqueue({
+        sessionName: 'deck', clientMessageId: id, text, privateMaterialJson: JSON.stringify({ text }),
+        ...(supervisionReference ? { supervisionReference } : {}),
+      });
+      store.markFailed('deck', id, 'expired');
+    }
+    const lookup = (taskId: string) => taskId === 'tsk_finalized'
+      ? {
+          taskId, status: 'finalized', currentRevision: 'rev-final',
+          assignments: [{
+            taskId, assignmentId: 'asg_finalized', status: 'finalized', auditRevision: 'rev-final',
+          }],
+        }
+      : taskId === 'tsk_live'
+        ? {
+            taskId, status: 'ready_for_integration', currentRevision: 'rev-live',
+            assignments: [{
+              taskId, assignmentId: 'asg_live', status: 'ready_for_integration', auditRevision: 'rev-live',
+            }],
+          }
+        : undefined;
+
+    const before = store.readSnapshot('deck');
+    expect(reconcileObsoleteSupervisionQueueFailures(store, before, lookup)).toBe(true);
+    const after = store.readSnapshot('deck');
+    expect(after.pendingMessageVersion).toBeGreaterThan(before.pendingMessageVersion);
+    expect(after.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['live', 'ordinary']);
+    expect(store.readPrivateDispatchMaterial('deck', 'obsolete')).toBeUndefined();
+
+    const replayVersion = after.pendingMessageVersion;
+    store.close();
+    store = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+    const afterRestart = store.readSnapshot('deck');
+    expect(afterRestart.failedMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['live', 'ordinary']);
+    expect(reconcileObsoleteSupervisionQueueFailures(store, afterRestart, lookup)).toBe(false);
+    expect(store.readSnapshot('deck').pendingMessageVersion).toBe(replayVersion);
+    expect(afterRestart.failedMessageEntries.find((entry) => entry.clientMessageId === 'live')?.supervisionReference)
+      .toEqual({ kind: 'exact_integration', taskId: 'tsk_live', assignmentId: 'asg_live', revision: 'rev-live' });
+  });
+
+  it('attaches deterministic supervision authority to a legacy row without overwriting conflicts', () => {
+    store.enqueue({ sessionName: 'deck', clientMessageId: 'legacy', text: 'old wording' });
+    const reference = {
+      kind: 'exact_integration' as const, taskId: 'tsk_done', assignmentId: 'asg_owner', revision: 'rev-1',
+    };
+    expect(store.attachSupervisionReference('deck', 'legacy', reference, 200)).toBe(true);
+    expect(store.attachSupervisionReference('deck', 'legacy', reference, 201)).toBe(true);
+    expect(store.readSnapshot('deck').pendingMessageEntries[0]?.supervisionReference).toEqual(reference);
+    expect(() => store.attachSupervisionReference('deck', 'legacy', {
+      ...reference, revision: 'other-revision',
+    }, 202)).toThrow('supervision reference mismatch');
+  });
+
+  it('migrates an existing queue database to the structured supervision column on restart', () => {
+    const dbPath = join(dir, 'queue.sqlite');
+    store.close();
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec('ALTER TABLE queue_entries DROP COLUMN supervision_reference_json');
+    legacy.close();
+    store = new TransportQueueStore({ dbPath });
+
+    const reference = {
+      kind: 'exact_integration' as const, taskId: 'tsk_restart', assignmentId: 'asg_restart', revision: 'rev-1',
+    };
+    store.enqueue({ sessionName: 'deck', clientMessageId: 'after-upgrade', text: 'display', supervisionReference: reference });
+    expect(store.readSnapshot('deck').pendingMessageEntries[0]?.supervisionReference).toEqual(reference);
+  });
+
+  it('recovers legacy exact-integration and no-progress rows from deterministic ids, never prose', () => {
+    const task = {
+      taskId: 'tsk_legacy', status: 'finalized', currentRevision: 'rev-1',
+      assignments: [{
+        taskId: 'tsk_legacy', assignmentId: 'asg_owner', role: 'integration_owner', status: 'finalized',
+        auditRevision: 'rev-1', auditAttemptId: 'attempt-1',
+      }, {
+        taskId: 'tsk_legacy', assignmentId: 'asg_worker', role: 'implementer', status: 'rework',
+        auditRevision: 'rev-1',
+      }],
+      auditReceipts: [{ revision: 'rev-1', attemptId: 'attempt-1' }],
+    };
+    const integrationId = deterministicSendMessageId('auto-integration:asg_owner:rev-1:attempt-1');
+    expect(resolveLegacySupervisionQueueReference(integrationId, [task])).toEqual({
+      kind: 'exact_integration', taskId: 'tsk_legacy', assignmentId: 'asg_owner', revision: 'rev-1',
+    });
+    const fingerprint = createHash('sha256').update(JSON.stringify({
+      taskId: 'tsk_legacy', assignmentId: 'asg_worker', revision: 'rev-1', status: 'implementing',
+      exactError: 'implementation heartbeat completed without durable progress or structured escalation',
+    })).digest('hex');
+    expect(resolveLegacySupervisionQueueReference(
+      deterministicSendMessageId(`implementation-blocker:${fingerprint}`), [task],
+    )).toEqual({
+      kind: 'implementation_blocker', taskId: 'tsk_legacy', assignmentId: 'asg_worker',
+      revision: 'rev-1',
+      exactError: 'implementation heartbeat completed without durable progress or structured escalation',
+    });
+    expect(resolveLegacySupervisionQueueReference('send_message_00000000-0000-5000-a000-000000000000', [task]))
+      .toBeUndefined();
+  });
+
+  it('wires terminal-task retirement through the production snapshot boundary', () => {
+    resetTransportQueueStoreForTests();
+    resetSupervisionTaskRegistryForTests();
+    try {
+      const queue = getTransportQueueStore();
+      const registry = getSupervisionTaskRegistry();
+      const created = registry.createOrGet({
+        semanticTaskKey: 'terminal-queue-projection',
+        projectName: 'queue-test',
+        classification: 'independent_top_level',
+        objective: 'prove terminal queue projection cleanup',
+        currentRevision: 'terminal-rev',
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error(created.reason);
+      const assigned = registry.createAssignment({
+        taskId: created.value.taskId,
+        role: 'integration_owner',
+        identity: {
+          sessionName: 'queue-owner', sessionInstanceId: 'queue-owner-instance', runtimeEpoch: 'queue-owner-epoch',
+          agentType: 'codex-sdk', providerFamily: 'openai',
+        },
+        auditRevision: 'terminal-rev',
+      });
+      expect(assigned.ok).toBe(true);
+      if (!assigned.ok) throw new Error(assigned.reason);
+      expect(registry.updateTask({ taskId: created.value.taskId, status: 'cancelled' }).ok).toBe(true);
+
+      const text = [
+        '[Daemon-resolved exact PASS integration]',
+        `taskId=${created.value.taskId}`,
+        `assignmentId=${assigned.value.assignmentId}`,
+        'revision=terminal-rev',
+      ].join('\n');
+      queue.enqueue({
+        sessionName: 'queue-target', clientMessageId: 'terminal-card', text,
+        supervisionReference: {
+          kind: 'exact_integration', taskId: created.value.taskId,
+          assignmentId: assigned.value.assignmentId, revision: 'terminal-rev',
+        },
+      });
+      queue.markFailed('queue-target', 'terminal-card', 'expired');
+      const beforeVersion = queue.readSnapshot('queue-target').pendingMessageVersion;
+
+      expect(buildTransportQueueSnapshot('queue-target', 'test').failedMessageEntries).toEqual([]);
+      const afterVersion = queue.readSnapshot('queue-target').pendingMessageVersion;
+      expect(afterVersion).toBeGreaterThan(beforeVersion);
+      expect(buildTransportQueueSnapshot('queue-target', 'test').failedMessageEntries).toEqual([]);
+      expect(queue.readSnapshot('queue-target').pendingMessageVersion).toBe(afterVersion);
+    } finally {
+      resetTransportQueueStoreForTests();
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
   it('scrubs only orphaned peer-audit rows and preserves ordinary queued work', () => {
     store.enqueue({
       sessionName: 'deck',

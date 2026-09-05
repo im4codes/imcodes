@@ -39,6 +39,7 @@ import {
   expireDelegationReplyAuthority,
 } from './delegation-reply-authority.js';
 import type { TimelineEvent } from './timeline-event.js';
+import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 
 export interface SessionDispatchRuntimeCaller {
   userId: string;
@@ -59,6 +60,8 @@ export interface SessionDispatchMessageOptions {
    * before acknowledging delivery.
    */
   supervision?: { taskId: string; assignmentId: string };
+  /** Durable lifecycle authority; never inferred from the message body. */
+  queueSupervisionReference?: QueueSupervisionReference;
   /** Persist before delivery. Used by daemon-owned exactly-once control traffic. */
   durableQueue?: boolean;
 }
@@ -185,6 +188,7 @@ export async function dispatchSessionMessage(
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         queuedAt: Date.now(),
       });
       if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
@@ -207,6 +211,7 @@ export async function dispatchSessionMessage(
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
           ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
           : {}),

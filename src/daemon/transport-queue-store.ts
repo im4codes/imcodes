@@ -15,6 +15,7 @@ import {
   type QueueResetReason,
   type QueueSnapshot,
   type QueueStoredEntry,
+  type QueueSupervisionReference,
 } from '../../shared/transport-queue-types.js';
 import { buildQueueProjectionEntry } from '../../shared/transport-queue-privacy.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
@@ -67,6 +68,7 @@ export interface EnqueueTransportQueueEntryInput {
   activityGeneration?: number | string;
   replacesClientMessageId?: string;
   privateMaterialJson?: string;
+  supervisionReference?: QueueSupervisionReference;
 }
 
 export interface EnqueueTransportQueueEntryResult {
@@ -133,6 +135,29 @@ function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+function parseSupervisionReference(value: unknown): QueueSupervisionReference | undefined {
+  const raw = readString(value);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Partial<QueueSupervisionReference>;
+    const taskId = typeof parsed.taskId === 'string' ? parsed.taskId.trim() : '';
+    const assignmentId = typeof parsed.assignmentId === 'string' ? parsed.assignmentId.trim() : '';
+    if (!taskId || !assignmentId) return undefined;
+    if (parsed.kind === 'exact_integration') {
+      const revision = typeof parsed.revision === 'string' ? parsed.revision.trim() : '';
+      return revision ? { kind: parsed.kind, taskId, assignmentId, revision } : undefined;
+    }
+    if (parsed.kind === 'implementation_blocker') {
+      const revision = typeof parsed.revision === 'string' ? parsed.revision.trim() : '';
+      const exactError = typeof parsed.exactError === 'string' ? parsed.exactError.trim() : '';
+      return revision && exactError ? { kind: parsed.kind, taskId, assignmentId, revision, exactError } : undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 function readNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -176,6 +201,9 @@ function parseStoredEntry(row: Record<string, unknown>): QueueStoredEntry {
     ...(readNumber(row.handoffExpiresAt) !== undefined ? { handoffExpiresAt: readNumber(row.handoffExpiresAt) } : {}),
     ...(readNumber(row.handoffAttempt) !== undefined ? { handoffAttempt: readNumber(row.handoffAttempt) } : {}),
     ...(readString(row.privateMaterialRef) ? { privateMaterialRef: readString(row.privateMaterialRef) } : {}),
+    ...(parseSupervisionReference(row.supervisionReferenceJson)
+      ? { supervisionReference: parseSupervisionReference(row.supervisionReferenceJson) }
+      : {}),
   };
 }
 
@@ -243,6 +271,7 @@ export class TransportQueueStore {
         handoff_expires_at INTEGER,
         handoff_attempt INTEGER,
         private_material_ref TEXT,
+        supervision_reference_json TEXT,
         recipient_session_instance_id TEXT,
         recipient_runtime_epoch TEXT,
         PRIMARY KEY (session_name, client_message_id)
@@ -279,6 +308,14 @@ export class TransportQueueStore {
       );
     `);
     this.migrateRecipientIdentityColumns();
+    this.migrateSupervisionReferenceColumn();
+  }
+
+  private migrateSupervisionReferenceColumn(): void {
+    const columns = this.db.prepare('PRAGMA table_info(queue_entries)').all() as { name?: unknown }[];
+    if (!columns.some((column) => String(column.name ?? '') === 'supervision_reference_json')) {
+      this.db.exec('ALTER TABLE queue_entries ADD COLUMN supervision_reference_json TEXT');
+    }
   }
 
   /**
@@ -440,8 +477,8 @@ export class TransportQueueStore {
         INSERT INTO queue_entries (
           session_name, client_message_id, command_id, text, status, placement, ordinal,
           created_at, updated_at, activity_generation, replaces_client_message_id, private_material_ref,
-          recipient_session_instance_id, recipient_runtime_epoch
-        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          supervision_reference_json, recipient_session_instance_id, recipient_runtime_epoch
+        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         sessionName,
         clientMessageId,
@@ -454,6 +491,7 @@ export class TransportQueueStore {
         input.activityGeneration === undefined ? null : String(input.activityGeneration),
         input.replacesClientMessageId?.trim() || null,
         input.privateMaterialJson === undefined ? null : clientMessageId,
+        input.supervisionReference ? JSON.stringify(input.supervisionReference) : null,
         recipient?.sessionInstanceId ?? null,
         recipient?.runtimeEpoch ?? null,
       );
@@ -477,6 +515,47 @@ export class TransportQueueStore {
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
+    }
+  }
+
+  /**
+   * Attach daemon-known authority to a legacy row by its deterministic message
+   * id. Existing different authority is never overwritten.
+   */
+  attachSupervisionReference(
+    sessionNameInput: string,
+    clientMessageIdInput: string,
+    reference: QueueSupervisionReference,
+    now = Date.now(),
+  ): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
+    const encoded = JSON.stringify(reference);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.db.prepare(`
+        SELECT supervision_reference_json AS supervisionReferenceJson
+        FROM queue_entries WHERE session_name = ? AND client_message_id = ?
+      `).get(sessionName, clientMessageId) as { supervisionReferenceJson?: string | null } | undefined;
+      if (!existing) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      if (existing.supervisionReferenceJson && existing.supervisionReferenceJson !== encoded) {
+        throw new Error('transport queue supervision reference mismatch');
+      }
+      if (!existing.supervisionReferenceJson) {
+        this.db.prepare(`
+          UPDATE queue_entries SET supervision_reference_json = ?, updated_at = ?
+          WHERE session_name = ? AND client_message_id = ? AND supervision_reference_json IS NULL
+        `).run(encoded, now, sessionName, clientMessageId);
+        this.bumpVersion(sessionName, now);
+      }
+      this.db.exec('COMMIT');
+      return true;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
     }
   }
 
@@ -1672,6 +1751,7 @@ export class TransportQueueStore {
         e.handoff_expires_at AS handoffExpiresAt,
         e.handoff_attempt AS handoffAttempt,
         e.private_material_ref AS privateMaterialRef
+        , e.supervision_reference_json AS supervisionReferenceJson
       FROM queue_entries e
       JOIN queue_meta m ON m.session_name = e.session_name
       WHERE e.session_name = ?

@@ -5463,6 +5463,358 @@ afterEach(() => {
     expect(screen.queryByLabelText('sendFailedLabel')).toBeNull();
   });
 
+  it('keeps a failed row non-appendable when a later authoritative snapshot replaces an optimistic overlay', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 1,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          failedMessageEntries: [
+            { clientMessageId: 'failed-authoritative', text: 'old failed text' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'new optimistic send';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'authoritative-failed-refresh',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 2,
+            pendingMessageEntries: [
+              { clientMessageId: 'authoritative-pending', text: 'still pending' },
+            ],
+            failedMessageEntries: [
+              { clientMessageId: 'failed-authoritative', text: 'new failed text' },
+            ],
+          },
+        },
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText('new failed text')).toBeDefined());
+    const failedRow = screen.getByText('new failed text').closest('.controls-queued-item');
+    expect(failedRow).toBeTruthy();
+    expect(within(failedRow as HTMLElement).getByLabelText('sendFailedLabel')).toBeDefined();
+    expect(within(failedRow as HTMLElement).getByRole('button', { name: 'retrySend' })).toBeDefined();
+    expect(within(failedRow as HTMLElement).queryByRole('button', { name: 'transport_queue_append' })).toBeNull();
+    expect(within(failedRow as HTMLElement).queryByRole('button', { name: /edit/i })).toBeNull();
+  });
+
+  it('lets an authoritative realtime snapshot clear failed rows from stale session props', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 3,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          failedMessageEntries: [
+            { clientMessageId: 'stale-failed', text: 'stale failed card' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('stale failed card')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'qwen-session',
+          project: 'my-project',
+          role: 'brain',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 4,
+          transportPendingMessageVersion: 4,
+          pendingMessageEntries: [],
+          transportPendingMessageEntries: [],
+          failedMessageEntries: [],
+        }],
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('stale failed card')).toBeNull());
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+  });
+
+  it('keeps a failed-row delete hidden until an authoritative snapshot removes that id', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 5,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          failedMessageEntries: [
+            { clientMessageId: 'failed-being-deleted', text: 'failed delete stays hidden' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /delete/i }));
+    expect(screen.queryByText('failed delete stays hidden')).toBeNull();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'authoritative-failed-still-present',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 3,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 6,
+            pendingMessageEntries: [],
+            failedMessageEntries: [
+              { clientMessageId: 'failed-being-deleted', text: 'failed delete stays hidden' },
+            ],
+          },
+        },
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('failed delete stays hidden')).toBeNull());
+  });
+
+  it('does not resurrect an absent card when not-found follows its authoritative queue snapshot', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'stale-append-id', text: 'stale append card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+    expect(append.commandId).toBeTruthy();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'authoritative-after-not-found',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 3,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 8,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+            queueReconcilesCommandId: append.commandId,
+          },
+        },
+      });
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('stale append card')).toBeNull());
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+  });
+
+  it('keeps only the authoritative survivor when a multi-append selection is partly missing', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'missing-selected', text: 'missing selected card' },
+            { clientMessageId: 'real-selected', text: 'real selected card' },
+          ],
+          transportPendingMessageVersion: 11,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'authoritative-partial-not-found',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 4,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 12,
+            pendingMessageEntries: [
+              { clientMessageId: 'real-selected', text: 'real selected card' },
+            ],
+            failedMessageEntries: [],
+            queueReconcilesCommandId: append.commandId,
+          },
+        },
+      });
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('missing selected card')).toBeNull());
+    expect(screen.getAllByText('real selected card')).toHaveLength(1);
+  });
+
+  it('keeps mixed queue actions authoritative across refresh and late failure frames', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          queueEpoch: 'queue-epoch-current',
+          queueAuthorityId: 'queue-authority-current',
+          transportPendingMessageVersion: 12,
+          transportPendingMessageEntries: [
+            { clientMessageId: 'live-append-card', text: 'still truly appendable' },
+          ],
+          failedMessageEntries: [
+            { clientMessageId: 'obsolete-retry-card', text: 'obsolete retry must retire' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'transport_queue_append' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'retrySend' })).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'authoritative-mixed-v13', sessionId: 'qwen-session', type: 'session.state',
+          ts: Date.now(), seq: 13, epoch: 1, source: 'daemon', confidence: 'high',
+          payload: {
+            state: 'running', queueEpoch: 'queue-epoch-current', queueAuthorityId: 'queue-authority-current',
+            pendingMessageVersion: 13,
+            pendingMessageEntries: [{ clientMessageId: 'live-append-card', text: 'still truly appendable' }],
+            failedMessageEntries: [],
+          },
+        },
+      });
+      // A reconnect can replay an older session_list, and an outbox can deliver
+      // an old error ack afterwards. Neither is queue authority over v13.
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'qwen-session', project: 'my-project', role: 'brain', agentType: 'qwen',
+          state: 'running', runtimeType: 'transport', queueEpoch: 'queue-epoch-current',
+          queueAuthorityId: 'queue-authority-current', pendingMessageVersion: 12,
+          transportPendingMessageVersion: 12,
+          transportPendingMessageEntries: [{ clientMessageId: 'live-append-card', text: 'still truly appendable' }],
+          failedMessageEntries: [{ clientMessageId: 'obsolete-retry-card', text: 'obsolete retry must retire' }],
+        }],
+      });
+      ws.emit({
+        type: 'command.ack', session: 'qwen-session', commandId: 'obsolete-retry-card',
+        status: 'error', error: 'late delivery failure',
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('obsolete retry must retire')).toBeNull());
+    expect(screen.queryByRole('button', { name: 'retrySend' })).toBeNull();
+    expect(screen.getByText('still truly appendable')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'transport_queue_append' })).toBeDefined();
+  });
+
   it('sends the backend undo when deleting a still-local optimistic queue entry', () => {
     // Regression: an optimistic entry is queued locally the instant you send it,
     // but the daemon has ALSO already enqueued it (the WS enqueue is ordered

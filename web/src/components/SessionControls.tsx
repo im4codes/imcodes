@@ -453,7 +453,8 @@ type LocalQueuedTransportEntry = {
 
 type RealtimeTransportQueueOverride = {
   sessionName: string;
-  entries: LocalQueuedTransportEntry[];
+  pendingEntries: LocalQueuedTransportEntry[];
+  failedEntries: LocalQueuedTransportEntry[];
   version?: number;
 };
 
@@ -1255,6 +1256,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // messages even though the daemon and SQLite deletion had succeeded.
   const [optimisticallyRemovedQueuedIds, setOptimisticallyRemovedQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
+  const reconciledMissingAppendCommandIdsRef = useRef<Set<string>>(new Set());
   const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
   const queuedMutationRollbackRef = useRef<Map<string,
@@ -1353,11 +1355,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       || realtimeQueueOverride.version >= activeSessionPendingVersion
     );
   const incomingPendingTransportEntries = shouldUseRealtimeQueueOverride
-    ? realtimeQueueOverride.entries
+    ? realtimeQueueOverride.pendingEntries
     : activeSessionPendingEntries;
+  const incomingFailedTransportEntries = shouldUseRealtimeQueueOverride
+    ? realtimeQueueOverride.failedEntries
+    : activeSessionFailedEntries;
   const incomingQueuedTransportEntries: LocalQueuedTransportEntry[] = [
     ...incomingPendingTransportEntries,
-    ...activeSessionFailedEntries.filter((failed) => (
+    ...incomingFailedTransportEntries.filter((failed) => (
       !incomingPendingTransportEntries.some((pending) => pending.clientMessageId === failed.clientMessageId)
     )),
   ];
@@ -1391,7 +1396,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     else if (incomingQueuedTransportEntries.length === 0) merged = optimisticQueuedEntries;
     else {
       const byId = new Map<string, LocalQueuedTransportEntry>();
-      for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, { ...entry, status: 'queued' });
+      for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, entry);
       for (const entry of optimisticQueuedEntries) {
         byId.set(entry.clientMessageId, entry);
       }
@@ -1420,6 +1425,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setOptimisticallyRemovedQueuedIds(new Set());
     setOptimisticQueuedEntries(null);
     setRealtimeQueueOverride(null);
+    reconciledMissingAppendCommandIdsRef.current.clear();
     lastRealtimeEmptyQueueSnapshotRef.current = null;
     setEditingQueuedMessageId(null);
     queuedMutationRollbackRef.current.clear();
@@ -2277,26 +2283,59 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           failedMessageEntries: currentSession.failedMessageEntries,
         }, payload, snapshotSessionName);
         if (Object.keys(patch).length === 0) return false;
-        const entries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
+        const pendingEntries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
           ...entry,
           status: 'queued' as const,
         }));
+        const failedEntries = (patch.failedMessageEntries ?? []).map((entry) => ({
+          ...entry,
+          status: 'failed' as const,
+        }));
+        const queueReconcilesCommandId = typeof payload.queueReconcilesCommandId === 'string'
+          ? payload.queueReconcilesCommandId.trim()
+          : '';
+        if (
+          queueReconcilesCommandId
+          && queuedMutationRollbackRef.current.get(queueReconcilesCommandId)?.type === 'append'
+        ) {
+          reconciledMissingAppendCommandIdsRef.current.add(queueReconcilesCommandId);
+        }
         setRealtimeQueueOverride({
           sessionName: snapshotSessionName,
-          entries,
+          pendingEntries,
+          failedEntries,
           version: patch.transportPendingMessageVersion,
         });
+        // Several authoritative frames can arrive in one websocket burst,
+        // before React commits the state update above. Advance the mutable
+        // reducer baseline synchronously so an older session_list/subsession
+        // frame in that same burst cannot overwrite this snapshot and revive a
+        // retired Retry card.
+        realtimeQueueStateRef.current = {
+          activeSession: {
+            ...currentSession,
+            queueEpoch: patch.queueEpoch,
+            queueAuthorityId: patch.queueAuthorityId,
+            transportPendingMessageVersion: patch.transportPendingMessageVersion,
+            transportPendingMessageEntries: patch.transportPendingMessageEntries,
+            failedMessageEntries: patch.failedMessageEntries,
+          },
+          incomingQueuedTransportEntries: [...pendingEntries, ...failedEntries],
+          incomingQueuedTransportVersion: patch.transportPendingMessageVersion,
+        };
         // Once an authoritative snapshot no longer contains an optimistically
         // removed id, its deletion is fully reconciled and the tombstone can be
         // discarded. Keep tombstones that are still present in a stale/equal
         // snapshot so those cards cannot flash back into the UI.
-        const authoritativeIds = new Set(entries.map((entry) => entry.clientMessageId));
+        const authoritativeIds = new Set(
+          [...pendingEntries, ...failedEntries].map((entry) => entry.clientMessageId),
+        );
         setOptimisticallyRemovedQueuedIds((prev) => {
           if (prev.size === 0) return prev;
           const next = new Set([...prev].filter((id) => authoritativeIds.has(id)));
           return next.size === prev.size ? prev : next;
         });
-        if (entries.length === 0) {
+        if (pendingEntries.length === 0) {
           lastRealtimeEmptyQueueSnapshotRef.current = {
             sessionName: snapshotSessionName,
             version: patch.transportPendingMessageVersion,
@@ -2375,24 +2414,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 for (const id of rollbackIds) next.delete(id);
                 return next;
               });
-              const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
-              const restoreAppendQueue = (source: LocalQueuedTransportEntry[]) => [
-                ...rollback.queue,
-                ...source.filter((entry) => !rollbackQueueIds.has(entry.clientMessageId)),
-              ];
-              const currentQueue = realtimeQueueStateRef.current;
-              // Keep the incoming/base order aligned with the optimistic
-              // rollback. Merely returning an ordered optimistic array is not
-              // enough: the merge map preserves the prior authoritative
-              // insertion order for ids that exist in both arrays.
-              setRealtimeQueueOverride({
-                sessionName,
-                entries: restoreAppendQueue(currentQueue.incomingQueuedTransportEntries),
-                version: currentQueue.incomingQueuedTransportVersion,
-              });
-              setOptimisticQueuedEntries((prev) => restoreAppendQueue(
-                prev ?? currentQueue.incomingQueuedTransportEntries,
-              ));
+              // The daemon sends an authoritative queue snapshot before a
+              // not-found append ack. If that snapshot arrived after this
+              // mutation started, it is newer authority than the optimistic
+              // pre-click queue and must not be overwritten by rollback.
+              if (!reconciledMissingAppendCommandIdsRef.current.delete(msg.commandId)) {
+                const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
+                const restoreAppendQueue = (source: LocalQueuedTransportEntry[]) => [
+                  ...rollback.queue,
+                  ...source.filter((entry) => !rollbackQueueIds.has(entry.clientMessageId)),
+                ];
+                const currentQueue = realtimeQueueStateRef.current;
+                const restored = restoreAppendQueue(currentQueue.incomingQueuedTransportEntries);
+                // Keep the incoming/base order aligned with the optimistic
+                // rollback. Merely returning an ordered optimistic array is not
+                // enough: the merge map preserves the prior authoritative
+                // insertion order for ids that exist in both arrays.
+                setRealtimeQueueOverride({
+                  sessionName,
+                  pendingEntries: restored.filter((entry) => entry.status !== 'failed'),
+                  failedEntries: restored.filter((entry) => entry.status === 'failed'),
+                  version: currentQueue.incomingQueuedTransportVersion,
+                });
+                setOptimisticQueuedEntries((prev) => restoreAppendQueue(
+                  prev ?? currentQueue.incomingQueuedTransportEntries,
+                ));
+              }
             }
             if (rollback.type !== 'append') {
               setOptimisticQueuedEntries((prev) => {
@@ -2414,6 +2461,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             markLocalQueuedEntry(msg.commandId, 'failed');
           }
         } else {
+          reconciledMissingAppendCommandIdsRef.current.delete(msg.commandId);
           failedQueuedCommandIdsRef.current.delete(msg.commandId);
           if (rollback) queuedMutationRollbackRef.current.delete(msg.commandId);
           markLocalQueuedEntry(msg.commandId, 'queued');

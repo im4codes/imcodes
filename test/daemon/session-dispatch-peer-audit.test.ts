@@ -230,12 +230,18 @@ describe('peer-audit dedicated dispatch', () => {
       dispatchId: 'send_dispatch_12345678' as never,
       messageId: 'send_message_12345678' as never,
       durableQueue: true,
+      queueSupervisionReference: {
+        kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
+      },
     })).resolves.toBe('queued');
 
     expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
       text: 'automatic audit',
       commandId: 'send_message_12345678',
       clientMessageId: 'send_message_12345678',
+      supervisionReference: {
+        kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
+      },
     }));
     expect(drainTransportResendQueueForDispatchMock).toHaveBeenCalledWith('deck_sub_audit123');
     expect(sendMock).not.toHaveBeenCalled();

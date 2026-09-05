@@ -5199,6 +5199,7 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
         timelineEmitter.emit(sessionName, 'session.state', {
           state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
           ...queuePayload,
+          queueReconcilesCommandId: commandId,
         }, { source: 'daemon', confidence: 'high' });
       }
       reject(error);

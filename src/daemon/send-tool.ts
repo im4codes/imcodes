@@ -2,7 +2,7 @@ import path from 'path';
 import logger from '../util/logger.js';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
+import { createSendDispatchId, createSendMessageId, deterministicSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
 import { IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG } from '../../shared/imcodes-send.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import {
@@ -126,6 +126,7 @@ import {
   resolveSupervisionAssignmentWorktree,
 } from './supervision-worktree-inspector.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -278,6 +279,8 @@ export interface SendMessageInput {
   internalMessageId?: SendMessageId;
   /** Daemon-only: persist to the transport queue before attempting delivery. */
   internalDurableQueue?: true;
+  /** Daemon-only durable supervision lifecycle identity. */
+  internalQueueSupervisionReference?: QueueSupervisionReference;
 }
 
 export interface SendMessageDelivery {
@@ -1019,13 +1022,6 @@ function eligibleSupervisionPoolsForTarget(
     targetMatchesConfiguredSupervisionPool(pools, pool, target)
   ));
 }
-
-function deterministicSendMessageId(seed: string): SendMessageId {
-  const hex = createHash('sha256').update(seed).digest('hex');
-  const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
-  return `send_message_${uuid}`;
-}
-
 
 function supervisionTaskIdentityForTarget(target: SessionRecord): PersistedSupervisionTaskAssignmentIdentity | undefined {
   if (!target.name.trim()) return undefined;
@@ -2117,6 +2113,9 @@ export async function dispatchSendMessage(
         dispatchId,
         messageId,
         ...(input.internalDurableQueue ? { durableQueue: true } : {}),
+        ...(input.internalQueueSupervisionReference
+          ? { queueSupervisionReference: input.internalQueueSupervisionReference }
+          : {}),
         deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
         ...(supervisedTaskId && supervisedAssignmentId
           ? { supervision: { taskId: supervisedTaskId, assignmentId: supervisedAssignmentId } }
@@ -2224,6 +2223,14 @@ export async function reportImplementationNoProgressBlocker(
     status: assignment.status,
     exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
   })).digest('hex');
+  const messageId = deterministicSendMessageId(`implementation-blocker:${fingerprint}`);
+  if (brain) {
+    bindExistingQueueSupervisionReference(brain.name, messageId, {
+      kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
+      revision: task.currentRevision ?? assignment.auditRevision ?? '',
+      exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+    });
+  }
   const replay = readMatchingBlockerEscalation(assignment.blocker, fingerprint);
   if (replay) {
     return replay.disposition === SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
@@ -2265,7 +2272,6 @@ export async function reportImplementationNoProgressBlocker(
   if (!brainCanResolve || !reporter || !brain) {
     return { status: 'needs_input', report, replay: false };
   }
-  const messageId = deterministicSendMessageId(`implementation-blocker:${fingerprint}`);
   if (!(deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(brain.name, messageId)) {
     const dispatched = await dispatchSendMessage({
       userId: reporter.name,
@@ -2278,6 +2284,11 @@ export async function reportImplementationNoProgressBlocker(
       idempotencyKey: `implementation-blocker:${fingerprint}`,
       internalMessageId: messageId,
       internalDurableQueue: true,
+      internalQueueSupervisionReference: {
+        kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
+        revision: task.currentRevision ?? assignment.auditRevision ?? '',
+        exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+      },
     }, deps);
     if (dispatched.status !== 'accepted') {
       const failedReport: SupervisionBlockerEscalationReport = {
@@ -2332,6 +2343,19 @@ function hasDurableDeliveryEvidence(sessionName: string, messageId: SendMessageI
       (entry) => entry.clientMessageId === messageId && entry.status === 'queued',
     );
   } catch {
+    return false;
+  }
+}
+
+function bindExistingQueueSupervisionReference(
+  sessionName: string,
+  messageId: SendMessageId,
+  reference: QueueSupervisionReference,
+): boolean {
+  try {
+    return getTransportQueueStore().attachSupervisionReference(sessionName, messageId, reference);
+  } catch {
+    // Missing or conflicting queue authority is never a reason to overwrite.
     return false;
   }
 }
@@ -2485,6 +2509,11 @@ async function reportAutomaticAuditBlocker(
   const target = exactLiveSessionForAssignment(coordinator, sessions);
   if (!origin || !target || target.role !== 'brain') return false;
   const messageId = deterministicSendMessageId(`auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`);
+  const queueReference: QueueSupervisionReference = {
+    kind: 'implementation_blocker', taskId: task.taskId, assignmentId: implementer.assignmentId, exactError,
+    revision: task.currentRevision ?? implementer.auditRevision ?? '',
+  };
+  if (bindExistingQueueSupervisionReference(target.name, messageId, queueReference)) return true;
   const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
   if (hasEvidence(target.name, messageId)) return true;
   const dispatched = await (deps.dispatch ?? dispatchSendMessage)({
@@ -2498,6 +2527,7 @@ async function reportAutomaticAuditBlocker(
     idempotencyKey: `auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
+    internalQueueSupervisionReference: queueReference,
   });
   return dispatched.status === 'accepted';
 }
@@ -3132,6 +3162,12 @@ export async function dispatchReadyIntegration(
     return { status: 'blocked', reason: 'integration owner PASS bind did not converge', reported: false };
   }
   const messageId = deterministicSendMessageId(`auto-integration:${owner.assignmentId}:${revision}:${implementer.auditAttemptId}`);
+  const queueReference: QueueSupervisionReference = {
+    kind: 'exact_integration', taskId: task.taskId, assignmentId: owner.assignmentId, revision,
+  };
+  if (bindExistingQueueSupervisionReference(brain.name, messageId, queueReference)) {
+    return { status: 'replayed', assignmentId: owner.assignmentId, messageId };
+  }
   const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
   if (hasEvidence(brain.name, messageId)) return { status: 'replayed', assignmentId: owner.assignmentId, messageId };
   const origin = exactLiveSessionForAssignment(implementer, sessions) ?? brain;
@@ -3156,6 +3192,7 @@ export async function dispatchReadyIntegration(
     idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
+    internalQueueSupervisionReference: queueReference,
   });
   if (result.status !== 'accepted') {
     return { status: 'blocked', reason: result.status === 'error' ? result.error : `integration dispatch ${result.status}`, reported: false };

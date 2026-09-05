@@ -60,6 +60,7 @@ export function buildQueueProjectionEntry(entry: QueueStoredEntry): QueueProject
     ...(entry.failureReason ? { failureReason: entry.failureReason } : {}),
     ...(entry.attachments?.length ? { attachments: entry.attachments.map(buildQueueAttachmentProjection).filter((item): item is QueueAttachmentProjection => !!item) } : {}),
     ...(entry.sharedActor ? { sharedActor: buildQueueSharedActorProjection(entry.sharedActor) } : {}),
+    ...(entry.supervisionReference ? { supervisionReference: entry.supervisionReference } : {}),
   };
 }
 

@@ -13,6 +13,27 @@ export type QueueEntryStatus =
 
 export type QueuePlacement = 'normal' | 'front';
 
+/**
+ * Daemon-authored lifecycle identity for supervision control traffic.
+ *
+ * This is persisted independently from the human-readable message. Queue
+ * authority must never be reconstructed by parsing that message.
+ */
+export type QueueSupervisionReference =
+  | {
+      kind: 'exact_integration';
+      taskId: string;
+      assignmentId: string;
+      revision: string;
+    }
+  | {
+      kind: 'implementation_blocker';
+      taskId: string;
+      assignmentId: string;
+      revision: string;
+      exactError: string;
+    };
+
 export type QueueDropReason =
   | 'expired'
   | 'capacity_evicted'
@@ -100,6 +121,7 @@ export interface QueueStoredEntry {
   handoffExpiresAt?: number;
   handoffAttempt?: number;
   privateMaterialRef?: string;
+  supervisionReference?: QueueSupervisionReference;
 }
 
 export interface QueueProjectionEntry {
@@ -116,6 +138,7 @@ export interface QueueProjectionEntry {
   failureReason?: QueueFailureReason;
   attachments?: QueueAttachmentProjection[];
   sharedActor?: QueueSharedActorProjection;
+  supervisionReference?: QueueSupervisionReference;
 }
 
 export interface QueueSnapshot {

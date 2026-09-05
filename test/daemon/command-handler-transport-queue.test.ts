@@ -5138,7 +5138,11 @@ describe('handleWebCommand transport queue behavior', () => {
       expect(emitMock).toHaveBeenCalledWith(
         'deck_transport_brain',
         'session.state',
-        expect.objectContaining({ pendingMessageEntries: [], pendingCount: 0 }),
+        expect.objectContaining({
+          pendingMessageEntries: [],
+          pendingCount: 0,
+          queueReconcilesCommandId: 'cmd-old-append',
+        }),
         expect.any(Object),
       );
       expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -5148,6 +5152,59 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingSpy.mockRestore();
       await runtime.kill();
     }
+  });
+
+  it('keeps a live handoff visible when append reports not_found instead of treating it as an absent card', async () => {
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'append-live-handoff',
+      commandId: 'append-live-handoff',
+      text: 'already crossing the provider boundary',
+      privateMaterialJson: JSON.stringify({ text: 'already crossing the provider boundary' }),
+    });
+    store.markHandoffInFlight('deck_transport_brain', ['append-live-handoff'], 60_000, Date.now());
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'not_found' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      pendingEntries: [{
+        clientMessageId: 'append-live-handoff',
+        text: 'already crossing the provider boundary',
+      }],
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['append-live-handoff'],
+      commandId: 'cmd-append-live-handoff',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'append-live-handoff',
+        status: 'handoff_inflight',
+      }),
+    ]);
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        queueReconcilesCommandId: 'cmd-append-live-handoff',
+        pendingMessageEntries: [expect.objectContaining({
+          clientMessageId: 'append-live-handoff',
+          status: 'handoff_inflight',
+        })],
+      }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-append-live-handoff', status: 'error', error: 'Queued message not found',
+    }));
   });
 
   it('appends a displayed canonical row immediately across a stranded same-instance queue epoch', async () => {

@@ -25,7 +25,7 @@ import type { MemoryMcpSendDeliveryMode } from '../../shared/memory-mcp-contract
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
-import type { QueueDeliveryFact, QueueDropReason, QueueResetReason, QueueSnapshot } from '../../shared/transport-queue-types.js';
+import type { QueueDeliveryFact, QueueDropReason, QueueResetReason, QueueSnapshot, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import {
   bumpTransportQueueRevision,
   clearAllTransportQueueRevisions,
@@ -44,6 +44,7 @@ export interface ResendEntry {
    * at enqueue. Queued work belongs to an instance, not to a reusable name.
    */
   recipient?: QueueRecipientIdentity;
+  supervisionReference?: QueueSupervisionReference;
   /** User-visible task text — the ORIGINAL marker text used for the timeline. */
   text: string;
   /**
@@ -143,6 +144,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
           ? { registeredSystemContract: normalizedEntry.registeredSystemContract }
           : {}),
       }),
+      ...(normalizedEntry.supervisionReference ? { supervisionReference: normalizedEntry.supervisionReference } : {}),
     }, evicted?.clientMessageId);
     queueSnapshot = result.queueSnapshot;
     dropSnapshot = result.dropSnapshot;
