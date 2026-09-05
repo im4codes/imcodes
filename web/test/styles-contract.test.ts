@@ -186,6 +186,23 @@ describe('styles.css regression contracts', () => {
     expect(bodyRule).not.toMatch(/overscroll-behavior/);
   });
 
+  it('gives trusted delegation verdicts restrained accessible state styling across interaction and viewport modes', () => {
+    const passRule = cssWithoutComments.match(/\.delegation-reply-card--pass\s*\{[^}]*\}/)?.[0];
+    const reworkRule = cssWithoutComments.match(/\.delegation-reply-card--rework\s*\{[^}]*\}/)?.[0];
+    expect(passRule).toMatch(/--delegation-verdict-rgb:\s*34,\s*197,\s*94/);
+    expect(reworkRule).toMatch(/--delegation-verdict-rgb:\s*239,\s*68,\s*68/);
+
+    const stateRule = cssWithoutComments.match(/\.delegation-reply-card\[data-verdict\]\s*\{[^}]*\}/)?.[0];
+    expect(stateRule).toMatch(/border-color:\s*rgba\(var\(--delegation-verdict-rgb\)/);
+    expect(stateRule).toMatch(/box-shadow:\s*inset/);
+
+    expect(cssWithoutComments).toMatch(/\.delegation-reply-card\[data-verdict\]:hover/);
+    expect(cssWithoutComments).toMatch(/\.delegation-reply-card\[data-verdict\]\.chat-highlight\s*\{/);
+    expect(cssWithoutComments).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.delegation-reply-card\[data-verdict\]/);
+    expect(cssWithoutComments).toMatch(/@media\s*\(prefers-color-scheme:\s*light\)[\s\S]*?\.delegation-reply-card\[data-verdict\]/);
+    expect(cssWithoutComments).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.delegation-reply-card\[data-verdict\]::before\s*\{[^}]*animation:\s*none/);
+  });
+
   it('.chat-view-preview must NOT be a scroll container', () => {
     // User reported: card chat history flickers / oscillates infinitely
     // near the bottom at certain heights — only resolves after manual

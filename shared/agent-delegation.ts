@@ -3,7 +3,12 @@ import { isSessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import { isValidImcodesSessionName } from './session-scope.js';
-import { PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS } from './peer-audit.js';
+import {
+  PEER_AUDIT_DELEGATED_REPLY_STATUS,
+  PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
+  isPeerAuditVerdict,
+  type PeerAuditVerdict,
+} from './peer-audit.js';
 import { SUPERVISION_CONTRACT_IDS } from './supervision-config.js';
 
 export const AGENT_DELEGATION_TARGET_FIELD = 'delegateTarget' as const;
@@ -65,6 +70,19 @@ export interface AgentDelegationReplyEnvelope {
   version: typeof AGENT_DELEGATION_REPLY_VERSION;
   delegationId: string;
   result: string;
+}
+
+/**
+ * Reads only the daemon-decoded, top-level audit verdict projection. Reply
+ * prose and nested metadata are deliberately outside this trust boundary.
+ */
+export function readTrustedAgentDelegationReplyVerdict(value: unknown): PeerAuditVerdict | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.status !== PEER_AUDIT_DELEGATED_REPLY_STATUS
+    || !Object.prototype.hasOwnProperty.call(record, 'verdict')
+    || !isPeerAuditVerdict(record.verdict)) return undefined;
+  return record.verdict;
 }
 
 export interface AgentDelegationReplyAuthority {

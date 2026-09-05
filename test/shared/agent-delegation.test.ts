@@ -28,6 +28,7 @@ import {
   extractAgentDelegationReplyAuthorityFromInstruction,
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
+  readTrustedAgentDelegationReplyVerdict,
   hasAgentDelegationTargetField,
   hasLegacyP2pControlToken,
   isAgentDelegationForwardedPayloadText,
@@ -40,6 +41,25 @@ import {
   type AgentDelegationErrorCode,
 } from '../../shared/agent-delegation.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+
+describe('readTrustedAgentDelegationReplyVerdict', () => {
+  it.each(['PASS', 'REWORK'] as const)('accepts the exact top-level %s verdict', (verdict) => {
+    expect(readTrustedAgentDelegationReplyVerdict({
+      status: 'peer_audit_completed',
+      verdict,
+    })).toBe(verdict);
+  });
+
+  it.each([
+    undefined,
+    { status: 'peer_audit_completed' },
+    { status: 'peer_audit_completed', verdict: 'APPROVED' },
+    { status: 'other', verdict: 'PASS' },
+    { status: 'peer_audit_completed', metadata: { verdict: 'PASS' } },
+  ])('rejects missing, unknown, nested, or wrong-shape verdict metadata', (value) => {
+    expect(readTrustedAgentDelegationReplyVerdict(value)).toBeUndefined();
+  });
+});
 
 const expectInvalid = (value: unknown) => {
   expect(parseAgentDelegationTargetPayload(value)).toEqual(expect.objectContaining({

@@ -19,6 +19,7 @@ import type {
   PeerAuditRuntimeDisposition,
   PeerAuditTerminalOutcome,
   PeerAuditTrigger,
+  PeerAuditVerdict,
 } from '../../../shared/peer-audit.js';
 
 export type TimelineEventType =
@@ -204,6 +205,8 @@ export interface AgentDelegationReplyTimelinePayload {
   sourceSessionName: string;
   sourceLabel?: string;
   result: string;
+  /** Present only when daemon authority decoded a structured audit reply. */
+  verdict?: PeerAuditVerdict;
 }
 
 export interface MemoryContextTimelineItem {

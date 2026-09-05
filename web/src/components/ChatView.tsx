@@ -67,7 +67,11 @@ import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
-import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
+import {
+  PEER_AUDIT_VERDICTS,
+  isPeerAuditRuntimeDisposition,
+  isPeerAuditVerdict,
+} from '@shared/peer-audit.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
@@ -4632,11 +4636,27 @@ const ChatEvent = memo(function ChatEvent({
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');
       const result = typeof event.payload.result === 'string' ? event.payload.result : '';
+      const verdict = isPeerAuditVerdict(event.payload.verdict) ? event.payload.verdict : undefined;
+      const verdictClass = verdict ? ` delegation-reply-card--${verdict.toLowerCase()}` : '';
+      const verdictLabel = verdict
+        ? t(verdict === PEER_AUDIT_VERDICTS[0]
+          ? 'peerAuditQuick.result_pass'
+          : 'peerAuditQuick.result_rework')
+        : undefined;
       return (
-        <section class="chat-event chat-system delegation-reply-card" data-event-id={event.eventId}>
+        <section
+          class={`chat-event chat-system delegation-reply-card${verdictClass}`}
+          data-event-id={event.eventId}
+          {...(verdict ? { 'data-verdict': verdict } : {})}
+        >
           <div class="delegation-reply-card-head">
             <strong>{t('delegation.reply_title')}</strong>
-            <span>{t('delegation.reply_from', { source })}</span>
+            <div class="delegation-reply-card-meta">
+              {verdict && (
+                <span class="delegation-reply-verdict" aria-label={verdictLabel}>{verdict}</span>
+              )}
+              <span>{t('delegation.reply_from', { source })}</span>
+            </div>
           </div>
           {result && (
             <div class="delegation-reply-card-body">

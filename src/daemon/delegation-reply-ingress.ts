@@ -1,10 +1,12 @@
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_STATUSES,
   decodeAgentDelegationReplyEnvelope,
+  readTrustedAgentDelegationReplyVerdict,
   type AgentDelegationReplyEnvelope,
   type AgentDelegationReplyError,
 } from '../../shared/agent-delegation.js';
@@ -105,6 +107,15 @@ function notificationText(record: DelegationReplyRecord): string {
   ].join('\n');
 }
 
+function trustedStructuredVerdict(record: DelegationReplyRecord) {
+  if (record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT || !record.result) return undefined;
+  try {
+    return readTrustedAgentDelegationReplyVerdict(JSON.parse(record.result));
+  } catch {
+    return undefined;
+  }
+}
+
 function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   // The timeline is projected onto a session NAME, and this ran at three call
   // sites BEFORE any origin verification. A same-named replacement therefore saw
@@ -114,6 +125,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   // pending and is projected when it reaches the exact origin.
   if (!identityMatches(record.origin, boundIdentity(getSession(record.origin.sessionName)))) return;
   const targetSession = getSession(record.target.sessionName);
+  const verdict = trustedStructuredVerdict(record);
   timelineEmitter.emit(
     record.origin.sessionName,
     AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
@@ -122,6 +134,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
       sourceSessionName: record.target.sessionName,
       ...(targetSession?.label ? { sourceLabel: targetSession.label } : {}),
       result: record.result ?? '',
+      ...(verdict ? { verdict } : {}),
     },
     {
       source: 'daemon',
