@@ -7138,6 +7138,90 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.listAssignments(taskId)).toHaveLength(assignmentCount);
   });
 
+  it('send_message atomically refreshes a rotated exact continuation before task_update and finish', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'existing-task-rotated-continuation';
+    const assignmentId = 'rotated-continuation-assignment';
+    const revision = 'rotated-continuation-r1';
+    const stale = {
+      ...identity('deck_alpha_w1', 'claude-code-sdk'),
+      sessionInstanceId: 'instance-before-restart',
+      runtimeEpoch: 'epoch-before-restart',
+    };
+    const brain = session('deck_alpha_brain');
+    const worker = session('deck_alpha_w1');
+    const staleExecutionBinding = persistedExecutionBinding(worker.name);
+    staleExecutionBinding.actual = { ...staleExecutionBinding.actual, ...stale };
+    expect(registry.createOrGet({
+      projectName: 'alpha', taskId, classification: 'independent_top_level',
+      objective: 'resume after runtime rotation', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', identity: identity(brain.name), required: false,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, assignmentId, role: 'implementer', identity: stale,
+      scopeFiles: ['src/exact.ts'], auditRevision: revision,
+      executionBinding: staleExecutionBinding,
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId, identity: stale, status: 'implementing', revision,
+    })).toMatchObject({ ok: true });
+
+    const dispatchMessage = vi.fn(async () => {
+      // The durable row must be current BEFORE delivery. Otherwise a worker can
+      // receive this append and immediately lose task_update to owner_mismatch.
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        identity: {
+          sessionName: worker.name,
+          sessionInstanceId: worker.sessionInstanceId,
+          runtimeEpoch: worker.runtimeEpoch,
+          agentType: worker.agentType,
+        },
+        executionBinding: { actual: {
+          sessionInstanceId: worker.sessionInstanceId,
+          runtimeEpoch: worker.runtimeEpoch,
+        } },
+      });
+      return undefined;
+    });
+    const request = {
+      target: worker.name,
+      message: 'continue after restart',
+      idempotencyKey: 'rotated-continuation-once',
+      task: { taskId, assignmentId, currentRevision: revision },
+    } as const;
+    const deps = {
+      listSessions: () => [brain, worker], dispatchMessage,
+      exactTargetOnly: true, ensureSupervisionAssignmentWorktree: ensureTestAssignmentWorktree,
+    };
+    const caller = {
+      userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    };
+
+    const sent = await dispatchSendMessage(caller, request, deps);
+    if (sent.status !== 'accepted') throw new Error(JSON.stringify(sent));
+    expect(sent).toMatchObject({
+      status: 'accepted', taskId, assignmentId,
+    });
+    const liveIdentity = identity(worker.name, worker.agentType);
+    expect(registry.updateAssignment({
+      assignmentId, identity: liveIdentity, status: 'validated',
+      revision, validationState: 'passed',
+    })).toMatchObject({ ok: true });
+    expect(registry.finishAssignment({
+      assignmentId, identity: liveIdentity, revision,
+    })).toMatchObject({ ok: true, value: { assignmentId, status: 'ready_for_audit' } });
+
+    const generation = registry.getAssignment(assignmentId)!.generation;
+    expect(await dispatchSendMessage(caller, request, deps)).toMatchObject({
+      status: 'accepted', idempotentReplay: true, taskId, assignmentId,
+    });
+    expect(registry.getAssignment(assignmentId)!.generation).toBe(generation);
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'implementer'))
+      .toHaveLength(1);
+  });
+
   it('send_message rejects missing and inaccessible explicit task ids without minting or dispatching', async () => {
     const registry = getSupervisionTaskRegistry();
     expect(registry.createOrGet({ projectName: 'alpha', taskId: 'other-owner-task', objective: 'private task' }).ok).toBe(true);

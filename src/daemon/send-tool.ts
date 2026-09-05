@@ -1616,6 +1616,45 @@ export async function dispatchSendMessage(
         }
       }
       taskId = existing.taskId;
+
+      // A continuation is delivered to the daemon's CURRENT runtime, not to
+      // the historical instance/epoch stored when the assignment was minted.
+      // Refresh that observational tuple before dispatch, on the exact existing
+      // task/assignment, so the worker cannot receive an append and then lose
+      // its immediately-following task_update/finish to owner_mismatch.
+      //
+      // Do not synthesize authority from the requested target alone. The
+      // registry receives the complete live project/session census and owns the
+      // fail-closed decision (terminal lifecycle, wrong project/session, or an
+      // ambiguous same-name runtime). No scope, revision, receipt, lease, or
+      // assignment id is changed by this convergence.
+      if (reusedContinuationAssignment
+        && (reusedContinuationAssignment.identity.sessionInstanceId !== targetIdentity.sessionInstanceId
+          || reusedContinuationAssignment.identity.runtimeEpoch !== targetIdentity.runtimeEpoch
+          || reusedContinuationAssignment.identity.agentType !== targetIdentity.agentType
+          || reusedContinuationAssignment.identity.providerFamily !== targetIdentity.providerFamily)) {
+        const candidates = allSessions.flatMap((candidate) => {
+          const identity = supervisionTaskIdentityForTarget(candidate);
+          const projectName = resolveEffectiveProjectName(candidate, allSessions);
+          return candidate.state !== 'stopped' && identity && projectName
+            ? [{ projectName, identity }]
+            : [];
+        });
+        const converged = registry.convergeImplementationHeartbeatTarget({
+          taskId,
+          assignmentId: reusedContinuationAssignment.assignmentId,
+          candidates,
+          now,
+        });
+        if (!converged.ok) {
+          return {
+            status: 'error',
+            reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+            error: `task continuation identity convergence rejected: ${converged.reason}`,
+          };
+        }
+        reusedContinuationAssignment = converged.value;
+      }
     } else {
       const classification = input.task.classification ?? 'integration_slice';
       const explicitAuditPolicy = input.task.auditPolicy ?? undefined;
