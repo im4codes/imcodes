@@ -297,6 +297,7 @@ describe('styles.css regression contracts', () => {
       @media (max-width: 640px) {
         @supports (display: grid) { .target { color: red; } }
       }
+      @media (max-width: 640px) and (orientation: portrait) { .target { color: blue; } }
       @media (max-width: 641px) { .target { color: orange; } }
       @media (max-width: 640px) { .target { color: green; } }
     `;
@@ -304,7 +305,20 @@ describe('styles.css regression contracts', () => {
     expect(blocks).toHaveLength(2);
     expect(extractDirectStyleRule(blocks[0]!, /\.target/)).toBeUndefined();
     expect(extractDirectStyleRule(blocks[1]!, /\.target/)).toMatch(/color:\s*green/);
+    expect(blocks.join('\n')).not.toContain('color: blue');
     expect(blocks.join('\n')).not.toContain('color: orange');
+  });
+
+  it('ignores structural braces and escaped quotes inside CSS strings', () => {
+    const fixture = `
+      @media (max-width: 640px) {
+        .quoted-brace::before { content: "escaped \\" quote then }"; }
+        .after-quoted-brace { color: purple; }
+      }
+    `;
+    const blocks = extractBalancedAtRuleBlocks(fixture, /@media\s*\(\s*max-width\s*:\s*640px\s*\)/);
+    expect(blocks).toHaveLength(1);
+    expect(extractDirectStyleRule(blocks[0]!, /\.after-quoted-brace/)).toMatch(/color:\s*purple/);
   });
 
   it('.chat-view-preview must NOT be a scroll container', () => {
