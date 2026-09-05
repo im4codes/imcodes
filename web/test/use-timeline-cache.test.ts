@@ -537,15 +537,35 @@ describe('useTimeline global cache bounds', () => {
     vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
     vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
-    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneSessionHistory').mockResolvedValue({ deleted: 0 });
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneSessionHistory')
+      .mockResolvedValue({ deleted: 0, done: true });
 
     await renderRestoredProbe(sessionName, serverId, 'prune-probe');
 
-    expect(pruneSpy).toHaveBeenCalledWith(`${serverId}:${sessionName}`, 1000);
+    // Nothing may be deleted while the app is still painting. The first version
+    // swept immediately after each restore, so a dozen sessions mounting
+    // together queued a dozen large readwrite transactions ahead of everyone's
+    // reads on the shared connection, and chats opened blank and hung on
+    // "local cache". Reclaiming space has no deadline; a paint does.
+    expect(pruneSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+      await flushMicrotasks();
+    });
+
+    expect(pruneSpy).toHaveBeenCalledWith(
+      `${serverId}:${sessionName}`,
+      1000,
+      expect.objectContaining({ maxDeletions: expect.any(Number) }),
+    );
     // The retention must stay above the page the first paint reads, or every
     // restore would come back truncated.
-    const [, keepCount] = pruneSpy.mock.calls[0]!;
+    const [, keepCount, opts] = pruneSpy.mock.calls[0]!;
     expect(keepCount).toBeGreaterThan(300);
+    // And each sweep must be bounded, so one transaction can never monopolise
+    // the connection the way the unbounded version did.
+    expect((opts as { maxDeletions: number }).maxDeletions).toBeLessThanOrEqual(2_000);
   });
 
   it('never deletes local history while the store is degraded to memory-only', async () => {
@@ -562,9 +582,14 @@ describe('useTimeline global cache bounds', () => {
     vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
     vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(true);
-    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneSessionHistory').mockResolvedValue({ deleted: 0 });
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneSessionHistory')
+      .mockResolvedValue({ deleted: 0, done: true });
 
     await renderRestoredProbe(sessionName, serverId, 'prune-degraded-probe');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+      await flushMicrotasks();
+    });
 
     expect(pruneSpy).not.toHaveBeenCalled();
   });

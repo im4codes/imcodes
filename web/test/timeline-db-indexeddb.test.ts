@@ -246,6 +246,48 @@ describe('TimelineDB — real IndexedDB (fake-indexeddb)', () => {
     expect(kept).toHaveLength(5);
   });
 
+  it('honours a deletion budget so one sweep cannot monopolise the connection', async () => {
+    // Every timeline in the app shares ONE IndexedDB connection. An unbounded
+    // readwrite sweep over a never-pruned store therefore parks every other
+    // session's read behind it, which is exactly how this feature first shipped
+    // and made chats open blank and hang on "local cache". A capped sweep keeps
+    // each transaction short; deletions come from the OLDEST end, so repeated
+    // sweeps always make progress rather than re-deleting the same rows.
+    const db = new TimelineDB();
+    const events: TimelineEvent[] = [];
+    for (let i = 0; i < 400; i += 1) events.push(ev(`e${i + 1}`, 's', i + 1));
+    await db.putEvents(events);
+
+    const first = await db.pruneSessionHistory('s', 100, { maxDeletions: 50 });
+    expect(first).not.toBeNull();
+    expect(first!.deleted).toBe(50);
+    // Unfinished, and it says so, so the caller knows to come back.
+    expect(first!.done).toBe(false);
+    const afterFirst = await db.getRecentEvents('s', { limit: 1000 });
+    expect(afterFirst).toHaveLength(350);
+    // The retained window is what matters and it is intact. The walk has to run
+    // newest-first (that is how "keep the newest of each last-value type" is
+    // decided), so a partial sweep removes from the middle rather than the
+    // oldest end. That is safe precisely because everything it can touch lies
+    // BELOW the retained window, and reads never reach past it.
+    const newestHundred = afterFirst.slice(-100).map((e) => e.eventId);
+    expect(newestHundred[0]).toBe('e301');
+    expect(newestHundred[99]).toBe('e400');
+
+    let guard = 0;
+    let done = false;
+    while (!done && guard < 20) {
+      const next = await db.pruneSessionHistory('s', 100, { maxDeletions: 50 });
+      done = next?.done ?? true;
+      guard += 1;
+    }
+    expect(done).toBe(true);
+    const finalRows = await db.getRecentEvents('s', { limit: 1000 });
+    expect(finalRows).toHaveLength(100);
+    expect(finalRows[0]!.eventId).toBe('e301');
+    expect(finalRows[99]!.eventId).toBe('e400');
+  });
+
   it('prunes only the requested session', async () => {
     const db = new TimelineDB();
     const noise: TimelineEvent[] = [];

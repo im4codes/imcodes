@@ -509,8 +509,40 @@ const LOCAL_RETAINED_EVENTS_PER_SESSION = 1000;
  */
 const LOCAL_PRUNE_WRITE_INTERVAL = 200;
 
+/**
+ * Sweep shape. All three of these exist because the first version blocked the
+ * UI: it deleted a never-pruned store in ONE readwrite transaction, per
+ * session, right after each first paint. Every timeline shares one IndexedDB
+ * connection, so a dozen sessions mounting together queued a dozen huge writes
+ * ahead of everyone's reads and chats opened blank, stuck on "local cache".
+ */
+const LOCAL_PRUNE_DELETIONS_PER_SWEEP = 500;
+/** Long enough that the mount burst -- every pane and card -- is fully painted. */
+const LOCAL_PRUNE_START_DELAY_MS = 5_000;
+/** Yield between chunks so reads interleave instead of queueing behind us. */
+const LOCAL_PRUNE_CHUNK_GAP_MS = 750;
+/** Bound total work per page session; the rest waits for the next load. */
+const LOCAL_PRUNE_MAX_CHUNKS = 40;
+
 const localPruneWriteCounts = new Map<string, number>();
 const localPruneDoneThisPageSession = new Set<string>();
+/** One sweep at a time across ALL sessions — they share a single connection. */
+let localPruneChain: Promise<void> = Promise.resolve();
+
+function runLocalHistoryPrune(cacheKey: string): void {
+  localPruneChain = localPruneChain.then(async () => {
+    for (let chunk = 0; chunk < LOCAL_PRUNE_MAX_CHUNKS; chunk += 1) {
+      if (sharedDb.memoryOnly) return;
+      const result = await sharedDb
+        .pruneSessionHistory(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION, {
+          maxDeletions: LOCAL_PRUNE_DELETIONS_PER_SWEEP,
+        })
+        .catch(() => null);
+      if (!result || result.done) return;
+      await new Promise<void>((resolve) => { setTimeout(resolve, LOCAL_PRUNE_CHUNK_GAP_MS); });
+    }
+  }).catch(() => {});
+}
 
 /**
  * Trim a session's stored history to LOCAL_RETAINED_EVENTS_PER_SESSION.
@@ -537,11 +569,15 @@ function scheduleLocalHistoryPrune(cacheKey: string, writtenEvents: number, forc
     }
     localPruneWriteCounts.set(cacheKey, 0);
   }
-  sharedDb.pruneSessionHistory(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION).catch(() => {});
+  // Deliberately delayed and never awaited: reclaiming space must never sit in
+  // front of a paint, and there is no deadline on it.
+  const timer = setTimeout(() => runLocalHistoryPrune(cacheKey), LOCAL_PRUNE_START_DELAY_MS);
+  timer.unref?.();
 }
 
 /** Test hook: page-session prune bookkeeping is module state. */
 export function __resetLocalHistoryPruneStateForTests(): void {
+  localPruneChain = Promise.resolve();
   localPruneWriteCounts.clear();
   localPruneDoneThisPageSession.clear();
 }

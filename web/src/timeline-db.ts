@@ -516,22 +516,41 @@ export class TimelineDB {
    * must never be attempted against the memory fallback, where the DB cannot
    * report what is actually on disk.
    */
-  async pruneSessionHistory(sessionId: string, keepHistoryEvents: number): Promise<{ deleted: number } | null> {
+  async pruneSessionHistory(
+    sessionId: string,
+    keepHistoryEvents: number,
+    opts?: { maxDeletions?: number },
+  ): Promise<{ deleted: number; done: boolean } | null> {
     const db = await this.ensureOpen();
     if (!db) return null;
+    // No total-count shortcut here. An earlier version skipped the sweep when
+    // the session held fewer rows than `keepHistoryEvents`, which silently
+    // disabled the last-value collapse: a small store that is 90% superseded
+    // state events is "within budget" by row count and still needs collapsing.
+    // The walk is bounded and runs off the paint path, so pay it.
+    const maxDeletions = Math.max(1, opts?.maxDeletions ?? Number.MAX_SAFE_INTEGER);
     try {
-      return await new Promise<{ deleted: number }>((resolve, reject) => {
+      return await new Promise<{ deleted: number; done: boolean }>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readwrite');
         const index = tx.objectStore(STORE_NAME).index('session_ts');
         const range = IDBKeyRange.bound([sessionId, 0], [sessionId, Infinity]);
         const keptLastValueTypes = new Set<string>();
         let historyKept = 0;
         let deleted = 0;
+        let done = true;
         const req = index.openCursor(range, 'prev');
         req.onsuccess = () => {
           const cursor = req.result;
           // Walk finished; tx.oncomplete settles once the deletes commit.
           if (!cursor) return;
+          // Stop the transaction short once the deletion budget is spent. A
+          // never-pruned store holds tens of thousands of rows, and deleting
+          // them in ONE readwrite transaction blocks every other session's
+          // read on this shared connection -- which showed up as chats opening
+          // blank and stuck on "local cache" while the sweep ran. Deletions are
+          // taken from the OLDEST end, so a capped sweep always makes progress
+          // and the next one resumes.
+          if (deleted >= maxDeletions) { done = false; return; }
           const type = String((cursor.value as TimelineEvent).type ?? '');
           let drop: boolean;
           if (isLastValueTimelineEventType(type)) {
@@ -549,7 +568,7 @@ export class TimelineDB {
           cursor.continue();
         };
         req.onerror = () => reject(req.error);
-        tx.oncomplete = () => resolve({ deleted });
+        tx.oncomplete = () => resolve({ deleted, done });
         tx.onerror = () => reject(tx.error);
         tx.onabort = () => reject(tx.error);
       });
