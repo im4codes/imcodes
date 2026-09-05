@@ -45,7 +45,7 @@ import {
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
-import { deterministicSendMessageId } from '../../shared/send-message-id.js';
+import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
 
 type ToolResult = Record<string, unknown>;
 
@@ -77,6 +77,7 @@ export interface SupervisionVisibilityItem {
     auditAttemptId?: string;
     auditRevision?: string;
     verdict?: string;
+    generation?: number;
     identity?: {
       sessionName?: string;
       sessionInstanceId?: string;
@@ -189,9 +190,11 @@ export interface SupervisionRegistryPort {
       sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
       agentType: string; providerFamily: string;
     };
+    expectedGeneration: number;
     expectedRevision: string;
     auditAttemptId: string;
     callerProjectName: string;
+    supersededDeliveryMessageId: string;
     deliveryMessageId: string;
     idempotencyKey: string;
     reason: string;
@@ -257,11 +260,12 @@ export interface SupervisionMcpToolDeps {
     coordinatorAssignmentId: string;
     origin: { sessionName: string; sessionInstanceId: string; runtimeEpoch: string };
   }) => number;
-  /** Best-effort retirement of the superseded target's pending queue row. */
+  /** CAS retirement of the superseded target's exact pending queue identity. */
   retireSupersededAuditDelivery?: (input: {
     sessionName: string;
     messageId: string;
-  }) => void;
+    recipient: { sessionInstanceId: string; runtimeEpoch: string };
+  }) => boolean | Promise<boolean>;
   resolveSessionIdentity?: (sessionName: string) => {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
     agentType: string; providerFamily: string; projectName: string;
@@ -678,15 +682,18 @@ export function createSupervisionMcpToolHandlers(
           && candidate.auditRevision === expectedRevision
         )) ?? [];
         if (assignment?.role !== 'auditor'
-          || assignment.status !== 'delegated'
+          || (assignment.status !== 'delegated' && assignment.status !== 'auditing')
           || assignment.auditAttemptId !== auditAttemptId
           || assignment.auditRevision !== expectedRevision
+          || !Number.isSafeInteger(assignment.generation)
           || implementers.length !== 1) {
-          return err('invalid_transition', 'orphaned auditor recovery requires one exact delegated auditor and ready implementer');
+          return err('invalid_transition', 'orphaned auditor recovery requires one exact open auditor and ready implementer');
         }
         const priorSessionName = assignment.identity?.sessionName;
+        const priorSessionInstanceId = assignment.identity?.sessionInstanceId;
+        const priorRuntimeEpoch = assignment.identity?.runtimeEpoch;
         const implementerProviderFamily = implementers[0]?.identity?.providerFamily;
-        if (!priorSessionName || !implementerProviderFamily) {
+        if (!priorSessionName || !priorSessionInstanceId || !priorRuntimeEpoch || !implementerProviderFamily) {
           return err('identity_rejected', 'orphaned auditor recovery requires complete durable assignment identities');
         }
         const identity = deps.resolveSessionIdentity?.(rebindSessionName);
@@ -696,9 +703,44 @@ export function createSupervisionMcpToolHandlers(
           || identity.providerFamily === implementerProviderFamily) {
           return err('identity_rejected', 'orphaned auditor recovery requires one live same-project cross-vendor transport target');
         }
-        const deliveryMessageId = deterministicSendMessageId(
-          `auto-audit:${assignmentId}:${auditAttemptId}`,
+        const alreadyRebound = assignment.identity?.sessionName === identity.sessionName
+          && assignment.identity?.sessionInstanceId === identity.sessionInstanceId
+          && assignment.identity?.runtimeEpoch === identity.runtimeEpoch
+          && assignment.identity?.agentType === identity.agentType
+          && assignment.identity?.providerFamily === identity.providerFamily;
+        const deliveryGeneration = alreadyRebound
+          ? assignment.generation!
+          : assignment.generation! + 1;
+        const supersededDeliveryMessageId = deterministicAutomaticAuditDeliveryMessageId(
+          assignmentId,
+          auditAttemptId,
+          Math.max(1, deliveryGeneration - 1),
         );
+        const deliveryMessageId = deterministicAutomaticAuditDeliveryMessageId(
+          assignmentId,
+          auditAttemptId,
+          deliveryGeneration,
+        );
+        if (!alreadyRebound) {
+          const retire = deps.retireSupersededAuditDelivery;
+          if (!retire) return err('unavailable', 'exact superseded audit delivery retirement is not bound');
+          let retired = false;
+          try {
+            retired = await retire({
+              sessionName: priorSessionName,
+              messageId: supersededDeliveryMessageId,
+              recipient: {
+                sessionInstanceId: priorSessionInstanceId,
+                runtimeEpoch: priorRuntimeEpoch,
+              },
+            });
+          } catch {
+            return err('unavailable', 'exact superseded audit delivery retirement failed');
+          }
+          if (!retired) {
+            return err('identity_rejected', 'superseded audit delivery identity no longer matches');
+          }
+        }
         const rebound = reg.recoverOrphanedDelegatedAuditor?.({
           taskId,
           assignmentId,
@@ -709,21 +751,17 @@ export function createSupervisionMcpToolHandlers(
             agentType: identity.agentType,
             providerFamily: identity.providerFamily,
           },
+          expectedGeneration: assignment.generation!,
           expectedRevision,
           auditAttemptId,
           callerProjectName: taskProjectName,
+          supersededDeliveryMessageId,
           deliveryMessageId,
           idempotencyKey,
           reason,
         });
         if (!rebound) return err('unavailable', 'orphaned auditor recovery is not bound');
         if (!rebound.ok) return err(rebound.reason, `orphaned auditor recovery rejected: ${rebound.reason}`);
-        if (!rebound.replay) {
-          deps.retireSupersededAuditDelivery?.({
-            sessionName: priorSessionName,
-            messageId: deliveryMessageId,
-          });
-        }
         let auditTrigger: unknown;
         try {
           auditTrigger = await deps.dispatchReadyAudit?.(taskId);

@@ -57,7 +57,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   ]);
   assignmentStates = new Map<string, Array<{
     assignmentId: string; role: string; status: string; leaseId: string; auditAttemptId?: string;
-    auditRevision?: string; verdict?: string;
+    auditRevision?: string; verdict?: string; generation?: number;
     identity: { sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; agentType?: string; providerFamily?: string };
   }>>();
   currentRevisions = new Map<string, string>();
@@ -1112,7 +1112,7 @@ describe('administrative recover', () => {
         identity: testIdentity('deck_d4d_implementer'),
       },
       {
-        assignmentId, role: 'auditor', status: 'delegated', leaseId: '',
+        assignmentId, role: 'auditor', status: 'auditing', leaseId: '', generation: 7,
         auditAttemptId, auditRevision: revision,
         identity: {
           ...testIdentity('deck_sub_1a2h2b1w'),
@@ -1137,7 +1137,7 @@ describe('administrative recover', () => {
     const dispatchReadyAudit = vi.fn().mockResolvedValue({
       status: 'dispatched', assignmentId, auditAttemptId,
     });
-    const retireSupersededAuditDelivery = vi.fn();
+    const retireSupersededAuditDelivery = vi.fn().mockReturnValue(true);
     const handlers = createSupervisionMcpToolHandlers(CALLER, {
       registry,
       isProjectBrain: () => true,
@@ -1166,6 +1166,7 @@ describe('administrative recover', () => {
     expect(registry.orphanedAuditorRebound).toEqual([
       expect.objectContaining({
         taskId, assignmentId, expectedRevision: revision, auditAttemptId,
+        expectedGeneration: 7,
         identity: expect.objectContaining({ sessionName: replacement.sessionName }),
         callerProjectName: 'codedeck',
       }),
@@ -1173,11 +1174,57 @@ describe('administrative recover', () => {
     expect(retireSupersededAuditDelivery).toHaveBeenCalledWith({
       sessionName: 'deck_sub_1a2h2b1w',
       messageId: expect.stringMatching(/^send_message_/),
+      recipient: {
+        sessionInstanceId: 'instance-deck_sub_1a2h2b1w',
+        runtimeEpoch: 'epoch-deck_sub_1a2h2b1w',
+      },
     });
     expect(dispatchReadyAudit).toHaveBeenCalledOnce();
     expect(dispatchReadyAudit).toHaveBeenCalledWith(taskId);
     expect(registry.rebound, 'must not use the loose legacy audit-rebind branch').toEqual([]);
     expect(registry.implementerRebound, 'must not use implementer evidence recovery').toEqual([]);
+  });
+
+  it('fails closed before rebind when exact superseded audit delivery cannot be retired', async () => {
+    const taskId = 'tsk_5w9';
+    const assignmentId = 'asg_e7r';
+    const revision = 'successor-revision-projection-cc3-r3-01c155d603b8';
+    const auditAttemptId = 'auto-audit-c73d9296ca7a631a8d5ff136';
+    registry.statuses.set(taskId, 'ready_for_audit');
+    registry.currentRevisions.set(taskId, revision);
+    registry.assignmentStates.set(taskId, [
+      {
+        assignmentId: 'asg_worker', role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditRevision: revision, identity: testIdentity('deck_worker'),
+      },
+      {
+        assignmentId, role: 'auditor', status: 'auditing', leaseId: '', generation: 3,
+        auditAttemptId, auditRevision: revision,
+        identity: { ...testIdentity('deck_stale'), agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+      },
+    ]);
+    const originalItem = registry.item.bind(registry);
+    registry.item = (id: string) => ({
+      ...originalItem(id), auditPolicy: id === taskId ? 'auto_strict_cross_vendor' : undefined,
+      validationState: id === taskId ? 'passed' : undefined,
+    });
+    const replacement = {
+      ...testResolveSessionIdentity('deck_live'),
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+    };
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true,
+      resolveSessionIdentity: () => replacement,
+      retireSupersededAuditDelivery: vi.fn().mockReturnValue(false),
+      dispatchReadyAudit: vi.fn(),
+    });
+
+    await expect(handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId, rebindSessionName: replacement.sessionName,
+      expectedRevision: revision, auditAttemptId, idempotencyKey: 'exact-retire-failed',
+      reason: 'old queue identity does not match',
+    })).resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(registry.orphanedAuditorRebound).toEqual([]);
   });
 
   it('rebinds a validated required implementer through the live same-session identity and frozen evidence', async () => {

@@ -25,6 +25,21 @@ export function deterministicSendMessageId(seed: string): SendMessageId {
   return `${SEND_MESSAGE_ID_PREFIX}${uuid}`;
 }
 
+/** Exact delivery identity for one automatic-audit assignment generation. */
+export function deterministicAutomaticAuditDeliveryMessageId(
+  assignmentId: string,
+  attemptId: string,
+  generation: number,
+): SendMessageId {
+  if (!assignmentId.trim() || !attemptId.trim()
+    || !Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('automatic audit delivery identity requires assignment, attempt, and positive generation');
+  }
+  return deterministicSendMessageId(generation === 1
+    ? `auto-audit:${assignmentId}:${attemptId}`
+    : `auto-audit-rebind:${assignmentId}:${attemptId}:${generation}`);
+}
+
 export function isSendDispatchId(value: unknown): value is SendDispatchId {
   return typeof value === 'string' && SEND_DISPATCH_ID_RE.test(value);
 }

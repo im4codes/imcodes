@@ -4605,18 +4605,20 @@ export class SupervisionTaskRegistry {
   }
 
   /**
-   * Recover one orphaned, never-started automatic auditor on the SAME durable
-   * assignment/attempt/revision. This is intentionally narrower than the
-   * general identity rebind above: any receipt or progressed lifecycle proves
-   * an execution owner may exist and therefore fails closed.
+   * Recover one orphaned automatic auditor on the SAME durable
+   * assignment/attempt/revision. Delivery can fail after the assignment has
+   * already claimed `auditing`, so lifecycle projection alone is not delivery
+   * evidence. Only a formal verdict receipt closes this recovery edge.
    */
   recoverOrphanedDelegatedAuditor(input: {
     taskId: string;
     assignmentId: string;
     identity: PersistedSupervisionTaskAssignmentIdentity;
+    expectedGeneration: number;
     expectedRevision: string;
     auditAttemptId: string;
     callerProjectName: string;
+    supersededDeliveryMessageId: string;
     deliveryMessageId: string;
     idempotencyKey: string;
     reason: string;
@@ -4627,11 +4629,15 @@ export class SupervisionTaskRegistry {
     const expectedRevision = normalizeTaskString(input.expectedRevision);
     const auditAttemptId = normalizeTaskString(input.auditAttemptId);
     const callerProjectName = normalizeTaskString(input.callerProjectName);
+    const supersededDeliveryMessageId = normalizeTaskString(input.supersededDeliveryMessageId);
     const deliveryMessageId = normalizeTaskString(input.deliveryMessageId);
     const idempotencyKey = normalizeTaskString(input.idempotencyKey);
     const reason = normalizeTaskString(input.reason);
+    const expectedGeneration = input.expectedGeneration;
     if (!taskId || !assignmentId || !expectedRevision || !auditAttemptId
-      || !callerProjectName || !deliveryMessageId || !idempotencyKey || !reason) {
+      || !callerProjectName || !supersededDeliveryMessageId || !deliveryMessageId
+      || supersededDeliveryMessageId === deliveryMessageId || !idempotencyKey || !reason
+      || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
       return { ok: false, reason: 'invalid' };
     }
     const now = input.now ?? Date.now();
@@ -4647,6 +4653,17 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'owner_mismatch' };
       }
+      const hasFormalReceipt = this.listAuditReceipts(taskId).some((receipt) => (
+        receipt.assignmentId === assignmentId
+        && receipt.attemptId === auditAttemptId
+        && receipt.revision === expectedRevision
+        && receipt.receiptKind === 'final'
+        && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
+      ));
+      if (hasFormalReceipt) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'receipt_closed' };
+      }
       const priorEvents = this.listEvents(taskId).filter((event) => (
         event.eventType === 'recovered'
         && event.assignmentId === assignmentId
@@ -4659,6 +4676,7 @@ export class SupervisionTaskRegistry {
         && event.payload?.targetSessionName === input.identity.sessionName
         && event.payload?.targetSessionInstanceId === input.identity.sessionInstanceId
         && event.payload?.targetRuntimeEpoch === input.identity.runtimeEpoch
+        && event.payload?.supersededDeliveryMessageId === supersededDeliveryMessageId
         && event.payload?.deliveryMessageId === deliveryMessageId
       ));
       if (priorEvents.length > 0) {
@@ -4667,28 +4685,26 @@ export class SupervisionTaskRegistry {
           ? { ok: true, value: assignment, replay: true }
           : { ok: false, reason: 'conflicting_replay' };
       }
+      if (assignment.generation !== expectedGeneration) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
       const implementers = this.listAssignments(taskId).filter((candidate) => (
         candidate.required
         && (candidate.role === 'implementer' || candidate.role === 'integration_owner')
         && candidate.status === 'ready_for_audit'
         && candidate.auditRevision === expectedRevision
       ));
-      const hasReceipt = this.listAuditReceipts(taskId).some((receipt) => (
-        receipt.assignmentId === assignmentId
-        && receipt.attemptId === auditAttemptId
-        && receipt.revision === expectedRevision
-      ));
       if (task.status !== 'ready_for_audit'
         || task.validationState !== 'passed'
         || task.auditPolicy !== 'auto_strict_cross_vendor'
         || task.currentRevision !== expectedRevision
         || assignment.role !== 'auditor'
-        || assignment.status !== 'delegated'
+        || (assignment.status !== 'delegated' && assignment.status !== 'auditing')
         || assignment.auditAttemptId !== auditAttemptId
         || assignment.auditRevision !== expectedRevision
         || implementers.length !== 1
-        || implementers[0]!.identity.providerFamily === input.identity.providerFamily
-        || hasReceipt) {
+        || implementers[0]!.identity.providerFamily === input.identity.providerFamily) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid_transition' };
       }
@@ -4698,6 +4714,7 @@ export class SupervisionTaskRegistry {
       }
       const rebound: PersistedSupervisionTaskAssignment = {
         ...assignment,
+        status: 'delegated',
         identity: input.identity,
         ...(assignment.executionBinding ? {
           executionBinding: {
@@ -4713,6 +4730,10 @@ export class SupervisionTaskRegistry {
           },
         } : {}),
         generation: assignment.generation + 1,
+        verdict: undefined,
+        blocker: undefined,
+        primaryReviewPassed: undefined,
+        crossVendorAuditPassed: undefined,
         updatedAt: now,
       };
       this.#writeAssignment(rebound, 'recovered', {
@@ -4721,7 +4742,11 @@ export class SupervisionTaskRegistry {
         reason,
         revision: expectedRevision,
         attemptId: auditAttemptId,
+        supersededDeliveryMessageId,
         deliveryMessageId,
+        priorStatus: assignment.status,
+        priorGeneration: assignment.generation,
+        targetGeneration: rebound.generation,
         supersededSessionName: assignment.identity.sessionName,
         targetSessionName: input.identity.sessionName,
         targetSessionInstanceId: input.identity.sessionInstanceId,

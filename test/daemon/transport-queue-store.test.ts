@@ -17,11 +17,15 @@ import {
   resolveLegacySupervisionQueueReference,
   shouldDismissObsoleteSupervisionQueueEntry,
 } from '../../src/daemon/transport-queue-projection.js';
-import { deterministicSendMessageId } from '../../shared/send-message-id.js';
+import {
+  deterministicAutomaticAuditDeliveryMessageId,
+  deterministicSendMessageId,
+} from '../../shared/send-message-id.js';
 import {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
 } from '../../src/daemon/supervision-state-store.js';
+import { retireExactSupersededAuditDelivery } from '../../src/daemon/supervision-registry-port.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -40,6 +44,39 @@ afterEach(() => {
 });
 
 describe('TransportQueueStore', () => {
+  it('CAS-retires the exact stale audit recipient and defeats a late old-generation enqueue', () => {
+    const sessionName = 'deck_sub_stale_auditor';
+    const assignmentId = 'asg_e7r';
+    const attemptId = 'auto-audit-c73d9296ca7a631a8d5ff136';
+    const clientMessageId = deterministicAutomaticAuditDeliveryMessageId(assignmentId, attemptId, 1);
+    const stale = { sessionInstanceId: 'instance-auditor', runtimeEpoch: 'epoch-stale' };
+    const restarted = { sessionInstanceId: stale.sessionInstanceId, runtimeEpoch: 'epoch-restarted' };
+    const foreign = { sessionInstanceId: 'instance-foreign', runtimeEpoch: 'epoch-stale' };
+
+    expect(retireExactSupersededAuditDelivery(store, {
+      sessionName, messageId: clientMessageId, recipient: stale,
+    })).toBe(true);
+    expect(store.enqueue({
+      sessionName, recipient: stale, clientMessageId, text: 'late stale audit delivery', now: 110,
+      privateMaterialJson: JSON.stringify({ text: 'late stale audit delivery' }),
+    })).toMatchObject({ source: 'enqueue_cancelled', pendingMessageEntries: [] });
+    expect(store.enqueue({
+      sessionName, recipient: restarted, clientMessageId, text: 'late restarted audit delivery', now: 120,
+      privateMaterialJson: JSON.stringify({ text: 'late restarted audit delivery' }),
+    })).toMatchObject({ source: 'enqueue_cancelled', pendingMessageEntries: [] });
+    const reboundMessageId = deterministicAutomaticAuditDeliveryMessageId(assignmentId, attemptId, 2);
+    expect(store.enqueue({
+      sessionName, recipient: restarted, clientMessageId: reboundMessageId,
+      text: 'generation-bound rebound delivery', now: 125,
+      privateMaterialJson: JSON.stringify({ text: 'generation-bound rebound delivery' }),
+    })).toMatchObject({ source: 'enqueue', pendingMessageEntries: [
+      expect.objectContaining({ clientMessageId: reboundMessageId }),
+    ] });
+    expect(store.cancelQueuedMessage(sessionName, clientMessageId, foreign, 130).status)
+      .toBe('identity_mismatch');
+    expect(store.readSnapshotForRecipient(sessionName, stale).pendingMessageEntries).toEqual([]);
+  });
+
   it('derives the queue action matrix only from typed durable supervision references', () => {
     const integration = {
       kind: 'exact_integration' as const, taskId: 'tsk_done', assignmentId: 'asg_owner', revision: 'rev-1',

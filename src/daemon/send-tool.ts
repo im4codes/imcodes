@@ -2,7 +2,14 @@ import path from 'path';
 import logger from '../util/logger.js';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { createSendDispatchId, createSendMessageId, deterministicSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
+import {
+  createSendDispatchId,
+  createSendMessageId,
+  deterministicAutomaticAuditDeliveryMessageId,
+  deterministicSendMessageId,
+  type SendDispatchId,
+  type SendMessageId,
+} from '../../shared/send-message-id.js';
 import { IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG } from '../../shared/imcodes-send.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import {
@@ -1495,6 +1502,7 @@ export async function dispatchSendMessage(
 
   let supervisedTaskId: string | undefined;
   let supervisedAssignmentId: string | undefined;
+  let supervisedAssignmentGeneration: number | undefined;
   /** The task's ORIGINAL coordinator assignment, stamped onto the durable return
    *  authority so the reply is bound to that assignment rather than to whoever
    *  later holds the origin session name. */
@@ -1993,6 +2001,7 @@ export async function dispatchSendMessage(
 
     supervisedTaskId = taskId;
     supervisedAssignmentId = assignment.value.assignmentId;
+    supervisedAssignmentGeneration = assignment.value.generation;
     // Resolve the task's coordinator assignment ONCE, from the registry, and by
     // exact identity where the caller is that coordinator. This is the authority
     // a pending return may later be advanced under.
@@ -2040,9 +2049,13 @@ export async function dispatchSendMessage(
           error: 'audit redelivery requires the exact non-terminal assignment, target, attempt, revision and identity, and no final verdict',
         };
       }
-      const messageId = deterministicSendMessageId(
-        `${input.automaticSupervision ? 'auto' : 'manual'}-audit:${assignment.value.assignmentId}:${input.audit.attemptId}`,
-      );
+      const messageId = input.internalMessageId ?? (input.automaticSupervision
+        ? deterministicAutomaticAuditDeliveryMessageId(
+            assignment.value.assignmentId,
+            input.audit.attemptId,
+            assignment.value.generation,
+          )
+        : deterministicSendMessageId(`manual-audit:${assignment.value.assignmentId}:${input.audit.attemptId}`));
       if ((deps?.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(targetIdentity.sessionName, messageId)) {
         return {
           status: 'error',
@@ -2084,7 +2097,13 @@ export async function dispatchSendMessage(
   for (const target of dispatchable) {
     const messageId = input.internalMessageId
       ?? (supervisedAssignmentId && input.audit
-        ? deterministicSendMessageId(`${input.automaticSupervision ? 'auto' : 'manual'}-audit:${supervisedAssignmentId}:${input.audit.attemptId}`)
+        ? input.automaticSupervision
+          ? deterministicAutomaticAuditDeliveryMessageId(
+              supervisedAssignmentId,
+              input.audit.attemptId,
+              supervisedAssignmentGeneration ?? 1,
+            )
+          : deterministicSendMessageId(`manual-audit:${supervisedAssignmentId}:${input.audit.attemptId}`)
         : createSendMessageId());
     // A newly registered assignment must always have an authenticated return
     // path. Without this, a worker that hits illegal_transition or a contract
@@ -2948,7 +2967,11 @@ export async function dispatchReadyAudit(
       const reported = await reportBlocker(implementer, reason);
       return { status: 'blocked', reason, reported };
     }
-    const messageId = deterministicSendMessageId(`auto-audit:${existingAudit.assignmentId}:${attemptId}`);
+    const messageId = deterministicAutomaticAuditDeliveryMessageId(
+      existingAudit.assignmentId,
+      attemptId,
+      existingAudit.generation,
+    );
     const recoveredHandoff = recoverAutomaticAuditHandoff(target.name, messageId, deps);
     const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
     const hasExistingEvidence = hasEvidence(target.name, messageId);
@@ -3098,8 +3121,13 @@ export async function dispatchReadyAudit(
       now: deps.now?.() ?? Date.now(),
     });
   }
+  const acceptedAudit = registry.getAssignment(result.assignmentId);
   const messageId = result.messageId
-    ?? deterministicSendMessageId(`auto-audit:${result.assignmentId}:${attemptId}`);
+    ?? deterministicAutomaticAuditDeliveryMessageId(
+      result.assignmentId,
+      attemptId,
+      acceptedAudit?.generation ?? 1,
+    );
   return { status: 'dispatched', assignmentId: result.assignmentId, attemptId, messageId };
 }
 

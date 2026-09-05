@@ -9,7 +9,10 @@ import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { normalizeSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
-import type { SendMessageId } from '../../shared/send-message-id.js';
+import {
+  deterministicAutomaticAuditDeliveryMessageId,
+  type SendMessageId,
+} from '../../shared/send-message-id.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
   clearSendIdempotencyCacheForTests,
@@ -2445,15 +2448,20 @@ describe('periodic supervision convergence tick', () => {
     if (!auditor.ok) throw new Error(auditor.reason);
     const replacement = identity('deck_alpha_live_cc9', 'claude-code-sdk', 'anthropic');
     const messageId = automaticMessageId(auditor.value.assignmentId, attemptId);
+    const replacementMessageId = deterministicAutomaticAuditDeliveryMessageId(
+      auditor.value.assignmentId, attemptId, auditor.value.generation + 1,
+    );
 
     expect(registry.recoverOrphanedDelegatedAuditor({
       taskId,
       assignmentId: auditor.value.assignmentId,
       identity: replacement,
+      expectedGeneration: auditor.value.generation,
       expectedRevision: revision,
       auditAttemptId: attemptId,
       callerProjectName: 'alpha',
-      deliveryMessageId: messageId,
+      supersededDeliveryMessageId: messageId,
+      deliveryMessageId: replacementMessageId,
       idempotencyKey: `orphan-rebind:${taskId}:${auditor.value.assignmentId}:${attemptId}`,
       reason: 'old auditor target is no longer discoverable and has no visible acceptance',
       now: 200,
@@ -2471,10 +2479,12 @@ describe('periodic supervision convergence tick', () => {
       taskId,
       assignmentId: auditor.value.assignmentId,
       identity: replacement,
+      expectedGeneration: auditor.value.generation,
       expectedRevision: revision,
       auditAttemptId: attemptId,
       callerProjectName: 'alpha',
-      deliveryMessageId: messageId,
+      supersededDeliveryMessageId: messageId,
+      deliveryMessageId: replacementMessageId,
       idempotencyKey: `orphan-rebind:${taskId}:${auditor.value.assignmentId}:${attemptId}`,
       reason: 'old auditor target is no longer discoverable and has no visible acceptance',
       now: 300,
@@ -2485,7 +2495,7 @@ describe('periodic supervision convergence tick', () => {
     const liveAuditor = session(replacement.sessionName, 'w2', 'claude-code-sdk', 'anthropic');
     let replacementEvidence = false;
     const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
-      expect(input.internalMessageId).toBe(messageId);
+      expect(input.internalMessageId).toBe(replacementMessageId);
       expect(input.task).toMatchObject({
         taskId, assignmentId: auditor.value.assignmentId,
         auditAttemptId: attemptId, auditRevision: revision,
@@ -2494,7 +2504,7 @@ describe('periodic supervision convergence tick', () => {
       return {
         status: 'accepted' as const,
         dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000d6' as const,
-        messageId,
+        messageId: input.internalMessageId!,
         deliveries: [{ target: liveAuditor.name, status: 'queued' as const }],
         taskId,
         assignmentId: auditor.value.assignmentId,
@@ -2506,17 +2516,19 @@ describe('periodic supervision convergence tick', () => {
       listTargets: listTargetRecords(liveAuditor),
       dispatch,
       hasDeliveryEvidence: (sessionName: string, candidate: SendMessageId) => (
-        candidate === messageId
+        candidate === replacementMessageId
         && (sessionName === oldIdentity.sessionName
           || (sessionName === liveAuditor.name && replacementEvidence))
       ),
       hasVisibleAuditAcceptance: () => replacementEvidence,
     };
     await expect(dispatchReadyAudit(taskId, deps)).resolves.toMatchObject({
-      status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId, messageId,
+      status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId,
+      messageId: replacementMessageId,
     });
     await expect(dispatchReadyAudit(taskId, deps)).resolves.toMatchObject({
-      status: 'replayed', assignmentId: auditor.value.assignmentId, attemptId, messageId,
+      status: 'replayed', assignmentId: auditor.value.assignmentId, attemptId,
+      messageId: replacementMessageId,
     });
     expect(dispatch).toHaveBeenCalledOnce();
     expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([
@@ -2528,6 +2540,129 @@ describe('periodic supervision convergence tick', () => {
       }),
     ]);
     expect(registry.listAuditReceipts(taskId)).toEqual([]);
+  });
+
+  it('recovers auditing tsk_5w9/asg_e7r in place and replays exactly after restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-auditing-rebind-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const taskId = 'tsk_5w9';
+    const revision = 'successor-revision-projection-cc3-r3-01c155d603b8';
+    const attemptId = 'auto-audit-c73d9296ca7a631a8d5ff136';
+    const assignmentId = 'asg_e7r';
+    const oldIdentity = identity('deck_sub_stale_cc3', 'claude-code-sdk', 'anthropic');
+    const replacement = identity('deck_sub_live_cc3', 'claude-code-sdk', 'anthropic');
+    const idempotencyKey = `orphan-auditor:${taskId}:${assignmentId}:${attemptId}`;
+    const messageId = automaticMessageId(assignmentId, attemptId);
+    let registry = new SupervisionTaskRegistry({ database: new DatabaseSync(dbPath) });
+    try {
+      makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor', registry });
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'auditor', required: false, identity: oldIdentity,
+        auditAttemptId: attemptId, auditRevision: revision,
+        idempotencyKey: `send:auto-audit:${taskId}:${revision}`, now: 100,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      expect(registry.updateAssignment({
+        assignmentId, identity: oldIdentity, status: 'auditing',
+        auditAttemptId: attemptId, auditRevision: revision, now: 110,
+      })).toMatchObject({ ok: true });
+      const before = registry.getAssignment(assignmentId)!;
+
+      const request = {
+        taskId, assignmentId, identity: replacement,
+        expectedGeneration: before.generation,
+        expectedRevision: revision, auditAttemptId: attemptId,
+        callerProjectName: 'alpha', supersededDeliveryMessageId: messageId,
+        deliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(
+          assignmentId, attemptId, before.generation + 1,
+        ),
+        idempotencyKey, reason: 'transport queue unavailable without durable delivery evidence', now: 200,
+      };
+      expect(registry.recoverOrphanedDelegatedAuditor(request)).toMatchObject({
+        ok: true,
+        value: {
+          assignmentId, status: 'delegated', generation: before.generation + 1,
+          auditAttemptId: attemptId, auditRevision: revision, identity: replacement,
+        },
+      });
+      expect(registry.listAuditReceipts(taskId)).toEqual([]);
+      expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'recovered'
+        && event.assignmentId === assignmentId
+        && event.payload?.source === 'orphaned_automatic_auditor_rebind'
+      ))).toHaveLength(1);
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ database: new DatabaseSync(dbPath) });
+      expect(registry.recoverOrphanedDelegatedAuditor({ ...request, now: 300 })).toMatchObject({
+        ok: true, replay: true,
+        value: { assignmentId, status: 'delegated', generation: before.generation + 1, identity: replacement },
+      });
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'recovered'
+        && event.assignmentId === assignmentId
+        && event.payload?.source === 'orphaned_automatic_auditor_rebind'
+      ))).toHaveLength(1);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts progress-only auditing recovery but rejects a stale generation and a formal receipt', () => {
+    const taskId = 'tsk_5w9-progress';
+    const revision = 'successor-revision-projection-cc3-r3-01c155d603b8';
+    const attemptId = 'auto-audit-c73d9296ca7a631a8d5ff136';
+    const assignmentId = 'asg_e7r';
+    const { registry } = makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor' });
+    const oldIdentity = identity('deck_sub_stale_cc3', 'claude-code-sdk', 'anthropic');
+    const firstTarget = identity('deck_sub_live_cc3', 'claude-code-sdk', 'anthropic');
+    const secondTarget = identity('deck_sub_other_cc3', 'claude-code-sdk', 'anthropic');
+    const created = registry.createAssignment({
+      assignmentId, taskId, role: 'auditor', required: false, identity: oldIdentity,
+      auditAttemptId: attemptId, auditRevision: revision, now: 100,
+    });
+    if (!created.ok) throw new Error(created.reason);
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: assignmentId, auditorIdentity: oldIdentity,
+      auditorSessionName: oldIdentity.sessionName, attemptId, revision,
+      receiptKind: 'progress', findings: 'claimed but transport delivery was never durable', validations: [], now: 110,
+    })).toMatchObject({ ok: true, value: { receiptKind: 'progress' } });
+    const before = registry.getAssignment(assignmentId)!;
+    const common = {
+      taskId, assignmentId, expectedGeneration: before.generation,
+      expectedRevision: revision, auditAttemptId: attemptId, callerProjectName: 'alpha',
+      supersededDeliveryMessageId: automaticMessageId(assignmentId, attemptId),
+      deliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(
+        assignmentId, attemptId, before.generation + 1,
+      ),
+      reason: 'recover exact active round without replacing its assignment or attempt',
+    };
+    expect(registry.recoverOrphanedDelegatedAuditor({
+      ...common, identity: firstTarget, idempotencyKey: 'recover-first', now: 200,
+    })).toMatchObject({ ok: true, value: { status: 'delegated', identity: firstTarget } });
+    expect(registry.recoverOrphanedDelegatedAuditor({
+      ...common, identity: secondTarget, idempotencyKey: 'recover-stale-generation', now: 210,
+    })).toEqual({ ok: false, reason: 'conflicting_replay' });
+    expect(registry.getAssignment(assignmentId)).toMatchObject({
+      identity: firstTarget, generation: before.generation + 1,
+    });
+
+    expect(registry.updateAssignment({
+      assignmentId, identity: firstTarget, status: 'auditing',
+      auditAttemptId: attemptId, auditRevision: revision, now: 220,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: assignmentId, auditorIdentity: firstTarget,
+      auditorSessionName: firstTarget.sessionName, attemptId, revision,
+      receiptKind: 'final', verdict: 'REWORK', findings: 'formal finding', validations: [], now: 230,
+    })).toMatchObject({ ok: true, value: { receiptKind: 'final', verdict: 'REWORK' } });
+    expect(registry.recoverOrphanedDelegatedAuditor({
+      ...common,
+      expectedGeneration: registry.getAssignment(assignmentId)!.generation,
+      identity: secondTarget, idempotencyKey: 'recover-after-final', now: 240,
+    })).toEqual({ ok: false, reason: 'receipt_closed' });
   });
 
   it('routes tsk_79u from the authoritative coordinator pool instead of the worker legacy snapshot', async () => {

@@ -27,7 +27,22 @@ import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-ins
 import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-ingress.js';
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
-import { getTransportQueueStore } from './transport-queue-store.js';
+import { getTransportQueueStore, type TransportQueueStore } from './transport-queue-store.js';
+
+export function retireExactSupersededAuditDelivery(
+  store: Pick<TransportQueueStore, 'cancelQueuedMessage'>,
+  input: {
+    sessionName: string;
+    messageId: string;
+    recipient: { sessionInstanceId: string; runtimeEpoch: string };
+  },
+): boolean {
+  return store.cancelQueuedMessage(
+    input.sessionName,
+    input.messageId,
+    input.recipient,
+  ).status === 'accepted';
+}
 
 /**
  * One live-session authority check shared by the MCP project list and the Web
@@ -302,16 +317,14 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
     advancePendingRepliesForReboundCoordinator: (input) => (
       advancePendingRepliesForReboundCoordinator(input)
     ),
-    retireSupersededAuditDelivery: ({ sessionName, messageId }) => {
+    retireSupersededAuditDelivery: ({ sessionName, messageId, recipient }) => {
       try {
-        const store = getTransportQueueStore();
-        const pending = store.readSnapshot(sessionName, 'orphaned_auditor_rebind_retire')
-          .pendingMessageEntries.some((entry) => entry.clientMessageId === messageId);
-        if (pending) store.markDeleted(sessionName, messageId);
+        return retireExactSupersededAuditDelivery(
+          getTransportQueueStore(),
+          { sessionName, messageId, recipient },
+        );
       } catch {
-        // The registry event is the durable supersession authority. Queue
-        // cleanup is best-effort and the replacement target is independently
-        // keyed, so a stale old-target row cannot authorize execution.
+        return false;
       }
     },
     resolveSessionIdentity: (sessionName) => {
