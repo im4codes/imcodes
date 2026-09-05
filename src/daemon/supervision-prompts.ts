@@ -436,13 +436,16 @@ export function buildSupervisionTaskFinalizationContract(_locale?: SupervisionUi
     contractId: SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
     v: 1,
     integration_slice: { audit: false, handoff: 'ready_for_integration' },
-    overall: { audit: 'one_matching', bind: ['attemptId', 'revision'], oldPassReleasesNewRevision: false },
+    overall: {
+      audit: 'one_matching_delta_reuse_unchanged_pass',
+      bind: ['attemptId', 'revision'],
+      oldPassReleasesNewRevision: false,
+    },
     beforePass: { forbid: ['stage', 'commit', 'push', 'merge', 'release', 'publish', 'deploy'] },
     authority: 'actual_worktree+Git_bytes',
     git: { conflict: 'block', add: 'explicit_non_broad_pathspec', forbidAdd: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD, forbidStagePrefixes: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES },
     metadata: { fields: ['ownedFiles', 'scopeFiles', 'touchedFiles', 'file_event', 'integrationManifest'], mode: 'record_only', editAllowlist: false, gate: false },
     auditEvidence: { frozenFirst: true, rerun: 'minimal_on_concrete_gap', rerunReason: true },
-    design: 'smallest_reliable',
     implementation_finished: 'handoff_not_PASS_or_Git_finalization',
   });
 }

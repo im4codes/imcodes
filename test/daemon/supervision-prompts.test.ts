@@ -38,7 +38,10 @@ describe('supervision prompts', () => {
     expect(finalization).toMatchObject({
       contractId: SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
       integration_slice: { audit: false, handoff: 'ready_for_integration' },
-      overall: { audit: 'one_matching', oldPassReleasesNewRevision: false },
+      overall: {
+        audit: 'one_matching_delta_reuse_unchanged_pass',
+        oldPassReleasesNewRevision: false,
+      },
       authority: 'actual_worktree+Git_bytes',
       metadata: { mode: 'record_only', editAllowlist: false, gate: false },
       auditEvidence: { frozenFirst: true, rerun: 'minimal_on_concrete_gap' },

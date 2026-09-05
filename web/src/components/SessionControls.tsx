@@ -5443,13 +5443,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   {quickSupervisionMode === SUPERVISION_MODE.OFF ? '● ' : '○ '}{t('session.supervision.mode.off')}
                 </button>
                 <button
-                  class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? 'menu-item-active' : ''}`}
-                  onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED); }}
-                  disabled={!canQuickControlSupervision}
-                >
-                  {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? '● ' : '○ '}{t('session.supervision.mode.supervised')}
-                </button>
-                <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? 'menu-item-active' : ''}`}
                   onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED_AUDIT); }}
                   disabled={!canQuickControlSupervision}

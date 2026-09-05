@@ -6245,7 +6245,7 @@ afterEach(() => {
     expect(metadataScroller?.querySelector('.shortcuts-model')).toBeTruthy();
   });
 
-  it('shows a compact Auto dropdown for supported transport sessions and enables supervised mode from saved defaults', async () => {
+  it('hides standalone supervision from the compact Auto dropdown while keeping audit available', () => {
     const ws = makeWs();
     fetchSupervisorDefaultsMock.mockResolvedValue({
       backend: 'codex-sdk',
@@ -6266,7 +6266,6 @@ afterEach(() => {
         economyTaskPool: { configs: [], controls: {} },
       },
     });
-    const onTransportConfigSaved = vi.fn();
     render(
       <SessionControls
         ws={ws as any}
@@ -6277,7 +6276,6 @@ afterEach(() => {
           state: 'idle',
         })}
         onSettings={vi.fn()}
-        onTransportConfigSaved={onTransportConfigSaved}
         quickData={makeQuickData() as any}
       />,
     );
@@ -6289,25 +6287,8 @@ afterEach(() => {
     expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(false);
     fireEvent.click(autoBtn);
     expect(document.querySelector('.menu-dropdown-auto')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
-
-    await waitFor(() => {
-      expect(patchSessionSupervisionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
-        mode: 'supervised',
-        backend: 'codex-sdk',
-        model: 'gpt-5.4',
-      }));
-    });
-    expect(onTransportConfigSaved).toHaveBeenCalledWith(expect.objectContaining({
-      supervision: expect.objectContaining({
-        mode: 'supervised',
-      }),
-    }));
-    expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(true);
-    expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);
-    expect(autoBtn.textContent).toContain('supervised');
-    expect(autoBtn.textContent).not.toContain('Auto');
-    expect(screen.getByTestId('supervision-mode-toast').textContent).toContain('Automatic supervision is now supervised.');
+    expect(screen.queryByRole('button', { name: /(^|\s)supervised$/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /supervised_audit$/i })).toBeTruthy();
   });
 
   it('keeps the previous Auto mode and shows a specific synchronization error when saving fails', async () => {
@@ -6337,7 +6318,20 @@ afterEach(() => {
       <SessionControls
         ws={ws as any}
         serverId="srv1"
-        activeSession={makeTransportSession({ name: 'codex-sdk-session', role: 'brain', state: 'idle' })}
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          role: 'brain',
+          state: 'idle',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.4',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+            },
+          },
+        })}
         onSettings={vi.fn()}
         onTransportConfigSaved={onTransportConfigSaved}
         quickData={makeQuickData() as any}
@@ -6346,10 +6340,11 @@ afterEach(() => {
 
     const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
     fireEvent.click(autoBtn);
-    fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
+    expect(screen.queryByRole('button', { name: /(^|\s)supervised$/i })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /off$/i }));
 
     await waitFor(() => expect(screen.getByText('Automatic supervision could not be synchronized. Please retry.')).toBeTruthy());
-    expect(autoBtn.classList.contains('shortcut-btn-auto-off')).toBe(true);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(true);
     expect(onTransportConfigSaved).not.toHaveBeenCalled();
     expect(screen.queryByTestId('supervision-mode-toast')).toBeNull();
   });
