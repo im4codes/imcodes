@@ -1334,14 +1334,70 @@ async function prepareLease(command: DirectFileTransferLeasePrepare, sender: Fil
   });
 }
 
+/**
+ * Refuse an operation the daemon has decided not to run, out loud.
+ *
+ * Every guard below used to `return` silently. The browser has already been
+ * told AUTHORIZED by the server — the server does not wait for the daemon to
+ * confirm PREPARE — so it goes on to open a data channel and send START into
+ * a daemon that is never going to answer. With nothing coming back, its only
+ * way to discover this is to burn its whole connect budget and then fall back,
+ * which is precisely the "connecting, 0 bytes, for twenty seconds" report.
+ *
+ * Refusing explicitly turns that wait into an immediate fallback. It is sent
+ * through `sender` rather than `sendControl` because most of these guards fire
+ * exactly when there is no lease to send through.
+ */
+function refuseOperation(
+  authority: DirectFileTransferPrepare,
+  sender: FileTransferSender,
+  error: DirectFileTransferError,
+  retryable: boolean,
+): void {
+  directFileMetric('attempt_refused', {
+    direction: authority.direction,
+    attempt: authority.attempt,
+    error,
+    retryable,
+  });
+  try {
+    sender.send({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION,
+      ...attemptBinding(authority),
+      error,
+      retryable,
+    });
+  } catch { /* control socket already gone; the browser will time out as before */ }
+}
+
 async function prepareOperation(authority: DirectFileTransferPrepare, sender: FileTransferSender): Promise<void> {
-  if (!rtc) return;
-  if (Date.now() >= authority.authorityExpiresAt) return;
+  if (!rtc) {
+    refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
+    return;
+  }
+  if (Date.now() >= authority.authorityExpiresAt) {
+    refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, false);
+    return;
+  }
   const lease = leases.get(leaseKey(authority.leaseId, authority.leaseGeneration));
   if (!lease || lease.binding.serverId !== authority.serverId || lease.binding.browserTabId !== authority.browserTabId
-    || lease.binding.daemonGeneration !== authority.daemonGeneration) return;
+    || lease.binding.daemonGeneration !== authority.daemonGeneration) {
+    // The daemon evicts an idle lease on its own timer without telling the
+    // server, so the server can still hand out authority against one that is
+    // gone here. Retryable: re-initialising the lease is exactly the recovery.
+    refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION, true);
+    return;
+  }
   lease.sender = sender;
-  if (lease.activeAttempts.size >= DIRECT_FILE_TRANSFER_LIMITS.MAX_ACTIVE_CHANNELS_PER_LEASE) return;
+  if (lease.activeAttempts.size >= DIRECT_FILE_TRANSFER_LIMITS.MAX_ACTIVE_CHANNELS_PER_LEASE) {
+    refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.TOO_MANY_CHANNELS, true);
+    return;
+  }
+  // Duplicate PREPARE for an attempt already running stays silent on purpose:
+  // it is an idempotent replay, and answering it with an error would terminate
+  // the live attempt it duplicates.
   if (activeAttempts.has(authority.attemptId)) return;
   directFileMetric('attempt_started', { direction: authority.direction, attempt: authority.attempt });
   if (authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
@@ -1381,7 +1437,14 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Fi
     settled: false,
     idleTimer: null,
   };
-  if (authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && !transfer.uploadClaim) return;
+  if (authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && !transfer.uploadClaim) {
+    // Another attempt for this same clientUploadId still owns the claim — and
+    // clientUploadId is constant across all retries of one upload, so a leaked
+    // claim silently no-ops every retry. Say so instead: the browser exhausts
+    // its retries in milliseconds and takes HTTP.
+    refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.STALE_ATTEMPT, true);
+    return;
+  }
   activeAttempts.set(authority.attemptId, transfer);
   lease.activeAttempts.add(authority.attemptId);
   resetLeaseIdleTimer(lease);

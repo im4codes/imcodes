@@ -1315,6 +1315,61 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('refuses an operation whose lease it no longer holds instead of going quiet', async () => {
+    // The server does not wait for the daemon to confirm PREPARE before telling
+    // the browser AUTHORIZED, and the daemon evicts an idle lease on its own
+    // timer without telling the server. So the browser can open a channel and
+    // send START into a daemon that will never answer. Silence leaves it
+    // burning its whole connect budget before falling back — the reported
+    // "connecting, 0 bytes" stall. Refuse out loud so it falls back at once.
+    const { direct, sent, sender } = await readyLease();
+    sent.length = 0;
+
+    await direct.handleDirectFileTransferCommand(uploadPrepare({
+      ...binding({ leaseId: 'lease-that-was-evicted' }),
+      clientUploadId: operationId,
+      channelLabel: 'imcodes-file-upload-gone',
+    }), sender);
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      error: DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+      retryable: true,
+    }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('refuses an operation whose authority has already expired', async () => {
+    const { direct, sent, sender } = await readyLease();
+    sent.length = 0;
+
+    await direct.handleDirectFileTransferCommand(uploadPrepare({
+      authorityExpiresAt: Date.now() - 1,
+      channelLabel: 'imcodes-file-upload-expired',
+    }), sender);
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      error: DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED,
+      retryable: false,
+    }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('stays silent for a duplicate prepare so a replay cannot kill the live attempt', async () => {
+    // The one guard that must NOT answer: a repeated PREPARE for an attempt
+    // already running is an idempotent replay, and an error would terminate the
+    // very transfer it duplicates.
+    const { direct, sent, sender } = await readyLease();
+    await direct.handleDirectFileTransferCommand(uploadPrepare(), sender);
+    sent.length = 0;
+
+    await direct.handleDirectFileTransferCommand(uploadPrepare(), sender);
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.ERROR)).toEqual([]);
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('restarts the no-progress window when a slow relayed channel finally attaches', async () => {
     // The window is armed at authorization, before any channel exists, so a
     // browser still completing ICE and DTLS was spending it. A relayed path is

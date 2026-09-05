@@ -180,6 +180,23 @@ const SUPERVISION_WAITING_HEARTBEAT_MS = 10 * 60_000;
 const IMPLEMENTATION_IDLE_REMINDER_MS = 10 * 60_000;
 const IMPLEMENTATION_REMINDER_MAX_BACKOFF_MS = 60 * 60_000;
 const IMPLEMENTATION_WATCHDOG_TICK_MS = 60_000;
+/**
+ * Backoff for a housekeeping batch that keeps throwing.
+ *
+ * The batch is synchronous SQLite on the daemon's only event loop. A permanent
+ * failure used to retry every tick forever — this machine's log holds 629
+ * consecutive identical failures, about ten hours of it — and each attempt
+ * blocks the loop. The measured cost was 881 event-loop stalls with a median
+ * drift of 8.9 s, and EVERY direct-file-transfer failure in the same log landed
+ * inside one of those windows: the WebRTC data plane was not broken, it was
+ * starved of callbacks.
+ *
+ * Whatever the underlying cause of a failing batch, retrying it at full rate
+ * cannot fix it and demonstrably breaks unrelated real-time paths, so a
+ * repeatedly failing batch backs off instead of spinning.
+ */
+const HOUSEKEEPING_FAILURE_BACKOFF_START_MS = 5 * 60_000;
+const HOUSEKEEPING_FAILURE_BACKOFF_MAX_MS = 60 * 60_000;
 const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
 /**
  * Provider/runtime projections are not guaranteed to publish the final
@@ -936,6 +953,12 @@ class SupervisionAutomation {
   private emittedAuditResultAttemptIdSet = new Set<string>();
   private implementationBlockerEscalationsInFlight = new Set<string>();
   private implementationWatchdogTimer?: NodeJS.Timeout;
+
+  /** Consecutive housekeeping batch failures; drives the backoff below. */
+  private housekeepingFailureStreak = 0;
+
+  /** Epoch ms before which the housekeeping batch is skipped entirely. */
+  private housekeepingRetryAfter = 0;
   /** Monotonic even across cancellation, so an old async verdict cannot match a replacement run. */
   private nextRunGeneration = 0;
   private initialized = false;
@@ -1073,10 +1096,29 @@ class SupervisionAutomation {
     // Production housekeeping is inert until an administrator has reviewed a
     // dry-run and explicitly called apply. Once authorized, this advances one
     // bounded cursor page per cooldown tick and remains restart-idempotent.
-    try {
-      registry.runApprovedHousekeepingBatch(now);
-    } catch (error) {
-      logger.warn({ err: error }, 'Bounded supervision housekeeping tick failed');
+    if (now >= this.housekeepingRetryAfter) {
+      try {
+        registry.runApprovedHousekeepingBatch(now);
+        this.housekeepingFailureStreak = 0;
+        this.housekeepingRetryAfter = 0;
+      } catch (error) {
+        this.housekeepingFailureStreak += 1;
+        const backoffMs = Math.min(
+          HOUSEKEEPING_FAILURE_BACKOFF_MAX_MS,
+          HOUSEKEEPING_FAILURE_BACKOFF_START_MS * (2 ** (this.housekeepingFailureStreak - 1)),
+        );
+        this.housekeepingRetryAfter = now + backoffMs;
+        // Log the first few, then only on each backoff escalation: 629 copies
+        // of one line is not a signal, it is what buried this in the first
+        // place.
+        if (this.housekeepingFailureStreak <= 3
+          || (this.housekeepingFailureStreak & (this.housekeepingFailureStreak - 1)) === 0) {
+          logger.warn(
+            { err: error, consecutiveFailures: this.housekeepingFailureStreak, backoffMs },
+            'Bounded supervision housekeeping tick failed',
+          );
+        }
+      }
     }
     // Forward convergence rides this same bounded tick. A boot-only sweep
     // cannot close a window that opens later: a task can reach ready_for_audit,

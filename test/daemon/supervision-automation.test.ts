@@ -5553,6 +5553,41 @@ describe('SupervisionAutomation', () => {
       return { registry, coordinator: coordinator.value };
     }
 
+    it('backs off a housekeeping batch that keeps failing instead of retrying every tick', () => {
+      // The batch is synchronous SQLite on the daemon's only event loop. A
+      // permanent failure used to retry every 60s forever -- this machine's log
+      // holds 629 consecutive identical failures, roughly ten hours -- and each
+      // attempt blocks the loop. Measured alongside: 881 event-loop stalls,
+      // median drift 8.9s, and every direct-file-transfer failure in the same
+      // log fell inside one of those windows. Retrying at full rate cannot fix
+      // the batch and demonstrably starves unrelated real-time paths.
+      const registry = getSupervisionTaskRegistry();
+      const batch = vi.spyOn(registry, 'runApprovedHousekeepingBatch').mockImplementation(() => {
+        throw new Error('supervision task project scope is required');
+      });
+      try {
+        const t0 = 10_000_000;
+        supervisionAutomation.__checkImplementationAssignmentsForTests(t0);
+        expect(batch).toHaveBeenCalledTimes(1);
+
+        // Ticks inside the backoff window must not touch it at all.
+        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 60_000);
+        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 120_000);
+        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 240_000);
+        expect(batch).toHaveBeenCalledTimes(1);
+
+        // It is a backoff, not a kill switch: once the window elapses it retries.
+        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 5 * 60_000 + 1);
+        expect(batch).toHaveBeenCalledTimes(2);
+
+        // And the window widens rather than settling into a fixed retry rate.
+        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 11 * 60_000);
+        expect(batch).toHaveBeenCalledTimes(2);
+      } finally {
+        batch.mockRestore();
+      }
+    });
+
     it('rebinds a stale coordinator epoch from the production tick with no injected resolver', () => {
       const brain = liveBrain('deck_r4a_brain', 'r4a');
       const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4a', 'r4a', 'deck_r4a_brain');
