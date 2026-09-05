@@ -10209,3 +10209,432 @@ describe('Brain-approved stale closed-attempt auditor retirement', () => {
     }
   });
 });
+
+/**
+ * tsk_d4d — a Brain reopen must be ONE complete atomic transition.
+ *
+ * Field failure on tsk_cst / tsk_crx: with the task at PASS/ready_for_integration,
+ * Brain's coordination override (rework + renew) returned ok, the successor
+ * revision recovery in the same turn was refused `invalid_transition`, and the
+ * authority was then re-projected back to the predecessor PASS.
+ *
+ * Localisation, then reproduction, established that neither obvious hypothesis
+ * held: the override DID clear the implementer's auditAttemptId / auditRevision /
+ * verdict / crossVendorAuditPassed and renew its lease, and a single
+ * start / heartbeat / checkpoint restored NOTHING (the cleared implementer breaks
+ * #resolvePassAuthorizedIntegration's requiredLineage agreement, so convergence
+ * correctly declines).
+ *
+ * The actual blocker is the exact predecessor integration_owner, which the
+ * reopen left at ready_for_integration still holding verdict=PASS at the SOURCE
+ * revision. rebindTaskAssignmentRevision's conflictingLivePassAssignment matches
+ * that OWNER through protectedRevisions, so the successor bind is refused even
+ * after a perfectly correct reopen. The existing post-PASS CI contract test never
+ * saw this because its shape has no integration_owner.
+ *
+ * Fix: the reopen retires that exact owner in the SAME transaction. Its source
+ * revision / attempt / verdict are retained as provenance; only liveness changes.
+ * The rebind's safety predicate is unchanged, so a pre-reopen bind is still a
+ * zero-mutation invalid_transition and target-revision PASS still conflicts.
+ */
+function prepareOwnerBackedPassShape(registry: SupervisionTaskRegistry, taskId: string) {
+  const revision = `${taskId}-r1`;
+  const toRevision = `${taskId}-r2`;
+  const attemptId = `${taskId}-attempt`;
+  const files = ['src/daemon/owner-backed.ts'];
+  // Production parity: dispatchReadyIntegration mints the integration owner with
+  // the COORDINATOR's identity, so the owner carries Brain authority.
+  const brainIdentity = identity(`deck_${taskId}_brain`);
+  const implementerIdentity = identity(`deck_${taskId}_worker`);
+  const auditorIdentity = identity(`deck_${taskId}_auditor`, 'claude-code-sdk');
+  expect(registry.createOrGet({
+    taskId, projectName: 'alpha', classification: 'integration_task',
+    objective: 'owner-backed PASS then successor rebind', currentRevision: revision,
+  })).toMatchObject({ ok: true });
+  const coordinator = registry.createAssignment({
+    taskId, role: 'coordinator', identity: brainIdentity, required: false,
+  });
+  const owner = registry.createAssignment({
+    taskId, role: 'integration_owner', identity: brainIdentity, scopeFiles: files,
+    auditAttemptId: attemptId, auditRevision: revision,
+  });
+  const implementer = registry.createAssignment({
+    taskId, role: 'implementer', identity: implementerIdentity, scopeFiles: files,
+    auditAttemptId: attemptId, auditRevision: revision,
+  });
+  const auditor = registry.createAssignment({
+    taskId, role: 'auditor', identity: auditorIdentity, required: false,
+    auditAttemptId: attemptId, auditRevision: revision,
+  });
+  if (!coordinator.ok || !owner.ok || !implementer.ok || !auditor.ok) throw new Error('shape failed');
+  expect(registry.recordFileEvent({
+    assignmentId: implementer.value.assignmentId, identity: implementerIdentity,
+    path: files[0]!, operation: 'modify', idempotencyKey: `${taskId}-file`,
+  })).toMatchObject({ ok: true });
+  for (const target of [owner.value, implementer.value]) {
+    for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: target.assignmentId, identity: target.identity, status,
+        revision, auditAttemptId: attemptId, auditRevision: revision,
+        ...(status === 'passed' || status === 'ready_for_integration'
+          ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+      }), `${target.role}:${status}`).toMatchObject({ ok: true });
+    }
+  }
+  for (const status of ['auditing', 'passed'] as const) {
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity, status,
+      auditAttemptId: attemptId, auditRevision: revision,
+      ...(status === 'passed' ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+    })).toMatchObject({ ok: true });
+  }
+  expect(registry.finishAssignment({
+    assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision,
+  })).toMatchObject({ ok: true, value: { status: 'finalized' } });
+  expect(registry.finishAssignment({
+    assignmentId: implementer.value.assignmentId, identity: implementerIdentity, revision,
+  })).toMatchObject({ ok: true, value: { status: 'ready_for_integration' } });
+  expect(registry.finishAssignment({
+    assignmentId: owner.value.assignmentId, identity: brainIdentity, revision,
+  })).toMatchObject({ ok: true, value: { status: 'ready_for_integration' } });
+  expect(registry.updateTask({
+    taskId, status: 'ready_for_integration', integrationOwnerAssignmentId: owner.value.assignmentId,
+  })).toMatchObject({ ok: true });
+  return {
+    taskId, revision, toRevision, attemptId, files,
+    owner: owner.value, implementer: implementer.value, auditor: auditor.value,
+    brainIdentity, implementerIdentity,
+  };
+}
+
+describe('tsk_d4d atomic Brain reopen retires the predecessor integration owner', () => {
+  const reopen = (registry: SupervisionTaskRegistry, shape: ReturnType<typeof prepareOwnerBackedPassShape>, key: string) => (
+    registry.coordinateTaskAssignment({
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      taskStatus: 'implementing', assignmentStatus: 'implementing', leaseAction: 'renew',
+      idempotencyKey: key, reason: 'explicit Brain reopen before the successor bind', now: 1000,
+    })
+  );
+  const rebind = (registry: SupervisionTaskRegistry, shape: ReturnType<typeof prepareOwnerBackedPassShape>, key: string) => (
+    registry.rebindTaskAssignmentRevision({
+      taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+      fromRevision: shape.revision, toRevision: shape.toRevision,
+      ownedFiles: shape.files, leaseAction: 'preserve', idempotencyKey: key,
+      worktreeSnapshot: recoveryWorktreeSnapshot(shape.files),
+      reason: 'bind the frozen successor on the same objects', now: 1100,
+    })
+  );
+
+  it('retires the exact predecessor owner and lets the successor bind succeed', () => {
+    const registry = makeRegistry();
+    const shape = prepareOwnerBackedPassShape(registry, 'd4d-atomic-reopen');
+    const before = registry.listAssignments(shape.taskId).length;
+
+    expect(reopen(registry, shape, 'd4d-atomic-reopen-key')).toMatchObject({ ok: true });
+    expect(
+      registry.getAssignment(shape.owner.assignmentId),
+      'the predecessor owner is retired, not left live',
+    ).toMatchObject({ status: 'cancelled', leaseId: '' });
+    expect(
+      rebind(registry, shape, 'd4d-atomic-rebind-key'),
+      'the successor bind must now succeed',
+    ).toMatchObject({ ok: true, value: { currentRevision: shape.toRevision } });
+    expect(
+      registry.listAssignments(shape.taskId),
+      'no replacement task or implementer',
+    ).toHaveLength(before);
+    registry.close();
+  });
+
+  it('keeps the retired owner PROVENANCE and all historical audit evidence intact', () => {
+    const registry = makeRegistry();
+    const shape = prepareOwnerBackedPassShape(registry, 'd4d-provenance');
+    const auditorBefore = JSON.stringify(registry.getAssignment(shape.auditor.assignmentId));
+    const receiptsBefore = JSON.stringify(registry.listAuditReceipts(shape.taskId));
+
+    expect(reopen(registry, shape, 'd4d-provenance-reopen')).toMatchObject({ ok: true });
+    const retired = registry.getAssignment(shape.owner.assignmentId)!;
+    expect(retired, 'source revision/attempt/verdict retained as provenance').toMatchObject({
+      status: 'cancelled', auditRevision: shape.revision,
+      auditAttemptId: shape.attemptId, verdict: 'PASS',
+    });
+    expect(
+      JSON.stringify(registry.getAssignment(shape.auditor.assignmentId)),
+      'the finalized auditor row is never rewritten',
+    ).toBe(auditorBefore);
+    expect(JSON.stringify(registry.listAuditReceipts(shape.taskId))).toBe(receiptsBefore);
+    registry.close();
+  });
+
+  it.each(['start', 'heartbeat', 'checkpoint'] as const)(
+    'does not revive the retired owner when %s lands between reopen and rebind',
+    (intent) => {
+      const registry = makeRegistry();
+      const shape = prepareOwnerBackedPassShape(registry, `d4d-interleaved-${intent}`);
+      expect(reopen(registry, shape, `d4d-interleaved-reopen-${intent}`)).toMatchObject({ ok: true });
+      registry.applyTaskIntent({
+        taskId: shape.taskId, assignmentId: shape.implementer.assignmentId,
+        intent, toStatus: intent === 'start' ? 'implementing' : null,
+      } as never);
+      expect(
+        registry.getAssignment(shape.owner.assignmentId),
+        'an interleaved intent must not restore predecessor PASS authority',
+      ).toMatchObject({ status: 'cancelled', leaseId: '' });
+      expect(rebind(registry, shape, `d4d-interleaved-rebind-${intent}`))
+        .toMatchObject({ ok: true, value: { currentRevision: shape.toRevision } });
+      registry.close();
+    },
+  );
+
+  it('still refuses a pre-reopen successor bind with zero mutation', () => {
+    // The contract ruling (a) preserves: a PASS'd implementer may not supersede
+    // itself without an explicit Brain reopen.
+    const registry = makeRegistry();
+    const shape = prepareOwnerBackedPassShape(registry, 'd4d-pre-reopen');
+    const taskBefore = JSON.stringify(registry.get(shape.taskId));
+    const eventsBefore = registry.listEvents(shape.taskId).length;
+    expect(rebind(registry, shape, 'd4d-pre-reopen-rebind'))
+      .toMatchObject({ ok: false, reason: 'invalid_transition' });
+    expect(JSON.stringify(registry.get(shape.taskId)), 'zero mutation on refusal').toBe(taskBefore);
+    expect(registry.listEvents(shape.taskId)).toHaveLength(eventsBefore);
+    registry.close();
+  });
+
+  it('fails closed when the owner is bound to a different revision', () => {
+    const registry = makeRegistry();
+    const shape = prepareOwnerBackedPassShape(registry, 'd4d-wrong-owner-revision');
+    // Move the task forward so the owner no longer matches the source revision.
+    expect(registry.updateTask({ taskId: shape.taskId, currentRevision: 'some-other-revision' }))
+      .toMatchObject({ ok: true });
+    expect(
+      reopen(registry, shape, 'd4d-wrong-owner-revision-reopen'),
+      'a mismatched owner must not be retired by guesswork',
+    ).toMatchObject({ ok: false });
+    expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
+      status: 'ready_for_integration', verdict: 'PASS',
+    });
+    registry.close();
+  });
+});
+
+/**
+ * tsk_d4d — discriminating refusals for every eligibility term.
+ *
+ * A first mutant pass killed the wire, the revision term, the finalized skip,
+ * the actual retirement (status/lease) and the provenance retention, but SIX
+ * terms survived: pointer, status, attempt, verdict, coordinator identity and
+ * the ambiguity guard. Each case below isolates ONE term so that relaxing it
+ * turns exactly this test red. Every case asserts the reopen fails closed AND
+ * that the owner is left untouched, so a mutant cannot pass by half-acting.
+ */
+describe('tsk_d4d predecessor-owner retirement eligibility is exact', () => {
+  const reopenWith = (registry: SupervisionTaskRegistry, taskId: string, assignmentId: string, key: string) => (
+    registry.coordinateTaskAssignment({
+      taskId, assignmentId,
+      taskStatus: 'implementing', assignmentStatus: 'implementing', leaseAction: 'renew',
+      idempotencyKey: key, reason: 'reopen attempt under an ineligible owner', now: 1000,
+    })
+  );
+
+  it('fails closed when the owner is not at ready_for_integration', () => {
+    const registry = makeRegistry();
+    const shape = prepareOwnerBackedPassShape(registry, 'd4d-gap-status');
+    expect(registry.updateAssignment({
+      assignmentId: shape.owner.assignmentId, identity: shape.brainIdentity,
+      status: 'integrating', auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+      verdict: 'PASS', crossVendorAuditPassed: true,
+    })).toMatchObject({ ok: true });
+    expect(reopenWith(registry, shape.taskId, shape.implementer.assignmentId, 'd4d-gap-status-key'))
+      .toMatchObject({ ok: false });
+    expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({ status: 'integrating' });
+    registry.close();
+  });
+
+  it('fails closed when the owner identity is not a task coordinator identity', () => {
+    // Production parity check: dispatchReadyIntegration mints the owner with the
+    // coordinator's identity, so a foreign owner is a different shape entirely
+    // and must never be retired by this path.
+    const registry = makeRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'd4d-gap-identity');
+    const implementerId = registry.listAssignments(shape.taskId)
+      .find((a) => a.role === 'implementer')!.assignmentId;
+    const owner = registry.listAssignments(shape.taskId).find((a) => a.role === 'integration_owner')!;
+    expect(reopenWith(registry, shape.taskId, implementerId, 'd4d-gap-identity-key'))
+      .toMatchObject({ ok: false });
+    expect(
+      registry.getAssignment(owner.assignmentId),
+      'a foreign-identity owner must be left live and untouched',
+    ).toMatchObject({ status: 'ready_for_integration', verdict: 'PASS' });
+    registry.close();
+  });
+
+  it('fails closed with ambiguous_assignment when two live owners exist', () => {
+    const registry = makeRegistry();
+    const shape = prepareOwnerBackedPassShape(registry, 'd4d-gap-ambiguous');
+    // NOTE: createAssignment REPLAYS an existing integration_owner that shares
+    // an identity, so a second row only exists under a distinct identity.
+    const second = registry.createAssignment({
+      taskId: shape.taskId, role: 'integration_owner',
+      identity: identity(`deck_${shape.taskId}_second_owner`),
+      auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+    });
+    if (!second.ok) throw new Error('second owner fixture failed');
+    expect(
+      registry.listAssignments(shape.taskId).filter((a) => (
+        a.role === 'integration_owner' && !['cancelled', 'finalized'].includes(a.status)
+      )),
+      'the fixture must genuinely create two LIVE owners',
+    ).toHaveLength(2);
+    expect(reopenWith(registry, shape.taskId, shape.implementer.assignmentId, 'd4d-gap-ambiguous-key'))
+      .toMatchObject({ ok: false, reason: 'ambiguous_assignment' });
+    expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
+      status: 'ready_for_integration', verdict: 'PASS',
+    });
+    registry.close();
+  });
+});
+
+/**
+ * tsk_d4d — the pointer / attempt / verdict guards defend a DURABLE boundary.
+ *
+ * These three shapes are refused by the write APIs, so they cannot be built by
+ * calling updateTask/updateAssignment. That is not evidence the guards are
+ * unreachable: they exist for rows that already drifted on disk — restart,
+ * migration, an older daemon, or a partial write. tsk_cst/tsk_crx showed row
+ * projections do drift in the field.
+ *
+ * So each case seeds the drift directly into the authoritative persisted record
+ * and then reads it back through the ordinary hydration path. Note that
+ * getAssignment/get hydrate from payload_json ALONE (the scalar columns are
+ * indexes), and the integration-owner pointer lives inside the task payload —
+ * there is no column for it. Seeding therefore rewrites payload_json, with the
+ * mirrored scalar columns kept consistent, and uses no test-only backdoor.
+ *
+ * Every case asserts the drift SURVIVED hydration (if it were normalised away,
+ * that normalisation is asserted instead and the guard is genuinely unreachable),
+ * then that the reopen fails closed with ZERO writes: owner, implementer, task,
+ * event count and updated_at all byte-identical.
+ */
+function driftAssignmentPayload(
+  database: InstanceType<typeof DatabaseSync>,
+  assignmentId: string,
+  mutate: (payload: Record<string, unknown>) => void,
+): void {
+  const row = database.prepare(
+    'SELECT payload_json AS payloadJson FROM supervision_task_assignments WHERE assignment_id = ?',
+  ).get(assignmentId) as { payloadJson?: string } | undefined;
+  if (!row?.payloadJson) throw new Error(`no persisted assignment ${assignmentId}`);
+  const payload = JSON.parse(row.payloadJson) as Record<string, unknown>;
+  mutate(payload);
+  database.prepare(
+    `UPDATE supervision_task_assignments
+     SET payload_json = ?, audit_attempt_id = ?, audit_revision = ?, verdict = ?
+     WHERE assignment_id = ?`,
+  ).run(
+    JSON.stringify(payload),
+    (payload.auditAttemptId as string | undefined) ?? null,
+    (payload.auditRevision as string | undefined) ?? null,
+    (payload.verdict as string | undefined) ?? null,
+    assignmentId,
+  );
+}
+
+function driftTaskPayload(
+  database: InstanceType<typeof DatabaseSync>,
+  taskId: string,
+  mutate: (payload: Record<string, unknown>) => void,
+): void {
+  const row = database.prepare(
+    'SELECT payload_json AS payloadJson FROM supervision_tasks WHERE task_id = ?',
+  ).get(taskId) as { payloadJson?: string } | undefined;
+  if (!row?.payloadJson) throw new Error(`no persisted task ${taskId}`);
+  const payload = JSON.parse(row.payloadJson) as Record<string, unknown>;
+  mutate(payload);
+  database.prepare('UPDATE supervision_tasks SET payload_json = ? WHERE task_id = ?')
+    .run(JSON.stringify(payload), taskId);
+}
+
+describe('tsk_d4d durable drift: pointer / attempt / verdict guards bear weight', () => {
+  function seededShape(taskId: string) {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = prepareOwnerBackedPassShape(registry, taskId);
+    return { database, registry, shape };
+  }
+
+  function snapshotAll(registry: SupervisionTaskRegistry, shape: { taskId: string; owner: { assignmentId: string }; implementer: { assignmentId: string } }) {
+    return JSON.stringify({
+      task: registry.get(shape.taskId),
+      owner: registry.getAssignment(shape.owner.assignmentId),
+      implementer: registry.getAssignment(shape.implementer.assignmentId),
+      events: registry.listEvents(shape.taskId).length,
+    });
+  }
+
+  const reopen = (registry: SupervisionTaskRegistry, taskId: string, assignmentId: string, key: string) => (
+    registry.coordinateTaskAssignment({
+      taskId, assignmentId,
+      taskStatus: 'implementing', assignmentStatus: 'implementing', leaseAction: 'renew',
+      idempotencyKey: key, reason: 'reopen against a durably drifted owner row', now: 2000,
+    })
+  );
+
+  it('fails closed, zero-write, when the persisted task pointer names another assignment', () => {
+    const { database, registry, shape } = seededShape('d4d-seed-pointer');
+    driftTaskPayload(database, shape.taskId, (payload) => {
+      payload.integrationOwnerAssignmentId = shape.implementer.assignmentId;
+    });
+    // Re-read through ordinary hydration; the drift must survive it.
+    expect(
+      registry.get(shape.taskId)?.integrationOwnerAssignmentId,
+      'the drifted pointer must survive hydration for this guard to be reachable',
+    ).toBe(shape.implementer.assignmentId);
+    expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
+      status: 'ready_for_integration', verdict: 'PASS',
+    });
+
+    const before = snapshotAll(registry, shape);
+    expect(reopen(registry, shape.taskId, shape.implementer.assignmentId, 'd4d-seed-pointer-key'))
+      .toMatchObject({ ok: false });
+    expect(snapshotAll(registry, shape), 'zero write on refusal').toBe(before);
+    registry.close();
+    database.close();
+  });
+
+  it('fails closed, zero-write, when the persisted owner attempt differs from the implementer source attempt', () => {
+    const { database, registry, shape } = seededShape('d4d-seed-attempt');
+    driftAssignmentPayload(database, shape.owner.assignmentId, (payload) => {
+      payload.auditAttemptId = `${shape.attemptId}-drifted`;
+    });
+    expect(
+      registry.getAssignment(shape.owner.assignmentId)?.auditAttemptId,
+      'the drifted attempt must survive hydration',
+    ).toBe(`${shape.attemptId}-drifted`);
+
+    const before = snapshotAll(registry, shape);
+    expect(reopen(registry, shape.taskId, shape.implementer.assignmentId, 'd4d-seed-attempt-key'))
+      .toMatchObject({ ok: false });
+    expect(snapshotAll(registry, shape), 'zero write on refusal').toBe(before);
+    registry.close();
+    database.close();
+  });
+
+  it('fails closed, zero-write, when the persisted owner is ready_for_integration without a PASS verdict', () => {
+    const { database, registry, shape } = seededShape('d4d-seed-verdict');
+    driftAssignmentPayload(database, shape.owner.assignmentId, (payload) => {
+      delete payload.verdict;
+    });
+    expect(
+      registry.getAssignment(shape.owner.assignmentId),
+      'the drifted verdict-less owner must survive hydration',
+    ).toMatchObject({ status: 'ready_for_integration' });
+    expect(registry.getAssignment(shape.owner.assignmentId)?.verdict).toBeUndefined();
+
+    const before = snapshotAll(registry, shape);
+    expect(reopen(registry, shape.taskId, shape.implementer.assignmentId, 'd4d-seed-verdict-key'))
+      .toMatchObject({ ok: false });
+    expect(snapshotAll(registry, shape), 'zero write on refusal').toBe(before);
+    registry.close();
+    database.close();
+  });
+});

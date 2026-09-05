@@ -5290,9 +5290,78 @@ export class SupervisionTaskRegistry {
         blocker: repairsControlState ? reason : assignment.blocker,
         updatedAt: now,
       };
+      // A Brain reopen is ONE complete transition, not a half of one.
+      //
+      // Clearing the implementer's source audit projection alone leaves the
+      // exact predecessor integration_owner holding LIVE PASS authority at the
+      // SOURCE revision. That owner then trips the rebind's
+      // conflictingLivePassAssignment guard, so the successor bind is refused
+      // `invalid_transition` even though the reopen returned ok — the observed
+      // tsk_cst/tsk_crx dead end. It also leaves a coherent predecessor round
+      // for the PASS-authorized-integration convergence to re-project.
+      //
+      // So the SAME transaction retires that exact owner. Its source
+      // revision/attempt/verdict are RETAINED as provenance; only its liveness
+      // (status + lease) changes. Historical auditors and receipts are never
+      // touched. A task with no owner is unaffected, which keeps the existing
+      // post-PASS CI contract exactly as it is.
+      // Scoped to the successor-preparation reopen only. A finalized/committed/
+      // pushed/archived aggregate is governed by the finalized-boundary rules
+      // above, which already permit an exactly-one-unconsumed-successor repair;
+      // engaging here would refuse that legitimate path. Those aggregates keep
+      // their existing behaviour, and no owner is retired on them.
+      let retiredPredecessorOwner: PersistedSupervisionTaskAssignment | undefined;
+      if (!closedEvidencePresent && resetsAudit && assignment.role === 'implementer') {
+        const ownerPointer = normalizeTaskString(task.integrationOwnerAssignmentId);
+        const liveOwners = assignments.filter((candidate) => (
+          candidate.role === 'integration_owner'
+          && !['cancelled', 'finalized'].includes(candidate.status)
+        ));
+        if (ownerPointer || liveOwners.length > 0) {
+          // Ambiguity is never resolved by guessing.
+          if (liveOwners.length > 1) {
+            this.#db.exec('ROLLBACK');
+            return { ok: false, reason: 'ambiguous_assignment' };
+          }
+          const owner = liveOwners[0];
+          const sourceRevision = normalizeTaskString(task.currentRevision);
+          const sourceAttempt = normalizeTaskString(assignment.auditAttemptId);
+          const coordinatorSessionNames = new Set(assignments
+            .filter((candidate) => candidate.role === 'coordinator')
+            .map((candidate) => candidate.identity.sessionName));
+          const ownerRetirable = Boolean(
+            owner
+            && ownerPointer
+            && owner.assignmentId === ownerPointer
+            && owner.status === 'ready_for_integration'
+            && sourceRevision
+            && owner.auditRevision === sourceRevision
+            && sourceAttempt
+            && owner.auditAttemptId === sourceAttempt
+            && owner.verdict?.trim().toUpperCase() === 'PASS'
+            // The owner carries Brain authority; a foreign identity is not this
+            // shape and must not be retired by it.
+            && coordinatorSessionNames.has(owner.identity.sessionName)
+            && !task.finalization && !task.commitSha && !task.pushRemoteRef && !task.archivedAt,
+          );
+          if (!ownerRetirable) {
+            this.#db.exec('ROLLBACK');
+            return { ok: false, reason: 'invalid_transition' };
+          }
+          retiredPredecessorOwner = {
+            ...owner!,
+            status: 'cancelled',
+            leaseId: '',
+            generation: owner!.generation + 1,
+            blocker: reason,
+            updatedAt: now,
+          };
+        }
+      }
       const nextTask: PersistedSupervisionTaskRecord = {
         ...task,
         status: taskStatus ?? task.status,
+        ...(retiredPredecessorOwner ? { integrationOwnerAssignmentId: undefined } : {}),
         blocker: repairsControlState ? reason : task.blocker,
         updatedAt: repairsControlState ? now : task.updatedAt,
       };
@@ -5316,7 +5385,18 @@ export class SupervisionTaskRegistry {
         preservedRevision: task.currentRevision,
       };
       this.#writeAssignment(nextAssignment, 'recovered', payload);
-      if (repairsControlState) {
+      if (retiredPredecessorOwner) {
+        // Same transaction, so the reopen can never be observed half-applied.
+        this.#writeAssignment(retiredPredecessorOwner, 'recovered', {
+          ...payload,
+          source: 'brain_coordination_override_predecessor_owner_retired',
+          retiredOwnerAssignmentId: retiredPredecessorOwner.assignmentId,
+          retiredOwnerRevision: retiredPredecessorOwner.auditRevision ?? null,
+          retiredOwnerAttemptId: retiredPredecessorOwner.auditAttemptId ?? null,
+          retiredOwnerVerdict: retiredPredecessorOwner.verdict ?? null,
+        });
+      }
+      if (repairsControlState || retiredPredecessorOwner) {
         this.#writeTask(nextTask, 'recovered', { ...payload, assignmentId });
       }
       this.#db.exec('COMMIT');
