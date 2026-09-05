@@ -374,6 +374,8 @@ describe('controlled-node self-upgrade', () => {
     ) as { artifact: { authenticodeSignerSha256?: string } };
     expect(stagedManifest.artifact.authenticodeSignerSha256).toBe(WINDOWS_SIGNER_SHA256);
     const script = await readFile(result.scriptPath!, 'utf8');
+    expect(script).toContain("targetVersion = '2026.7.1'");
+    expect(script).toContain(`artifactSha256 = '${sha256}'`);
     const ownershipMarkerPath = join(dirname(result.scriptPath!), CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
     const ownershipMarker = JSON.parse(await readFile(ownershipMarkerPath, 'utf8')) as {
       directoryName: string;
@@ -566,6 +568,45 @@ describe('controlled-node self-upgrade', () => {
     expect(finallyStart).toBeGreaterThan(script.indexOf('$rollbackStatus ='));
     expect(script.indexOf("Unregister-ScheduledTask -TaskName 'imcodes-node-upgrade-test'", finallyStart))
       .toBeLessThan(finalCleanup);
+  });
+
+  it('persists bounded Windows handoff evidence before owned staging cleanup', () => {
+    const script = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe.manifest.json',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'd'.repeat(64),
+      upgradeTaskName: 'imcodes-node-upgrade-test',
+      stagingOwnership: {
+        directoryPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123',
+        markerPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\.imcodes-controlled-node-upgrade.json',
+        ownerToken: '12345678-1234-4123-8123-123456789abc',
+      },
+    });
+
+    expect(script).toContain("$persistentUpgradeResult = Join-Path (Split-Path -Parent $dst) 'last-upgrade-result.json'");
+    expect(script).toContain("targetVersion = '2026.9.9999'");
+    expect(script).toContain("artifactSha256 = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'");
+    expect(script).toContain("if ('dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' -and $srcHash -cne 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd')");
+    expect(script).toContain('mainArtifactVerified = [bool]$mainArtifactVerified');
+    expect(script).toContain('helperArtifactVerified = [bool]$helperArtifactVerified');
+    expect(script).toContain('remoteDesktopArtifactVerified = [bool]$remoteDesktopArtifactVerified');
+    expect(script).toContain('$persistentUpgradeResultTemp = "$persistentUpgradeResult.pending-$PID"');
+    expect(script).toContain('Move-Item -Force -LiteralPath $persistentUpgradeResultTemp -Destination $persistentUpgradeResult');
+    expect(script).toContain("status = 'preflight_failed'; phase = 'preflight'");
+    expect(script).toContain("status = 'success'; phase = 'complete'");
+    expect(script).toContain("status = $rollbackStatus; phase = 'rollback'");
+    expect(script.match(/error = \$failureMessage/g)).toHaveLength(3);
+    expect(script.match(/failedPhase = \$upgradePhase/g)).toHaveLength(2);
+    expect(script).toContain("$upgradePhase = 'restart_health'");
+    expect(script).toContain('if ($recoveryFailure.Length -gt 240)');
+    const preflightPersist = script.indexOf("status = 'preflight_failed'; phase = 'preflight'");
+    const preflightCleanup = script.indexOf('Remove-Item -LiteralPath $stagingDir', preflightPersist);
+    expect(preflightPersist).toBeGreaterThan(0);
+    expect(preflightCleanup).toBeGreaterThan(preflightPersist);
+    expect(script).toContain("if (-not $upgradeResultPersisted) { Write-Warning 'IMCODES_UPGRADE_CLEANUP_SKIPPED phase=helper_finally code=result_not_persisted'");
   });
 
   it('scavenges only old direct owned non-reparse staging directories and preserves live/new/unowned entries', async () => {

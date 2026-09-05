@@ -258,12 +258,15 @@ export interface ControlledNodeRuntimeOptions {
    * worker beside it even when its main version already matches the Server.
    */
   repairMissingRemoteDesktopWorker?: (targetVersion: string) => ReturnType<typeof startControlledNodeSelfUpgrade>;
+  /** Test seam for the normal Server-requested upgrade path. */
+  startSelfUpgrade?: typeof startControlledNodeSelfUpgrade;
   platform?: NodeJS.Platform;
   arch?: string;
   now?: () => number;
 }
 
 const REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS = 5 * 60_000;
+export const CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS = 60_000;
 // Server-side version convergence is deliberately scheduled five seconds after
 // authentication. Wait through that window before attempting a same-version
 // repair so an actually stale node performs one atomic upgrade, not two.
@@ -416,6 +419,28 @@ export function createControlledNodeRuntime(
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
   let upgradeInFlight = false;
+  let upgradeHandoffDeadlineAt: number | null = null;
+  const armUpgradeHandoffWatchdog = (): void => {
+    if (platform !== 'win32') return;
+    upgradeHandoffDeadlineAt = (options.now?.() ?? Date.now())
+      + CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS;
+  };
+  const clearUpgradeGate = (): void => {
+    upgradeInFlight = false;
+    upgradeHandoffDeadlineAt = null;
+  };
+  const reportStalledUpgradeHandoff = (): void => {
+    if (!upgradeInFlight || upgradeHandoffDeadlineAt === null) return;
+    if ((options.now?.() ?? Date.now()) < upgradeHandoffDeadlineAt) return;
+    if (!client.send({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+    })) return;
+    // One generation emits this recovery edge once. Keep the upgrade gate
+    // claimed until the Server's signed rescue restarts the process.
+    upgradeHandoffDeadlineAt = null;
+    logger.warn('controlled node upgrade handoff timed out; requesting signed rescue');
+  };
   // Attended consent. The UI lives in the signed worker, so the provider can
   // only ask while that worker is usable; `surfaceState()` re-probes per
   // request rather than trusting a value cached at startup.
@@ -546,15 +571,16 @@ export function createControlledNodeRuntime(
           ...(result.artifactSha256 ? { artifactSha256: result.artifactSha256 } : {}),
         });
         logger.info('staged same-version controlled-node repair for missing remote desktop worker');
+        armUpgradeHandoffWatchdog();
         // Keep the gate claimed. The detached upgrade task replaces the
         // artifact set and restarts this process; clearing it here could admit
         // a second task during that handoff window.
         return;
       }
-      upgradeInFlight = false;
+      clearUpgradeGate();
       logger.warn({ reason: result.reason }, 'could not stage missing remote desktop worker repair');
     }, (error) => {
-      upgradeInFlight = false;
+      clearUpgradeGate();
       logger.warn({ err: error }, 'missing remote desktop worker repair failed; will retry');
     });
     return true;
@@ -656,6 +682,7 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isControlledNodeAuthAck(message)) {
+        reportStalledUpgradeHandoff();
         persistAuthentication();
         if (remoteDesktopWorkerRepairEligibleAt === null) {
           remoteDesktopWorkerRepairEligibleAt = (options.now?.() ?? Date.now())
@@ -712,15 +739,17 @@ export function createControlledNodeRuntime(
         }
         upgradeInFlight = true;
         const targetVersion = message.targetVersion;
-        void startControlledNodeSelfUpgrade(credential, targetVersion).then((result) => {
+        const startSelfUpgrade = options.startSelfUpgrade ?? startControlledNodeSelfUpgrade;
+        void startSelfUpgrade(credential, targetVersion).then((result) => {
           if (result.ok) {
             client.send({ type: DAEMON_MSG.UPGRADING, targetVersion: result.targetVersion, artifactSha256: result.artifactSha256 });
+            armUpgradeHandoffWatchdog();
             return;
           }
-          upgradeInFlight = false;
+          clearUpgradeGate();
           client.send({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: result.reason ?? 'controlled_node_upgrade_failed' });
         }, (error) => {
-          upgradeInFlight = false;
+          clearUpgradeGate();
           client.send({
             type: DAEMON_MSG.UPGRADE_BLOCKED,
             reason: error instanceof Error ? error.message : 'controlled_node_upgrade_failed',

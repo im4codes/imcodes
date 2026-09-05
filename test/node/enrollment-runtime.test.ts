@@ -15,7 +15,11 @@ import {
 import { markServiceHealthy } from '../../src/node/bootstrap.js';
 import { encodeEnrollmentBlob, parseEnrollmentBlob } from '../../src/node/enrollment.js';
 import { loadInstallJournal } from '../../src/node/install-journal.js';
-import { createControlledNodeRuntime, isControlledNodeAuthAck } from '../../src/node/runtime.js';
+import {
+  CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS,
+  createControlledNodeRuntime,
+  isControlledNodeAuthAck,
+} from '../../src/node/runtime.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
@@ -64,6 +68,7 @@ import {
   REMOTE_DESKTOP_INSTALL_MSG,
 } from '../../shared/remote-desktop-install.js';
 import { DAEMON_VERSION } from '../../src/util/version.js';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 
 const { receiveMachineDirectUploadMock, sendMachineDirectFetchMock } = vi.hoisted(() => ({
   receiveMachineDirectUploadMock: vi.fn(),
@@ -95,6 +100,96 @@ afterEach(async () => {
 });
 
 describe('controlled node enrollment and runtime', () => {
+  it('reports one bounded blocker when a staged Windows upgrade never hands off', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const startSelfUpgrade = vi.fn(async () => ({
+      ok: true as const,
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'c'.repeat(64),
+    }));
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'win32',
+      arch: 'x64',
+      now: () => now,
+      startSelfUpgrade,
+    });
+    runtime.start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      targetVersion: '2026.9.9999',
+    }));
+    await vi.waitFor(() => expect(startSelfUpgrade).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: DAEMON_MSG.UPGRADING,
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'c'.repeat(64),
+    }));
+
+    now += CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS - 1;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    expect(socket.sent.map(JSON.parse).filter((frame) => (
+      frame.type === DAEMON_MSG.UPGRADE_BLOCKED
+      && frame.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    ))).toHaveLength(0);
+
+    now += 1;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+    }));
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    expect(socket.sent.map(JSON.parse).filter((frame) => (
+      frame.type === DAEMON_MSG.UPGRADE_BLOCKED
+      && frame.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    ))).toHaveLength(1);
+    runtime.stop();
+  });
+
+  it('does not request the Windows rescue path for a stalled non-Windows upgrade', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const startSelfUpgrade = vi.fn(async () => ({
+      ok: true as const,
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'c'.repeat(64),
+    }));
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      now: () => now,
+      startSelfUpgrade,
+    });
+    runtime.start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      targetVersion: '2026.9.9999',
+    }));
+    await vi.waitFor(() => expect(startSelfUpgrade).toHaveBeenCalledOnce());
+    now += CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    expect(socket.sent.map(JSON.parse).filter((frame) => (
+      frame.type === DAEMON_MSG.UPGRADE_BLOCKED
+      && frame.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    ))).toHaveLength(0);
+    runtime.stop();
+  });
+
   it('round-trips an enrollment blob appended to arbitrary executable bytes', () => {
     const encoded = encodeEnrollmentBlob({ serverUrl: 'https://im.example/', enrollToken: 'once-123' });
     expect(parseEnrollmentBlob(Buffer.concat([Buffer.from('binary-prefix'), encoded]))).toEqual({

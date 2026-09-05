@@ -593,6 +593,8 @@ export async function downloadControlledNodeRemoteDesktopWorker(input: {
 export function buildWindowsControlledNodeUpgradeScript(input: {
   stagedArtifactPath: string;
   stagedManifestPath: string;
+  targetVersion?: string;
+  artifactSha256?: string;
   stagedComputerUseHelperDir?: string;
   stagedRemoteDesktopWorkerDir?: string;
   stagedJournalPath?: string;
@@ -643,13 +645,13 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     ? `try { Unregister-ScheduledTask -TaskName ${psQuote(input.upgradeTaskName)} -Confirm:$false -ErrorAction Stop } catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=task_unregister_failed' }\r\n`
     : '';
   const stagingCleanup = input.stagingOwnership
-    ? `try {\r\n`
+    ? `if (-not $upgradeResultPersisted) { Write-Warning 'IMCODES_UPGRADE_CLEANUP_SKIPPED phase=helper_finally code=result_not_persisted' } else { try {\r\n`
       + `  $stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
       + `  $stagingMarkerItem = Get-Item -LiteralPath $stagingOwnershipMarker -Force -ErrorAction Stop\r\n`
       + `  $stagingMarker = Get-Content -LiteralPath $stagingOwnershipMarker -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
       + `  if (-not $stagingItem.PSIsContainer -or ($stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingMarkerItem.PSIsContainer -or ($stagingMarkerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingItem.Name -cnotmatch '^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$' -or [int]$stagingMarker.schemaVersion -ne 1 -or [string]$stagingMarker.product -cne ${psQuote(CONTROLLED_NODE_UPGRADE_PRODUCT)} -or [string]$stagingMarker.directoryName -cne $stagingItem.Name -or [string]$stagingMarker.ownerToken -cne $stagingOwnerToken) { throw 'staging ownership refused' }\r\n`
       + `  Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction Stop\r\n`
-      + `} catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=cleanup_refused_or_failed' }\r\n`
+      + `} catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=cleanup_refused_or_failed' } }\r\n`
     : '';
   const stagingActivation = input.stagingOwnership
     ? `$stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
@@ -674,11 +676,14 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$srcNodeManifest = Get-Content -LiteralPath $srcManifest -Raw | ConvertFrom-Json\r\n`
     + `$srcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $src).Hash.ToLowerInvariant()\r\n`
     + `if ([int]$srcNodeManifest.schemaVersion -ne 1 -or [string]$srcNodeManifest.artifact.fileName -cne 'imcodes-node.exe' -or [string]$srcNodeManifest.artifact.os -cne 'win32' -or [string]$srcNodeManifest.artifact.arch -cne 'x64' -or [int64]$srcNodeManifest.artifact.size -ne (Get-Item -LiteralPath $src).Length -or [string]$srcNodeManifest.artifact.sha256 -cne $srcHash -or [string]$srcNodeManifest.artifact.authenticodeSignerSha256 -cne $trustedReleaseSigner) { throw ${psQuote(CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE)} }\r\n`
+    + `if (${psQuote(input.artifactSha256 ?? '')} -and $srcHash -cne ${psQuote(input.artifactSha256 ?? '')}) { throw 'controlled node staged artifact hash differs from upgrade authority' }\r\n`
     + `$srcManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $srcManifest).Hash.ToLowerInvariant()\r\n`
+    + `$mainArtifactVerified = $true\r\n`
     + (input.stagedComputerUseHelperDir
       ? `$srcHelper = ${psQuote(input.stagedComputerUseHelperDir)}\r\n`
         + `$srcHelperExe = Join-Path $srcHelper 'open-computer-use.exe'\r\n`
         + `& $verifyReleaseArtifact $srcHelperExe\r\n`
+        + `$helperArtifactVerified = $true\r\n`
       : '');
   const remoteDesktopPreflight = input.stagedRemoteDesktopWorkerDir
     ? `$srcRemoteDesktop = ${psQuote(input.stagedRemoteDesktopWorkerDir)}\r\n`
@@ -723,6 +728,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `  foreach ($signed in @('imcodes-virtual-display.dll','imcodes-virtual-display.cat')) { $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $virtualDisplay $signed); if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or $null -eq $signature.SignerCertificate) { throw 'virtual display copied Authenticode verification failed' }; $sha256 = [System.Security.Cryptography.SHA256]::Create(); try { $signer = [BitConverter]::ToString($sha256.ComputeHash($signature.SignerCertificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }; if ($signer -cne $trustedSigner) { throw 'virtual display copied signer mismatch' } }\r\n`
       + `}\r\n`
       + `& $verifyRemoteDesktopArtifactSet $srcRemoteDesktop $srcRemoteDesktopHash $srcRemoteDesktopManifestHash $srcVirtualDisplayHash $srcRemoteDesktopSignerSha256\r\n`
+      + `$remoteDesktopArtifactVerified = $true\r\n`
     : '';
   const helperVariables = input.stagedComputerUseHelperDir
     ? `$dstHelper = ${psQuote(helperDir)}\r\n`
@@ -807,7 +813,8 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `} catch {\r\n`
       + `$failureMessage = [string]$_.Exception.Message\r\n`
       + `if ($failureMessage.Length -gt 240) { $failureMessage = $failureMessage.Substring(0, 240) }\r\n`
-      + `try { @{ status = ${psQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)}; reason = $failureMessage; completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeResult -Encoding utf8 } catch { }\r\n`
+      + `$upgradeResultPersisted = $false\r\n`
+      + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = ${psQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)}; phase = 'preflight'; error = $failureMessage; reason = $failureMessage; completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=preflight' }\r\n`
       + upgradeTaskCleanup
       + stagingCleanup
       + `throw\r\n`
@@ -843,6 +850,29 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       : '')
     + `$upgradeResult = "$src.upgrade-result.json"\r\n`
     + `Remove-Item -Force $upgradeResult -ErrorAction SilentlyContinue\r\n`
+    + `$persistentUpgradeResult = Join-Path (Split-Path -Parent $dst) 'last-upgrade-result.json'\r\n`
+    + `$upgradeResultPersisted = $false\r\n`
+    + `$mainArtifactVerified = $false\r\n`
+    + `$helperArtifactVerified = $false\r\n`
+    + `$remoteDesktopArtifactVerified = $false\r\n`
+    + `$writeUpgradeResult = { param([hashtable]$record)\r\n`
+    + `  $record.schemaVersion = 1\r\n`
+    + `  if (-not $record.ContainsKey('recordedAt')) { $record.recordedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }\r\n`
+    + `  $record.targetVersion = ${psQuote(input.targetVersion ?? '')}\r\n`
+    + `  $record.artifactSha256 = ${psQuote(input.artifactSha256 ?? '')}\r\n`
+    + `  $record.mainArtifactVerified = [bool]$mainArtifactVerified\r\n`
+    + `  $record.helperArtifactVerified = [bool]$helperArtifactVerified\r\n`
+    + `  $record.remoteDesktopArtifactVerified = [bool]$remoteDesktopArtifactVerified\r\n`
+    + `  $resultJson = $record | ConvertTo-Json -Compress -Depth 4\r\n`
+    + `  try { [IO.File]::WriteAllText($upgradeResult, $resultJson, [Text.UTF8Encoding]::new($false)) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_STAGE_WRITE_FAILED' }\r\n`
+    + `  $persistentUpgradeResultTemp = "$persistentUpgradeResult.pending-$PID"\r\n`
+    + `  try {\r\n`
+    + `    [IO.File]::WriteAllText($persistentUpgradeResultTemp, $resultJson, [Text.UTF8Encoding]::new($false))\r\n`
+    + `    Move-Item -Force -LiteralPath $persistentUpgradeResultTemp -Destination $persistentUpgradeResult\r\n`
+    + `    return $true\r\n`
+    + `  } finally { Remove-Item -Force -LiteralPath $persistentUpgradeResultTemp -ErrorAction SilentlyContinue }\r\n`
+    + `}\r\n`
+    + `$upgradePhase = 'preflight'\r\n`
     + `$healthLease = Join-Path (Split-Path -Parent $dst) 'health-lease.json'\r\n`
     + `$upgradeMarker = Join-Path (Split-Path -Parent $dst) ${psQuote(WINDOWS_UPGRADE_MARKER_NAME)}\r\n`
     + `$backupDst = "$dst.upgrade-old"\r\n`
@@ -863,8 +893,9 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + remoteDesktopVariables
     + journalVariables
     + `$recoveryFailures = [System.Collections.Generic.List[string]]::new()\r\n`
-    + `$runRecovery = { param([string]$label,[scriptblock]$action) try { & $action } catch { [void]$recoveryFailures.Add(('{0}: {1}' -f $label, [string]$_.Exception.Message)) } }\r\n`
+    + `$runRecovery = { param([string]$label,[scriptblock]$action) try { & $action } catch { $recoveryFailure = ('{0}: {1}' -f $label, [string]$_.Exception.Message); if ($recoveryFailure.Length -gt 240) { $recoveryFailure = $recoveryFailure.Substring(0, 240) }; [void]$recoveryFailures.Add($recoveryFailure) } }\r\n`
     + releasePreflightGuard
+    + `$upgradePhase = 'install'\r\n`
     + `try {\r\n`
     + `@{ version = 1; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeMarker -Encoding utf8\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
@@ -897,6 +928,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       : '')
     + `Remove-Item -Force $healthLease -ErrorAction SilentlyContinue\r\n`
     + `$upgradeStartedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\r\n`
+    + `$upgradePhase = 'restart_health'\r\n`
     + `Start-ScheduledTask -TaskName $task\r\n`
     + `for ($attempt = 0; $attempt -lt 60 -and -not $healthy; $attempt++) {\r\n`
     + `  Start-Sleep -Seconds 2\r\n`
@@ -913,11 +945,13 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + helperCleanup
     + remoteDesktopCleanup
     + journalCleanup
-    + `@{ status = 'success'; completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeResult -Encoding utf8\r\n`
+    + `$upgradeResultPersisted = $false\r\n`
+    + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = 'success'; phase = 'complete'; completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=complete' }\r\n`
     + `} catch {\r\n`
     + `$failureMessage = [string]$_.Exception.Message\r\n`
     + `if ($failureMessage.Length -gt 240) { $failureMessage = $failureMessage.Substring(0, 240) }\r\n`
-    + `try { @{ status = 'rollback_started'; reason = $failureMessage; recordedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeResult -Encoding utf8 } catch { }\r\n`
+    + `$upgradeResultPersisted = $false\r\n`
+    + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = 'rollback_started'; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recordedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback_started' }\r\n`
     + `& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter 'name="imcodes-node.exe"' | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $dst, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep -Seconds 1 }\r\n`
     + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node rollback source hash mismatch' }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node restored hash mismatch' } } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
     + `& $runRecovery 'restore_manifest' { if ($manifestBackedUp -and (Test-Path $backupManifest)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node manifest rollback source hash mismatch' }; Copy-Item -Force $backupManifest $dstManifest; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node restored manifest hash mismatch' } } elseif ($manifestPublished) { Remove-Item -Force $dstManifest -ErrorAction Stop } }\r\n`
@@ -929,7 +963,8 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       : '')
     + (journalRollback ? `& $runRecovery 'restore_journal' { ${journalRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
     + `$rollbackStatus = if ($recoveryFailures.Count -eq 0) { 'rolled_back' } else { 'rollback_failed' }\r\n`
-    + `try { @{ status = $rollbackStatus; reason = $failureMessage; recoveryFailures = @($recoveryFailures); completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeResult -Encoding utf8 } catch { }\r\n`
+    + `$upgradeResultPersisted = $false\r\n`
+    + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = $rollbackStatus; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recoveryFailures = @($recoveryFailures); completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback' }\r\n`
     + `throw\r\n`
     + `} finally {\r\n`
     + `Remove-Item -Force -LiteralPath $upgradeMarker -ErrorAction SilentlyContinue\r\n`
@@ -1201,6 +1236,8 @@ export async function startControlledNodeSelfUpgrade(
       ? buildWindowsControlledNodeUpgradeScript({
         stagedArtifactPath: downloaded.artifactPath,
         stagedManifestPath: downloaded.manifestPath,
+        targetVersion: downloaded.version,
+        artifactSha256: downloaded.sha256,
         stagedComputerUseHelperDir: helper?.helperDir,
         // Swap the platform-root as one directory so the installed layout stays
         // remote-desktop-worker/win32-x64/<worker+manifest>, matching both the
