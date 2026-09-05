@@ -66,6 +66,22 @@ function makeExisting(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 describe('mergeSessionListEntry — supervision preservation', () => {
+  it('accepts a new authoritative shared mode and preserves it when an older sparse snapshot omits it', () => {
+    const projected = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    }, makeExisting({ supervisionMode: SUPERVISION_MODE.OFF }));
+    expect(projected.supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+
+    const sparse = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+    }, projected);
+    expect(sparse.supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+  });
   it('keeps daemon-provided error reason for error session list entries and clears it on recovery', () => {
     const errored = mergeSessionListEntry({
       ...BASE_INCOMING,

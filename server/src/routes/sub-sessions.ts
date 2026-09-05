@@ -201,6 +201,15 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
+  // Share participants may edit the existing non-transport presentation
+  // fields above, but transportConfig carries the owner Brain's supervision
+  // authority. Reject every shape (including null/empty/partial) before a DB
+  // write or daemon relay, using the server-resolved share capability rather
+  // than any client/projected session role.
+  if (access?.actor.kind === 'share' && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+
   const fields: {
     label?: string | null;
     closed_at?: number | null;

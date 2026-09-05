@@ -233,6 +233,8 @@ export function canSessionRoleOwnAutomaticSupervision(role: unknown): boolean {
 }
 
 export const SUPERVISION_TRANSPORT_CONFIG_KEY = 'supervision' as const;
+/** The only supervision field safe to project through a shared-tab boundary. */
+export const SUPERVISION_MODE_PROJECTION_KEY = 'supervisionMode' as const;
 export const SUPERVISION_USER_DEFAULT_PREF_KEY = 'supervision.user_default' as const;
 
 export const SUPERVISION_SUPPORTED_BACKENDS = SHARED_CONTEXT_RUNTIME_BACKENDS;
@@ -1435,6 +1437,33 @@ export function extractSessionSupervisionSnapshot(
 ): SessionSupervisionSnapshot | null {
   if (!transportConfig || typeof transportConfig !== 'object' || Array.isArray(transportConfig)) return null;
   return parseSessionSupervisionSnapshot(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]);
+}
+
+/**
+ * Project only the authoritative mode from a daemon/DB transport config.
+ *
+ * Shared-tab recipients need to render the owner's current mode, but must not
+ * receive provider settings, prompts, custom instructions, pool identities,
+ * endpoints, or any other transport configuration.  Both the realtime WS
+ * redactor and the `/shares/open` bootstrap use this single projection helper
+ * so their privacy and validation semantics cannot drift.
+ */
+export function projectSharedSessionSupervisionMode(
+  transportConfig: unknown,
+): SupervisionMode | null {
+  let candidate = transportConfig;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate) as unknown;
+    } catch {
+      return null;
+    }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+  const supervision = (candidate as Record<string, unknown>)[SUPERVISION_TRANSPORT_CONFIG_KEY];
+  if (!supervision || typeof supervision !== 'object' || Array.isArray(supervision)) return null;
+  const mode = (supervision as Record<string, unknown>).mode;
+  return SUPERVISION_MODES.includes(mode as SupervisionMode) ? mode as SupervisionMode : null;
 }
 
 export function embedSessionSupervisionSnapshot(

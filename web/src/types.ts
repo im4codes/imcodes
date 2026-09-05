@@ -1,5 +1,6 @@
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { SharedStateSummary } from './tab-sharing-ui.js';
+import type { SupervisionMode } from '@shared/supervision-config.js';
 
 export type Priority = 0 | 1 | 2 | 3;
 
@@ -74,6 +75,8 @@ export interface SessionInfo {
   contextNamespace?: SessionContextBootstrapState['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
+  /** Minimal owner-authoritative projection exposed to shared-tab readers. */
+  supervisionMode?: SupervisionMode | null;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: import('./transport-queue.js').TransportPendingMessageEntry[];
   queueEpoch?: string;

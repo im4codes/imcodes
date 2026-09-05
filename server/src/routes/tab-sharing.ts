@@ -25,6 +25,10 @@ import {
   type ShareTargetInput,
 } from '../db/tab-sharing.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
+import {
+  projectSharedSessionSupervisionMode,
+  SUPERVISION_MODE_PROJECTION_KEY,
+} from '../../../shared/supervision-config.js';
 
 export const tabSharingRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -266,6 +270,7 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: session.label?.trim() || session.project_name,
       state: session.state,
       agentType: session.agent_type,
+      [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(session.transport_config),
       ...(includeActiveDispatch
         ? { activeDispatchId: bridge.getActiveDispatchIdForSession(session.name) }
         : {}),
@@ -276,6 +281,7 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: subSession.label?.trim() || subSession.type,
       type: subSession.type,
       parentSessionName: subSession.parent_session,
+      [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(subSession.transport_config),
       ...(includeActiveDispatch
         ? { activeDispatchId: bridge.getActiveDispatchIdForSession(`deck_sub_${subSession.id}`) }
         : {}),

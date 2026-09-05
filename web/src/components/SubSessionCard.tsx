@@ -132,6 +132,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     transportConfig: sub.transportConfig ?? undefined,
+    supervisionMode: sub.supervisionMode ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,

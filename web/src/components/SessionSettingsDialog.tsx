@@ -88,6 +88,8 @@ interface Props {
   /** UI hint only; Server/daemon remain the authority for automatic mode. */
   canControlAutomaticSupervision?: boolean;
   transportConfig?: Record<string, unknown> | null;
+  /** Minimal owner-authoritative mode projected to shared read-only clients. */
+  supervisionMode?: SupervisionMode | null;
   sessionInstanceId?: string;
   runtimeEpoch?: string;
   activeModel?: string | null;
@@ -779,6 +781,7 @@ export function SessionSettingsDialog({
   cwd: initCwd,
   type,
   transportConfig,
+  supervisionMode,
   activeModel,
   requestedModel,
   peerAuditSessions = [],
@@ -800,8 +803,8 @@ export function SessionSettingsDialog({
   const initialSupervision = useMemo<SupervisionDraft>(() => {
     const persisted: SupervisionDraft = hasPersistedSupervision
       ? readSupervisionSnapshotFromTransportConfig(transportConfig)
-      : { mode: 'off' as const };
-    if (!canControlAutomaticSupervision) return { ...persisted, mode: SUPERVISION_MODE.OFF };
+      : { mode: supervisionMode ?? SUPERVISION_MODE.OFF };
+    if (!canControlAutomaticSupervision) return persisted;
     if (!openIntent?.supervisionMode) return persisted;
     if (openIntent.supervisionMode === 'off' || (persisted.backend && persisted.model)) {
       return { ...persisted, mode: openIntent.supervisionMode };
@@ -817,7 +820,7 @@ export function SessionSettingsDialog({
       ...persisted,
       mode: openIntent.supervisionMode,
     };
-  }, [canControlAutomaticSupervision, hasPersistedSupervision, openIntent?.supervisionMode, transportConfig, type]);
+  }, [canControlAutomaticSupervision, hasPersistedSupervision, openIntent?.supervisionMode, supervisionMode, transportConfig, type]);
 
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
@@ -832,6 +835,12 @@ export function SessionSettingsDialog({
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
+  useEffect(() => {
+    if (canControlAutomaticSupervision || supervisionMode == null) return;
+    setSupervision((current) => current.mode === supervisionMode
+      ? current
+      : { ...current, mode: supervisionMode });
+  }, [canControlAutomaticSupervision, supervisionMode]);
   // Qwen presets (env bundles) fetched from the daemon via the same
   // `cc.presets.list` WS channel the Shared Context panel uses. Stays empty
   // when `ws` is not provided — the picker hides itself in that case.
@@ -1100,7 +1109,8 @@ export function SessionSettingsDialog({
     && supervisorDefaultsCustomInstructions.trim().length > 0
     && supervisionCustomInstructions.trim().length > 0;
 
-  const nextTransportConfig = useMemo(() => buildTransportConfigWithSupervision(transportConfig, {
+  const nextTransportConfig = useMemo(() => canControlAutomaticSupervision
+    ? buildTransportConfigWithSupervision(transportConfig, {
     mode: supervision.mode,
     // Session snapshots retain a runtime mirror for cold-start compatibility,
     // but the UI has one global source of truth and the daemon refreshes it
@@ -1148,7 +1158,9 @@ export function SessionSettingsDialog({
           taskRunPromptVersion,
         }
       : {}),
-  }), [
+    })
+    : transportConfig ?? null, [
+    canControlAutomaticSupervision,
     isAuditMode,
     defaultsBackupSupportsPreset,
     defaultsSupportsPreset,
@@ -1605,7 +1617,7 @@ export function SessionSettingsDialog({
           )}
         </div>
 
-        {hasSupervision && (
+        {hasSupervision && canControlAutomaticSupervision && (
           <>
             <div class="session-settings-notice">
               {t('session.supervision.usesGlobalRuntime')}

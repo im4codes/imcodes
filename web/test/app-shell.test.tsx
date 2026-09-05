@@ -3,7 +3,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { createPortal } from 'preact/compat';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
@@ -517,6 +517,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
     <div
       data-testid={`session-pane-${session.name}`}
       data-active-dispatch-id={session.sharedState?.activeDispatchId ?? ''}
+      data-supervision-mode={session.supervisionMode ?? ''}
     >
       session-pane:{session.name}
       <button onClick={() => onFitFn?.(vi.fn())}>pane-fit-ref</button>
@@ -743,8 +744,13 @@ vi.mock('../src/components/StartSubSessionDialog.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionSettingsDialog.js', () => ({
-  SessionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen }: any) => (
-    <div data-child-dialog-open={String(Boolean(poolSessionDialogOpen))}>
+  SessionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen, supervisionMode, canControlAutomaticSupervision }: any) => (
+    <div
+      data-testid="session-settings-dialog"
+      data-child-dialog-open={String(Boolean(poolSessionDialogOpen))}
+      data-supervision-mode={supervisionMode ?? ''}
+      data-can-control-supervision={String(Boolean(canControlAutomaticSupervision))}
+    >
       session-settings-dialog
       <button onClick={() => onAddPoolSession?.('economy')}>settings-pool-add</button>
       <button onClick={() => onSaved?.({ label: 'Saved', type: 'codex-sdk', cwd: '/work/saved', transportConfig: {} })}>settings-save</button>
@@ -4285,6 +4291,7 @@ describe('App shell', () => {
         state: 'running',
         agentType: 'codex-sdk',
         activeDispatchId: 'dispatch-open-1',
+        supervisionMode: 'supervised_audit',
       }],
       subSessions: [],
     });
@@ -4309,6 +4316,12 @@ describe('App shell', () => {
     });
     const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
     expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-open-1');
+    expect(sharedPane.getAttribute('data-supervision-mode')).toBe('supervised_audit');
+    fireEvent.click(within(sharedPane).getByRole('button', { name: 'pane-settings' }));
+    const settings = await screen.findByTestId('session-settings-dialog');
+    expect(settings.getAttribute('data-supervision-mode')).toBe('supervised_audit');
+    expect(settings.getAttribute('data-can-control-supervision')).toBe('false');
+    fireEvent.click(within(settings).getByRole('button', { name: 'settings-close' }));
     await waitFor(() => expect(wsInstances.length).toBeGreaterThan(ownServerWsCount));
     await waitFor(() => expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true));
     const sharedWs = wsInstances.findLast((instance) => instance.options?.shareTarget === sharedEntry.target)!;

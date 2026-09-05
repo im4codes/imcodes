@@ -2022,7 +2022,7 @@ export function App() {
 
   const [showSubDialog, setShowSubDialog] = useState(false);
   const [poolAddTarget, setPoolAddTarget] = useState<SupervisionExecutionPoolKind | null>(null);
-  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; openIntent?: SessionSettingsOpenIntent; canControlAutomaticSupervision: boolean } | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('@shared/supervision-config.js').SupervisionMode | null; openIntent?: SessionSettingsOpenIntent; canControlAutomaticSupervision: boolean } | null>(null);
   const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
@@ -2914,11 +2914,13 @@ export function App() {
       const activeModel = source.activeModel ?? current.activeModel;
       const requestedModel = source.requestedModel ?? current.requestedModel;
       const providerId = source.providerId ?? current.providerId;
+      const supervisionMode = source.supervisionMode ?? current.supervisionMode;
       if (sessionInstanceId === current.sessionInstanceId
         && runtimeEpoch === current.runtimeEpoch
         && activeModel === current.activeModel
         && requestedModel === current.requestedModel
-        && providerId === current.providerId) {
+        && providerId === current.providerId
+        && supervisionMode === current.supervisionMode) {
         return current;
       }
       return {
@@ -2928,6 +2930,7 @@ export function App() {
         activeModel,
         requestedModel,
         providerId,
+        supervisionMode,
       };
     });
   }, [sessions, subSessions]);
@@ -3040,6 +3043,7 @@ export function App() {
           agentType: session.agentType || 'unknown',
           state: session.state as SessionInfo['state'],
           label: session.title,
+          supervisionMode: session.supervisionMode ?? null,
           sharedState: {
             effectiveRole: opened.coverage.effectiveRole,
             status: 'active',
@@ -6407,7 +6411,8 @@ export function App() {
                 type: session.agentType || '',
                 parentSession: null,
                 transportConfig: session.transportConfig ?? null,
-                canControlAutomaticSupervision: canSessionRoleOwnAutomaticSupervision(session.role),
+                supervisionMode: session.supervisionMode ?? null,
+                canControlAutomaticSupervision: !session.sharedState && canSessionRoleOwnAutomaticSupervision(session.role),
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
               onShareSession={openShareDialogForSession}
@@ -6525,7 +6530,7 @@ export function App() {
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
-                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, openIntent, canControlAutomaticSupervision: canSessionRoleOwnAutomaticSupervision(s.role) })}
+                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, supervisionMode: s.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: !s.sharedState && canSessionRoleOwnAutomaticSupervision(s.role) })}
                 onShareSession={openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
@@ -7458,7 +7463,7 @@ export function App() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
-              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, openIntent, canControlAutomaticSupervision: false })}
+              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, supervisionMode: sub.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: false })}
               onShareSession={openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
@@ -7592,6 +7597,7 @@ export function App() {
           parentSession={settingsTarget.parentSession}
           canControlAutomaticSupervision={settingsTarget.canControlAutomaticSupervision}
           transportConfig={settingsTarget.transportConfig}
+          supervisionMode={settingsTarget.supervisionMode}
           sessionInstanceId={settingsTarget.sessionInstanceId}
           runtimeEpoch={settingsTarget.runtimeEpoch}
           activeModel={settingsTarget.activeModel}

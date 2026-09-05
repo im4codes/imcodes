@@ -308,6 +308,59 @@ describe('session-mgmt persistence routes', () => {
     );
   });
 
+  it('PATCH /sessions/:name cannot bypass participant supervision read-only authority via transportConfig', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: Date.now(),
+        },
+      },
+    });
+    mockGetDbSessionByName.mockResolvedValue({
+      name: 'deck_proj_brain',
+      role: 'brain',
+      agent_type: 'codex-sdk',
+    });
+    const app = await buildApp();
+
+    const attemptedTransportConfigs = [
+      null,
+      {},
+      { provider: { mode: 'partial' } },
+      { supervision: null },
+      ...(['off', 'supervised', 'supervised_audit'] as const).map((mode) => ({
+        supervision: { mode },
+      })),
+    ];
+    for (const transportConfig of attemptedTransportConfigs) {
+      const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          label: 'must-not-mutate-either',
+          transportConfig,
+        }),
+      });
+      expect(res.status, JSON.stringify(transportConfig)).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    }
+
+    expect(mockGetDbSessionByName).not.toHaveBeenCalled();
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(mockUpdateSubSession).not.toHaveBeenCalled();
+    expect(mockDbExecute).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
   it('PATCH /sessions/:name relays session.restart when agentType changes', async () => {
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
@@ -586,7 +639,7 @@ describe('session-mgmt persistence routes', () => {
     });
   });
 
-  it('PATCH /sessions/:name/supervision lets a covered participant change only supervision mode', async () => {
+  it('PATCH /sessions/:name/supervision keeps covered participants read-only', async () => {
     const coverage = {
       target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
       effectiveRole: 'participant',
@@ -621,56 +674,49 @@ describe('session-mgmt persistence routes', () => {
     });
     const app = await buildApp();
 
-    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        supervision: {
-          mode: 'supervised',
-          backend: 'claude-code-sdk',
-          model: 'sonnet',
-          timeoutMs: 30_000,
-          promptVersion: 'supervision_decision_v1',
-          maxParseRetries: 1,
-          maxAutoContinueStreak: 1,
-          maxAutoContinueTotal: 1,
-        },
-      }),
-    });
-
-    expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({
-      ok: true,
-      transportConfig: {
-        supervision: expect.objectContaining({
-          mode: 'supervised',
-          backend: 'codex-sdk',
-          model: 'gpt-5.4',
+    for (const mode of ['off', 'supervised', 'supervised_audit'] as const) {
+      const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          supervision: {
+            mode,
+            backend: 'codex-sdk',
+            model: 'gpt-5.4',
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+            maxParseRetries: 1,
+            maxAutoContinueStreak: 1,
+            maxAutoContinueTotal: 1,
+            ...(mode === 'supervised_audit' ? {
+              maxAuditLoops: 2,
+              taskRunPromptVersion: 'task_run_status_v1',
+              executionPools: {
+                state: 'configured',
+                primaryDevelopmentPool: {
+                  configs: [{
+                    capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.4',
+                    agentType: 'codex-sdk',
+                    providerFamily: 'openai',
+                    runtimeType: 'transport',
+                    model: 'gpt-5.4',
+                  }],
+                  controls: {},
+                },
+                economyTaskPool: { configs: [], controls: {} },
+              },
+            } : {}),
+          },
         }),
-      },
-    });
-    const expectedTransportConfig = {
-      provider: { privateSetting: 'preserved' },
-      supervision: expect.objectContaining({
-        mode: 'supervised',
-        backend: 'codex-sdk',
-        model: 'gpt-5.4',
-        timeoutMs: 45_000,
-        maxAutoContinueStreak: 2,
-        maxAutoContinueTotal: 0,
-      }),
-    };
-    expect(mockUpdateSession).toHaveBeenCalledWith(
-      mockDb,
-      'srv-1',
-      'deck_proj_brain',
-      { transport_config: expectedTransportConfig },
-    );
-    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
-      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
-      sessionName: 'deck_proj_brain',
-      transportConfig: expectedTransportConfig,
-    });
+      });
+
+      expect(res.status, mode).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    }
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(mockUpdateSubSession).not.toHaveBeenCalled();
+    expect(mockDbExecute).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
   it('PATCH /sessions/:name/supervision accepts automatic audit routed from the live pool', async () => {
@@ -842,7 +888,7 @@ describe('session-mgmt persistence routes', () => {
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
-  it('PATCH /sessions/:name/supervision denies an audit target outside the participant share', async () => {
+  it('PATCH /sessions/:name/supervision denies a participant before inspecting a forged audit target', async () => {
     const coverage = {
       target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
       effectiveRole: 'participant',
@@ -883,7 +929,7 @@ describe('session-mgmt persistence routes', () => {
     expect(res.status).toBe(403);
     await expect(res.json()).resolves.toEqual({
       error: 'forbidden',
-      reason: 'share-direct-surface-denied',
+      reason: 'share-role-denied',
     });
     expect(mockUpdateSession).not.toHaveBeenCalled();
     expect(sendToDaemonMock).not.toHaveBeenCalled();

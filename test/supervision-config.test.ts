@@ -41,6 +41,7 @@ import {
   parseSupervisionExecutionStateFromText,
   parseTaskRunTerminalStateFromText,
   patchPeerAuditTargetInTransportConfig,
+  projectSharedSessionSupervisionMode,
   resolveEffectiveCustomInstructions,
   SUPERVISION_UNAVAILABLE_REASONS,
   SUPERVISION_PAUSE_CATEGORIES,
@@ -50,6 +51,26 @@ import {
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
+  it('projects only a validated supervision mode across shared-tab boundaries', () => {
+    const privateConfig = {
+      provider: { token: 'must-not-leak' },
+      supervision: {
+        mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+        prompt: 'must-not-leak',
+        customInstructions: 'must-not-leak',
+        identity: { sessionName: 'must-not-leak' },
+      },
+    };
+
+    expect(projectSharedSessionSupervisionMode(privateConfig))
+      .toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(projectSharedSessionSupervisionMode(JSON.stringify(privateConfig)))
+      .toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(projectSharedSessionSupervisionMode({ supervision: { mode: 'forged' } })).toBeNull();
+    expect(projectSharedSessionSupervisionMode('{broken')).toBeNull();
+    expect(projectSharedSessionSupervisionMode(null)).toBeNull();
+  });
+
   it('registers the canonical Brain work-delegation contract in every standing reference', () => {
     expect(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION)
       .toBe('supervision_brain_work_delegation_v1');

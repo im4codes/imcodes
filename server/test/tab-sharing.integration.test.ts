@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { Hono } from 'hono';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { createServer, createSubSession, createUser, updateSessionLabel, upsertDbSession } from '../src/db/queries.js';
+import { createServer, createSubSession, createUser, updateSession, updateSessionLabel, updateSubSession, upsertDbSession } from '../src/db/queries.js';
 import {
   createOrUpdateShare,
   deriveShareTransitionKey,
@@ -733,6 +733,29 @@ describe('tab sharing APIs', () => {
   it('keeps manager and recipient share metadata minimized and shape-separated', async () => {
     const app = makeApp();
     const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await updateSession(db, serverId, sessionName, {
+      transport_config: {
+        provider: { privateToken: 'must-not-leak' },
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    await updateSubSession(db, subSessionId, serverId, {
+      transport_config: {
+        provider: { privateToken: 'must-not-leak-sub' },
+        supervision: { mode: 'supervised' },
+      },
+    });
     await db.execute(
       'UPDATE users SET username = $1, display_name = $2, password_hash = $3 WHERE id = $4',
       [`recipient_${recipientId}`, 'Shared Recipient', 'secret-hash', recipientId],
@@ -833,6 +856,7 @@ describe('tab sharing APIs', () => {
           state: 'idle',
           agentType: 'codex',
           activeDispatchId: 'dispatch-main-1',
+          supervisionMode: 'supervised_audit',
         },
       ],
       subSessions: [
@@ -843,9 +867,12 @@ describe('tab sharing APIs', () => {
           type: 'codex',
           parentSessionName: sessionName,
           activeDispatchId: 'dispatch-sub-1',
+          supervisionMode: 'supervised',
         },
       ],
     });
+    expect((openBody.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
+    expect((openBody.subSessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
     expect(openBody).not.toHaveProperty('shares');
     expect(openBody).not.toHaveProperty('targetUser');
     expect(openBody).not.toHaveProperty('createdBy');

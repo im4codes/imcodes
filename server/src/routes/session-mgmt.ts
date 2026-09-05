@@ -287,19 +287,11 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
   }
 
-  const now = Date.now();
-  const actionId = actionIdFromBody(body as Record<string, unknown>);
-  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
-    await auditHttpShareCommand(c, {
-      userId,
-      target,
-      coverage: access.actor.coverage,
-      actionType: 'session.supervision',
-      decision: 'rejected',
-      reason: 'share-role-denied',
-      actionId,
-      now,
-    });
+  // Automatic supervision belongs to the owner Brain. A participant may read
+  // the minimal authoritative mode projection, but a projected row.role must
+  // never be treated as an owner capability for writes. Reject before any DB
+  // write or daemon relay: the shared actor has read authority only.
+  if (access.actor.kind === 'share') {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
@@ -342,53 +334,6 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   }
   const nextTransportConfig = buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
 
-  if (access.actor.kind === 'share') {
-    if (nextSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT && nextSnapshot.auditTargetSessionName) {
-      const p2pScopeTarget = await httpP2pScopeTarget(c.env.DB, {
-        userId,
-        serverId,
-        requestedTarget: target,
-        coverage: access.actor.coverage,
-        now,
-      });
-      const coveredSessionNames = await resolveCoveredSessionNames(c.env.DB, p2pScopeTarget);
-      if (!buildCoversSessionPredicate(p2pScopeTarget, coveredSessionNames)(nextSnapshot.auditTargetSessionName)) {
-        await auditHttpShareCommand(c, {
-          userId,
-          target,
-          coverage: access.actor.coverage,
-          actionType: 'session.supervision',
-          decision: 'rejected',
-          reason: 'share-direct-surface-denied',
-          actionId,
-          now,
-        });
-        return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-      }
-    }
-    const rateLimitReason = evaluateHttpShareRateLimit({
-      bridge: WsBridge.get(serverId),
-      userId,
-      serverId,
-      sessionName,
-      commandType: 'session.send',
-      now,
-    });
-    if (rateLimitReason) {
-      await auditHttpShareCommand(c, {
-        userId,
-        target,
-        coverage: access.actor.coverage,
-        actionType: 'session.supervision',
-        decision: 'rejected',
-        reason: rateLimitReason,
-        actionId,
-        now,
-      });
-      return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
-    }
-  }
-
   if (target.kind === 'subsession') {
     await updateSubSession(c.env.DB, target.subSessionId, serverId, { transport_config: nextTransportConfig });
   } else {
@@ -408,21 +353,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     return c.json({ error: 'relay_failed' }, 502);
   }
 
-  if (access.actor.kind === 'share') {
-    await auditHttpShareCommand(c, {
-      userId,
-      target,
-      coverage: access.actor.coverage,
-      actionType: 'session.supervision',
-      decision: 'accepted',
-      actionId,
-      now,
-    });
-  }
-  const responseTransportConfig = access.actor.kind === 'share'
-    ? buildTransportConfigWithSupervision(null, nextSnapshot)
-    : nextTransportConfig;
-  return c.json({ ok: true, transportConfig: responseTransportConfig });
+  return c.json({ ok: true, transportConfig: nextTransportConfig });
 });
 
 async function resolveSupervisorDefaultsOwner(
@@ -575,6 +506,14 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     body = await c.req.json() as typeof body;
   } catch {
     return c.json({ error: 'invalid_json' }, 400);
+  }
+
+  // The dedicated supervision route is not the only way an owner can persist
+  // transportConfig. Keep the generic settings route from becoming a bypass:
+  // shared participants may still edit their authorized presentation fields,
+  // but no transport config (including an apparent `off`) crosses this gate.
+  if (access.actor.kind === 'share' && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
   const fields: {

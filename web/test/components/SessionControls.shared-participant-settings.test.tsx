@@ -7,6 +7,7 @@ import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 
 const fetchSupervisorDefaultsMock = vi.fn().mockResolvedValue(null);
+const patchSessionSupervisionMock = vi.fn().mockResolvedValue(null);
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -28,7 +29,7 @@ vi.mock('../../src/api.js', () => ({
   getUserPref: vi.fn().mockResolvedValue(null),
   onUserPrefChanged: vi.fn(() => () => {}),
   patchSession: vi.fn().mockResolvedValue(undefined),
-  patchSessionSupervision: vi.fn().mockResolvedValue(null),
+  patchSessionSupervision: (...args: unknown[]) => patchSessionSupervisionMock(...args),
   patchSubSession: vi.fn().mockResolvedValue(undefined),
   saveSessionSupervisorDefaults: vi.fn(async (_serverId: string, _sessionName: string, value: unknown) => value),
   saveUserPref: vi.fn().mockResolvedValue(undefined),
@@ -80,8 +81,9 @@ function sharedSession(role: 'participant' | 'viewer'): SessionInfo {
     agentType: 'codex-sdk',
     runtimeType: 'transport',
     state: 'idle',
+    supervisionMode: 'supervised_audit',
     sharedState: { effectiveRole: role, status: 'active' },
-  };
+  } as SessionInfo;
 }
 
 function renderControls(role: 'participant' | 'viewer', onSettings: () => void) {
@@ -101,6 +103,7 @@ describe('SessionControls shared participant settings entry points', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
+    patchSessionSupervisionMock.mockResolvedValue(null);
   });
 
   afterEach(() => cleanup());
@@ -115,6 +118,23 @@ describe('SessionControls shared participant settings entry points', () => {
     fireEvent.click(settings);
 
     expect(onSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders the owner-authoritative audit mode but keeps every quick mode choice read-only', () => {
+    renderControls('participant', vi.fn());
+
+    const auto = screen.getByRole('button', { name: 'Auto' });
+    expect(auto.textContent).toContain('quickAuditLabel');
+    fireEvent.click(auto);
+
+    const menu = document.querySelector('.menu-dropdown-auto') as HTMLElement;
+    const options = within(menu).getAllByRole('button').filter((button) => button.textContent !== 'Settings');
+    expect(options).toHaveLength(3);
+    for (const option of options) {
+      expect((option as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(option);
+    }
+    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
   });
 
   it('opens the same settings surface from the session action menu for an active participant', () => {

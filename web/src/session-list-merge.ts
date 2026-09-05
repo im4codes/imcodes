@@ -67,6 +67,7 @@ export interface IncomingSessionListEntry {
   contextNamespace?: SessionInfo['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
+  supervisionMode?: SessionInfo['supervisionMode'];
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
   pendingMessageEntries?: unknown;
@@ -182,6 +183,9 @@ export function mergeSessionListEntry(
       incoming.transportConfig,
       existing?.transportConfig,
     ),
+    supervisionMode: incoming.supervisionMode !== undefined
+      ? incoming.supervisionMode
+      : existing?.supervisionMode,
     transportPendingMessages: nextPendingMessages,
     transportPendingMessageEntries: nextPendingEntries,
     queueEpoch: hasPendingSyncPatch ? (pendingSyncPatch.queueEpoch ?? existing?.queueEpoch) : existing?.queueEpoch,

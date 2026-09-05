@@ -292,7 +292,26 @@ describe('WsBridge share-scoped sockets', () => {
     daemon.emit('message', JSON.stringify({
       type: 'session_list',
       sessions: [
-        { name: 'deck_proj_brain', runtimeType: 'transport', projectDir: '/owner/project' },
+        {
+          name: 'deck_proj_brain',
+          runtimeType: 'transport',
+          projectDir: '/owner/project',
+          transportConfig: {
+            provider: { privateToken: 'must-not-leak' },
+            supervision: {
+              mode: 'supervised_audit',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6-sol',
+              timeoutMs: 30_000,
+              promptVersion: 'supervision_decision_v1',
+              maxParseRetries: 1,
+              maxAutoContinueStreak: 2,
+              maxAutoContinueTotal: 0,
+              maxAuditLoops: 2,
+              taskRunPromptVersion: 'task_run_status_v1',
+            },
+          },
+        },
         { name: 'deck_other_brain', runtimeType: 'transport' },
       ],
     }));
@@ -305,7 +324,45 @@ describe('WsBridge share-scoped sockets', () => {
       name: 'deck_proj_brain',
       runtimeType: 'transport',
       projectDir: '/owner/project',
+      supervisionMode: 'supervised_audit',
     }]);
+    expect((sharedList?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
+  });
+
+  it('projects only supervision mode for a covered shared sub-session event', () => {
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const state = {
+      userId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      ticketId: 'subsession-mode-ticket',
+      target,
+      snapshot: coverage(target, 'participant', now),
+      connectedAt: now,
+      coveredSessionNames: ['deck_proj_brain', 'deck_sub_child'],
+    };
+    const filtered = filterShareDaemonMessage({
+      type: 'subsession.created',
+      id: 'child',
+      sessionName: 'deck_sub_child',
+      parentSession: 'deck_proj_brain',
+      sessionType: 'codex-sdk',
+      transportConfig: {
+        provider: { privateToken: 'must-not-leak' },
+        supervision: { mode: 'supervised' },
+      },
+      providerId: 'private-provider',
+      requestedModel: 'private-model',
+    }, state);
+
+    expect(filtered).toMatchObject({
+      type: 'subsession.created',
+      id: 'child',
+      sessionName: 'deck_sub_child',
+      supervisionMode: 'supervised',
+    });
+    expect(filtered).not.toHaveProperty('transportConfig');
+    expect(filtered).not.toHaveProperty('providerId');
+    expect(filtered).not.toHaveProperty('requestedModel');
   });
 
   it('bridges task-console reads only for shared MAIN viewers and participants', async () => {

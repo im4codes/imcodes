@@ -30,6 +30,10 @@ import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
 import { CC_PRESET_MSG } from '../../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
+import {
+  projectSharedSessionSupervisionMode,
+  SUPERVISION_MODE_PROJECTION_KEY,
+} from '../../../shared/supervision-config.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -300,7 +304,7 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['command.ack', { target: sessionFieldTarget, redact: redactActiveDispatchForViewers }],
   ['command.failed', { target: sessionFieldTarget }],
   ['subsession.response', { target: sessionNameFieldTarget }],
-  ['subsession.created', { target: subsessionCreatedTarget }],
+  ['subsession.created', { target: subsessionCreatedTarget, redact: redactSubsessionCreated }],
   ['subsession.removed', { target: subsessionRemovedTarget }],
   ['timeline.event', {
     target: timelineEventTarget,
@@ -939,6 +943,37 @@ function redactSessionRow(row: Record<string, unknown>, includeActiveDispatch: b
   if (includeActiveDispatch && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
     redacted.activeDispatchId = row.activeDispatchId;
   }
+  const supervisionMode = projectSharedSessionSupervisionMode(row.transportConfig);
+  if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
+  return redacted;
+}
+
+const SHARE_VISIBLE_SUBSESSION_FIELDS = new Set([
+  'type',
+  'id',
+  'sessionName',
+  'sessionInstanceId',
+  'runtimeEpoch',
+  'sessionType',
+  'cwd',
+  'label',
+  'parentSession',
+  'runtimeType',
+  'state',
+  'activeModel',
+  'modelDisplay',
+]);
+
+function redactSubsessionCreated(
+  msg: Record<string, unknown>,
+  _state: ShareScopedSocketState,
+): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(msg)) {
+    if (SHARE_VISIBLE_SUBSESSION_FIELDS.has(key)) redacted[key] = value;
+  }
+  const supervisionMode = projectSharedSessionSupervisionMode(msg.transportConfig);
+  if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
   return redacted;
 }
 

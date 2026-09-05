@@ -25,6 +25,7 @@ import {
   normalizeSupervisorDefaultConfig,
   parseSupervisorDefaultConfig,
   type SessionSupervisionSnapshot,
+  type SupervisionMode,
   type SupervisorDefaultConfig,
 } from '@shared/supervision-config.js';
 import { normalizeSupervisionExecutionConfig } from '@shared/supervision-execution-pool.js';
@@ -764,6 +765,7 @@ export interface OpenSharedEntryResponse {
     state: string;
     agentType: string;
     activeDispatchId?: string | null;
+    supervisionMode?: SupervisionMode | null;
   }>;
   subSessions: Array<{
     subSessionId: string;
@@ -772,6 +774,7 @@ export interface OpenSharedEntryResponse {
     type: string;
     parentSessionName: string | null;
     activeDispatchId?: string | null;
+    supervisionMode?: SupervisionMode | null;
   }>;
 }
 
@@ -915,6 +918,7 @@ export interface SubSessionData {
   contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null;
   contextNamespaceDiagnostics?: string[] | null;
   transportConfig?: Record<string, unknown> | null;
+  supervisionMode?: SupervisionMode | null;
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
   queueEpoch?: string | null;

@@ -68,6 +68,14 @@ function Harness({ ws, connected }: { ws: any; connected: boolean }) {
 let closeSubSessionHook: ((id: string) => Promise<void>) | null = null;
 let renameSubSessionHook: ((id: string, label: string) => Promise<void>) | null = null;
 let createSubSessionHook: ((type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => Promise<SubSession | null>) | null = null;
+let hydrateSharedHook: ((serverId: string, items: Array<{
+  subSessionId: string;
+  sessionName: string;
+  title: string;
+  type: string;
+  parentSessionName: string | null;
+  supervisionMode?: SubSession['supervisionMode'];
+}>) => void) | null = null;
 
 function CloseHarness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions, close } = useSubSessions('srv1', ws, connected, null);
@@ -90,8 +98,40 @@ function CreateHarness({ ws, connected }: { ws: any; connected: boolean }) {
   return null;
 }
 
+function SharedHarness({ ws }: { ws: any }) {
+  const { subSessions, hydrateShared } = useSubSessions('srv1', ws, true, null, true);
+  captured = subSessions;
+  hydrateSharedHook = hydrateShared;
+  return null;
+}
+
 describe('sub-session metadata via subsession.created', () => {
-  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; sentMessages.length = 0; });
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    captured = [];
+    sentMessages.length = 0;
+    hydrateSharedHook = null;
+  });
+
+  it('hydrates the authoritative shared supervision mode without a transport config', async () => {
+    const { ws } = createMockWs();
+    render(<SharedHarness ws={ws} />);
+    await waitFor(() => expect(hydrateSharedHook).not.toBeNull());
+
+    act(() => hydrateSharedHook?.('srv1', [{
+      subSessionId: 'shared-child',
+      sessionName: 'deck_sub_shared_child',
+      title: 'Shared child',
+      type: 'codex-sdk',
+      parentSessionName: 'deck_project_brain',
+      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    }]));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(captured[0].transportConfig).toBeUndefined();
+  });
 
   it('stores Qwen metadata fields from subsession.created', async () => {
     const { ws, send } = createMockWs();

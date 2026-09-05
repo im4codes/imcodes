@@ -1868,7 +1868,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const currentTransportConfig = localTransportConfig ?? activeSession?.transportConfig ?? null;
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
-  const quickSupervisionMode = supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
+  const quickSupervisionMode = isShareScopedSession
+    ? activeSession?.supervisionMode ?? SUPERVISION_MODE.OFF
+    : supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
   const auditedSessionName = activeSession?.name ?? null;
   const hasSavedAuditTarget = Boolean(
     supervisionSnapshot?.auditTargetSessionName
@@ -1880,8 +1882,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
   );
-  const canQuickControlSupervision = canQuickPeerAudit
-    && canSessionRoleOwnAutomaticSupervision(activeSession?.role);
+  const canQuickViewSupervision = canQuickPeerAudit
+    && canSessionRoleOwnAutomaticSupervision(activeSession?.role)
+    && (!isShareScopedSession || (
+      sharedState?.status === 'active'
+      && sharedState.effectiveRole === 'participant'
+    ));
+  const canQuickControlSupervision = canQuickViewSupervision && !isShareScopedSession;
   const supervisorDefaultsPref = useSupervisorDefaults(
     canQuickControlSupervision,
     serverId && activeSession?.name ? { serverId, sessionName: activeSession.name } : null,
@@ -5409,7 +5416,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </svg>
               <span class="shortcut-btn-peer-audit-label">{t('peerAuditQuick.shortLabel')}</span>
             </button>
-            {canQuickControlSupervision && <>
+            {canQuickViewSupervision && <>
             <button
               class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}
               onClick={() => setAutoOpen((open) => !open)}
@@ -5426,23 +5433,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <span class="shortcut-btn-auto-label">{quickSupervisionLabel}</span>
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
             </button>
-            {canQuickControlSupervision && autoOpen && (
+            {canQuickViewSupervision && autoOpen && (
               <div class="menu-dropdown menu-dropdown-auto">
                 <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.OFF ? 'menu-item-active' : ''}`}
                   onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.OFF); }}
+                  disabled={!canQuickControlSupervision}
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.OFF ? '● ' : '○ '}{t('session.supervision.mode.off')}
                 </button>
                 <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? 'menu-item-active' : ''}`}
                   onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED); }}
+                  disabled={!canQuickControlSupervision}
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? '● ' : '○ '}{t('session.supervision.mode.supervised')}
                 </button>
                 <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? 'menu-item-active' : ''}`}
                   onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED_AUDIT); }}
+                  disabled={!canQuickControlSupervision}
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? '● ' : '○ '}{t('session.supervision.mode.supervised_audit')}
                 </button>

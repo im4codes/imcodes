@@ -112,7 +112,7 @@ describe('SessionSettingsDialog supervision', () => {
     cleanup();
   });
 
-  it('forces automatic supervision off for non-Brain settings', () => {
+  it('renders authoritative supervision read-only without forcing it off', () => {
     render(
       <SessionSettingsDialog
         canControlAutomaticSupervision={false}
@@ -140,8 +140,52 @@ describe('SessionSettingsDialog supervision', () => {
 
     const mode = screen.getByLabelText('supervision-session:mode') as HTMLSelectElement;
     expect(mode.disabled).toBe(true);
-    expect(mode.value).toBe('off');
+    expect(mode.value).toBe('supervised_audit');
     expect(screen.getByText('brainOnly')).toBeDefined();
+  });
+
+  it('uses the minimal shared projection and never writes supervision from a read-only dialog', async () => {
+    const view = render(
+      <SessionSettingsDialog
+        canControlAutomaticSupervision={false}
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Shared Brain"
+        description=""
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        supervisionMode="supervised_audit"
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const mode = screen.getByLabelText('supervision-session:mode') as HTMLSelectElement;
+    expect(mode.disabled).toBe(true);
+    expect(mode.value).toBe('supervised_audit');
+
+    view.rerender(
+      <SessionSettingsDialog
+        canControlAutomaticSupervision={false}
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Shared Brain"
+        description=""
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        supervisionMode="supervised"
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(mode.value).toBe('supervised'));
+
+    fireEvent.input(inputForLabel('label'), { target: { value: 'Shared Brain renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalled());
+    expect(patchSessionMock.mock.calls.at(-1)?.[2]).not.toHaveProperty('transportConfig');
   });
 
   it('shows the working directory as read-only and omits cwd when saving a main session', async () => {
