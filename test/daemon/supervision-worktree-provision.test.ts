@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -10,6 +11,7 @@ import {
 } from '../../src/daemon/supervision-worktree-provision.js';
 
 const roots: string[] = [];
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -66,6 +68,39 @@ describe('supervision assignment worktree provisioning', () => {
     });
     expect(replay).toEqual({ ok: true, worktreePath, baseRevision: shape.baseRevision, created: false });
     expect(readFileSync(join(worktreePath, '.git'), 'utf8')).toBe(gitFile);
+  });
+
+  it('provisions the tracked Gradle batch file with CRLF bytes and a clean Git status', async () => {
+    const shape = fixture();
+    const attributes = readFileSync(join(repositoryRoot, '.gitattributes'));
+    const trackedBatch = execFileSync(
+      'git', ['show', 'HEAD:web/android/gradlew.bat'], { cwd: repositoryRoot },
+    );
+    expect(trackedBatch.includes(Buffer.from('\r\n'))).toBe(false);
+    expect(trackedBatch.includes(Buffer.from('\n'))).toBe(true);
+
+    writeFileSync(join(shape.source, '.gitattributes'), attributes);
+    const batchPath = join(shape.source, 'web', 'android', 'gradlew.bat');
+    mkdirSync(dirname(batchPath), { recursive: true });
+    writeFileSync(batchPath, trackedBatch);
+    git(shape.source, 'add', '.gitattributes', 'web/android/gradlew.bat');
+    git(shape.source, 'commit', '-qm', 'add production EOL fixture');
+    const baseRevision = git(shape.source, 'rev-parse', 'HEAD');
+    const worktreePath = join(shape.root, 'worktrees', 'imcodes', 'deck_sub_worker', 'asg_gradlew_eol', 'repo');
+
+    await expect(ensureSupervisionAssignmentWorktree({
+      projectRoot: shape.source, sessionName: 'deck_sub_worker', assignmentId: 'asg_gradlew_eol',
+      baseRevision, worktreePath,
+    })).resolves.toEqual({ ok: true, worktreePath, baseRevision, created: true });
+
+    expect(git(worktreePath, 'check-attr', 'text', '--', 'web/android/gradlew.bat'))
+      .toBe('web/android/gradlew.bat: text: set');
+    expect(git(worktreePath, 'check-attr', 'eol', '--', 'web/android/gradlew.bat'))
+      .toBe('web/android/gradlew.bat: eol: crlf');
+    const checkedOutBatch = readFileSync(join(worktreePath, 'web', 'android', 'gradlew.bat'));
+    expect(checkedOutBatch.includes(Buffer.from('\r\n'))).toBe(true);
+    expect(checkedOutBatch.toString('binary').replaceAll('\r\n', '')).not.toContain('\n');
+    expect(git(worktreePath, 'status', '--short', '--', 'web/android/gradlew.bat')).toBe('');
   });
 
   it('recovers the same missing path after an interrupted journal-only attempt', async () => {
