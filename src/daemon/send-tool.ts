@@ -314,6 +314,20 @@ export type SendMessageResult =
       auditRoutingReason?: SupervisionAuditRoutingReason;
       auditDegradedReason?: SupervisionAuditDegradedReason;
       provisioning?: SupervisionProvisioningEvidence;
+      /**
+       * Present ONLY for a control-plane operation that carries task authority
+       * without delivering a message. `deliveries` is empty in that case and no
+       * delivery record is fabricated, so a caller can tell an authority change
+       * from a chat send by structure rather than by reading prose.
+       */
+      controlPlane?: {
+        operation: 'audit_policy_bind';
+        auditPolicy: NonNullable<SupervisionTaskMetadata['auditPolicy']>;
+        /** Whether this call performed the write or found it already satisfied. */
+        policyBound: 'newly_bound' | 'already_bound';
+        /** Outcome of the ONE existing ready-audit trigger, never a second dispatcher. */
+        auditTrigger: 'skipped' | 'invoked' | 'failed';
+      };
     }
   | { status: 'disabled'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED; disabledFlag: typeof SEND_MCP_DISPATCH_FEATURE_FLAG }
   | {
@@ -1235,6 +1249,130 @@ export async function dispatchSendMessage(
   const targets = resolveScopedTargets({ ...caller, projectName: callerProjectName }, resolvedInput, allSessions, d.exactTargetOnly, 'exactCreatorOnly');
   if (!targets.ok) return { status: 'error', reason: targets.reason, error: targets.error };
 
+  // ── Control-plane auditPolicy bind ─────────────────────────────────────
+  //
+  // `auditPolicy` is TASK authority, not a message. Binding it used to ride on
+  // the implementation-delivery path, which requires exactly one dispatchable
+  // target, validates that target against the project's execution pool, and
+  // reaches the bind only through a task continuation that re-checks the frozen
+  // implementer's identity. A historical ready_for_audit task therefore could
+  // not acquire a policy once its implementer drifted -- model no longer
+  // pool-selected, or a rotated runtime epoch -- and the observed workaround was
+  // a manual SAME-assignment identity rebind, after which delivery still failed.
+  //
+  // This branch runs BEFORE any dispatchable-target, execution-pool or
+  // continuation-identity check and AFTER its own exact authority gates. It
+  // delivers nothing, fabricates no delivery record, mutates no implementer
+  // identity/binding/status/lease/scope/revision/worktree and no historical
+  // receipt, and then reuses the ONE existing ready-audit trigger. Every gate
+  // below refuses with zero writes.
+  //
+  // The ordinary send path is untouched: this returns before it, so exact-one-
+  // target and pool validation still apply byte-for-byte to every real message.
+  // Discriminator: a control-plane bind names a TASK and no assignment. Supplying
+  // an assignmentId means "continue this exact assignment", which is a real
+  // delivery and must keep the ordinary path byte-for-byte -- including its
+  // exact-one-target and execution-pool gates. Only the assignment-less form,
+  // which has nothing to deliver and nobody to continue, is control-plane.
+  const controlPlaneAuditPolicy = !input.audit
+    && input.task?.taskId?.trim()
+    && !input.task.assignmentId?.trim()
+    ? input.task.auditPolicy ?? undefined
+    : undefined;
+  if (controlPlaneAuditPolicy) {
+    const controlPlaneTaskId = input.task!.taskId!.trim();
+    const registry = getSupervisionTaskRegistry();
+    const task = registry.get(controlPlaneTaskId);
+    const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
+    const callerIdentity = callerRecord && supervisionTaskIdentityForTarget(callerRecord);
+    const reject = (error: string, reason: SendToolErrorReason = MCP_ERROR_REASONS.VALIDATION_FAILED) => ({
+      status: 'error' as const, reason, error,
+    });
+
+    if (!task) return reject('task is not visible to this caller', MCP_ERROR_REASONS.IDENTITY_REJECTED);
+    // Exact same-project live Brain coordinator, by identity, not by name.
+    const exactCoordinator = callerIdentity && task.assignments.find((assignment) => (
+      assignment.role === 'coordinator'
+      && supervisionIdentityMatches(assignment.identity, callerIdentity)
+    ));
+    if (callerRecord?.role !== 'brain' || callerRecord.parentSession
+      || task.projectName !== callerProjectName || !exactCoordinator) {
+      return reject(
+        'task auditPolicy requires the exact authoritative project Brain coordinator',
+        MCP_ERROR_REASONS.IDENTITY_REJECTED,
+      );
+    }
+    if (resolveProjectAuthoritativeSupervisionSnapshot(callerProjectName, allSessions).mode
+      !== SUPERVISION_MODE.SUPERVISED_AUDIT) {
+      return reject('task auditPolicy requires supervised_audit mode on the authoritative project Brain');
+    }
+    if (!isAuditableSupervisionTaskClassification(task.classification)) {
+      return reject('task auditPolicy requires an auditable task classification');
+    }
+    if (isTerminalSupervisionTaskStatus(task.status) || task.finalization) {
+      return reject('task auditPolicy cannot be bound on a terminal task');
+    }
+    const controlPlaneRevision = task.currentRevision?.trim();
+    if (!controlPlaneRevision) return reject('task auditPolicy requires an exact current revision');
+    const requestedRevision = input.task!.currentRevision?.trim();
+    if (requestedRevision && requestedRevision !== controlPlaneRevision) {
+      return reject('task continuation revision does not match the authoritative task revision');
+    }
+    if (task.auditPolicy && task.auditPolicy !== controlPlaneAuditPolicy) {
+      return reject('task auditPolicy conflicts with the immutable task policy');
+    }
+    // An auditor already holding this revision, or a settled verdict, means the
+    // audit round is decided; attaching a policy now would rewrite that history.
+    const liveExactAuditors = task.assignments.filter((assignment) => (
+      assignment.role === 'auditor'
+      && assignment.auditRevision === controlPlaneRevision
+      && !['rework', 'cancelled', 'finalized'].includes(assignment.status)
+    ));
+    if (!task.auditPolicy && liveExactAuditors.length > 0) {
+      return reject('task auditPolicy cannot be attached after an auditor exists for the exact revision');
+    }
+    if (!task.auditPolicy && registry.listAuditReceipts(controlPlaneTaskId).some((receipt) => (
+      receipt.revision === controlPlaneRevision && receipt.receiptKind === 'final'
+    ))) {
+      return reject('task auditPolicy cannot be attached after a final receipt for the exact revision');
+    }
+
+    // Only the task row is written, and only when it is not already satisfied.
+    let policyBound: 'newly_bound' | 'already_bound' = 'already_bound';
+    if (!task.auditPolicy) {
+      const bound = registry.updateTask({
+        taskId: controlPlaneTaskId, auditPolicy: controlPlaneAuditPolicy, now,
+      });
+      if (!bound.ok) return reject(`task auditPolicy bind rejected: ${bound.reason}`);
+      policyBound = 'newly_bound';
+    }
+
+    // The SAME trigger the ordinary path uses. dispatchReadyAudit is itself
+    // fail-closed and idempotent, so a replay cannot mint a second auditor and
+    // a crash before this line is recovered by the existing boot sweep.
+    let auditTrigger: 'skipped' | 'invoked' | 'failed' = 'skipped';
+    if (task.status === 'ready_for_audit') {
+      try {
+        await (deps?.dispatchReadyAudit ?? dispatchReadyAudit)(controlPlaneTaskId);
+        auditTrigger = 'invoked';
+      } catch {
+        auditTrigger = 'failed';
+      }
+    }
+    return {
+      status: 'accepted',
+      dispatchId: createSendDispatchId(),
+      deliveries: [],
+      taskId: controlPlaneTaskId,
+      controlPlane: {
+        operation: 'audit_policy_bind',
+        auditPolicy: controlPlaneAuditPolicy,
+        policyBound,
+        auditTrigger,
+      },
+    };
+  }
+
   // ── Provider-limit gate ────────────────────────────────────────────────
   // Same resolver, same inputs as `send_list_targets`, so the list and the send
   // can never disagree about one target. Refusing here rather than queueing is
@@ -1448,7 +1586,19 @@ export async function dispatchSendMessage(
         };
       }
       const explicitAuditPolicy = input.task.auditPolicy ?? undefined;
-      if (explicitAuditPolicy) {
+      // An audit send that merely RESTATES the already-persisted policy is a
+      // no-op, not a bind, so the whole bind block is skipped for it. The block
+      // used to be entered on the mere PRESENCE of auditPolicy, which refused an
+      // exact audit continuation that echoed back the policy it had just read --
+      // observed on tsk_bzp, where the policy was already persisted and an exact
+      // auditor/attempt already existed, yet redelivery WITH audit metadata was
+      // rejected while the identical append WITHOUT it succeeded. A real bind
+      // (no policy yet) and a conflicting value still enter the block and are
+      // still refused by the guards inside it.
+      const auditRestatesPersistedPolicy = Boolean(input.audit)
+        && Boolean(explicitAuditPolicy)
+        && existing.auditPolicy === explicitAuditPolicy;
+      if (explicitAuditPolicy && !auditRestatesPersistedPolicy) {
         if (input.audit) {
           return {
             status: 'error',

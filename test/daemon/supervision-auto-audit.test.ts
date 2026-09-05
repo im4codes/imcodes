@@ -3331,3 +3331,535 @@ describe('zero-coordinator recovery is limited to the ZERO-row legacy shape', ()
     expect(registry.listAssignments(taskId).filter((a) => a.role === 'integration_owner')).toEqual([]);
   });
 });
+
+/**
+ * tsk_cic — auditPolicy is TASK authority, not a message.
+ *
+ * Binding a missing policy used to ride on the implementation-delivery path:
+ * every task-bearing send requires exactly one dispatchable target and then
+ * validates that target against the project's execution pool BEFORE the
+ * registry is touched, and the bind itself is only reachable as a task
+ * continuation. So a historical ready_for_audit task could not acquire a policy
+ * once its frozen implementer drifted -- model no longer pool-selected, or a
+ * rotated identity epoch -- and the observed workaround was a manual
+ * SAME-assignment identity rebind, after which delivery still failed.
+ *
+ * The bind is now a CONTROL-PLANE operation: it runs before any
+ * dispatchable-target, execution-pool or continuation-identity check, delivers
+ * nothing, mutates no implementer state, and then reuses the ONE existing
+ * dispatchReadyAudit trigger to materialise exactly one fresh auditor.
+ */
+describe('control-plane auditPolicy bind (tsk_cic)', () => {
+  const selectedPoolConfig = {
+    agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+  };
+
+  function brainWith(mode: 'supervised_audit' | 'off', poolModel = selectedPoolConfig.model) {
+    const brain = session('deck_alpha_brain', 'brain');
+    const config = { ...selectedPoolConfig, model: poolModel };
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode,
+        auditTargetSessionName: 'deck_alpha_auditor',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...config, capabilityId: buildSupervisionExecutionCapabilityId(config) }],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    return brain;
+  }
+
+  const brainCaller = {
+    userId: 'deck_alpha_brain', sessionName: 'deck_alpha_brain',
+    projectName: 'alpha', projectRoot: '/work/alpha',
+  };
+
+  function bindInput(taskId: string, revision: string, policy = 'auto_allow_degraded' as const) {
+    return {
+      target: 'deck_alpha_worker',
+      message: 'bind the missing audit policy',
+      task: {
+        taskId,
+        currentRevision: revision,
+        auditPolicy: policy,
+        executionPool: 'primary' as const,
+      },
+    };
+  }
+
+  it('binds on a task whose frozen implementer is NO LONGER pool-selected', async () => {
+    // The exact observed shape: the pool selects gpt-5.6, the frozen implementer
+    // runs a model that is no longer selected. Today this dies at the execution
+    // pool gate with unselected_config, long before the registry is reached.
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'cic-unselected-model', registry });
+    const brain = brainWith('supervised_audit', 'gpt-5.6');
+    const drifted = session('deck_alpha_worker', 'w1');
+    drifted.activeModel = 'retired-model-9';
+    drifted.requestedModel = 'retired-model-9';
+    const dispatchMessage = vi.fn();
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'ignored', reason: 'test_hook' });
+
+    const result = await dispatchSendMessage(brainCaller, bindInput(ready.taskId, ready.revision), {
+      listSessions: () => [brain, drifted],
+      dispatchMessage,
+      dispatchReadyAudit,
+    });
+
+    expect(result, 'a drifted implementer must not block task authority').toMatchObject({
+      status: 'accepted', taskId: ready.taskId,
+    });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+    expect(dispatchMessage, 'a control-plane bind delivers nothing').not.toHaveBeenCalled();
+    expect(dispatchReadyAudit, 'the ONE existing trigger still runs').toHaveBeenCalledWith(ready.taskId);
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(result.deliveries, 'no fabricated delivery record').toEqual([]);
+    expect(result.controlPlane).toMatchObject({
+      operation: 'audit_policy_bind', auditPolicy: 'auto_allow_degraded', policyBound: 'newly_bound',
+    });
+  });
+
+  it('binds on a task whose frozen implementer identity epoch is stale', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'cic-stale-epoch', registry });
+    const brain = brainWith('supervised_audit');
+    const rotated = session('deck_alpha_worker', 'w1');
+    rotated.runtimeEpoch = 'epoch-rotated-after-restart';
+    rotated.sessionInstanceId = 'instance-rotated-after-restart';
+    const dispatchMessage = vi.fn();
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'ignored', reason: 'test_hook' });
+
+    const result = await dispatchSendMessage(brainCaller, bindInput(ready.taskId, ready.revision), {
+      listSessions: () => [brain, rotated],
+      dispatchMessage,
+      dispatchReadyAudit,
+    });
+
+    expect(result, 'a rotated epoch must not require a manual rebind first')
+      .toMatchObject({ status: 'accepted', taskId: ready.taskId });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
+  it('mutates NO implementer state and no historical evidence', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'cic-no-mutation', registry });
+    const before = registry.getAssignment(ready.worker.assignmentId)!;
+    const beforeSnapshot = JSON.stringify({
+      identity: before.identity, executionBinding: before.executionBinding, status: before.status,
+      leaseId: before.leaseId, scopeFiles: before.scopeFiles, auditRevision: before.auditRevision,
+    });
+    const beforeRevision = registry.get(ready.taskId)!.currentRevision;
+    const beforeReceipts = registry.listAuditReceipts(ready.taskId).length;
+
+    const drifted = session('deck_alpha_worker', 'w1');
+    drifted.activeModel = 'retired-model-9';
+    await dispatchSendMessage(brainCaller, bindInput(ready.taskId, ready.revision), {
+      listSessions: () => [brainWith('supervised_audit'), drifted],
+      dispatchMessage: vi.fn(),
+      dispatchReadyAudit: vi.fn().mockResolvedValue({ status: 'ignored', reason: 'test_hook' }),
+    });
+
+    const after = registry.getAssignment(ready.worker.assignmentId)!;
+    expect(JSON.stringify({
+      identity: after.identity, executionBinding: after.executionBinding, status: after.status,
+      leaseId: after.leaseId, scopeFiles: after.scopeFiles, auditRevision: after.auditRevision,
+    }), 'the bind must not touch implementer identity/binding/status/lease/scope/revision').toBe(beforeSnapshot);
+    expect(registry.get(ready.taskId)!.currentRevision).toBe(beforeRevision);
+    expect(registry.listAuditReceipts(ready.taskId)).toHaveLength(beforeReceipts);
+  });
+
+  it('is idempotent on replay: no second policy write, no duplicate auditor', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'cic-idempotent', registry });
+    const brain = brainWith('supervised_audit');
+    const drifted = session('deck_alpha_worker', 'w1');
+    drifted.activeModel = 'retired-model-9';
+    const deps = () => ({
+      listSessions: () => [brain, drifted],
+      dispatchMessage: vi.fn(),
+      dispatchReadyAudit: vi.fn().mockResolvedValue({ status: 'ignored', reason: 'test_hook' }),
+    });
+
+    const first = await dispatchSendMessage(brainCaller, bindInput(ready.taskId, ready.revision), deps());
+    const second = await dispatchSendMessage(brainCaller, bindInput(ready.taskId, ready.revision), deps());
+
+    expect(first).toMatchObject({ status: 'accepted' });
+    expect(second).toMatchObject({ status: 'accepted' });
+    if (second.status !== 'accepted') throw new Error('expected accepted');
+    expect(second.controlPlane, 'a replay reports already_bound rather than rebinding')
+      .toMatchObject({ policyBound: 'already_bound' });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+    expect(registry.listAssignments(ready.taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+  });
+
+  it('refuses a live same-project Brain that is NOT the task coordinator', async () => {
+    // Discriminating on purpose. The earlier non-Brain case asserted only
+    // status:'error', which an unrelated earlier failure satisfies, so a mutant
+    // that deleted the Brain gate survived it. Here every other gate passes and
+    // ONLY the exact-coordinator check can refuse, and the exact error is pinned.
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'cic-wrong-brain', registry });
+    // A DIFFERENT Brain session, not merely a rotated epoch: epoch rotation is
+    // deliberately tolerated by supervisionIdentityMatches (that is the whole
+    // point of identity convergence), so only a different session isolates the
+    // exact-coordinator half of this gate.
+    const impostor = brainWith('supervised_audit');
+    impostor.name = 'deck_alpha_other_brain';
+    const impostorCaller = {
+      userId: impostor.name, sessionName: impostor.name,
+      projectName: 'alpha', projectRoot: '/work/alpha',
+    };
+    const drifted = session('deck_alpha_worker', 'w1');
+    drifted.activeModel = 'retired-model-9';
+    // Addressable by the impostor, so target resolution cannot be what refuses.
+    drifted.parentSession = impostor.name;
+    const dispatchReadyAudit = vi.fn();
+    const result = await dispatchSendMessage(impostorCaller, bindInput(ready.taskId, ready.revision), {
+      listSessions: () => [impostor, drifted],
+      dispatchMessage: vi.fn(),
+      dispatchReadyAudit,
+    });
+    expect(result).toMatchObject({
+      status: 'error',
+      error: 'task auditPolicy requires the exact authoritative project Brain coordinator',
+    });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBeUndefined();
+    expect(dispatchReadyAudit).not.toHaveBeenCalled();
+  });
+
+  describe('zero-write refusals', () => {
+    async function refuse(overrides: {
+      taskId: string; revision?: string; policy?: 'auto_allow_degraded' | 'auto_strict_cross_vendor';
+      mode?: 'supervised_audit' | 'off'; caller?: typeof brainCaller; sessions?: SessionRecord[];
+    }) {
+      const drifted = session('deck_alpha_worker', 'w1');
+      drifted.activeModel = 'retired-model-9';
+      const dispatchReadyAudit = vi.fn();
+      const dispatchMessage = vi.fn();
+      const result = await dispatchSendMessage(
+        overrides.caller ?? brainCaller,
+        bindInput(overrides.taskId, overrides.revision ?? 'unused-revision', overrides.policy),
+        {
+          listSessions: () => overrides.sessions ?? [brainWith(overrides.mode ?? 'supervised_audit'), drifted],
+          dispatchMessage,
+          dispatchReadyAudit,
+        },
+      );
+      return { result, dispatchReadyAudit, dispatchMessage };
+    }
+
+    it('refuses a non-Brain caller', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const ready = makeReadyTask({ taskId: 'cic-not-brain', registry });
+      const worker = session('deck_alpha_worker', 'w1');
+      const { result, dispatchReadyAudit } = await refuse({
+        taskId: ready.taskId, revision: ready.revision,
+        caller: { userId: worker.name, sessionName: worker.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      });
+      expect(result).toMatchObject({ status: 'error' });
+      expect(registry.get(ready.taskId)?.auditPolicy).toBeUndefined();
+      expect(dispatchReadyAudit).not.toHaveBeenCalled();
+    });
+
+    it('refuses a stale/incorrect currentRevision', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const ready = makeReadyTask({ taskId: 'cic-old-revision', registry });
+      const { result, dispatchReadyAudit } = await refuse({
+        taskId: ready.taskId, revision: 'some-older-revision',
+      });
+      expect(result).toMatchObject({ status: 'error' });
+      expect(registry.get(ready.taskId)?.auditPolicy).toBeUndefined();
+      expect(dispatchReadyAudit).not.toHaveBeenCalled();
+    });
+
+    it('refuses when supervision mode is off', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const ready = makeReadyTask({ taskId: 'cic-mode-off', registry });
+      const { result, dispatchReadyAudit } = await refuse({
+        taskId: ready.taskId, revision: ready.revision, mode: 'off',
+      });
+      expect(result).toMatchObject({ status: 'error' });
+      expect(registry.get(ready.taskId)?.auditPolicy).toBeUndefined();
+      expect(dispatchReadyAudit).not.toHaveBeenCalled();
+    });
+
+    it('refuses a conflicting policy and never overwrites the bound one', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const ready = makeReadyTask({
+        taskId: 'cic-conflict', auditPolicy: 'auto_allow_degraded', registry,
+      });
+      const { result, dispatchReadyAudit } = await refuse({
+        taskId: ready.taskId, revision: ready.revision, policy: 'auto_strict_cross_vendor',
+      });
+      expect(result).toMatchObject({ status: 'error' });
+      expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+      expect(dispatchReadyAudit).not.toHaveBeenCalled();
+    });
+
+    it('refuses once an auditor already holds the exact revision', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const ready = makeReadyTask({ taskId: 'cic-has-auditor', registry });
+      expect(registry.createAssignment({
+        taskId: ready.taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: 'manual-attempt-cic', auditRevision: ready.revision,
+      })).toMatchObject({ ok: true });
+      const { result, dispatchReadyAudit } = await refuse({
+        taskId: ready.taskId, revision: ready.revision,
+      });
+      expect(result).toMatchObject({ status: 'error' });
+      expect(registry.get(ready.taskId)?.auditPolicy).toBeUndefined();
+      expect(dispatchReadyAudit).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('control-plane auditPolicy bind refuses a settled revision (tsk_cic)', () => {
+  it('refuses once a FINAL receipt exists for the exact revision, even with no live auditor', async () => {
+    // The auditor is finalized, so the live-auditor gate does NOT fire; what must
+    // refuse here is the settled-receipt gate. Attaching a policy to a revision
+    // whose verdict is already recorded would retroactively change the terms the
+    // audit was decided under.
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'cic-settled-receipt', registry });
+    const attemptId = 'manual-attempt-cic-settled';
+    const auditor = registry.createAssignment({
+      taskId: ready.taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_settled_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: ready.revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: ready.revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId: ready.taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity, auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision: ready.revision, receiptKind: 'final', verdict: 'PASS',
+      findings: 'already decided', validations: [],
+    })).toMatchObject({ ok: true });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision: ready.revision,
+    })).toMatchObject({ ok: true });
+    expect(
+      registry.listAssignments(ready.taskId).filter((a) => (
+        a.role === 'auditor' && !['rework', 'cancelled', 'finalized'].includes(a.status)
+      )),
+      'no LIVE auditor remains, so only the receipt gate can refuse',
+    ).toEqual([]);
+
+    const selected = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        auditTargetSessionName: 'deck_alpha_auditor',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) }],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const worker = session('deck_alpha_worker', 'w1');
+    const dispatchReadyAudit = vi.fn();
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: worker.name,
+      message: 'bind after the verdict landed',
+      task: {
+        taskId: ready.taskId, currentRevision: ready.revision,
+        auditPolicy: 'auto_allow_degraded', executionPool: 'primary' as const,
+      },
+    }, { listSessions: () => [brain, worker], dispatchMessage: vi.fn(), dispatchReadyAudit });
+
+    expect(result).toMatchObject({ status: 'error' });
+    expect(registry.get(ready.taskId)?.auditPolicy, 'zero write on a settled revision').toBeUndefined();
+    expect(dispatchReadyAudit).not.toHaveBeenCalled();
+  });
+});
+
+describe('audit redelivery when the policy is already persisted (tsk_bzp shape)', () => {
+  it('accepts an exact audit continuation that restates the persisted policy, without duplicating the auditor', async () => {
+    // tsk_bzp: auditPolicy was already persisted AND an exact auditor/attempt
+    // already existed, yet an exact continuation carrying audit metadata was
+    // refused with "must be bound by a task continuation before audit dispatch",
+    // while the identical append WITHOUT audit metadata succeeded. The client
+    // was echoing back the policy it had just read, which is a no-op restatement
+    // rather than a bind, so refusing it broke redelivery after a refresh.
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({
+      taskId: 'bzp-restate-policy', auditPolicy: 'auto_strict_cross_vendor', registry,
+    });
+    const attemptId = 'auto-audit-637b02fa1eeb0677207ea76d';
+    const auditorSession = session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic');
+    const existingAuditor = registry.createAssignment({
+      taskId: ready.taskId, role: 'auditor', required: true,
+      identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: ready.revision,
+    });
+    if (!existingAuditor.ok) throw new Error(existingAuditor.reason);
+
+    const selected = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const auditorCapability = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+      runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+    };
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        auditTargetSessionName: auditorSession.name,
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            // The audit TARGET is the auditor, so its capability must also be
+            // pool-selected for the ordinary target/pool gate to admit the send.
+            configs: [
+              { ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) },
+              { ...auditorCapability, capabilityId: buildSupervisionExecutionCapabilityId(auditorCapability) },
+            ],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditorsBefore = registry.listAssignments(ready.taskId).filter((a) => a.role === 'auditor').length;
+
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: auditorSession.name,
+      message: 'continue the exact existing audit',
+      reply: true,
+      audit: {
+        kind: 'supervision_audit',
+        attemptId,
+        auditedSessionName: worker.name,
+      },
+      task: {
+        taskId: ready.taskId,
+        assignmentId: existingAuditor.value.assignmentId,
+        currentRevision: ready.revision,
+        auditRevision: ready.revision,
+        auditAttemptId: attemptId,
+        // The client echoes back the policy it just read. Identical to persisted.
+        auditPolicy: 'auto_strict_cross_vendor',
+        executionPool: 'primary' as const,
+      },
+    }, {
+      listSessions: () => [brain, worker, auditorSession],
+      dispatchMessage: vi.fn().mockResolvedValue('queued'),
+      ensureSupervisionAssignmentWorktree: async () => ({
+        ok: true, worktreePath: '/worktree/repo', baseRevision: 'a'.repeat(40), created: false,
+      }),
+    });
+
+    // POSITIVE assertion on purpose. An earlier draft asserted only "not the
+    // policy error", which passed vacuously while the call was actually failing
+    // for an unrelated fixture reason. Requiring acceptance cannot pass unless
+    // the redelivery genuinely succeeds.
+    expect(
+      result,
+      'restating the already-persisted policy must not block an exact audit continuation',
+    ).toMatchObject({ status: 'accepted', taskId: ready.taskId });
+    expect(
+      registry.listAssignments(ready.taskId).filter((a) => a.role === 'auditor'),
+      'redelivery must never mint a duplicate auditor',
+    ).toHaveLength(auditorsBefore);
+    expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_strict_cross_vendor');
+  });
+
+  it('still refuses audit metadata carrying a CONFLICTING policy', async () => {
+    // Single-variable control: byte-for-byte the same setup as the restatement
+    // case above -- same existing auditor, same attempt, same target -- with ONLY
+    // the policy value changed. The relaxation is exact-value only, so a
+    // different policy alongside audit metadata is still a bind attempt.
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({
+      taskId: 'bzp-conflicting-policy', auditPolicy: 'auto_strict_cross_vendor', registry,
+    });
+    const attemptId = 'auto-audit-637b02fa1eeb0677207ea76d';
+    const auditorSession = session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic');
+    const existingAuditor = registry.createAssignment({
+      taskId: ready.taskId, role: 'auditor', required: true,
+      identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: ready.revision,
+    });
+    if (!existingAuditor.ok) throw new Error(existingAuditor.reason);
+    const selected = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const auditorCapability = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+      runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+    };
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        auditTargetSessionName: auditorSession.name,
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            // The audit TARGET is the auditor, so its capability must also be
+            // pool-selected for the ordinary target/pool gate to admit the send.
+            configs: [
+              { ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) },
+              { ...auditorCapability, capabilityId: buildSupervisionExecutionCapabilityId(auditorCapability) },
+            ],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const worker = session('deck_alpha_worker', 'w1');
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: auditorSession.name,
+      message: 'conflicting policy alongside audit metadata',
+      reply: true,
+      audit: { kind: 'supervision_audit', attemptId, auditedSessionName: worker.name },
+      task: {
+        taskId: ready.taskId,
+        assignmentId: existingAuditor.value.assignmentId,
+        currentRevision: ready.revision,
+        auditRevision: ready.revision,
+        auditAttemptId: attemptId,
+        auditPolicy: 'auto_allow_degraded',
+        executionPool: 'primary' as const,
+      },
+    }, {
+      listSessions: () => [brain, worker, auditorSession],
+      dispatchMessage: vi.fn().mockResolvedValue('queued'),
+      ensureSupervisionAssignmentWorktree: async () => ({
+        ok: true, worktreePath: '/worktree/repo', baseRevision: 'a'.repeat(40), created: false,
+      }),
+    });
+
+    expect(result).toMatchObject({
+      status: 'error',
+      error: 'task auditPolicy must be bound by a task continuation before audit dispatch',
+    });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_strict_cross_vendor');
+  });
+});
