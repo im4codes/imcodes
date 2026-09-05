@@ -851,6 +851,13 @@ describe('useTimeline global cache bounds', () => {
     // included -- and would mask what the migration itself did. A blocked or
     // private-mode store fails without evicting, so the migration's own
     // behaviour is the only thing that can remove the key.
+    // Fake timers are load-bearing here, not hygiene. This probe is inactive, so
+    // its IndexedDB load is staggered by setTimeout(80) and -- by design -- is
+    // NOT cancelled on cleanup. With real timers a slow machine fires that load
+    // after the injection below is restored, the migration then runs for real,
+    // and it legitimately deletes the raw key. That is what made this test pass
+    // locally and fail on CI: the assertion was observing an unstubbed run.
+    vi.useFakeTimers();
     const sessionName = `deck_ls_denied_${Date.now()}`;
     const serverId = `srv-ls-denied-${Date.now()}`;
     const events = makeEvents(sessionName, 3);
@@ -858,24 +865,45 @@ describe('useTimeline global cache bounds', () => {
     localStorage.setItem(rawKey, JSON.stringify(events));
     localStorage.removeItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`);
 
-    const setItemSpy = vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
-      throw new DOMException('storage is blocked', 'SecurityError');
-    });
-
-    try {
-      function Probe() {
-        const { events: seen } = useTimeline(sessionName, null, serverId, { isActiveSession: false });
-        return h('div', { 'data-testid': 'ls-denied-probe' }, String(seen.length));
-      }
-      render(h(Probe));
-      // The user still sees their history on this open...
-      expect(screen.getByTestId('ls-denied-probe').textContent).toBe('3');
-    } finally {
-      setItemSpy.mockRestore();
+    // Intercept BOTH shapes. Depending on the jsdom/vitest combination
+    // `localStorage` is either the memory shim installed by the setup file (an
+    // own-property object) or a real Storage whose methods live on the
+    // prototype, and stubbing only one of them silently does nothing.
+    const deny = (): never => { throw new DOMException('storage is blocked', 'SecurityError'); };
+    // Always stub the prototype when one exists, unconditionally: jsdom's real
+    // Storage is proxy-backed and an instance-level spy on it can be silently
+    // ignored, and once that happens `window.localStorage.setItem` still equals
+    // the prototype's function — so any check that compares the two to decide
+    // whether the prototype also needs stubbing concludes "no" exactly when the
+    // answer is "yes".
+    const spies = [vi.spyOn(window.localStorage, 'setItem').mockImplementation(deny)];
+    if (typeof Storage !== 'undefined' && typeof Storage.prototype?.setItem === 'function') {
+      spies.push(vi.spyOn(Storage.prototype, 'setItem').mockImplementation(deny));
     }
+    // State the precondition instead of assuming it. An ineffective stub would
+    // otherwise make this test quietly assert nothing and fail later with a
+    // confusing "expected null to be truthy" somewhere else entirely.
+    expect(() => localStorage.setItem('rcc_timeline_snapshot:__probe__', 'x')).toThrow();
+    expect(spies.length).toBeGreaterThan(0);
 
+    function Probe() {
+      const { events: seen } = useTimeline(sessionName, null, serverId, { isActiveSession: false });
+      return h('div', { 'data-testid': 'ls-denied-probe' }, String(seen.length));
+    }
+    render(h(Probe));
+
+    // The user still sees their history on this open...
+    expect(screen.getByTestId('ls-denied-probe').textContent).toBe('3');
     // ...and the only copy of it is still there for the next one.
     expect(localStorage.getItem(rawKey)).toBeTruthy();
+
+    // Note there is deliberately no restore here. The suite's afterEach already
+    // calls vi.restoreAllMocks(), so the injection stays in force for the whole
+    // test. An earlier version restored in a finally block and asserted after
+    // it, which left a window where a write could succeed -- and then the test
+    // was reporting on a migration that had never been stubbed at all. Whether
+    // the migration runs synchronously in the seed or later is then irrelevant:
+    // every attempt inside this test is denied.
   });
 
   it('stays idle for shell/script sessions with history disabled', async () => {
