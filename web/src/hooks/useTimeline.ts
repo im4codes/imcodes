@@ -534,7 +534,7 @@ function runLocalHistoryPrune(cacheKey: string): void {
     for (let chunk = 0; chunk < LOCAL_PRUNE_MAX_CHUNKS; chunk += 1) {
       if (sharedDb.memoryOnly) return;
       const result = await sharedDb
-        .pruneSessionHistory(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION, {
+        .pruneOldEvents(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION, {
           maxDeletions: LOCAL_PRUNE_DELETIONS_PER_SWEEP,
         })
         .catch(() => null);

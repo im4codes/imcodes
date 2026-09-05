@@ -537,7 +537,7 @@ describe('useTimeline global cache bounds', () => {
     vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
     vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
-    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneSessionHistory')
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents')
       .mockResolvedValue({ deleted: 0, done: true });
 
     await renderRestoredProbe(sessionName, serverId, 'prune-probe');
@@ -582,7 +582,7 @@ describe('useTimeline global cache bounds', () => {
     vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
     vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(true);
-    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneSessionHistory')
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents')
       .mockResolvedValue({ deleted: 0, done: true });
 
     await renderRestoredProbe(sessionName, serverId, 'prune-degraded-probe');

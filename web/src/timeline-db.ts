@@ -27,8 +27,19 @@ import { preferTimelineEvent } from '../../src/shared/timeline/merge.js';
 import { isLastValueTimelineEventType } from '../../src/shared/timeline/types.js';
 
 const DB_NAME = 'imcodes-timeline';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'events';
+/**
+ * Last-value signals live in their own store, keyed by `[sessionId, type]`.
+ *
+ * That key is the whole point: a session's state line, token counter and agent
+ * status only ever display "now", so writing one overwrites the previous row
+ * instead of appending. The store cannot grow, so there is nothing to prune and
+ * no type index to maintain -- the partition IS the filter. Conversation reads
+ * touch only `events`, in their own transaction, so state bookkeeping can never
+ * queue in front of a chat opening.
+ */
+const SIGNAL_STORE_NAME = 'signals';
 
 /**
  * How long to stay in transient memory-only mode after an open failure before
@@ -148,6 +159,13 @@ export class TimelineDB {
           store.createIndex('session_epoch_seq', ['sessionId', 'epoch', 'seq'], { unique: false });
           store.createIndex('session_ts', ['sessionId', 'ts'], { unique: false });
         }
+        // v2. Additive only: no existing row is read, rewritten or deleted, so
+        // the upgrade is O(1) rather than a full-store migration on a phone.
+        // Signals already sitting in `events` are drained later, in the
+        // background, by pruneSessionHistory.
+        if (!db.objectStoreNames.contains(SIGNAL_STORE_NAME)) {
+          db.createObjectStore(SIGNAL_STORE_NAME, { keyPath: ['sessionId', 'type'] });
+        }
       };
 
       // Single settle point so a late onsuccess after a blocked-timeout reject
@@ -227,8 +245,16 @@ export class TimelineDB {
       return;
     }
 
+    // Route by kind. Conversation is append-only history; signals collapse onto
+    // one row per (session, type) so their store never grows and never needs a
+    // sweep. Anything unclassified is treated as conversation and kept.
+    const conversation = events.filter((event) => !isLastValueTimelineEventType(event.type));
+    const signals = events.filter((event) => isLastValueTimelineEventType(event.type));
     try {
-      await txPutEventsPreservingCompleteness(db, events);
+      // Separate transactions on separate stores: a signal write must never be
+      // able to hold up a conversation write, or a read of the other store.
+      if (conversation.length > 0) await txPutEventsPreservingCompleteness(db, conversation);
+      if (signals.length > 0) await txPutSignals(db, signals);
     } catch {
       for (const e of events) this.memPut(e);
     }
@@ -285,7 +311,15 @@ export class TimelineDB {
       return this.memGetByTime(sessionId, opts);
     }
     try {
-      return await this.getRecentEventsTx(db, sessionId, opts);
+      // Conversation first, on its own transaction: this is the read the first
+      // paint is waiting on, and the whole reason signals were moved out is so
+      // nothing else shares its budget.
+      const conversation = await this.getRecentEventsTx(db, sessionId, opts);
+      // Then the signals, which are at most one row per type. A failure here
+      // must not cost the caller the conversation it already has.
+      const signals = await txReadSignals(db, sessionId).catch(() => [] as TimelineEvent[]);
+      if (signals.length === 0) return conversation;
+      return mergeStoredByTimestamp(conversation, signals);
     } catch {
       return this.memGetByTime(sessionId, opts);
     }
@@ -454,14 +488,18 @@ export class TimelineDB {
     }
   }
 
-  async pruneOldEvents(sessionId: string, keepCount: number): Promise<void> {
+  async pruneOldEvents(
+    sessionId: string,
+    keepCount: number,
+    opts?: { maxDeletions?: number },
+  ): Promise<{ deleted: number; done: boolean } | null> {
     const db = await this.ensureOpen();
     if (!db) {
       const events = this.memoryFallback.get(sessionId);
       if (events && events.length > keepCount) {
         this.memoryFallback.set(sessionId, events.slice(-keepCount));
       }
-      return;
+      return null;
     }
 
     try {
@@ -481,97 +519,19 @@ export class TimelineDB {
         req.onerror = () => reject(req.error);
       });
 
-      if (keys.length <= keepCount) return;
+      if (keys.length <= keepCount) return { deleted: 0, done: true };
 
-      const toDelete = keys.slice(0, keys.length - keepCount);
+      // Oldest first, capped. Every timeline shares one connection, so a single
+      // unbounded delete transaction over a large store parks every other
+      // session's read behind it -- which is exactly how an earlier version of
+      // this made chats open blank and hang on "local cache".
+      const overflow = keys.slice(0, keys.length - keepCount);
+      const budget = Math.max(1, opts?.maxDeletions ?? overflow.length);
+      const toDelete = overflow.slice(0, budget);
       await txWrite(db, STORE_NAME, (store) => {
         for (const key of toDelete) store.delete(key);
       });
-    } catch {
-      // best-effort
-    }
-  }
-
-  /**
-   * Trim a session to what can actually be rendered, in one newest-first pass.
-   *
-   * Two different retention rules, because the stream holds two different kinds
-   * of record:
-   *   - History (the conversation) keeps the newest `keepHistoryEvents`.
-   *   - Last-value signals (session state, token usage, agent status, ...) keep
-   *     exactly ONE row each: only the newest is ever displayed, so every older
-   *     copy is storage and page budget spent on something unrenderable.
-   *
-   * That second rule is what makes a bounded read useful. Measured on a real
-   * store, `session.state` alone was ~67% of all events and the whole
-   * last-value group ~84%, so the newest 60 raw events of a busy agent session
-   * contained as few as ONE actual message — a page counted in raw events was
-   * mostly counting churn.
-   *
-   * Fail-safe by construction: only the short explicit last-value allowlist is
-   * collapsed. An unclassified (e.g. newly added) event type is treated as
-   * history and kept.
-   *
-   * Returns null when the store is unavailable — pruning is best-effort and
-   * must never be attempted against the memory fallback, where the DB cannot
-   * report what is actually on disk.
-   */
-  async pruneSessionHistory(
-    sessionId: string,
-    keepHistoryEvents: number,
-    opts?: { maxDeletions?: number },
-  ): Promise<{ deleted: number; done: boolean } | null> {
-    const db = await this.ensureOpen();
-    if (!db) return null;
-    // No total-count shortcut here. An earlier version skipped the sweep when
-    // the session held fewer rows than `keepHistoryEvents`, which silently
-    // disabled the last-value collapse: a small store that is 90% superseded
-    // state events is "within budget" by row count and still needs collapsing.
-    // The walk is bounded and runs off the paint path, so pay it.
-    const maxDeletions = Math.max(1, opts?.maxDeletions ?? Number.MAX_SAFE_INTEGER);
-    try {
-      return await new Promise<{ deleted: number; done: boolean }>((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const index = tx.objectStore(STORE_NAME).index('session_ts');
-        const range = IDBKeyRange.bound([sessionId, 0], [sessionId, Infinity]);
-        const keptLastValueTypes = new Set<string>();
-        let historyKept = 0;
-        let deleted = 0;
-        let done = true;
-        const req = index.openCursor(range, 'prev');
-        req.onsuccess = () => {
-          const cursor = req.result;
-          // Walk finished; tx.oncomplete settles once the deletes commit.
-          if (!cursor) return;
-          // Stop the transaction short once the deletion budget is spent. A
-          // never-pruned store holds tens of thousands of rows, and deleting
-          // them in ONE readwrite transaction blocks every other session's
-          // read on this shared connection -- which showed up as chats opening
-          // blank and stuck on "local cache" while the sweep ran. Deletions are
-          // taken from the OLDEST end, so a capped sweep always makes progress
-          // and the next one resumes.
-          if (deleted >= maxDeletions) { done = false; return; }
-          const type = String((cursor.value as TimelineEvent).type ?? '');
-          let drop: boolean;
-          if (isLastValueTimelineEventType(type)) {
-            // Newest-first, so the FIRST one seen for a type is the survivor.
-            drop = keptLastValueTypes.has(type);
-            if (!drop) keptLastValueTypes.add(type);
-          } else {
-            historyKept += 1;
-            drop = historyKept > keepHistoryEvents;
-          }
-          if (drop) {
-            cursor.delete();
-            deleted += 1;
-          }
-          cursor.continue();
-        };
-        req.onerror = () => reject(req.error);
-        tx.oncomplete = () => resolve({ deleted, done });
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error);
-      });
+      return { deleted: toDelete.length, done: toDelete.length === overflow.length };
     } catch {
       return null;
     }
@@ -651,6 +611,64 @@ function txPutEventsPreservingCompleteness(
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
   });
+}
+
+/**
+ * Upsert last-value signals, newest wins.
+ *
+ * The key is `[sessionId, type]`, so a plain put would let a late or replayed
+ * older event clobber a newer state. Compare timestamps first: a signal only
+ * moves forward.
+ */
+function txPutSignals(db: IDBDatabase, events: TimelineEvent[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SIGNAL_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(SIGNAL_STORE_NAME);
+    for (const event of events) {
+      const getReq = store.get([event.sessionId, event.type]);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as TimelineEvent | undefined;
+        if (!existing || (event.ts ?? 0) >= (existing.ts ?? 0)) store.put(event);
+      };
+      getReq.onerror = () => reject(getReq.error);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+/** Every stored signal for one session. Bounded by the number of signal types. */
+function txReadSignals(db: IDBDatabase, sessionId: string): Promise<TimelineEvent[]> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SIGNAL_STORE_NAME, 'readonly');
+    const store = tx.objectStore(SIGNAL_STORE_NAME);
+    // Primary-key range over `[sessionId, type]`; no index needed because the
+    // key itself is already scoped by session.
+    const req = store.getAll(IDBKeyRange.bound([sessionId, ''], [sessionId, '\uffff']));
+    req.onsuccess = () => resolve((req.result as TimelineEvent[]) ?? []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * Interleave the two stores back into one ascending stream.
+ *
+ * Deduplicates by `eventId` because a legacy signal can still exist in `events`
+ * while its successor already lives in `signals`; the drain removes the old copy
+ * later, and until then the newer row must win rather than render twice.
+ */
+function mergeStoredByTimestamp(
+  conversation: TimelineEvent[],
+  signals: TimelineEvent[],
+): TimelineEvent[] {
+  const byId = new Map<string, TimelineEvent>();
+  for (const event of conversation) byId.set(event.eventId, event);
+  for (const event of signals) {
+    const existing = byId.get(event.eventId);
+    if (!existing || (event.ts ?? 0) >= (existing.ts ?? 0)) byId.set(event.eventId, event);
+  }
+  return [...byId.values()].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq));
 }
 
 // ── IDB transaction helper ─────────────────────────────────────────────────
