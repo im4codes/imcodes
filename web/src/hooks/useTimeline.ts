@@ -485,6 +485,66 @@ const TERMINAL_TAIL_IDLE_RECONCILE_MS = 5000;
 // `persistTimelineSnapshotTail` starts dropping writes. Dynamic LRU eviction
 // is a follow-up (see Round 3 plan PR-5 §quota).
 const MAX_PERSISTED_SNAPSHOT_EVENTS = 300;
+
+/**
+ * How much history each session keeps in IndexedDB.
+ *
+ * Nothing pruned this store before — `pruneOldEvents` existed but was only ever
+ * called from tests — so it grew for the life of the install. Older history is
+ * NOT lost by trimming it: it lives on the daemon and comes back through
+ * `load older` (a WS page request) and the HTTP backfill, so the local copy
+ * only has to be big enough to paint instantly and to absorb a reconnect gap.
+ *
+ * Must stay comfortably above MAX_MEMORY_EVENTS (the size of the page the
+ * first paint reads); the assertion below fails the build if that ever stops
+ * holding, because a retention under the read page would silently truncate
+ * every restore.
+ */
+const LOCAL_RETAINED_EVENTS_PER_SESSION = 1000;
+
+/**
+ * Amortize the readwrite sweep: one prune per this many persisted events for a
+ * session, plus one after each bootstrap restore. Pruning on every write would
+ * put a delete transaction in front of live message writes.
+ */
+const LOCAL_PRUNE_WRITE_INTERVAL = 200;
+
+const localPruneWriteCounts = new Map<string, number>();
+const localPruneDoneThisPageSession = new Set<string>();
+
+/**
+ * Trim a session's stored history to LOCAL_RETAINED_EVENTS_PER_SESSION.
+ *
+ * `force` runs at most once per session per page session (the post-restore
+ * sweep); otherwise the sweep waits until LOCAL_PRUNE_WRITE_INTERVAL events
+ * have been persisted for that key.
+ *
+ * Deliberately a no-op while the shared DB is degraded to memory-only: in that
+ * state it cannot report what is actually on disk, so a delete would be issued
+ * blind — and this file has already destroyed local history once by deleting
+ * against an assumption (see migrateRawToScoped).
+ */
+function scheduleLocalHistoryPrune(cacheKey: string, writtenEvents: number, force = false): void {
+  if (!cacheKey || sharedDb.memoryOnly) return;
+  if (force) {
+    if (localPruneDoneThisPageSession.has(cacheKey)) return;
+    localPruneDoneThisPageSession.add(cacheKey);
+  } else {
+    const pending = (localPruneWriteCounts.get(cacheKey) ?? 0) + writtenEvents;
+    if (pending < LOCAL_PRUNE_WRITE_INTERVAL) {
+      localPruneWriteCounts.set(cacheKey, pending);
+      return;
+    }
+    localPruneWriteCounts.set(cacheKey, 0);
+  }
+  sharedDb.pruneOldEvents(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION).catch(() => {});
+}
+
+/** Test hook: page-session prune bookkeeping is module state. */
+export function __resetLocalHistoryPruneStateForTests(): void {
+  localPruneWriteCounts.clear();
+  localPruneDoneThisPageSession.clear();
+}
 // If no confirmation arrives within this window we auto-flip the pending bubble to
 // "failed" so the user can retry rather than stare at a perpetual spinner.
 //
@@ -910,6 +970,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
   const persistable = events.filter(shouldPersistTimelineEvent);
   if (persistable.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, persistable)).catch(() => {});
+  scheduleLocalHistoryPrune(cacheKey, persistable.length);
 }
 
 // Persist events to IDB WITHOUT the streaming filter — used only by the
@@ -917,6 +978,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
 function persistTimelineEventsIncludingStreaming(cacheKey: string, events: TimelineEvent[]): void {
   if (events.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
+  scheduleLocalHistoryPrune(cacheKey, events.length);
 }
 
 function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
@@ -2155,6 +2217,10 @@ export function useTimeline(
         // NON-low-completeness restore locks path-2. A truncated tail stays
         // unlocked so re-open re-reads/self-heals.
         markHistoryLoadedIfComplete(restored);
+        // The restore proves this key's store opened and is readable, which is
+        // the only safe moment to trim it. Fire-and-forget: it must never sit
+        // in front of the paint we just did.
+        scheduleLocalHistoryPrune(cacheKey!, 0, true);
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the last
         // WS event; reopening after a mid-chat close may leave a gap. A

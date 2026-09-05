@@ -22,6 +22,7 @@ import {
   __getTimelineCacheKeysForTests,
   __getTimelineSnapshotBookkeepingKeysForTests,
   __getSharedTimelineBaseForTests,
+  __resetLocalHistoryPruneStateForTests,
   __resetTimelineCacheForTests,
   __setTimelineCacheForTests,
   ingestTimelineEventForCache,
@@ -494,6 +495,78 @@ describe('useTimeline global cache bounds', () => {
     });
 
     expect(screen.getByTestId('inactive-probe').textContent).toBe('inactive history is loaded too');
+  });
+
+  function makeStoredEvent(sessionName: string, text: string): TimelineEvent {
+    return {
+      eventId: `${sessionName}-stored-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text },
+    };
+  }
+
+  async function renderRestoredProbe(sessionName: string, serverId: string, testId: string) {
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId, { isActiveSession: false });
+      return h('div', { 'data-testid': testId }, String(events.length));
+    }
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+      await flushMicrotasks();
+    });
+  }
+
+  it('trims the local store to the retention bound once a restore proves it readable', async () => {
+    // Nothing pruned this store before — pruneOldEvents existed but only tests
+    // called it — so IndexedDB grew for the life of the install and every open
+    // paid for the whole thing. Older history stays available from the daemon.
+    vi.useFakeTimers();
+    __resetLocalHistoryPruneStateForTests();
+    const sessionName = `deck_prune_${Date.now()}`;
+    const serverId = `srv-prune-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents').mockResolvedValue();
+
+    await renderRestoredProbe(sessionName, serverId, 'prune-probe');
+
+    expect(pruneSpy).toHaveBeenCalledWith(`${serverId}:${sessionName}`, 1000);
+    // The retention must stay above the page the first paint reads, or every
+    // restore would come back truncated.
+    const [, keepCount] = pruneSpy.mock.calls[0]!;
+    expect(keepCount).toBeGreaterThan(300);
+  });
+
+  it('never deletes local history while the store is degraded to memory-only', async () => {
+    // A memory-only DB cannot report what is actually on disk, so a delete
+    // issued against it is a delete issued blind. This file has destroyed local
+    // history once already by deleting on an assumption (migrateRawToScoped).
+    vi.useFakeTimers();
+    __resetLocalHistoryPruneStateForTests();
+    const sessionName = `deck_prune_degraded_${Date.now()}`;
+    const serverId = `srv-prune-degraded-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(true);
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents').mockResolvedValue();
+
+    await renderRestoredProbe(sessionName, serverId, 'prune-degraded-probe');
+
+    expect(pruneSpy).not.toHaveBeenCalled();
   });
 
   it('inactive load survives effect-cleanup dep churn', async () => {
