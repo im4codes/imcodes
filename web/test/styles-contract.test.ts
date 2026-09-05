@@ -2,6 +2,72 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+function* cssStructuralBraces(source: string, start = 0): Generator<{ character: '{' | '}'; index: number }> {
+  let quote: '"' | "'" | undefined;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") quote = character;
+    else if (character === '{' || character === '}') yield { character, index };
+  }
+}
+
+function findBalancedClosingBrace(source: string, open: number): number | undefined {
+  let depth = 0;
+  for (const brace of cssStructuralBraces(source, open)) {
+    if (brace.character === '{') depth += 1;
+    else if (depth > 0) depth -= 1;
+    if (depth === 0) return brace.index;
+  }
+  return undefined;
+}
+
+function braceDepthAt(source: string, index: number): number {
+  let depth = 0;
+  for (const brace of cssStructuralBraces(source)) {
+    if (brace.index >= index) break;
+    depth += brace.character === '{' ? 1 : -1;
+  }
+  return depth;
+}
+
+function extractBalancedAtRuleBlocks(source: string, prelude: RegExp): string[] {
+  const flags = `${prelude.flags.replaceAll('g', '').replaceAll('y', '')}g`;
+  const matcher = new RegExp(prelude.source, flags);
+  const blocks: string[] = [];
+
+  for (let match = matcher.exec(source); match; match = matcher.exec(source)) {
+    const open = source.indexOf('{', matcher.lastIndex);
+    if (open === -1 || source.slice(matcher.lastIndex, open).trim() !== '') continue;
+
+    const close = findBalancedClosingBrace(source, open);
+    if (close !== undefined) blocks.push(source.slice(match.index, close + 1));
+  }
+
+  return blocks;
+}
+
+function extractDirectStyleRule(block: string, selector: RegExp): string | undefined {
+  const flags = `${selector.flags.replaceAll('g', '').replaceAll('y', '')}g`;
+  const matcher = new RegExp(selector.source, flags);
+
+  for (let match = matcher.exec(block); match; match = matcher.exec(block)) {
+    if (braceDepthAt(block, match.index) !== 1) continue;
+
+    const open = block.indexOf('{', matcher.lastIndex);
+    if (open === -1 || block.slice(matcher.lastIndex, open).trim() !== '') continue;
+    const close = findBalancedClosingBrace(block, open);
+    if (close !== undefined) return block.slice(match.index, close + 1);
+  }
+  return undefined;
+}
+
 /**
  * Style contracts that must NOT regress.
  *
@@ -198,9 +264,47 @@ describe('styles.css regression contracts', () => {
 
     expect(cssWithoutComments).toMatch(/\.delegation-reply-card\[data-verdict\]:hover/);
     expect(cssWithoutComments).toMatch(/\.delegation-reply-card\[data-verdict\]\.chat-highlight\s*\{/);
-    expect(cssWithoutComments).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.delegation-reply-card\[data-verdict\]/);
-    expect(cssWithoutComments).toMatch(/@media\s*\(prefers-color-scheme:\s*light\)[\s\S]*?\.delegation-reply-card\[data-verdict\]/);
-    expect(cssWithoutComments).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.delegation-reply-card\[data-verdict\]::before\s*\{[^}]*animation:\s*none/);
+
+    const mobileRule = extractBalancedAtRuleBlocks(
+      cssWithoutComments,
+      /@media\s*\(\s*max-width\s*:\s*640px\s*\)/,
+    ).map((block) => extractDirectStyleRule(block, /\.delegation-reply-card\[data-verdict\]/))
+      .find((rule) => rule !== undefined);
+    expect(mobileRule, 'the verdict card mobile rule must live directly in the 640px media block').toBeTruthy();
+    expect(mobileRule).toMatch(/padding:\s*9px\s+10px/);
+
+    const lightRule = extractBalancedAtRuleBlocks(
+      cssWithoutComments,
+      /@media\s*\(\s*prefers-color-scheme\s*:\s*light\s*\)/,
+    ).map((block) => extractDirectStyleRule(block, /\.delegation-reply-card\[data-verdict\]/))
+      .find((rule) => rule !== undefined);
+    expect(lightRule, 'the verdict card light rule must live directly in the light-scheme media block').toBeTruthy();
+
+    const reducedMotionRule = extractBalancedAtRuleBlocks(
+      cssWithoutComments,
+      /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)/,
+    ).map((block) => extractDirectStyleRule(block, /\.delegation-reply-card\[data-verdict\]::before/))
+      .find((rule) => rule !== undefined);
+    expect(
+      reducedMotionRule,
+      'the verdict scan-line rule must live directly in the reduced-motion media block',
+    ).toBeTruthy();
+    expect(reducedMotionRule).toMatch(/animation:\s*none/);
+  });
+
+  it('extracts repeated media blocks without leaking through nested or wrong media', () => {
+    const fixture = `
+      @media (max-width: 640px) {
+        @supports (display: grid) { .target { color: red; } }
+      }
+      @media (max-width: 641px) { .target { color: orange; } }
+      @media (max-width: 640px) { .target { color: green; } }
+    `;
+    const blocks = extractBalancedAtRuleBlocks(fixture, /@media\s*\(\s*max-width\s*:\s*640px\s*\)/);
+    expect(blocks).toHaveLength(2);
+    expect(extractDirectStyleRule(blocks[0]!, /\.target/)).toBeUndefined();
+    expect(extractDirectStyleRule(blocks[1]!, /\.target/)).toMatch(/color:\s*green/);
+    expect(blocks.join('\n')).not.toContain('color: orange');
   });
 
   it('.chat-view-preview must NOT be a scroll container', () => {
