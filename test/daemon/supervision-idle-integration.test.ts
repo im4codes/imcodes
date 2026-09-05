@@ -222,6 +222,13 @@ describe('supervision → idle → broker integration', () => {
       undefined,
       expect.stringContaining('"localWork":"perform_now_no_marker"'),
     );
+    const executionPreamble = String(transportSend.mock.calls[0]?.[3]);
+    expect(executionPreamble.match(/<!-- IMCODES_EXEC: [A-Z_]+ -->/g)).toEqual([
+      SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY,
+      SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+      SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+    ]);
+    expect(executionPreamble).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
     expect(supervisionAutomation.getActiveRun(SESSION)).toBeTruthy();
 
     // Now simulate the transport runtime's status flow: streaming → idle.
