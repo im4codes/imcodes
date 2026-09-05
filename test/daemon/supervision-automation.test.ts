@@ -429,6 +429,44 @@ function finishAuditRecoveryTestCleanup() {
 }
 
 describe('SupervisionAutomation', () => {
+  it('hydrates the persisted Brain snapshot on startup and deduplicates identical restore notifications', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    const worker = getSession('deck_sub_reviewer');
+    if (!worker) throw new Error('missing seeded worker');
+    upsertSession({ ...worker, transportConfig: { supervision: snapshot } });
+    mockedPeerAuditService.applyAutomaticConfiguration.mockClear();
+
+    supervisionAutomation.init();
+
+    expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenCalledTimes(1);
+    expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenLastCalledWith(
+      'deck_supervision_brain',
+      true,
+    );
+
+    supervisionAutomation.applyPersistedSnapshot('deck_supervision_brain');
+    supervisionAutomation.applyPersistedSnapshot('deck_supervision_brain');
+
+    expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenCalledTimes(1);
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({ status: SUPERVISION_AUDIT_ENABLED_STATUS }),
+      }),
+    ]));
+
+    const prior = getSession('deck_supervision_brain');
+    if (!prior) throw new Error('missing seeded Brain');
+    removeSession('deck_supervision_brain');
+    upsertSession({
+      ...prior,
+      transportConfig: { supervision: snapshot },
+    });
+    supervisionAutomation.applyPersistedSnapshot('deck_supervision_brain');
+
+    expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenCalledTimes(2);
+  });
+
   it('fast-paths ADVANCE without calling the supervisor model', async () => {
     const snapshot = await seedSession('supervised_audit', false, 2, { uiLocale: 'zh-CN' });
     supervisionAutomation.init();
@@ -3053,6 +3091,8 @@ describe('SupervisionAutomation', () => {
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-live', 'implement the feature', supervised);
+    mockedPeerAuditService.applyAutomaticConfiguration.mockClear();
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', upgraded);
     supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', upgraded);
     beginRun('cmd-live', 'implement the feature');
 
@@ -3061,6 +3101,7 @@ describe('SupervisionAutomation', () => {
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenCalledTimes(1);
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
     expect(mockStartP2pRun).not.toHaveBeenCalled();

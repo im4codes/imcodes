@@ -1,5 +1,5 @@
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
@@ -1334,6 +1334,9 @@ export async function startup(): Promise<DaemonContext> {
   // Rewrite all CC hook scripts with the actual port (may differ from last run)
   await setupCCHooks().catch((e) => logger.warn({ err: e }, 'CC hook setup failed'));
 
+  setTransportSessionRestoredCallback((sessionName) => {
+    supervisionAutomation.applyPersistedSnapshot(sessionName);
+  });
   supervisionAutomation.init();
   supervisionAutomation.setServerLink(serverLink);
   // One recovery pass closes the durable ready_for_audit -> dispatch crash

@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
@@ -232,6 +234,23 @@ const flushDispatch = async () => {
   await Promise.resolve();
   await new Promise((resolve) => setTimeout(resolve, 0));
 };
+
+describe('transport restore snapshot propagation', () => {
+  it('notifies automation only after the restored record and authority are committed', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/agent/session-manager.ts'), 'utf8');
+    const upsert = source.indexOf('upsertSession(restoredRecord);');
+    const authority = source.indexOf('refreshRestoreAuthority(persistedRestoredRecord);', upsert);
+    const committed = source.indexOf('restoreCommitted = true;', authority);
+    const snapshotNotification = source.indexOf('emitTransportSessionRestored(s.name);', committed);
+    const persistence = source.indexOf('emitSessionPersist(persistedRestoredRecord, s.name);', snapshotNotification);
+
+    expect(upsert).toBeGreaterThan(-1);
+    expect(authority).toBeGreaterThan(upsert);
+    expect(committed).toBeGreaterThan(authority);
+    expect(snapshotNotification).toBeGreaterThan(committed);
+    expect(persistence).toBeGreaterThan(snapshotNotification);
+  });
+});
 
 const waitForProviderSendCount = async (provider: ReturnType<typeof makeMockProvider>['provider'], count: number) => {
   const send = provider.send as ReturnType<typeof vi.fn>;

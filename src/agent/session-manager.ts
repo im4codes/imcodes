@@ -265,6 +265,22 @@ export async function persistSessionRecordAwaited(record: SessionRecord | null, 
   await _onSessionPersist?.(record, name);
 }
 
+type TransportSessionRestoredCallback = (sessionName: string) => void;
+let _onTransportSessionRestored: TransportSessionRestoredCallback | null = null;
+
+/** Wire the authoritative post-upsert transport restore boundary. */
+export function setTransportSessionRestoredCallback(cb: TransportSessionRestoredCallback): void {
+  _onTransportSessionRestored = cb;
+}
+
+function emitTransportSessionRestored(sessionName: string): void {
+  try {
+    _onTransportSessionRestored?.(sessionName);
+  } catch (error) {
+    logger.warn({ err: error, sessionName }, 'transport session restored callback failed');
+  }
+}
+
 export interface ProjectConfig {
   name: string;
   dir: string;
@@ -2798,6 +2814,7 @@ export async function restoreTransportSessions(
       const persistedRestoredRecord = getSession(s.name) ?? restoredRecord;
       refreshRestoreAuthority(persistedRestoredRecord);
       restoreCommitted = true;
+      emitTransportSessionRestored(s.name);
       emitSessionPersist(persistedRestoredRecord, s.name);
       wireTransportProviderReadyDrain(runtime, s.name);
       await reconcileTransportRestoreOrphanTools(s.name, runtime);

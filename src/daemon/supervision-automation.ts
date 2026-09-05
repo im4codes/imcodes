@@ -962,6 +962,8 @@ class SupervisionAutomation {
   /** Monotonic even across cancellation, so an old async verdict cannot match a replacement run. */
   private nextRunGeneration = 0;
   private initialized = false;
+  /** Canonical persisted snapshot last applied in this daemon lifetime. */
+  private appliedSnapshotFingerprints = new Map<string, string>();
   private eventSequence = 0;
   /** Test-only compatibility seam for the retired daemon-owned audit driver. */
   private automaticPeerAuditCompatibilityForTests = false;
@@ -1079,6 +1081,10 @@ class SupervisionAutomation {
       }
     });
     this.restorePersistedWaitStates();
+    for (const session of listSessions()) {
+      if (!canSessionRoleOwnAutomaticSupervision(session.role)) continue;
+      this.applyPersistedSnapshot(session.name);
+    }
     this.implementationWatchdogTimer = setInterval(() => {
       this.checkImplementationAssignments(Date.now());
     }, IMPLEMENTATION_WATCHDOG_TICK_MS);
@@ -1345,8 +1351,18 @@ class SupervisionAutomation {
     this.latestAssistantTexts.delete(sessionName);
     this.lastObservedSessionStates.delete(sessionName);
     this.recoverySuppressedUntilNextUser.delete(sessionName);
+    this.appliedSnapshotFingerprints.delete(sessionName);
     this.forgetRecoveredImplicitCompletionKeys(sessionName);
     this.clearStatus(sessionName);
+  }
+
+  /** Re-apply the store's authoritative snapshot after a runtime restore. */
+  applyPersistedSnapshot(sessionName: string): void {
+    const record = getSession(sessionName);
+    this.applySnapshotUpdate(
+      sessionName,
+      extractSessionSupervisionSnapshot(record?.transportConfig ?? null),
+    );
   }
 
   /**
@@ -1384,27 +1400,40 @@ class SupervisionAutomation {
   }
 
   applySnapshotUpdate(sessionName: string, snapshot: SessionSupervisionSnapshot | null | undefined): void {
+    const normalizedSnapshot = snapshot
+      ? normalizeSessionSupervisionSnapshot(snapshot)
+      : null;
+    const session = getSession(sessionName);
+    const snapshotFingerprint = JSON.stringify({
+      role: session?.role ?? null,
+      sessionInstanceId: session?.sessionInstanceId ?? null,
+      runtimeEpoch: session?.runtimeEpoch ?? null,
+      snapshot: normalizedSnapshot,
+    });
+    if (this.appliedSnapshotFingerprints.get(sessionName) === snapshotFingerprint) return;
+
     // Quick Peer Audit remains user-invoked. Automatic supervision must never
     // enable/disable, start, cancel, or recover its audit controller.
     peerAuditService.applyAutomaticConfiguration(
       sessionName,
       this.automaticPeerAuditCompatibilityForTests
-        && Boolean(snapshot && snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
-          && snapshot.auditTargetSessionName),
+        && Boolean(normalizedSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+          && normalizedSnapshot.auditTargetSessionName),
     );
-    if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) {
+    if (!isBrainOwnedAutomaticSupervision(sessionName, normalizedSnapshot)) {
       this.heartbeatPausedForNeedsInput.delete(sessionName);
       this.cancelSession(sessionName);
+      this.appliedSnapshotFingerprints.set(sessionName, snapshotFingerprint);
       return;
     }
-    if (snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+    if (normalizedSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
       this.emitStatus(sessionName, SUPERVISION_AUDIT_ENABLED_STATUS, SUPERVISION_AUDIT_ENABLED_LABEL);
     }
     const active = this.activeRuns.get(sessionName);
     if (active) {
       active.snapshot = active.snapshot.uiLocale
-        ? { ...snapshot, uiLocale: active.snapshot.uiLocale }
-        : snapshot;
+        ? { ...normalizedSnapshot, uiLocale: active.snapshot.uiLocale }
+        : normalizedSnapshot;
       active.hasLiveSnapshotUpdate = true;
     }
     const pending = this.pendingTaskIntents.get(sessionName);
@@ -1412,8 +1441,8 @@ class SupervisionAutomation {
       this.pendingTaskIntents.set(sessionName, {
         ...pending,
         snapshot: pending.snapshot.uiLocale
-          ? { ...snapshot, uiLocale: pending.snapshot.uiLocale }
-          : snapshot,
+          ? { ...normalizedSnapshot, uiLocale: pending.snapshot.uiLocale }
+          : normalizedSnapshot,
       });
     }
     // Regression fix: if supervision was freshly enabled on an already-idle
@@ -1427,12 +1456,13 @@ class SupervisionAutomation {
     // (recent task candidate + newer assistant response) so the guardrails
     // against stale turns stay identical.
     if (!active && this.isSessionIdle(sessionName)) {
-      if (!this.tryStartImplicitRun(sessionName, snapshot)
-        && !this.tryRecoverImplicitRunFromTimeline(sessionName, snapshot)) {
+      if (!this.tryStartImplicitRun(sessionName, normalizedSnapshot)
+        && !this.tryRecoverImplicitRunFromTimeline(sessionName, normalizedSnapshot)) {
         const candidate = this.recentTaskCandidates.get(sessionName);
-        if (candidate) this.armImplicitCompletionGrace(sessionName, snapshot, candidate);
+        if (candidate) this.armImplicitCompletionGrace(sessionName, normalizedSnapshot, candidate);
       }
     }
+    this.appliedSnapshotFingerprints.set(sessionName, snapshotFingerprint);
   }
 
   /**
