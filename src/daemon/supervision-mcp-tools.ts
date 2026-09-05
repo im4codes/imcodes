@@ -44,6 +44,8 @@ import {
 } from '../../shared/supervision-participant-authority.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import { deterministicSendMessageId } from '../../shared/send-message-id.js';
 
 type ToolResult = Record<string, unknown>;
 
@@ -64,15 +66,24 @@ export interface SupervisionVisibilityItem {
   classification?: string;
   status?: string;
   currentRevision?: string;
+  auditPolicy?: string;
+  validationState?: string;
   assignments?: ReadonlyArray<{
     assignmentId?: string;
     role?: string;
+    required?: boolean;
     status?: string;
     leaseId?: string;
     auditAttemptId?: string;
     auditRevision?: string;
     verdict?: string;
-    identity?: { sessionName?: string };
+    identity?: {
+      sessionName?: string;
+      sessionInstanceId?: string;
+      runtimeEpoch?: string;
+      agentType?: string;
+      providerFamily?: string;
+    };
   }>;
 }
 
@@ -171,6 +182,20 @@ export interface SupervisionRegistryPort {
     callerProjectName: string;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
+  recoverOrphanedDelegatedAuditor?(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: {
+      sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
+      agentType: string; providerFamily: string;
+    };
+    expectedRevision: string;
+    auditAttemptId: string;
+    callerProjectName: string;
+    deliveryMessageId: string;
+    idempotencyKey: string;
+    reason: string;
+  }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   rebindValidatedImplementerAssignment?(input: {
     taskId: string;
     assignmentId: string;
@@ -232,6 +257,11 @@ export interface SupervisionMcpToolDeps {
     coordinatorAssignmentId: string;
     origin: { sessionName: string; sessionInstanceId: string; runtimeEpoch: string };
   }) => number;
+  /** Best-effort retirement of the superseded target's pending queue row. */
+  retireSupersededAuditDelivery?: (input: {
+    sessionName: string;
+    messageId: string;
+  }) => void;
   resolveSessionIdentity?: (sessionName: string) => {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
     agentType: string; providerFamily: string; projectName: string;
@@ -285,6 +315,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     assignmentId: z.string().min(1).optional(),
     rebindSessionName: z.string().min(1).optional(),
     expectedRevision: z.string().min(1).optional(),
+    auditAttemptId: z.string().min(1).optional(),
     fromRevision: z.string().min(1).optional(),
     toRevision: z.string().min(1).optional(),
     ownedFiles: z.unknown().optional(),
@@ -602,6 +633,7 @@ export function createSupervisionMcpToolHandlers(
       const assignmentId = String(input.assignmentId ?? '').trim();
       const rebindSessionName = String(input.rebindSessionName ?? '').trim();
       const expectedRevision = String(input.expectedRevision ?? '').trim();
+      const auditAttemptId = String(input.auditAttemptId ?? '').trim();
       const fromRevision = String(input.fromRevision ?? '').trim();
       const toRevision = String(input.toRevision ?? '').trim();
       const ownedFiles = Array.isArray(input.ownedFiles)
@@ -617,6 +649,98 @@ export function createSupervisionMcpToolHandlers(
       const idempotencyKey = String(input.idempotencyKey ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
+      const orphanedAuditorRecoveryRequested = Boolean(
+        assignmentId && rebindSessionName && expectedRevision && auditAttemptId,
+      );
+      if (orphanedAuditorRecoveryRequested) {
+        if (!idempotencyKey || ownedFiles.length > 0 || evidenceManifestSha256
+          || fromRevision || toRevision || taskStatus || assignmentStatus
+          || scopeFiles.length > 0 || leaseAction || input.toStatus !== undefined
+          || input.completionEvidenceDecision !== undefined || input.evidenceId !== undefined
+          || input.targetAssignmentId !== undefined) {
+          return err(
+            'validation_failed',
+            'orphaned auditor recovery requires only taskId, assignmentId, rebindSessionName, expectedRevision, auditAttemptId, idempotencyKey and reason',
+          );
+        }
+        const task = reg.get(taskId);
+        const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+        const authorized = isAdmin(caller) || Boolean(
+          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
+        );
+        if (!task || !authorized) {
+          return err('forbidden', 'orphaned auditor recovery requires the authoritative project Brain or administrator');
+        }
+        const assignment = task.assignments?.find((candidate) => candidate.assignmentId === assignmentId);
+        const implementers = task.assignments?.filter((candidate) => (
+          candidate.role === 'implementer'
+          && candidate.status === 'ready_for_audit'
+          && candidate.auditRevision === expectedRevision
+        )) ?? [];
+        if (assignment?.role !== 'auditor'
+          || assignment.status !== 'delegated'
+          || assignment.auditAttemptId !== auditAttemptId
+          || assignment.auditRevision !== expectedRevision
+          || implementers.length !== 1) {
+          return err('invalid_transition', 'orphaned auditor recovery requires one exact delegated auditor and ready implementer');
+        }
+        const priorSessionName = assignment.identity?.sessionName;
+        const implementerProviderFamily = implementers[0]?.identity?.providerFamily;
+        if (!priorSessionName || !implementerProviderFamily) {
+          return err('identity_rejected', 'orphaned auditor recovery requires complete durable assignment identities');
+        }
+        const identity = deps.resolveSessionIdentity?.(rebindSessionName);
+        if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
+        if (identity.projectName !== taskProjectName
+          || getSessionRuntimeType(identity.agentType) !== 'transport'
+          || identity.providerFamily === implementerProviderFamily) {
+          return err('identity_rejected', 'orphaned auditor recovery requires one live same-project cross-vendor transport target');
+        }
+        const deliveryMessageId = deterministicSendMessageId(
+          `auto-audit:${assignmentId}:${auditAttemptId}`,
+        );
+        const rebound = reg.recoverOrphanedDelegatedAuditor?.({
+          taskId,
+          assignmentId,
+          identity: {
+            sessionName: identity.sessionName,
+            sessionInstanceId: identity.sessionInstanceId,
+            runtimeEpoch: identity.runtimeEpoch,
+            agentType: identity.agentType,
+            providerFamily: identity.providerFamily,
+          },
+          expectedRevision,
+          auditAttemptId,
+          callerProjectName: taskProjectName,
+          deliveryMessageId,
+          idempotencyKey,
+          reason,
+        });
+        if (!rebound) return err('unavailable', 'orphaned auditor recovery is not bound');
+        if (!rebound.ok) return err(rebound.reason, `orphaned auditor recovery rejected: ${rebound.reason}`);
+        if (!rebound.replay) {
+          deps.retireSupersededAuditDelivery?.({
+            sessionName: priorSessionName,
+            messageId: deliveryMessageId,
+          });
+        }
+        let auditTrigger: unknown;
+        try {
+          auditTrigger = await deps.dispatchReadyAudit?.(taskId);
+        } catch {
+          // The rebind is authoritative; the bounded boot/tick path retries the
+          // same deterministic delivery without creating another auditor.
+        }
+        return ok({
+          taskId,
+          assignmentId,
+          rebindSessionName,
+          expectedRevision,
+          auditAttemptId,
+          replay: rebound.replay === true,
+          ...(auditTrigger !== undefined ? { auditTrigger } : {}),
+        });
+      }
       const validatedImplementerRecoveryRequested = Boolean(
         expectedRevision || (rebindSessionName && (ownedFiles.length > 0 || evidenceManifestSha256)),
       );

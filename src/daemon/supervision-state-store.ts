@@ -1775,9 +1775,23 @@ export class SupervisionTaskRegistry {
     return (this.#db.prepare(sql).all(...params) as Array<Record<string, unknown>>)
       .map(parseTaskRow)
       .filter((record): record is PersistedSupervisionTaskRecord => record !== undefined)
-      .filter((record) => filter.history === true
-        ? !isSupervisionTaskVisibleByDefault(record)
-        : filter.includeArchived === true || isSupervisionTaskVisibleByDefault(record))
+      .filter((record) => {
+        // A status-filtered query is a lifecycle projection, not a retention
+        // query. A live row may carry an obsolete archivedAt marker after a
+        // predecessor finalization/recovery; task_get already exposes that
+        // authoritative status, so hiding it only from task_list makes the
+        // boot/tick materializer skip ready_for_audit forever. Keep the default
+        // unfiltered history view unchanged and narrowly let the requested
+        // non-terminal status win over stale retention metadata.
+        const selectedLiveStatus = filter.status !== undefined
+          && record.status === filter.status
+          && !isTerminalSupervisionTaskStatus(record.status);
+        return filter.history === true
+          ? !selectedLiveStatus && !isSupervisionTaskVisibleByDefault(record)
+          : filter.includeArchived === true
+            || selectedLiveStatus
+            || isSupervisionTaskVisibleByDefault(record);
+      })
       .slice(0, limit ?? Number.MAX_SAFE_INTEGER)
       .map((record) => this.get(record.taskId))
       .filter((record): record is SupervisionTaskSnapshot => record !== undefined);
@@ -1788,6 +1802,100 @@ export class SupervisionTaskRegistry {
     return (this.#db.prepare('SELECT payload_json AS payloadJson FROM supervision_task_assignments WHERE task_id = ? ORDER BY created_at ASC').all(taskId) as Array<Record<string, unknown>>)
       .map(parseAssignmentRow)
       .filter((record): record is PersistedSupervisionTaskAssignment => record !== undefined);
+  }
+
+  /**
+   * Persist one exact automatic-audit routing refusal on both aggregate rows.
+   * The caller owns the blocker schema; the store treats the full string as a
+   * CAS token so later recovery can clear only the refusal it actually fixed.
+   */
+  recordAutomaticAuditRoutingBlocker(input: {
+    taskId: string;
+    assignmentId: string;
+    blocker: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const blocker = normalizeTaskString(input.blocker);
+    if (!blocker) return { ok: false, reason: 'invalid' };
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(input.taskId);
+      const assignment = this.getAssignment(input.assignmentId);
+      if (!task || !assignment || assignment.taskId !== task.taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (task.status !== 'ready_for_audit'
+        || assignment.status !== 'ready_for_audit'
+        || !assignment.required
+        || (assignment.role !== 'implementer' && assignment.role !== 'integration_owner')) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (task.blocker === blocker && assignment.blocker === blocker) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: task, replay: true };
+      }
+      this.#writeAssignment(
+        { ...assignment, blocker, updatedAt: now },
+        'blocked',
+        { source: 'automatic_audit_routing_blocked' },
+      );
+      const updatedTask = { ...task, blocker, updatedAt: now };
+      this.#writeTask(updatedTask, 'blocked', { source: 'automatic_audit_routing_blocked' });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: updatedTask };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /** Clear only the exact routing blocker CAS token after accepted recovery. */
+  clearAutomaticAuditRoutingBlocker(input: {
+    taskId: string;
+    assignmentId: string;
+    blocker: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const blocker = normalizeTaskString(input.blocker);
+    if (!blocker) return { ok: false, reason: 'invalid' };
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(input.taskId);
+      const assignment = this.getAssignment(input.assignmentId);
+      if (!task || !assignment || assignment.taskId !== task.taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      const clearsTask = task.blocker === blocker;
+      const clearsAssignment = assignment.blocker === blocker;
+      if (!clearsTask && !clearsAssignment) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: task, replay: true };
+      }
+      if (clearsAssignment) {
+        const { blocker: _obsolete, ...rest } = assignment;
+        this.#writeAssignment(
+          { ...rest, updatedAt: now },
+          'recovered',
+          { source: 'automatic_audit_routing_recovered' },
+        );
+      }
+      let updatedTask = task;
+      if (clearsTask) {
+        const { blocker: _obsolete, ...rest } = task;
+        updatedTask = { ...rest, updatedAt: now };
+        this.#writeTask(updatedTask, 'recovered', { source: 'automatic_audit_routing_recovered' });
+      }
+      this.#db.exec('COMMIT');
+      return { ok: true, value: updatedTask };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   listAuditReceipts(taskId: string): PersistedSupervisionAuditReceipt[] {
@@ -4494,6 +4602,137 @@ export class SupervisionTaskRegistry {
       revision: assignment.auditRevision,
     });
     return { ok: true, value: rebound };
+  }
+
+  /**
+   * Recover one orphaned, never-started automatic auditor on the SAME durable
+   * assignment/attempt/revision. This is intentionally narrower than the
+   * general identity rebind above: any receipt or progressed lifecycle proves
+   * an execution owner may exist and therefore fails closed.
+   */
+  recoverOrphanedDelegatedAuditor(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: PersistedSupervisionTaskAssignmentIdentity;
+    expectedRevision: string;
+    auditAttemptId: string;
+    callerProjectName: string;
+    deliveryMessageId: string;
+    idempotencyKey: string;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const expectedRevision = normalizeTaskString(input.expectedRevision);
+    const auditAttemptId = normalizeTaskString(input.auditAttemptId);
+    const callerProjectName = normalizeTaskString(input.callerProjectName);
+    const deliveryMessageId = normalizeTaskString(input.deliveryMessageId);
+    const idempotencyKey = normalizeTaskString(input.idempotencyKey);
+    const reason = normalizeTaskString(input.reason);
+    if (!taskId || !assignmentId || !expectedRevision || !auditAttemptId
+      || !callerProjectName || !deliveryMessageId || !idempotencyKey || !reason) {
+      return { ok: false, reason: 'invalid' };
+    }
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(taskId);
+      const assignment = this.getAssignment(assignmentId);
+      if (!task || !assignment || assignment.taskId !== taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (task.projectName !== callerProjectName) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'owner_mismatch' };
+      }
+      const priorEvents = this.listEvents(taskId).filter((event) => (
+        event.eventType === 'recovered'
+        && event.assignmentId === assignmentId
+        && event.payload?.source === 'orphaned_automatic_auditor_rebind'
+        && event.payload?.idempotencyKey === idempotencyKey
+      ));
+      const exactReplay = priorEvents.some((event) => (
+        event.payload?.revision === expectedRevision
+        && event.payload?.attemptId === auditAttemptId
+        && event.payload?.targetSessionName === input.identity.sessionName
+        && event.payload?.targetSessionInstanceId === input.identity.sessionInstanceId
+        && event.payload?.targetRuntimeEpoch === input.identity.runtimeEpoch
+        && event.payload?.deliveryMessageId === deliveryMessageId
+      ));
+      if (priorEvents.length > 0) {
+        this.#db.exec('ROLLBACK');
+        return exactReplay && runtimeIdentityMetadataMatches(assignment.identity, input.identity)
+          ? { ok: true, value: assignment, replay: true }
+          : { ok: false, reason: 'conflicting_replay' };
+      }
+      const implementers = this.listAssignments(taskId).filter((candidate) => (
+        candidate.required
+        && (candidate.role === 'implementer' || candidate.role === 'integration_owner')
+        && candidate.status === 'ready_for_audit'
+        && candidate.auditRevision === expectedRevision
+      ));
+      const hasReceipt = this.listAuditReceipts(taskId).some((receipt) => (
+        receipt.assignmentId === assignmentId
+        && receipt.attemptId === auditAttemptId
+        && receipt.revision === expectedRevision
+      ));
+      if (task.status !== 'ready_for_audit'
+        || task.validationState !== 'passed'
+        || task.auditPolicy !== 'auto_strict_cross_vendor'
+        || task.currentRevision !== expectedRevision
+        || assignment.role !== 'auditor'
+        || assignment.status !== 'delegated'
+        || assignment.auditAttemptId !== auditAttemptId
+        || assignment.auditRevision !== expectedRevision
+        || implementers.length !== 1
+        || implementers[0]!.identity.providerFamily === input.identity.providerFamily
+        || hasReceipt) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (runtimeIdentityMetadataMatches(assignment.identity, input.identity)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
+      const rebound: PersistedSupervisionTaskAssignment = {
+        ...assignment,
+        identity: input.identity,
+        ...(assignment.executionBinding ? {
+          executionBinding: {
+            ...assignment.executionBinding,
+            actual: {
+              ...assignment.executionBinding.actual,
+              sessionName: input.identity.sessionName,
+              sessionInstanceId: input.identity.sessionInstanceId,
+              runtimeEpoch: input.identity.runtimeEpoch,
+              agentType: input.identity.agentType,
+              providerFamily: input.identity.providerFamily,
+            },
+          },
+        } : {}),
+        generation: assignment.generation + 1,
+        updatedAt: now,
+      };
+      this.#writeAssignment(rebound, 'recovered', {
+        source: 'orphaned_automatic_auditor_rebind',
+        idempotencyKey,
+        reason,
+        revision: expectedRevision,
+        attemptId: auditAttemptId,
+        deliveryMessageId,
+        supersededSessionName: assignment.identity.sessionName,
+        targetSessionName: input.identity.sessionName,
+        targetSessionInstanceId: input.identity.sessionInstanceId,
+        targetRuntimeEpoch: input.identity.runtimeEpoch,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: rebound };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /**

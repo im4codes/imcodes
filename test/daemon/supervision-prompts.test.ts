@@ -702,6 +702,134 @@ describe('supervision user authority clause', () => {
       .toBe('only_after_authorized_tools_exhausted_and_external_information_or_authorization_genuinely_missing');
   });
 
+  it('requires bounded active same-object recovery for every non-external blocked or waiting_for_brain assignment', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.blockedRecoveryDuty.trigger).toEqual({
+      assignmentState: ['blocked', 'waiting_for_brain'],
+      blockerAuthority: 'non_external',
+      cadence: 'every_bounded_coordinator_or_automation_tick',
+      freshDaemonEventRequired: false,
+    });
+    expect(contract.blockedRecoveryDuty.deadline).toBe('same_or_next_bounded_coordination_turn');
+    expect(contract.blockedRecoveryDuty.inspect).toBe('authoritative_task_state');
+    expect(contract.blockedRecoveryDuty.repair).toEqual([
+      'lifecycle', 'lease', 'revision', 'scope', 'identity', 'delivery',
+    ]);
+    expect(contract.blockedRecoveryDuty.reuse).toEqual({
+      object: 'same_task_assignment_attempt', actions: ['rebind', 'renew'],
+    });
+    expect(contract.blockedRecoveryDuty.resume).toEqual(['validation', 'audit', 'rework']);
+  });
+
+  it('kills report-only, silent-wait, repeated-heartbeat, parked-task, and replacement recovery mutants', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.blockedRecoveryDuty.forbid).toEqual([
+      'park_recoverable_task',
+      'report_only',
+      'silent_wait',
+      'repeated_heartbeat_without_recovery',
+      'replacement_object',
+    ]);
+    expect(contract.blockedRecoveryDuty.success).toEqual({
+      obsoleteWaitingForBrainBlocker: 'clear_not_overwrite_with_recovery_prose',
+      continueSafeWork: 'until_resumed_or_next_authority_defect_durably_entered',
+    });
+  });
+
+  it('reserves WAITING and NEEDS_INPUT for genuine external and human authority only', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.blockedRecoveryDuty.markers).toEqual({
+      waiting: 'genuine_external_authority_or_state_unavailable_to_brain_only',
+      needsInput: 'brain_missing_required_human_information_only',
+      daemonSilence: 'not_waiting_authority',
+    });
+    expect(contract.blockedRecoveryDuty.retry).toEqual({
+      bounded: true, pollLoop: false, repeatedTick: 'idempotent',
+    });
+  });
+
+  it('turns an authority-handler recovery refusal into a mandatory production RED on the original object', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.blockedRecoveryDuty.authorityHandlerDefect).toEqual({
+      disposition: 'mandatory_active_control_plane_production_defect',
+      require: ['load_bearing_red', 'repair', 'continue_original_object'],
+    });
+  });
+
+  it('places the exact blocked-recovery operational duty in the generated Brain decision preamble', () => {
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+    const preamble = buildSupervisionDecisionPrompt({
+      snapshot,
+      taskRequest: 'recover the same blocked assignment',
+      assistantResponse: 'waiting for the Brain',
+    });
+    for (const clause of [
+      'every_bounded_coordinator_or_automation_tick',
+      'same_or_next_bounded_coordination_turn',
+      'same_task_assignment_attempt',
+      'clear_not_overwrite_with_recovery_prose',
+      'mandatory_active_control_plane_production_defect',
+      'genuine_external_authority_or_state_unavailable_to_brain_only',
+    ]) expect(preamble).toContain(clause);
+  });
+
+  it('makes SAME task/assignment plus addendum or scope expansion the priority topology for one root-cause chain', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.taskTopology.reuseSame).toEqual({
+      whenAny: [
+        'same_objective_or_root_cause_chain',
+        'shared_primary_production_files',
+        'sequential_integration_required',
+      ],
+      target: 'same_task_and_assignment',
+      changeMode: 'addendum_or_scope_expansion',
+      priority: 'reuse_before_mint',
+    });
+    expect(contract.taskTopology.reuseSame.whenAny)
+      .toContain('shared_primary_production_files');
+  });
+
+  it('permits splitting only through the independent, disjoint-write, independent-lifecycle triple gate', () => {
+    const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    expect(contract.taskGranularity.splitOnlyWhenAll).toEqual([
+      'independent_parallel_work',
+      'disjoint_writes',
+      'independently_completable_lifecycle_and_acceptance',
+    ]);
+    expect(contract.taskGranularity.beforeSplitEvaluate).toEqual([
+      'management_complexity',
+      'file_conflicts',
+      'audit_cost',
+      'integration_cost',
+    ]);
+  });
+
+  it('forbids finding-driven object churn and cross-checks the existing-task append hard gate', () => {
+    const brain = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
+    const messaging = JSON.parse(buildSupervisionMessagingContract());
+    expect(brain.taskGranularity.forbidDefaultMint).toEqual([
+      'task_per_new_finding',
+      'slice_per_new_finding',
+      'replacement_per_new_finding',
+    ]);
+    expect(brain.taskGranularity.authority)
+      .toBe('brain_decision_contract_not_runtime_semantic_equivalence');
+    expect(messaging.send_message).toMatchObject({
+      existingTask: 'append',
+      replacementObject: false,
+    });
+  });
+
   it('keeps the Brain duty at the Brain entrypoint and only a compact escalation ref in sub-session preambles', () => {
     // Placement matters as much as content. The full duty belongs where Brain
     // actually acts; restating it in every sub-session preamble would spend the

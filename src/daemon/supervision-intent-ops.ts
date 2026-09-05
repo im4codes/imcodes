@@ -173,6 +173,8 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
       taskId: { type: 'string' },
       assignmentId: { type: 'string' },
       rebindSessionName: { type: 'string' },
+      expectedRevision: { type: 'string' },
+      auditAttemptId: { type: 'string' },
       validationState: { type: 'string', enum: [...SUPERVISION_CONSOLE_VALIDATION_STATES] },
       note: { type: 'string' },
     },

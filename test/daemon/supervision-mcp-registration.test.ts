@@ -64,6 +64,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   applied: any[] = [];
   recovered: any[] = [];
   rebound: any[] = [];
+  orphanedAuditorRebound: any[] = [];
   implementerRebound: any[] = [];
   revisionRebound: any[] = [];
   coordinated: any[] = [];
@@ -102,6 +103,10 @@ class FakeRegistry implements SupervisionRegistryPort {
   recover(input: any) { this.recovered.push(input); this.statuses.set(input.taskId, input.toStatus); }
   rebindAuditAssignment(input: any) {
     this.rebound.push(input);
+    return { ok: true as const, value: { assignmentId: input.assignmentId } };
+  }
+  recoverOrphanedDelegatedAuditor(input: any) {
+    this.orphanedAuditorRebound.push(input);
     return { ok: true as const, value: { assignmentId: input.assignmentId } };
   }
   rebindValidatedImplementerAssignment(input: any) {
@@ -1087,6 +1092,92 @@ describe('administrative recover', () => {
       callerProjectName: 'codedeck',
       reason: 'authorized device replacement',
     }]);
+  });
+
+  it('recovers an orphaned delegated auditor on the SAME attempt and immediately drives exact redelivery', async () => {
+    const taskId = 'tsk_d4d';
+    const assignmentId = 'asg_dlt';
+    const revision = 'post-pass-successor-owner-retirement-cx1-r1-eb2b2965f045';
+    const auditAttemptId = 'auto-audit-30656902ee6c14fbdcb2751b';
+    registry.statuses.set(taskId, 'ready_for_audit');
+    registry.currentRevisions.set(taskId, revision);
+    registry.assignmentStates.set(taskId, [
+      {
+        assignmentId: 'asg_d4d_coord', role: 'coordinator', status: 'delegated', leaseId: '',
+        identity: testIdentity('deck_cd_brain'),
+      },
+      {
+        assignmentId: 'asg_d4h', role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditRevision: revision,
+        identity: testIdentity('deck_d4d_implementer'),
+      },
+      {
+        assignmentId, role: 'auditor', status: 'delegated', leaseId: '',
+        auditAttemptId, auditRevision: revision,
+        identity: {
+          ...testIdentity('deck_sub_1a2h2b1w'),
+          agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        },
+      },
+    ]);
+    const originalItem = registry.item.bind(registry);
+    registry.item = (id: string) => ({
+      ...originalItem(id),
+      auditPolicy: id === taskId ? 'auto_strict_cross_vendor' : undefined,
+      validationState: id === taskId ? 'passed' : undefined,
+    });
+    const replacement = {
+      sessionName: 'deck_d4d_live_cc9',
+      sessionInstanceId: 'instance-deck_d4d_live_cc9',
+      runtimeEpoch: 'epoch-deck_d4d_live_cc9',
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      projectName: 'codedeck',
+    };
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({
+      status: 'dispatched', assignmentId, auditAttemptId,
+    });
+    const retireSupersededAuditDelivery = vi.fn();
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
+      dispatchReadyAudit,
+      retireSupersededAuditDelivery,
+    });
+
+    const result = await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId,
+      assignmentId,
+      rebindSessionName: replacement.sessionName,
+      expectedRevision: revision,
+      auditAttemptId,
+      idempotencyKey: `orphan-auditor:${taskId}:${assignmentId}:${auditAttemptId}`,
+      reason: 'old auditor target is no longer discoverable',
+    });
+
+    expect(result).toMatchObject({
+      status: 'ok', taskId, assignmentId,
+      rebindSessionName: replacement.sessionName,
+      expectedRevision: revision,
+      auditAttemptId,
+      auditTrigger: { status: 'dispatched', assignmentId },
+    });
+    expect(registry.orphanedAuditorRebound).toEqual([
+      expect.objectContaining({
+        taskId, assignmentId, expectedRevision: revision, auditAttemptId,
+        identity: expect.objectContaining({ sessionName: replacement.sessionName }),
+        callerProjectName: 'codedeck',
+      }),
+    ]);
+    expect(retireSupersededAuditDelivery).toHaveBeenCalledWith({
+      sessionName: 'deck_sub_1a2h2b1w',
+      messageId: expect.stringMatching(/^send_message_/),
+    });
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledWith(taskId);
+    expect(registry.rebound, 'must not use the loose legacy audit-rebind branch').toEqual([]);
+    expect(registry.implementerRebound, 'must not use implementer evidence recovery').toEqual([]);
   });
 
   it('rebinds a validated required implementer through the live same-session identity and frozen evidence', async () => {

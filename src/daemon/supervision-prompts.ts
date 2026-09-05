@@ -283,6 +283,77 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
       mustNotOffload: ['operation_to_user', 'responsibility_to_user', 'ask_user_to_run_brain_only_tool'],
       needsInput: 'only_after_authorized_tools_exhausted_and_external_information_or_authorization_genuinely_missing',
     },
+    blockedRecoveryDuty: {
+      trigger: {
+        assignmentState: ['blocked', 'waiting_for_brain'],
+        blockerAuthority: 'non_external',
+        cadence: 'every_bounded_coordinator_or_automation_tick',
+        freshDaemonEventRequired: false,
+      },
+      deadline: 'same_or_next_bounded_coordination_turn',
+      inspect: 'authoritative_task_state',
+      repair: ['lifecycle', 'lease', 'revision', 'scope', 'identity', 'delivery'],
+      reuse: {
+        object: 'same_task_assignment_attempt',
+        actions: ['rebind', 'renew'],
+      },
+      resume: ['validation', 'audit', 'rework'],
+      forbid: [
+        'park_recoverable_task',
+        'report_only',
+        'silent_wait',
+        'repeated_heartbeat_without_recovery',
+        'replacement_object',
+      ],
+      markers: {
+        waiting: 'genuine_external_authority_or_state_unavailable_to_brain_only',
+        needsInput: 'brain_missing_required_human_information_only',
+        daemonSilence: 'not_waiting_authority',
+      },
+      authorityHandlerDefect: {
+        disposition: 'mandatory_active_control_plane_production_defect',
+        require: ['load_bearing_red', 'repair', 'continue_original_object'],
+      },
+      success: {
+        obsoleteWaitingForBrainBlocker: 'clear_not_overwrite_with_recovery_prose',
+        continueSafeWork: 'until_resumed_or_next_authority_defect_durably_entered',
+      },
+      retry: { bounded: true, pollLoop: false, repeatedTick: 'idempotent' },
+    },
+    // Task topology is a Brain decision contract, not a claim that runtime
+    // code can determine semantic equivalence. Keep one root-cause chain on
+    // one durable object unless all split gates below are independently true.
+    taskTopology: {
+      reuseSame: {
+        whenAny: [
+          'same_objective_or_root_cause_chain',
+          'shared_primary_production_files',
+          'sequential_integration_required',
+        ],
+        target: 'same_task_and_assignment',
+        changeMode: 'addendum_or_scope_expansion',
+        priority: 'reuse_before_mint',
+      },
+    },
+    taskGranularity: {
+      splitOnlyWhenAll: [
+        'independent_parallel_work',
+        'disjoint_writes',
+        'independently_completable_lifecycle_and_acceptance',
+      ],
+      beforeSplitEvaluate: [
+        'management_complexity',
+        'file_conflicts',
+        'audit_cost',
+        'integration_cost',
+      ],
+      forbidDefaultMint: [
+        'task_per_new_finding',
+        'slice_per_new_finding',
+        'replacement_per_new_finding',
+      ],
+      authority: 'brain_decision_contract_not_runtime_semantic_equivalence',
+    },
     status: {
       discoveryOrDispatchIsAdvance: false,
       delegateRemainingIsAdvance: false,

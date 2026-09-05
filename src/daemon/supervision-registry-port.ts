@@ -27,6 +27,7 @@ import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-ins
 import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-ingress.js';
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
 
 /**
  * One live-session authority check shared by the MCP project list and the Web
@@ -137,6 +138,9 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     },
     cancelStaleAuditorAsProjectBrain: (input) => getSupervisionTaskRegistry().cancelStaleAuditorAsProjectBrain(input),
     rebindAuditAssignment: (input) => getSupervisionTaskRegistry().rebindAuditAssignment(input),
+    recoverOrphanedDelegatedAuditor: (input) => (
+      getSupervisionTaskRegistry().recoverOrphanedDelegatedAuditor(input)
+    ),
     rebindValidatedImplementerAssignment: (input) => getSupervisionTaskRegistry().rebindValidatedImplementerAssignment(input),
     rebindTaskAssignmentRevision: (input) => {
       const registry = getSupervisionTaskRegistry();
@@ -298,6 +302,18 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
     advancePendingRepliesForReboundCoordinator: (input) => (
       advancePendingRepliesForReboundCoordinator(input)
     ),
+    retireSupersededAuditDelivery: ({ sessionName, messageId }) => {
+      try {
+        const store = getTransportQueueStore();
+        const pending = store.readSnapshot(sessionName, 'orphaned_auditor_rebind_retire')
+          .pendingMessageEntries.some((entry) => entry.clientMessageId === messageId);
+        if (pending) store.markDeleted(sessionName, messageId);
+      } catch {
+        // The registry event is the durable supersession authority. Queue
+        // cleanup is best-effort and the replacement target is independently
+        // keyed, so a stale old-target row cannot authorize execution.
+      }
+    },
     resolveSessionIdentity: (sessionName) => {
       const sessions = listSessions();
       const session = sessions.find((candidate) => candidate.name === sessionName);

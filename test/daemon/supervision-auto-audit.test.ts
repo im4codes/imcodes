@@ -1088,6 +1088,314 @@ describe('automatic supervision audit materialization', () => {
     expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
   });
 
+  it.each([
+    ['tsk_d4d', 'post-pass-successor-owner-retirement-cx1-r1-eb2b2965f045'],
+    ['tsk_djb', 'provider-route-restart-hydration-cx5-r1-ea6185551042'],
+  ])('boot-materializes exactly one strict auditor for archived live %s without refinish', async (taskId, revision) => {
+    const root = mkdtempSync(join(tmpdir(), `imcodes-${taskId}-zero-auditor-`));
+    const dbPath = join(root, 'registry.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor', registry });
+      registry.close();
+
+      // Exact production drift: task_get reads the live ready_for_audit row,
+      // while an obsolete retention marker used to hide it from the
+      // status-filtered list that drives boot/tick materialization.
+      const database = new DatabaseSync(dbPath);
+      const row = database.prepare(
+        'SELECT payload_json AS payloadJson FROM supervision_tasks WHERE task_id = ?',
+      ).get(taskId) as { payloadJson: string };
+      database.prepare('UPDATE supervision_tasks SET payload_json = ? WHERE task_id = ?')
+        .run(JSON.stringify({ ...JSON.parse(row.payloadJson), archivedAt: 1 }), taskId);
+      database.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.get(taskId)).toMatchObject({
+        taskId, status: 'ready_for_audit', validationState: 'passed',
+        currentRevision: revision, auditPolicy: 'auto_strict_cross_vendor', archivedAt: 1,
+      });
+      expect(registry.list({ status: 'ready_for_audit' }).map((task) => task.taskId)).toContain(taskId);
+
+      const brain = session('deck_alpha_brain', 'brain');
+      const worker = session('deck_alpha_worker', 'w1');
+      const auditor = session(`deck_alpha_${taskId}_auditor`, 'w2', 'claude-code-sdk', 'anthropic');
+      let evidence = false;
+      const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+        const created = registry.createAssignment({
+          taskId, role: 'auditor', required: false,
+          identity: identity(auditor.name, 'claude-code-sdk', 'anthropic'),
+          auditAttemptId: input.audit!.attemptId, auditRevision: revision,
+          idempotencyKey: `send:${input.idempotencyKey}`,
+        });
+        if (!created.ok) throw new Error(created.reason);
+        evidence = true;
+        return {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000d4' as const,
+          messageId: 'send_message_00000000-0000-5000-a000-0000000000d4' as SendMessageId,
+          deliveries: [{ target: auditor.name, status: 'queued' as const }],
+          taskId, assignmentId: created.value.assignmentId,
+        };
+      });
+      const deps = {
+        registry,
+        listSessions: () => [brain, worker, auditor],
+        listTargets: listTargetRecords(auditor),
+        dispatch,
+        hasDeliveryEvidence: () => evidence,
+      };
+
+      __resetSupervisionConvergenceTickForTests();
+      await expect(dispatchReadyAuditSweep(deps)).resolves.toEqual([
+        expect.objectContaining({ status: 'dispatched', attemptId: automaticAttempt(taskId, revision) }),
+      ]);
+      __resetSupervisionConvergenceTickForTests();
+      await expect(runSupervisionConvergenceTick(deps)).resolves.toMatchObject({
+        audits: [expect.objectContaining({ status: 'replayed', attemptId: automaticAttempt(taskId, revision) })],
+      });
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(registry.listAssignments(taskId).filter((item) => item.role === 'implementer')).toHaveLength(1);
+      expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+      expect(registry.listAuditReceipts(taskId)).toEqual([]);
+    } finally {
+      registry.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('lets the exact Brain recover no_selected_config with one fresh strict cross-vendor auditor', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const { taskId, revision, worker } = makeReadyTask({
+      taskId: 'zero-auditor-no-selected-config',
+      revision: 'zero-auditor-no-selected-config-r1',
+      auditPolicy: 'auto_strict_cross_vendor',
+      registry,
+    });
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit', executionPools: { state: 'legacy_unconfigured' },
+      }),
+    };
+    const implementer = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_exact_route', 'w2', 'claude-code-sdk', 'anthropic');
+    const attemptId = automaticAttempt(taskId, revision);
+    const beforeImplementer = registry.getAssignment(worker.assignmentId);
+    const dispatchMessage = vi.fn().mockResolvedValue({ status: 'queued' });
+
+    let blockerDelivered = false;
+    await expect(dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => [brain, implementer, auditor],
+      listTargets: listTargetRecords(),
+      dispatch: vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+        if (input.audit) {
+          return {
+            status: 'error' as const,
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: 'supervision target provisioning blocked: no_selected_config',
+          };
+        }
+        blockerDelivered = true;
+        return {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000d5' as const,
+          messageId: input.internalMessageId!,
+          deliveries: [{ target: brain.name, status: 'queued' as const }],
+        };
+      }),
+      hasDeliveryEvidence: () => blockerDelivered,
+    })).resolves.toMatchObject({
+      status: 'blocked', reason: 'supervision target provisioning blocked: no_selected_config',
+    });
+    const durableBlocker = registry.get(taskId)!.blocker!;
+    expect(JSON.parse(durableBlocker)).toMatchObject({
+      kind: 'automatic_audit_routing', taskId, assignmentId: worker.assignmentId,
+      revision, attemptId, exactError: 'supervision target provisioning blocked: no_selected_config',
+      disposition: 'waiting_for_brain',
+    });
+    expect(registry.getAssignment(worker.assignmentId)?.blocker).toBe(durableBlocker);
+
+    const recoveryInput = (): SendMessageInput => ({
+      target: auditor.name,
+      message: 'recover the exact zero-auditor task',
+      reply: true,
+      idempotencyKey: `exact-zero-auditor:${taskId}:${revision}`,
+      newWorkload: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId,
+        auditedSessionName: implementer.name,
+        strictCrossVendor: true,
+      },
+      task: {
+        taskId,
+        currentRevision: revision,
+        auditRevision: revision,
+        auditAttemptId: attemptId,
+        auditPolicy: 'auto_strict_cross_vendor',
+        executionPool: 'primary',
+      },
+    });
+    const recoveryDeps = {
+      listSessions: () => [brain, implementer, auditor],
+      dispatchMessage,
+      ensureSupervisionAssignmentWorktree: async ({ assignmentId }: { assignmentId: string }) => ({
+        ok: true as const, worktreePath: `/tmp/${assignmentId}/repo`, baseRevision: undefined,
+      }),
+    };
+
+    const first = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, recoveryInput(), recoveryDeps);
+
+    expect(first, JSON.stringify(first)).toMatchObject({
+      status: 'accepted', taskId, assignmentId: expect.any(String),
+    });
+    const assignments = registry.listAssignments(taskId);
+    expect(assignments.filter((item) => item.role === 'implementer')).toEqual([
+      expect.objectContaining({ assignmentId: worker.assignmentId }),
+    ]);
+    expect(registry.getAssignment(worker.assignmentId)).toMatchObject({
+      assignmentId: beforeImplementer!.assignmentId,
+      identity: beforeImplementer!.identity,
+      status: beforeImplementer!.status,
+      auditRevision: beforeImplementer!.auditRevision,
+      scopeFiles: beforeImplementer!.scopeFiles,
+    });
+    expect(registry.get(taskId)).not.toHaveProperty('blocker');
+    expect(registry.getAssignment(worker.assignmentId)).not.toHaveProperty('blocker');
+    expect(assignments.filter((item) => item.role === 'auditor')).toEqual([
+      expect.objectContaining({
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        identity: expect.objectContaining({ sessionName: auditor.name, providerFamily: 'anthropic' }),
+      }),
+    ]);
+
+    const replay = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, recoveryInput(), recoveryDeps);
+    expect(replay).toMatchObject({ status: 'accepted', idempotentReplay: true, taskId });
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'wrong_attempt',
+    'wrong_revision',
+    'conflicting_policy',
+    'same_vendor',
+    'non_brain',
+  ] as const)('keeps no_selected_config fail-closed for %s', async (variant) => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = `zero-auditor-reject-${variant}`;
+    const revision = `${taskId}-r1`;
+    const ready = makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor', registry });
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit', executionPools: { state: 'legacy_unconfigured' },
+      }),
+    };
+    const implementer = session('deck_alpha_worker', 'w1');
+    const target = variant === 'same_vendor'
+      ? session('deck_alpha_same_vendor', 'w2', 'codex-sdk', 'openai')
+      : session('deck_alpha_cross_vendor', 'w2', 'claude-code-sdk', 'anthropic');
+    const caller = variant === 'non_brain'
+      ? session('deck_alpha_not_brain', 'w3')
+      : brain;
+    const requestedRevision = variant === 'wrong_revision' ? `${revision}-wrong` : revision;
+    const attemptId = variant === 'wrong_attempt'
+      ? `auto-audit-${'f'.repeat(24)}`
+      : automaticAttempt(taskId, requestedRevision);
+    const result = await dispatchSendMessage({
+      userId: caller.name, sessionName: caller.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: target.name,
+      message: 'must stay fail closed',
+      reply: true,
+      idempotencyKey: `reject-zero-auditor:${variant}`,
+      newWorkload: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId,
+        auditedSessionName: implementer.name,
+        strictCrossVendor: true,
+      },
+      task: {
+        taskId,
+        currentRevision: requestedRevision,
+        auditRevision: requestedRevision,
+        auditAttemptId: attemptId,
+        auditPolicy: variant === 'conflicting_policy'
+          ? 'auto_allow_degraded'
+          : 'auto_strict_cross_vendor',
+        executionPool: 'primary',
+      },
+    }, {
+      listSessions: () => [brain, ...(caller.name === brain.name ? [] : [caller]), implementer, target],
+      dispatchMessage: vi.fn(),
+      ensureSupervisionAssignmentWorktree: async ({ assignmentId }) => ({
+        ok: true as const, worktreePath: `/tmp/${assignmentId}/repo`, baseRevision: undefined,
+      }),
+    });
+    expect(result).toMatchObject({ status: 'error' });
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([]);
+    expect(registry.getAssignment(ready.worker.assignmentId)).toMatchObject({
+      status: 'ready_for_audit', auditRevision: revision,
+    });
+  });
+
+  it('keeps the recoverable routing blocker durable across restart and clears only its exact CAS token', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-zero-auditor-routing-blocker-'));
+    const dbPath = join(root, 'registry.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      const ready = makeReadyTask({
+        taskId: 'zero-auditor-routing-restart',
+        revision: 'zero-auditor-routing-restart-r1',
+        auditPolicy: 'auto_strict_cross_vendor',
+        registry,
+      });
+      const blocker = JSON.stringify({
+        kind: 'automatic_audit_routing',
+        taskId: ready.taskId,
+        assignmentId: ready.worker.assignmentId,
+        revision: ready.revision,
+        attemptId: automaticAttempt(ready.taskId, ready.revision),
+        exactError: 'supervision target provisioning blocked: no_selected_config',
+        disposition: 'waiting_for_brain',
+      });
+      expect(registry.recordAutomaticAuditRoutingBlocker({
+        taskId: ready.taskId, assignmentId: ready.worker.assignmentId, blocker, now: 100,
+      })).toMatchObject({ ok: true });
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.get(ready.taskId)?.blocker).toBe(blocker);
+      expect(registry.getAssignment(ready.worker.assignmentId)?.blocker).toBe(blocker);
+
+      expect(registry.clearAutomaticAuditRoutingBlocker({
+        taskId: ready.taskId,
+        assignmentId: ready.worker.assignmentId,
+        blocker: `${blocker}-not-the-CAS-token`,
+        now: 200,
+      })).toMatchObject({ ok: true, replay: true });
+      expect(registry.get(ready.taskId)?.blocker).toBe(blocker);
+      expect(registry.clearAutomaticAuditRoutingBlocker({
+        taskId: ready.taskId, assignmentId: ready.worker.assignmentId, blocker, now: 300,
+      })).toMatchObject({ ok: true });
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.get(ready.taskId)).not.toHaveProperty('blocker');
+      expect(registry.getAssignment(ready.worker.assignmentId)).not.toHaveProperty('blocker');
+    } finally {
+      registry.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('selects an authorized ready transport before spawn or a busy FIFO', async () => {
     const { registry, taskId } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });
     const worker = session('deck_alpha_worker', 'w1');
@@ -1818,7 +2126,8 @@ describe('automatic supervision audit materialization', () => {
       }
       const report = JSON.parse(input.message) as Record<string, unknown>;
       expect(Object.keys(report)).toEqual([
-        'taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'recommendedNextAction',
+        'kind', 'taskId', 'assignmentId', 'revision', 'attemptId', 'exactError',
+        'completedSafeWork', 'recommendedNextAction', 'disposition',
       ]);
       expect(report).toMatchObject({
         taskId,
@@ -1849,6 +2158,13 @@ describe('automatic supervision audit materialization', () => {
     });
     expect(dispatch).toHaveBeenCalledTimes(3); // two deterministic provision attempts; one deduped blocker delivery
     expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([]);
+    expect(registry.get(taskId)?.blocker).toBe(registry.getAssignment(
+      registry.listAssignments(taskId).find((item) => item.role === 'implementer')!.assignmentId,
+    )?.blocker);
+    expect(JSON.parse(registry.get(taskId)!.blocker!)).toMatchObject({
+      kind: 'automatic_audit_routing', disposition: 'waiting_for_brain',
+      exactError: 'supervision target provisioning blocked: no_selected_config',
+    });
   });
 });
 
@@ -2056,10 +2372,13 @@ describe('periodic supervision convergence tick', () => {
     ]);
   });
 
-  it('redelivers one stale delegated auditor to the exact same assignment and attempt', async () => {
-    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
-    const attemptId = automaticAttempt(taskId, revision);
+  it('redelivers tsk_csx/asg_cuw once when delegated has no visible acceptance/claim/receipt', async () => {
+    const taskId = 'tsk_csx';
+    const revision = 'rtc-isolation-phase1-design-cc2-r1-09fd88feeb36';
+    const { registry } = makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor' });
+    const attemptId = 'auto-audit-213feddb83db7a1d8cdf4eb6';
     const auditor = registry.createAssignment({
+      assignmentId: 'asg_cuw',
       taskId, role: 'auditor', required: false,
       identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
       auditAttemptId: attemptId, auditRevision: revision,
@@ -2073,16 +2392,19 @@ describe('periodic supervision convergence tick', () => {
       session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
     ];
     let evidenceChecks = 0;
-    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => ({
-      status: 'accepted' as const,
-      dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000099' as const,
-      messageId: input.internalMessageId!,
-      deliveries: [{ target: sessions[2]!.name, status: 'queued' as const }],
-      taskId,
-      assignmentId: auditor.value.assignmentId,
-    }));
-
-    await expect(dispatchReadyAudit(taskId, {
+    let activeClaim = false;
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      activeClaim = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000099' as const,
+        messageId: input.internalMessageId!,
+        deliveries: [{ target: sessions[2]!.name, status: 'queued' as const }],
+        taskId,
+        assignmentId: auditor.value.assignmentId,
+      };
+    });
+    const deps = {
       registry,
       listSessions: () => sessions,
       listTargets: listTargetRecords(sessions[2]!),
@@ -2091,8 +2413,15 @@ describe('periodic supervision convergence tick', () => {
       // The original exact delivery was consumed; the distinct deterministic
       // redelivery id has no receipt yet.
       hasDeliveryEvidence: () => ++evidenceChecks === 1,
-    })).resolves.toMatchObject({
+      hasActiveAuditExecutionClaim: () => activeClaim,
+    };
+
+    await expect(dispatchReadyAudit(taskId, deps)).resolves.toMatchObject({
       status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId,
+    });
+    evidenceChecks = 0;
+    await expect(dispatchReadyAudit(taskId, deps)).resolves.toMatchObject({
+      status: 'replayed', assignmentId: auditor.value.assignmentId, attemptId,
     });
     expect(dispatch).toHaveBeenCalledOnce();
     expect(dispatch.mock.calls[0]![1]).toMatchObject({
@@ -2100,6 +2429,105 @@ describe('periodic supervision convergence tick', () => {
       task: { assignmentId: auditor.value.assignmentId, auditAttemptId: attemptId, auditRevision: revision },
       audit: { attemptId },
     });
+  });
+
+  it('rebinds orphaned d4d auditor asg_dlt and dispatches the SAME assignment/attempt once', async () => {
+    const taskId = 'tsk_d4d';
+    const revision = 'post-pass-successor-owner-retirement-cx1-r1-eb2b2965f045';
+    const attemptId = 'auto-audit-30656902ee6c14fbdcb2751b';
+    const { registry } = makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor' });
+    const oldIdentity = identity('deck_sub_1a2h2b1w', 'claude-code-sdk', 'anthropic');
+    const auditor = registry.createAssignment({
+      assignmentId: 'asg_dlt', taskId, role: 'auditor', required: false,
+      identity: oldIdentity, auditAttemptId: attemptId, auditRevision: revision,
+      idempotencyKey: `send:auto-audit:${taskId}:${revision}`, now: 100,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    const replacement = identity('deck_alpha_live_cc9', 'claude-code-sdk', 'anthropic');
+    const messageId = automaticMessageId(auditor.value.assignmentId, attemptId);
+
+    expect(registry.recoverOrphanedDelegatedAuditor({
+      taskId,
+      assignmentId: auditor.value.assignmentId,
+      identity: replacement,
+      expectedRevision: revision,
+      auditAttemptId: attemptId,
+      callerProjectName: 'alpha',
+      deliveryMessageId: messageId,
+      idempotencyKey: `orphan-rebind:${taskId}:${auditor.value.assignmentId}:${attemptId}`,
+      reason: 'old auditor target is no longer discoverable and has no visible acceptance',
+      now: 200,
+    })).toMatchObject({
+      ok: true,
+      value: {
+        assignmentId: auditor.value.assignmentId,
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        generation: 2,
+        identity: replacement,
+      },
+    });
+    expect(registry.recoverOrphanedDelegatedAuditor({
+      taskId,
+      assignmentId: auditor.value.assignmentId,
+      identity: replacement,
+      expectedRevision: revision,
+      auditAttemptId: attemptId,
+      callerProjectName: 'alpha',
+      deliveryMessageId: messageId,
+      idempotencyKey: `orphan-rebind:${taskId}:${auditor.value.assignmentId}:${attemptId}`,
+      reason: 'old auditor target is no longer discoverable and has no visible acceptance',
+      now: 300,
+    })).toMatchObject({ ok: true, replay: true });
+
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const liveAuditor = session(replacement.sessionName, 'w2', 'claude-code-sdk', 'anthropic');
+    let replacementEvidence = false;
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      expect(input.internalMessageId).toBe(messageId);
+      expect(input.task).toMatchObject({
+        taskId, assignmentId: auditor.value.assignmentId,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      replacementEvidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000d6' as const,
+        messageId,
+        deliveries: [{ target: liveAuditor.name, status: 'queued' as const }],
+        taskId,
+        assignmentId: auditor.value.assignmentId,
+      };
+    });
+    const deps = {
+      registry,
+      listSessions: () => [brain, worker, liveAuditor],
+      listTargets: listTargetRecords(liveAuditor),
+      dispatch,
+      hasDeliveryEvidence: (sessionName: string, candidate: SendMessageId) => (
+        candidate === messageId
+        && (sessionName === oldIdentity.sessionName
+          || (sessionName === liveAuditor.name && replacementEvidence))
+      ),
+      hasVisibleAuditAcceptance: () => replacementEvidence,
+    };
+    await expect(dispatchReadyAudit(taskId, deps)).resolves.toMatchObject({
+      status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId, messageId,
+    });
+    await expect(dispatchReadyAudit(taskId, deps)).resolves.toMatchObject({
+      status: 'replayed', assignmentId: auditor.value.assignmentId, attemptId, messageId,
+    });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([
+      expect.objectContaining({
+        assignmentId: auditor.value.assignmentId,
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        identity: replacement,
+      }),
+    ]);
+    expect(registry.listAuditReceipts(taskId)).toEqual([]);
   });
 
   it('routes tsk_79u from the authoritative coordinator pool instead of the worker legacy snapshot', async () => {

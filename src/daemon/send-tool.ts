@@ -58,6 +58,7 @@ import {
 } from '../../shared/supervision-config.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import {
+  buildSupervisionExecutionCapabilityId,
   evaluateSupervisionExecutionBinding,
   evaluateSupervisionObservedIdentity,
   type SupervisionExecutionBinding,
@@ -422,6 +423,14 @@ export interface SendToolDeps {
   exactTargetOnly?: boolean;
   /** Testable boundary for an already durably accepted supervised delivery. */
   hasDeliveryEvidence?: (sessionName: string, messageId: SendMessageId) => boolean;
+  /** Exact recipient-side acceptance projection for one auditor attempt. */
+  hasVisibleAuditAcceptance?: (input: {
+    taskId: string; assignmentId: string; attemptId: string; revision: string;
+  }) => boolean;
+  /** Durable execution ownership wins over any delivery retry. */
+  hasActiveAuditExecutionClaim?: (input: {
+    taskId: string; assignmentId: string; attemptId: string; revision: string;
+  }) => boolean;
   /** Testable post-append recovery hook for an explicitly bound task policy. */
   dispatchReadyAudit?: (taskId: string) => Promise<ReadyAuditDispatchResult>;
   /**
@@ -1496,6 +1505,11 @@ export async function dispatchSendMessage(
   let reusedAuditAssignment: ReturnType<ReturnType<typeof getSupervisionTaskRegistry>['getAssignment']>;
   let triggerReadyAuditAfterSend = false;
   let pendingTaskAuditPolicy: NonNullable<SupervisionTaskMetadata['auditPolicy']> | undefined;
+  let automaticAuditRoutingRecoveryClear: {
+    taskId: string;
+    assignmentId: string;
+    blocker: string;
+  } | undefined;
 
   if (input.task) {
     const targetRecord = dispatchable[0]!;
@@ -1510,6 +1524,7 @@ export async function dispatchSendMessage(
       callerProjectName,
       allSessions,
     );
+    const registry = getSupervisionTaskRegistry();
     const actual = supervisionObservedIdentityForTarget(targetRecord);
     const pool = input.task.executionPool ?? 'primary';
     const pools = resolveProjectAuthoritativeSupervisionPools(callerProjectName, allSessions);
@@ -1520,27 +1535,109 @@ export async function dispatchSendMessage(
       requestedCapabilityId: input.task.requestedExecutionType?.capabilityId,
       economyPolicy: input.task.economyPolicy ?? undefined,
     });
-    if (!targetMatchesConfiguredSupervisionPool(pools, pool, targetRecord, actual) || !checked.ok) {
+    const requestedTaskId = input.task.taskId?.trim();
+    const recoveryTask = input.audit && requestedTaskId
+      ? registry.get(requestedTaskId)
+      : undefined;
+    const recoveryRevision = String(
+      input.task.auditRevision ?? input.task.currentRevision ?? '',
+    ).trim();
+    const recoveryAttempt = input.task.auditAttemptId?.trim() || input.audit?.attemptId;
+    const recoveryImplementers = recoveryTask?.assignments.filter((assignment) => (
+      assignment.required
+      && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+      && assignment.status === 'ready_for_audit'
+      && assignment.auditRevision === recoveryRevision
+    )) ?? [];
+    const recoveryAuditors = recoveryTask?.assignments.filter((assignment) => (
+      assignment.role === 'auditor'
+      && assignment.auditRevision === recoveryRevision
+      && !['cancelled', 'finalized'].includes(assignment.status)
+    )) ?? [];
+    const callerIdentity = callerRecord && supervisionTaskIdentityForTarget(callerRecord);
+    const callerOwnsRecovery = Boolean(callerIdentity && recoveryTask?.assignments.some((assignment) => (
+      assignment.role === 'coordinator'
+      && supervisionIdentityMatches(assignment.identity, callerIdentity)
+    )));
+    // Pool configuration admits new implementation work. It must not make an
+    // already-valid ready_for_audit task a permanent dead end. The exact
+    // authoritative Brain may bind one explicitly selected live transport as
+    // the canonical fresh strict-cross-vendor auditor when every durable fact
+    // is exact and the task currently has zero auditors. Any mismatch remains
+    // on the ordinary fail-closed pool path.
+    const exactUnconfiguredAuditRecovery = Boolean(
+      input.audit?.strictCrossVendor === true
+      && input.task.assignmentId === undefined
+      && recoveryTask
+      && recoveryTask.projectName === callerProjectName
+      && recoveryTask.status === 'ready_for_audit'
+      && recoveryTask.validationState === 'passed'
+      && recoveryTask.auditPolicy === 'auto_strict_cross_vendor'
+      && input.task.auditPolicy === recoveryTask.auditPolicy
+      && recoveryTask.currentRevision === recoveryRevision
+      && recoveryAttempt === automaticAuditAttemptId(recoveryTask.taskId, recoveryRevision)
+      && recoveryImplementers.length === 1
+      && recoveryAuditors.length === 0
+      && callerRecord?.role === 'brain'
+      && !callerRecord.parentSession
+      && callerOwnsRecovery
+      && targetRecord.name !== recoveryImplementers[0]?.identity.sessionName
+      && targetIdentity.providerFamily !== recoveryImplementers[0]?.identity.providerFamily
+      && (targetRecord.runtimeType ?? getSessionRuntimeType(targetRecord.agentType)) === 'transport'
+      && targetRecord.sessionInstanceId?.trim()
+      && targetRecord.runtimeEpoch?.trim(),
+    );
+    if (exactUnconfiguredAuditRecovery && recoveryTask && recoveryImplementers[0]) {
+      const blocker = matchingAutomaticAuditRoutingBlocker(
+        recoveryTask,
+        recoveryImplementers[0],
+      );
+      if (blocker) {
+        automaticAuditRoutingRecoveryClear = {
+          taskId: recoveryTask.taskId,
+          assignmentId: recoveryImplementers[0].assignmentId,
+          blocker,
+        };
+      }
+    }
+    const poolSelected = targetMatchesConfiguredSupervisionPool(pools, pool, targetRecord, actual)
+      && checked.ok;
+    if (!poolSelected && !exactUnconfiguredAuditRecovery) {
       return {
         status: 'error',
         reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
         error: `task execution pool rejected target: ${checked.ok ? 'unselected_config' : checked.reason}`,
       };
     }
-    const executionBinding: SupervisionExecutionBinding = {
-      pool,
-      requested: checked.requested,
-      actual: actual as SupervisionObservedExecutionIdentity,
-      origin: provisioning?.createdSessionName ? 'spawned' : 'reused',
-    };
+    const executionBinding: SupervisionExecutionBinding = poolSelected && checked.ok
+      ? {
+          pool,
+          requested: checked.requested,
+          actual: actual as SupervisionObservedExecutionIdentity,
+          origin: provisioning?.createdSessionName ? 'spawned' : 'reused',
+        }
+      : (() => {
+          const exactActual = actual as SupervisionObservedExecutionIdentity;
+          return {
+            pool,
+            requested: input.task!.requestedExecutionType ?? {
+              capabilityId: buildSupervisionExecutionCapabilityId(exactActual),
+              agentType: exactActual.agentType,
+              providerFamily: exactActual.providerFamily,
+              runtimeType: exactActual.runtimeType,
+              model: exactActual.model,
+              ...(exactActual.ccPresetId ? { ccPresetId: exactActual.ccPresetId } : {}),
+            },
+            actual: exactActual,
+            origin: 'reused',
+          };
+        })();
     supervisedExecutionBinding = executionBinding;
     if (input.audit) {
       // Same single validator as the audit-only path above; already run.
       const taskRouteCheck = validateBrainAuditRoute(targetRecord);
       if (!taskRouteCheck.ok) return { status: 'error', reason: taskRouteCheck.reason, error: taskRouteCheck.error };
     }
-    const registry = getSupervisionTaskRegistry();
-    const requestedTaskId = input.task.taskId?.trim();
     const newTaskCoordinatorIdentity = !requestedTaskId && callerRecord?.role === 'brain'
       ? supervisionTaskIdentityForTarget(callerRecord)
       : undefined;
@@ -2160,6 +2257,12 @@ export async function dispatchSendMessage(
     ...(provisioning ? { provisioning } : {}),
     ...(failed > 0 ? { partial: true } : {}),
   };
+  if (automaticAuditRoutingRecoveryClear) {
+    getSupervisionTaskRegistry().clearAutomaticAuditRoutingBlocker({
+      ...automaticAuditRoutingRecoveryClear,
+      now,
+    });
+  }
   if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
   if (triggerReadyAuditAfterSend && supervisedTaskId) {
     try {
@@ -2320,6 +2423,14 @@ export interface ReadyAuditDispatchDeps {
   listTargets?: typeof listSendTargets;
   dispatch?: typeof dispatchSendMessage;
   hasDeliveryEvidence?: (sessionName: string, messageId: SendMessageId) => boolean;
+  /** Exact recipient-side acceptance projection for one auditor attempt. */
+  hasVisibleAuditAcceptance?: (input: {
+    taskId: string; assignmentId: string; attemptId: string; revision: string;
+  }) => boolean;
+  /** Durable execution ownership wins over any delivery retry. */
+  hasActiveAuditExecutionClaim?: (input: {
+    taskId: string; assignmentId: string; attemptId: string; revision: string;
+  }) => boolean;
   /** Internal boot-sweep marker: prior-process handoffs are abandoned. */
   recoverRestartHandoffs?: boolean;
   now?: () => number;
@@ -2483,18 +2594,45 @@ function boundedAuditBrief(
   ].join('\n');
 }
 
+const AUTOMATIC_AUDIT_ROUTING_BLOCKER_KIND = 'automatic_audit_routing';
+
 function automaticBlockerMessage(input: {
   taskId: string;
   assignmentId: string;
   exactError: string;
+  revision?: string;
+  attemptId?: string;
 }): string {
   return JSON.stringify({
+    kind: AUTOMATIC_AUDIT_ROUTING_BLOCKER_KIND,
     taskId: input.taskId,
     assignmentId: input.assignmentId,
+    ...(input.revision ? { revision: input.revision } : {}),
+    ...(input.attemptId ? { attemptId: input.attemptId } : {}),
     exactError: input.exactError,
     completedSafeWork: 'ready_for_audit is durable; no auditor replacement or Git side effect was created',
     recommendedNextAction: 'Brain must recover the same object or manually exact-route one eligible matching auditor for the current revision',
+    disposition: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN,
   });
+}
+
+function matchingAutomaticAuditRoutingBlocker(
+  task: SupervisionTaskSnapshot,
+  implementer: PersistedSupervisionTaskAssignment,
+): string | undefined {
+  if (!task.blocker || task.blocker !== implementer.blocker) return undefined;
+  try {
+    const parsed = JSON.parse(task.blocker) as Record<string, unknown>;
+    return parsed.kind === AUTOMATIC_AUDIT_ROUTING_BLOCKER_KIND
+      && parsed.taskId === task.taskId
+      && parsed.assignmentId === implementer.assignmentId
+      && parsed.revision === task.currentRevision
+      && parsed.attemptId === automaticAuditAttemptId(task.taskId, task.currentRevision ?? '')
+      ? task.blocker
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function reportAutomaticAuditBlocker(
@@ -2523,7 +2661,15 @@ async function reportAutomaticAuditBlocker(
     projectRoot: origin.projectDir,
   }, {
     target: target.name,
-    message: automaticBlockerMessage({ taskId: task.taskId, assignmentId: implementer.assignmentId, exactError }),
+    message: automaticBlockerMessage({
+      taskId: task.taskId,
+      assignmentId: implementer.assignmentId,
+      revision: task.currentRevision,
+      attemptId: task.currentRevision
+        ? automaticAuditAttemptId(task.taskId, task.currentRevision)
+        : undefined,
+      exactError,
+    }),
     idempotencyKey: `auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
@@ -2805,10 +2951,23 @@ export async function dispatchReadyAudit(
     const messageId = deterministicSendMessageId(`auto-audit:${existingAudit.assignmentId}:${attemptId}`);
     const recoveredHandoff = recoverAutomaticAuditHandoff(target.name, messageId, deps);
     const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
-    if (!recoveredHandoff && hasEvidence(target.name, messageId)) {
+    const hasExistingEvidence = hasEvidence(target.name, messageId);
+    if (!recoveredHandoff && hasExistingEvidence) {
       const now = deps.now?.() ?? Date.now();
       const staleDelegated = existingAudit.status === AUDITOR_REDELIVERY_STATUS
         && now - existingAudit.updatedAt >= AUDITOR_STALE_REDELIVERY_MS;
+      const exactExecution = {
+        taskId: task.taskId,
+        assignmentId: existingAudit.assignmentId,
+        attemptId,
+        revision,
+      };
+      const visiblyAccepted = existingAudit.status !== AUDITOR_REDELIVERY_STATUS
+        || deps.hasVisibleAuditAcceptance?.(exactExecution) === true;
+      const activelyClaimed = deps.hasActiveAuditExecutionClaim?.(exactExecution) === true;
+      if (visiblyAccepted || activelyClaimed) {
+        return { status: 'replayed', assignmentId: existingAudit.assignmentId, attemptId, messageId };
+      }
       if (!staleDelegated) {
         return { status: 'replayed', assignmentId: existingAudit.assignmentId, attemptId, messageId };
       }
@@ -2824,6 +2983,13 @@ export async function dispatchReadyAudit(
       recoveredExistingMessageId = redeliveryMessageId;
     }
     if (recoveredHandoff) recoveredExistingMessageId = messageId;
+    // An assignment may have been transactionally rebound from an orphaned
+    // target. Delivery evidence is target-scoped, so the replacement has none;
+    // nevertheless it must reuse the assignment's canonical message id rather
+    // than minting a second logical delivery.
+    if (!recoveredHandoff && !hasExistingEvidence) {
+      recoveredExistingMessageId = messageId;
+    }
   }
 
   // Pool scoping context, NOT a relay. The audit envelope is delivered straight
@@ -2903,8 +3069,34 @@ export async function dispatchReadyAudit(
   }
   if (result.status !== 'accepted' || !result.assignmentId) {
     const reason = result.status === 'error' ? result.error : `automatic audit dispatch ${result.status}`;
+    if (reason.includes('no_selected_config')) {
+      registry.recordAutomaticAuditRoutingBlocker({
+        taskId: task.taskId,
+        assignmentId: implementer.assignmentId,
+        blocker: automaticBlockerMessage({
+          taskId: task.taskId,
+          assignmentId: implementer.assignmentId,
+          revision,
+          attemptId,
+          exactError: reason,
+        }),
+        now: deps.now?.() ?? Date.now(),
+      });
+    }
     const reported = await reportBlocker(implementer, reason);
     return { status: 'blocked', reason, reported };
+  }
+  const routingBlocker = matchingAutomaticAuditRoutingBlocker(
+    registry.get(task.taskId) ?? task,
+    registry.getAssignment(implementer.assignmentId) ?? implementer,
+  );
+  if (routingBlocker) {
+    registry.clearAutomaticAuditRoutingBlocker({
+      taskId: task.taskId,
+      assignmentId: implementer.assignmentId,
+      blocker: routingBlocker,
+      now: deps.now?.() ?? Date.now(),
+    });
   }
   const messageId = result.messageId
     ?? deterministicSendMessageId(`auto-audit:${result.assignmentId}:${attemptId}`);
