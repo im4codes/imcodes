@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { access, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
+  DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX,
   DIRECT_FILE_TRANSFER_DATA_MSG,
+  DIRECT_FILE_TRANSFER_WORKER_MSG,
+  DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_LIMITS,
@@ -12,6 +17,7 @@ import {
   DIRECT_FILE_TRANSFER_OPERATION_STATE,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_TERMINAL_STATE,
+  validateDirectFileTransferDaemonMessage,
 } from '../../shared/direct-file-transfer.js';
 
 class FakeDataChannel {
@@ -155,6 +161,15 @@ function downloadPrepare(overrides: Record<string, unknown> = {}) {
 describe('daemon direct file transfer v2 lease broker', () => {
   let root: string;
   let storedPath: string;
+  /**
+   * Every control message the state machine emits, in every scenario below.
+   *
+   * The proxy validates each one before handing it to the WebSocket, so this
+   * collection is the evidence that the guard cannot silence real traffic: if
+   * the machine can emit something the daemon-message validator rejects, that
+   * is a defect here, not a reason to loosen the boundary.
+   */
+  let emitted: unknown[] = [];
   let sourcePath: string;
   let finalizeDirectUploadedFile: ReturnType<typeof vi.fn>;
   let lookupAttachmentByClientUploadId: ReturnType<typeof vi.fn>;
@@ -163,6 +178,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
 
   beforeEach(async () => {
     vi.resetModules();
+    emitted = [];
     FakePeerConnection.latest = null;
     FakePeerConnection.instances = [];
     root = await mkdtemp(path.join(tmpdir(), 'imcodes-direct-file-v2-'));
@@ -181,7 +197,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     directLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
     vi.doMock('node-datachannel', () => ({ PeerConnection: FakePeerConnection, initLogger: vi.fn(), cleanup: vi.fn() }));
     vi.doMock('../../src/daemon/file-transfer-handler.js', () => ({
-      initFileTransfer: vi.fn(),
+      ensureUploadDirectory: vi.fn(),
       createDirectUploadFilename: () => 'stored.bin',
       resolveUploadPath: () => storedPath,
       lookupAttachmentByClientUploadId,
@@ -194,6 +210,12 @@ describe('daemon direct file transfer v2 lease broker', () => {
   });
 
   afterEach(async () => {
+    for (const message of emitted) {
+      expect(
+        validateDirectFileTransferDaemonMessage(message).ok,
+        `emitted control message must be a valid daemon message: ${JSON.stringify(message).slice(0, 300)}`,
+      ).toBe(true);
+    }
     vi.useRealTimers();
     vi.doUnmock('node-datachannel');
     vi.doUnmock('../../src/daemon/file-transfer-handler.js');
@@ -202,11 +224,42 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  /** The write-ahead record the worker keeps beside a publishing upload. */
+  const commitIntentPath = () => `${storedPath}${DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX}`;
+
   async function readyLease() {
-    const direct = await import('../../src/daemon/direct-file-transfer.js');
+    const direct = await import('../../src/daemon/direct-file-transfer-worker.js');
+    // The state machine now reaches attachment/claim authority through the host
+    // call, so these tests supply that authority in-process. Routing to the same
+    // mocked handler keeps them testing the state machine, not the IPC.
+    const handler = await import('../../src/daemon/file-transfer-handler.js');
+    const claimTokens = new Map<string, symbol>();
+    direct.__setDirectFileTransferWorkerHostForTests(async (method, args) => {
+      if (method === 'tryClaimClientUpload') {
+        const token = handler.tryClaimClientUpload(String(args[0] ?? ''));
+        if (!token) return null;
+        const handle = `t-claim-${claimTokens.size + 1}`;
+        claimTokens.set(handle, token);
+        return handle;
+      }
+      if (method === 'releaseClientUploadClaim') {
+        const token = claimTokens.get(String(args[1] ?? ''));
+        if (token) { claimTokens.delete(String(args[1] ?? '')); handler.releaseClientUploadClaim(String(args[0] ?? ''), token); }
+        return null;
+      }
+      if (method === 'lookupAttachmentByClientUploadId') return handler.lookupAttachmentByClientUploadId(String(args[0] ?? '')) ?? null;
+      if (method === 'resolveDirectFileDownloadSource') return await handler.resolveDirectFileDownloadSource(String(args[0] ?? ''));
+      if (method === 'finalizeDirectUploadedFile') return await handler.finalizeDirectUploadedFile(args[0] as never);
+      throw new Error(`unsupported_host_method:${method}`);
+    });
     expect(await direct.initializeDirectFileTransfer()).toBe(true);
     const sent: Array<Record<string, unknown>> = [];
-    const sender = { send: (message: unknown) => sent.push(message as Record<string, unknown>) };
+    const sender = {
+      send: (message: unknown) => {
+        emitted.push(message);
+        return sent.push(message as Record<string, unknown>);
+      },
+    };
     await direct.handleDirectFileTransferCommand(leasePrepare(), sender);
     expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED, leaseId, leaseGeneration: 1 }));
     await direct.handleDirectFileTransferCommand({
@@ -789,6 +842,20 @@ describe('daemon direct file transfer v2 lease broker', () => {
 
   it('commits a selected-directory upload once and exposes it through exact status recovery', async () => {
     const { direct, sent, sender } = await readyLease();
+    // Snapshot taken from inside the registry write, the one instant that can
+    // prove ordering: the file is already published and the write-ahead record
+    // still describes it, so a crash anywhere in this window is recoverable.
+    let atRegistryWrite: { published: boolean; intent: boolean } | null = null;
+    finalizeDirectUploadedFile.mockImplementationOnce(async (params: { size: number }) => {
+      atRegistryWrite = {
+        published: existsSync(storedPath),
+        intent: existsSync(commitIntentPath()),
+      };
+      return {
+        id: 'stored-id', source: 'upload', serverId: '', daemonPath: storedPath,
+        originalName: 'source.bin', size: params.size, createdAt: new Date().toISOString(), downloadable: true,
+      };
+    });
     const authority = uploadPrepare({ destinationDirectory: 'C:\\Users\\admin\\Desktop' });
     await direct.handleDirectFileTransferCommand(authority, sender);
     const channel = new FakeDataChannel(authority.channelLabel as string);
@@ -810,6 +877,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       destinationDirectory: 'C:\\Users\\admin\\Desktop',
     }));
     await expect(readFile(storedPath, 'utf8')).resolves.toBe('hello');
+    expect(atRegistryWrite, 'the write-ahead record covers the publish/register window')
+      .toEqual({ published: true, intent: true });
+    expect(existsSync(commitIntentPath()), 'and is cleared once the upload is durable').toBe(false);
     expect(directLogger.info).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'direct_file_v2.direct_success', direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, attempt: 1, bytes: 5, route: 'direct',
@@ -865,6 +935,81 @@ describe('daemon direct file transfer v2 lease broker', () => {
     })));
     await expect(readFile(storedPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await direct.shutdownDirectFileTransfers();
+  });
+
+  it('acks a shutdown whose cleanup failed as failed, rather than as a clean stop', async () => {
+    // Driven through a real parent port so the worker's own dispatcher, control
+    // shim and shutdown handler all run as they do in production.
+    const posted: Record<string, unknown>[] = [];
+    let controlPostsFail = false;
+    const port = new EventEmitter() as EventEmitter & { postMessage(value: Record<string, unknown>): void };
+    port.postMessage = (value: Record<string, unknown>) => {
+      if (controlPostsFail && value.type === DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL) {
+        // What postMessage actually does when a payload cannot cross.
+        throw new Error('DataCloneError: control message could not be cloned');
+      }
+      posted.push(value);
+    };
+    vi.doMock('node:worker_threads', () => ({ parentPort: port, workerData: { generation: 1 } }));
+
+    const direct = await import('../../src/daemon/direct-file-transfer-worker.js');
+    const handler = await import('../../src/daemon/file-transfer-handler.js');
+    const claimTokens = new Map<string, symbol>();
+    let claimCalls = 0;
+    direct.__setDirectFileTransferWorkerHostForTests(async (method, args) => {
+      if (method === 'tryClaimClientUpload') {
+        claimCalls += 1;
+        const token = handler.tryClaimClientUpload(String(args[0] ?? ''));
+        if (!token) return null;
+        const handle = `t-claim-${claimTokens.size + 1}`;
+        claimTokens.set(handle, token);
+        return handle;
+      }
+      if (method === 'releaseClientUploadClaim') {
+        const token = claimTokens.get(String(args[1] ?? ''));
+        if (token) handler.releaseClientUploadClaim(String(args[0] ?? ''), token);
+        return null;
+      }
+      return null;
+    });
+
+    const emit = (envelope: Record<string, unknown>) => port.emit('message', {
+      v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION, generation: 1, ...envelope,
+    });
+    const typesPosted = () => posted.map((p) => p.type);
+    await vi.waitFor(() => expect(typesPosted()).toContain(DIRECT_FILE_TRANSFER_WORKER_MSG.READY));
+    expect(
+      typesPosted().indexOf(DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY),
+      'availability is published before ready, so no caller sees a stale projection',
+    ).toBeLessThan(typesPosted().indexOf(DIRECT_FILE_TRANSFER_WORKER_MSG.READY));
+
+    emit({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND, senderId: 'dft-sender-1', command: leasePrepare() });
+    await vi.waitFor(() => expect(posted.some((p) => (p.message as Record<string, unknown>)?.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED)).toBe(true));
+    emit({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND, senderId: 'dft-sender-1',
+      command: {
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
+        requestId, sdp: 'browser-lease-offer',
+      },
+    });
+    await vi.waitFor(() => expect(posted.some((p) => (p.message as Record<string, unknown>)?.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER)).toBe(true));
+    emit({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND, senderId: 'dft-sender-1', command: uploadPrepare() });
+    // The upload attempt is live once it holds the single client-upload claim.
+    await vi.waitFor(() => expect(claimCalls, 'the upload attempt is prepared and holds its claim').toBe(1));
+
+    // The boundary breaks while the worker is quiescing, so cancelling the live
+    // attempt cannot be delivered and cleanup does not complete.
+    controlPostsFail = true;
+    emit({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN });
+
+    await vi.waitFor(() => expect(typesPosted()).toContain(DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK));
+    const ack = posted.find((p) => p.type === DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK)!;
+    expect(ack.cleanupOk, 'the ack states the outcome instead of implying success').toBe(false);
+    expect(String(ack.detail), 'and says what went wrong').toContain('DataCloneError');
+
+    vi.doUnmock('node:worker_threads');
   });
 
   it('rejects a data START whose exact authority binding differs from the prepared attempt', async () => {

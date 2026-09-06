@@ -1411,3 +1411,349 @@ export function isDirectFileTransferDaemonMessageType(value: unknown): boolean {
 export function getDirectFileTransferOperationId(value: Pick<DirectFileTransferOperationInit, 'operationId'>): string {
   return value.operationId;
 }
+
+/* ------------------------------------------------------------------------- *
+ * Worker control protocol.
+ *
+ * The RTC data plane runs in a worker thread so a blocked daemon event loop
+ * cannot starve ICE/DataChannel callbacks, progress timers, hashing or file
+ * I/O. Only CONTROL-plane envelopes cross the thread boundary: file bytes are
+ * read, hashed and written entirely inside the worker and never appear in an
+ * IPC payload.
+ *
+ * Every envelope carries a worker generation. A generation is minted per spawn,
+ * so a reply from a crashed-and-replaced worker is recognisably stale and is
+ * dropped rather than applied to the current worker's state. Validation is
+ * fail-closed in both directions: an envelope that is not exactly well-formed
+ * is rejected, never coerced.
+ * ------------------------------------------------------------------------- */
+
+export const DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION = 1 as const;
+
+export const DIRECT_FILE_TRANSFER_WORKER_MSG = {
+  /** main -> worker: a validated daemon command plus the sender it replies to. */
+  COMMAND: 'dft.worker.command',
+  /** worker -> main: a control message to hand to that sender's transport. */
+  CONTROL: 'dft.worker.control',
+  /** worker -> main: the worker finished booting and declares its generation. */
+  READY: 'dft.worker.ready',
+  /** main -> worker: begin graceful shutdown. */
+  SHUTDOWN: 'dft.worker.shutdown',
+  /** worker -> main: graceful shutdown finished; safe to terminate. */
+  SHUTDOWN_ACK: 'dft.worker.shutdown_ack',
+  /**
+   * main -> worker: prove the native addon is idle before it may be replaced.
+   *
+   * The upgrade path replaces node_datachannel.node in place. Only the isolate
+   * that holds the mapping can drain its peers and call cleanup(), so the main
+   * thread cannot answer this question itself — it has to ask.
+   */
+  QUIESCE: 'dft.worker.quiesce',
+  /** worker -> main: the real outcome of exactly one QUIESCE. */
+  QUIESCE_RESULT: 'dft.worker.quiesce_result',
+  /** main -> worker / worker -> main: runtime availability projection. */
+  STATUS_REQUEST: 'dft.worker.status_request',
+  STATUS_REPLY: 'dft.worker.status_reply',
+  /**
+   * worker -> main: invoke a host-owned authority function.
+   *
+   * Attachment registration and client-upload claims are single-authority state
+   * that the RELAY path also uses, and relay runs on the main thread. Holding a
+   * second copy inside the worker would let a direct and a relay upload claim
+   * the same id independently and would hide worker-registered attachments from
+   * the main thread. So the worker owns no such state: it asks the host.
+   * Only metadata crosses - never file contents.
+   */
+  HOST_CALL: 'dft.worker.host_call',
+  /** main -> worker: the result of exactly one HOST_CALL. */
+  HOST_RESULT: 'dft.worker.host_result',
+} as const;
+
+/**
+ * Host authority methods the worker may invoke. This is an allowlist, not a
+ * suggestion: an envelope naming anything else is refused, so a malformed or
+ * hostile message cannot reach arbitrary main-thread code.
+ */
+/**
+ * Write-ahead record kept beside an upload that is being published.
+ *
+ * Shared because two modules must agree on it without either importing the
+ * other: the worker writes and clears it, and the upload-directory scan on the
+ * host has to recognise it as an internal artifact rather than rehydrate it as
+ * a downloadable attachment.
+ */
+export const DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX = '.commit-intent.json';
+
+export const DIRECT_FILE_TRANSFER_HOST_METHOD = {
+  TRY_CLAIM_CLIENT_UPLOAD: 'tryClaimClientUpload',
+  RELEASE_CLIENT_UPLOAD_CLAIM: 'releaseClientUploadClaim',
+  LOOKUP_ATTACHMENT_BY_CLIENT_UPLOAD_ID: 'lookupAttachmentByClientUploadId',
+  RESOLVE_DIRECT_FILE_DOWNLOAD_SOURCE: 'resolveDirectFileDownloadSource',
+  FINALIZE_DIRECT_UPLOADED_FILE: 'finalizeDirectUploadedFile',
+} as const;
+
+export type DirectFileTransferHostMethod =
+  typeof DIRECT_FILE_TRANSFER_HOST_METHOD[keyof typeof DIRECT_FILE_TRANSFER_HOST_METHOD];
+
+const HOST_METHODS = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_HOST_METHOD));
+
+/**
+ * Structural limits applied BEFORE a value is handed to structured clone.
+ *
+ * structuredClone will happily copy a deeply nested or enormous payload, and
+ * doing so on the main thread is exactly the stall this split removes. These
+ * bounds are therefore a liveness control, not only a hygiene one.
+ */
+export const DIRECT_FILE_TRANSFER_IPC_LIMITS = {
+  MAX_DEPTH: 8,
+  /**
+   * Derived from the protocol, never chosen independently.
+   *
+   * This is a backstop against an unbounded payload, not a second opinion on
+   * what the protocol allows. A hand-picked 8 KB looked reasonable and was
+   * wrong: `SDP_BYTES` is 256 KB, and a real multi-candidate offer passes 8 KB
+   * easily, so every such lease negotiation was dropped at this boundary with
+   * no error anywhere — the transfer simply never started. Any future
+   * tightening must stay at or above the largest single protocol field.
+   */
+  MAX_STRING_LENGTH: DIRECT_FILE_TRANSFER_LIMITS.SDP_BYTES,
+  MAX_ARRAY_LENGTH: 256,
+  MAX_KEYS: 64,
+  /** One maximal SDP plus everything legal that can accompany it. */
+  MAX_TOTAL_STRING_BUDGET: DIRECT_FILE_TRANSFER_LIMITS.SDP_BYTES * 2,
+} as const;
+
+/**
+ * Reject anything that is not a small, plain, JSON-shaped value.
+ *
+ * Binary payloads are refused outright rather than truncated: a Buffer or
+ * TypedArray crossing this boundary would mean file bytes had re-entered the
+ * main thread, which is the property the worker split exists to guarantee.
+ */
+export function isWithinDirectFileTransferIpcLimits(
+  value: unknown,
+  budget: { strings: number } = { strings: 0 },
+  depth = 0,
+): boolean {
+  if (depth > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_DEPTH) return false;
+  if (value === null || value === undefined) return true;
+  const kind = typeof value;
+  if (kind === 'boolean' || kind === 'number') return Number.isFinite(value as number) || kind === 'boolean';
+  if (kind === 'string') {
+    const text = value as string;
+    if (text.length > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_STRING_LENGTH) return false;
+    budget.strings += text.length;
+    return budget.strings <= DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_TOTAL_STRING_BUDGET;
+  }
+  if (kind !== 'object') return false;
+  // Binary never crosses. This is deliberate defence in depth, not the only
+  // thing standing between file bytes and the main thread: the plain-object
+  // check below independently rejects every view and buffer, because none of
+  // them has Object.prototype. Deleting either guard alone still refuses
+  // binary, and that redundancy is the point — the invariant is important
+  // enough to state explicitly rather than to inherit from a prototype test
+  // whose purpose is something else. Kept ahead of the array/record branches so
+  // the refusal is attributable to the rule that means it.
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return false;
+  if (Array.isArray(value)) {
+    if (value.length > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_ARRAY_LENGTH) return false;
+    return value.every((entry) => isWithinDirectFileTransferIpcLimits(entry, budget, depth + 1));
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_KEYS) return false;
+  return entries.every(([key, entry]) => (
+    key.length <= DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_STRING_LENGTH
+    && isWithinDirectFileTransferIpcLimits(entry, budget, depth + 1)
+  ));
+}
+
+export type DirectFileTransferWorkerMessageType =
+  typeof DIRECT_FILE_TRANSFER_WORKER_MSG[keyof typeof DIRECT_FILE_TRANSFER_WORKER_MSG];
+
+export interface DirectFileTransferWorkerEnvelopeBase {
+  v: typeof DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION;
+  type: DirectFileTransferWorkerMessageType;
+  /** Spawn-scoped worker identity. Mismatches are dropped, never coerced. */
+  generation: number;
+}
+
+export interface DirectFileTransferWorkerCommandEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND;
+  /** Opaque main-thread transport handle id; the worker never sees the socket. */
+  senderId: string;
+  command: unknown;
+}
+
+export interface DirectFileTransferWorkerControlEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL;
+  senderId: string;
+  message: Record<string, unknown>;
+  /**
+   * Worker-clock time at which this was produced.
+   *
+   * The point of the split is that the worker keeps working while the daemon
+   * loop is blocked. That is only observable if the emission time is recorded
+   * on the worker side: a message received after the block could otherwise have
+   * been produced either before or after it.
+   */
+  emittedAt: number;
+}
+
+export interface DirectFileTransferWorkerSignalEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type:
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.READY
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REQUEST;
+}
+
+/**
+ * Shutdown acknowledgement.
+ *
+ * `cleanupOk` is mandatory because an ack is otherwise indistinguishable from a
+ * successful quiesce. A worker whose lease/partial cleanup threw has NOT
+ * reached a safe resting point, and saying so is the difference between an
+ * orderly stop and silently abandoning a half-written upload.
+ */
+export interface DirectFileTransferWorkerQuiesceEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE;
+  timeoutMs: number;
+}
+
+export interface DirectFileTransferWorkerQuiesceResultEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE_RESULT;
+  ok: boolean;
+  closedLeases: number;
+  reason?: string;
+}
+
+export interface DirectFileTransferWorkerShutdownAckEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK;
+  cleanupOk: boolean;
+  detail?: string;
+}
+
+export interface DirectFileTransferWorkerStatusEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY;
+  available: boolean;
+  detail?: string;
+}
+
+export interface DirectFileTransferWorkerHostCallEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL;
+  callId: string;
+  method: DirectFileTransferHostMethod;
+  args: unknown[];
+}
+
+export interface DirectFileTransferWorkerHostResultEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT;
+  callId: string;
+  ok: boolean;
+  value?: unknown;
+  error?: string;
+}
+
+export type DirectFileTransferWorkerEnvelope =
+  | DirectFileTransferWorkerCommandEnvelope
+  | DirectFileTransferWorkerControlEnvelope
+  | DirectFileTransferWorkerSignalEnvelope
+  | DirectFileTransferWorkerQuiesceEnvelope
+  | DirectFileTransferWorkerQuiesceResultEnvelope
+  | DirectFileTransferWorkerShutdownAckEnvelope
+  | DirectFileTransferWorkerStatusEnvelope
+  | DirectFileTransferWorkerHostCallEnvelope
+  | DirectFileTransferWorkerHostResultEnvelope;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasValidEnvelopeHead(value: unknown): value is Record<string, unknown> {
+  if (!isPlainRecord(value)) return false;
+  if (value.v !== DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION) return false;
+  if (typeof value.type !== 'string') return false;
+  return Number.isSafeInteger(value.generation) && (value.generation as number) >= 0;
+}
+
+/**
+ * Fail-closed envelope validation. Returns undefined for anything that is not
+ * exactly a known, well-formed envelope; callers must treat undefined as
+ * "drop", never as "assume default".
+ */
+export function validateDirectFileTransferWorkerEnvelope(
+  value: unknown,
+): DirectFileTransferWorkerEnvelope | undefined {
+  if (!hasValidEnvelopeHead(value)) return undefined;
+  const type = value.type as DirectFileTransferWorkerMessageType;
+  switch (type) {
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND:
+      if (typeof value.senderId !== 'string' || !value.senderId) return undefined;
+      if (!('command' in value)) return undefined;
+      // Bounded before it is cloned into the worker.
+      if (!isWithinDirectFileTransferIpcLimits(value.command)) return undefined;
+      return value as unknown as DirectFileTransferWorkerCommandEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL:
+      if (typeof value.senderId !== 'string' || !value.senderId) return undefined;
+      if (!isPlainRecord(value.message)) return undefined;
+      if (!Number.isFinite(value.emittedAt)) return undefined;
+      // A control message is forwarded onto the daemon transport, so it is
+      // bounded here rather than trusted because it came from our own worker.
+      if (!isWithinDirectFileTransferIpcLimits(value.message)) return undefined;
+      return value as unknown as DirectFileTransferWorkerControlEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.READY:
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN:
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REQUEST:
+      return value as unknown as DirectFileTransferWorkerSignalEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE:
+      // A deadline that is not a finite positive number is not a deadline.
+      if (typeof value.timeoutMs !== 'number' || !Number.isFinite(value.timeoutMs) || value.timeoutMs <= 0) return undefined;
+      return value as unknown as DirectFileTransferWorkerQuiesceEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE_RESULT:
+      // Fail closed: a result that cannot state whether the addon is idle must
+      // never be read as permission to replace it.
+      if (typeof value.ok !== 'boolean') return undefined;
+      if (typeof value.closedLeases !== 'number' || !Number.isInteger(value.closedLeases) || value.closedLeases < 0) return undefined;
+      if (value.reason !== undefined && typeof value.reason !== 'string') return undefined;
+      return value as unknown as DirectFileTransferWorkerQuiesceResultEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK:
+      // Fail closed: an ack that does not state its cleanup outcome is refused,
+      // so a missing field can never be read as "cleanup succeeded".
+      if (typeof value.cleanupOk !== 'boolean') return undefined;
+      if (value.detail !== undefined && typeof value.detail !== 'string') return undefined;
+      return value as unknown as DirectFileTransferWorkerShutdownAckEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL:
+      if (typeof value.callId !== 'string' || !value.callId) return undefined;
+      // Allowlisted method only: never dispatch an arbitrary named call.
+      if (typeof value.method !== 'string' || !HOST_METHODS.has(value.method)) return undefined;
+      if (!Array.isArray(value.args)) return undefined;
+      if (!isWithinDirectFileTransferIpcLimits(value.args)) return undefined;
+      return value as unknown as DirectFileTransferWorkerHostCallEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT:
+      if (typeof value.callId !== 'string' || !value.callId) return undefined;
+      if (typeof value.ok !== 'boolean') return undefined;
+      if (value.error !== undefined && typeof value.error !== 'string') return undefined;
+      if (!isWithinDirectFileTransferIpcLimits(value.value)) return undefined;
+      return value as unknown as DirectFileTransferWorkerHostResultEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY:
+      if (typeof value.available !== 'boolean') return undefined;
+      if (value.detail !== undefined && typeof value.detail !== 'string') return undefined;
+      return value as unknown as DirectFileTransferWorkerStatusEnvelope;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Accept an envelope only from the generation currently in force.
+ *
+ * A late reply from a worker that has since crashed and been replaced carries
+ * the old generation. Applying it would let a dead worker mutate live lease and
+ * attempt state, so it is dropped.
+ */
+export function isCurrentDirectFileTransferWorkerGeneration(
+  envelope: Pick<DirectFileTransferWorkerEnvelopeBase, 'generation'>,
+  currentGeneration: number,
+): boolean {
+  return envelope.generation === currentGeneration;
+}

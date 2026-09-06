@@ -28,7 +28,11 @@ async function freshModule() {
   vi.resetModules();
   cleanupCalls.count = 0;
   cleanupThrows.value = false;
-  return import('../../src/daemon/direct-file-transfer.js');
+  // The addon, `leases` and cleanup() all live in the worker isolate now, so
+  // this contract is exercised where it is actually implemented. `vi.mock`
+  // cannot reach across a thread boundary, and a test that pretended otherwise
+  // would be asserting against a mock nothing under test ever calls.
+  return import('../../src/daemon/direct-file-transfer-worker.js');
 }
 
 beforeEach(() => { cleanupCalls.count = 0; cleanupThrows.value = false; });

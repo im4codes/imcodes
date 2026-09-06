@@ -39,6 +39,7 @@ import {
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
 } from '../../shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
@@ -587,10 +588,23 @@ async function fetchRelayUpload(
 
 let initialized = false;
 
+/**
+ * Make the upload directory exist. Nothing more.
+ *
+ * Separated from `initFileTransfer` so a caller that only needs somewhere to
+ * write — the transfer worker, which owns no attachment state — does not also
+ * build a second copy of the attachment registry in its own isolate. A
+ * registry that is written in one isolate and read in another is the exact
+ * split-brain the host-call boundary exists to prevent.
+ */
+export async function ensureUploadDirectory(): Promise<void> {
+  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+}
+
 export async function initFileTransfer(): Promise<void> {
   if (initialized) return;
   initialized = true;
-  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+  await ensureUploadDirectory();
   await cleanupExpiredUploads();
   await recoverRegistry();
 }
@@ -602,6 +616,9 @@ async function recoverRegistry(): Promise<void> {
     const now = Date.now();
     for (const file of files) {
       if (file.endsWith('.meta.json')) continue; // skip sidecar files
+      // A commit intent describes an upload mid-publish; it is bookkeeping, not
+      // an uploaded file, and must never surface as a downloadable attachment.
+      if (file.endsWith(DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX)) continue;
       if (attachmentRegistry.has(file)) continue;
       try {
         const filePath = path.join(UPLOAD_DIR, file);
