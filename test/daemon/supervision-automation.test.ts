@@ -3142,7 +3142,7 @@ describe('SupervisionAutomation', () => {
     expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
-  it('delivers enabled and disabled mode changes immediately to the exact project Brain', async () => {
+  it('delivers the main session mode to its exact project Brain and ignores child modes', async () => {
     const enabled = await seedSession('supervised_audit');
     upsertSession({
       name: 'deck_sub_impl',
@@ -3178,6 +3178,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
     supervisionAutomation.init();
 
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', enabled);
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', enabled);
     supervisionAutomation.applySnapshotUpdate('deck_sub_impl', enabled);
     supervisionAutomation.applySnapshotUpdate('deck_sub_impl', enabled);
     const disabled = normalizeSessionSupervisionSnapshot({
@@ -3186,14 +3188,20 @@ describe('SupervisionAutomation', () => {
     });
     supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
     supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', disabled);
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', disabled);
 
-    const implementationControls = mockTransportRuntime.send.mock.calls.filter((call) => (
+    const childControls = mockTransportRuntime.send.mock.calls.filter((call) => (
       String(call[0]).includes('sourceSession=deck_sub_impl')
     ));
-    expect(implementationControls).toHaveLength(2);
-    expect(String(implementationControls[0]?.[0])).toContain('autoAudit=enabled');
-    expect(String(implementationControls[1]?.[0])).toContain('autoAudit=disabled');
-    expect(implementationControls[1]?.[4]).toMatchObject({
+    expect(childControls).toHaveLength(0);
+    const brainControls = mockTransportRuntime.send.mock.calls.filter((call) => (
+      String(call[0]).includes('sourceSession=deck_supervision_brain')
+    ));
+    expect(brainControls).toHaveLength(2);
+    expect(String(brainControls[0]?.[0])).toContain('autoAudit=enabled');
+    expect(String(brainControls[1]?.[0])).toContain('autoAudit=disabled');
+    expect(brainControls[1]?.[4]).toMatchObject({
       timelineCommitted: true,
       deliveryMode: 'append',
     });
@@ -3203,7 +3211,7 @@ describe('SupervisionAutomation', () => {
     ));
     expect(controls).toHaveLength(2);
     expect(controls[0]?.payload).toMatchObject({
-      sourceSessionName: 'deck_sub_impl',
+      sourceSessionName: 'deck_supervision_brain',
       supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
       autoAuditEnabled: true,
       memoryExcluded: true,

@@ -1125,6 +1125,9 @@ class SupervisionAutomation {
     if (!source) return;
     const brain = this.resolveProjectBrain(source);
     if (!brain) return;
+    // Mode control is owned by the project's main session. Child/worker
+    // snapshots must never inject control messages into their parent Brain.
+    if (source.name !== brain.name) return;
     const runtime = getTransportRuntime(brain.name);
     if (!runtime) return;
     const mode = snapshot?.mode ?? SUPERVISION_MODE.OFF;
@@ -1196,14 +1199,10 @@ class SupervisionAutomation {
   private syncProjectBrainModeStates(brainSessionName: string): void {
     const brain = getSession(brainSessionName);
     if (!brain || brain.role !== 'brain' || brain.state === 'stopped') return;
-    for (const source of listSessions(brain.projectName)) {
-      const snapshot = extractSessionSupervisionSnapshot(source.transportConfig ?? null);
-      // A missing Brain snapshot is treated as OFF, but syncAutoAuditModeState
-      // only delivers it when it revokes a previously enabled authority.
-      // Other project sessions participate once they have a valid snapshot.
-      if (source.name !== brain.name && !snapshot) continue;
-      this.syncAutoAuditModeState(source.name, snapshot);
-    }
+    const snapshot = extractSessionSupervisionSnapshot(brain.transportConfig ?? null);
+    // A missing Brain snapshot is treated as OFF, but syncAutoAuditModeState
+    // only delivers it when it revokes a previously enabled authority.
+    this.syncAutoAuditModeState(brain.name, snapshot);
   }
 
   private sweepProjectBrainModeStatesOnce(brainSessionName: string): void {
