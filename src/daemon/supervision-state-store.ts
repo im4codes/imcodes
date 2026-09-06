@@ -2916,6 +2916,79 @@ export class SupervisionTaskRegistry {
     return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
   }
 
+  /**
+   * Atomically persist the watchdog's one no-progress disposition.
+   *
+   * The asynchronous reporter used to read a live assignment and later call
+   * generic updateAssignment(). Finalization could commit between those two
+   * operations, allowing the stale write to put the blocker back onto archived
+   * history. This task+assignment terminal gate and fingerprint CAS are the
+   * durable boundary for both that race and daemon-restart replay.
+   */
+  recordImplementationNoProgressBlocker(input: {
+    assignmentId: string;
+    blocker: string;
+    blockerFingerprint: string;
+    replaceMatching?: boolean;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const blocker = normalizeTaskString(input.blocker);
+    const blockerFingerprint = normalizeTaskString(input.blockerFingerprint);
+    if (!blocker || !blockerFingerprint) return { ok: false, reason: 'invalid' };
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const assignment = this.getAssignment(input.assignmentId);
+      const task = assignment ? this.getTaskRecord(assignment.taskId) : undefined;
+      if (!assignment || !task) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (isTerminalSupervisionTaskStatus(task.status)
+        || isTerminalSupervisionTaskStatus(assignment.status)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (assignment.role !== 'implementer'
+        || (assignment.status !== 'delegated' && assignment.status !== 'implementing')) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (assignment.blocker) {
+        try {
+          const existing = JSON.parse(assignment.blocker) as { blockerFingerprint?: unknown };
+          if (existing.blockerFingerprint === blockerFingerprint) {
+            if (!input.replaceMatching) {
+              this.#db.exec('ROLLBACK');
+              return { ok: true, value: assignment, replay: true };
+            }
+          } else {
+            this.#db.exec('ROLLBACK');
+            return { ok: false, reason: 'conflicting_replay' };
+          }
+        } catch {
+          // A non-JSON blocker is still authoritative and must not be replaced.
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'conflicting_replay' };
+        }
+      }
+      const recorded = { ...assignment, blocker };
+      this.#db.prepare(
+        'UPDATE supervision_task_assignments SET blocker = ?, payload_json = ? WHERE assignment_id = ?',
+      ).run(blocker, JSON.stringify(recorded), assignment.assignmentId);
+      this.#appendEvent(task.taskId, assignment.assignmentId, 'implementation_heartbeat', assignment.status, {
+        source: 'implementation_watchdog_no_progress',
+        substantiveProgress: false,
+        blockerFingerprint,
+      }, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: recorded };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   listFileEvents(taskId: string): PersistedSupervisionTaskFileEvent[] {
     if (this.#closed) return [];
     return (this.#db.prepare(`SELECT id, task_id AS taskId, assignment_id AS assignmentId, file_path AS path, operation, before_hash AS beforeHash, after_hash AS afterHash, tool, source, session_name AS sessionName, session_instance_id AS sessionInstanceId, runtime_epoch AS runtimeEpoch, agent_type AS agentType, provider_family AS providerFamily, created_at AS createdAt FROM supervision_task_file_events WHERE task_id = ? ORDER BY id ASC`).all(taskId) as Array<Record<string, unknown>>)
@@ -4668,9 +4741,20 @@ export class SupervisionTaskRegistry {
         this.#writeTask(taskRecord, this.#taskEventFor(status), payload);
       }
       for (const assignment of assignments) {
-        if (assignment.assignmentId === owner.assignmentId || !assignment.leaseId) continue;
-        this.#writeAssignment({ ...assignment, leaseId: '', updatedAt: now }, this.#taskEventFor(assignment.status), {
-          source: 'structured_integration_finalization', leaseRevoked: true,
+        if (assignment.assignmentId === owner.assignmentId
+          || (!assignment.leaseId && !assignment.blocker)) continue;
+        this.#writeAssignment({
+          ...assignment,
+          leaseId: '',
+          // A watchdog escalation is live-work state. Once the aggregate is
+          // finalized/archived it must not survive as a stale actionable
+          // blocker, including when that assignment's lease was already gone.
+          blocker: undefined,
+          updatedAt: now,
+        }, this.#taskEventFor(assignment.status), {
+          source: 'structured_integration_finalization',
+          leaseRevoked: Boolean(assignment.leaseId),
+          blockerCleared: Boolean(assignment.blocker),
         });
       }
       this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ?').run(task.taskId);

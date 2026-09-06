@@ -1405,9 +1405,20 @@ describe('SupervisionTaskRegistry', () => {
     let registry = new SupervisionTaskRegistry({ dbPath });
     try {
       const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-restart');
+      const staleHeartbeatFingerprint = '72fb38ec09abb41624ba014f178e3d7eacf043311d9d02f66a79cae1579b46a7';
+      expect(registry.updateAssignment({
+        assignmentId: shape.implementer.assignmentId,
+        identity: shape.implementer.identity,
+        blocker: JSON.stringify({
+          taskId: 'tsk_erz', assignmentId: 'asg_es2',
+          exactError: 'implementation heartbeat completed without durable progress or structured escalation',
+          blockerFingerprint: staleHeartbeatFingerprint,
+        }),
+      })).toMatchObject({ ok: true });
       expect(registry.finalizeIntegration({
         ...shape.finalization, identity: shape.owner.identity, now: 500,
       })).toMatchObject({ ok: true, value: { status: 'finalized', archivedAt: 500 } });
+      expect(registry.getAssignment(shape.implementer.assignmentId)?.blocker).toBeUndefined();
       const eventCount = registry.listEvents(shape.taskId).length;
       registry.close();
       registry = new SupervisionTaskRegistry({ dbPath });
@@ -1420,6 +1431,13 @@ describe('SupervisionTaskRegistry', () => {
           finalizedAt: 500,
         },
       });
+      expect(registry.getAssignment(shape.implementer.assignmentId)?.blocker).toBeUndefined();
+      expect(registry.recordImplementationNoProgressBlocker({
+        assignmentId: shape.implementer.assignmentId,
+        blocker: JSON.stringify({ blockerFingerprint: staleHeartbeatFingerprint }),
+        blockerFingerprint: staleHeartbeatFingerprint,
+        now: 700,
+      })).toEqual({ ok: false, reason: 'invalid_transition' });
       expect(registry.finalizeIntegration({
         ...shape.finalization, identity: shape.owner.identity, now: 900,
       })).toMatchObject({ ok: true, replay: true, value: { status: 'finalized', archivedAt: 500 } });
@@ -4891,6 +4909,49 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.getAssignment(assignment.value.assignmentId)?.heartbeatAt).toBe(10_000);
       registry.close();
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('CAS-deduplicates one no-progress blocker across SQLite reopen without moving progress', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-implementation-no-progress-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const worker = identity('deck_alpha_no_progress_worker');
+    const fingerprint = '72fb38ec09abb41624ba014f178e3d7eacf043311d9d02f66a79cae1579b46a7';
+    const blocker = JSON.stringify({
+      exactError: 'implementation heartbeat completed without durable progress or structured escalation',
+      blockerFingerprint: fingerprint,
+    });
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({
+        taskId: 'no-progress-task', projectName: 'alpha',
+        classification: 'independent_top_level', objective: 'dedupe watchdog disposition', now: 1_000,
+      })).toMatchObject({ ok: true });
+      const assignment = registry.createAssignment({
+        taskId: 'no-progress-task', assignmentId: 'no-progress-assignment', role: 'implementer',
+        identity: worker, scopeFiles: ['src/no-progress.ts'], now: 2_000,
+      });
+      if (!assignment.ok) throw new Error(assignment.reason);
+      const progressClock = assignment.value.updatedAt;
+      expect(registry.recordImplementationNoProgressBlocker({
+        assignmentId: assignment.value.assignmentId, blocker,
+        blockerFingerprint: fingerprint, now: 10_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.getAssignment(assignment.value.assignmentId)).toMatchObject({
+        blocker, updatedAt: progressClock,
+      });
+      const eventCount = registry.listEvents('no-progress-task').length;
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.recordImplementationNoProgressBlocker({
+        assignmentId: assignment.value.assignmentId, blocker,
+        blockerFingerprint: fingerprint, now: 20_000,
+      })).toMatchObject({ ok: true, replay: true });
+      expect(registry.listEvents('no-progress-task')).toHaveLength(eventCount);
+      expect(registry.getAssignment(assignment.value.assignmentId)?.updatedAt).toBe(progressClock);
+    } finally {
+      registry.close();
       rmSync(dir, { recursive: true, force: true });
     }
   });

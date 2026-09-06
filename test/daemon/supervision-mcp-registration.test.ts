@@ -1373,6 +1373,113 @@ describe('administrative recover', () => {
   });
 });
 
+describe('durable coordinator authority after daemon state loss', () => {
+  it('keeps the same project coordinator able to list, get and recover after SQLite reopen', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-brain-authority-reopen-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    let durable = new SupervisionTaskRegistry({ dbPath });
+    const taskId = 'tsk_restart_authority';
+    const coordinatorId = 'asg_restart_coordinator';
+    const implementerId = 'asg_restart_implementer';
+    try {
+      expect(durable.createOrGet({
+        taskId, projectName: 'codedeck', classification: 'integration_task',
+        objective: 'retain coordinator authority across daemon restart',
+      })).toMatchObject({ ok: true });
+      expect(durable.createAssignment({
+        taskId, assignmentId: coordinatorId, role: 'coordinator', required: false,
+        identity: { ...testIdentity('deck_cd_brain'), runtimeEpoch: 'epoch-before-restart' },
+      })).toMatchObject({ ok: true });
+      expect(durable.createAssignment({
+        taskId, assignmentId: implementerId, role: 'implementer',
+        identity: testIdentity('deck_worker'), scopeFiles: ['src/exact.ts'],
+      })).toMatchObject({ ok: true });
+      durable.close();
+      durable = new SupervisionTaskRegistry({ dbPath });
+
+      // Production failure window: the stdio caller survives with its stable
+      // project/session binding while the reopened daemon session registry has
+      // not yet made the rotated runtime identity observable.
+      const port: SupervisionRegistryPort = {
+        getStatus: (id) => durable.get(id)?.status,
+        applyIntent: (input) => durable.applyTaskIntent(input),
+        list: (filter) => durable.list(filter as never) as never,
+        get: (id) => durable.get(id) as never,
+        recover: (input) => durable.recoverTask(input),
+        coordinateTaskAssignment: (input) => durable.coordinateTaskAssignment(input),
+        housekeeping: (input) => durable.housekeeping(input),
+      };
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        registry: port,
+        isAdmin: () => false,
+        isProjectBrain: () => false,
+        resolveSessionIdentity: () => undefined,
+      });
+      await expect(handlers[SUPERVISION_MCP_TOOLS.GET]({ taskId }))
+        .resolves.toMatchObject({ status: 'ok', task: { taskId } });
+      await expect(handlers[SUPERVISION_MCP_TOOLS.LIST]({}))
+        .resolves.toMatchObject({ status: 'ok', count: 1, tasks: [{ taskId }] });
+      const coordinatorRenewal = {
+        taskId, assignmentId: coordinatorId,
+        leaseAction: 'renew', idempotencyKey: 'restart-coordinator-renew-once',
+        reason: 'same coordinator renews its durable lease after runtime rotation',
+      };
+      const concurrent = await Promise.all([
+        handlers[SUPERVISION_MCP_TOOLS.RECOVER](coordinatorRenewal),
+        handlers[SUPERVISION_MCP_TOOLS.RECOVER](coordinatorRenewal),
+      ]);
+      expect(concurrent).toEqual([
+        expect.objectContaining({ status: 'ok', taskId, assignmentId: coordinatorId }),
+        expect.objectContaining({ status: 'ok', taskId, assignmentId: coordinatorId }),
+      ]);
+      expect(concurrent.filter((result) => result.replay === true)).toHaveLength(1);
+      await expect(handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        taskId, assignmentId: implementerId,
+        taskStatus: 'implementing', assignmentStatus: 'implementing',
+        leaseAction: 'renew', idempotencyKey: 'restart-authority-recover-once',
+        reason: 'same coordinator resumes the exact assignment after runtime rotation',
+      })).resolves.toMatchObject({ status: 'ok', taskId, assignmentId: implementerId });
+
+      expect(durable.listAssignments(taskId).filter((item) => item.role === 'coordinator'))
+        .toHaveLength(1);
+      expect(durable.listAssignments(taskId).filter((item) => item.role === 'implementer'))
+        .toHaveLength(1);
+    } finally {
+      durable.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps foreign, same-name cross-project and conflicting observed identities fail-closed', async () => {
+    registry.statuses.set('tsk_authority', 'implementing');
+    registry.participants.set('tsk_authority', ['deck_cd_brain']);
+    registry.assignmentStates.set('tsk_authority', [{
+      assignmentId: 'asg_authority_coordinator', role: 'coordinator', status: 'delegated', leaseId: 'lease',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    const args = {
+      taskId: 'tsk_authority', assignmentId: 'asg_authority_coordinator',
+      leaseAction: 'renew', idempotencyKey: 'must-fail', reason: 'unauthorized probe',
+    };
+    for (const [caller, liveIdentity] of [
+      [{ ...CALLER, sessionName: 'deck_foreign' }, undefined],
+      [{ ...CALLER, projectName: 'other-project' }, undefined],
+      [CALLER, { ...testResolveSessionIdentity('deck_cd_brain'), projectName: 'other-project' }],
+      [CALLER, { ...testResolveSessionIdentity('deck_forged'), projectName: 'codedeck' }],
+    ] as const) {
+      const handlers = createSupervisionMcpToolHandlers(caller as McpRuntimeCaller, {
+        registry, isAdmin: () => false, isProjectBrain: () => false,
+        resolveSessionIdentity: () => liveIdentity,
+      });
+      await expect(handlers[SUPERVISION_MCP_TOOLS.GET]({ taskId: 'tsk_authority' }))
+        .resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+      await expect(handlers[SUPERVISION_MCP_TOOLS.RECOVER](args))
+        .resolves.toMatchObject({ status: 'error', reason: 'forbidden' });
+    }
+    expect(registry.coordinated).toEqual([]);
+  });
+});
+
 describe('bounded housekeeping administration', () => {
   it('keeps dryRun/apply admin-only and forwards the bounded cursor contract', async () => {
     const out: any = await call(SUPERVISION_MCP_TOOLS.HOUSEKEEPING, {

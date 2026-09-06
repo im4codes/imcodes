@@ -112,6 +112,60 @@ export function supervisionCallerParticipates(
     && isSupervisionTaskParticipant(item.assignments as never, callerIdentity));
 }
 
+/**
+ * Resolve authority for one already-persisted task.
+ *
+ * Runtime identity is preferred when the daemon can observe it, but the task's
+ * durable coordinator row is the restart-safe authority of last resort.  That
+ * fallback is deliberately task-local: a session name alone never grants
+ * project-wide Brain authority, and project scope must still match exactly.
+ */
+export function supervisionTaskCallerAuthority(input: {
+  item: SupervisionVisibilityItem | undefined;
+  callerSessionName: string;
+  callerProjectName?: string | null;
+  liveIdentity?: (Partial<SupervisionPersistentIdentity> & { projectName?: string }) | undefined;
+  liveProjectBrain?: boolean;
+}): {
+  projectName: string;
+  participantMayRead: boolean;
+  coordinatorMayAct: boolean;
+  projectBrainMayRead: boolean;
+} {
+  const callerSessionName = input.callerSessionName.trim();
+  const rawProjectName = input.callerProjectName?.trim() || '';
+  const observedSessionName = input.liveIdentity?.sessionName?.trim() || '';
+  const observedProjectName = input.liveIdentity?.projectName?.trim() || '';
+  const usableLiveIdentity = Boolean(input.liveIdentity
+    && observedSessionName === callerSessionName && observedProjectName);
+  const liveIdentityConflict = Boolean(input.liveIdentity && !usableLiveIdentity);
+  // A resolver result for some other session is not the caller's identity.
+  // Ignore it rather than letting target-resolution mocks/data poison the
+  // independently verified live-Brain lane; it still grants no participant
+  // authority. A same-session observed cross-project identity remains binding
+  // and therefore fails the task project check below.
+  const projectName = usableLiveIdentity ? observedProjectName : rawProjectName;
+  const projectMatches = Boolean(input.item?.projectName && projectName
+    && input.item.projectName === projectName);
+  const stableIdentity = callerSessionName ? { sessionName: callerSessionName } : undefined;
+  const hasCoordinator = Boolean(input.item?.assignments?.some((assignment) => assignment.role === 'coordinator'));
+  const durableCoordinator = Boolean(projectMatches && !liveIdentityConflict
+    && isSupervisionTaskCoordinator(input.item?.assignments as never, stableIdentity));
+  // Legacy rows can predate coordinator attribution. Preserve their existing
+  // recovery lane only for a daemon-verified live project Brain; once ANY
+  // coordinator row exists, that exact durable assignment owns authority.
+  const coordinatorMayAct = durableCoordinator
+    || Boolean(projectMatches && input.liveProjectBrain && !hasCoordinator);
+  const participantMayRead = Boolean(projectMatches && usableLiveIdentity && input.liveIdentity
+    && supervisionCallerParticipates(input.item, input.liveIdentity, projectName));
+  return {
+    projectName,
+    participantMayRead,
+    coordinatorMayAct,
+    projectBrainMayRead: Boolean(projectMatches && input.liveProjectBrain),
+  };
+}
+
 export type SupervisionOwnerScope =
   | { ok: true; ownerSessionName: string; source: 'target' | 'ownerSessionName' | 'caller_default' }
   | { ok: false; reason: 'conflicting_owner_filter' };
@@ -380,6 +434,16 @@ export function createSupervisionMcpToolHandlers(
       projectName: identity?.projectName?.trim() || caller.projectName?.trim() || '',
     };
   };
+  const taskAuthority = (task: SupervisionVisibilityItem | undefined) => {
+    const authority = callerAuthority();
+    return supervisionTaskCallerAuthority({
+      item: task,
+      callerSessionName: callerSession,
+      callerProjectName: authority.projectName,
+      liveIdentity: authority.identity,
+      liveProjectBrain: isProjectBrain(caller),
+    });
+  };
   const need = (): SupervisionRegistryPort | undefined => registry;
 
   return {
@@ -392,8 +456,9 @@ export function createSupervisionMcpToolHandlers(
       const authority = callerAuthority();
       const requestedAssignmentId = input.assignmentId === undefined ? undefined : String(input.assignmentId);
       const intent = String(input.intent ?? '');
+      const exactTaskAuthority = taskAuthority(task);
       const callerAssignments = (task?.assignments ?? []).filter(
-        (assignment) => task?.projectName === authority.projectName
+        (assignment) => task?.projectName === exactTaskAuthority.projectName
           && supervisionIdentityMatches(assignment.identity, authority.identity)
           && assignment.assignmentId,
       );
@@ -407,8 +472,7 @@ export function createSupervisionMcpToolHandlers(
       const coordinatorMayAct = Boolean(
         requestedAssignmentId
         && task?.projectName
-        && authority.projectName === task.projectName
-        && isSupervisionTaskCoordinator(task.assignments as never, authority.identity)
+        && exactTaskAuthority.coordinatorMayAct
         && task.assignments?.some((assignment) => assignment.assignmentId === requestedAssignmentId),
       );
       const boundAssignmentId = callerBoundAssignmentId
@@ -605,8 +669,10 @@ export function createSupervisionMcpToolHandlers(
       });
       // Post-filter: an explicit owner filter must never widen visibility beyond
       // the tasks this caller actually participates in.
-      const identity = authority.identity;
-      const tasks = rows.filter((row) => supervisionCallerParticipates(row, identity, authority.projectName));
+      const tasks = rows.filter((row) => {
+        const exact = taskAuthority(row);
+        return exact.participantMayRead || exact.coordinatorMayAct;
+      });
       return ok({
         tasks,
         count: tasks.length,
@@ -619,16 +685,13 @@ export function createSupervisionMcpToolHandlers(
       const reg = need();
       if (!reg) return err('unavailable', 'supervision registry not bound');
       const task = reg.get(String(input.taskId ?? ''));
-      const authority = callerAuthority();
       // Deliberately the SAME refusal for "does not exist" and "exists but you
       // are not a participant". Distinguishing them would turn this tool into an
       // existence oracle for other coordinators' task ids.
-      const taskProjectName = typeof (task as { projectName?: unknown } | undefined)?.projectName === 'string'
-        ? String((task as { projectName: string }).projectName)
-        : '';
-      const brainMayRead = Boolean(task && authority.projectName && isProjectBrain(caller)
-        && taskProjectName === authority.projectName);
-      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, authority.identity, authority.projectName))) {
+      const exactTaskAuthority = taskAuthority(task);
+      if (!task || (!exactTaskAuthority.projectBrainMayRead
+        && !exactTaskAuthority.coordinatorMayAct
+        && !exactTaskAuthority.participantMayRead)) {
         return err('identity_rejected', 'task is not visible to this caller');
       }
       return ok({ task });
@@ -657,6 +720,9 @@ export function createSupervisionMcpToolHandlers(
       const idempotencyKey = String(input.idempotencyKey ?? '').trim();
       const reason = String(input.reason ?? '').trim();
       const taskId = String(input.taskId ?? '');
+      const coordinatorMayRecover = (task: SupervisionVisibilityItem | undefined) => (
+        taskAuthority(task).coordinatorMayAct
+      );
       const orphanedAuditorRecoveryRequested = Boolean(
         assignmentId && rebindSessionName && expectedRevision && auditAttemptId,
       );
@@ -673,9 +739,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        const authorized = isAdmin(caller) || Boolean(
-          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
-        );
+        const authorized = isAdmin(caller) || coordinatorMayRecover(task);
         if (!task || !authorized) {
           return err('forbidden', 'orphaned auditor recovery requires the authoritative project Brain or administrator');
         }
@@ -793,9 +857,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        const authorized = isAdmin(caller) || Boolean(
-          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
-        );
+        const authorized = isAdmin(caller) || coordinatorMayRecover(task);
         if (!task || !authorized) {
           return err('forbidden', 'implementer identity recovery requires the authoritative project Brain or administrator');
         }
@@ -826,9 +888,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        const authorized = isAdmin(caller) || Boolean(
-          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
-        );
+        const authorized = isAdmin(caller) || coordinatorMayRecover(task);
         if (!task || !authorized) return err('forbidden', 'completion evidence resolution requires the authoritative project Brain or administrator');
         const resolved = reg.resolveCompletionEvidence?.({
           taskId, evidenceId, targetAssignmentId,
@@ -855,9 +915,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        const authorized = isAdmin(caller) || Boolean(
-          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
-        );
+        const authorized = isAdmin(caller) || coordinatorMayRecover(task);
         if (!task || !authorized) {
           return err('forbidden', 'revision recovery requires the authoritative project Brain or administrator');
         }
@@ -932,9 +990,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        const authorized = isAdmin(caller) || Boolean(
-          caller.projectName && caller.projectName === taskProjectName && isProjectBrain(caller),
-        );
+        const authorized = isAdmin(caller) || coordinatorMayRecover(task);
         if (!task || !authorized) {
           return err('forbidden', 'coordination override requires the authoritative project Brain or administrator');
         }
@@ -1006,8 +1062,7 @@ export function createSupervisionMcpToolHandlers(
         if (!reason) return err('validation_failed', 'stale auditor cancellation requires a reason');
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        if (!task || !caller.projectName || caller.projectName !== taskProjectName
-          || (!isAdmin(caller) && !isProjectBrain(caller))) {
+        if (!task || (!isAdmin(caller) && !coordinatorMayRecover(task))) {
           return err('forbidden', 'stale auditor cancellation requires the authoritative project Brain or administrator');
         }
         const cancelled = reg.cancelStaleAuditorAsProjectBrain?.({
@@ -1021,8 +1076,7 @@ export function createSupervisionMcpToolHandlers(
         if (!assignmentId || !rebindSessionName || !reason) return err('validation_failed', 'audit rebind requires assignmentId, rebindSessionName and reason');
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-        if (!task || !caller.projectName || caller.projectName !== taskProjectName
-          || (!isAdmin(caller) && !isProjectBrain(caller))) {
+        if (!task || (!isAdmin(caller) && !coordinatorMayRecover(task))) {
           return err('forbidden', 'audit identity rebind requires the authoritative project Brain or administrator');
         }
         const identity = deps.resolveSessionIdentity?.(rebindSessionName);
@@ -1055,10 +1109,7 @@ export function createSupervisionMcpToolHandlers(
       const task = reg.get(taskId);
       const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
       const evidenceRecovery = current === 'cancelled' && target === 'recovered';
-      const projectBrainMayRecover = evidenceRecovery
-        && Boolean(caller.projectName)
-        && caller.projectName === taskProjectName
-        && isProjectBrain(caller);
+      const projectBrainMayRecover = evidenceRecovery && coordinatorMayRecover(task);
       if (!isAdmin(caller) && !projectBrainMayRecover) {
         return err('forbidden', 'administrative recovery is not authorized for this caller');
       }

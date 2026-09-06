@@ -89,7 +89,7 @@ import type {
   SupervisionAutoProvisionRequest,
   SupervisionAutoProvisionResult,
 } from './supervision-auto-provision.js';
-import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
+import { supervisionTaskCallerAuthority } from './supervision-mcp-tools.js';
 import { isExactContinuationEligible } from './supervision-participant-delivery.js';
 import {
   EXECUTION_CLONE_KIND,
@@ -1665,6 +1665,16 @@ export async function dispatchSendMessage(
     let taskId: string;
     if (requestedTaskId) {
       const existing = registry.get(requestedTaskId);
+      const existingAuthority = supervisionTaskCallerAuthority({
+        item: existing,
+        callerSessionName: caller.sessionName,
+        callerProjectName,
+        liveIdentity: callerRecord ? {
+          ...supervisionTaskIdentityForTarget(callerRecord),
+          projectName: resolveEffectiveProjectName(callerRecord, allSessions),
+        } : undefined,
+        liveProjectBrain: isUniqueAuthoritativeProjectBrainCaller(callerRecord, callerProjectName, allSessions),
+      });
       const legacyBrainMayCoordinate = Boolean(
         existing
         && existing.projectName === callerProjectName
@@ -1678,11 +1688,9 @@ export async function dispatchSendMessage(
       // coordinator row at all; ambiguity still fails closed.
       if (!existing
         || existing.projectName !== callerProjectName
-        || (!legacyBrainMayCoordinate && !supervisionCallerParticipates(
-            existing,
-            callerRecord ? supervisionTaskIdentityForTarget(callerRecord) : undefined,
-            callerProjectName,
-          ))) {
+        || (!legacyBrainMayCoordinate
+          && !existingAuthority.participantMayRead
+          && !existingAuthority.coordinatorMayAct)) {
         return {
           status: 'error',
           reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -2393,13 +2401,25 @@ export async function reportImplementationNoProgressBlocker(
     ...(brain ? { brain: { label: brain.label?.trim() || brain.name, sessionName: brain.name } } : {}),
     ...(brainCanResolve ? {} : { missing: 'one live authoritative same-project Brain or external authorization' }),
   };
-  const persisted = registry.updateAssignment({
+  const persisted = registry.recordImplementationNoProgressBlocker({
     assignmentId: assignment.assignmentId,
-    identity: assignment.identity,
     blocker: JSON.stringify(report),
+    blockerFingerprint: fingerprint,
     now: (deps.now ?? Date.now)(),
   });
-  if (!persisted.ok) return { status: 'ignored', reason: `blocker_persist_failed:${persisted.reason}` };
+  if (!persisted.ok) {
+    if (persisted.reason === 'invalid_transition') {
+      return { status: 'ignored', reason: 'terminal' };
+    }
+    return { status: 'ignored', reason: `blocker_persist_failed:${persisted.reason}` };
+  }
+  if (persisted.replay) {
+    const durable = readMatchingBlockerEscalation(persisted.value.blocker, fingerprint);
+    if (!durable) return { status: 'ignored', reason: 'blocker_replay_mismatch' };
+    return durable.disposition === SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
+      ? { status: 'waiting', report: durable, replay: true }
+      : { status: 'needs_input', report: durable, replay: true };
+  }
 
   if (!brainCanResolve || !reporter || !brain) {
     return { status: 'needs_input', report, replay: false };
@@ -2428,12 +2448,16 @@ export async function reportImplementationNoProgressBlocker(
         disposition: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.NEEDS_INPUT,
         missing: `Brain escalation delivery failed: ${dispatched.status === 'error' ? dispatched.error : dispatched.reason}`,
       };
-      registry.updateAssignment({
+      const failedPersist = registry.recordImplementationNoProgressBlocker({
         assignmentId: assignment.assignmentId,
-        identity: assignment.identity,
         blocker: JSON.stringify(failedReport),
+        blockerFingerprint: fingerprint,
+        replaceMatching: true,
         now: (deps.now ?? Date.now)(),
       });
+      if (!failedPersist.ok && failedPersist.reason === 'invalid_transition') {
+        return { status: 'ignored', reason: 'terminal' };
+      }
       return { status: 'needs_input', report: failedReport, replay: false };
     }
   }
