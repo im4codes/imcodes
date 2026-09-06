@@ -51,6 +51,7 @@ import {
   sessionResourceOwnerFromEnv,
 } from './session-resource-service.js';
 import type { SessionResourceOwner } from './session-resource-registry.js';
+import { EMBEDDING_MODEL_RSS_BUDGET_BYTES } from '../../shared/embedding-config.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -69,7 +70,13 @@ export interface MemoryMcpServerCatalogOptions {
 }
 
 const MEMORY_MCP_DEFAULT_MAX_CONCURRENT = 8;
-const MEMORY_MCP_DEFAULT_RSS_HEADROOM_BYTES = 768 * 1024 * 1024;
+// The semantic-search path starts both the embedding and context-store workers
+// after the stdio server baseline is measured. Budget the model explicitly and
+// leave room for the second worker, SQLite/native allocations, and result data.
+// The old model-only 768 MiB allowance made a healthy first search kill MCP.
+const MEMORY_MCP_NON_MODEL_RSS_HEADROOM_BYTES = 512 * 1024 * 1024;
+const MEMORY_MCP_DEFAULT_RSS_HEADROOM_BYTES =
+  EMBEDDING_MODEL_RSS_BUDGET_BYTES + MEMORY_MCP_NON_MODEL_RSS_HEADROOM_BYTES;
 const MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 
 function positiveEnvNumber(value: string | undefined, fallback: number): number {

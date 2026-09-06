@@ -126,7 +126,7 @@ describe('memory MCP interface e2e', () => {
 
   it('budgets semantic-search RSS growth relative to the stdio process baseline', () => {
     const mib = 1024 * 1024;
-    expect(resolveMemoryMcpMaxRssBytes({}, 300 * mib)).toBe(1068 * mib);
+    expect(resolveMemoryMcpMaxRssBytes({}, 300 * mib)).toBe(1580 * mib);
   });
 
   it('runs the real stdio server, exposes the registered shared tools, and persists runtime-derived preference provenance', async () => {

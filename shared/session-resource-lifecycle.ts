@@ -36,6 +36,8 @@ export const SESSION_RESOURCE_RELEASE_REASON = {
   ORPHANED: 'orphaned',
   TTL_EXPIRED: 'ttl_expired',
   IDLE_EXPIRED: 'idle_expired',
+  PROCESS_MISSING: 'process_missing',
+  SUSTAINED_CPU: 'sustained_cpu',
 } as const;
 
 export const SESSION_RESOURCE_DEFAULTS = {

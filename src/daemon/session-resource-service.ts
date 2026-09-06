@@ -212,8 +212,15 @@ export async function sweepMemoryMcpCpu(
       // process-start observation may authorize that destructive recovery.
       const exactProcessCurrent = await dependencies.pidHandleIsCurrent(record.handle);
       if (exactProcessCurrent !== false) continue;
-      const released = await dependencies.releaseResource(record.resourceId, record.owner, 'process_missing');
-      if (released.released > 0) await dependencies.restartOwner(record.owner, 'process_missing');
+      // The MCP stdio process is already gone. Restarting its owner cannot
+      // reconnect the current host to that closed transport generation; it
+      // only kills otherwise healthy agent work. Drop the stale registry row
+      // and let the MCP host own child-process reconnection/relaunch.
+      await dependencies.releaseResource(
+        record.resourceId,
+        record.owner,
+        SESSION_RESOURCE_RELEASE_REASON.PROCESS_MISSING,
+      );
       continue;
     }
     const previous = mcpCpuSamples.get(record.resourceId);
@@ -226,9 +233,15 @@ export async function sweepMemoryMcpCpu(
     const strikes = cpuRatio >= MEMORY_MCP_WATCHDOG.CPU_RATIO_THRESHOLD ? previous.strikes + 1 : 0;
     mcpCpuSamples.set(record.resourceId, { cpuMs, sampledAt: now, strikes });
     if (strikes >= MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT) {
-      const released = await dependencies.releaseResource(record.resourceId, record.owner, 'sustained_cpu');
+      const released = await dependencies.releaseResource(
+        record.resourceId,
+        record.owner,
+        SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
+      );
       mcpCpuSamples.delete(record.resourceId);
-      if (released.released > 0) await dependencies.restartOwner(record.owner, 'sustained_cpu');
+      if (released.released > 0) {
+        await dependencies.restartOwner(record.owner, SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU);
+      }
     }
   }
   for (const resourceId of mcpCpuSamples.keys()) {
