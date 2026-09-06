@@ -52,6 +52,8 @@ export interface SubSessionRecord {
   parentSession?: string | null;
   /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
   ccPreset?: string | null;
+  /** Durable server/web spelling used by subsession.rebuild_all. */
+  ccPresetId?: string | null;
   /** Extra init prompt injected after session starts. */
   ccInitPrompt?: string | null;
   /** Session description/persona — injected as background info on start and respawn. */
@@ -482,8 +484,22 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       continue;
     }
     const projectName = parentProjectName(sub, sessionName);
+    const existing = getSession(sessionName);
+    // The web/server projection deliberately calls this durable identifier
+    // `ccPresetId`, while local SessionRecord and runtime assembly call it
+    // `ccPreset`. Treat an explicitly supplied wire value (including null) as
+    // authoritative after restart; only fall back to the local record when an
+    // older rebuild caller omitted both spellings entirely.
+    const hasWirePreset = Object.prototype.hasOwnProperty.call(sub, 'ccPresetId');
+    const hasLegacyPreset = Object.prototype.hasOwnProperty.call(sub, 'ccPreset');
+    const suppliedPreset = hasWirePreset ? sub.ccPresetId : hasLegacyPreset ? sub.ccPreset : undefined;
+    const normalizedSuppliedPreset = typeof suppliedPreset === 'string' && suppliedPreset.trim()
+      ? suppliedPreset.trim()
+      : undefined;
+    const rebuildCcPreset = hasWirePreset || hasLegacyPreset
+      ? normalizedSuppliedPreset
+      : existing?.ccPreset;
     if (isTransportAgent(sub.type)) {
-      const existing = getSession(sessionName);
       const existingRuntime = getTransportRuntime(sessionName);
       const now = Date.now();
       const nextRecord: SessionRecord = {
@@ -511,7 +527,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         effort: sub.effort ?? existing?.effort,
         transportConfig: sub.transportConfig ?? existing?.transportConfig,
         description: sub.description ?? existing?.description,
-        ccPreset: sub.ccPreset ?? existing?.ccPreset,
+        ccPreset: rebuildCcPreset,
       };
       upsertSession(nextRecord);
       if (!existingRuntime) {
@@ -524,9 +540,9 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
     }
     const exists = await sessionExists(sessionName);
     if (!exists) {
-      await startSubSession(sub).catch(() => {});
+      await startSubSession({ ...sub, ccPreset: rebuildCcPreset }).catch(() => {});
     } else {
-      const stored = getSession(sessionName);
+      const stored = existing ?? getSession(sessionName);
       const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
       if (sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
         // Pre-claim before seed creation to prevent main session's watchDir from stealing the file
@@ -593,7 +609,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         // don't copy forward gets wiped. Without carrying these over, daemon
         // restart resets preset/description/userCreated/memory-dedup state
         // and the next respawn spawns the raw CLI without preset env.
-        ...(sub.ccPreset ?? stored?.ccPreset ? { ccPreset: sub.ccPreset ?? stored?.ccPreset ?? undefined } : {}),
+        ...(rebuildCcPreset ? { ccPreset: rebuildCcPreset } : {}),
         ...(sub.description ?? stored?.description ? { description: sub.description ?? stored?.description ?? undefined } : {}),
         ...(stored?.userCreated ? { userCreated: stored.userCreated } : {}),
         ...(stored?.startupMemoryInjected ? { startupMemoryInjected: true } : {}),

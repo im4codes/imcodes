@@ -29,6 +29,40 @@ const mocks = vi.hoisted(() => {
   return { store, emitted, claudeCalls, codexCalls };
 });
 
+const presetRouteMocks = vi.hoisted(() => ({
+  qwen: vi.fn(async (_preset: string) => ({
+    env: {
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: 'test-qwen-key',
+      ANTHROPIC_MODEL: 'MiniMax-M3',
+      OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+      OPENAI_API_KEY: 'test-qwen-key',
+    },
+    settings: {
+      security: { auth: { selectedType: 'anthropic' } },
+      model: { name: 'MiniMax-M3' },
+    },
+    model: 'MiniMax-M3',
+    availableModels: ['MiniMax-M3'],
+  })),
+  dsh: vi.fn(async (_preset: string, model?: string) => ({
+    env: { ANTHROPIC_MODEL: model ?? 'MiniMax-M3' },
+    llm: {
+      provider: 'minimax', model: model ?? 'MiniMax-M3',
+      baseUrl: 'https://api.minimax.io/anthropic', apiKey: 'test-dsh-key',
+    },
+    model: model ?? 'MiniMax-M3',
+  })),
+  pi: vi.fn(async (_preset: string, model?: string) => ({
+    env: { ANTHROPIC_MODEL: model ?? 'MiniMax-M3' },
+    piLlm: {
+      provider: 'minimax', model: model ?? 'MiniMax-M3',
+      baseUrl: 'https://api.minimax.io/anthropic', apiKey: 'test-pi-key',
+    },
+    model: model ?? 'MiniMax-M3',
+  })),
+}));
+
 const PRESET_ENV = {
   ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
   ANTHROPIC_AUTH_TOKEN: 'test-token',
@@ -100,6 +134,9 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
     name.trim().toLowerCase() === 'minimax' ? 200000 : undefined
   )),
   getPresetInitMessage: vi.fn(() => 'preset-init'),
+  getQwenPresetTransportConfig: presetRouteMocks.qwen,
+  getDshPresetTransportConfig: presetRouteMocks.dsh,
+  getPiPresetTransportConfig: presetRouteMocks.pi,
   invalidateCache: vi.fn(),
 }));
 
@@ -325,9 +362,9 @@ vi.mock('../../src/agent/tmux.js', () => ({
   getPaneStartCommand: vi.fn().mockResolvedValue(''),
   cleanupOrphanFifos: vi.fn().mockResolvedValue(undefined), BACKEND: 'tmux',
 }));
-vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
-vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
+vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), ensureClaudeSessionFile: vi.fn(), preClaimFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
+vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), isFileClaimedByOther: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
+vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), startWatchingDiscovered: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
@@ -340,9 +377,14 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
-import { getTransportRuntime, launchSession } from '../../src/agent/session-manager.js';
+import { ensureTransportRuntimeAvailable, getTransportRuntime, launchSession } from '../../src/agent/session-manager.js';
 import { disconnectAll } from '../../src/agent/provider-registry.js';
+import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { QwenProvider } from '../../src/agent/providers/qwen.js';
+import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
+import { PiProvider } from '../../src/agent/providers/pi.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { rebuildSubSessions } from '../../src/daemon/subsession-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
 
 describe('sdk transport flow e2e', () => {
@@ -859,6 +901,139 @@ describe('sdk transport flow e2e', () => {
       type: 'subsession.sync',
       id: 'cxsdk_rebuild',
     }));
+  });
+
+  it('rehydrates a CC preset from the durable rebuild wire before the first post-restart turn', async () => {
+    const sessionName = 'deck_sub_ccsdk_preset_rebuild';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'parent',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/ccsdk-preset-rebuild',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    await rebuildSubSessions([{
+      id: 'ccsdk_preset_rebuild',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      cwd: '/tmp/ccsdk-preset-rebuild',
+      parentSession: 'deck_parent_brain',
+      ccPresetId: 'MiniMax',
+      requestedModel: 'MiniMax-M3',
+    }]);
+
+    expect(mocks.store.get(sessionName)).toMatchObject({
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M3',
+    });
+
+    const createSessionSpy = vi.spyOn(ClaudeCodeSdkProvider.prototype, 'createSession');
+    try {
+      await ensureTransportRuntimeAvailable(sessionName);
+      expect(getTransportRuntime(sessionName)).toBeDefined();
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_API_KEY: expect.any(String),
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        }),
+      }));
+    } finally {
+      createSessionSpy.mockRestore();
+    }
+  });
+
+  it('rehydrates Qwen, DSH, and Pi preset routes through their real post-restart runtime assembly', async () => {
+    const qwenCreate = vi.spyOn(QwenProvider.prototype, 'createSession');
+    const dshCreate = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    const piCreate = vi.spyOn(PiProvider.prototype, 'createSession');
+    try {
+      await rebuildSubSessions([
+        {
+          id: 'qwen_preset_rebuild', type: 'qwen', runtimeType: 'transport',
+          providerId: 'qwen', cwd: '/tmp/qwen-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'stale-qwen-model',
+        },
+        {
+          id: 'dsh_preset_rebuild', type: 'deepseek-harness', runtimeType: 'transport',
+          providerId: 'deepseek-harness', cwd: '/tmp/dsh-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'MiniMax-M3',
+        },
+        {
+          id: 'pi_preset_rebuild', type: 'pi', runtimeType: 'transport',
+          providerId: 'pi', cwd: '/tmp/pi-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'MiniMax-M3',
+        },
+      ]);
+
+      await ensureTransportRuntimeAvailable('deck_sub_qwen_preset_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_dsh_preset_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_pi_preset_rebuild');
+
+      expect(presetRouteMocks.qwen).toHaveBeenCalledWith('MiniMax');
+      expect(qwenCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({
+          OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+          OPENAI_API_KEY: 'test-qwen-key',
+        }),
+        settings: expect.objectContaining({ model: { name: 'MiniMax-M3' } }),
+      }));
+      expect(presetRouteMocks.dsh).toHaveBeenCalledWith('MiniMax', 'MiniMax-M3');
+      expect(dshCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        llm: expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-dsh-key' }),
+      }));
+      expect(presetRouteMocks.pi).toHaveBeenCalledWith('MiniMax', 'MiniMax-M3');
+      expect(piCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        piLlm: expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-pi-key' }),
+      }));
+    } finally {
+      qwenCreate.mockRestore();
+      dshCreate.mockRestore();
+      piCreate.mockRestore();
+    }
+  });
+
+  it('does not synthesize a preset or credential route for direct DSH and Pi rebuilds', async () => {
+    presetRouteMocks.dsh.mockClear();
+    presetRouteMocks.pi.mockClear();
+    const dshCreate = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    const piCreate = vi.spyOn(PiProvider.prototype, 'createSession');
+    try {
+      await rebuildSubSessions([
+        {
+          id: 'dsh_direct_rebuild', type: 'deepseek-harness', runtimeType: 'transport',
+          providerId: 'deepseek-harness', cwd: '/tmp/dsh-direct-rebuild', requestedModel: 'deepseek-v4-flash',
+        },
+        {
+          id: 'pi_direct_rebuild', type: 'pi', runtimeType: 'transport',
+          providerId: 'pi', cwd: '/tmp/pi-direct-rebuild', requestedModel: 'provider-owned-model',
+        },
+      ]);
+
+      await ensureTransportRuntimeAvailable('deck_sub_dsh_direct_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_pi_direct_rebuild');
+
+      expect(presetRouteMocks.dsh).not.toHaveBeenCalled();
+      expect(presetRouteMocks.pi).not.toHaveBeenCalled();
+      expect(dshCreate).toHaveBeenCalledWith(expect.not.objectContaining({ llm: expect.anything() }));
+      expect(piCreate).toHaveBeenCalledWith(expect.not.objectContaining({ piLlm: expect.anything() }));
+    } finally {
+      dshCreate.mockRestore();
+      piCreate.mockRestore();
+    }
   });
 
 

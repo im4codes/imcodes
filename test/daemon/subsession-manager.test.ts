@@ -685,6 +685,73 @@ describe('rebuildSubSessions — transport sessions are lazy', () => {
       state: 'idle',
     }));
   });
+
+  it.each([
+    ['claude-code-sdk', 'CC Preset'],
+    ['qwen', 'Qwen Preset'],
+    ['deepseek-harness', 'DeepSeek Preset'],
+    ['pi', 'Pi Preset'],
+  ])('rehydrates the server-authoritative preset for %s after daemon restart', async (type, ccPresetId) => {
+    await rebuildSubSessions([{
+      id: `preset-${type}`,
+      type,
+      cwd: '/proj',
+      requestedModel: 'MiniMax-M3',
+      // The durable server/web wire calls this field ccPresetId. A daemon
+      // restart must not silently drop it before provider runtime assembly.
+      ccPresetId,
+    } as Parameters<typeof rebuildSubSessions>[0][number] & { ccPresetId: string }]);
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: `deck_sub_preset-${type}`,
+      agentType: type,
+      requestedModel: 'MiniMax-M3',
+      ccPreset: ccPresetId,
+    }));
+  });
+
+  it.each(['claude-code-sdk', 'qwen', 'deepseek-harness', 'pi'])('keeps direct %s rebuilds unbound from presets', async (type) => {
+    await rebuildSubSessions([{
+      id: `direct-${type}`,
+      type,
+      cwd: '/proj',
+      requestedModel: 'provider-owned-model',
+    }]);
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: `deck_sub_direct-${type}`,
+      agentType: type,
+      requestedModel: 'provider-owned-model',
+    }));
+    expect(upsertSessionMock.mock.calls.at(-1)?.[0]?.ccPreset).toBeUndefined();
+  });
+
+  it('clears a stale local credential route when the durable rebuild explicitly selects no preset', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_direct-after-preset',
+      agentType: 'pi',
+      projectDir: '/proj',
+      state: 'idle',
+      ccPreset: 'Other User Private Route',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+    });
+
+    await rebuildSubSessions([{
+      id: 'direct-after-preset',
+      type: 'pi',
+      cwd: '/proj',
+      ccPresetId: null,
+      requestedModel: 'provider-owned-model',
+    }]);
+
+    expect(upsertSessionMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      name: 'deck_sub_direct-after-preset',
+      requestedModel: 'provider-owned-model',
+      ccPreset: undefined,
+    });
+  });
 });
 
 // ── rebuildSubSessions: geminiSessionId preserved ────────────────────────────
