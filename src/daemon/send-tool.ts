@@ -1858,7 +1858,8 @@ export async function dispatchSendMessage(
             || candidate.identity.runtimeEpoch !== targetIdentity.runtimeEpoch
             || candidate.identity.agentType !== targetIdentity.agentType
             || candidate.identity.providerFamily !== targetIdentity.providerFamily
-            || !supervisionSelectedExecutionBindingMatches(candidate.executionBinding, executionBinding);
+            || (candidate.executionBinding !== undefined
+              && !supervisionSelectedExecutionBindingMatches(candidate.executionBinding, executionBinding));
           if (identityDrifted) {
             if (!exactStrictSameObjectRecovery) {
               return {
