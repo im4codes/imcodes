@@ -34,7 +34,7 @@ function sha(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function productionShape() {
+async function productionShape() {
   const root = mkdtempSync(join(tmpdir(), 'imcodes-frozen-bundle-'));
   roots.push(root);
   const sourceRoot = join(root, 'source');
@@ -61,7 +61,7 @@ function productionShape() {
   chmodSync(join(implementer, 'test/b.test.ts'), 0o755);
   writeFileSync(join(implementer, 'test/added.test.ts'), 'after-add\n');
   rmSync(join(implementer, 'test/deleted.test.ts'));
-  const inspected = inspectSupervisionAssignmentWorktree({
+  const inspected = await inspectSupervisionAssignmentWorktree({
     sessionName: 'deck_alpha_worker', assignmentId: 'asg_exact', worktreePath: implementer,
   });
   if (!inspected.ok) throw new Error(inspected.reason);
@@ -69,8 +69,8 @@ function productionShape() {
 }
 
 describe('immutable supervision integration bundle', () => {
-  it('preserves the exact tsk_f1x after bytes after the implementer worktree returns to base', () => {
-    const shape = productionShape();
+  it('preserves the exact tsk_f1x after bytes after the implementer worktree returns to base', async () => {
+    const shape = await productionShape();
     const frozen = freezeSupervisionIntegrationBundle({
       taskId: 'tsk_f1x', assignmentId: 'asg_f40', revision: 'daemon-preview-drain-order-r1',
       snapshot: shape.snapshot, bundleRoot: shape.bundleRoot, now: 100,
@@ -90,7 +90,7 @@ describe('immutable supervision integration bundle', () => {
     expect(statSync(join(shape.integration, 'test/b.test.ts')).mode & 0o777).toBe(0o755);
     expect(readFileSync(join(shape.integration, 'test/added.test.ts'), 'utf8')).toBe('after-add\n');
     expect(existsSync(join(shape.integration, 'test/deleted.test.ts'))).toBe(false);
-    expect(inspectSupervisionAssignmentWorktree({
+    expect(await inspectSupervisionAssignmentWorktree({
       sessionName: 'deck_alpha_brain', assignmentId: 'asg_integration', worktreePath: shape.integration,
     })).toMatchObject({ ok: true, snapshot: { files: shape.snapshot.files } });
     git(shape.integration, 'add', '-A');
@@ -108,8 +108,8 @@ describe('immutable supervision integration bundle', () => {
     })).toEqual({ ok: false, reason: 'hash_mismatch', path: 'test/a.test.ts' });
   });
 
-  it('is content addressed, replay-safe, and fails closed on bundle or target conflicts', () => {
-    const shape = productionShape();
+  it('is content addressed, replay-safe, and fails closed on bundle or target conflicts', async () => {
+    const shape = await productionShape();
     const input = {
       taskId: 'tsk_exact', assignmentId: 'asg_exact', revision: 'exact-r1',
       snapshot: shape.snapshot, bundleRoot: shape.bundleRoot, now: 100,
@@ -140,8 +140,8 @@ describe('immutable supervision integration bundle', () => {
       .toBe(sha('after-a\n'));
   });
 
-  it('persists one exact bundle binding across store reopen and refuses a conflicting hash', () => {
-    const shape = productionShape();
+  it('persists one exact bundle binding across store reopen and refuses a conflicting hash', async () => {
+    const shape = await productionShape();
     const dbPath = join(shape.root, 'supervision.sqlite');
     const identity = {
       sessionName: 'deck_alpha_worker', sessionInstanceId: 'instance-worker',
