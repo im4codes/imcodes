@@ -22,6 +22,7 @@ import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../sha
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
+import { resolveMemoryMcpMaxRssBytes } from '../../src/daemon/memory-mcp-server.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import {
   archiveEventsForMaterialization,
@@ -122,6 +123,11 @@ describe('memory MCP interface e2e', () => {
       [memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.preferences)]: 'true',
     };
   }
+
+  it('budgets semantic-search RSS growth relative to the stdio process baseline', () => {
+    const mib = 1024 * 1024;
+    expect(resolveMemoryMcpMaxRssBytes({}, 300 * mib)).toBe(1068 * mib);
+  });
 
   it('runs the real stdio server, exposes the registered shared tools, and persists runtime-derived preference provenance', async () => {
     await withStdioClient(childEnv(), async (client) => {

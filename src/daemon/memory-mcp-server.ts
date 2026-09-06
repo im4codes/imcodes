@@ -69,12 +69,31 @@ export interface MemoryMcpServerCatalogOptions {
 }
 
 const MEMORY_MCP_DEFAULT_MAX_CONCURRENT = 8;
-const MEMORY_MCP_DEFAULT_MAX_RSS_BYTES = 768 * 1024 * 1024;
+const MEMORY_MCP_DEFAULT_RSS_HEADROOM_BYTES = 768 * 1024 * 1024;
 const MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 
 function positiveEnvNumber(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * The embedding worker shares this process' RSS but platform/loader baseline
+ * RSS differs substantially. Bound memory growth, rather than comparing the
+ * post-search process against an absolute budget smaller than a valid x64
+ * baseline plus the model.
+ */
+export function resolveMemoryMcpMaxRssBytes(
+  env: Record<string, string | undefined> = process.env,
+  baselineRssBytes = process.memoryUsage().rss,
+): number {
+  const baseline = Number.isFinite(baselineRssBytes) && baselineRssBytes >= 0
+    ? baselineRssBytes
+    : 0;
+  return positiveEnvNumber(
+    env.IMCODES_MEMORY_MCP_MAX_RSS_BYTES,
+    baseline + MEMORY_MCP_DEFAULT_RSS_HEADROOM_BYTES,
+  );
 }
 
 function createDefaultMemoryMcpResourceGuard(
@@ -83,7 +102,7 @@ function createDefaultMemoryMcpResourceGuard(
 ): MemoryMcpResourceGuard {
   return new MemoryMcpResourceGuard({
     maxConcurrent: positiveEnvNumber(env.IMCODES_MEMORY_MCP_MAX_CONCURRENT, MEMORY_MCP_DEFAULT_MAX_CONCURRENT),
-    maxRssBytes: positiveEnvNumber(env.IMCODES_MEMORY_MCP_MAX_RSS_BYTES, MEMORY_MCP_DEFAULT_MAX_RSS_BYTES),
+    maxRssBytes: resolveMemoryMcpMaxRssBytes(env),
     requestTimeoutMs: positiveEnvNumber(env.IMCODES_MEMORY_MCP_REQUEST_TIMEOUT_MS, MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS),
     cpuStrikeLimit: MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT,
     onSustainedCpu,
