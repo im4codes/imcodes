@@ -37,6 +37,8 @@ import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
 import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
+import { createSupervisionMcpToolDeps } from '../../src/daemon/supervision-registry-port.js';
+import { createSupervisionMcpToolHandlers } from '../../src/daemon/supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from '../../src/daemon/peer-audit-candidates.js';
 import {
   getSupervisionTaskRegistry,
@@ -103,6 +105,56 @@ beforeEach(() => resetSupervisionTaskRegistryForTests());
 afterEach(() => resetSupervisionTaskRegistryForTests());
 
 describe('supervision registry binding', () => {
+  it('finishes through the production port when the MCP project hint is absent', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'finish-without-project-hint';
+    expect(registry.createOrGet({
+      taskId, projectName: LIVE_CALLER.projectName,
+      classification: 'independent_top_level', objective: 'finish without raw project hint',
+    })).toMatchObject({ ok: true });
+    const created = registry.createAssignment({
+      taskId, role: 'implementer',
+      identity: {
+        sessionName: LIVE_CALLER.name,
+        sessionInstanceId: LIVE_CALLER.sessionInstanceId,
+        runtimeEpoch: LIVE_CALLER.runtimeEpoch,
+        agentType: LIVE_CALLER.agentType,
+        providerFamily: resolvePeerAuditProviderFamily(LIVE_CALLER as never),
+      },
+    });
+    if (!created.ok) throw new Error(`assignment failed: ${created.reason}`);
+    const assignment = created.value;
+    const revision = 'finish-without-project-hint-r1';
+    expect(registry.updateTask({ taskId, currentRevision: revision })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: assignment.assignmentId,
+      identity: assignment.identity,
+      status: 'implementing',
+      revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({
+      taskId,
+      assignmentId: assignment.assignmentId,
+      identity: assignment.identity,
+      intent: 'record_validation',
+      toStatus: 'validated',
+      validationState: 'passed',
+    })).toMatchObject({ ok: true });
+
+    const handlers = createSupervisionMcpToolHandlers(
+      // Production MCP children can legitimately omit the project hint. The
+      // daemon session store remains the authority for the effective project.
+      { sessionName: LIVE_CALLER.name } as never,
+      createSupervisionMcpToolDeps(),
+    );
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId, assignmentId: assignment.assignmentId,
+    })).resolves.toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
+    expect(registry.getAssignment(assignment.assignmentId)).toMatchObject({
+      status: 'ready_for_audit', leaseId: '', auditRevision: revision,
+    });
+  });
+
   it('binds the real registry through the production server entry point', async () => {
     const taskId = seedTaskOwnedByCaller('binding-1');
     const { client, close } = await connectProductionServer();

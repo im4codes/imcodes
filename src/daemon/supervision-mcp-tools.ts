@@ -530,7 +530,12 @@ export function createSupervisionMcpToolHandlers(
         const finished = reg.finishAssignment({
           assignmentId: boundAssignmentId,
           callerSessionName: callerSession,
-          ...(caller.projectName ? { callerProjectName: caller.projectName } : {}),
+          // Use the daemon-resolved project scope, not the optional/stale MCP
+          // environment hint. Read/intent authorization above already proved
+          // this exact live identity against that scope; handing the raw hint
+          // to the production port made a successful handoff report
+          // owner_mismatch when the child MCP omitted IMCODES_PROJECT_NAME.
+          ...(authority.projectName ? { callerProjectName: authority.projectName } : {}),
           ...(coordinatorMayAct ? { projectBrain: true } : {}),
           ...(rebind ? {
             rebindIdentity: {
