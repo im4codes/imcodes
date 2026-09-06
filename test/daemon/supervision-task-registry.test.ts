@@ -1454,6 +1454,186 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('self-heals a missing pointer only for the unique exact integration owner during structured finalization', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-missing-integration-owner-pointer-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      const shape = prepareStructuredFinalizationShape(registry, 'tsk_fyz_missing_owner_pointer', {
+        ownerAssignmentId: 'asg_fyz_exact_integration_owner',
+        leaveAuditorUnfinalized: true,
+      });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId: shape.taskId,
+        auditorAssignmentId: shape.auditor.assignmentId,
+        attemptId: shape.attemptId,
+        revision: shape.revision,
+        receiptKind: 'final',
+        verdict: 'PASS',
+        auditorSessionName: shape.auditor.identity.sessionName,
+        auditorIdentity: shape.auditor.identity,
+        findings: 'exact frozen PASS',
+        validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'exact bytes passed' }],
+        now: 400,
+      })).toMatchObject({ ok: true, value: { verdict: 'PASS' } });
+      expect(registry.finishAssignment({
+        assignmentId: shape.auditor.assignmentId,
+        identity: shape.auditor.identity,
+        revision: shape.revision,
+      })).toMatchObject({ ok: true, value: { status: 'finalized', leaseId: '' } });
+      registry.close();
+
+      const database = new DatabaseSync(dbPath);
+      const row = database.prepare('SELECT payload_json AS payloadJson FROM supervision_tasks WHERE task_id = ?')
+        .get(shape.taskId) as { payloadJson: string };
+      const payload = JSON.parse(row.payloadJson) as Record<string, unknown>;
+      delete payload.integrationOwnerAssignmentId;
+      database.prepare('UPDATE supervision_tasks SET payload_json = ? WHERE task_id = ?')
+        .run(JSON.stringify(payload), shape.taskId);
+      database.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.getTaskRecord(shape.taskId)?.integrationOwnerAssignmentId).toBeUndefined();
+      expect(registry.finalizeIntegration({
+        ...shape.finalization,
+        identity: shape.owner.identity,
+        now: 500,
+      })).toMatchObject({
+        ok: true,
+        value: {
+          status: 'finalized',
+          integrationOwnerAssignmentId: shape.owner.assignmentId,
+          archivedAt: 500,
+        },
+      });
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.finalizeIntegration({
+        ...shape.finalization,
+        identity: shape.owner.identity,
+        now: 900,
+      })).toMatchObject({
+        ok: true,
+        replay: true,
+        value: {
+          status: 'finalized',
+          integrationOwnerAssignmentId: shape.owner.assignmentId,
+          archivedAt: 500,
+        },
+      });
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps missing-pointer finalization fail-closed for ambiguous or mismatched authority', () => {
+    const cases = [
+      ['multiple', 'ambiguous_assignment'],
+      ['stale_owner', 'old_revision'],
+      ['foreign', 'owner_mismatch'],
+      ['stale_revision', 'old_revision'],
+      ['stale_attempt', 'old_audit_attempt'],
+      ['rework_receipt', 'old_audit_attempt'],
+      ['missing_receipt', 'old_audit_attempt'],
+      ['closed_owner', 'invalid_transition'],
+    ] as const;
+    for (const [variant, expectedReason] of cases) {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      try {
+        const taskId = `missing-owner-pointer-${variant}`;
+        const shape = prepareStructuredFinalizationShape(registry, taskId, {
+          ownerAssignmentId: `${taskId}-owner`,
+          leaveAuditorUnfinalized: true,
+        });
+        expect(registry.appendMatchingAuditReceipt({
+          taskId,
+          auditorAssignmentId: shape.auditor.assignmentId,
+          attemptId: shape.attemptId,
+          revision: shape.revision,
+          receiptKind: 'final',
+          verdict: 'PASS',
+          auditorSessionName: shape.auditor.identity.sessionName,
+          auditorIdentity: shape.auditor.identity,
+          findings: 'exact frozen PASS',
+          validations: [],
+          now: 400,
+        })).toMatchObject({ ok: true });
+        expect(registry.finishAssignment({
+          assignmentId: shape.auditor.assignmentId,
+          identity: shape.auditor.identity,
+          revision: shape.revision,
+        })).toMatchObject({ ok: true });
+
+        if (variant === 'multiple' || variant === 'stale_owner') {
+          const secondIdentity = identity(`${taskId}-second-owner`);
+          const second = registry.createAssignment({
+            taskId,
+            role: 'integration_owner',
+            identity: secondIdentity,
+            scopeFiles: shape.files,
+            auditAttemptId: variant === 'multiple' ? shape.attemptId : `${shape.attemptId}-stale`,
+            auditRevision: variant === 'multiple' ? shape.revision : `${shape.revision}-stale`,
+          });
+          if (!second.ok) throw new Error(second.reason);
+          if (variant === 'multiple') {
+            for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
+              expect(registry.updateAssignment({
+                assignmentId: second.value.assignmentId,
+                identity: secondIdentity,
+                status,
+                revision: shape.revision,
+                auditAttemptId: shape.attemptId,
+                auditRevision: shape.revision,
+                ...(status === 'passed' || status === 'ready_for_integration'
+                  ? { verdict: 'PASS' as const, crossVendorAuditPassed: true }
+                  : {}),
+              })).toMatchObject({ ok: true });
+            }
+            expect(registry.finishAssignment({
+              assignmentId: second.value.assignmentId,
+              identity: secondIdentity,
+              revision: shape.revision,
+            })).toMatchObject({ ok: true });
+          }
+        } else if (variant === 'rework_receipt') {
+          database.prepare(`UPDATE supervision_audit_receipts SET verdict = 'REWORK'
+            WHERE task_id = ? AND assignment_id = ? AND attempt_id = ? AND revision = ? AND receipt_kind = 'final'`)
+            .run(taskId, shape.auditor.assignmentId, shape.attemptId, shape.revision);
+        } else if (variant === 'missing_receipt') {
+          database.prepare('DELETE FROM supervision_audit_receipts WHERE task_id = ?').run(taskId);
+        } else if (variant === 'closed_owner') {
+          rewritePersistedAssignment(database, {
+            ...registry.getAssignment(shape.owner.assignmentId)!,
+            status: 'finalized',
+            leaseId: '',
+          });
+        }
+
+        const persistedTask = registry.getTaskRecord(taskId)!;
+        const { integrationOwnerAssignmentId: _pointer, ...pointerlessTask } = persistedTask;
+        rewritePersistedTask(database, pointerlessTask);
+        const before = registry.get(taskId);
+        const eventCount = registry.listEvents(taskId).length;
+        const result = registry.finalizeIntegration({
+          ...shape.finalization,
+          ...(variant === 'stale_revision'
+            ? { revision: `${shape.revision}-stale`, auditRevision: `${shape.revision}-stale` }
+            : {}),
+          ...(variant === 'stale_attempt' ? { auditAttemptId: `${shape.attemptId}-stale` } : {}),
+          identity: variant === 'foreign' ? identity(`${taskId}-foreign`) : shape.owner.identity,
+        });
+        expect(result, variant).toEqual({ ok: false, reason: expectedReason });
+        expect(registry.get(taskId), variant).toEqual(before);
+        expect(registry.listEvents(taskId), variant).toHaveLength(eventCount);
+      } finally {
+        registry.close();
+      }
+    }
+  });
+
   it('finalizes through the same durable project+session owner after runtime rotation and replays idempotently', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-stale-integration-owner-'));
     const dbPath = join(dir, 'supervision-state.sqlite');

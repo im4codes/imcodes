@@ -4633,38 +4633,43 @@ export class SupervisionTaskRegistry {
     // update is written below in the same transaction as finalization; this is
     // not a general owner-selection or recovery mechanism.
     let integrationOwnerReboundFromAssignmentId: string | undefined;
+    let repairMissingIntegrationOwnerPointer = false;
     if (task.integrationOwnerAssignmentId !== owner.assignmentId) {
-      const staleOwner = task.integrationOwnerAssignmentId
-        ? assignments.find((assignment) => assignment.assignmentId === task.integrationOwnerAssignmentId)
-        : undefined;
-      const concurrentOwners = assignments.filter((assignment) => (
-        assignment.role === 'integration_owner'
-        && assignment.assignmentId !== owner.assignmentId
-        && assignment.assignmentId !== staleOwner?.assignmentId
-        && (assignment.leaseId !== '' || !['cancelled', 'finalized'].includes(assignment.status))
-      ));
-      if (concurrentOwners.length > 0) return { ok: false, reason: 'ambiguous_assignment' };
-      const callerIsProjectBrain = assignments.some((assignment) => (
-        assignment.role === 'coordinator'
-        && assignment.identity.sessionName === owner.identity.sessionName
-      ));
-      const exactStaleRuntimeOwner = Boolean(
-        staleOwner
-        && staleOwner.role === 'integration_owner'
-        && staleOwner.taskId === task.taskId
-        && staleOwner.identity.sessionName === owner.identity.sessionName
-        && !runtimeIdentityMetadataMatches(staleOwner.identity, owner.identity)
-        && staleOwner.status === 'ready_for_integration'
-        && staleOwner.leaseId === ''
-        && staleOwner.auditRevision === revision
-        && staleOwner.auditAttemptId === auditAttemptId
-        && staleOwner.verdict?.trim().toUpperCase() === 'PASS'
-        && staleOwner.crossVendorAuditPassed === true
-        && owner.crossVendorAuditPassed === true
-        && callerIsProjectBrain
-      );
-      if (!exactStaleRuntimeOwner) return { ok: false, reason: 'owner_mismatch' };
-      integrationOwnerReboundFromAssignmentId = staleOwner!.assignmentId;
+      if (!task.integrationOwnerAssignmentId) {
+        repairMissingIntegrationOwnerPointer = true;
+      } else {
+        const staleOwner = assignments.find(
+          (assignment) => assignment.assignmentId === task.integrationOwnerAssignmentId,
+        );
+        const concurrentOwners = assignments.filter((assignment) => (
+          assignment.role === 'integration_owner'
+          && assignment.assignmentId !== owner.assignmentId
+          && assignment.assignmentId !== staleOwner?.assignmentId
+          && (assignment.leaseId !== '' || !['cancelled', 'finalized'].includes(assignment.status))
+        ));
+        if (concurrentOwners.length > 0) return { ok: false, reason: 'ambiguous_assignment' };
+        const callerIsProjectBrain = assignments.some((assignment) => (
+          assignment.role === 'coordinator'
+          && assignment.identity.sessionName === owner.identity.sessionName
+        ));
+        const exactStaleRuntimeOwner = Boolean(
+          staleOwner
+          && staleOwner.role === 'integration_owner'
+          && staleOwner.taskId === task.taskId
+          && staleOwner.identity.sessionName === owner.identity.sessionName
+          && !runtimeIdentityMetadataMatches(staleOwner.identity, owner.identity)
+          && staleOwner.status === 'ready_for_integration'
+          && staleOwner.leaseId === ''
+          && staleOwner.auditRevision === revision
+          && staleOwner.auditAttemptId === auditAttemptId
+          && staleOwner.verdict?.trim().toUpperCase() === 'PASS'
+          && staleOwner.crossVendorAuditPassed === true
+          && owner.crossVendorAuditPassed === true
+          && callerIsProjectBrain
+        );
+        if (!exactStaleRuntimeOwner) return { ok: false, reason: 'owner_mismatch' };
+        integrationOwnerReboundFromAssignmentId = staleOwner!.assignmentId;
+      }
     }
 
     if (requiredLineage.some((assignment) => assignment.auditRevision !== revision)) {
@@ -4693,6 +4698,70 @@ export class SupervisionTaskRegistry {
       const latestFinal = auditReceipts.filter((receipt) => receipt.receiptKind === 'final').at(-1);
       if (!latestFinal || latestFinal.verdict !== 'PASS') return { ok: false, reason: 'old_audit_attempt' };
     }
+    const missingPointerRefusal = (
+      candidateTask: PersistedSupervisionTaskRecord,
+      candidateOwner: PersistedSupervisionTaskAssignment,
+      candidates: PersistedSupervisionTaskAssignment[],
+    ): 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'old_audit_attempt'
+      | 'manifest_mismatch' | 'ambiguous_assignment' | undefined => {
+      if (candidateTask.integrationOwnerAssignmentId) return 'owner_mismatch';
+      if (candidateTask.status !== 'ready_for_integration'
+        || candidateOwner.status !== 'ready_for_integration'
+        || candidateOwner.leaseId !== ''
+        || candidateTask.finalization) return 'invalid_transition';
+      if (candidateTask.currentRevision !== revision || candidateOwner.auditRevision !== revision) {
+        return 'old_revision';
+      }
+      if (candidateOwner.auditAttemptId !== auditAttemptId
+        || candidateOwner.verdict?.trim().toUpperCase() !== 'PASS'
+        || candidateOwner.crossVendorAuditPassed !== true) return 'old_audit_attempt';
+      if (!identityMatches(candidateOwner.identity, input.identity)
+        || candidateOwner.identity.sessionName !== integrationOwner) return 'owner_mismatch';
+      const liveOwners = candidates.filter((assignment) => (
+        assignment.role === 'integration_owner'
+        && !isTerminalSupervisionTaskStatus(assignment.status)
+      ));
+      if (liveOwners.length !== 1) return liveOwners.length > 1 ? 'ambiguous_assignment' : 'owner_mismatch';
+      if (liveOwners[0]!.assignmentId !== candidateOwner.assignmentId) return 'owner_mismatch';
+      const lineage = candidates.filter((assignment) => (
+        assignment.required
+        && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+        && assignment.status !== 'cancelled'
+        && assignment.status !== 'recovered'
+      ));
+      if (lineage.some((assignment) => assignment.auditRevision !== revision)) return 'old_revision';
+      if (lineage.length === 0 || lineage.some((assignment) => (
+        assignment.auditAttemptId !== auditAttemptId
+        || assignment.verdict?.trim().toUpperCase() !== 'PASS'
+        || assignment.crossVendorAuditPassed !== true
+      ))) return 'old_audit_attempt';
+      const auditors = candidates.filter((assignment) => (
+        assignment.role === 'auditor'
+        && assignment.auditAttemptId === auditAttemptId
+        && assignment.auditRevision === revision
+        && assignment.verdict?.trim().toUpperCase() === 'PASS'
+      ));
+      if (auditors.length !== 1) return 'ambiguous_assignment';
+      if (auditors[0]!.status !== 'finalized' || auditors[0]!.leaseId !== '') return 'invalid_transition';
+      if (auditors[0]!.identity.sessionName === candidateOwner.identity.sessionName) return 'owner_mismatch';
+      const finalReceipts = this.listAuditReceipts(candidateTask.taskId).filter((receipt) => (
+        receipt.assignmentId === auditors[0]!.assignmentId
+        && receipt.attemptId === auditAttemptId
+        && receipt.revision === revision
+        && receipt.receiptKind === 'final'
+        && receipt.verdict === 'PASS'
+      ));
+      if (finalReceipts.length !== 1) return 'old_audit_attempt';
+      if (hasExactCiRun && (candidateOwner.externalRunId !== externalRunId
+        || candidateOwner.externalHeadSha?.toLowerCase() !== externalHeadSha
+        || (externalTaskId && candidateOwner.externalTaskId !== externalTaskId)
+        || externalHeadSha !== commitSha)) return 'manifest_mismatch';
+      return undefined;
+    };
+    if (repairMissingIntegrationOwnerPointer) {
+      const refusal = missingPointerRefusal(task, owner, assignments);
+      if (refusal) return { ok: false, reason: refusal };
+    }
 
     const chain: readonly SupervisionTaskLifecycleStatus[] =
       SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH.slice(1);
@@ -4710,10 +4779,23 @@ export class SupervisionTaskRegistry {
     const now = input.now ?? Date.now();
     this.#db.exec('BEGIN IMMEDIATE');
     try {
-      taskRecord = integrationOwnerReboundFromAssignmentId
-        ? { ...task, integrationOwnerAssignmentId: owner.assignmentId }
-        : task;
-      ownerRecord = owner;
+      if (repairMissingIntegrationOwnerPointer) {
+        const lockedTask = this.getTaskRecord(task.taskId);
+        const lockedOwner = this.getAssignment(owner.assignmentId);
+        const lockedAssignments = this.listAssignments(task.taskId);
+        if (!lockedTask || !lockedOwner
+          || missingPointerRefusal(lockedTask, lockedOwner, lockedAssignments)) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'conflicting_replay' };
+        }
+        taskRecord = { ...lockedTask, integrationOwnerAssignmentId: lockedOwner.assignmentId };
+        ownerRecord = lockedOwner;
+      } else {
+        taskRecord = integrationOwnerReboundFromAssignmentId
+          ? { ...task, integrationOwnerAssignmentId: owner.assignmentId }
+          : task;
+        ownerRecord = owner;
+      }
       for (const status of chain) {
         ownerRecord = {
           ...ownerRecord,
@@ -4747,6 +4829,9 @@ export class SupervisionTaskRegistry {
           ...(integrationOwnerReboundFromAssignmentId ? {
             integrationOwnerReboundFromAssignmentId,
             integrationOwnerReboundToAssignmentId: owner.assignmentId,
+          } : {}),
+          ...(repairMissingIntegrationOwnerPointer ? {
+            integrationOwnerPointerRecoveredToAssignmentId: owner.assignmentId,
           } : {}),
           ...(status === 'committed' ? { commitSha } : {}),
           ...(status === 'pushed' ? { pushResult: input.pushResult, pushRemoteRef } : {}),
