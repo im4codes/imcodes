@@ -92,6 +92,10 @@ describe('useTimeline optimistic send flow', () => {
     __clearPersistedTimelineSnapshotsForTests();
     cleanup();
     vi.useFakeTimers();
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(
+      (cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 0) as unknown as number,
+    );
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id: number) => clearTimeout(id));
     sendSessionViaHttpMock.mockReset();
     // Default: HTTP fallback rejects (matches "the network is broken" tests).
     // Individual tests can override via `sendSessionViaHttpMock.mockResolvedValue`.
@@ -100,6 +104,12 @@ describe('useTimeline optimistic send flow', () => {
 
   afterEach(async () => {
     await cleanupRenderedTimeline();
+    // Drain frame callbacks WHILE the timer-backed rAF mock is still installed.
+    // Restoring first can leave a queued callback that fires after teardown and
+    // dereferences a cancelAnimationFrame that no longer exists — the exact
+    // hazard web/vitest.fake-timers.ts documents, and it surfaced as an
+    // unhandled error under full-suite load before this drain existed.
+    vi.runOnlyPendingTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -262,6 +272,8 @@ describe('useTimeline optimistic send flow', () => {
     act(() => {
       ref.current!.addOptimisticUserMessage('queue me', 'cmd-queued');
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
     expect(ref.current!.events).toHaveLength(1);
 
     act(() => {
@@ -287,6 +299,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].type).toBe('session.state');
@@ -327,6 +341,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].eventId).toBe('queued-state-structured');
@@ -363,6 +379,8 @@ describe('useTimeline optimistic send flow', () => {
       } as unknown as ServerMessage);
       ref.current!.addOptimisticUserMessage('must survive stale', 'cmd-stale');
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     act(() => {
       handlerBox.fn?.({
@@ -387,6 +405,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
   });
@@ -421,6 +441,8 @@ describe('useTimeline optimistic send flow', () => {
       } as unknown as ServerMessage);
       ref.current!.addOptimisticUserMessage('must survive mismatch', 'cmd-mismatch');
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     act(() => {
       handlerBox.fn?.({
@@ -445,6 +467,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
   });
@@ -468,6 +492,8 @@ describe('useTimeline optimistic send flow', () => {
         status: 'accepted',
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     const accepted = ref.current!.events.find((event) => event.payload.commandId === 'cmd-direct-accepted');
     expect(accepted?.payload.acked).toBe(true);
@@ -484,6 +510,8 @@ describe('useTimeline optimistic send flow', () => {
         failureReason: 'failed',
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     const failed = ref.current!.events.find((event) => event.payload.commandId === 'cmd-direct-failed');
     expect(failed?.payload.failed).toBe(true);
@@ -509,6 +537,8 @@ describe('useTimeline optimistic send flow', () => {
         source: 'test',
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     act(() => {
       handlerBox.fn?.({
@@ -522,6 +552,8 @@ describe('useTimeline optimistic send flow', () => {
         deliveryFrameVersion: 1,
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
   });
@@ -558,6 +590,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
     expect(ref.current!.events.some((event) => event.eventId === 'queue-delivery-event')).toBe(true);
@@ -582,6 +616,8 @@ describe('useTimeline optimistic send flow', () => {
       } as unknown as ServerMessage);
       ref.current!.addOptimisticUserMessage('reset accepted', 'cmd-reset');
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     act(() => {
       handlerBox.fn?.({
@@ -603,6 +639,8 @@ describe('useTimeline optimistic send flow', () => {
         source: 'test',
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
   });
@@ -638,6 +676,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
     expect(ref.current!.events.some((event) => event.eventId === 'running-empty-state')).toBe(true);
@@ -673,6 +713,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.map((event) => event.eventId)).toContain('queued-state-legacy');
     expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
@@ -1187,6 +1229,8 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
+    // Last-value signals coalesce; their effect lands on the next frame.
+    act(() => { vi.advanceTimersByTime(20); });
 
     expect(ref.current!.events.map((event) => event.eventId)).toEqual([
       'real-memory-user',

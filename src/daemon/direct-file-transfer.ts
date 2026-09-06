@@ -285,6 +285,52 @@ async function discardUploadResumeState(operationId: string): Promise<void> {
 
 let rtc: NodeDataChannel | null = null;
 let loadAttempted = false;
+/**
+ * Admission is closed and the native addon must never be entered again.
+ *
+ * Set BEFORE any draining so nothing new can be admitted while we drain.
+ */
+let nativeAdmissionClosed = false;
+/**
+ * Quiesce COMPLETED: drained AND cleaned up. Distinct from admission closure on
+ * purpose — closing admission is the first step, not proof that the addon is
+ * safe to replace. Treating the admission flag as completion let a repeat call
+ * authorize a package replacement while leases were still live.
+ */
+let nativeQuiesceCompleted = false;
+/**
+ * The addon reference, preserved across retries. `rtc` is cleared on the first
+ * attempt to shut admission, so a later attempt would otherwise find null and
+ * skip cleanup entirely while reporting success.
+ */
+let quiescedNativeRef: NodeDataChannel | null = null;
+/** In-flight quiesce, so concurrent callers share the real outcome. */
+let inFlightNativeQuiesce: Promise<{ ok: boolean; reason?: string; closedLeases: number }> | null = null;
+/**
+ * The REAL drain, retained across deadline responses.
+ *
+ * closeLease() removes a lease from `leases` BEFORE awaiting active transfer
+ * shutdown, and it still calls into the addon afterwards
+ * (pendingOperationChannels close, lease.peer.close). So a drain that outran
+ * its deadline leaves `leases` empty while native calls are still pending: a
+ * retry that re-snapshotted the map would see nothing to drain, clean up
+ * immediately, and report success while the original close was still running —
+ * re-creating the native-entry-after-replacement hazard this whole path exists
+ * to remove. Every attempt therefore joins THIS promise instead of taking a
+ * fresh snapshot.
+ */
+let inFlightNativeDrain: Promise<void> | null = null;
+/** Count captured with the drain, so a joining retry reports the same number. */
+let inFlightNativeDrainLeases = 0;
+
+/**
+ * Deadline for draining peers during an upgrade quiesce.
+ *
+ * Deliberately local rather than in `shared/`: this is an internal drain
+ * deadline for this module, not a protocol value exchanged with the server or
+ * the browser, so it has no cross-boundary contract to keep in sync.
+ */
+const DIRECT_FILE_TRANSFER_NATIVE_QUIESCE_TIMEOUT_MS = 10_000;
 let rtcLoadError: DirectConnectivityRuntimeError | undefined;
 const leases = new Map<string, DirectLease>();
 const activeAttempts = new Map<string, ActiveDirectTransfer>();
@@ -1618,12 +1664,202 @@ export async function handleDirectFileTransferCommand(message: unknown, sender: 
   return true;
 }
 
+/**
+ * Quiesce the native transport BEFORE anything may replace its files on disk.
+ *
+ * WHY THIS EXISTS — the upgrade SIGBUS.
+ *
+ * A detached upgrade replaces the global package, and therefore
+ * node_datachannel.node, IN PLACE while this process still has the addon
+ * mapped. The daemon then restarts and its shutdown path finally runs the
+ * direct-transfer cleanup — by which time the pages behind that live mapping
+ * belong to a different file, so the first call back into the addon faults.
+ * Both production crashes landed at the same relative offset with addr2line
+ * resolving inside rtc::Description::Media::RtpMap's copy constructor.
+ *
+ * The invariant is NOT "do not re-import after quiesce": `import()` is
+ * ESM-cached, so a re-import would hand back the same module pointing at the
+ * replaced mapping, and a guard built on re-import would fix nothing. The
+ * invariant is that once the file may have been replaced, NOTHING may enter
+ * the addon again.
+ *
+ * Ordering matters and is deliberate: `rtc` is cleared FIRST and
+ * synchronously. Every admission gate in this module is `if (!rtc)`, so that
+ * single assignment closes new leases and new PeerConnections immediately —
+ * before draining begins, rather than after it finishes. The local reference
+ * is what keeps `cleanup()` reachable exactly once, while the file is still
+ * the original one.
+ *
+ * A caller that gets `ok: false` MUST NOT replace anything. Admission stays
+ * closed, so the daemon keeps running with direct transfer degraded to relay
+ * rather than risking a fault.
+ *
+ * @param timeoutMs bound on draining. This is a deadline for reporting
+ *   failure, never a substitute for the acknowledgement itself.
+ */
+export async function quiesceDirectFileTransferNative(
+  timeoutMs = DIRECT_FILE_TRANSFER_NATIVE_QUIESCE_TIMEOUT_MS,
+): Promise<{ ok: boolean; reason?: string; closedLeases: number }> {
+  // Only a COMPLETED quiesce is standing authority. Admission closure is not:
+  // a first attempt whose drain timed out leaves admission shut with leases
+  // still live, and inheriting that flag would authorize replacement without
+  // ever proving the addon is idle.
+  if (nativeQuiesceCompleted) return { ok: true, closedLeases: 0 };
+  // Concurrent callers must observe the REAL outcome, not a second half-run.
+  if (inFlightNativeQuiesce) return inFlightNativeQuiesce;
+  const run = (async () => {
+    if (rtc) {
+      // Close admission first, synchronously, so nothing is admitted mid-drain.
+      quiescedNativeRef = rtc;
+      rtc = null;
+    }
+    nativeAdmissionClosed = true;
+    if (!inFlightNativeDrain) {
+      const current = [...leases.values()];
+      inFlightNativeDrainLeases = current.length;
+      // Started once and retained. A later attempt awaits this same promise
+      // rather than re-snapshotting a map the first attempt has already emptied.
+      inFlightNativeDrain = Promise.all(current.map((lease) => closeLease(lease, true)))
+        .then(() => undefined);
+    }
+    const drain = inFlightNativeDrain;
+    const current = { length: inFlightNativeDrainLeases };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        drain,
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('quiesce_drain_timeout')), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (error) {
+      // Peers may still be live, so the addon must NOT be cleaned up here and
+      // the caller must not replace it either. A later attempt re-drains.
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : 'quiesce_drain_failed',
+        closedLeases: 0,
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    recentOperations.clear();
+    if (quiescedNativeRef) {
+      try {
+        quiescedNativeRef.cleanup();
+      } catch (error) {
+        // Fail CLOSED. A cleanup that threw leaves the old mapping potentially
+        // callable, so replacing the file underneath it is exactly the fault
+        // this exists to prevent. Not completed, so a retry runs again.
+        return {
+          ok: false,
+          reason: error instanceof Error ? `native_cleanup_failed: ${error.message}` : 'native_cleanup_failed',
+          closedLeases: 0,
+        };
+      }
+      quiescedNativeRef = null;
+    }
+    nativeQuiesceCompleted = true;
+    logger.info({ event: 'direct_file_v2.native_quiesced', closedLeases: current.length }, 'Direct file transfer native runtime quiesced');
+    return { ok: true, closedLeases: current.length };
+  })();
+  inFlightNativeQuiesce = run;
+  try {
+    return await run;
+  } finally {
+    inFlightNativeQuiesce = null;
+  }
+}
+
+/**
+ * Test seam: a PRODUCTION-SHAPED lease whose close blocks exactly where the
+ * real one does — after `leases.delete`, inside closeTransferResources awaiting
+ * `transfer.writeChain`, and therefore before the native `channel.close()` and
+ * `lease.peer.close()` calls that follow it.
+ *
+ * The previous fixture was a bare cast with no `binding`, so production
+ * closeLease threw on the first dereference and the drain rejected before it
+ * ever removed the lease. Both quiesce calls then returned false for a fixture
+ * TypeError rather than for the property under test — a false green.
+ *
+ * `nativeCallsAfterDrain` counts the addon entries that happen after the block
+ * is released, which is the hazard: they must never run after a cleanup that a
+ * retry authorized.
+ */
+export function __installBlockedLeaseForTests(): {
+  release: () => void;
+  nativeCallsAfterDrain: () => number;
+} | null {
+  if (process.env.NODE_ENV !== 'test') return null;
+  let releaseWrite: (() => void) | undefined;
+  let nativeCalls = 0;
+  const writeChain = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  const binding = {
+    serverId: 'seam-server', browserTabId: 'seam-tab', leaseId: 'seam-lease',
+    leaseGeneration: 1, daemonGeneration: 1, requestId: 'seam-request',
+    expiresAt: Date.now() + 60_000,
+  };
+  const lease = {
+    binding,
+    sender: { send: () => {} },
+    peer: { close: () => { nativeCalls += 1; } },
+    activeAttempts: new Map(),
+    pendingOperationChannels: new Map(),
+    idleTimer: null,
+    iceServers: [],
+    controlEpoch: 0,
+    terminalGrace: new Map(),
+  } as unknown as DirectLease;
+  const transfer = {
+    lease,
+    settled: false,
+    received: 0,
+    writeChain,
+    idleTimer: null,
+    uploadFileHandle: null,
+    downloadFileHandle: null,
+    partPath: null,
+    finalPath: null,
+    channel: { close: () => { nativeCalls += 1; }, getLabel: () => 'seam-channel' },
+    authority: {
+      ...binding, attemptId: 'seam-attempt', attempt: 1, operationId: 'seam-operation',
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, clientUploadId: 'seam-upload',
+      filename: 'seam.bin', size: 1, authority: 'seam', authorityExpiresAt: Date.now() + 60_000,
+      channelLabel: 'seam-channel',
+    },
+  } as unknown as ActiveDirectTransfer;
+  leases.set(leaseKey(binding.leaseId, binding.leaseGeneration), lease);
+  activeAttempts.set('seam-attempt', transfer);
+  return {
+    release: () => releaseWrite?.(),
+    nativeCallsAfterDrain: () => nativeCalls,
+  };
+}
+
+/** Whether new peers/leases are refused because the addon was quiesced. */
+export function isDirectTransferNativeQuiesced(): boolean {
+  return nativeAdmissionClosed;
+}
+
 export async function shutdownDirectFileTransfers(): Promise<void> {
   const current = [...leases.values()];
   await Promise.all(current.map((lease) => closeLease(lease, true)));
   recentOperations.clear();
-  if (rtc) {
-    try { rtc.cleanup(); } catch { /* native runtime already cleaned */ }
+  // Exactly once, and `rtc === null` is what guarantees it. Quiesce clears the
+  // reference before draining and keeps a local one, so a later SIGTERM sees
+  // null and cannot re-enter a possibly-replaced mapping. A second concurrent
+  // shutdown cannot slip through either: the tail after the await is
+  // synchronous, so whichever resumes first clears the reference before the
+  // other observes it. A separate "cleanup done" latch was tried here and
+  // removed — it was provably redundant, and its only effect was to look
+  // load-bearing while no test could distinguish it.
+  const pending = rtc ?? (nativeQuiesceCompleted ? null : quiescedNativeRef);
+  if (pending) {
+    try { pending.cleanup(); } catch { /* native runtime already cleaned */ }
+    nativeQuiesceCompleted = true;
   }
+  quiescedNativeRef = null;
   rtc = null;
+  nativeAdmissionClosed = true;
 }

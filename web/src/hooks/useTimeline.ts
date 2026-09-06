@@ -1,3 +1,4 @@
+import { isLastValueTimelineEventType } from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import {
@@ -1028,7 +1029,25 @@ function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
 function shouldFrameCoalesceTimelineEvent(event: TimelineEvent): boolean {
   return (event.type === 'assistant.text' && event.payload?.streaming === true)
     || event.type === 'tool.call'
-    || event.type === 'tool.result';
+    || event.type === 'tool.result'
+    // Last-value signals: session state, agent status, token usage, memory
+    // context, terminal snapshots, command acks. Measured on a real store they
+    // are ~84% of all events, session.state alone ~67%, and by definition only
+    // the NEWEST of each is ever rendered.
+    //
+    // They were the only high-volume class left outside this allowlist, so each
+    // arrival drove its own setEvents and its own React commit. Measured through
+    // the live WS path with one macrotask per frame — which is how frames really
+    // arrive, and where React auto-batching does NOT apply — 200 session.state
+    // frames produced 200 commits while streaming text and tool events produced
+    // one.
+    //
+    // Coalescing costs at most one animation frame and cannot lose information:
+    // same-frame arrivals collapse via preferTimelineEvent, so the newest
+    // authoritative value wins and a superseded one was never going to be
+    // displayed. Queue reconciliation rides on session.state and still applies,
+    // one frame later rather than in the same call stack.
+    || isLastValueTimelineEventType(event.type);
 }
 
 const pendingTimelineCacheIngests = new Map<string, Map<string, TimelineEvent>>();

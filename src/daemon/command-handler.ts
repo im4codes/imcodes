@@ -1192,7 +1192,7 @@ import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
-import { handleDirectFileTransferCommand } from './direct-file-transfer.js';
+import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -7763,6 +7763,39 @@ async function handleDaemonUpgrade(
         nodeBin: toolchain.nodeBin,
       }, 'daemon.upgrade: npm-cli.js not found next to the node binary; the upgrade script will fall back to `npm prefix -g` / PATH but the install may fail');
     }
+  }
+
+  // ── Native transport quiesce (BOTH platforms, before any spawn/install) ───
+  // The detached upgrade replaces the global package — and therefore
+  // node_datachannel.node — IN PLACE while this process still has the addon
+  // mapped. The daemon then restarts and its shutdown finally runs the
+  // direct-transfer cleanup, by which point the pages behind that live mapping
+  // belong to a different file. Both production crashes were SIGBUS at the same
+  // relative offset, addr2line landing in rtc::Description::Media::RtpMap.
+  //
+  // So the addon must be drained and cleaned up while its file is still the
+  // original one, and the acknowledgement must be awaited — not slept on —
+  // before anything is spawned or installed. A refused or timed-out quiesce
+  // means peers may still be live, so nothing is spawned and no package is
+  // touched: the daemon keeps running and direct transfer degrades to relay.
+  //
+  // Deliberately NOT released on abort, unlike the memory freeze below: a
+  // native runtime cannot be un-cleaned, so the safe direction is to stay
+  // degraded until the next restart rather than re-enter a replaced mapping.
+  const nativeQuiesce = await quiesceDirectFileTransferNative();
+  if (!nativeQuiesce.ok) {
+    logger.error({
+      targetVersion,
+      reason: nativeQuiesce.reason,
+    }, 'daemon.upgrade: ABORTING — direct-transfer native runtime did not quiesce, so replacing the package could fault a live mapping. Keeping the current version running; direct transfer is degraded to relay.');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'native_quiesce_failed',
+        detail: nativeQuiesce.reason ?? 'quiesce_refused',
+      });
+    } catch { /* ignore */ }
+    return;
   }
 
   let upgradeScriptSpawned = false;

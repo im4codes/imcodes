@@ -937,6 +937,36 @@ function compactSequenceCandidate(sequence: string, attempt: number): string {
   return attempt === 0 ? sequence : `${sequence}-${attempt.toString(36)}`;
 }
 
+/** Shared row -> receipt mapping, used by both the per-task and batched reads. */
+function parseAuditReceiptRows(rows: Array<Record<string, unknown>>): PersistedSupervisionAuditReceipt[] {
+  return rows.flatMap((row) => {
+    const senderIdentity = safeJsonParseObject(String(row.senderIdentityJson ?? ''));
+    let validations: PeerAuditValidationItem[] = [];
+    try {
+      const parsed = JSON.parse(String(row.validationsJson ?? '[]')) as unknown;
+      if (Array.isArray(parsed)) validations = parsed as PeerAuditValidationItem[];
+    } catch { return []; }
+    if (!senderIdentity) return [];
+    const verdict = row.verdict === 'PASS' || row.verdict === 'REWORK' ? row.verdict : undefined;
+    const supersedesReceiptId = normalizeTaskString(row.supersedesReceiptId as string | undefined);
+    return [{
+      receiptId: String(row.receiptId ?? ''),
+      taskId: String(row.taskId ?? ''),
+      assignmentId: String(row.assignmentId ?? ''),
+      attemptId: String(row.attemptId ?? ''),
+      revision: String(row.revision ?? ''),
+      sequence: Number(row.sequence ?? 0),
+      receiptKind: String(row.receiptKind ?? 'progress') as PeerAuditReceiptKind,
+      ...(verdict ? { verdict } : {}),
+      findings: String(row.findings ?? ''),
+      validations,
+      ...(supersedesReceiptId ? { supersedesReceiptId } : {}),
+      senderIdentity: senderIdentity as unknown as PersistedSupervisionTaskAssignmentIdentity,
+      createdAt: Number(row.createdAt ?? 0),
+    }];
+  });
+}
+
 function normalizeTaskString(value: string | number | null | undefined): string | undefined {
   const text = typeof value === 'number' ? String(value) : value?.trim();
   return text ? text : undefined;
@@ -1772,7 +1802,7 @@ export class SupervisionTaskRegistry {
       ? undefined
       : Math.max(1, Math.min(SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE + 1, Math.floor(filter.limit)));
     if (limit !== undefined) { sql += ' LIMIT ?'; params.push(limit); }
-    return (this.#db.prepare(sql).all(...params) as Array<Record<string, unknown>>)
+    const visible = (this.#db.prepare(sql).all(...params) as Array<Record<string, unknown>>)
       .map(parseTaskRow)
       .filter((record): record is PersistedSupervisionTaskRecord => record !== undefined)
       .filter((record) => {
@@ -1792,9 +1822,94 @@ export class SupervisionTaskRegistry {
             || selectedLiveStatus
             || isSupervisionTaskVisibleByDefault(record);
       })
-      .slice(0, limit ?? Number.MAX_SAFE_INTEGER)
-      .map((record) => this.get(record.taskId))
-      .filter((record): record is SupervisionTaskSnapshot => record !== undefined);
+      .slice(0, limit ?? Number.MAX_SAFE_INTEGER);
+    return this.#hydrateTaskSnapshots(visible);
+  }
+
+  /**
+   * Build snapshots for an ALREADY-PARSED set of task records.
+   *
+   * `list()` used to finish with `.map((record) => this.get(record.taskId))`,
+   * discarding the payloads the first SELECT had just returned and re-reading
+   * every task through `get()` — five synchronous statements each. node:sqlite
+   * is synchronous, so each one blocked the event loop, and `list()` sits on
+   * paths ordinary traffic drives: the convergence tick calls it four times per
+   * pass and the hook send path reaches it too. Measured against a copy of the
+   * real database, the tail of one call was ~218 ms at p95; batching took that
+   * to ~26 ms.
+   *
+   * Same output, but per-task cost is gone: one batched query per relation
+   * regardless of how many tasks came back.
+   */
+  #hydrateTaskSnapshots(records: PersistedSupervisionTaskRecord[]): SupervisionTaskSnapshot[] {
+    if (records.length === 0) return [];
+    const taskIds = records.map((record) => record.taskId);
+    const placeholders = taskIds.map(() => '?').join(',');
+
+    const assignmentsByTask = new Map<string, PersistedSupervisionTaskAssignment[]>();
+    for (const row of this.#db.prepare(
+      `SELECT task_id AS taskId, payload_json AS payloadJson FROM supervision_task_assignments
+       WHERE task_id IN (${placeholders}) ORDER BY created_at ASC`,
+    ).all(...taskIds) as Array<Record<string, unknown>>) {
+      const parsed = parseAssignmentRow(row);
+      if (!parsed) continue;
+      const key = String(row.taskId ?? '');
+      const bucket = assignmentsByTask.get(key);
+      if (bucket) bucket.push(parsed); else assignmentsByTask.set(key, [parsed]);
+    }
+
+    // Only the path is needed: get() already reduced file events to a sorted
+    // unique path list, so this reads strictly less than what it replaces.
+    const touchedByTask = new Map<string, Set<string>>();
+    for (const row of this.#db.prepare(
+      `SELECT task_id AS taskId, file_path AS path FROM supervision_task_file_events
+       WHERE task_id IN (${placeholders}) ORDER BY id ASC`,
+    ).all(...taskIds) as Array<Record<string, unknown>>) {
+      const key = String(row.taskId ?? '');
+      const bucket = touchedByTask.get(key) ?? new Set<string>();
+      bucket.add(String(row.path ?? ''));
+      touchedByTask.set(key, bucket);
+    }
+
+    const receiptsByTask = new Map<string, PersistedSupervisionAuditReceipt[]>();
+    for (const receipt of parseAuditReceiptRows(this.#db.prepare(
+      `SELECT receipt_id AS receiptId, task_id AS taskId, assignment_id AS assignmentId,
+              attempt_id AS attemptId, revision, sequence, receipt_kind AS receiptKind,
+              verdict, findings, validations_json AS validationsJson,
+              supersedes_receipt_id AS supersedesReceiptId,
+              sender_identity_json AS senderIdentityJson, created_at AS createdAt
+       FROM supervision_audit_receipts
+       WHERE task_id IN (${placeholders}) ORDER BY created_at ASC, sequence ASC`,
+    ).all(...taskIds) as Array<Record<string, unknown>>)) {
+      const bucket = receiptsByTask.get(receipt.taskId);
+      if (bucket) bucket.push(receipt); else receiptsByTask.set(receipt.taskId, [receipt]);
+    }
+
+    const evidenceByTask = new Map<string, PersistedSupervisionCompletionEvidence[]>();
+    for (const row of this.#db.prepare(
+      `SELECT task_id AS taskId, payload_json AS payloadJson FROM supervision_task_completion_evidence
+       WHERE task_id IN (${placeholders}) ORDER BY created_at ASC, evidence_id ASC`,
+    ).all(...taskIds) as Array<Record<string, unknown>>) {
+      const parsed = parseCompletionEvidenceRow(row);
+      if (!parsed) continue;
+      const key = String(row.taskId ?? '');
+      const bucket = evidenceByTask.get(key);
+      if (bucket) bucket.push(parsed); else evidenceByTask.set(key, [parsed]);
+    }
+
+    return records.map((record) => {
+      const auditReceipts = receiptsByTask.get(record.taskId) ?? [];
+      const completionEvidence = evidenceByTask.get(record.taskId) ?? [];
+      return {
+        ...record,
+        assignments: assignmentsByTask.get(record.taskId) ?? [],
+        // Matches listFileClaims, which is a stub returning [].
+        fileClaims: [],
+        touchedFiles: [...(touchedByTask.get(record.taskId) ?? [])].sort(),
+        ...(auditReceipts.length > 0 ? { auditReceipts } : {}),
+        ...(completionEvidence.length > 0 ? { completionEvidence } : {}),
+      };
+    });
   }
 
   listAssignments(taskId: string): PersistedSupervisionTaskAssignment[] {
@@ -1909,32 +2024,7 @@ export class SupervisionTaskRegistry {
       FROM supervision_audit_receipts
       WHERE task_id = ? ORDER BY created_at ASC, sequence ASC
     `).all(taskId) as Array<Record<string, unknown>>;
-    return rows.flatMap((row) => {
-      const senderIdentity = safeJsonParseObject(String(row.senderIdentityJson ?? ''));
-      let validations: PeerAuditValidationItem[] = [];
-      try {
-        const parsed = JSON.parse(String(row.validationsJson ?? '[]')) as unknown;
-        if (Array.isArray(parsed)) validations = parsed as PeerAuditValidationItem[];
-      } catch { return []; }
-      if (!senderIdentity) return [];
-      const verdict = row.verdict === 'PASS' || row.verdict === 'REWORK' ? row.verdict : undefined;
-      const supersedesReceiptId = normalizeTaskString(row.supersedesReceiptId as string | undefined);
-      return [{
-        receiptId: String(row.receiptId ?? ''),
-        taskId: String(row.taskId ?? ''),
-        assignmentId: String(row.assignmentId ?? ''),
-        attemptId: String(row.attemptId ?? ''),
-        revision: String(row.revision ?? ''),
-        sequence: Number(row.sequence ?? 0),
-        receiptKind: String(row.receiptKind ?? 'progress') as PeerAuditReceiptKind,
-        ...(verdict ? { verdict } : {}),
-        findings: String(row.findings ?? ''),
-        validations,
-        ...(supersedesReceiptId ? { supersedesReceiptId } : {}),
-        senderIdentity: senderIdentity as unknown as PersistedSupervisionTaskAssignmentIdentity,
-        createdAt: Number(row.createdAt ?? 0),
-      }];
-    });
+    return parseAuditReceiptRows(rows);
   }
 
   listCompletionEvidence(taskId: string): PersistedSupervisionCompletionEvidence[] {
