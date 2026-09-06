@@ -38,6 +38,7 @@ import {
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
   SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
@@ -64,6 +65,7 @@ import {
   buildAuditMarkerCorrectionPrompt,
   buildAuditTargetRecoveryPrompt,
   buildSupervisionWaitingHeartbeatPrompt,
+  buildAutoAuditModeControlPrompt,
 } from './supervision-prompts.js';
 
 import {
@@ -953,6 +955,8 @@ class SupervisionAutomation {
   private emittedAuditResultAttemptIdSet = new Set<string>();
   private implementationBlockerEscalationsInFlight = new Set<string>();
   private implementationWatchdogTimer?: NodeJS.Timeout;
+  /** Last mode delivered for one source session to the current Brain runtime. */
+  private autoAuditModeDeliveryKeys = new Map<string, string>();
 
   /** Consecutive housekeeping batch failures; drives the backoff below. */
   private housekeepingFailureStreak = 0;
@@ -971,6 +975,7 @@ class SupervisionAutomation {
   __setAutomaticPeerAuditCompatibilityForTests(enabled: boolean): void {
     if (process.env.NODE_ENV !== 'test') return;
     this.automaticPeerAuditCompatibilityForTests = enabled;
+    this.autoAuditModeDeliveryKeys.clear();
   }
 
   /** Presentation seam for the console; this is authoritative run state. */
@@ -1089,6 +1094,97 @@ class SupervisionAutomation {
       this.checkImplementationAssignments(Date.now());
     }, IMPLEMENTATION_WATCHDOG_TICK_MS);
     this.implementationWatchdogTimer.unref?.();
+    // A runtime may already be live when lifecycle wiring finishes. The normal
+    // session.state running/idle path below covers later restores/reconnects.
+    queueMicrotask(() => this.syncAllProjectBrainModeStates());
+  }
+
+  private resolveProjectBrain(source: SessionRecord): SessionRecord | undefined {
+    const candidates = listSessions(source.projectName).filter((record) => (
+      record.role === 'brain' && record.state !== 'stopped'
+    ));
+    return candidates.length === 1 ? candidates[0] : undefined;
+  }
+
+  private syncAutoAuditModeState(
+    sourceSessionName: string,
+    snapshot: SessionSupervisionSnapshot | null | undefined,
+  ): void {
+    if (this.automaticPeerAuditCompatibilityForTests) return;
+    const source = getSession(sourceSessionName);
+    if (!source) return;
+    const brain = this.resolveProjectBrain(source);
+    if (!brain) return;
+    const runtime = getTransportRuntime(brain.name);
+    if (!runtime) return;
+    const mode = snapshot?.mode ?? SUPERVISION_MODE.OFF;
+    const brainAuthority = `${brain.sessionInstanceId ?? brain.createdAt}:${brain.runtimeEpoch ?? ''}`;
+    const deliveryKey = `${brain.name}:${brainAuthority}:${mode}`;
+    if (this.autoAuditModeDeliveryKeys.get(sourceSessionName) === deliveryKey) return;
+
+    const prompt = buildAutoAuditModeControlPrompt({
+      projectName: source.projectName,
+      sourceSessionName,
+      mode,
+    });
+    const clientMessageId = `supervision-mode-control:${sourceSessionName}:${randomUUID()}`;
+    timelineEmitter.emit(
+      brain.name,
+      'user.message',
+      {
+        text: prompt,
+        clientMessageId,
+        sourceSessionName,
+        supervisionMode: mode,
+        autoAuditEnabled: mode === SUPERVISION_MODE.SUPERVISED_AUDIT,
+        automation: true,
+        automationKind: SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
+        memoryExcluded: true,
+      },
+      { source: 'daemon', confidence: 'high', eventId: clientMessageId },
+    );
+    try {
+      runtime.send(prompt, clientMessageId, undefined, undefined, {
+        timelineCommitted: true,
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      });
+      this.autoAuditModeDeliveryKeys.set(sourceSessionName, deliveryKey);
+    } catch (error) {
+      logger.warn({
+        project: source.projectName,
+        sourceSession: sourceSessionName,
+        brainSession: brain.name,
+        err: error,
+      }, 'Supervision auto-audit mode control delivery failed');
+    }
+  }
+
+  private syncProjectBrainModeStates(brainSessionName: string): void {
+    const brain = getSession(brainSessionName);
+    if (!brain || brain.role !== 'brain' || brain.state === 'stopped') return;
+    for (const source of listSessions(brain.projectName)) {
+      const snapshot = extractSessionSupervisionSnapshot(source.transportConfig ?? null);
+      // The Brain itself always receives an explicit fail-closed OFF state.
+      // Other project sessions participate once they have a valid snapshot.
+      if (source.name !== brain.name && !snapshot) continue;
+      this.syncAutoAuditModeState(source.name, snapshot);
+    }
+  }
+
+  private clearProjectBrainModeDelivery(brainSessionName: string): void {
+    const brain = getSession(brainSessionName);
+    if (!brain || brain.role !== 'brain') return;
+    for (const source of listSessions(brain.projectName)) {
+      this.autoAuditModeDeliveryKeys.delete(source.name);
+    }
+  }
+
+  private syncAllProjectBrainModeStates(): void {
+    for (const session of listSessions()) {
+      if (session.role === 'brain' && session.state !== 'stopped') {
+        this.syncProjectBrainModeStates(session.name);
+      }
+    }
   }
 
   /** Test seam for the durable single-implementer watchdog. */
@@ -1420,6 +1516,7 @@ class SupervisionAutomation {
         && Boolean(normalizedSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
           && normalizedSnapshot.auditTargetSessionName),
     );
+    this.syncAutoAuditModeState(sessionName, normalizedSnapshot);
     if (!isBrainOwnedAutomaticSupervision(sessionName, normalizedSnapshot)) {
       this.heartbeatPausedForNeedsInput.delete(sessionName);
       this.cancelSession(sessionName);
@@ -2906,6 +3003,17 @@ class SupervisionAutomation {
       const run = this.activeRuns.get(event.sessionId);
       const state = trimString(event.payload.state);
       if (state) this.lastObservedSessionStates.set(event.sessionId, state);
+      if (state === 'error' || state === 'stopped') {
+        this.clearProjectBrainModeDelivery(event.sessionId);
+      }
+      // Restored transport runtimes normally reconnect directly to idle. Init
+      // runs before that delayed restore, so its startup microtask can observe
+      // no runtime and must be retried at the restore-complete idle boundary.
+      // The runtime-identity/mode delivery key keeps ordinary idle transitions
+      // exactly-once just like repeated running transitions.
+      if (state === 'running' || state === 'idle') {
+        this.syncProjectBrainModeStates(event.sessionId);
+      }
       if (state === 'idle' && !run) {
         const candidate = this.recentTaskCandidates.get(event.sessionId);
         const record = getSession(event.sessionId);

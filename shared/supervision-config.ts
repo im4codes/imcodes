@@ -47,6 +47,7 @@ export const SUPERVISION_CONTRACT_IDS = {
   AUDIT_HEARTBEAT: 'supervision_audit_heartbeat_v1',
   AUDIT_TARGET_RECOVERY: 'supervision_audit_target_recovery_v1',
   AUDIT_MARKER_CORRECTION: 'supervision_audit_marker_correction_v1',
+  AUTO_AUDIT_MODE_CONTROL: 'supervision_auto_audit_mode_control_v1',
   ORCHESTRATOR_CONTEXT: 'supervision_orchestrator_context_v1',
   BRAIN_WORK_DELEGATION: 'supervision_brain_work_delegation_v1',
   CONTINUATION_REPAIR: 'supervision_continuation_repair_v1',
@@ -60,6 +61,7 @@ export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-au
 export const SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND = 'supervision-audit-marker-correction' as const;
 export const SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND = 'supervision-waiting-heartbeat' as const;
 export const SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND = 'supervision-audit-heartbeat' as const;
+export const SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND = 'supervision-auto-audit-mode-control' as const;
 
 export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
   SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,

@@ -19,6 +19,7 @@ import {
   buildSupervisionExecutionPreamble,
   buildSupervisionWaitingHeartbeatPrompt,
   buildAutomaticAuditTaskPrompt,
+  buildAutoAuditModeControlPrompt,
   buildPeerAuditBriefV1,
   buildReworkBriefPrompt,
   buildSupervisionDelegationEligibilityPolicy,
@@ -121,6 +122,8 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('"beforePass":"no_delivery_finalization"');
     expect(prompt).toContain('"rerun":"minimal_on_concrete_gap"');
     expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY);
+    expect(prompt).toContain('Authoritative auto-audit mode: enabled');
+    expect(prompt).toContain('Brain coordinates and integrates');
     expect(prompt).not.toContain('同伴审计模式');
   });
 
@@ -134,7 +137,28 @@ describe('supervision prompts', () => {
       expect(prompt).toContain('"localWork":"perform_now_no_marker"');
       expect(prompt).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
+      expect(prompt).toContain('Authoritative auto-audit mode: disabled');
     }
+  });
+
+  it('builds a mode-only Brain control update that cannot duplicate audit lifecycle', () => {
+    const enabled = buildAutoAuditModeControlPrompt({
+      projectName: 'alpha',
+      sourceSessionName: 'deck_alpha_brain',
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    });
+    expect(enabled).toContain('[Contract: supervision_auto_audit_mode_control_v1]');
+    expect(enabled).toContain('autoAudit=enabled');
+    expect(enabled).toContain('exactly one automatic audit');
+    expect(enabled).toContain('must not create, cancel, replay, or duplicate');
+
+    const disabled = buildAutoAuditModeControlPrompt({
+      projectName: 'alpha',
+      sourceSessionName: 'deck_sub_impl',
+      mode: SUPERVISION_MODE.OFF,
+    });
+    expect(disabled).toContain('autoAudit=disabled');
+    expect(disabled).toContain('Policy revoked immediately');
   });
 
   it('uses one shared compact reference for continuation turns', () => {
@@ -853,8 +877,9 @@ describe('supervision user authority clause', () => {
       expect(preamble).toContain('exactly_one_structured_decision_request_to_authoritative_brain');
     }
 
-    // And the budgets must not regress because of this change.
-    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(5_000 - 250);
-    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(5_200 - 250);
+    // The authenticated mode clause is bounded while the full Brain-only duty
+    // still stays out of these sub-session preambles.
+    expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(4_900);
+    expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(5_200);
   });
 });

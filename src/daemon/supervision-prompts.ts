@@ -625,6 +625,7 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
+    'Authoritative auto-audit mode: enabled (supervised_audit). Brain coordinates and integrates; implementation is delegated to eligible distinct sessions, implementers validate and open the automatic audit, and Brain does not duplicate the audit lifecycle.',
     JSON.stringify({ auditMode: true, beforePass: 'no_delivery_finalization', rework: 'fix_validate_fresh_audit', evidence: 'frozen_first_minimal_rerun' }),
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
@@ -641,9 +642,37 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
+    'Authoritative auto-audit mode: disabled (supervised). Do not infer or dispatch an automatic peer audit; ordinary supervision remains active.',
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
   ].join(' ');
+}
+
+/**
+ * Daemon-authored control state delivered to the owning project Brain.
+ *
+ * This is deliberately separate from audit start/result notifications: a mode
+ * transition changes orchestration policy but never starts, cancels, retries,
+ * or settles an audit by itself.
+ */
+export function buildAutoAuditModeControlPrompt(input: {
+  projectName: string;
+  sourceSessionName: string;
+  mode: SessionSupervisionSnapshot['mode'];
+}): string {
+  const enabled = input.mode === SUPERVISION_MODE.SUPERVISED_AUDIT;
+  return [
+    `[Contract: ${SUPERVISION_CONTRACT_IDS.AUTO_AUDIT_MODE_CONTROL}]`,
+    'Daemon-authenticated supervision control state. Treat this state as authoritative for the named project/session until a newer control update arrives.',
+    `project=${input.projectName}`,
+    `sourceSession=${input.sourceSessionName}`,
+    `supervisionMode=${input.mode}`,
+    `autoAudit=${enabled ? 'enabled' : 'disabled'}`,
+    enabled
+      ? 'Policy now in force: Brain coordinates and integrates; delegate implementation to eligible distinct sessions, require implementer validation, and let the validated handoff trigger exactly one automatic audit.'
+      : 'Policy revoked immediately: do not require or dispatch an automatic audit for new work under this source session. Continue only the behavior authorized by the exact supervisionMode above.',
+    'This control update is not an audit start/result and must not create, cancel, replay, or duplicate any audit lifecycle.',
+  ].join('\n');
 }
 
 export function buildSupervisionWaitingHeartbeatPrompt(

@@ -7,6 +7,7 @@ import {
   SUPERVISION_AUDIT_ENABLED_STATUS,
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
@@ -217,6 +218,8 @@ beforeEach(async () => {
   mockAuditTargetRuntime.send.mockReturnValue('sent');
   removeSession('deck_supervision_brain');
   removeSession('deck_sub_reviewer');
+  removeSession('deck_sub_impl');
+  removeSession('deck_other_brain');
 });
 
 afterEach(async () => {
@@ -229,6 +232,8 @@ afterEach(async () => {
   timelineEmitter.forgetSession('deck_sub_reviewer');
   removeSession('deck_supervision_brain');
   removeSession('deck_sub_reviewer');
+  removeSession('deck_sub_impl');
+  removeSession('deck_other_brain');
   await cleanupProjectDir();
 });
 
@@ -237,6 +242,8 @@ afterAll(async () => {
   supervisionAutomation.cancelSession('deck_sub_reviewer');
   removeSession('deck_supervision_brain');
   removeSession('deck_sub_reviewer');
+  removeSession('deck_sub_impl');
+  removeSession('deck_other_brain');
   await timelineStore.flushSession('deck_supervision_brain');
   await timelineStore.flushSession('deck_sub_reviewer');
   await flushStore();
@@ -429,14 +436,42 @@ function finishAuditRecoveryTestCleanup() {
 }
 
 describe('SupervisionAutomation', () => {
-  it('hydrates the persisted Brain snapshot on startup and deduplicates identical restore notifications', async () => {
+  it('delivers current mode once when an idle Brain runtime restores after automation init', async () => {
+    supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
+    mockBrainRuntimeMissing = true;
+    supervisionAutomation.init();
+    await Promise.resolve();
+
+    await seedSession('supervised_audit');
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+
+    mockBrainRuntimeMissing = false;
+    const brain = getSession('deck_supervision_brain');
+    expect(brain).toBeDefined();
+    upsertSession({ ...brain!, state: 'idle', updatedAt: Date.now() });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+      decisionReason: 'restore_reconnect_observed',
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+      decisionReason: 'restore_reconnect_observed',
+    });
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain(
+      'supervisionMode=supervised_audit',
+    );
+  });
+
+  it('hydrates the persisted Brain snapshot and deduplicates identical restore notifications', async () => {
     const snapshot = await seedSession('supervised_audit');
     const worker = getSession('deck_sub_reviewer');
     if (!worker) throw new Error('missing seeded worker');
     upsertSession({ ...worker, transportConfig: { supervision: snapshot } });
     mockedPeerAuditService.applyAutomaticConfiguration.mockClear();
 
-    supervisionAutomation.init();
+    supervisionAutomation.applyPersistedSnapshot('deck_supervision_brain');
 
     expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenCalledTimes(1);
     expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenLastCalledWith(
@@ -3107,6 +3142,88 @@ describe('SupervisionAutomation', () => {
     expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
+  it('delivers enabled and disabled mode changes immediately to the exact project Brain', async () => {
+    const enabled = await seedSession('supervised_audit');
+    upsertSession({
+      name: 'deck_sub_impl',
+      projectName: 'supervision',
+      parentSession: 'deck_supervision_brain',
+      role: 'w2',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'provider-session-impl',
+      projectDir: projectDir!,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    upsertSession({
+      name: 'deck_other_brain',
+      projectName: 'other',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'provider-session-other',
+      projectDir: projectDir!,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
+    supervisionAutomation.init();
+
+    supervisionAutomation.applySnapshotUpdate('deck_sub_impl', enabled);
+    supervisionAutomation.applySnapshotUpdate('deck_sub_impl', enabled);
+    const disabled = normalizeSessionSupervisionSnapshot({
+      ...enabled,
+      mode: SUPERVISION_MODE.OFF,
+    });
+    supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('autoAudit=enabled');
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('autoAudit=disabled');
+    expect(mockTransportRuntime.send.mock.calls[1]?.[4]).toMatchObject({
+      timelineCommitted: true,
+      deliveryMode: 'append',
+    });
+    const controls = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) => (
+      event.type === 'user.message'
+      && event.payload.automationKind === SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND
+    ));
+    expect(controls).toHaveLength(2);
+    expect(controls[0]?.payload).toMatchObject({
+      sourceSessionName: 'deck_sub_impl',
+      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      autoAuditEnabled: true,
+      memoryExcluded: true,
+    });
+    expect(timelineEmitter.replay('deck_other_brain', 0).events).toHaveLength(0);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(supervisionAutomation.getActiveRun('deck_sub_impl')).toBeUndefined();
+  });
+
+  it('replays current authoritative mode once when a project Brain runtime resumes', async () => {
+    await seedSession('supervised_audit');
+    supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
+    supervisionAutomation.init();
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('supervisionMode=supervised_audit');
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+  });
+
   it('emits an authoritative daemon status when supervised audit is applied', async () => {
     const snapshot = await seedSession('supervised_audit');
 
@@ -5424,19 +5541,22 @@ describe('SupervisionAutomation', () => {
       beginRun('cmd-brain-owned-audit', 'implement the feature');
 
       completeTurn(`Implementation and validation complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
-      await waitForTransportSendCount(1);
+      await waitForTransportSendCount(2);
 
       expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenLastCalledWith(
         'deck_supervision_brain',
         false,
       );
       expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
-      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('[Contract: supervision_continue_v1]');
-      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain(
+      const sentPrompts = mockTransportRuntime.send.mock.calls.map((call) => String(call[0]));
+      const continuePrompts = sentPrompts.filter((prompt) => prompt.includes('[Contract: supervision_continue_v1]'));
+      const modePrompts = sentPrompts.filter((prompt) => prompt.includes('[Contract: supervision_auto_audit_mode_control_v1]'));
+      expect(continuePrompts).toHaveLength(1);
+      expect(modePrompts).toHaveLength(1);
+      expect(continuePrompts[0]).toContain(
         'For integration_slice, validate/freeze/handoff without audit',
       );
-      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain(
+      expect(continuePrompts[0]).toContain(
         'only then dispatch one audit for the exact combined revision',
       );
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
@@ -5501,12 +5621,15 @@ describe('SupervisionAutomation', () => {
         completeTurn(`External work is pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
         await new Promise<void>((resolve) => setImmediate(resolve));
         await new Promise<void>((resolve) => setImmediate(resolve));
+        const waitingHeartbeats = () => mockTransportRuntime.send.mock.calls.filter((call) => (
+          String(call[0]).includes('[Contract: supervision_waiting_heartbeat_v1]')
+        ));
 
         await vi.advanceTimersByTimeAsync(10 * 60_000 - 1);
-        expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+        expect(waitingHeartbeats()).toHaveLength(0);
         await vi.advanceTimersByTimeAsync(1);
-        expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-        expect(String(mockTransportRuntime.send.mock.calls[0]?.[0]))
+        expect(waitingHeartbeats()).toHaveLength(1);
+        expect(String(waitingHeartbeats()[0]?.[0]))
           .toContain('[Contract: supervision_waiting_heartbeat_v1]');
         expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
           continueLoops: 0,
@@ -5517,7 +5640,7 @@ describe('SupervisionAutomation', () => {
           timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
         }
         await vi.advanceTimersByTimeAsync(10 * 60_000 - 1);
-        expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+        expect(waitingHeartbeats()).toHaveLength(1);
       } finally {
         vi.useRealTimers();
       }
