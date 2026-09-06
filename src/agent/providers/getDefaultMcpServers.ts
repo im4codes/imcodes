@@ -11,6 +11,7 @@ import {
   IMCODES_DAEMON_USER_ID_ENV,
   IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
 } from '../../../shared/memory-mcp-env.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../../shared/session-resource-lifecycle.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   MCP_TOOL_CATALOG_MODES,
@@ -90,6 +91,8 @@ function buildIdentityEnv(config: SessionConfig): Record<string, string> {
     [IMCODES_DAEMON_PROJECT_ROOT_ENV]: stringValue(config.cwd),
     [IMCODES_DAEMON_SERVER_ID_ENV]: stringValue(config.serverId),
     [IMCODES_DAEMON_PROVIDER_ID_ENV]: stringValue(config.providerId),
+    [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: stringValue(config.sessionInstanceId),
+    [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: stringValue(config.runtimeEpoch),
   });
 }
 

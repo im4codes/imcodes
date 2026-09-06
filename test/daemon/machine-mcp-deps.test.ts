@@ -102,6 +102,9 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
   });
 
   it('computer-use resolves ref_name → serverId and forwards to the client, preserving the outcome', async () => {
+    const resourceOwner = {
+      sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
+    };
     const computerUse = vi.fn(async (opts: { targetServerId: string; tool: string }) => ({
       outcome: 'completed' as const,
       result: {
@@ -117,6 +120,7 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
       listMachines: async () => [m({ serverId: 'srv-win', refName: 'win-1' })],
       execRemote: async () => ({ outcome: 'completed' }),
       computerUseCall: computerUse as never,
+      resourceOwner,
     });
     const r = await deps.computerUseCall?.({
       machine: 'win-1',
@@ -130,12 +134,16 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
       arguments: { app: 'msedge' },
       timeoutMs: 3000,
       sourceServerId: 's1',
+      resourceOwner,
     }));
     expect(r).toMatchObject({ outcome: 'completed', result: { ok: true, content: [{ text: 'ran:get_app_state@srv-win' }] } });
   });
 
 
   it('computer-use local target runs on the imcodes daemon host even when unbound', async () => {
+    const resourceOwner = {
+      sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
+    };
     const localComputerUse = vi.fn(async ({ tool }: { tool: string }) => ({
       outcome: 'completed' as const,
       result: {
@@ -151,9 +159,10 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
       loadCredential: async () => null,
       computerUseCall: remoteComputerUse as never,
       localComputerUseCall: localComputerUse as never,
+      resourceOwner,
     });
     const r = await deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' });
-    expect(localComputerUse).toHaveBeenCalledWith(expect.objectContaining({ tool: 'list_apps' }));
+    expect(localComputerUse).toHaveBeenCalledWith(expect.objectContaining({ tool: 'list_apps', resourceOwner }));
     expect(remoteComputerUse).not.toHaveBeenCalled();
     expect(r).toMatchObject({ outcome: 'completed', result: { content: [{ text: 'local:list_apps' }] } });
   });

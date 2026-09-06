@@ -95,13 +95,15 @@ describe('computer use IPC helper lifecycle', () => {
     dirs.push(dir);
     const pipe = join(dir, 'c.sock');
     const closeRuntime = vi.fn(async () => {});
+    const sweepOrphans = vi.fn(async () => ({}));
     const server = net.createServer((socket) => {
       socket.once('data', () => socket.destroy());
     });
     await new Promise<void>((resolve) => server.listen(pipe, resolve));
 
-    await runComputerUseIpcHelper(pipe, closeRuntime);
+    await runComputerUseIpcHelper(pipe, closeRuntime, sweepOrphans);
 
+    expect(sweepOrphans).toHaveBeenCalledOnce();
     expect(closeRuntime).toHaveBeenCalledOnce();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });

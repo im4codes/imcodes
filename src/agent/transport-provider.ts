@@ -291,6 +291,10 @@ export interface SessionConfig {
   sessionKey: string;
   /** Exact IM.codes session name whose identity is injected into managed MCP servers. */
   sessionName?: string;
+  /** Stable logical owner id for session-owned child resources. */
+  sessionInstanceId?: string;
+  /** Current runtime authority id for session-owned child resources. */
+  runtimeEpoch?: string;
   /** Runtime-bound project name for project-scoped managed MCP servers. */
   projectName?: string;
   /** Runtime-bound server id for daemon-dependent managed MCP tools. */

@@ -53,6 +53,18 @@ describe('computer-use shared protocol', () => {
       timeoutMs: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS + 1,
     }).ok).toBe(false);
     expect(validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId, tool: 'list_apps', timeoutMs: COMPUTER_USE_MAX_TIMEOUT_MS + 1 }).ok).toBe(false);
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'browser_open',
+      resourceOwner: { sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1' },
+    })).toMatchObject({ ok: true, value: { resourceOwner: { runtimeEpoch: 'epoch-1' } } });
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'browser_open',
+      resourceOwner: { sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1', forged: true },
+    })).toEqual({ ok: false, error: 'invalid_resourceOwner' });
   });
 
   it('validates strict result frames and HTTP envelopes', () => {

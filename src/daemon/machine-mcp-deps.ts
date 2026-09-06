@@ -19,6 +19,7 @@ import { execRemote as clientExecRemote, listMachines as clientListMachines, Mac
 import { computerUseCall as clientComputerUseCall } from './computer-use-client.js';
 import { fetchFileFromMachine as clientFetchFileFromMachine, sendFileToMachine as clientSendFileToMachine } from './machine-file-client.js';
 import { runComputerUseTool } from '../node/computer-use-runner.js';
+import type { SessionResourceOwnerIdentity } from '../../shared/session-resource-lifecycle.js';
 import type { ComputerUseToolResult, MachineFileToolResult, MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
 import { classifyMachineTarget } from '../../shared/machine-reference.js';
 import type { MachineListItem } from './machine-exec-client.js';
@@ -49,6 +50,7 @@ export interface DaemonMachineToolDepsOverrides {
   fetchFileFromMachine?: typeof clientFetchFileFromMachine;
   computerUseCall?: typeof clientComputerUseCall;
   localComputerUseCall?: (input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
+  resourceOwner?: SessionResourceOwnerIdentity | null;
 }
 
 const LOCAL_COMPUTER_USE_ALIASES = new Set(['local', 'localhost', 'self', 'this']);
@@ -66,13 +68,14 @@ function matchingMachines(all: readonly MachineListItem[], machine: string): Mac
     : all.filter((candidate) => candidate.refName === target.value);
 }
 
-async function defaultLocalComputerUseCall(input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }): Promise<ComputerUseToolResult> {
+async function defaultLocalComputerUseCall(input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal; resourceOwner?: SessionResourceOwnerIdentity }): Promise<ComputerUseToolResult> {
   if (input.signal?.aborted) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, error: 'computer use call aborted' };
   const result = await runComputerUseTool({
     correlationId: `local-${randomBytes(12).toString('hex')}`,
     tool: input.tool,
     ...(input.arguments ? { arguments: input.arguments } : {}),
     ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    ...(input.resourceOwner ? { resourceOwner: input.resourceOwner } : {}),
   });
   return { outcome: result.ok ? 'completed' : 'tool_error', result };
 }
@@ -86,6 +89,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
   const sendFile = overrides.sendFileToMachine ?? clientSendFileToMachine;
   const fetchFile = overrides.fetchFileFromMachine ?? clientFetchFileFromMachine;
   const localComputerUse = overrides.localComputerUseCall ?? defaultLocalComputerUseCall;
+  const resourceOwner = overrides.resourceOwner ?? undefined;
 
   const toSummary = (m: Awaited<ReturnType<typeof clientListMachines>>[number]): MachineSummaryForTool => ({
     name: m.nodeId,
@@ -243,6 +247,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
           ...(args ? { arguments: args } : {}),
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(signal ? { signal } : {}),
+          ...(resourceOwner ? { resourceOwner } : {}),
         });
       }
       if (!creds) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
@@ -270,6 +275,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         ...(args ? { arguments: args } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(signal ? { signal } : {}),
+        ...(resourceOwner ? { resourceOwner } : {}),
       });
     },
   };

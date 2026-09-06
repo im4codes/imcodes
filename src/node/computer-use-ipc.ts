@@ -10,6 +10,7 @@ import {
   runComputerUseTool,
   WINDOWS_DEFAULT_OCU_DIR,
 } from './computer-use-runner.js';
+import { sweepComputerUseOrphanedResources } from '../daemon/session-resource-service.js';
 import { applyWindowsAclCommands, windowsComputerUseHelperAclCommands } from './installer.js';
 import {
   authorizeMacosComputerUseSocket,
@@ -426,7 +427,9 @@ export class ComputerUseIpcHost {
 export async function runComputerUseIpcHelper(
   pipe: string,
   closeRuntime: () => Promise<void> = closeComputerUseRuntimeForProcessExit,
+  sweepOrphans: () => Promise<unknown> = sweepComputerUseOrphanedResources,
 ): Promise<void> {
+  await sweepOrphans();
   const socket = net.createConnection(pipe);
   const closed = new Promise<void>((resolve) => socket.once('close', resolve));
   try {

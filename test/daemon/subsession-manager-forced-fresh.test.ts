@@ -122,6 +122,16 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sendKey: vi.fn().mockResolvedValue(undefined),
   sendKeys: vi.fn().mockResolvedValue(undefined),
   getPanePids: vi.fn().mockResolvedValue([]),
+  getPaneId: vi.fn().mockResolvedValue('%1'),
+}));
+
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: (owner: { sessionInstanceId: string; runtimeEpoch: string }) => ({
+    IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+    IMCODES_RESOURCE_RUNTIME_EPOCH: owner.runtimeEpoch,
+  }),
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({

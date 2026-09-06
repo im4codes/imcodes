@@ -1,5 +1,9 @@
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
 import { DAEMON_MSG } from './daemon-events.js';
+import {
+  isSessionResourceOwnerIdentity,
+  type SessionResourceOwnerIdentity,
+} from './session-resource-lifecycle.js';
 
 export const COMPUTER_USE_TOOLS = [
   'list_apps',
@@ -79,6 +83,7 @@ export interface ComputerUseRequest {
   tool: ComputerUseToolName;
   arguments?: Record<string, unknown>;
   timeoutMs?: number;
+  resourceOwner?: SessionResourceOwnerIdentity;
 }
 
 export interface ComputerUseContentItem {
@@ -151,7 +156,7 @@ function isContentItem(value: unknown): value is ComputerUseContentItem {
   return utf8ByteLength(value.data) <= COMPUTER_USE_MAX_IMAGE_BASE64_BYTES;
 }
 
-const COMPUTER_USE_REQUEST_KEYS = new Set(['type', 'correlationId', 'tool', 'arguments', 'timeoutMs']);
+const COMPUTER_USE_REQUEST_KEYS = new Set(['type', 'correlationId', 'tool', 'arguments', 'timeoutMs', 'resourceOwner']);
 const COMPUTER_USE_RESULT_KEYS = new Set(['type', 'correlationId', 'ok', 'tool', 'content', 'durationMs', 'error', 'timedOut', 'truncated']);
 const COMPUTER_USE_HTTP_ENVELOPE_KEYS = new Set(['protocol', 'version', 'outcome', 'result', 'reason']);
 const COMPUTER_USE_HTTP_REASONS: ReadonlySet<string> = new Set(Object.values(COMPUTER_USE_HTTP_REASON));
@@ -170,6 +175,10 @@ export function validateComputerUseFrame(raw: unknown): ValidationResult<Compute
     && (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > maxTimeoutMs)) {
     return { ok: false, error: 'invalid_timeoutMs' };
   }
+  const resourceOwner = raw.resourceOwner;
+  if (resourceOwner !== undefined) {
+    if (!isSessionResourceOwnerIdentity(resourceOwner)) return { ok: false, error: 'invalid_resourceOwner' };
+  }
   return {
     ok: true,
     value: {
@@ -178,6 +187,7 @@ export function validateComputerUseFrame(raw: unknown): ValidationResult<Compute
       tool: raw.tool,
       ...(raw.arguments !== undefined ? { arguments: raw.arguments } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(resourceOwner !== undefined ? { resourceOwner } : {}),
     },
   };
 }

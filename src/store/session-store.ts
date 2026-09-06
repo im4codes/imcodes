@@ -15,6 +15,7 @@ import type { SessionContextBootstrapState } from '../../shared/session-context-
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
+import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 
 const DEBOUNCE_MS = 500;
 
@@ -453,10 +454,15 @@ export function upsertSession(record: SessionRecord): void {
   // Persisted hydration bypasses upsert and keeps its stored id; every truly
   // absent name is therefore a new logical instance even if a stale caller
   // accidentally carries the deleted record's old id.
-  const sessionInstanceId = existing?.sessionInstanceId ?? createSessionInstanceId();
+  const sessionInstanceId = existing?.sessionInstanceId
+    ?? (isMarkedSessionLaunchIdentity(record) && isUsableSessionIdentity(record.sessionInstanceId)
+      ? record.sessionInstanceId
+      : createSessionInstanceId());
   const runtimeAuthorityChanged = existing ? didRuntimeAuthorityChange(existing, record) : false;
   const runtimeEpoch = !existing
-    ? createRuntimeEpoch()
+    ? isMarkedSessionLaunchIdentity(record) && isUsableSessionIdentity(record.runtimeEpoch)
+      ? record.runtimeEpoch
+      : createRuntimeEpoch()
     : isUsableSessionIdentity(record.runtimeEpoch)
     && record.runtimeEpoch !== existing.runtimeEpoch
     ? record.runtimeEpoch

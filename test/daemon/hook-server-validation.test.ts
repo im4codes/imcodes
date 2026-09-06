@@ -11,6 +11,10 @@ const getSessionMock = vi.hoisted(() => vi.fn());
 const upsertSessionMock = vi.hoisted(() => vi.fn());
 const listSessionsMock = vi.hoisted(() => vi.fn(() => []));
 const timelineEmitMock = vi.hoisted(() => vi.fn(() => ({})));
+const admissionControllerMock = vi.hoisted(() => ({
+  acquire: vi.fn(() => ({ action: 'accept', token: 'admission-token' })),
+  release: vi.fn((sessionName: string, token: string) => sessionName === 'deck_current_brain' && token === 'admission-token'),
+}));
 
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
@@ -24,6 +28,10 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 
 vi.mock('../../src/util/logger.js', () => ({
   default: { debug: vi.fn(), warn: vi.fn(), info: vi.fn() },
+}));
+
+vi.mock('../../src/daemon/daemon-task-admission.js', () => ({
+  getDaemonTaskAdmissionController: () => admissionControllerMock,
 }));
 
 import { startHookServer } from '../../src/daemon/hook-server.js';
@@ -57,6 +65,26 @@ function postCapabilityIdentity(
       let response = '';
       res.on('data', (chunk) => { response += chunk; });
       res.on('end', () => resolve({ status: res.statusCode!, body: response }));
+    });
+    req.on('error', reject);
+    req.end(data);
+  });
+}
+
+function postResourceAdmission(
+  port: number,
+  sessionName: string,
+  body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: '/resource-admission', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'x-imcodes-session': sessionName },
+    }, (res) => {
+      let response = '';
+      res.on('data', (chunk) => { response += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(response) as Record<string, unknown> }));
     });
     req.on('error', reject);
     req.end(data);
@@ -122,6 +150,34 @@ describe('Hook server — session validation', () => {
     expect(res.body).toBe('ignored');
     expect(timelineEmitMock).not.toHaveBeenCalledWith('deck_unknown', 'tool.call', expect.anything(), expect.anything());
     expect(hookCallback).not.toHaveBeenCalled();
+  });
+
+  it('binds task-memory admission reservations to the exact live session', async () => {
+    getSessionMock.mockImplementation((name: string) => name === 'deck_current_brain'
+      ? { name, state: 'idle', runtimeType: 'transport', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1' }
+      : null);
+    const identity = { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1' };
+    const acquired = await postResourceAdmission(port, 'deck_current_brain', { operation: 'acquire', ...identity });
+    expect(acquired).toMatchObject({ status: 200, body: { ok: true, action: 'accept' } });
+    const token = acquired.body.token;
+    expect(typeof token).toBe('string');
+    await expect(postResourceAdmission(port, 'deck_other_brain', { operation: 'release', token }))
+      .resolves.toMatchObject({ status: 403 });
+    await expect(postResourceAdmission(port, 'deck_current_brain', { operation: 'release', token, ...identity }))
+      .resolves.toMatchObject({ status: 200, body: { ok: true, released: true } });
+  });
+
+  it('rejects a stale runtime epoch before reserving daemon memory', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_current_brain', state: 'idle', runtimeType: 'transport',
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current',
+    });
+    await expect(postResourceAdmission(port, 'deck_current_brain', {
+      operation: 'acquire', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old',
+    })).resolves.toMatchObject({
+      status: 409,
+      body: { ok: false, error: 'task_admission_stale_runtime' },
+    });
   });
 
   it('rejects hook when session is gemini (not claude-code)', async () => {

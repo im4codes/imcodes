@@ -31,6 +31,15 @@ import {
   MACOS_COMPUTER_USE_RUNTIME_ROOT,
   verifyMacosComputerUseExecutable,
 } from './macos-computer-use.js';
+import {
+  registerBrowserProcessResource,
+  registerMcpProcessResource,
+  releaseSessionResource,
+  sessionResourceOwnerFromEnv,
+  startSessionResourceExpirySweep,
+  touchSessionResource,
+} from '../daemon/session-resource-service.js';
+import type { SessionResourceOwner } from '../daemon/session-resource-registry.js';
 
 export const WINDOWS_DEFAULT_OCU_DIR = 'C:\\ProgramData\\imcodes-node\\computer-use-helper';
 const WINDOWS_DEFAULT_OCU_EXE = `${WINDOWS_DEFAULT_OCU_DIR}\\open-computer-use.exe`;
@@ -358,17 +367,23 @@ class OpenComputerUseMcpClient {
   private nextId = 1;
   private pending = new Map<number, PendingMcp>();
   private starting: Promise<void> | null = null;
+  private resourceId: string | null = null;
 
-  constructor(private readonly binary: string) {}
+  constructor(
+    private readonly binary: string,
+    private readonly resourceOwner: SessionResourceOwner | null,
+  ) {}
 
   async callTool(tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
     await this.ensureStarted();
     return await this.request('tools/call', { name: tool, arguments: openComputerUseMcpToolArgs(tool, args) }, timeoutMs);
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.rejectAll(new Error('open_computer_use_mcp_closed'));
-    this.child?.kill();
+    const child = this.child;
+    await this.releaseResource();
+    child?.kill();
     this.child = null;
     this.starting = null;
     this.buffer = '';
@@ -382,23 +397,38 @@ class OpenComputerUseMcpClient {
   }
 
   private async start(): Promise<void> {
-    this.close();
+    await this.close();
     await verifyOpenComputerUseBinaryForLaunch(this.binary);
     const env = process.platform === 'win32'
       ? { ...process.env, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' }
       : process.env;
-    const child = spawn(this.binary, ['mcp'], { windowsHide: true, env });
+    const child = spawn(this.binary, ['mcp'], {
+      windowsHide: true,
+      env,
+      detached: process.platform !== 'win32',
+    });
     this.child = child;
+    if (this.resourceOwner && child.pid) {
+      try {
+        this.resourceId = await registerMcpProcessResource(this.resourceOwner, child.pid, true, 'computer-use-mcp');
+      } catch (error) {
+        child.kill();
+        this.child = null;
+        throw error;
+      }
+    }
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => this.onStdout(String(chunk)));
     child.stderr.on('data', () => {});
     child.on('error', (error) => {
       if (this.child === child) this.child = null;
+      void this.releaseResource();
       this.rejectAll(error instanceof Error ? error : new Error(String(error)));
     });
     child.on('exit', (code, signal) => {
       if (this.child === child) this.child = null;
+      void this.releaseResource();
       this.rejectAll(new Error(`open_computer_use_mcp_exited:${code ?? signal ?? 'unknown'}`));
     });
     await this.request('initialize', {
@@ -475,23 +505,49 @@ class OpenComputerUseMcpClient {
       this.pending.delete(id);
     }
   }
+
+  private async releaseResource(): Promise<void> {
+    const resourceId = this.resourceId;
+    this.resourceId = null;
+    if (resourceId && this.resourceOwner) {
+      await releaseSessionResource(resourceId, this.resourceOwner).catch(() => {});
+    }
+  }
 }
 
 let mcpClient: OpenComputerUseMcpClient | null = null;
 let mcpClientBinary = '';
+let mcpClientOwnerKey = '';
+let stopComputerUseExpirySweep: (() => void) | null = null;
 
-async function openComputerUseMcpClient(): Promise<OpenComputerUseMcpClient> {
+function computerUseOwnerKey(owner: SessionResourceOwner | null | undefined): string {
+  return owner ? JSON.stringify([owner.sessionName, owner.sessionInstanceId, owner.runtimeEpoch]) : 'unowned';
+}
+
+function ensureComputerUseExpirySweep(): void {
+  stopComputerUseExpirySweep ??= startSessionResourceExpirySweep();
+}
+
+async function openComputerUseMcpClient(owner: SessionResourceOwner | null): Promise<OpenComputerUseMcpClient> {
   const bin = await resolveOpenComputerUseBinary();
-  if (!mcpClient || mcpClientBinary !== bin) {
-    mcpClient?.close();
-    mcpClient = new OpenComputerUseMcpClient(bin);
+  const ownerKey = computerUseOwnerKey(owner);
+  if (!mcpClient || mcpClientBinary !== bin || mcpClientOwnerKey !== ownerKey) {
+    await mcpClient?.close();
+    mcpClient = new OpenComputerUseMcpClient(bin, owner);
     mcpClientBinary = bin;
+    mcpClientOwnerKey = ownerKey;
   }
   return mcpClient;
 }
 
-async function callOpenComputerUseMcpTool(tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
-  const client = await openComputerUseMcpClient();
+async function callOpenComputerUseMcpTool(
+  tool: string,
+  args: Record<string, unknown>,
+  timeoutMs: number,
+  owner: SessionResourceOwner | null,
+): Promise<unknown> {
+  if (owner) ensureComputerUseExpirySweep();
+  const client = await openComputerUseMcpClient(owner);
   const result = await client.callTool(tool, args, timeoutMs);
   if (isActionTool(tool) && typeof args.app === 'string' && args.app.trim() && isNoAppStateError(result)) {
     await client.callTool('get_app_state', { app: args.app, text_limit: 1_000, max_tree_nodes: 1_500, max_tree_depth: 80 }, timeoutMs);
@@ -1476,6 +1532,9 @@ class BrowserUseController {
   private client: CdpClient | null = null;
   private starting: Promise<CdpClient> | null = null;
   private cdpHttpEndpoint: string | null = null;
+  private resourceId: string | null = null;
+
+  constructor(private readonly resourceOwner: SessionResourceOwner | null) {}
 
   async run(tool: ComputerUseToolName, args: Record<string, unknown>, timeoutMs: number): Promise<{ content: ComputerUseContentItem[]; truncated?: boolean }> {
     if (tool === 'browser_close') {
@@ -1483,6 +1542,7 @@ class BrowserUseController {
       return { content: [{ type: 'text', text: 'browser closed' }] };
     }
     const client = await this.ensureClient(args, timeoutMs);
+    if (this.resourceId) await touchSessionResource(this.resourceId);
     if (tool === 'browser_open' || tool === 'browser_navigate') {
       const url = optionalStringArg(args, 'url');
       if (tool === 'browser_navigate' && !url) throw new Error('url_required');
@@ -1537,12 +1597,26 @@ class BrowserUseController {
       // for confined (snap/flatpak/container) browsers.
       const port = await reserveFreePort();
       const launchArgs = browserLaunchArgs(this.userDataDir, args, process.platform, process.env, port);
-      this.child = spawn(browser, launchArgs, { windowsHide: true, stdio: 'ignore' });
+      this.child = spawn(browser, launchArgs, {
+        windowsHide: true,
+        stdio: 'ignore',
+        detached: process.platform !== 'win32',
+      });
+      if (this.resourceOwner && this.child.pid) {
+        try {
+          this.resourceId = await registerBrowserProcessResource(this.resourceOwner, this.child.pid);
+        } catch (error) {
+          this.child.kill();
+          this.child = null;
+          throw error;
+        }
+      }
       this.child.once('exit', () => {
         this.client?.close();
         this.client = null;
         this.cdpHttpEndpoint = null;
         this.child = null;
+        void this.releaseResource();
       });
       const base = `http://127.0.0.1:${port}`;
       const browserUserAgent = await this.waitForCdp(base, Date.now() + Math.min(timeoutMs, 30_000));
@@ -1737,28 +1811,54 @@ class BrowserUseController {
     this.client?.close();
     this.client = null;
     this.cdpHttpEndpoint = null;
-    this.child?.kill();
+    const child = this.child;
     this.child = null;
+    await this.releaseResource();
+    child?.kill();
     const dir = this.userDataDir;
     this.userDataDir = null;
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+
+  private async releaseResource(): Promise<void> {
+    const resourceId = this.resourceId;
+    this.resourceId = null;
+    if (resourceId && this.resourceOwner) {
+      await releaseSessionResource(resourceId, this.resourceOwner).catch(() => {});
+    }
+  }
 }
 
-const browserUseController = new BrowserUseController();
+const browserUseControllers = new Map<string, BrowserUseController>();
+
+function browserUseController(owner: SessionResourceOwner | null): BrowserUseController {
+  const key = computerUseOwnerKey(owner);
+  let controller = browserUseControllers.get(key);
+  if (!controller) {
+    controller = new BrowserUseController(owner);
+    browserUseControllers.set(key, controller);
+  }
+  if (owner) ensureComputerUseExpirySweep();
+  return controller;
+}
 
 export async function closeComputerUseRuntimeForProcessExit(): Promise<void> {
-  mcpClient?.close();
+  await mcpClient?.close();
   mcpClient = null;
   mcpClientBinary = '';
+  mcpClientOwnerKey = '';
   fastPointerClient?.close();
   fastPointerClient = null;
-  await browserUseController.close();
+  await Promise.all([...browserUseControllers.values()].map((controller) => controller.close()));
+  browserUseControllers.clear();
+  stopComputerUseExpirySweep?.();
+  stopComputerUseExpirySweep = null;
 }
 
 async function runBrowserUseTool(request: ComputerUseRequest, timeoutMs: number, started: number): Promise<ComputerUseResult> {
   try {
-    const result = await browserUseController.run(request.tool, request.arguments ?? {}, timeoutMs);
+    const owner = request.resourceOwner ?? sessionResourceOwnerFromEnv();
+    const result = await browserUseController(owner).run(request.tool, request.arguments ?? {}, timeoutMs);
     return {
       correlationId: request.correlationId,
       ok: true,
@@ -1851,7 +1951,10 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
       const returnOptions = parseReturnOptions(request.tool, argsObject);
       if (returnOptions.includeState || returnOptions.includeImage) {
         try {
-          const snapshot = await callOpenComputerUseMcpTool('get_app_state', { app: argsObject.app }, timeoutMs);
+          const snapshot = await callOpenComputerUseMcpTool(
+            'get_app_state', { app: argsObject.app }, timeoutMs,
+            request.resourceOwner ?? sessionResourceOwnerFromEnv(),
+          );
           const normalized = await normalizeContent(snapshot, returnOptions);
           return {
             correlationId: request.correlationId,
@@ -1880,7 +1983,12 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
   try {
     let parsed: unknown;
     try {
-      parsed = await callOpenComputerUseMcpTool(request.tool, forwardedComputerUseArgs(argsObject), timeoutMs);
+      parsed = await callOpenComputerUseMcpTool(
+        request.tool,
+        forwardedComputerUseArgs(argsObject),
+        timeoutMs,
+        request.resourceOwner ?? sessionResourceOwnerFromEnv(),
+      );
     } catch {
       const bin = await resolveOpenComputerUseBinary();
       const proc = await execFileBounded(bin, openComputerUseCallArgs(request.tool, argsJson), timeoutMs + 1_000, openComputerUseEnv(request.tool));

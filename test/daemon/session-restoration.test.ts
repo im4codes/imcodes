@@ -30,6 +30,16 @@ vi.mock('../../src/store/session-store.js', () => ({
     const all = mocks.storeListSessions() || [];
     return all.find(s => s.name === name);
   }),
+  updateSessionState: vi.fn(),
+  removeSession: vi.fn(),
+}));
+
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, preserved: 0, failed: 0 }),
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: () => ({}),
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({

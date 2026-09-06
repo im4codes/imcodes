@@ -57,6 +57,7 @@ describe('closeSingleSession', () => {
         callOrder.push('verifyClosed');
         throw new Error('tmux still alive');
       },
+      cleanupResources: () => { callOrder.push('cleanupResources'); },
       emitSuccess: () => { callOrder.push('emitSuccess'); },
       persistSuccess: () => { callOrder.push('persistSuccess'); },
       emitFailure: () => { callOrder.push('emitFailure'); },
@@ -87,6 +88,7 @@ describe('closeSingleSession', () => {
       stopTransportRuntime: () => { callOrder.push('stopTransportRuntime'); },
       killProcessRuntime: () => { callOrder.push('killProcessRuntime'); },
       verifyClosed: () => { callOrder.push('verifyClosed'); },
+      cleanupResources: () => { callOrder.push('cleanupResources'); },
       persistSuccess: () => {
         callOrder.push('persistSuccess');
         throw new Error('db update failed');
@@ -106,6 +108,7 @@ describe('closeSingleSession', () => {
       'stopWatchers',
       'killProcessRuntime',
       'verifyClosed',
+      'cleanupResources',
       'persistSuccess',
       'emitFailure',
       'persistFailure',

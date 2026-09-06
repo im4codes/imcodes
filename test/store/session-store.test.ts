@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { vi } from 'vitest';
+import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 
 // This suite exercises the real persistence module. `vi.unmock` is hoisted by
 // Vitest, so it clears any worker-inherited session-store mock BEFORE module
@@ -476,6 +477,23 @@ describe('session-store', () => {
     removeSession(base.name);
     upsertSession({ ...base, sessionInstanceId: firstId });
     expect(getSession(base.name)?.sessionInstanceId).not.toBe(firstId);
+  });
+
+  it('preserves an explicitly minted resource owner only on the trusted launch path', async () => {
+    const { upsertSession, removeSession, getSession } = await importSessionStore();
+    const base = {
+      name: 'deck_launch_identity_brain', projectName: 'identity', projectDir: '/tmp/identity',
+      role: 'brain' as const, agentType: 'codex-sdk', state: 'idle' as const,
+      restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+      sessionInstanceId: 'launch-instance', runtimeEpoch: 'launch-epoch',
+    };
+    upsertSession(markSessionLaunchIdentity({ ...base }));
+    expect(getSession(base.name)).toMatchObject({
+      sessionInstanceId: 'launch-instance', runtimeEpoch: 'launch-epoch',
+    });
+    removeSession(base.name);
+    upsertSession({ ...base });
+    expect(getSession(base.name)?.sessionInstanceId).not.toBe('launch-instance');
   });
 
   it('rotates runtimeEpoch only when runtime authority is replaced', async () => {

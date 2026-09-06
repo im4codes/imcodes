@@ -40,10 +40,18 @@ import {
   type SessionRecord,
   type SessionState,
 } from '../store/session-store.js';
+import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import logger from '../util/logger.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { timelineStore } from '../daemon/timeline-store.js';
+import {
+  registerTmuxSessionResource,
+  initializeSessionResourceLifecycle,
+  releaseSessionChildResources,
+  releaseSessionResources,
+  resourceOwnerEnv,
+} from '../daemon/session-resource-service.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
@@ -362,6 +370,10 @@ export async function stopProject(
         }
         if (await sessionExists(record.name)) throw new Error('session still exists after kill');
       },
+      cleanupResources: async () => {
+        const result = await releaseSessionResources(record);
+        if (result.failed > 0) throw new Error(`session resource cleanup failed for ${result.failed} resource(s)`);
+      },
       emitSuccess: async () => {
         if (record.name.startsWith('deck_sub_')) {
           timelineEmitter.emit(record.name, 'session.state', { state: 'stopped' });
@@ -467,6 +479,24 @@ export async function initOnStartup(): Promise<void> {
     await cleanupKnownTestTerminalSessions();
   } catch (err) {
     logger.warn({ err }, 'cleanupKnownTestTerminalSessions failed — daemon continues');
+  }
+  try {
+    const activeProcessOwners: SessionRecord[] = [];
+    for (const record of storeSessions()) {
+      if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) continue;
+      if (await sessionExists(record.name)) activeProcessOwners.push(record);
+    }
+    const swept = await initializeSessionResourceLifecycle(activeProcessOwners, async (owner, reason) => {
+      const record = getSession(owner.sessionName);
+      if (!record || record.sessionInstanceId !== owner.sessionInstanceId
+        || record.runtimeEpoch !== owner.runtimeEpoch
+        || record.state === 'stopped' || record.state === 'error') return;
+      logger.warn({ session: owner.sessionName, reason }, 'Restarting session after memory MCP watchdog termination');
+      await relaunchSessionWithSettings(record);
+    });
+    logger.info({ ...swept }, 'Session resource orphan sweep completed');
+  } catch (err) {
+    logger.warn({ err }, 'Session resource orphan sweep failed — daemon continues');
   }
   // Execution clones are ephemeral and their parent runs live in daemon memory
   // (not reattachable after a restart). Sweep ALL execution clones on startup so
@@ -886,9 +916,23 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     opencodeSessionId: effectiveRecord.opencodeSessionId,
   });
 
+  const resourceSessionInstanceId = record.sessionInstanceId?.trim() || randomUUID();
+  const resourceRuntimeEpoch = randomUUID();
+  const oldResources = await releaseSessionChildResources(record);
+  if (oldResources.failed > 0) {
+    throw new Error(`session resource cleanup failed for ${oldResources.failed} resource(s)`);
+  }
+
   // Env injection: on ConPTY (Windows), pass env directly to the PTY spawn so cmd.exe
   // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
-  const mergedEnv: Record<string, string> = { IMCODES_SESSION: record.name };
+  const mergedEnv: Record<string, string> = {
+    IMCODES_SESSION: record.name,
+    ...resourceOwnerEnv({
+      sessionName: record.name,
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+    }),
+  };
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
@@ -910,9 +954,13 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     restarts: record.restarts + 1,
     restartTimestamps: [...recentRestarts, now],
     state: 'idle',
+    sessionInstanceId: resourceSessionInstanceId,
+    runtimeEpoch: resourceRuntimeEpoch,
     updatedAt: now,
   };
   upsertSession(updated);
+  const persistedRecord = getSession(record.name);
+  if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
 
   startStructuredWatcher(record.name, effectiveRecord.agentType as AgentType, projectDir, {
     ccSessionId,
@@ -2938,6 +2986,8 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
+  const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = randomUUID();
   if (opts.fresh || !existing) clearSummarySyncHistory(name);
   const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
   const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
@@ -2957,6 +3007,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       } catch (err) {
         logger.warn({ err, session: name }, 'Failed to kill existing transport runtime before fresh launch');
       }
+    }
+  }
+
+  if (existing && !transportRuntimes.has(name)) {
+    const previousResources = await releaseSessionChildResources(existing);
+    if (previousResources.failed > 0) {
+      throw new Error(`session resource cleanup failed for ${previousResources.failed} resource(s)`);
     }
   }
 
@@ -3171,6 +3228,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
     sessionName: name,
+    sessionInstanceId: resourceSessionInstanceId,
+    runtimeEpoch: resourceRuntimeEpoch,
     projectName,
     serverId: boundServerId,
     providerId: provider.id,
@@ -3209,8 +3268,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
 
   try {
     if (!skipStore) {
-      const record: SessionRecord = {
+      const record = markSessionLaunchIdentity<SessionRecord>({
         name,
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
         projectName,
         role,
         agentType,
@@ -3272,7 +3333,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(preservedSummarySyncFingerprints && preservedSummarySyncFingerprints.length > 0
           ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
           : {}),
-      };
+      });
       // Repair legacy NULL recipients and same-instance mixed epochs against
       // the CURRENT persisted SessionRecord before upsert is allowed to rotate
       // runtimeEpoch. Doing this after upsert is too late: the ordinary epoch
@@ -3426,8 +3487,6 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh, label } = opts;
-  // Inject IMCODES_SESSION so agents can auto-detect their own session identity
-  const mergedEnv: Record<string, string> = { IMCODES_SESSION: name, ...extraEnv };
   const driver = getDriver(agentType);
   const agentVersion = await getAgentVersion(agentType);
 
@@ -3444,6 +3503,14 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   const exists = await sessionExists(name);
   const storedBeforeLaunch = getSession(name);
+  const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = !exists ? randomUUID() : storedBeforeLaunch?.runtimeEpoch ?? randomUUID();
+  // Inject both the display identity and the exact logical/runtime owner tuple.
+  const mergedEnv: Record<string, string> = {
+    ...extraEnv,
+    IMCODES_SESSION: name,
+    ...resourceOwnerEnv({ sessionName: name, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+  };
   // A missing tmux pane can be a non-fresh crash restart of the same logical
   // conversation. Only explicit fresh launches or genuinely new records reset
   // the conversation-lifetime summary ledger.
@@ -3483,6 +3550,12 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }));
 
   if (!exists) {
+    if (storedBeforeLaunch) {
+      const previousResources = await releaseSessionResources(storedBeforeLaunch);
+      if (previousResources.failed > 0) {
+        throw new Error(`session resource cleanup failed for ${previousResources.failed} resource(s)`);
+      }
+    }
     // CC: if JSONL already exists (restart via killSession+newSession), use --resume to
     // launchSession is only for NEW tmux sessions (--session-id for CC).
     // Restarts go through respawnSession which uses respawnPane + --resume.
@@ -3529,6 +3602,8 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     const summarySyncFingerprints = getSummarySyncFingerprints(name);
     const record: SessionRecord = {
       name,
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
       projectName,
       role,
       agentType,
@@ -3552,13 +3627,21 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
     };
-    upsertSession(record);
+    try {
+      await registerTmuxSessionResource(record);
+    } catch (error) {
+      if (!exists) await killSession(name).catch(() => {});
+      throw error;
+    }
+    upsertSession(markSessionLaunchIdentity(record));
     emitSessionPersist(record, name);
   } else {
     const existing = getSession(name);
     if (existing) {
       const merged: SessionRecord = {
         ...existing,
+        sessionInstanceId: resourceSessionInstanceId,
+        runtimeEpoch: resourceRuntimeEpoch,
         ...(paneId ? { paneId } : {}),
         ...(ccSessionId ? { ccSessionId } : {}),
         ...(codexSessionId ? { codexSessionId } : {}),
@@ -3571,6 +3654,8 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         updatedAt: Date.now(),
       };
       upsertSession(merged);
+      const persistedRecord = getSession(name);
+      if (persistedRecord) await registerTmuxSessionResource(persistedRecord);
       emitSessionPersist(merged, name);
     }
   }

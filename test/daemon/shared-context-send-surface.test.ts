@@ -93,6 +93,15 @@ vi.mock('../../src/daemon/subsession-manager.js', () => ({
   subSessionName: (id: string) => `deck_sub_${id}`,
 }));
 
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: vi.fn(() => ({})),
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, preserved: 0, failed: 0 }),
+  measureSessionProcessTreeRssBytes: vi.fn().mockResolvedValue(0),
+}));
+
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: vi.fn(),
   cancelP2pRun: vi.fn(),

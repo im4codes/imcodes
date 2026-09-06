@@ -2,7 +2,7 @@
  * Sub-session manager — creates/stops/rebuilds tmux sessions for sub-sessions.
  */
 
-import { newSession, killSession, sessionExists } from '../agent/tmux.js';
+import { newSession, killSession, sessionExists, getPaneId } from '../agent/tmux.js';
 import { getDriver, getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
 import type { AgentType } from '../agent/detect.js';
 import { isTransportAgent } from '../agent/detect.js';
@@ -24,6 +24,8 @@ import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../
 import { emitSessionInlineError } from './session-error.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { clearResend } from './transport-resend-queue.js';
+import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
+import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -196,6 +198,12 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const agentVersion = await getAgentVersion(agentType, sub.shellBin ?? undefined);
 
   if (await sessionExists(sessionName)) return;
+  if (storedBeforeLaunch) {
+    const previousResources = await releaseSessionResources(storedBeforeLaunch);
+    if (previousResources.failed > 0) {
+      throw new Error(`session resource cleanup failed for ${previousResources.failed} resource(s)`);
+    }
+  }
 
   // Forced fresh (process families): never feed stored identity ids into the
   // bootstrap resolver or launch opts. Drop them up front so bootstrap mints
@@ -256,7 +264,12 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     : driver.buildLaunchCommand(sessionName, launchOpts);
 
   // Resolve CC env preset if specified
-  const launchEnv: Record<string, string> = { IMCODES_SESSION: sessionName };
+  const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = createRuntimeEpoch();
+  const launchEnv: Record<string, string> = {
+    IMCODES_SESSION: sessionName,
+    ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+  };
   let presetInitMessage: string | undefined;
   if (sub.ccPreset && agentType === 'claude-code') {
     const { resolvePresetEnv, getPreset, getPresetInitMessage } = await import('./cc-presets.js');
@@ -265,8 +278,13 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     const preset = await getPreset(sub.ccPreset);
     if (preset) presetInitMessage = getPresetInitMessage(preset);
   }
+  Object.assign(launchEnv, {
+    IMCODES_SESSION: sessionName,
+    ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+  });
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
+  const paneId = await getPaneId(sessionName);
 
   if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
     const { waitForOpenCodeSessionId } = await import('./opencode-history.js');
@@ -306,12 +324,13 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   void injectInit();
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
-  upsertSession({
+  const record = markSessionLaunchIdentity<SessionRecord>({
     name: sessionName, projectName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
-    sessionInstanceId: storedBeforeLaunch?.sessionInstanceId,
+    sessionInstanceId: resourceSessionInstanceId,
     // Reaching this write means a previously absent process authority was
     // created above. Preserve the logical identity but install a new epoch.
-    runtimeEpoch: createRuntimeEpoch(),
+    runtimeEpoch: resourceRuntimeEpoch,
+    paneId,
     projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
     ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
@@ -327,6 +346,13 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...(sub.effort ? { effort: sub.effort } : {}),
     restarts: 0, restartTimestamps: [], createdAt: storedBeforeLaunch?.createdAt ?? Date.now(), updatedAt: Date.now()
   });
+  try {
+    await registerTmuxSessionResource(record);
+  } catch (error) {
+    await killSession(sessionName).catch(() => {});
+    throw error;
+  }
+  upsertSession(record);
 
   // Start Watchers
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
@@ -408,6 +434,10 @@ export async function stopSubSession(
       if (record.runtimeType !== 'transport' && await sessionExists(sessionName)) {
         throw new Error('session still exists after kill');
       }
+    },
+    cleanupResources: async () => {
+      const result = await releaseSessionResources(record);
+      if (result.failed > 0) throw new Error(`session resource cleanup failed for ${result.failed} resource(s)`);
     },
     emitSuccess: async () => {
       timelineEmitter.emit(sessionName, 'session.state', { state: 'stopped' });

@@ -35,9 +35,22 @@ import {
 import { registerMcpToolDiscovery } from './mcp-tool-discovery.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
-import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { parseMcpToolCatalogMode, type McpToolCatalogMode } from '../../shared/mcp-tool-discovery.js';
+import { MemoryMcpResourceGuard } from './memory-mcp-resource-guard.js';
+import {
+  TASK_ADMISSION,
+  TASK_ADMISSION_HOOK_PATH,
+  TASK_ADMISSION_OPERATION,
+  MEMORY_MCP_WATCHDOG,
+} from '../../shared/session-resource-lifecycle.js';
+import {
+  registerMcpProcessResource,
+  releaseSessionResource,
+  sessionResourceOwnerFromEnv,
+} from './session-resource-service.js';
+import type { SessionResourceOwner } from './session-resource-registry.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -45,10 +58,125 @@ export interface MemoryMcpServerOptions {
   messagePinToolDeps?: MessagePinMcpToolDeps;
   /** Injected by tests; production binds the real registry. */
   supervisionToolDeps?: SupervisionMcpToolDeps;
+  resourceGuard?: MemoryMcpResourceGuard;
 }
 
 export interface MemoryMcpServerCatalogOptions {
   toolCatalogMode?: McpToolCatalogMode;
+  resourceGuard?: MemoryMcpResourceGuard;
+  daemonAdmissionEnabled?: boolean;
+  daemonAdmissionOwner?: SessionResourceOwner | null;
+}
+
+const MEMORY_MCP_DEFAULT_MAX_CONCURRENT = 8;
+const MEMORY_MCP_DEFAULT_MAX_RSS_BYTES = 768 * 1024 * 1024;
+const MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+
+function positiveEnvNumber(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function createDefaultMemoryMcpResourceGuard(
+  env: Record<string, string | undefined> = process.env,
+  onSustainedCpu?: (details: { cpuRatio: number; strikes: number }) => void,
+): MemoryMcpResourceGuard {
+  return new MemoryMcpResourceGuard({
+    maxConcurrent: positiveEnvNumber(env.IMCODES_MEMORY_MCP_MAX_CONCURRENT, MEMORY_MCP_DEFAULT_MAX_CONCURRENT),
+    maxRssBytes: positiveEnvNumber(env.IMCODES_MEMORY_MCP_MAX_RSS_BYTES, MEMORY_MCP_DEFAULT_MAX_RSS_BYTES),
+    requestTimeoutMs: positiveEnvNumber(env.IMCODES_MEMORY_MCP_REQUEST_TIMEOUT_MS, MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS),
+    cpuStrikeLimit: MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT,
+    onSustainedCpu,
+  });
+}
+
+const DAEMON_ADMISSION_GATED_TOOLS = new Set<string>([
+  MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
+]);
+
+async function acquireDaemonTaskAdmission(
+  caller: McpRuntimeCaller,
+  owner: SessionResourceOwner | null,
+): Promise<{ port: number; token: string } | null> {
+  if (!caller.sessionName || !owner || owner.sessionName !== caller.sessionName) {
+    throw new Error('daemon_task_admission_identity_unavailable');
+  }
+  const port = await resolveLiveHookPort();
+  if (!port) throw new Error('daemon_task_admission_unavailable');
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const response = await postHookSend(
+      port,
+      {
+        operation: TASK_ADMISSION_OPERATION.ACQUIRE,
+        sessionInstanceId: owner.sessionInstanceId,
+        runtimeEpoch: owner.runtimeEpoch,
+      },
+      TASK_ADMISSION_HOOK_PATH,
+      caller.sessionName,
+      2_000,
+    );
+    if (response.action === TASK_ADMISSION.ACCEPT && typeof response.token === 'string') {
+      return { port, token: response.token };
+    }
+    if (response.action === TASK_ADMISSION.REJECT || Date.now() >= deadline) {
+      throw new Error(response.action === TASK_ADMISSION.REJECT
+        ? 'daemon_task_memory_budget_rejected'
+        : 'daemon_task_memory_budget_queued');
+    }
+    const retryAfterMs = typeof response.retryAfterMs === 'number'
+      ? Math.min(Math.max(response.retryAfterMs, 50), 1_000)
+      : 250;
+    await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+  }
+}
+
+async function releaseDaemonTaskAdmission(
+  caller: McpRuntimeCaller,
+  owner: SessionResourceOwner | null,
+  lease: { port: number; token: string } | null,
+): Promise<void> {
+  if (!lease || !caller.sessionName || !owner) return;
+  await postHookSend(
+    lease.port,
+    {
+      operation: TASK_ADMISSION_OPERATION.RELEASE,
+      token: lease.token,
+      sessionInstanceId: owner.sessionInstanceId,
+      runtimeEpoch: owner.runtimeEpoch,
+    },
+    TASK_ADMISSION_HOOK_PATH,
+    caller.sessionName,
+    2_000,
+  ).catch(() => {});
+}
+
+function installMemoryMcpResourceGuard(
+  server: McpServer,
+  caller: McpRuntimeCaller,
+  guard: MemoryMcpResourceGuard,
+  daemonAdmissionEnabled: boolean,
+  daemonAdmissionOwner: SessionResourceOwner | null,
+): void {
+  const original = server.registerTool.bind(server);
+  server.registerTool = ((name: string, config: unknown, callback: (...args: unknown[]) => unknown) => {
+    const guarded = async (...args: unknown[]) => guard.run(name, async () => {
+      const lease = daemonAdmissionEnabled && DAEMON_ADMISSION_GATED_TOOLS.has(name)
+        ? await acquireDaemonTaskAdmission(caller, daemonAdmissionOwner)
+        : null;
+      try {
+        return await callback(...args);
+      } finally {
+        await releaseDaemonTaskAdmission(caller, daemonAdmissionOwner, lease);
+      }
+    });
+    return original(
+      name,
+      config as Parameters<typeof original>[1],
+      guarded as Parameters<typeof original>[2],
+    );
+  }) as typeof server.registerTool;
 }
 
 type ExactStoreMcpToolDeps = MessagePinMcpToolDeps & AliasMcpToolDeps;
@@ -64,6 +192,15 @@ export function createMemoryMcpServer(
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
     version: '0.1.0',
   });
+  if (caller.transport === 'stdio') {
+    installMemoryMcpResourceGuard(
+      server,
+      caller,
+      catalogOptions.resourceGuard ?? createDefaultMemoryMcpResourceGuard(),
+      catalogOptions.daemonAdmissionEnabled === true,
+      catalogOptions.daemonAdmissionOwner ?? null,
+    );
+  }
   const registered = new Map([
     ...registerMemoryMcpTools(server, caller, toolDeps),
     ...registerCapabilityMcpTools(server, caller, toolDeps),
@@ -185,7 +322,11 @@ export async function postHookSend(
  * clone create still enforces per-run caps). Exported for unit-testing the
  * production seam without a full stdio harness.
  */
-export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolDeps): MemoryMcpToolDeps {
+export function mergeDefaultToolDeps(
+  caller: McpRuntimeCaller,
+  toolDeps: MemoryMcpToolDeps,
+  resourceOwner: SessionResourceOwner | null = sessionResourceOwnerFromEnv(),
+): MemoryMcpToolDeps {
   const usesDefaultCapabilityService = !toolDeps.capabilityService && Boolean(caller.serverId);
   const resolveCapabilityIdentity = toolDeps.resolveCapabilityIdentity
     ?? (usesDefaultCapabilityService ? resolveDaemonCapabilityIdentity : undefined);
@@ -234,7 +375,7 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
     // An injected override (tests) wins; otherwise the daemon default is used.
     // This stdio MCP server only runs on FULL nodes, so the tools are advertised
     // (a controlled node never starts it — see registerMemoryMcpTools gate).
-    machineDeps: toolDeps.machineDeps ?? createDaemonMachineToolDeps(),
+    machineDeps: toolDeps.machineDeps ?? createDaemonMachineToolDeps({ resourceOwner }),
     sendDeps: {
       ...toolDeps.sendDeps,
       // The stdio MCP runs in a child process, so its local transport/tmux
@@ -319,23 +460,70 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
 export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {}): McpServer {
   const env = options.env ?? process.env;
   const caller = parseMcpRuntimeCallerFromEnv(env, 'stdio');
+  const admissionOwner = sessionResourceOwnerFromEnv(env as NodeJS.ProcessEnv);
   return createMemoryMcpServer(
     caller,
-    mergeDefaultToolDeps(caller, options.toolDeps ?? {}),
+    mergeDefaultToolDeps(caller, options.toolDeps ?? {}, admissionOwner),
     options.messagePinToolDeps,
     // Fourth argument was MISSING, so supervisionToolDeps defaulted to {} and
     // every supervision tool reported `supervision registry not bound`.
     options.supervisionToolDeps ?? createSupervisionMcpToolDeps(),
-    { toolCatalogMode: parseMcpToolCatalogMode(env[MEMORY_MCP_ENV_KEYS.TOOL_CATALOG_MODE]) },
+    {
+      toolCatalogMode: parseMcpToolCatalogMode(env[MEMORY_MCP_ENV_KEYS.TOOL_CATALOG_MODE]),
+      resourceGuard: options.resourceGuard,
+      daemonAdmissionEnabled: Boolean(
+        admissionOwner && admissionOwner.sessionName === caller.sessionName,
+      ),
+      daemonAdmissionOwner: admissionOwner,
+    },
   );
 }
 
 export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): Promise<void> {
+  let cleanup: (() => Promise<void>) | null = null;
   try {
     await loadStore();
-    const server = createMemoryMcpServerFromEnv(options);
+    const env = options.env ?? process.env;
+    let cpuShutdownStarted = false;
+    let server: McpServer;
+    const guard = createDefaultMemoryMcpResourceGuard(env, ({ cpuRatio, strikes }) => {
+      process.stderr.write(`[memory-mcp] sustained single-core CPU: ratio=${cpuRatio.toFixed(2)} strikes=${strikes}; restarting\n`);
+      if (cpuShutdownStarted) return;
+      cpuShutdownStarted = true;
+      void server.close().finally(() => process.exit(70));
+    });
+    server = createMemoryMcpServerFromEnv({ ...options, resourceGuard: guard });
+    const owner = sessionResourceOwnerFromEnv(env as NodeJS.ProcessEnv);
+    const resourceId = owner ? await registerMcpProcessResource(owner) : null;
+    let previousCpu = process.cpuUsage();
+    let previousWall = Date.now();
+    const cpuTimer = setInterval(() => {
+      const now = Date.now();
+      const usage = process.cpuUsage(previousCpu);
+      guard.observeCpuWindow(usage.user + usage.system, now - previousWall);
+      if (guard.memoryLimitExceeded() && !cpuShutdownStarted) {
+        cpuShutdownStarted = true;
+        process.stderr.write('[memory-mcp] process RSS budget exceeded; restarting\n');
+        void server.close().finally(() => process.exit(71));
+      }
+      previousCpu = process.cpuUsage();
+      previousWall = now;
+    }, MEMORY_MCP_WATCHDOG.SAMPLE_INTERVAL_MS);
+    cpuTimer.unref?.();
+    const activeCleanup = async () => {
+      clearInterval(cpuTimer);
+      if (owner && resourceId) await releaseSessionResource(resourceId, owner).catch(() => {});
+    };
+    cleanup = activeCleanup;
+    process.once('beforeExit', () => { void activeCleanup(); });
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+      process.once(signal, () => {
+        void activeCleanup().finally(() => server.close()).finally(() => process.exit(0));
+      });
+    }
     await server.connect(new StdioServerTransport());
   } catch (err) {
+    await cleanup?.();
     if (err instanceof MemoryMcpCallerEnvError) {
       process.stderr.write(`${err.message}\n`);
       process.exitCode = 2;

@@ -44,6 +44,9 @@ import {
   type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
 import { isSendMessageId, type SendMessageId } from '../../shared/send-message-id.js';
+import { TASK_ADMISSION_HOOK_PATH, TASK_ADMISSION_OPERATION } from '../../shared/session-resource-lifecycle.js';
+import { getDaemonTaskAdmissionController } from './daemon-task-admission.js';
+import { measureSessionProcessTreeRssBytes } from './session-resource-service.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -628,6 +631,46 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     }
 
     const url = req.url;
+
+    if (url === TASK_ADMISSION_HOOK_PATH) {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      const session = senderSessionName ? getSession(senderSessionName) : null;
+      if (!session || session.state === 'stopped') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'task_admission_identity_unavailable' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        if (body.sessionInstanceId !== session.sessionInstanceId
+          || body.runtimeEpoch !== session.runtimeEpoch) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'task_admission_stale_runtime' }));
+          return;
+        }
+        const controller = getDaemonTaskAdmissionController();
+        if (body.operation === TASK_ADMISSION_OPERATION.ACQUIRE) {
+          const requestedBytes = typeof body.requestedBytes === 'number' ? body.requestedBytes : 0;
+          const sessionRssBytes = await measureSessionProcessTreeRssBytes(session);
+          const result = controller.acquire(session.name, requestedBytes, sessionRssBytes ?? Number.POSITIVE_INFINITY);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+          return;
+        }
+        if (body.operation === TASK_ADMISSION_OPERATION.RELEASE && typeof body.token === 'string') {
+          const released = controller.release(session.name, body.token);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, released }));
+          return;
+        }
+        throw new Error('invalid_task_admission_request');
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'malformed' }));
+      }
+      return;
+    }
 
     if (url === '/capability-identity') {
       const senderHeader = req.headers['x-imcodes-session'];

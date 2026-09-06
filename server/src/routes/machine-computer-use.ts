@@ -25,7 +25,7 @@ import {
 } from '../share/machine-access.js';
 
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
-const ALLOWED_BODY_KEYS = new Set(['tool', 'arguments', 'timeoutMs']);
+const ALLOWED_BODY_KEYS = new Set(['tool', 'arguments', 'timeoutMs', 'resourceOwner']);
 
 export type ComputerUseDispatcher = (
   targetServerId: string,

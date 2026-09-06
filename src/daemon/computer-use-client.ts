@@ -5,6 +5,7 @@ import {
   type ComputerUseResult,
   type ComputerUseToolName,
 } from '../../shared/computer-use.js';
+import type { SessionResourceOwnerIdentity } from '../../shared/session-resource-lifecycle.js';
 
 export interface ComputerUseRemoteOptions {
   serverUrl: string;
@@ -14,6 +15,7 @@ export interface ComputerUseRemoteOptions {
   tool: ComputerUseToolName;
   arguments?: Record<string, unknown>;
   timeoutMs?: number;
+  resourceOwner?: SessionResourceOwnerIdentity;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }
@@ -63,6 +65,7 @@ export async function computerUseCall(opts: ComputerUseRemoteOptions): Promise<C
         tool: opts.tool,
         ...(opts.arguments ? { arguments: opts.arguments } : {}),
         ...(typeof opts.timeoutMs === 'number' ? { timeoutMs: opts.timeoutMs } : {}),
+        ...(opts.resourceOwner ? { resourceOwner: opts.resourceOwner } : {}),
       }),
       ...(opts.signal ? { signal: opts.signal } : {}),
     });

@@ -84,6 +84,17 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, preserved: 0, failed: 0 }),
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: (owner: { sessionInstanceId: string; runtimeEpoch: string }) => ({
+    IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+    IMCODES_RESOURCE_RUNTIME_EPOCH: owner.runtimeEpoch,
+  }),
+}));
+
 import { launchSession } from '../../src/agent/session-manager.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

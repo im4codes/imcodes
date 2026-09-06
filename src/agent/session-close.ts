@@ -15,6 +15,7 @@ export type CloseStage =
   | 'processes'
   | 'tmux'
   | 'verify'
+  | 'resources'
   | 'persist'
   | 'events';
 
@@ -36,6 +37,7 @@ interface CloseSingleHooks {
   stopTransportRuntime(record: SessionRecord): Promise<void> | void;
   killProcessRuntime(record: SessionRecord): Promise<void> | void;
   verifyClosed(record: SessionRecord): Promise<void> | void;
+  cleanupResources?(record: SessionRecord): Promise<void> | void;
   emitSuccess(record: SessionRecord): Promise<void> | void;
   persistSuccess(record: SessionRecord): Promise<void> | void;
   emitFailure(record: SessionRecord, failure: CloseFailure): Promise<void> | void;
@@ -97,6 +99,9 @@ export async function closeSingleSession(record: SessionRecord, hooks: CloseSing
   }
 
   await recordStageFailure(failures, record, 'verify', () => hooks.verifyClosed(record));
+  if (failures.length === 0 && hooks.cleanupResources) {
+    await recordStageFailure(failures, record, 'resources', () => hooks.cleanupResources!(record));
+  }
 
   if (failures.length === 0) {
     await recordStageFailure(failures, record, 'persist', () => hooks.persistSuccess(record));
