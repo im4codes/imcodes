@@ -961,6 +961,31 @@ function readBoundedStateFile(path: string): string {
   }
 }
 
+/**
+ * fsync a directory so a completed rename survives power loss.
+ *
+ * Silent only where the platform cannot do it at all. On Windows `fsync` of a
+ * directory handle is EPERM by design, so this is a no-op there rather than a
+ * failure; everywhere else a genuine error still propagates, because losing
+ * durability silently is exactly the bug this call exists to prevent.
+ */
+function syncDirectoryBestEffort(directoryPath: string): void {
+  let handle: number;
+  try {
+    handle = openSync(directoryPath, 'r');
+  } catch (error) {
+    if (process.platform === 'win32') return;
+    throw error;
+  }
+  try {
+    fsyncSync(handle);
+  } catch (error) {
+    if (process.platform !== 'win32') throw error;
+  } finally {
+    closeSync(handle);
+  }
+}
+
 function atomicWriteJson(path: string, value: unknown): void {
   const serialized = `${JSON.stringify(value, null, 2)}\n`;
   if (Buffer.byteLength(serialized, 'utf8') > CAPABILITY_LIMITS.SYNC_FRAME_BYTES) {
@@ -973,11 +998,25 @@ function atomicWriteJson(path: string, value: unknown): void {
     const file = openSync(temporary, 'r');
     try { fsyncSync(file); } finally { closeSync(file); }
     renameSync(temporary, path);
-    const directory = openSync(dirname(path), 'r');
-    try { fsyncSync(directory); } finally { closeSync(directory); }
+    // Directory fsync makes the rename itself durable across power loss. It is
+    // POSIX-only: Windows refuses fsync on a directory handle with EPERM, and
+    // on NTFS the metadata journal already covers the rename, so there is
+    // nothing to force. Letting that EPERM escape failed the whole publish —
+    // and because the caller responds to a failed publish by clearing the
+    // authorization keys, every Windows node wiped its own capability state
+    // every 30s, re-requested a full snapshot, failed again, and never
+    // advanced its cursor. The file had already been renamed into place by
+    // this point, so the write was complete; only the extra durability step
+    // was unavailable.
+    syncDirectoryBestEffort(dirname(path));
   } finally {
     rmSync(temporary, { force: true });
   }
+}
+
+/** Test seam: the durability path is platform-dependent and must be provable. */
+export function __atomicWriteJsonForTests(path: string, value: unknown): void {
+  atomicWriteJson(path, value);
 }
 
 function atomicWriteState(path: string, state: CapabilitySyncPersistentState): void {
