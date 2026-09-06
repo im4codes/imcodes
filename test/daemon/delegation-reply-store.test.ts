@@ -243,6 +243,76 @@ describe('DelegationReplyStore', () => {
     }
   });
 
+  it('atomically converges stale SAME-assignment claims but leaves foreign authority untouched', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const exact = {
+      origin,
+      target,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-tsk-3xl',
+      auditRevision: 'revision-tsk-3xl',
+      auditedSessionName: 'deck_project_worker',
+      taskId: 'tsk_3xl',
+      assignmentId: 'asg_aon',
+    } as const;
+    const stale = store.create({
+      ...exact,
+      origin: { ...origin, sessionInstanceId: 'old-origin-instance', runtimeEpoch: 'old-origin-epoch' },
+      target: { ...target, sessionInstanceId: 'old-target-instance', runtimeEpoch: 'old-target-epoch' },
+      dispatchId: 'dispatch-stale',
+      messageId: 'message-generation-1',
+      now: 100,
+    });
+    const current = store.create({
+      ...exact,
+      dispatchId: 'dispatch-current',
+      messageId: 'message-generation-2',
+      now: 101,
+    });
+    const query = {
+      taskId: exact.taskId,
+      auditAttemptId: exact.auditAttemptId,
+      auditRevision: exact.auditRevision,
+      auditedSessionName: exact.auditedSessionName,
+      assignmentAuthority: {
+        assignmentId: exact.assignmentId,
+        messageId: current.record.messageId,
+        supersededMessageIds: [stale.record.messageId],
+        origins: [origin],
+        target,
+      },
+      now: 200,
+    } as const;
+
+    expect(store.findPendingAuditDelivery(query)).toMatchObject({
+      status: 'matched', record: { delegationId: current.record.delegationId },
+    });
+    expect(store.get(stale.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
+    expect(store.get(current.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    expect(store.findPendingAuditDelivery({ ...query, auditAttemptId: 'wrong-attempt' }))
+      .toEqual({ status: 'none' });
+    expect(store.findPendingAuditDelivery({ ...query, auditRevision: 'wrong-revision' }))
+      .toEqual({ status: 'none' });
+
+    const foreign = store.create({
+      ...exact,
+      origin: {
+        sessionName: 'deck_foreign_brain',
+        sessionInstanceId: 'foreign-origin-instance',
+        runtimeEpoch: 'foreign-origin-epoch',
+      },
+      dispatchId: 'dispatch-foreign',
+      messageId: current.record.messageId,
+      now: 300,
+    });
+    expect(store.findPendingAuditDelivery({ ...query, now: 301 })).toEqual({ status: 'ambiguous' });
+    expect(store.get(current.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    expect(store.get(foreign.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    store.close();
+    database.close();
+  });
+
   it('selects one exact ordinary assignment authority and fails closed on duplicate current rows', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });

@@ -85,6 +85,14 @@ export type CurrentAssignmentReplyAuthority =
 
 export type PendingAuditDeliveryAuthority = CurrentAssignmentReplyAuthority;
 
+export interface PendingAuditDeliveryAssignmentAuthority {
+  assignmentId: string;
+  messageId: string;
+  supersededMessageIds: readonly string[];
+  origins: readonly DelegationReplyBoundIdentity[];
+  target: DelegationReplyBoundIdentity;
+}
+
 export interface DelegationReplyStoreOptions {
   dbPath?: string;
   database?: DatabaseSyncInstance;
@@ -664,6 +672,12 @@ export class DelegationReplyStore {
     auditAttemptId: string;
     auditRevision: string;
     auditedSessionName: string;
+    /**
+     * The registry's one exact current auditor. When present it is the object
+     * authority; durable delivery rows may only be converged onto this binding.
+     */
+    assignmentAuthority?: PendingAuditDeliveryAssignmentAuthority;
+    now?: number;
   }): PendingAuditDeliveryAuthority {
     const taskId = input.taskId.trim();
     const auditAttemptId = input.auditAttemptId.trim();
@@ -672,14 +686,13 @@ export class DelegationReplyStore {
     if (!taskId || !auditAttemptId || !auditRevision || !auditedSessionName) {
       return { status: 'none' };
     }
-    const rows = this.#db.prepare(`
+    const queryRows = () => this.#db.prepare(`
       SELECT delegation_id AS delegationId
       FROM delegation_replies
       WHERE purpose = ?
         AND task_id = ?
         AND audit_attempt_id = ?
         AND audit_revision = ?
-        AND audited_session_name = ?
         AND assignment_id IS NOT NULL
         AND assignment_id <> ''
         AND status = ?
@@ -689,15 +702,101 @@ export class DelegationReplyStore {
       taskId,
       auditAttemptId,
       auditRevision,
-      auditedSessionName,
       AGENT_DELEGATION_REPLY_STATUSES.PENDING,
     ) as Array<{ delegationId?: unknown }>;
-    if (rows.length === 0) return { status: 'none' };
-    if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') {
-      return { status: 'ambiguous' };
+    const resolveRecords = (rows: Array<{ delegationId?: unknown }>) => rows
+      .map((row) => typeof row.delegationId === 'string' ? this.get(row.delegationId) : undefined)
+      .filter((record): record is DelegationReplyRecord => Boolean(record));
+    if (!input.assignmentAuthority) {
+      const rows = queryRows();
+      if (rows.length === 0) return { status: 'none' };
+      if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') {
+        return { status: 'ambiguous' };
+      }
+      const record = this.get(rows[0].delegationId);
+      return record?.auditedSessionName === auditedSessionName
+        ? { status: 'matched', record }
+        : { status: 'ambiguous' };
     }
-    const record = this.get(rows[0].delegationId);
-    return record ? { status: 'matched', record } : { status: 'none' };
+
+    const authority = input.assignmentAuthority;
+    if (!authority.assignmentId.trim() || !authority.messageId.trim()
+      || authority.origins.length === 0) return { status: 'none' };
+    const originNames = new Set(authority.origins.map((origin) => origin.sessionName));
+    const messageIds = new Set([authority.messageId, ...authority.supersededMessageIds]);
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = queryRows();
+      if (rows.length === 0) {
+        this.#db.exec('COMMIT');
+        return { status: 'none' };
+      }
+      const records = resolveRecords(rows);
+      if (records.length !== rows.length
+        || records.some((record) => (
+          record.assignmentId !== authority.assignmentId
+          || record.auditedSessionName !== auditedSessionName
+          || !originNames.has(record.origin.sessionName)
+          || record.target.sessionName !== authority.target.sessionName
+          || !messageIds.has(record.messageId)
+        ))) {
+        this.#db.exec('ROLLBACK');
+        return { status: 'ambiguous' };
+      }
+      const current = records.filter((record) => (
+        record.messageId === authority.messageId
+        && identityMatches(record.target, authority.target)
+        // A same-name old coordinator epoch is stale, not current authority.
+        // The existing coordinator-rebind path can advance it first; selecting
+        // it here would commit cleanup and then fail the caller's exact identity
+        // check after mutation.
+        && authority.origins.some((origin) => identityMatches(record.origin, origin))
+      )).reduce<DelegationReplyRecord | undefined>((latest, candidate) => (
+        !latest
+          || candidate.createdAt > latest.createdAt
+          || (candidate.createdAt === latest.createdAt && candidate.delegationId > latest.delegationId)
+          ? candidate
+          : latest
+      ), undefined);
+      // Stale runtime identities are never selected. Without one exact current
+      // claim there is no proof a resend is safe, so leave every row untouched.
+      if (!current) {
+        this.#db.exec('ROLLBACK');
+        return { status: 'ambiguous' };
+      }
+      // The registry supplies the single assignment authority. Once an exact
+      // current claim exists, older claims for that SAME object are superseded
+      // history, not competing auditors. Retire them with the selection in one
+      // SQLite write transaction so a crash can expose neither two authorities
+      // nor a partially-pruned decision.
+      this.#db.prepare(`
+        UPDATE delegation_replies
+        SET status = ?, updated_at = ?
+        WHERE purpose = ?
+          AND task_id = ?
+          AND assignment_id = ?
+          AND audit_attempt_id = ?
+          AND audit_revision = ?
+          AND status = ?
+          AND delegation_id <> ?
+      `).run(
+        AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+        input.now ?? Date.now(),
+        AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        taskId,
+        authority.assignmentId,
+        auditAttemptId,
+        auditRevision,
+        AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+        current.delegationId,
+      );
+      this.#db.exec('COMMIT');
+      const record = this.get(current.delegationId);
+      return record ? { status: 'matched', record } : { status: 'none' };
+    } catch (error) {
+      try { this.#db.exec('ROLLBACK'); } catch { /* transaction already closed */ }
+      throw error;
+    }
   }
 
   receive(input: {

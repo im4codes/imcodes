@@ -2612,6 +2612,13 @@ export interface ReadyAuditDispatchDeps {
   /** Recover a uniquely durable audit brief whose registry row was lost. */
   findAdoptableAuditDelivery?: (input: {
     taskId: string; attemptId: string; revision: string; auditedSessionName: string;
+    assignmentAuthority?: {
+      assignmentId: string;
+      messageId: SendMessageId;
+      supersededMessageIds: readonly SendMessageId[];
+      origins: readonly DelegationReplyRecord['origin'][];
+      target: DelegationReplyRecord['target'];
+    };
   }) => PendingAuditDeliveryAuthority;
   /** Internal boot-sweep marker: prior-process handoffs are abandoned. */
   recoverRestartHandoffs?: boolean;
@@ -2702,16 +2709,64 @@ function adoptExactDurableAuditDelivery(input: {
   sessions: readonly SessionRecord[];
   registry: ReturnType<typeof getSupervisionTaskRegistry>;
   deps: ReadyAuditDispatchDeps;
+  existingAssignment?: PersistedSupervisionTaskAssignment;
 }): { status: 'none' } | { status: 'blocked'; reason: string } | {
   status: 'adopted'; assignment: PersistedSupervisionTaskAssignment; messageId: SendMessageId;
 } {
+  if (input.existingAssignment
+    && (input.existingAssignment.auditAttemptId !== input.attemptId
+      || input.existingAssignment.auditRevision !== input.revision)) {
+    return { status: 'none' };
+  }
+  const exactExistingTarget = input.existingAssignment && input.sessions.find((session) => (
+    session.name === input.existingAssignment!.identity.sessionName
+    && session.sessionInstanceId === input.existingAssignment!.identity.sessionInstanceId
+    && session.runtimeEpoch === input.existingAssignment!.identity.runtimeEpoch
+  ));
+  // A stale assignment target must reach the existing-auditor fail-closed path
+  // without changing durable delivery rows.
+  if (input.existingAssignment && !exactExistingTarget) return { status: 'none' };
+  const assignmentAuthority = input.existingAssignment && exactExistingTarget ? {
+    assignmentId: input.existingAssignment.assignmentId,
+    messageId: deterministicAutomaticAuditDeliveryMessageId(
+      input.existingAssignment.assignmentId,
+      input.attemptId,
+      input.existingAssignment.generation,
+    ),
+    supersededMessageIds: Array.from(
+      { length: Math.max(0, input.existingAssignment.generation - 1) },
+      (_unused, index) => deterministicAutomaticAuditDeliveryMessageId(
+        input.existingAssignment!.assignmentId,
+        input.attemptId,
+        index + 1,
+      ),
+    ).concat(deterministicSendMessageId(
+      `auto-audit-redelivery:${input.existingAssignment.assignmentId}:${input.attemptId}`,
+    )),
+    origins: input.task.assignments
+      .filter((assignment) => assignment.role === 'coordinator'
+        || assignment.role === 'implementer'
+        || assignment.role === 'integration_owner')
+      .map((assignment) => assignment.identity),
+    target: input.existingAssignment.identity,
+  } : undefined;
   const lookup = input.deps.findAdoptableAuditDelivery
-    ?? ((query: { taskId: string; attemptId: string; revision: string; auditedSessionName: string }) => (
+    ?? ((query: {
+      taskId: string; attemptId: string; revision: string; auditedSessionName: string;
+      assignmentAuthority?: {
+        assignmentId: string; messageId: SendMessageId;
+        supersededMessageIds: readonly SendMessageId[];
+        origins: readonly DelegationReplyRecord['origin'][];
+        target: DelegationReplyRecord['target'];
+      };
+    }) => (
       getDelegationReplyStore().findPendingAuditDelivery({
         taskId: query.taskId,
         auditAttemptId: query.attemptId,
         auditRevision: query.revision,
         auditedSessionName: query.auditedSessionName,
+        ...(query.assignmentAuthority ? { assignmentAuthority: query.assignmentAuthority } : {}),
+        now: input.deps.now?.() ?? Date.now(),
       })
     ));
   const found = lookup({
@@ -2719,6 +2774,7 @@ function adoptExactDurableAuditDelivery(input: {
     attemptId: input.attemptId,
     revision: input.revision,
     auditedSessionName: input.implementer.identity.sessionName,
+    ...(assignmentAuthority ? { assignmentAuthority } : {}),
   });
   if (found.status === 'none') return { status: 'none' };
   if (found.status === 'ambiguous') {
@@ -2757,7 +2813,7 @@ function adoptExactDurableAuditDelivery(input: {
   const expectedMessageId = deterministicAutomaticAuditDeliveryMessageId(
     record.assignmentId,
     input.attemptId,
-    1,
+    input.existingAssignment?.generation ?? 1,
   );
   if (record.messageId !== expectedMessageId) {
     return { status: 'blocked', reason: 'durable audit delivery message id does not match its exact binding' };
@@ -3248,6 +3304,7 @@ export async function dispatchReadyAudit(
     sessions,
     registry,
     deps,
+    existingAssignment: existingAudit,
   });
   if (adopted.status === 'blocked') {
     const reported = await reportBlocker(implementer, adopted.reason);
