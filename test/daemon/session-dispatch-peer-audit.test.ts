@@ -230,6 +230,7 @@ describe('peer-audit dedicated dispatch', () => {
       dispatchId: 'send_dispatch_12345678' as never,
       messageId: 'send_message_12345678' as never,
       durableQueue: true,
+      suppressTimeline: true,
       queueSupervisionReference: {
         kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
       },
@@ -242,9 +243,44 @@ describe('peer-audit dedicated dispatch', () => {
       supervisionReference: {
         kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
       },
+      timelineCommitted: true,
     }));
     expect(drainTransportResendQueueForDispatchMock).toHaveBeenCalledWith('deck_sub_audit123');
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('delivers daemon control turns without projecting a second transport user message', async () => {
+    sendMock.mockReturnValue('sent');
+
+    await expect(dispatchSessionMessage(target(), 'internal continuation', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      suppressTimeline: true,
+    })).resolves.toBe('sent');
+
+    expect(sendMock).toHaveBeenCalledWith(
+      'internal continuation',
+      'send_message_12345678',
+      undefined,
+      undefined,
+      { timelineCommitted: true },
+    );
+  });
+
+  it('delivers daemon control turns to process agents without a second timeline projection', async () => {
+    const processTarget = target({ agentType: 'codex', runtimeType: 'process' });
+
+    await expect(dispatchSessionMessage(processTarget, 'internal continuation', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      suppressTimeline: true,
+    })).resolves.toBeUndefined();
+
+    expect(processSendMock).toHaveBeenCalledWith(
+      'deck_sub_audit123',
+      'internal continuation',
+      { suppressTimeline: true },
+    );
   });
 
   it('durably queues MCP delivery when the transport runtime is unavailable', async () => {

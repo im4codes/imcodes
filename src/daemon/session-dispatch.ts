@@ -64,6 +64,8 @@ export interface SessionDispatchMessageOptions {
   queueSupervisionReference?: QueueSupervisionReference;
   /** Persist before delivery. Used by daemon-owned exactly-once control traffic. */
   durableQueue?: boolean;
+  /** Deliver daemon-owned control traffic to the agent without a duplicate user timeline card. */
+  suppressTimeline?: boolean;
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
@@ -189,6 +191,7 @@ export async function dispatchSessionMessage(
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
+        ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
         queuedAt: Date.now(),
       });
       if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
@@ -212,6 +215,7 @@ export async function dispatchSessionMessage(
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
+        ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
         ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
           ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
           : {}),
@@ -236,12 +240,17 @@ export async function dispatchSessionMessage(
       if (result !== 'sent' && result !== 'appended') {
         // Unsupported providers and active-turn races retain the old durable
         // delivery guarantee. Prefer append, but never drop a peer message.
-        const fallback = options.sharedActor
+        const fallback = options.suppressTimeline
+          ? runtime.send(message, options.messageId, undefined, undefined, {
+              ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+              timelineCommitted: true,
+            })
+          : options.sharedActor
           ? runtime.send(message, options.messageId, undefined, undefined, {
               sharedActor: options.sharedActor,
             })
           : runtime.send(message, options.messageId);
-        if (fallback === 'sent') {
+        if (fallback === 'sent' && !options.suppressTimeline) {
           emitStructuredTransportUserMessage(
             target.name,
             message,
@@ -256,18 +265,25 @@ export async function dispatchSessionMessage(
         }
         return fallback;
       }
-      emitStructuredTransportUserMessage(
-        target.name,
-        message,
-        options.messageId,
-        options.sharedActor,
-      );
+      if (!options.suppressTimeline) {
+        emitStructuredTransportUserMessage(
+          target.name,
+          message,
+          options.messageId,
+          options.sharedActor,
+        );
+      }
       return 'sent';
     }
-    const result = options.sharedActor
+    const result = options.suppressTimeline
+      ? runtime.send(message, options.messageId, undefined, undefined, {
+          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+          timelineCommitted: true,
+        })
+      : options.sharedActor
       ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })
       : runtime.send(message, options.messageId);
-    if (result === 'sent') {
+    if (result === 'sent' && !options.suppressTimeline) {
       emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
     } else if (result === 'queued') {
       const queuePayload = buildTransportQueueSnapshotPayload(target.name, 'send_tool');
@@ -280,7 +296,11 @@ export async function dispatchSessionMessage(
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
-  await sendProcessSessionMessageForAutomation(target.name, message);
+  if (options.suppressTimeline) {
+    await sendProcessSessionMessageForAutomation(target.name, message, { suppressTimeline: true });
+  } else {
+    await sendProcessSessionMessageForAutomation(target.name, message);
+  }
 }
 
 /** Resolve a named session and deliver through the runtime-neutral boundary.

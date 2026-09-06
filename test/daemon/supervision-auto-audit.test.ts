@@ -353,6 +353,7 @@ describe('automatic supervision audit materialization', () => {
       currentRevision: shape.revision, auditRevision: shape.revision,
       auditAttemptId: shape.attemptId, executionPool: 'primary',
     });
+    expect(dispatch.mock.calls[0]![1].internalSuppressTimeline).toBe(true);
   });
 
   it('materializes one integration owner and directly delivers the exact authoritative pathspec after PASS', async () => {
@@ -397,6 +398,7 @@ describe('automatic supervision audit materialization', () => {
       kind: 'exact_integration', taskId: shape.taskId,
       assignmentId: owners[0]!.assignmentId, revision: shape.revision,
     });
+    expect(dispatch.mock.calls[0]![1].internalSuppressTimeline).toBe(true);
     const receiptCount = shape.registry.listAuditReceipts(shape.taskId).length;
     await expect(dispatchReadyIntegration(shape.taskId, deps)).resolves.toMatchObject({ status: 'replayed' });
     expect(dispatch).toHaveBeenCalledTimes(1);

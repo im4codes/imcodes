@@ -4783,6 +4783,8 @@ async function sendProcessSessionMessage(
     aliasAudit?: AliasSendAudit;
     /** Per-turn agent-only context that must never be projected to the timeline. */
     agentMessagePreamble?: string;
+    /** Daemon-owned control turn already represented by its lifecycle event. */
+    suppressTimeline?: boolean;
     /** Trusted daemon-owned metadata for automation surfaces such as P2P.
      * Values are projected only to the local user.message event. */
     userMessageMetadata?: Readonly<{
@@ -4806,7 +4808,9 @@ async function sendProcessSessionMessage(
   // carries only referenced names + a hash of resolved values, never plaintext.
   if (options?.aliasAudit) payload.aliasAudit = options.aliasAudit;
   if (options?.userMessageMetadata) Object.assign(payload, options.userMessageMetadata);
-  const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+  const userEvent = options?.suppressTimeline
+    ? undefined
+    : timelineEmitter.emit(sessionName, 'user.message', payload);
   if (options?.commandId && !options.ackAlreadySent) {
     const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
     emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
@@ -4895,6 +4899,7 @@ export async function sendProcessSessionMessageForAutomation(
   sessionName: string,
   text: string,
   options?: {
+    suppressTimeline?: boolean;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;
       memoryExcluded?: boolean;
@@ -4906,6 +4911,7 @@ export async function sendProcessSessionMessageForAutomation(
 ): Promise<void> {
   await sendProcessSessionMessage(sessionName, text, [], {
     originalText: text,
+    ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
   });
 }

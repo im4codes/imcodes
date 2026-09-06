@@ -298,6 +298,8 @@ export interface SendMessageInput {
   internalMessageId?: SendMessageId;
   /** Daemon-only: persist to the transport queue before attempting delivery. */
   internalDurableQueue?: true;
+  /** Daemon-only control turn: deliver to the agent without projecting a second user-visible message. */
+  internalSuppressTimeline?: true;
   /** Daemon-only durable supervision lifecycle identity. */
   internalQueueSupervisionReference?: QueueSupervisionReference;
 }
@@ -2369,6 +2371,7 @@ export async function dispatchSendMessage(
         dispatchId,
         messageId,
         ...(input.internalDurableQueue ? { durableQueue: true } : {}),
+        ...(input.internalSuppressTimeline ? { suppressTimeline: true } : {}),
         ...(input.internalQueueSupervisionReference
           ? { queueSupervisionReference: input.internalQueueSupervisionReference }
           : {}),
@@ -3572,6 +3575,7 @@ export async function dispatchReadyRework(
     idempotencyKey: `auto-rework:${task.taskId}:${revision}:${implementer.auditAttemptId}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
+    internalSuppressTimeline: true,
     task: {
       taskId: task.taskId,
       assignmentId: implementer.assignmentId,
@@ -3803,6 +3807,7 @@ export async function dispatchReadyIntegration(
     idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
+    internalSuppressTimeline: true,
     internalQueueSupervisionReference: queueReference,
   });
   if (result.status !== 'accepted') {
