@@ -68,6 +68,7 @@ import {
   buildSupervisionExecutionCapabilityId,
   evaluateSupervisionExecutionBinding,
   evaluateSupervisionObservedIdentity,
+  supervisionSelectedExecutionBindingMatches,
   type SupervisionExecutionBinding,
   type SupervisionExecutionPoolKind,
   type SupervisionExecutionPoolsConfig,
@@ -1022,6 +1023,35 @@ function supervisionObservedIdentityForTarget(
   };
 }
 
+/**
+ * Resolve the complete selected binding for one already-live target. Recovery
+ * callers must never rebuild this tuple from the stale assignment they are
+ * replacing: doing so preserves an obsolete requested capability/model while
+ * only the observed identity moves.
+ */
+export function resolveSelectedSupervisionExecutionBinding(
+  projectName: string,
+  sessions: readonly SessionRecord[],
+  target: SessionRecord,
+  pool: SupervisionExecutionPoolKind = 'primary',
+): SupervisionExecutionBinding | undefined {
+  const actual = supervisionObservedIdentityForTarget(target);
+  const checked = evaluateSupervisionExecutionBinding({
+    pools: resolveProjectAuthoritativeSupervisionPools(projectName, sessions),
+    pool,
+    actual,
+  });
+  if (!checked.ok || !actual.sessionName || !actual.sessionInstanceId
+    || !actual.runtimeEpoch || !actual.agentType || !actual.providerFamily
+    || !actual.runtimeType || !actual.model) return undefined;
+  return {
+    pool,
+    requested: checked.requested,
+    actual: actual as SupervisionObservedExecutionIdentity,
+    origin: 'reused',
+  };
+}
+
 function targetMatchesConfiguredSupervisionPool(
   pools: SupervisionExecutionPoolsConfig,
   pool: SupervisionExecutionPoolKind,
@@ -1317,8 +1347,12 @@ export async function dispatchSendMessage(
       assignment.role === 'coordinator'
       && supervisionIdentityMatches(assignment.identity, callerIdentity)
     ));
+    const coordinatorRows = task.assignments.filter((assignment) => assignment.role === 'coordinator');
+    const legacyUniqueBrainMayCoordinate = coordinatorRows.length === 0
+      && isUniqueAuthoritativeProjectBrainCaller(callerRecord, callerProjectName, allSessions);
     if (callerRecord?.role !== 'brain' || callerRecord.parentSession
-      || task.projectName !== callerProjectName || !exactCoordinator) {
+      || task.projectName !== callerProjectName
+      || (!exactCoordinator && !legacyUniqueBrainMayCoordinate)) {
       return reject(
         'task auditPolicy requires the exact authoritative project Brain coordinator',
         MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -1784,7 +1818,79 @@ export async function dispatchSendMessage(
               error: 'audit redelivery requires an exact existing assignment',
             };
           }
-          reusedAuditAssignment = candidate;
+          const auditedOwners = existing.assignments.filter((assignment) => (
+            assignment.role === 'implementer'
+            && assignment.required
+            && assignment.auditRevision === recoveryRevision
+            && !['cancelled', 'recovered', 'finalized'].includes(assignment.status)
+          ));
+          const selectedCxOrCcTransport = (
+            (targetIdentity.agentType === 'codex-sdk' && targetIdentity.providerFamily === 'openai')
+            || (targetIdentity.agentType === 'claude-code-sdk' && targetIdentity.providerFamily === 'anthropic')
+          ) && (targetRecord.runtimeType ?? getSessionRuntimeType(targetRecord.agentType)) === 'transport';
+          const exactStrictSameObjectRecovery = Boolean(
+            input.audit.strictCrossVendor === true
+            && poolSelected
+            && candidate.role === 'auditor'
+            && !AUDITOR_TERMINAL_STATUSES.has(candidate.status)
+            && ['ready_for_audit', 'ready_for_integration', 'blocked'].includes(existing.status)
+            && existing.validationState === 'passed'
+            && !existing.finalization
+            && existing.currentRevision === recoveryRevision
+            && candidate.auditRevision === recoveryRevision
+            && candidate.auditAttemptId === recoveryAttempt
+            && recoveryAuditors.length === 1
+            && recoveryAuditors[0]?.assignmentId === candidate.assignmentId
+            && auditedOwners.length === 1
+            && auditedOwners[0]?.identity.sessionName === input.audit.auditedSessionName
+            && auditedOwners[0]?.identity.providerFamily !== targetIdentity.providerFamily
+            && callerRecord?.role === 'brain'
+            && !callerRecord.parentSession
+            && callerOwnsRecovery
+            && resolveEffectiveProjectName(targetRecord, allSessions) === callerProjectName
+            && selectedCxOrCcTransport
+            && targetRecord.state !== 'stopped'
+            && targetRecord.sessionInstanceId?.trim()
+            && targetRecord.runtimeEpoch?.trim()
+          );
+          const identityDrifted = candidate.identity.sessionName !== targetIdentity.sessionName
+            || candidate.identity.sessionInstanceId !== targetIdentity.sessionInstanceId
+            || candidate.identity.runtimeEpoch !== targetIdentity.runtimeEpoch
+            || candidate.identity.agentType !== targetIdentity.agentType
+            || candidate.identity.providerFamily !== targetIdentity.providerFamily
+            || !supervisionSelectedExecutionBindingMatches(candidate.executionBinding, executionBinding);
+          if (identityDrifted) {
+            if (!exactStrictSameObjectRecovery) {
+              return {
+                status: 'error',
+                reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+                error: 'audit recovery requires one exact open selected Cx/CC transport assignment, attempt and revision',
+              };
+            }
+            const rebound = registry.rebindAuditAssignment({
+              taskId: existing.taskId,
+              assignmentId: candidate.assignmentId,
+              identity: targetIdentity,
+              callerProjectName,
+              reason: 'exact selected strict cross-vendor SAME-auditor recovery',
+              expectedGeneration: candidate.generation,
+              expectedAttemptId: recoveryAttempt,
+              expectedRevision: recoveryRevision,
+              strictCrossVendor: true,
+              executionBinding,
+              now,
+            });
+            if (!rebound.ok) {
+              return {
+                status: 'error',
+                reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+                error: `audit SAME-object rebind rejected: ${rebound.reason}`,
+              };
+            }
+            reusedAuditAssignment = rebound.value;
+          } else {
+            reusedAuditAssignment = candidate;
+          }
         }
       } else {
         const requestedExactId = input.task.assignmentId?.trim();
@@ -2016,6 +2122,21 @@ export async function dispatchSendMessage(
           now,
       });
     if (!assignment.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: `task registry rejected assignment: ${assignment.reason}` };
+
+    // A SAME-assignment continuation is addressed to the explicit live target,
+    // while executionBinding.actual is the durable record of where that work
+    // was admitted. If an administrative identity rebind updated only one of
+    // them, dispatching would deliver to one session and report/authorize the
+    // other. Refuse before minting reply authority or touching the transport;
+    // the project Brain must atomically converge the existing assignment first.
+    const boundSessionName = assignment.value.executionBinding?.actual.sessionName.trim();
+    if (assignment.replay && boundSessionName && boundSessionName !== targetIdentity.sessionName) {
+      return {
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: 'task assignment execution binding conflicts with exact target; authoritative rebind required',
+      };
+    }
 
     supervisedTaskId = taskId;
     supervisedAssignmentId = assignment.value.assignmentId;

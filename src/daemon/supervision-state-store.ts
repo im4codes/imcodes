@@ -42,6 +42,10 @@ import type {
   SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
 import { mayFinalizeEconomyAssignment } from '../../shared/supervision-execution-pool.js';
+import {
+  evaluateSupervisionObservedIdentity,
+  supervisionSelectedExecutionBindingMatches,
+} from '../../shared/supervision-execution-pool.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 import logger from '../util/logger.js';
 import { mintSupervisionId } from './supervision-id-minter.js';
@@ -4015,13 +4019,21 @@ export class SupervisionTaskRegistry {
         .filter((receipt) => receipt.assignmentId === existing.assignmentId
           && receipt.attemptId === existing.auditAttemptId
           && receipt.revision === existing.auditRevision);
-      const latestFinal = receipts.filter((receipt) => receipt.receiptKind === 'final').at(-1);
+      // A SAME-object runtime/provider rebind preserves receipt history, but it
+      // does not transfer the old sender's verdict authority to the new owner.
+      // Only a final receipt authenticated as the CURRENT bound identity may
+      // close this auditor; the rebound peer can submit a corrected final on
+      // the same attempt/revision, superseding rather than deleting history.
+      const latestFinal = receipts.filter((receipt) => (
+        receipt.receiptKind === 'final'
+        && runtimeIdentityMetadataMatches(receipt.senderIdentity, existing.identity)
+      )).at(-1);
       const verdict = (latestFinal?.verdict ?? existing.verdict)?.trim().toUpperCase();
-      if ((verdict !== 'PASS' && verdict !== 'REWORK')
-        || !existing.auditAttemptId || !existing.auditRevision
+      if (!existing.auditAttemptId || !existing.auditRevision
         || (requestedRevision && requestedRevision !== existing.auditRevision)) {
-        return { ok: false, reason: requestedRevision ? 'old_revision' : 'invalid_transition' };
+        return { ok: false, reason: 'old_revision' };
       }
+      if (verdict !== 'PASS' && verdict !== 'REWORK') return { ok: false, reason: 'invalid_transition' };
       if (receipts.length > 0 && !latestFinal) return { ok: false, reason: 'invalid_transition' };
       const claimedAssignmentIds = this.#claimedAssignmentIds(existing.taskId);
       if (existing.status === 'finalized' && !existing.leaseId
@@ -4846,48 +4858,167 @@ export class SupervisionTaskRegistry {
      */
     callerProjectName: string;
     reason: string;
+    expectedGeneration?: number;
+    expectedAttemptId?: string;
+    expectedRevision?: string;
+    strictCrossVendor?: boolean;
+    executionBinding?: SupervisionExecutionBinding;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
-    const task = this.getTaskRecord(input.taskId);
-    const assignment = this.getAssignment(input.assignmentId);
     const reason = input.reason.trim();
     const callerProjectName = normalizeTaskString(input.callerProjectName);
-    if (!task || !assignment || assignment.taskId !== task.taskId) return { ok: false, reason: 'not_found' };
-    if (!callerProjectName || task.projectName !== callerProjectName) return { ok: false, reason: 'owner_mismatch' };
-    // A daemon restart or runtime-epoch replacement strands the exact owner of
-    // ANY long-lived role, not just auditors. Coordinator and integration_owner
-    // are rebindable on the same object; attempt/revision provenance is
-    // required for auditors, where it is the audit's identity.
-    if (!SUPERVISION_REBINDABLE_EXACT_ROLES.has(assignment.role) || !reason) {
-      return { ok: false, reason: 'role_forbidden' };
-    }
-    if (assignment.role === 'auditor' && (!assignment.auditAttemptId || !assignment.auditRevision)) {
-      return { ok: false, reason: 'role_forbidden' };
-    }
-    if (assignment.auditRevision && task.currentRevision
-      && task.currentRevision !== assignment.auditRevision) return { ok: false, reason: 'old_revision' };
-    if (['finalized', 'cancelled', 'committed', 'pushed'].includes(assignment.status)
-      || ['committed', 'pushed', 'finalized'].includes(task.status)) {
-      return { ok: false, reason: 'receipt_closed' };
-    }
-    if (runtimeIdentityMetadataMatches(assignment.identity, input.identity)) {
-      return { ok: true, value: assignment, replay: true };
-    }
     const now = input.now ?? Date.now();
-    const rebound: PersistedSupervisionTaskAssignment = {
-      ...assignment,
-      identity: input.identity,
-      generation: assignment.generation + 1,
-      updatedAt: now,
-    };
-    this.#writeAssignment(rebound, 'recovered', {
-      source: 'brain_authorized_audit_identity_rebind',
-      reason,
-      priorIdentity: assignment.identity,
-      attemptId: assignment.auditAttemptId,
-      revision: assignment.auditRevision,
-    });
-    return { ok: true, value: rebound };
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(input.taskId);
+      const assignment = this.getAssignment(input.assignmentId);
+      const reject = (rejection: Extract<
+        SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment>, { ok: false }
+      >['reason']) => {
+        this.#db.exec('ROLLBACK');
+        return { ok: false as const, reason: rejection };
+      };
+      if (!task || !assignment || assignment.taskId !== task.taskId) return reject('not_found');
+      if (!callerProjectName || task.projectName !== callerProjectName) return reject('owner_mismatch');
+      // A daemon restart or runtime-epoch replacement strands the exact owner of
+      // ANY long-lived role, not just auditors. Coordinator and integration_owner
+      // are rebindable on the same object; attempt/revision provenance is
+      // required for auditors, where it is the audit's identity.
+      if (!SUPERVISION_REBINDABLE_EXACT_ROLES.has(assignment.role) || !reason) {
+        return reject('role_forbidden');
+      }
+      if (assignment.role === 'auditor' && (!assignment.auditAttemptId || !assignment.auditRevision)) {
+        return reject('role_forbidden');
+      }
+      if (input.expectedGeneration !== undefined
+        && assignment.generation !== input.expectedGeneration) return reject('conflicting_replay');
+      if (input.expectedAttemptId !== undefined
+        && assignment.auditAttemptId !== input.expectedAttemptId) return reject('old_audit_attempt');
+      if (input.expectedRevision !== undefined
+        && assignment.auditRevision !== input.expectedRevision) return reject('old_revision');
+      if (assignment.auditRevision && task.currentRevision
+        && task.currentRevision !== assignment.auditRevision) return reject('old_revision');
+      if (['finalized', 'cancelled', 'committed', 'pushed'].includes(assignment.status)
+        || ['committed', 'pushed', 'finalized'].includes(task.status)) {
+        return reject('receipt_closed');
+      }
+      const strictCrossVendor = input.strictCrossVendor === true;
+      if (strictCrossVendor && assignment.role !== 'auditor') return reject('role_forbidden');
+      const strictOwners = strictCrossVendor ? this.listAssignments(task.taskId).filter((candidate) => (
+        candidate.role === 'implementer'
+        && candidate.required
+        && candidate.auditRevision === assignment.auditRevision
+        && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+      )) : [];
+      if (strictCrossVendor && strictOwners.length !== 1) return reject('ambiguous_assignment');
+      const strictOwner = strictOwners[0];
+      if (strictOwner && strictOwner.identity.providerFamily === input.identity.providerFamily) {
+        return reject('owner_mismatch');
+      }
+      const otherOpenAuditor = strictCrossVendor && this.listAssignments(task.taskId).some((candidate) => (
+        candidate.role === 'auditor'
+        && candidate.assignmentId !== assignment.assignmentId
+        && candidate.auditRevision === assignment.auditRevision
+        && !SUPERVISION_AUDITOR_TERMINAL_STATUSES.has(candidate.status)
+      ));
+      if (otherOpenAuditor) return reject('ambiguous_assignment');
+      const latestFinal = strictCrossVendor ? this.listAuditReceipts(task.taskId).filter((receipt) => (
+        receipt.assignmentId === assignment.assignmentId
+        && receipt.attemptId === assignment.auditAttemptId
+        && receipt.revision === assignment.auditRevision
+        && receipt.receiptKind === 'final'
+      )).at(-1) : undefined;
+      const invalidatesPriorPass = Boolean(latestFinal
+        && !runtimeIdentityMetadataMatches(latestFinal.senderIdentity, input.identity));
+      const bindingIdentityMatches = !assignment.executionBinding
+        || runtimeIdentityMetadataMatches(assignment.executionBinding.actual, input.identity);
+      const strictMetadataMatches = !strictCrossVendor
+        || (assignment.auditRoutingReason === 'cross_vendor_preferred'
+          && assignment.auditDegradedReason === undefined
+          && !invalidatesPriorPass);
+      const selectionChanged = Boolean(assignment.executionBinding && (
+        assignment.executionBinding.actual.sessionName !== input.identity.sessionName
+        || assignment.executionBinding.actual.agentType !== input.identity.agentType
+        || assignment.executionBinding.actual.providerFamily !== input.identity.providerFamily
+      ));
+      if (input.executionBinding
+        && !runtimeIdentityMetadataMatches(input.executionBinding.actual, input.identity)) {
+        return reject('invalid');
+      }
+      // A different selected runtime may have a different capability and model.
+      // Identity fields alone cannot prove those values, so preserving the old
+      // requested tuple or actual.model would create a mixed binding. Require
+      // the caller that performed pool selection to supply the complete result.
+      if (selectionChanged && !input.executionBinding) return reject('invalid');
+      if (runtimeIdentityMetadataMatches(assignment.identity, input.identity)
+        && bindingIdentityMatches && strictMetadataMatches
+        && (!input.executionBinding
+          || JSON.stringify(assignment.executionBinding) === JSON.stringify(input.executionBinding))) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: assignment, replay: true };
+      }
+      const rebound: PersistedSupervisionTaskAssignment = {
+        ...assignment,
+        identity: input.identity,
+        executionBinding: input.executionBinding ?? (assignment.executionBinding ? {
+            ...assignment.executionBinding,
+            actual: {
+              ...assignment.executionBinding.actual,
+              sessionName: input.identity.sessionName,
+              sessionInstanceId: input.identity.sessionInstanceId,
+              runtimeEpoch: input.identity.runtimeEpoch,
+              agentType: input.identity.agentType,
+              providerFamily: input.identity.providerFamily,
+            },
+          } : undefined),
+        ...(strictCrossVendor ? {
+          auditRoutingReason: 'cross_vendor_preferred' as const,
+          auditDegradedReason: undefined,
+        } : {}),
+        ...(invalidatesPriorPass ? { verdict: undefined, blocker: undefined } : {}),
+        generation: assignment.generation + 1,
+        updatedAt: now,
+      };
+      if (invalidatesPriorPass && strictOwner) {
+        const reopenedOwner: PersistedSupervisionTaskAssignment = {
+          ...strictOwner,
+          status: strictOwner.status === 'ready_for_integration' || strictOwner.status === 'passed'
+            ? 'ready_for_audit'
+            : strictOwner.status,
+          verdict: undefined,
+          crossVendorAuditPassed: undefined,
+          blocker: undefined,
+          updatedAt: now,
+        };
+        this.#writeAssignment(reopenedOwner, 'recovered', {
+          source: 'strict_cross_vendor_auditor_rebind',
+          auditorAssignmentId: assignment.assignmentId,
+          invalidatedReceiptId: latestFinal?.receiptId,
+          attemptId: assignment.auditAttemptId,
+          revision: assignment.auditRevision,
+        });
+        if (task.status === 'ready_for_integration') {
+          this.#writeTask({ ...task, status: 'ready_for_audit', updatedAt: now }, 'recovered', {
+            source: 'strict_cross_vendor_auditor_rebind',
+            auditorAssignmentId: assignment.assignmentId,
+            invalidatedReceiptId: latestFinal?.receiptId,
+          });
+        }
+      }
+      this.#writeAssignment(rebound, 'recovered', {
+        source: 'brain_authorized_audit_identity_rebind',
+        reason,
+        priorIdentity: assignment.identity,
+        strictCrossVendor,
+        attemptId: assignment.auditAttemptId,
+        revision: assignment.auditRevision,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: rebound };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /**
@@ -4900,6 +5031,7 @@ export class SupervisionTaskRegistry {
     taskId: string;
     assignmentId: string;
     identity: PersistedSupervisionTaskAssignmentIdentity;
+    executionBinding?: SupervisionExecutionBinding;
     expectedGeneration: number;
     expectedRevision: string;
     auditAttemptId: string;
@@ -4950,6 +5082,14 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'receipt_closed' };
       }
+      const brainAuthorizedCancellation = assignment.status === 'cancelled'
+        && this.listEvents(taskId).some((event) => (
+          event.assignmentId === assignmentId
+          && event.eventType === 'cancelled'
+          && event.payload?.source === 'brain_authorized_stale_auditor_cancel'
+          && event.payload?.attemptId === auditAttemptId
+          && event.payload?.revision === expectedRevision
+        ));
       const priorEvents = this.listEvents(taskId).filter((event) => (
         event.eventType === 'recovered'
         && event.assignmentId === assignmentId
@@ -4981,20 +5121,41 @@ export class SupervisionTaskRegistry {
         && candidate.status === 'ready_for_audit'
         && candidate.auditRevision === expectedRevision
       ));
+      const competingAuditor = this.listAssignments(taskId).some((candidate) => (
+        candidate.role === 'auditor'
+        && candidate.assignmentId !== assignmentId
+        && candidate.auditRevision === expectedRevision
+        && !SUPERVISION_AUDITOR_TERMINAL_STATUSES.has(candidate.status)
+      ));
+      const requiresCompleteBinding = Boolean(assignment.executionBinding);
+      const bindingMatchesTarget = !requiresCompleteBinding && !input.executionBinding
+        ? true
+        : Boolean(input.executionBinding
+          && runtimeIdentityMetadataMatches(input.executionBinding.actual, input.identity)
+          && input.executionBinding.pool === 'primary'
+          && input.executionBinding.actual.runtimeType === 'transport'
+          && evaluateSupervisionObservedIdentity({
+            config: input.executionBinding.requested,
+            actual: input.executionBinding.actual,
+            pool: input.executionBinding.pool,
+          }).ok);
       if (task.status !== 'ready_for_audit'
         || task.validationState !== 'passed'
         || task.auditPolicy !== 'auto_strict_cross_vendor'
         || task.currentRevision !== expectedRevision
         || assignment.role !== 'auditor'
-        || (assignment.status !== 'delegated' && assignment.status !== 'auditing')
+        || (assignment.status !== 'delegated' && assignment.status !== 'auditing' && !brainAuthorizedCancellation)
         || assignment.auditAttemptId !== auditAttemptId
         || assignment.auditRevision !== expectedRevision
         || implementers.length !== 1
+        || competingAuditor
+        || !bindingMatchesTarget
         || implementers[0]!.identity.providerFamily === input.identity.providerFamily) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid_transition' };
       }
-      if (runtimeIdentityMetadataMatches(assignment.identity, input.identity)) {
+      if (runtimeIdentityMetadataMatches(assignment.identity, input.identity)
+        && supervisionSelectedExecutionBindingMatches(assignment.executionBinding, input.executionBinding)) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'conflicting_replay' };
       }
@@ -5002,19 +5163,7 @@ export class SupervisionTaskRegistry {
         ...assignment,
         status: 'delegated',
         identity: input.identity,
-        ...(assignment.executionBinding ? {
-          executionBinding: {
-            ...assignment.executionBinding,
-            actual: {
-              ...assignment.executionBinding.actual,
-              sessionName: input.identity.sessionName,
-              sessionInstanceId: input.identity.sessionInstanceId,
-              runtimeEpoch: input.identity.runtimeEpoch,
-              agentType: input.identity.agentType,
-              providerFamily: input.identity.providerFamily,
-            },
-          },
-        } : {}),
+        ...(input.executionBinding ? { executionBinding: input.executionBinding } : {}),
         generation: assignment.generation + 1,
         verdict: undefined,
         blocker: undefined,
@@ -6045,14 +6194,35 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: lockedAuthority.reason };
       }
+      let persistedDigest = digest;
       const existingDigest = this.#db.prepare(`
         SELECT receipt_id AS receiptId FROM supervision_audit_receipts
         WHERE assignment_id = ? AND attempt_id = ? AND revision = ? AND receipt_digest = ?
       `).get(assignmentId, attemptId, revision, digest) as { receiptId?: unknown } | undefined;
       if (typeof existingDigest?.receiptId === 'string') {
         const replay = this.listAuditReceipts(taskId).find((receipt) => receipt.receiptId === existingDigest.receiptId);
-        this.#db.exec('COMMIT');
-        return replay ? { ok: true, value: replay, replay: true } : { ok: false, reason: 'not_found' };
+        if (replay && runtimeIdentityMetadataMatches(replay.senderIdentity, input.auditorIdentity)) {
+          this.#db.exec('COMMIT');
+          return { ok: true, value: replay, replay: true };
+        }
+        // The immutable content digest intentionally predates sender binding.
+        // After an authorized SAME-object rebind, identical findings from the
+        // new owner are a NEW attestation, not a replay of the stale sender.
+        // Namespace only this collision by the daemon-observed identity so
+        // ordinary idempotent replays keep their historical digest unchanged.
+        persistedDigest = createHash('sha256').update(JSON.stringify({
+          digest,
+          auditorIdentity: input.auditorIdentity,
+        })).digest('hex');
+        const reboundDigest = this.#db.prepare(`
+          SELECT receipt_id AS receiptId FROM supervision_audit_receipts
+          WHERE assignment_id = ? AND attempt_id = ? AND revision = ? AND receipt_digest = ?
+        `).get(assignmentId, attemptId, revision, persistedDigest) as { receiptId?: unknown } | undefined;
+        if (typeof reboundDigest?.receiptId === 'string') {
+          const replay = this.listAuditReceipts(taskId).find((receipt) => receipt.receiptId === reboundDigest.receiptId);
+          this.#db.exec('COMMIT');
+          return replay ? { ok: true, value: replay, replay: true } : { ok: false, reason: 'not_found' };
+        }
       }
       if (['finalized', 'cancelled', 'committed', 'pushed'].includes(lockedAudit.status)
         || ['committed', 'pushed', 'finalized'].includes(lockedTask.status)) {
@@ -6081,7 +6251,7 @@ export class SupervisionTaskRegistry {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         receiptId, taskId, assignmentId, attemptId, revision, sequence,
-        input.receiptKind, input.verdict ?? null, findings, JSON.stringify(validations), digest,
+        input.receiptKind, input.verdict ?? null, findings, JSON.stringify(validations), persistedDigest,
         supersedesReceiptId ?? null, JSON.stringify(input.auditorIdentity), now,
       );
       const nextAudit: PersistedSupervisionTaskAssignment = {

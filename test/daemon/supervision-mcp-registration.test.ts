@@ -58,6 +58,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   assignmentStates = new Map<string, Array<{
     assignmentId: string; role: string; status: string; leaseId: string; auditAttemptId?: string;
     auditRevision?: string; verdict?: string; generation?: number;
+    executionBinding?: any;
     identity: { sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; agentType?: string; providerFamily?: string };
   }>>();
   currentRevisions = new Map<string, string>();
@@ -1110,7 +1111,7 @@ describe('administrative recover', () => {
     }]);
   });
 
-  it('recovers an orphaned delegated auditor on the SAME attempt and immediately drives exact redelivery', async () => {
+  it('reopens a Brain-cancelled undelivered auditor on the SAME attempt with one complete selected binding', async () => {
     const taskId = 'tsk_d4d';
     const assignmentId = 'asg_dlt';
     const revision = 'post-pass-successor-owner-retirement-cx1-r1-eb2b2965f045';
@@ -1128,11 +1129,22 @@ describe('administrative recover', () => {
         identity: testIdentity('deck_d4d_implementer'),
       },
       {
-        assignmentId, role: 'auditor', status: 'auditing', leaseId: '', generation: 7,
+        assignmentId, role: 'auditor', status: 'cancelled', leaseId: '', generation: 7,
         auditAttemptId, auditRevision: revision,
         identity: {
-          ...testIdentity('deck_sub_1a2h2b1w'),
+          ...testIdentity('deck_d4d_live_cc9'),
           agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        },
+        executionBinding: {
+          pool: 'primary', origin: 'reused',
+          requested: {
+            capabilityId: 'supervision-exec-v1:transport:cursor-headless:cursor:Auto',
+            agentType: 'cursor-headless', providerFamily: 'cursor', runtimeType: 'transport', model: 'Auto',
+          },
+          actual: {
+            ...testIdentity('deck_d4d_live_cc9'),
+            agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'process', model: 'Auto',
+          },
         },
       },
     ]);
@@ -1150,6 +1162,24 @@ describe('administrative recover', () => {
       providerFamily: 'anthropic',
       projectName: 'codedeck',
     };
+    const replacementBinding = {
+      pool: 'primary' as const,
+      requested: {
+        capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet',
+        agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        runtimeType: 'transport' as const, model: 'sonnet',
+      },
+      actual: {
+        sessionName: replacement.sessionName,
+        sessionInstanceId: replacement.sessionInstanceId,
+        runtimeEpoch: replacement.runtimeEpoch,
+        agentType: replacement.agentType,
+        providerFamily: replacement.providerFamily,
+        runtimeType: 'transport' as const,
+        model: 'sonnet',
+      },
+      origin: 'reused' as const,
+    };
     const dispatchReadyAudit = vi.fn().mockResolvedValue({
       status: 'dispatched', assignmentId, auditAttemptId,
     });
@@ -1158,6 +1188,7 @@ describe('administrative recover', () => {
       registry,
       isProjectBrain: () => true,
       resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
+      resolveAuditorRecoveryBinding: (name) => name === replacement.sessionName ? replacementBinding : undefined,
       dispatchReadyAudit,
       retireSupersededAuditDelivery,
     });
@@ -1184,15 +1215,16 @@ describe('administrative recover', () => {
         taskId, assignmentId, expectedRevision: revision, auditAttemptId,
         expectedGeneration: 7,
         identity: expect.objectContaining({ sessionName: replacement.sessionName }),
+        executionBinding: replacementBinding,
         callerProjectName: 'codedeck',
       }),
     ]);
     expect(retireSupersededAuditDelivery).toHaveBeenCalledWith({
-      sessionName: 'deck_sub_1a2h2b1w',
+      sessionName: 'deck_d4d_live_cc9',
       messageId: expect.stringMatching(/^send_message_/),
       recipient: {
-        sessionInstanceId: 'instance-deck_sub_1a2h2b1w',
-        runtimeEpoch: 'epoch-deck_sub_1a2h2b1w',
+        sessionInstanceId: 'instance-deck_d4d_live_cc9',
+        runtimeEpoch: 'epoch-deck_d4d_live_cc9',
       },
     });
     expect(dispatchReadyAudit).toHaveBeenCalledOnce();

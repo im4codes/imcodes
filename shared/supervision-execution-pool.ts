@@ -148,6 +148,28 @@ export interface SupervisionExecutionBinding {
   capacitySlot?: number;
 }
 
+/** Compare only the selected requested/observed execution tuple. */
+export function supervisionSelectedExecutionBindingMatches(
+  left: SupervisionExecutionBinding | null | undefined,
+  right: SupervisionExecutionBinding | null | undefined,
+): boolean {
+  if (!left || !right || left.pool !== right.pool) return false;
+  return left.requested.capabilityId === right.requested.capabilityId
+    && left.requested.agentType === right.requested.agentType
+    && left.requested.providerFamily === right.requested.providerFamily
+    && left.requested.runtimeType === right.requested.runtimeType
+    && left.requested.model === right.requested.model
+    && left.requested.ccPresetId === right.requested.ccPresetId
+    && left.actual.sessionName === right.actual.sessionName
+    && left.actual.sessionInstanceId === right.actual.sessionInstanceId
+    && left.actual.runtimeEpoch === right.actual.runtimeEpoch
+    && left.actual.agentType === right.actual.agentType
+    && left.actual.providerFamily === right.actual.providerFamily
+    && left.actual.runtimeType === right.actual.runtimeType
+    && left.actual.model === right.actual.model
+    && left.actual.ccPresetId === right.actual.ccPresetId;
+}
+
 export interface SupervisionEconomyTaskPolicy {
   taskKind: SupervisionEconomyTaskKind;
   lowComplexity: true;

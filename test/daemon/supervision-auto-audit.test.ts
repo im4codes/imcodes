@@ -1382,6 +1382,194 @@ describe('automatic supervision audit materialization', () => {
     expect(dispatchMessage).toHaveBeenCalledOnce();
   });
 
+  it('repairs a partially-converged selected auditor binding and dispatches the SAME object once', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({
+      taskId: 'existing-auditor-selected-cross-vendor',
+      revision: 'existing-auditor-selected-cross-vendor-r1',
+      auditPolicy: 'auto_allow_degraded',
+      registry,
+    });
+    const attemptId = 'auto-audit-existing-selected-r1';
+    // Production shape: assignment identity and the binding's identity fields
+    // already point at the selected CC. Only requested/model/runtimeType are
+    // stale, so identity-only drift detection cannot see the corruption.
+    const oldAuditorIdentity = identity('deck_alpha_selected_cc', 'claude-code-sdk', 'anthropic');
+    const auditor = registry.createAssignment({
+      taskId: ready.taskId,
+      role: 'auditor',
+      required: false,
+      identity: oldAuditorIdentity,
+      auditAttemptId: attemptId,
+      auditRevision: ready.revision,
+      auditRoutingReason: 'same_family_degraded',
+      auditDegradedReason: 'cross_vendor_limited',
+      executionBinding: {
+        pool: 'primary',
+        origin: 'reused',
+        requested: {
+          capabilityId: 'supervision-exec-v1:transport:cursor-headless:cursor:Auto',
+          agentType: 'cursor-headless', providerFamily: 'cursor', runtimeType: 'transport', model: 'Auto',
+        },
+        actual: {
+          ...oldAuditorIdentity, runtimeType: 'process', model: 'Auto',
+        },
+      },
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+
+    const brain = session('deck_alpha_brain', 'brain');
+    const cx = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const cc = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+      runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+    };
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [
+              { ...cx, capabilityId: buildSupervisionExecutionCapabilityId(cx) },
+              { ...cc, capabilityId: buildSupervisionExecutionCapabilityId(cc) },
+            ],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const implementer = session('deck_alpha_worker', 'w1');
+    const replacement = session('deck_alpha_selected_cc', 'w2', 'claude-code-sdk', 'anthropic');
+    const dispatchMessage = vi.fn().mockResolvedValue({ status: 'queued' });
+
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: replacement.name,
+      message: 'resume the exact strict audit on selected CC',
+      reply: true,
+      idempotencyKey: 'existing-selected-cross-vendor-rebind',
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId,
+        auditedSessionName: implementer.name,
+        strictCrossVendor: true,
+      },
+      task: {
+        taskId: ready.taskId,
+        assignmentId: auditor.value.assignmentId,
+        currentRevision: ready.revision,
+        auditRevision: ready.revision,
+        auditAttemptId: attemptId,
+        auditPolicy: 'auto_allow_degraded',
+        executionPool: 'primary',
+      },
+    }, {
+      listSessions: () => [brain, implementer, replacement],
+      dispatchMessage,
+      ensureSupervisionAssignmentWorktree: async () => ({
+        ok: true, worktreePath: '/tmp/existing-selected-cross-vendor/repo',
+        baseRevision: 'a'.repeat(40), created: false,
+      }),
+      hasDeliveryEvidence: () => false,
+    });
+
+    expect(result, JSON.stringify(result)).toMatchObject({
+      status: 'accepted', taskId: ready.taskId, assignmentId: auditor.value.assignmentId,
+    });
+    expect(registry.listAssignments(ready.taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+    expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
+      assignmentId: auditor.value.assignmentId,
+      generation: 2,
+      auditAttemptId: attemptId,
+      auditRevision: ready.revision,
+      identity: identity(replacement.name, 'claude-code-sdk', 'anthropic'),
+      auditRoutingReason: 'cross_vendor_preferred',
+      executionBinding: {
+        pool: 'primary',
+        requested: {
+          capabilityId: buildSupervisionExecutionCapabilityId(cc),
+          ...cc,
+          model: 'sonnet',
+        },
+        actual: {
+          sessionName: replacement.name,
+          sessionInstanceId: replacement.sessionInstanceId,
+          runtimeEpoch: replacement.runtimeEpoch,
+          agentType: 'claude-code-sdk',
+          providerFamily: 'anthropic',
+          runtimeType: 'transport',
+          model: 'claude-sonnet-4-6',
+        },
+      },
+    });
+    expect(registry.getAssignment(auditor.value.assignmentId)).not.toHaveProperty('auditDegradedReason');
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an existing strict auditor fail-closed when CC is not pool-selected', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({
+      taskId: 'existing-auditor-unselected-cc',
+      revision: 'existing-auditor-unselected-cc-r1',
+      auditPolicy: 'auto_allow_degraded',
+      registry,
+    });
+    const attemptId = 'auto-audit-existing-unselected-r1';
+    const existing = registry.createAssignment({
+      taskId: ready.taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_old_cx_auditor'),
+      auditAttemptId: attemptId, auditRevision: ready.revision,
+    });
+    if (!existing.ok) throw new Error(existing.reason);
+    const brain = session('deck_alpha_brain', 'brain');
+    const selectedCx = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{ ...selectedCx, capabilityId: buildSupervisionExecutionCapabilityId(selectedCx) }],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const implementer = session('deck_alpha_worker', 'w1');
+    const unselectedCc = session('deck_alpha_unselected_cc', 'w2', 'claude-code-sdk', 'anthropic');
+    const before = registry.getAssignment(existing.value.assignmentId);
+    const dispatchMessage = vi.fn();
+    const result = await dispatchSendMessage({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    }, {
+      target: unselectedCc.name, message: 'must remain fail closed', reply: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId, auditedSessionName: implementer.name, strictCrossVendor: true,
+      },
+      task: {
+        taskId: ready.taskId, assignmentId: existing.value.assignmentId,
+        currentRevision: ready.revision, auditRevision: ready.revision,
+        auditAttemptId: attemptId, auditPolicy: 'auto_allow_degraded', executionPool: 'primary',
+      },
+    }, { listSessions: () => [brain, implementer, unselectedCc], dispatchMessage });
+
+    expect(result).toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+      error: 'task execution pool rejected target: unselected_config',
+    });
+    expect(registry.getAssignment(existing.value.assignmentId)).toEqual(before);
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
   it.each([
     'wrong_attempt',
     'wrong_revision',
@@ -2531,19 +2719,41 @@ describe('periodic supervision convergence tick', () => {
     });
   });
 
-  it('rebinds orphaned d4d auditor asg_dlt and dispatches the SAME assignment/attempt once', async () => {
+  it('reopens a Brain-cancelled undelivered auditor with one complete selected binding', async () => {
     const taskId = 'tsk_d4d';
     const revision = 'post-pass-successor-owner-retirement-cx1-r1-eb2b2965f045';
     const attemptId = 'auto-audit-30656902ee6c14fbdcb2751b';
     const { registry } = makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor' });
-    const oldIdentity = identity('deck_sub_1a2h2b1w', 'claude-code-sdk', 'anthropic');
+    const oldIdentity = identity('deck_alpha_live_cc9', 'claude-code-sdk', 'anthropic');
+    const staleRequested = {
+      agentType: 'cursor-headless', providerFamily: 'cursor', runtimeType: 'transport' as const, model: 'Auto',
+    };
     const auditor = registry.createAssignment({
       assignmentId: 'asg_dlt', taskId, role: 'auditor', required: false,
       identity: oldIdentity, auditAttemptId: attemptId, auditRevision: revision,
+      executionBinding: {
+        pool: 'primary', origin: 'reused',
+        requested: { ...staleRequested, capabilityId: buildSupervisionExecutionCapabilityId(staleRequested) },
+        actual: { ...oldIdentity, runtimeType: 'process', model: 'Auto' },
+      },
       idempotencyKey: `send:auto-audit:${taskId}:${revision}`, now: 100,
     });
     if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.cancelStaleAuditorAsProjectBrain({
+      taskId, auditorAssignmentId: auditor.value.assignmentId, callerProjectName: 'alpha',
+      reason: 'undelivered split Cursor binding cannot reach selected CC', now: 150,
+    })).toMatchObject({ ok: true, value: { status: 'cancelled' } });
     const replacement = identity('deck_alpha_live_cc9', 'claude-code-sdk', 'anthropic');
+    const selected = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const,
+      model: 'claude-sonnet-4-6',
+    };
+    const replacementBinding = {
+      pool: 'primary' as const,
+      requested: { ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) },
+      actual: { ...replacement, runtimeType: 'transport' as const, model: selected.model },
+      origin: 'reused' as const,
+    };
     const messageId = automaticMessageId(auditor.value.assignmentId, attemptId);
     const replacementMessageId = deterministicAutomaticAuditDeliveryMessageId(
       auditor.value.assignmentId, attemptId, auditor.value.generation + 1,
@@ -2553,6 +2763,7 @@ describe('periodic supervision convergence tick', () => {
       taskId,
       assignmentId: auditor.value.assignmentId,
       identity: replacement,
+      executionBinding: replacementBinding,
       expectedGeneration: auditor.value.generation,
       expectedRevision: revision,
       auditAttemptId: attemptId,
@@ -2570,12 +2781,14 @@ describe('periodic supervision convergence tick', () => {
         auditRevision: revision,
         generation: 2,
         identity: replacement,
+        executionBinding: replacementBinding,
       },
     });
     expect(registry.recoverOrphanedDelegatedAuditor({
       taskId,
       assignmentId: auditor.value.assignmentId,
       identity: replacement,
+      executionBinding: replacementBinding,
       expectedGeneration: auditor.value.generation,
       expectedRevision: revision,
       auditAttemptId: attemptId,
@@ -2614,8 +2827,8 @@ describe('periodic supervision convergence tick', () => {
       dispatch,
       hasDeliveryEvidence: (sessionName: string, candidate: SendMessageId) => (
         candidate === replacementMessageId
-        && (sessionName === oldIdentity.sessionName
-          || (sessionName === liveAuditor.name && replacementEvidence))
+        && sessionName === liveAuditor.name
+        && replacementEvidence
       ),
       hasVisibleAuditAcceptance: () => replacementEvidence,
     };
@@ -2637,6 +2850,43 @@ describe('periodic supervision convergence tick', () => {
       }),
     ]);
     expect(registry.listAuditReceipts(taskId)).toEqual([]);
+    expect(registry.listEvents(taskId).filter((event) => event.assignmentId === auditor.value.assignmentId)
+      .map((event) => event.payload?.source)).toEqual(expect.arrayContaining([
+        'brain_authorized_stale_auditor_cancel',
+        'orphaned_automatic_auditor_rebind',
+      ]));
+
+    const genericTaskId = `${taskId}-generic-cancel`;
+    const generic = makeReadyTask({
+      registry, taskId: genericTaskId, revision, auditPolicy: 'auto_strict_cross_vendor',
+    });
+    const genericAuditor = registry.createAssignment({
+      taskId: genericTaskId, role: 'auditor', identity: oldIdentity,
+      auditAttemptId: `${attemptId}-generic`, auditRevision: revision,
+      executionBinding: {
+        pool: 'primary', origin: 'reused',
+        requested: { ...staleRequested, capabilityId: buildSupervisionExecutionCapabilityId(staleRequested) },
+        actual: { ...oldIdentity, runtimeType: 'transport', model: 'Auto' },
+      },
+    });
+    if (!genericAuditor.ok) throw new Error(genericAuditor.reason);
+    expect(registry.applyTaskIntent({
+      taskId: genericTaskId, assignmentId: genericAuditor.value.assignmentId,
+      intent: 'cancel', toStatus: 'cancelled', note: 'ordinary owner cancellation',
+    })).toMatchObject({ ok: true });
+    expect(registry.recoverOrphanedDelegatedAuditor({
+      taskId: genericTaskId, assignmentId: genericAuditor.value.assignmentId,
+      identity: replacement, executionBinding: replacementBinding,
+      expectedGeneration: genericAuditor.value.generation, expectedRevision: revision,
+      auditAttemptId: `${attemptId}-generic`, callerProjectName: 'alpha',
+      supersededDeliveryMessageId: automaticMessageId(genericAuditor.value.assignmentId, `${attemptId}-generic`),
+      deliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(
+        genericAuditor.value.assignmentId, `${attemptId}-generic`, genericAuditor.value.generation + 1,
+      ),
+      idempotencyKey: 'must-not-revive-generic-cancel', reason: 'not Brain-authorized', now: 400,
+    })).toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(registry.getAssignment(genericAuditor.value.assignmentId)).toMatchObject({ status: 'cancelled' });
+    expect(generic.worker.assignmentId).toBeTruthy();
   });
 
   it('recovers auditing tsk_5w9/asg_e7r in place and replays exactly after restart', () => {
@@ -4128,6 +4378,73 @@ describe('control-plane auditPolicy bind (tsk_cic)', () => {
     expect(result, 'a rotated epoch must not require a manual rebind first')
       .toMatchObject({ status: 'accepted', taskId: ready.taskId });
     expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
+  it('lets the unique authoritative legacy Brain bind strict policy with no coordinator row', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'legacy-no-coordinator-policy-bind';
+    const revision = 'legacy-no-coordinator-policy-bind-r1';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'recover the existing audit round', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
+      auditRevision: revision, scopeFiles: ['src/exact.ts'],
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    for (const [intent, toStatus, validationState] of [
+      ['start', 'implementing', undefined],
+      ['record_validation', 'validated', 'passed'],
+      ['open_audit', 'ready_for_audit', undefined],
+    ] as const) {
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
+        ...(validationState ? { validationState } : {}),
+      })).toMatchObject({ ok: true });
+    }
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'coordinator')).toEqual([]);
+    const beforeWorker = registry.getAssignment(worker.value.assignmentId);
+    const brain = brainWith('supervised_audit');
+    const implementer = session('deck_alpha_worker', 'w1');
+    const dispatchMessage = vi.fn();
+    const dispatchReadyAudit = vi.fn().mockImplementation(async () => {
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_unique_cc', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: automaticAttempt(taskId, revision), auditRevision: revision,
+        idempotencyKey: `legacy-zero-coordinator:${taskId}:${revision}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      return { status: 'dispatched', assignmentId: created.value.assignmentId };
+    });
+
+    const result = await dispatchSendMessage(brainCaller, {
+      target: implementer.name,
+      message: 'bind strict policy on the SAME legacy task',
+      task: {
+        taskId, currentRevision: revision,
+        auditPolicy: 'auto_strict_cross_vendor', executionPool: 'primary',
+      },
+    }, {
+      listSessions: () => [brain, implementer],
+      dispatchMessage,
+      dispatchReadyAudit,
+    });
+
+    expect(result).toMatchObject({
+      status: 'accepted', taskId,
+      controlPlane: {
+        operation: 'audit_policy_bind', auditPolicy: 'auto_strict_cross_vendor',
+        policyBound: 'newly_bound', auditTrigger: 'invoked',
+      },
+    });
+    expect(registry.get(taskId)?.auditPolicy).toBe('auto_strict_cross_vendor');
+    expect(registry.getAssignment(worker.value.assignmentId)).toEqual(beforeWorker);
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'coordinator')).toEqual([]);
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
     expect(dispatchMessage).not.toHaveBeenCalled();
   });
 

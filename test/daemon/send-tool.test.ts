@@ -346,6 +346,85 @@ describe('send-tool', () => {
     resetSupervisionTaskRegistryForTests();
   });
 
+  it('fails closed before dispatch when an exact assignment binding still names another session', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const target = session({
+      name: 'deck_alpha_rebound_auditor', projectName: 'alpha', role: 'w1', label: 'Auditor',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit', backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1', maxParseRetries: 1, maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const taskId = 'tsk_stale_execution_target';
+    const assignmentId = 'asg_stale_execution_target';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'fail closed',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId: `${assignmentId}-coordinator`, taskId, role: 'coordinator', scopeFiles: [],
+      identity: {
+        sessionName: brain.name, sessionInstanceId: brain.sessionInstanceId!, runtimeEpoch: brain.runtimeEpoch!,
+        agentType: brain.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', scopeFiles: [],
+      identity: {
+        sessionName: target.name, sessionInstanceId: target.sessionInstanceId!, runtimeEpoch: target.runtimeEpoch!,
+        agentType: target.agentType, providerFamily: 'openai',
+      },
+      executionBinding: {
+        pool: 'primary', origin: 'reused',
+        requested: {
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+        actual: {
+          sessionName: 'deck_alpha_old_openai_auditor', sessionInstanceId: 'old-instance', runtimeEpoch: 'old-epoch',
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn();
+    try {
+      await expect(dispatchSendMessage(caller, {
+        target: target.name, message: 'must not follow stale binding',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, {
+        listSessions: () => [brain, target], dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/asg', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      })).resolves.toMatchObject({
+        status: 'error', reason: 'identity_rejected',
+        error: 'task assignment execution binding conflicts with exact target; authoritative rebind required',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
   it('lets the unique authoritative project Brain continue a same-project legacy task without a coordinator row', async () => {
     resetSupervisionTaskRegistryForTests();
     const registry = getSupervisionTaskRegistry();

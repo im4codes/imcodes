@@ -32,6 +32,7 @@ import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-i
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
 import { getTransportQueueStore, type TransportQueueStore } from './transport-queue-store.js';
+import { resolveSelectedSupervisionExecutionBinding } from './send-tool.js';
 
 export function retireExactSupersededAuditDelivery(
   store: Pick<TransportQueueStore, 'cancelQueuedMessage'>,
@@ -369,6 +370,15 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         providerFamily: resolvePeerAuditProviderFamily(session),
         projectName,
       };
+    },
+    resolveAuditorRecoveryBinding: (sessionName) => {
+      const sessions = listSessions();
+      const session = sessions.find((candidate) => candidate.name === sessionName);
+      if (!session) return undefined;
+      const projectName = resolveEffectiveProjectName(session, sessions);
+      return projectName
+        ? resolveSelectedSupervisionExecutionBinding(projectName, sessions, session)
+        : undefined;
     },
     worktreeGc: async (input) => runSupervisionWorktreeGc(input, createSupervisionWorktreeGcDeps()),
     dispatchReadyAudit: async (taskId) => {

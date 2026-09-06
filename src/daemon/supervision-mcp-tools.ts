@@ -46,6 +46,10 @@ import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
+import {
+  supervisionSelectedExecutionBindingMatches,
+  type SupervisionExecutionBinding,
+} from '../../shared/supervision-execution-pool.js';
 
 type ToolResult = Record<string, unknown>;
 
@@ -78,6 +82,7 @@ export interface SupervisionVisibilityItem {
     auditRevision?: string;
     verdict?: string;
     generation?: number;
+    executionBinding?: SupervisionExecutionBinding;
     identity?: {
       sessionName?: string;
       sessionInstanceId?: string;
@@ -245,6 +250,7 @@ export interface SupervisionRegistryPort {
       sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
       agentType: string; providerFamily: string;
     };
+    executionBinding: SupervisionExecutionBinding;
     expectedGeneration: number;
     expectedRevision: string;
     auditAttemptId: string;
@@ -325,6 +331,8 @@ export interface SupervisionMcpToolDeps {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
     agentType: string; providerFamily: string; projectName: string;
   } | undefined;
+  /** Exact project-pool selection for an auditor recovery target. */
+  resolveAuditorRecoveryBinding?: (sessionName: string) => SupervisionExecutionBinding | undefined;
   /** Physical worktree cleanup shares the already-authorized housekeeping ingress. */
   worktreeGc?: (input: {
     mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number;
@@ -749,12 +757,26 @@ export function createSupervisionMcpToolHandlers(
           && candidate.status === 'ready_for_audit'
           && candidate.auditRevision === expectedRevision
         )) ?? [];
+        const exactOpenAuditors = task.assignments?.filter((candidate) => (
+          candidate.role === 'auditor'
+          && candidate.auditRevision === expectedRevision
+          && candidate.status !== 'cancelled'
+          && candidate.status !== 'finalized'
+          && candidate.status !== 'passed'
+          && candidate.status !== 'ready_for_integration'
+        )) ?? [];
+        const recoverableStatus = assignment?.status === 'delegated'
+          || assignment?.status === 'auditing'
+          || assignment?.status === 'cancelled';
         if (assignment?.role !== 'auditor'
-          || (assignment.status !== 'delegated' && assignment.status !== 'auditing')
+          || !recoverableStatus
           || assignment.auditAttemptId !== auditAttemptId
           || assignment.auditRevision !== expectedRevision
           || !Number.isSafeInteger(assignment.generation)
-          || implementers.length !== 1) {
+          || implementers.length !== 1
+          || (assignment.status === 'cancelled'
+            ? exactOpenAuditors.length !== 0
+            : exactOpenAuditors.length !== 1 || exactOpenAuditors[0]?.assignmentId !== assignmentId)) {
           return err('invalid_transition', 'orphaned auditor recovery requires one exact open auditor and ready implementer');
         }
         const priorSessionName = assignment.identity?.sessionName;
@@ -771,11 +793,16 @@ export function createSupervisionMcpToolHandlers(
           || identity.providerFamily === implementerProviderFamily) {
           return err('identity_rejected', 'orphaned auditor recovery requires one live same-project cross-vendor transport target');
         }
+        const executionBinding = deps.resolveAuditorRecoveryBinding?.(rebindSessionName);
+        if (!executionBinding) {
+          return err('identity_rejected', 'orphaned auditor recovery target is not selected in the authoritative execution pool');
+        }
         const alreadyRebound = assignment.identity?.sessionName === identity.sessionName
           && assignment.identity?.sessionInstanceId === identity.sessionInstanceId
           && assignment.identity?.runtimeEpoch === identity.runtimeEpoch
           && assignment.identity?.agentType === identity.agentType
-          && assignment.identity?.providerFamily === identity.providerFamily;
+          && assignment.identity?.providerFamily === identity.providerFamily
+          && supervisionSelectedExecutionBindingMatches(assignment.executionBinding, executionBinding);
         const deliveryGeneration = alreadyRebound
           ? assignment.generation!
           : assignment.generation! + 1;
@@ -819,6 +846,7 @@ export function createSupervisionMcpToolHandlers(
             agentType: identity.agentType,
             providerFamily: identity.providerFamily,
           },
+          executionBinding,
           expectedGeneration: assignment.generation!,
           expectedRevision,
           auditAttemptId,

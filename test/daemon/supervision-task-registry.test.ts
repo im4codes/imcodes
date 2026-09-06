@@ -8422,6 +8422,161 @@ describe('tsk_4ft R3 — P1 #2/#3/#4 recovery authority', () => {
     registry.close();
   });
 
+  it('atomically rebinds an auditor identity and executionBinding.actual across providers', () => {
+    const registry = makeRegistry();
+    const { R1 } = auditTask(registry, 'r3-cross-vendor-rebind');
+    const oldIdentity = identity('deck_alpha_openai_auditor');
+    const binding = persistedExecutionBinding(oldIdentity.sessionName);
+    const auditor = registry.createAssignment({
+      assignmentId: 'r3-cross-vendor-rebind-auditor',
+      taskId: 'r3-cross-vendor-rebind',
+      role: 'auditor',
+      identity: oldIdentity,
+      scopeFiles: [],
+      auditAttemptId: 'r3-cross-vendor-rebind-attempt',
+      auditRevision: R1,
+      executionBinding: binding,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    const replacement = {
+      sessionName: 'deck_alpha_anthropic_auditor',
+      sessionInstanceId: 'instance-anthropic',
+      runtimeEpoch: 'epoch-anthropic-after-restart',
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+    };
+    const replacementBinding = {
+      pool: 'primary' as const,
+      origin: 'reused' as const,
+      requested: {
+        capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet',
+        agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+      },
+      actual: {
+        ...replacement, runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+      },
+    };
+
+    expect(registry.rebindAuditAssignment({
+      taskId: 'r3-cross-vendor-rebind',
+      assignmentId: auditor.value.assignmentId,
+      identity: replacement,
+      callerProjectName: 'alpha',
+      reason: 'authoritative SAME-object cross-vendor recovery',
+      executionBinding: replacementBinding,
+      now: 10,
+    })).toMatchObject({ ok: true, value: { identity: replacement, generation: 2 } });
+
+    const after = registry.getAssignment(auditor.value.assignmentId)!;
+    expect(after.executionBinding).toEqual(replacementBinding);
+    expect(after.assignmentId).toBe(auditor.value.assignmentId);
+    expect(after.auditAttemptId).toBe('r3-cross-vendor-rebind-attempt');
+    expect(after.auditRevision).toBe(R1);
+    expect(registry.listAssignments('r3-cross-vendor-rebind')).toHaveLength(2);
+    registry.close();
+  });
+
+  it('requires a final receipt from the rebound strict auditor before restoring PASS authority', () => {
+    const registry = makeRegistry();
+    const taskId = 'r3-rebound-receipt-authority';
+    const { R1 } = auditTask(registry, taskId);
+    const implementer = registry.getAssignment(`${taskId}-impl`)!;
+    expect(registry.updateAssignment({
+      assignmentId: implementer.assignmentId, identity: implementer.identity,
+      status: 'validated', revision: R1, auditRevision: R1,
+    })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: implementer.assignmentId, identity: implementer.identity,
+      status: 'ready_for_audit', revision: R1, auditRevision: R1,
+    })).toMatchObject({ ok: true });
+    const attemptId = 'r3-rebound-receipt-attempt';
+    const oldIdentity = identity('deck_alpha_old_same_family');
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', identity: oldIdentity, scopeFiles: [],
+      auditAttemptId: attemptId, auditRevision: R1,
+      auditRoutingReason: 'same_family_degraded',
+      auditDegradedReason: 'cross_vendor_limited',
+      executionBinding: persistedExecutionBinding(oldIdentity.sessionName),
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: oldIdentity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: R1,
+    })).toMatchObject({ ok: true });
+    const receiptInput = {
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      attemptId, revision: R1, receiptKind: 'final' as const, verdict: 'PASS' as const,
+      findings: 'same exact frozen bytes pass', validations: [],
+    };
+    expect(registry.appendMatchingAuditReceipt({
+      ...receiptInput, auditorIdentity: oldIdentity, auditorSessionName: oldIdentity.sessionName,
+      now: 20,
+    })).toMatchObject({ ok: true, value: { sequence: 1 } });
+
+    const replacement = {
+      sessionName: 'deck_alpha_selected_cc',
+      sessionInstanceId: 'instance-selected-cc',
+      runtimeEpoch: 'epoch-selected-cc',
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+    };
+    const replacementBinding = {
+      pool: 'primary' as const,
+      origin: 'reused' as const,
+      requested: {
+        capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet',
+        agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+      },
+      actual: {
+        ...replacement, runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+      },
+    };
+    expect(registry.rebindAuditAssignment({
+      taskId, assignmentId: auditor.value.assignmentId,
+      identity: identity('deck_alpha_other_cx'),
+      callerProjectName: 'alpha', reason: 'must not satisfy strict with same provider',
+      expectedGeneration: 1, expectedAttemptId: attemptId, expectedRevision: R1,
+      strictCrossVendor: true, now: 25,
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
+    expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
+      generation: 1, identity: oldIdentity,
+    });
+    expect(registry.rebindAuditAssignment({
+      taskId, assignmentId: auditor.value.assignmentId, identity: replacement,
+      callerProjectName: 'alpha', reason: 'strict selected cross-vendor recovery',
+      expectedGeneration: 1, expectedAttemptId: attemptId, expectedRevision: R1,
+      strictCrossVendor: true, executionBinding: replacementBinding, now: 30,
+    })).toMatchObject({
+      ok: true,
+      value: { generation: 2, auditRoutingReason: 'cross_vendor_preferred' },
+    });
+
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: replacement, revision: R1, now: 35,
+    })).toMatchObject({ ok: false, reason: 'invalid_transition' });
+    expect(registry.getAssignment(implementer.assignmentId)).not.toHaveProperty('crossVendorAuditPassed');
+    expect(registry.get(taskId)?.status).not.toBe('ready_for_integration');
+
+    expect(registry.appendMatchingAuditReceipt({
+      ...receiptInput, auditorIdentity: replacement, auditorSessionName: replacement.sessionName,
+      now: 40,
+    })).toMatchObject({
+      ok: true,
+      value: { sequence: 2, supersedesReceiptId: expect.any(String), senderIdentity: replacement },
+    });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: replacement, revision: R1, now: 50,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(implementer.assignmentId)).toMatchObject({
+      status: 'ready_for_integration', verdict: 'PASS', crossVendorAuditPassed: true,
+      auditAttemptId: attemptId, auditRevision: R1,
+    });
+    expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+    registry.close();
+  });
+
   // P1 #2 — restart / runtimeEpoch replacement for NON-auditor exact roles.
   it('rebinds an integration_owner across a runtimeEpoch change, preserving provenance', () => {
     const registry = makeRegistry();
