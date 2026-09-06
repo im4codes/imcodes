@@ -1,12 +1,12 @@
 /**
- * Context-store worker client — the async facade the daemon main thread uses to
+ * Context-store process client — the async facade the daemon broker uses to
  * reach the memory/context store. Daemon production code MUST go through this
  * client (typed wrappers), never by importing the synchronous `context-store.ts`
  * directly (enforced by the exact-path import guard, task 4.5).
  *
  * Reliability contract (spec "Async client reliability" / "Failure policy
  * matrix" / "Transport liveness"):
- *  - eager worker spawn + `whenReady()` warmup (ensureDb runs in the worker,
+ *  - eager process spawn + `whenReady()` warmup (ensureDb runs in the child,
  *    never blocking the daemon listen path);
  *  - per-RPC client-side timeout (R1 front-of-turn ≤ min(transport budget, 2000),
  *    R3/R5 management+mutation 5000, R4 background 30000);
@@ -15,7 +15,7 @@
  *    drops telemetry / rejects mutations with `context_store_overloaded`);
  *  - self-heal: respawn the worker after N consecutive timeouts, on a cooldown.
  */
-import { Worker } from 'node:worker_threads';
+import { spawnChildProcessWorker } from '../util/child-process-worker.js';
 import {
   CONTEXT_STORE_RPC_BACKPRESSURE,
   CONTEXT_STORE_RPC_ERROR,
@@ -122,7 +122,9 @@ export class ContextStoreWorkerClient {
    *  without entering production owner mode. */
   private started = false;
 
-  constructor(private readonly createWorker: ContextStoreWorkerFactory = (url) => new Worker(url) as ContextStoreWorkerHandle) {}
+  constructor(
+    private readonly createWorker: ContextStoreWorkerFactory = (url) => spawnChildProcessWorker(url),
+  ) {}
 
   /** Eagerly spawn the worker (call once at daemon startup). Enters production
    *  single-owner mode: store access now goes through the worker, and on
@@ -167,7 +169,7 @@ export class ContextStoreWorkerClient {
     const generation = ++this.workerGeneration;
     const workerUrl = new URL('./context-store-worker-bootstrap.mjs', import.meta.url);
     const worker = this.createWorker(workerUrl);
-    // Don't keep the daemon process alive solely for this worker.
+    // Don't keep the daemon process alive solely for this child process.
     worker.unref();
     worker.on('message', (msg: unknown) => this.onMessage(msg, generation));
     worker.on('error', (err) =>

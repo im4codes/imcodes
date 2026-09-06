@@ -146,6 +146,10 @@ import {
   resolveMemoryShortRefCandidatesWithStore,
   resolveMemoryShortRefWithStore,
 } from '../context/memory-short-ref.js';
+import {
+  MEMORY_MCP_DAEMON_TOOL_NAMES,
+  type MemoryMcpDaemonToolName,
+} from '../../shared/memory-mcp-daemon-rpc.js';
 
 /** Upper bound on records expanded for one colliding handle. */
 const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
@@ -228,6 +232,15 @@ type MemoryMcpListSummaries = (query: {
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
+  /**
+   * Production stdio seam: execute memory-owning tools in the daemon process,
+   * whose process-wide context-store and embedding workers are shared by all
+   * sessions. When present, local MCP memory implementations are unreachable.
+   */
+  invokeDaemonMemoryTool?: (
+    name: MemoryMcpDaemonToolName,
+    input?: unknown,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Registered-node AI-managed MCP/Skill service. Capability tools are absent when unavailable. */
   capabilityService?: CapabilityService;
   /** Caller context resolver used only when activating binding-scoped Skill instructions. */
@@ -1105,7 +1118,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     };
   };
 
-  return wrapHandlers({
+  const handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler> = {
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
       if (gate) return gate;
@@ -2051,7 +2064,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ? { status: 'ok', outcome: result.outcome }
         : { status: 'ok', outcome: result.outcome, result: result.result };
     },
-  });
+  };
+  if (deps.invokeDaemonMemoryTool) {
+    for (const name of MEMORY_MCP_DAEMON_TOOL_NAMES) {
+      handlers[name] = (input) => deps.invokeDaemonMemoryTool!(name, input);
+    }
+  }
+  return wrapHandlers(handlers);
 }
 
 function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>): Record<MemoryMcpToolName, MemoryMcpToolHandler> {

@@ -36,6 +36,7 @@ vi.mock('../../src/daemon/daemon-task-admission.js', () => ({
 
 import { startHookServer } from '../../src/daemon/hook-server.js';
 import { clearCapabilityAuthorizationKeys, setCapabilityAuthority } from '../../src/capability/capability-authorization.js';
+import { MEMORY_MCP_DAEMON_RPC_PATH } from '../../shared/memory-mcp-daemon-rpc.js';
 
 function postNotify(port: number, body: Record<string, unknown>): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
@@ -80,6 +81,26 @@ function postResourceAdmission(
     const data = JSON.stringify(body);
     const req = http.request({
       hostname: '127.0.0.1', port, path: '/resource-admission', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'x-imcodes-session': sessionName },
+    }, (res) => {
+      let response = '';
+      res.on('data', (chunk) => { response += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(response) as Record<string, unknown> }));
+    });
+    req.on('error', reject);
+    req.end(data);
+  });
+}
+
+function postMemoryMcpDaemonTool(
+  port: number,
+  sessionName: string,
+  body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: MEMORY_MCP_DAEMON_RPC_PATH, method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'x-imcodes-session': sessionName },
     }, (res) => {
       let response = '';
@@ -178,6 +199,64 @@ describe('Hook server — session validation', () => {
       status: 409,
       body: { ok: false, error: 'task_admission_stale_runtime' },
     });
+  });
+
+  it('binds daemon memory tools to the exact runtime and stored namespace', async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const invokeMemoryMcpTool = vi.fn(async () => ({ status: 'ok', items: [] }));
+    const restarted = await startHookServer(hookCallback, { invokeMemoryMcpTool });
+    server = restarted.server;
+    port = restarted.port;
+    expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
+    getSessionMock.mockReturnValue({
+      name: 'deck_current_brain', state: 'idle', agentType: 'codex-sdk', providerId: 'codex-sdk',
+      projectName: 'current', projectDir: '/tmp/current',
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
+      contextNamespace: { scope: 'user_private', userId: 'owner-1', projectId: 'repo-1' },
+    });
+
+    const response = await postMemoryMcpDaemonTool(port, 'deck_current_brain', {
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1', serverId: 'server-1',
+      tool: 'search_memory', input: { query: 'worker sharing' },
+    });
+
+    expect(response).toMatchObject({ status: 200, body: { ok: true, result: { status: 'ok', items: [] } } });
+    expect(invokeMemoryMcpTool).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'owner-1',
+      namespace: { scope: 'user_private', userId: 'owner-1', projectId: 'repo-1' },
+      sessionName: 'deck_current_brain',
+      transport: 'in_process',
+    }), 'search_memory', { query: 'worker sharing' });
+  });
+
+  it('rejects stale or non-memory daemon worker requests before dispatch', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_current_brain', state: 'idle', agentType: 'codex-sdk',
+      projectName: 'current', projectDir: '/tmp/current',
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current',
+      contextNamespace: { scope: 'user_private', userId: 'owner-1', projectId: 'repo-1' },
+    });
+    await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old', tool: 'search_memory', input: {},
+    })).resolves.toMatchObject({ status: 409 });
+    await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current', tool: 'send_message', input: {},
+    })).resolves.toMatchObject({ status: 400 });
+  });
+
+  it('rejects a server authority owned by a different memory user', async () => {
+    expect(setCapabilityAuthority('other-owner', 'server-other', 1, [], [])).toBe(true);
+    getSessionMock.mockReturnValue({
+      name: 'deck_current_brain', state: 'idle', agentType: 'codex-sdk',
+      projectName: 'current', projectDir: '/tmp/current',
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current',
+      contextNamespace: { scope: 'user_private', userId: 'owner-1', projectId: 'repo-1' },
+    });
+
+    await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current',
+      serverId: 'server-other', tool: 'search_memory', input: {},
+    })).resolves.toMatchObject({ status: 403 });
   });
 
   it('rejects hook when session is gemini (not claude-code)', async () => {

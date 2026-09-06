@@ -47,6 +47,14 @@ import { isSendMessageId, type SendMessageId } from '../../shared/send-message-i
 import { TASK_ADMISSION_HOOK_PATH, TASK_ADMISSION_OPERATION } from '../../shared/session-resource-lifecycle.js';
 import { getDaemonTaskAdmissionController } from './daemon-task-admission.js';
 import { measureSessionProcessTreeRssBytes } from './session-resource-service.js';
+import {
+  MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES,
+  MEMORY_MCP_DAEMON_RPC_PATH,
+  isMemoryMcpDaemonToolName,
+  type MemoryMcpDaemonToolName,
+} from '../../shared/memory-mcp-daemon-rpc.js';
+import { normalizeDaemonLocalMemoryNamespace, LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
+import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -620,7 +628,28 @@ function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
-export async function startHookServer(onHook: HookCallback): Promise<{ server: http.Server; port: number }> {
+export interface HookServerOptions {
+  /** Test seam; production lazily binds the daemon-local memory handlers. */
+  invokeMemoryMcpTool?: (
+    caller: McpRuntimeCaller,
+    tool: MemoryMcpDaemonToolName,
+    input?: unknown,
+  ) => Promise<Record<string, unknown>>;
+}
+
+async function invokeDaemonMemoryMcpTool(
+  caller: McpRuntimeCaller,
+  tool: MemoryMcpDaemonToolName,
+  input?: unknown,
+): Promise<Record<string, unknown>> {
+  const { createMemoryMcpToolHandlers } = await import('./memory-mcp-tools.js');
+  return createMemoryMcpToolHandlers(caller)[tool](input) as Promise<Record<string, unknown>>;
+}
+
+export async function startHookServer(
+  onHook: HookCallback,
+  options: HookServerOptions = {},
+): Promise<{ server: http.Server; port: number }> {
   const preferredPort = await loadSavedPort();
 
   const server = http.createServer(async (req, res) => {
@@ -631,6 +660,66 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     }
 
     const url = req.url;
+
+    if (url === MEMORY_MCP_DAEMON_RPC_PATH) {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      const session = senderSessionName ? getSession(senderSessionName) : null;
+      if (!session || session.state === 'stopped') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_identity_unavailable' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES)) as Record<string, unknown>;
+        if (body.sessionInstanceId !== session.sessionInstanceId
+          || body.runtimeEpoch !== session.runtimeEpoch) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_stale_runtime' }));
+          return;
+        }
+        if (!isMemoryMcpDaemonToolName(body.tool)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_tool_forbidden' }));
+          return;
+        }
+        const requestedServerId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
+        const authenticatedOwner = requestedServerId
+          ? getAuthenticatedCapabilityOwner(requestedServerId)
+          : undefined;
+        const storedNamespace = session.contextNamespace && validCapabilityNamespace(session.contextNamespace)
+          ? normalizeDaemonLocalMemoryNamespace(session.contextNamespace)
+          : { scope: 'user_private' as const, userId: LEGACY_DAEMON_LOCAL_USER_ID };
+        const storedUserId = storedNamespace.userId?.trim() || LEGACY_DAEMON_LOCAL_USER_ID;
+        if (requestedServerId && authenticatedOwner !== storedUserId) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_server_identity_unavailable' }));
+          return;
+        }
+        const caller: McpRuntimeCaller = Object.freeze({
+          userId: storedUserId,
+          namespace: storedNamespace,
+          sessionName: session.name,
+          projectName: session.projectName,
+          projectRoot: session.projectDir,
+          serverId: requestedServerId || null,
+          providerId: session.providerId ?? session.agentType,
+          transport: 'in_process',
+        });
+        const invoke = options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool;
+        const result = await invoke(caller, body.tool, body.input);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result }));
+      } catch (error) {
+        const status = (error as Error).message === 'body too large' ? 413 : 500;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: status === 413 ? 'daemon_memory_worker_request_oversize' : 'daemon_memory_worker_failed',
+        }));
+      }
+      return;
+    }
 
     if (url === TASK_ADMISSION_HOOK_PATH) {
       const senderHeader = req.headers['x-imcodes-session'];

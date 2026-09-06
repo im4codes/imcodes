@@ -52,6 +52,10 @@ import {
 } from './session-resource-service.js';
 import type { SessionResourceOwner } from './session-resource-registry.js';
 import { EMBEDDING_MODEL_RSS_BUDGET_BYTES } from '../../shared/embedding-config.js';
+import {
+  MEMORY_MCP_DAEMON_RPC_PATH,
+  type MemoryMcpDaemonToolName,
+} from '../../shared/memory-mcp-daemon-rpc.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -358,6 +362,25 @@ export function mergeDefaultToolDeps(
     ?? (usesDefaultCapabilityService ? resolveDaemonCapabilityIdentity : undefined);
   return {
     ...toolDeps,
+    invokeDaemonMemoryTool: toolDeps.invokeDaemonMemoryTool
+      ?? (resourceOwner && caller.sessionName
+        ? async (name: MemoryMcpDaemonToolName, input?: unknown) => {
+            const port = await resolveLiveHookPort();
+            if (!port) throw new Error('daemon_memory_worker_unavailable');
+            const response = await postHookSend(port, {
+              sessionInstanceId: resourceOwner.sessionInstanceId,
+              runtimeEpoch: resourceOwner.runtimeEpoch,
+              serverId: caller.serverId,
+              tool: name,
+              input,
+            }, MEMORY_MCP_DAEMON_RPC_PATH, caller.sessionName!, MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS);
+            const result = response.result;
+            if (!result || typeof result !== 'object' || Array.isArray(result)) {
+              throw new Error('daemon_memory_worker_invalid_response');
+            }
+            return result as Record<string, unknown>;
+          }
+        : undefined),
     // The stdio MCP process is intentionally a thin client of the
     // server-authoritative operation store. Keeping the executor in the main
     // daemon avoids splitting one install operation across two processes.

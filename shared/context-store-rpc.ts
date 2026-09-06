@@ -1,7 +1,7 @@
 /**
  * Context-store worker RPC contract — the SINGLE SOURCE OF TRUTH for the
- * cross-thread protocol between the daemon main thread
- * (`src/store/context-store-worker-client.ts`) and the context-store worker
+ * cross-process protocol between the daemon broker
+ * (`src/store/context-store-worker-client.ts`) and the context-store process
  * (`src/store/context-store-worker.ts`).
  *
  * Per the project's no-duplicate-constants rule, every op name, error code,

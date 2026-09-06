@@ -1248,6 +1248,19 @@ describe('mergeDefaultToolDeps per-field composition', () => {
     const merged = mergeDefaultToolDeps({ ...caller, serverId: null }, {});
     expect(merged.capabilityService).toBeUndefined();
   });
+
+  it('enables daemon-shared memory workers only for an exact runtime owner', () => {
+    const owner = {
+      sessionName: 'deck_sub_worker',
+      sessionInstanceId: 'instance-1',
+      runtimeEpoch: 'epoch-1',
+    };
+    const merged = mergeDefaultToolDeps(caller, {}, owner);
+    expect(typeof merged.invokeDaemonMemoryTool).toBe('function');
+
+    const standalone = mergeDefaultToolDeps(caller, {}, null);
+    expect(standalone.invokeDaemonMemoryTool).toBeUndefined();
+  });
 });
 
 describe('createMemoryMcpServerFromEnv supervision wiring', () => {
