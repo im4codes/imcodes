@@ -3185,6 +3185,7 @@ describe('SupervisionAutomation', () => {
       mode: SUPERVISION_MODE.OFF,
     });
     supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
+    supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('autoAudit=enabled');
@@ -3207,6 +3208,51 @@ describe('SupervisionAutomation', () => {
     expect(timelineEmitter.replay('deck_other_brain', 0).events).toHaveLength(0);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
     expect(supervisionAutomation.getActiveRun('deck_sub_impl')).toBeUndefined();
+  });
+
+  it('skips never-enabled non-Brain OFF controls on initial sync and restore', async () => {
+    const enabled = await seedSession('supervised_audit');
+    const disabled = normalizeSessionSupervisionSnapshot({
+      ...enabled,
+      mode: SUPERVISION_MODE.OFF,
+    });
+    upsertSession({
+      ...getSession('deck_supervision_brain')!,
+      transportConfig: { supervision: disabled },
+      updatedAt: Date.now(),
+    });
+    upsertSession({
+      name: 'deck_sub_impl',
+      projectName: 'supervision',
+      parentSession: 'deck_supervision_brain',
+      role: 'w2',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'provider-session-impl',
+      projectDir: projectDir!,
+      state: 'idle',
+      transportConfig: { supervision: disabled },
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
+    supervisionAutomation.init();
+
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', disabled);
+    supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+
+    const prompts = mockTransportRuntime.send.mock.calls.map((call) => String(call[0]));
+    expect(prompts.filter((prompt) => prompt.includes('sourceSession=deck_supervision_brain')))
+      .toHaveLength(2);
+    expect(prompts.filter((prompt) => prompt.includes('sourceSession=deck_sub_impl')))
+      .toHaveLength(0);
+    expect(prompts.every((prompt) => prompt.includes('autoAudit=disabled'))).toBe(true);
   });
 
   it('replays current authoritative mode once when a project Brain runtime resumes', async () => {

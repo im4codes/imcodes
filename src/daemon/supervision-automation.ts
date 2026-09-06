@@ -957,6 +957,8 @@ class SupervisionAutomation {
   private implementationWatchdogTimer?: NodeJS.Timeout;
   /** Last mode delivered for one source session to the current Brain runtime. */
   private autoAuditModeDeliveryKeys = new Map<string, string>();
+  /** Source identities whose enabled state was successfully delivered. */
+  private autoAuditModeEnabledSourceAuthorities = new Map<string, string>();
 
   private implementationWatchdogRunning = false;
 
@@ -978,6 +980,7 @@ class SupervisionAutomation {
     if (process.env.NODE_ENV !== 'test') return;
     this.automaticPeerAuditCompatibilityForTests = enabled;
     this.autoAuditModeDeliveryKeys.clear();
+    this.autoAuditModeEnabledSourceAuthorities.clear();
   }
 
   /** Presentation seam for the console; this is authoritative run state. */
@@ -1127,8 +1130,12 @@ class SupervisionAutomation {
     const runtime = getTransportRuntime(brain.name);
     if (!runtime) return;
     const mode = snapshot?.mode ?? SUPERVISION_MODE.OFF;
+    const sourceAuthority = `${source.sessionInstanceId ?? source.createdAt}:${source.runtimeEpoch ?? ''}`;
+    if (source.name !== brain.name
+      && mode === SUPERVISION_MODE.OFF
+      && this.autoAuditModeEnabledSourceAuthorities.get(sourceSessionName) !== sourceAuthority) return;
     const brainAuthority = `${brain.sessionInstanceId ?? brain.createdAt}:${brain.runtimeEpoch ?? ''}`;
-    const deliveryKey = `${brain.name}:${brainAuthority}:${mode}`;
+    const deliveryKey = `${sourceAuthority}:${brain.name}:${brainAuthority}:${mode}`;
     if (this.autoAuditModeDeliveryKeys.get(sourceSessionName) === deliveryKey) return;
 
     const prompt = buildAutoAuditModeControlPrompt({
@@ -1158,6 +1165,9 @@ class SupervisionAutomation {
         deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       });
       this.autoAuditModeDeliveryKeys.set(sourceSessionName, deliveryKey);
+      if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+        this.autoAuditModeEnabledSourceAuthorities.set(sourceSessionName, sourceAuthority);
+      }
     } catch (error) {
       logger.warn({
         project: source.projectName,
