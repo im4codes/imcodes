@@ -6250,6 +6250,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(listContextObservationsMock).toHaveBeenCalledWith({
       scope: PREFERENCE_INGEST_SCOPE,
       class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      state: PREFERENCE_INGEST_OBSERVATION_STATE,
     });
     expect(serverLink.send).toHaveBeenCalledWith({
       type: MEMORY_WS.PREF_RESPONSE,
