@@ -1139,9 +1139,10 @@ class SupervisionAutomation {
     };
     const previous = this.stateStore.getModeControlDelivery(authority);
     if (previous?.mode === mode) return;
-    if (source.name !== brain.name
-      && mode === SUPERVISION_MODE.OFF
-      && previous?.enabledEver !== true) return;
+    // OFF is a revocation, not an initialization signal. Emitting it before
+    // this authority has ever enabled supervision creates a fresh control
+    // message on every new Brain/runtime instance without changing state.
+    if (mode === SUPERVISION_MODE.OFF && previous?.enabledEver !== true) return;
 
     const prompt = buildAutoAuditModeControlPrompt({
       projectName: source.projectName,
@@ -1197,7 +1198,8 @@ class SupervisionAutomation {
     if (!brain || brain.role !== 'brain' || brain.state === 'stopped') return;
     for (const source of listSessions(brain.projectName)) {
       const snapshot = extractSessionSupervisionSnapshot(source.transportConfig ?? null);
-      // The Brain itself always receives an explicit fail-closed OFF state.
+      // A missing Brain snapshot is treated as OFF, but syncAutoAuditModeState
+      // only delivers it when it revokes a previously enabled authority.
       // Other project sessions participate once they have a valid snapshot.
       if (source.name !== brain.name && !snapshot) continue;
       this.syncAutoAuditModeState(source.name, snapshot);

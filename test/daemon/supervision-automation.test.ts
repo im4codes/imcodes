@@ -3213,7 +3213,7 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_sub_impl')).toBeUndefined();
   });
 
-  it('skips never-enabled non-Brain OFF controls on initial sync and restore', async () => {
+  it('skips never-enabled OFF controls for Brain and non-Brain sessions', async () => {
     const enabled = await seedSession('supervised_audit');
     const disabled = normalizeSessionSupervisionSnapshot({
       ...enabled,
@@ -3252,10 +3252,10 @@ describe('SupervisionAutomation', () => {
 
     const prompts = mockTransportRuntime.send.mock.calls.map((call) => String(call[0]));
     expect(prompts.filter((prompt) => prompt.includes('sourceSession=deck_supervision_brain')))
-      .toHaveLength(1);
+      .toHaveLength(0);
     expect(prompts.filter((prompt) => prompt.includes('sourceSession=deck_sub_impl')))
       .toHaveLength(0);
-    expect(prompts.every((prompt) => prompt.includes('autoAudit=disabled'))).toBe(true);
+    expect(prompts).toEqual([]);
   });
 
   it('deduplicates one stable Brain across reconnects but delivers to a new Brain instance', async () => {
