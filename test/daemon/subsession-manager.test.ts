@@ -686,6 +686,93 @@ describe('rebuildSubSessions — transport sessions are lazy', () => {
     }));
   });
 
+  it('a replayed rebuild of unchanged sub-sessions writes nothing', async () => {
+    // Production shape: the server re-sends subsession.rebuild_all on every
+    // reconnect. Measured on a live daemon this replayed 113 sub-sessions every
+    // 40-90s, rewriting every record each time, because `updatedAt: now` made
+    // each one compare as changed. RSS swung 405MB -> 1621MB at 76% CPU and the
+    // resulting GC pauses stalled the loop, which caused the next reconnect.
+    const sub = {
+      id: 'replayed', type: 'codex-sdk', cwd: '/proj', label: 'Cx1',
+      providerSessionId: 'codex-provider-session', requestedModel: 'gpt-5.5',
+      parentSession: 'deck_cd_brain', runtimeType: 'transport',
+    } as Parameters<typeof rebuildSubSessions>[0][number];
+
+    await rebuildSubSessions([sub]);
+    expect(upsertSessionMock, 'the first rebuild persists the record').toHaveBeenCalledTimes(1);
+    const persisted = upsertSessionMock.mock.calls[0]![0] as Record<string, unknown>;
+
+    // The store holds what the rebuild produced, but stamped a MINUTE ago —
+    // the real gap between reconnects. Without this the replay would land in
+    // the same millisecond and `updatedAt` would match by accident, so the test
+    // would pass even if the comparison still counted that field.
+    getSessionMock.mockReturnValue({ ...persisted, updatedAt: (persisted.updatedAt as number) - 60_000 });
+    upsertSessionMock.mockClear();
+
+    await rebuildSubSessions([sub]);
+    await rebuildSubSessions([sub]);
+    expect(
+      upsertSessionMock,
+      'replaying a rebuild over unchanged records must not touch the store',
+    ).not.toHaveBeenCalled();
+  });
+
+  it('still writes when something real changed', async () => {
+    // The skip must be about substance, not about skipping work.
+    const base = {
+      id: 'changed', type: 'codex-sdk', cwd: '/proj', label: 'Cx1',
+      parentSession: 'deck_cd_brain', runtimeType: 'transport',
+    } as Parameters<typeof rebuildSubSessions>[0][number];
+
+    await rebuildSubSessions([base]);
+    const persisted = upsertSessionMock.mock.calls[0]![0] as Record<string, unknown>;
+    getSessionMock.mockReturnValue({ ...persisted, updatedAt: (persisted.updatedAt as number) - 60_000 });
+    upsertSessionMock.mockClear();
+
+    await rebuildSubSessions([{ ...base, label: 'Cx1 renamed' }]);
+    expect(upsertSessionMock, 'a real change is still persisted').toHaveBeenCalledTimes(1);
+    expect(upsertSessionMock.mock.calls[0]![0]).toMatchObject({ label: 'Cx1 renamed' });
+  });
+
+  it('a replayed rebuild does not resurrect a session the restart-loop breaker stopped', async () => {
+    // The breaker marks `error` after MAX_RESTARTS failures and the health
+    // sweep skips that state. Rebuild replays on every reconnect and forced
+    // `idle`, clearing the marker — so the sweep respawned, the session died,
+    // and the breaker re-fired. Measured live: "Restart loop detected" 8 times
+    // in 300s for two sub-sessions, indefinitely.
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_looping', state: 'error',
+      error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+      updatedAt: Date.now() - 60_000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'looping', type: 'codex', cwd: '/proj', parentSession: 'deck_cd_brain',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    const written = upsertSessionMock.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    for (const record of written) {
+      expect(record.state, 'the stop marker must survive a rebuild replay').toBe('error');
+    }
+  });
+
+  it('still brings a healthy stored session back as idle', async () => {
+    // The preservation must be narrow: only the breaker's terminal marker.
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_healthy', state: 'stopped', updatedAt: Date.now() - 60_000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'healthy', type: 'codex', cwd: '/proj', parentSession: 'deck_cd_brain',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    const written = upsertSessionMock.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    expect(written.length).toBeGreaterThan(0);
+    for (const record of written) {
+      expect(record.state, 'a non-terminal state is still re-derived').toBe('idle');
+    }
+  });
+
   it.each([
     ['claude-code-sdk', 'CC Preset'],
     ['qwen', 'Qwen Preset'],

@@ -120,22 +120,80 @@ function createDefaultMemoryMcpResourceGuard(
   });
 }
 
-const DAEMON_ADMISSION_GATED_TOOLS = new Set<string>([
+/**
+ * Tools whose resource use is ACCOUNTED FOR, never gated.
+ *
+ * These two are how the supervision control plane hands out work. Putting a
+ * memory-pressure check in front of them meant a memory incident made itself
+ * both undiagnosable and unfixable: the plane could not dispatch the task to
+ * investigate the pressure, because the pressure refused the dispatch. A
+ * resource signal is worth recording; it is not a reason to withhold the
+ * remedy. Admission is therefore observed and reported, and it never blocks.
+ */
+const DAEMON_ADMISSION_ACCOUNTED_TOOLS = new Set<string>([
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
 ]);
 
-async function acquireDaemonTaskAdmission(
+/** Record-only outcomes. Exported so tests bind to these and never re-spell them. */
+export const DAEMON_TASK_ADMISSION_OUTCOME = {
+  ACCEPTED: 'accepted',
+  PRESSURE_OBSERVED: 'pressure_observed',
+  IDENTITY_UNAVAILABLE: 'identity_unavailable',
+  UNAVAILABLE: 'unavailable',
+} as const;
+
+export type DaemonTaskAdmissionOutcome =
+  typeof DAEMON_TASK_ADMISSION_OUTCOME[keyof typeof DAEMON_TASK_ADMISSION_OUTCOME];
+
+/** Test seam: observe what the gate WOULD have done, without it doing anything. */
+let daemonTaskAdmissionObserver:
+  ((record: { tool: string; outcome: DaemonTaskAdmissionOutcome; detail?: string }) => void) | null = null;
+
+export function __setDaemonTaskAdmissionObserverForTests(
+  observer: ((record: { tool: string; outcome: DaemonTaskAdmissionOutcome; detail?: string }) => void) | null,
+): void {
+  daemonTaskAdmissionObserver = observer;
+}
+
+function recordDaemonTaskAdmission(
+  tool: string,
+  outcome: DaemonTaskAdmissionOutcome,
+  detail?: string,
+): void {
+  daemonTaskAdmissionObserver?.({ tool, outcome, ...(detail ? { detail } : {}) });
+  if (outcome === DAEMON_TASK_ADMISSION_OUTCOME.ACCEPTED) return;
+  // stderr, because stdout is the MCP protocol channel.
+  process.stderr.write(
+    `[memory-mcp] task admission ${outcome} for ${tool}${detail ? `: ${detail}` : ''}; proceeding (record-only)\n`,
+  );
+}
+
+/**
+ * Take an admission lease if one is immediately available.
+ *
+ * One attempt, no retry loop, no throw. The previous implementation polled for
+ * five seconds and then threw `daemon_task_memory_budget_rejected` or
+ * `daemon_task_memory_budget_queued`, which both refused the call and added up
+ * to five seconds of latency to every dispatch. A lease is still taken and
+ * released when the daemon grants one, so accounting stays honest whenever it
+ * is available; when it is not, the caller proceeds regardless.
+ */
+async function observeDaemonTaskAdmission(
+  tool: string,
   caller: McpRuntimeCaller,
   owner: SessionResourceOwner | null,
 ): Promise<{ port: number; token: string } | null> {
   if (!caller.sessionName || !owner || owner.sessionName !== caller.sessionName) {
-    throw new Error('daemon_task_admission_identity_unavailable');
+    recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.IDENTITY_UNAVAILABLE);
+    return null;
   }
-  const port = await resolveLiveHookPort();
-  if (!port) throw new Error('daemon_task_admission_unavailable');
-  const deadline = Date.now() + 5_000;
-  for (;;) {
+  try {
+    const port = await resolveLiveHookPort();
+    if (!port) {
+      recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.UNAVAILABLE, 'no_hook_port');
+      return null;
+    }
     const response = await postHookSend(
       port,
       {
@@ -148,17 +206,21 @@ async function acquireDaemonTaskAdmission(
       2_000,
     );
     if (response.action === TASK_ADMISSION.ACCEPT && typeof response.token === 'string') {
+      recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.ACCEPTED);
       return { port, token: response.token };
     }
-    if (response.action === TASK_ADMISSION.REJECT || Date.now() >= deadline) {
-      throw new Error(response.action === TASK_ADMISSION.REJECT
-        ? 'daemon_task_memory_budget_rejected'
-        : 'daemon_task_memory_budget_queued');
-    }
-    const retryAfterMs = typeof response.retryAfterMs === 'number'
-      ? Math.min(Math.max(response.retryAfterMs, 50), 1_000)
-      : 250;
-    await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+    // Pressure is real and recorded. It still does not refuse the call.
+    recordDaemonTaskAdmission(
+      tool, DAEMON_TASK_ADMISSION_OUTCOME.PRESSURE_OBSERVED, String(response.action ?? 'unknown'),
+    );
+    return null;
+  } catch (error) {
+    // Even a broken admission hook must not take the control plane with it.
+    recordDaemonTaskAdmission(
+      tool, DAEMON_TASK_ADMISSION_OUTCOME.UNAVAILABLE,
+      error instanceof Error ? error.message : String(error),
+    );
+    return null;
   }
 }
 
@@ -192,8 +254,8 @@ function installMemoryMcpResourceGuard(
   const original = server.registerTool.bind(server);
   server.registerTool = ((name: string, config: unknown, callback: (...args: unknown[]) => unknown) => {
     const guarded = async (...args: unknown[]) => guard.run(name, async () => {
-      const lease = daemonAdmissionEnabled && DAEMON_ADMISSION_GATED_TOOLS.has(name)
-        ? await acquireDaemonTaskAdmission(caller, daemonAdmissionOwner)
+      const lease = daemonAdmissionEnabled && DAEMON_ADMISSION_ACCOUNTED_TOOLS.has(name)
+        ? await observeDaemonTaskAdmission(name, caller, daemonAdmissionOwner)
         : null;
       try {
         return await callback(...args);

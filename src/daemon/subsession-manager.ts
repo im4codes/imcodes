@@ -470,6 +470,57 @@ export async function stopSubSession(
   });
 }
 
+/**
+ * Is this rebuild a no-op for an already-correct record?
+ *
+ * `updatedAt` is excluded deliberately: the rebuild stamps it with `now` on
+ * every pass, so comparing it would report a change for a record where nothing
+ * of substance moved — which is exactly how a replayed rebuild turned into
+ * continuous store churn. Every other field participates, so a real change is
+ * still written.
+ */
+/**
+ * The state a rebuild may assign without undoing a deliberate decision.
+ *
+ * `error` is set by the restart-loop breaker in session-manager after
+ * MAX_RESTARTS failures in the window, and the health sweep skips sessions in
+ * that state — that pair is the whole stop mechanism. Rebuild is REPLAYED on
+ * every server reconnect, and it forced `idle` unconditionally, so each replay
+ * cleared the marker, the sweep respawned the session, it died again, and the
+ * breaker re-fired. Measured on a live daemon: two sub-sessions producing
+ * "Restart loop detected" 8 times in 300s, forever. Preserve the terminal
+ * marker; everything else may be re-derived.
+ */
+function rebuiltSessionState(
+  stored: SessionRecord | undefined,
+  fallback: SessionRecord['state'] = 'idle',
+): SessionRecord['state'] {
+  return stored?.state === 'error' ? 'error' : fallback;
+}
+
+function sameRebuiltTransportRecord(
+  existing: SessionRecord | undefined,
+  next: SessionRecord,
+): boolean {
+  if (!existing) return false;
+  const keys = new Set<string>([
+    ...Object.keys(existing as unknown as Record<string, unknown>),
+    ...Object.keys(next as unknown as Record<string, unknown>),
+  ]);
+  keys.delete('updatedAt');
+  const a = existing as unknown as Record<string, unknown>;
+  const b = next as unknown as Record<string, unknown>;
+  for (const key of keys) {
+    const left = a[key];
+    const right = b[key];
+    if (left === right) continue;
+    // Structural compare for the few object-valued fields (transportConfig,
+    // restartTimestamps). Cheap because these records are small and flat.
+    if (JSON.stringify(left ?? null) !== JSON.stringify(right ?? null)) return false;
+  }
+  return true;
+}
+
 export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {
   const { startWatchingFile, findJsonlPathBySessionId, ensureClaudeSessionFile, preClaimFile, isWatching } = await import('./jsonl-watcher.js');
   const { startWatchingById, isWatching: isCodexWatching, isFileClaimedByOther } = await import('./codex-watcher.js');
@@ -509,7 +560,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         role: 'w1',
         agentType: sub.type,
         projectDir: sub.cwd ?? existing?.projectDir ?? process.cwd(),
-        state: existingRuntime ? (existing?.state ?? 'idle') : 'idle',
+        state: rebuiltSessionState(existing, existingRuntime ? (existing?.state ?? 'idle') : 'idle'),
         runtimeType: 'transport',
         providerId: sub.providerId ?? sub.type,
         restarts: existing?.restarts ?? 0,
@@ -529,12 +580,21 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         description: sub.description ?? existing?.description,
         ccPreset: rebuildCcPreset,
       };
-      upsertSession(nextRecord);
-      if (!existingRuntime) {
-        logger.info(
-          { sessionName, agentType: sub.type, providerId: nextRecord.providerId },
-          'Transport sub-session rebuild deferred until first send',
-        );
+      // Rebuild is REPLAYED, not one-shot: the server re-sends it on every
+      // reconnect. Writing all of them unconditionally made a reconnect cost a
+      // full rewrite of every sub-session record, and `updatedAt: now` alone
+      // guaranteed every record always compared as changed — so the store was
+      // reserialized and every one of these lines logged, every time, for
+      // records that were already correct. With ~113 sub-sessions and a stall
+      // driving reconnects, that fed itself.
+      if (!sameRebuiltTransportRecord(existing, nextRecord)) {
+        upsertSession(nextRecord);
+        if (!existingRuntime) {
+          logger.info(
+            { sessionName, agentType: sub.type, providerId: nextRecord.providerId },
+            'Transport sub-session rebuild deferred until first send',
+          );
+        }
       }
       continue;
     }
@@ -575,7 +635,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
       const effectiveOpenCodeSessionId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
       upsertSession({
-        name: sessionName, projectName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'idle',
+        name: sessionName, projectName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: rebuiltSessionState(stored),
         sessionInstanceId: stored?.sessionInstanceId,
         runtimeEpoch: stored?.runtimeEpoch,
         projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,

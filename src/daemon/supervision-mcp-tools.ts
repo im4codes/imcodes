@@ -577,6 +577,10 @@ export function createSupervisionMcpToolHandlers(
           : reg.getStatus(taskId),
       });
       if (!outcome.ok) return err(outcome.refusal ?? 'refused', outcome.detail);
+      // Set only when a post-commit projection could not be completed. It never
+      // negates the committed transition; it tells the caller what still needs
+      // to converge so they do not have to guess from an error.
+      let convergenceOutcome: string | undefined;
       const applied = reg.applyIntent({
         taskId,
         ...(intentAssignmentId ? { assignmentId: intentAssignmentId } : {}),
@@ -591,9 +595,22 @@ export function createSupervisionMcpToolHandlers(
         // Validation is the event that makes FINISHED/open_audit uniquely
         // decidable. Converge the exact object immediately; the periodic tick
         // is only a restart backstop, never the primary production wire.
-        const convergence = await reg.convergeValidatedAssignment?.({ taskId, assignmentId: intentAssignmentId });
-        if (convergence && !Array.isArray(convergence) && convergence.ok === false) {
-          return err(convergence.reason, `integration bundle freeze rejected: ${convergence.reason}`);
+        // The validation edge is ALREADY COMMITTED by applyIntent above. A
+        // failure here is a secondary projection failing, not the transition,
+        // so returning an error would tell the caller their validation did not
+        // land while the store says it did — the caller then cannot tell which
+        // of the two to believe, and re-running is the wrong move because the
+        // state machine has already advanced. Report it as an outcome on a
+        // SUCCESSFUL response instead, exactly as the audit dispatch below
+        // already does, and let the same-object convergence backstop retry.
+        try {
+          const convergence = await reg.convergeValidatedAssignment?.({ taskId, assignmentId: intentAssignmentId });
+          if (convergence && !Array.isArray(convergence) && convergence.ok === false) {
+            convergenceOutcome = convergence.reason;
+          }
+        } catch (error) {
+          // A convergence that throws is still only a projection failing.
+          convergenceOutcome = error instanceof Error ? error.message : String(error);
         }
         try {
           await deps.dispatchReadyAudit?.(taskId);
@@ -617,6 +634,7 @@ export function createSupervisionMcpToolHandlers(
           ? reg.getStatus(taskId) ?? outcome.toStatus ?? null
           : outcome.toStatus ?? null,
         validationState: outcome.validationState,
+        ...(convergenceOutcome ? { pendingConvergence: convergenceOutcome } : {}),
       });
     },
 
