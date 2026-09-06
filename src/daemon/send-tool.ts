@@ -137,6 +137,12 @@ import {
   inspectSupervisionAssignmentWorktree,
   resolveSupervisionAssignmentWorktree,
 } from './supervision-worktree-inspector.js';
+import {
+  applySupervisionIntegrationBundle,
+  freezeSupervisionIntegrationBundle,
+  verifySupervisionIntegrationBundle,
+  type SupervisionIntegrationBundle,
+} from './supervision-integration-bundle.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 
@@ -2715,7 +2721,7 @@ function mayFallbackToBusyAfterProvision(result: SendMessageResult): boolean {
 function boundedAuditBrief(
   task: SupervisionTaskSnapshot,
   revision: string,
-  authoritativeWorktree: string,
+  authoritativeBundle: string,
 ): string {
   const shorten = (value: string, max = 800) => value.length <= max ? value : `${value.slice(0, max - 1)}…`;
   const files = task.touchedFiles.length > 0
@@ -2727,13 +2733,13 @@ function boundedAuditBrief(
     `revision=${revision}`,
     `classification=${task.classification}`,
     `objective=${shorten(task.objective)}`,
-    `Authoritative implementer worktree: ${authoritativeWorktree}`,
+    `Authoritative immutable integration bundle: ${authoritativeBundle}`,
     '',
     'Acceptance:',
     ...task.acceptance.slice(0, 20).map((item) => `- ${shorten(item, 500)}`),
     '',
     'Evidence-first independent audit. Verify the exact revision and return one final PASS/REWORK via peer_audit_reply.',
-    'Reconstruct and inspect the frozen bytes from the authoritative implementer worktree above. Do not inspect the auditor worktree as a substitute.',
+    'Inspect the manifest and frozen files from the immutable bundle above. Do not inspect the auditor worktree or substitute a mutable implementer worktree.',
     'Do not edit code, stage, commit, push, deploy, install, upgrade, restart, or create a replacement task/audit.',
     'On PASS, integrationOwner is the same-project Brain; on failure report bounded concrete findings.',
     ...(files.length > 0 ? ['', 'Referenced files:', ...[...new Set(files)].sort().slice(0, 40).map((file) => `- ${file}`)] : []),
@@ -3062,6 +3068,15 @@ export async function dispatchReadyAudit(
     return { status: 'blocked', reason: exactError, reported };
   }
 
+  const integrationArtifact = resolveIntegrationArtifact(task, implementer, deps, true);
+  if (!integrationArtifact) {
+    const exactError = 'authoritative immutable integration bundle unavailable or mismatched';
+    const reported = reporter && coordinator
+      ? await reportBlocker(implementer, exactError)
+      : false;
+    return { status: 'blocked', reason: exactError, reported };
+  }
+
   // attemptId and the final-receipt PREFLIGHT are established above, ahead of
   // every lifecycle write.
   const existingAudits = task.assignments.filter((assignment) => (
@@ -3198,14 +3213,9 @@ export async function dispatchReadyAudit(
     projectName: task.projectName,
     projectRoot: brain.projectDir,
   };
-  const authoritativeWorktree = inspectAssignmentForConvergence(implementer, deps)?.worktreePath
-    ?? resolveSupervisionAssignmentWorktree({
-      sessionName: implementer.identity.sessionName,
-      assignmentId: implementer.assignmentId,
-    });
   const buildInput = (target?: string, autoProvision = false): SendMessageInput => ({
     ...(target ? { target } : {}),
-    message: boundedAuditBrief(task, revision, authoritativeWorktree),
+    message: boundedAuditBrief(task, revision, integrationArtifact.path),
     reply: true,
     idempotencyKey: `auto-audit:${task.taskId}:${revision}`,
     ...(existingAudit ? {} : { newWorkload: true }),
@@ -3295,6 +3305,63 @@ function inspectAssignmentForConvergence(
     assignmentId: assignment.assignmentId,
   });
   return inspected.ok ? inspected.snapshot : undefined;
+}
+
+interface ResolvedIntegrationArtifact {
+  path: string;
+  files: import('./supervision-worktree-inspector.js').SupervisionWorktreeFileSnapshot[];
+  bundle?: SupervisionIntegrationBundle;
+}
+
+/**
+ * Resolve the one immutable artifact shared by audit and integration. An
+ * injected worktree inspector is an explicit unit-test seam; production may
+ * create a missing bundle only before audit, never after PASS.
+ */
+function resolveIntegrationArtifact(
+  task: SupervisionTaskSnapshot,
+  implementer: PersistedSupervisionTaskAssignment,
+  deps: ReadyAuditDispatchDeps,
+  allowFreeze: boolean,
+): ResolvedIntegrationArtifact | undefined {
+  const revision = task.currentRevision?.trim();
+  if (!revision) return undefined;
+  if (deps.inspectAssignmentWorktree) {
+    const snapshot = deps.inspectAssignmentWorktree(implementer);
+    return snapshot && snapshot.files.length > 0
+      && snapshot.stagedPaths.length === 0 && snapshot.conflictedPaths.length === 0
+      ? { path: snapshot.worktreePath, files: snapshot.files }
+      : undefined;
+  }
+  const persisted = task.integrationBundle;
+  if (persisted) {
+    if (persisted.taskId !== task.taskId
+      || persisted.sourceAssignmentId !== implementer.assignmentId
+      || persisted.revision !== revision
+      || !verifySupervisionIntegrationBundle(persisted).ok) return undefined;
+    return { path: persisted.bundlePath, files: persisted.files, bundle: persisted };
+  }
+  if (!allowFreeze) return undefined;
+  const snapshot = inspectAssignmentForConvergence(implementer, deps);
+  if (!snapshot || snapshot.files.length === 0
+    || snapshot.stagedPaths.length > 0 || snapshot.conflictedPaths.length > 0) return undefined;
+  const frozen = freezeSupervisionIntegrationBundle({
+    taskId: task.taskId,
+    assignmentId: implementer.assignmentId,
+    revision,
+    snapshot,
+  });
+  if (!frozen.ok || !verifySupervisionIntegrationBundle(frozen.bundle).ok) return undefined;
+  const bound = (deps.registry ?? getSupervisionTaskRegistry()).bindIntegrationBundle({
+    taskId: task.taskId,
+    assignmentId: implementer.assignmentId,
+    identity: implementer.identity,
+    revision,
+    bundle: frozen.bundle,
+    now: (deps.now ?? Date.now)(),
+  });
+  if (!bound.ok) return undefined;
+  return { path: frozen.bundle.bundlePath, files: frozen.bundle.files, bundle: frozen.bundle };
 }
 
 /** Deliver one exact REWORK receipt back to the same implementation object. */
@@ -3416,6 +3483,10 @@ export async function dispatchReadyIntegration(
     && item.receiptKind === 'final' && item.verdict === 'PASS'
   ));
   if (receipts.length !== 1) return { status: 'blocked', reason: 'exact PASS receipt unavailable', reported: false };
+  const integrationArtifact = resolveIntegrationArtifact(task, implementer, deps, false);
+  if (!integrationArtifact) {
+    return { status: 'blocked', reason: 'authoritative immutable integration bundle unavailable or mismatched', reported: false };
+  }
   const sessions = (deps.listSessions ?? listSessions)();
   const coordinators = task.assignments.filter((assignment) => assignment.role === 'coordinator');
   const liveCoordinators = coordinators.flatMap((assignment) => {
@@ -3451,10 +3522,6 @@ export async function dispatchReadyIntegration(
       return { status: 'blocked', reason: 'integration requires one exact live Brain coordinator', reported: false };
     }
     recoveredBrain = candidate;
-  }
-  const snapshot = inspectAssignmentForConvergence(implementer, deps);
-  if (!snapshot || snapshot.stagedPaths.length > 0 || snapshot.conflictedPaths.length > 0) {
-    return { status: 'blocked', reason: 'authoritative implementation manifest unavailable', reported: false };
   }
   // Every pre-existing gate has now passed, so the legacy recovery is safe to
   // materialise. Deterministic key: a replay reuses the same row rather than
@@ -3498,7 +3565,7 @@ export async function dispatchReadyIntegration(
       taskId: task.taskId,
       role: 'integration_owner',
       identity: coordinator.identity,
-      scopeFiles: snapshot.files.map((file) => file.path),
+      scopeFiles: integrationArtifact.files.map((file) => file.path),
       required: true,
       auditAttemptId: implementer.auditAttemptId,
       auditRevision: revision,
@@ -3507,6 +3574,34 @@ export async function dispatchReadyIntegration(
     });
     if (!created.ok) return { status: 'blocked', reason: `integration owner materialization rejected: ${created.reason}`, reported: false };
     owner = created.value;
+  }
+  let integrationWorktree: string | undefined;
+  if (integrationArtifact.bundle) {
+    const ensured = await defaultEnsureSupervisionAssignmentWorktree({
+      projectRoot: brain.projectDir,
+      sessionName: brain.name,
+      assignmentId: owner.assignmentId,
+      baseRevision: task.baseRevision ?? integrationArtifact.bundle.headSha,
+    });
+    if (!ensured.ok) {
+      return {
+        status: 'blocked',
+        reason: `integration bundle worktree provisioning rejected: ${ensured.reason}`,
+        reported: false,
+      };
+    }
+    const applied = applySupervisionIntegrationBundle({
+      bundle: integrationArtifact.bundle,
+      worktreePath: ensured.worktreePath,
+    });
+    if (!applied.ok) {
+      return {
+        status: 'blocked',
+        reason: `integration bundle apply rejected: ${applied.reason}${applied.path ? `:${applied.path}` : ''}`,
+        reported: false,
+      };
+    }
+    integrationWorktree = ensured.worktreePath;
   }
   // Reuse the registry's receipt-authenticated, atomic finish path rather than
   // copying PASS fields onto a delegated row. That path binds the exact final
@@ -3550,12 +3645,13 @@ export async function dispatchReadyIntegration(
       `implementerAssignmentId=${implementer.assignmentId}`,
       `revision=${revision}`,
       `attemptId=${implementer.auditAttemptId}`,
-      `authoritativeWorktree=${snapshot.worktreePath}`,
+      `authoritativeBundle=${integrationArtifact.path}`,
+      ...(integrationWorktree ? [`preparedIntegrationWorktree=${integrationWorktree}`] : []),
       '',
       'Exact pathspec:',
-      ...snapshot.files.map((file) => `- ${file.path}`),
+      ...integrationArtifact.files.map((file) => `- ${file.path}`),
       '',
-      'Integrate only these frozen bytes. Record real commit/push evidence; if already present, record that fact. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
+      'Integrate only the verified bundle bytes already materialized in the prepared integration worktree. Record real commit/push evidence; if already present, record that fact. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
     ].join('\n'),
     idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
     internalMessageId: messageId,

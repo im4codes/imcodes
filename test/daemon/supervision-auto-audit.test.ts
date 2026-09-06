@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,10 +42,12 @@ import {
   resetDelegationReplyStoreForTests,
 } from '../../src/daemon/delegation-reply-store.js';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
+import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+const bundleRoots: string[] = [];
 
 function identity(name: string, agentType = 'codex-sdk', providerFamily = 'openai'): PersistedSupervisionTaskAssignmentIdentity {
   return {
@@ -169,10 +171,39 @@ function makeReadyTask(options: {
       ...(validationState ? { validationState } : {}),
     })).toMatchObject({ ok: true });
   }
+  const bundleRoot = mkdtempSync(join(tmpdir(), 'imcodes-auto-audit-bundle-'));
+  bundleRoots.push(bundleRoot);
+  const source = join(bundleRoot, 'source');
+  mkdirSync(join(source, 'src'), { recursive: true });
+  writeFileSync(join(source, 'src/exact.ts'), 'exact-after-bytes\n');
+  const frozen = freezeSupervisionIntegrationBundle({
+    taskId,
+    assignmentId: worker.value.assignmentId,
+    revision,
+    bundleRoot: join(bundleRoot, 'bundles'),
+    snapshot: {
+      worktreePath: source,
+      headSha: 'a'.repeat(40),
+      files: [{
+        path: 'src/exact.ts',
+        sha256: createHash('sha256').update('exact-after-bytes\n').digest('hex'),
+      }],
+      stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+    },
+  });
+  if (!frozen.ok) throw new Error(frozen.reason);
+  expect(registry.bindIntegrationBundle({
+    taskId,
+    assignmentId: worker.value.assignmentId,
+    identity: worker.value.identity,
+    revision,
+    bundle: frozen.bundle,
+  })).toMatchObject({ ok: true });
   return { registry, taskId, revision, worker: worker.value };
 }
 
 beforeEach(() => {
+  for (const root of bundleRoots.splice(0)) rmSync(root, { recursive: true, force: true });
   resetSupervisionTaskRegistryForTests();
   resetTransportQueueStoreForTests();
   resetDelegationReplyStoreForTests();
@@ -360,7 +391,7 @@ describe('automatic supervision audit materialization', () => {
     expect(shape.registry.get(shape.taskId)).toMatchObject({
       status: 'ready_for_integration', integrationOwnerAssignmentId: owners[0]!.assignmentId,
     });
-    expect(dispatch.mock.calls[0]![1].message).toContain('authoritativeWorktree=/tmp/authoritative-worker/repo');
+    expect(dispatch.mock.calls[0]![1].message).toContain('authoritativeBundle=/tmp/authoritative-worker/repo');
     expect(dispatch.mock.calls[0]![1].message).toContain('- src/exact.ts');
     expect(dispatch.mock.calls[0]![1].internalQueueSupervisionReference).toEqual({
       kind: 'exact_integration', taskId: shape.taskId,
@@ -380,7 +411,9 @@ describe('automatic supervision audit materialization', () => {
       auditRevision: shape.revision,
       verdict: 'PASS',
       ownedFiles: ['src/exact.ts'],
-      integrationManifest: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+      integrationManifest: shape.registry.getTaskRecord(shape.taskId)!.integrationBundle!.files
+        .filter((file): file is { path: string; sha256: string } => file.deleted !== true && Boolean(file.sha256))
+        .map((file) => ({ path: file.path, sha256: file.sha256 })),
       integrationOwner: 'deck_alpha_brain',
       commitSha: 'a'.repeat(40),
       pushResult: 'already_present',
@@ -1050,7 +1083,7 @@ describe('automatic supervision audit materialization', () => {
         attemptId: automaticAttempt(taskId, revision),
         auditedSessionName: 'deck_alpha_worker',
       });
-      expect(input.message).toContain('Authoritative implementer worktree: /tmp/authoritative-auto-audit/repo');
+      expect(input.message).toContain('Authoritative immutable integration bundle: /tmp/authoritative-auto-audit/repo');
       expect(input.message).toContain('Do not inspect the auditor worktree');
       const created = registry.createAssignment({
         taskId,
@@ -2826,6 +2859,11 @@ describe('periodic supervision convergence tick', () => {
       registry, listSessions: () => sessions,
       listTargets: listTargetRecords(sessions[2]!), dispatch,
       hasDeliveryEvidence: () => evidence,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/legacy-explicit/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
     };
 
     const first = await runSupervisionConvergenceTick(deps);
@@ -3217,6 +3255,11 @@ describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
       registry, listSessions: () => sessions,
       listTargets: listTargetRecords(sessions[2]!), dispatch,
       hasDeliveryEvidence: () => evidence,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/legacy-explicit-recovery/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
     };
 
     const first = await runSupervisionConvergenceTick(deps);
@@ -3350,6 +3393,11 @@ describe('R5: deterministic implementer/revision alignment before materializatio
       registry, listSessions: () => sessions,
       listTargets: listTargetRecords(sessions[2]!), dispatch,
       hasDeliveryEvidence: () => evidence,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/rework-successor/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
     });
 
     expect(result).toMatchObject({ status: 'dispatched', attemptId: automaticAttempt(taskId, revision) });
@@ -3727,7 +3775,9 @@ describe('zero-coordinator legacy integration recovery', () => {
         ...cleanWorktree(), stagedPaths: ['src/exact.ts'],
       }),
     });
-    expect(result).toMatchObject({ status: 'blocked', reason: 'authoritative implementation manifest unavailable' });
+    expect(result).toMatchObject({
+      status: 'blocked', reason: 'authoritative immutable integration bundle unavailable or mismatched',
+    });
     expect(
       shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator'),
       'a dirty worktree must not mint a coordinator',

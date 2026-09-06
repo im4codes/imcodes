@@ -54,6 +54,10 @@ import type {
 import type { SupervisionRecoveryTargetStatus } from './supervision-mcp-tools.js';
 import { SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH } from './supervision-intent-ops.js';
 import type { SupervisionWorktreeSnapshot } from './supervision-worktree-inspector.js';
+import {
+  isValidSupervisionIntegrationBundleBinding,
+  type SupervisionIntegrationBundle,
+} from './supervision-integration-bundle.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -393,6 +397,8 @@ export interface PersistedSupervisionTaskRecord {
   /** Brain-owned creation snapshot. Missing keeps the legacy manual audit path. */
   auditPolicy?: SupervisionTaskAuditPolicy;
   integrationOwnerAssignmentId?: string;
+  /** Immutable exact after-bytes shared by audit and integration. */
+  integrationBundle?: SupervisionIntegrationBundle;
   baseRevision?: string;
   currentRevision?: string;
   status: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus;
@@ -753,6 +759,31 @@ export interface SupervisionTaskAssignmentFinishInput {
   revision?: string | null;
   evidence?: string | null;
   now?: number;
+}
+
+export interface SupervisionIntegrationBundleBindInput {
+  taskId: string;
+  assignmentId: string;
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  revision: string;
+  bundle: SupervisionIntegrationBundle;
+  now?: number;
+}
+
+function sameIntegrationBundleBinding(
+  left: SupervisionIntegrationBundle | undefined,
+  right: SupervisionIntegrationBundle,
+): boolean {
+  return Boolean(left
+    && left.version === right.version
+    && left.taskId === right.taskId
+    && left.sourceAssignmentId === right.sourceAssignmentId
+    && left.revision === right.revision
+    && left.headSha === right.headSha
+    && left.manifestSha256 === right.manifestSha256
+    && left.bundleRoot === right.bundleRoot
+    && left.bundlePath === right.bundlePath
+    && JSON.stringify(left.files) === JSON.stringify(right.files));
 }
 
 export interface SupervisionCancelledCompletionEvidenceInput {
@@ -3809,6 +3840,72 @@ export class SupervisionTaskRegistry {
     }
   }
 
+  /**
+   * Bind the immutable after-bytes before validation can hand an implementer
+   * to audit. The filesystem writer has already copied and verified the
+   * content-addressed object; this transaction makes its exact identity part
+   * of the task authority that survives daemon/store reopen.
+   */
+  bindIntegrationBundle(
+    input: SupervisionIntegrationBundleBindInput,
+  ): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const revision = normalizeTaskString(input.revision);
+    const task = taskId ? this.getTaskRecord(taskId) : undefined;
+    const assignment = assignmentId ? this.getAssignment(assignmentId) : undefined;
+    if (!task || !assignment || assignment.taskId !== task.taskId) return { ok: false, reason: 'not_found' };
+    if (!identityMatches(assignment.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
+    if (assignment.role !== 'implementer' || !assignment.required) return { ok: false, reason: 'role_forbidden' };
+    if (!revision || task.currentRevision !== revision || assignment.auditRevision !== revision) {
+      return { ok: false, reason: 'old_revision' };
+    }
+    const bundle = input.bundle;
+    if (!isValidSupervisionIntegrationBundleBinding(bundle)
+      || bundle.taskId !== task.taskId
+      || bundle.sourceAssignmentId !== assignment.assignmentId
+      || bundle.revision !== revision) return { ok: false, reason: 'manifest_mismatch' };
+    if (task.integrationBundle) {
+      return sameIntegrationBundleBinding(task.integrationBundle, bundle)
+        ? { ok: true, value: task, replay: true }
+        : { ok: false, reason: 'manifest_mismatch' };
+    }
+    if (!['implementing', 'validated', 'ready_for_audit'].includes(task.status)
+      || !['implementing', 'validated', 'ready_for_audit'].includes(assignment.status)) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    const now = input.now ?? Date.now();
+    const bound = { ...task, integrationBundle: bundle, updatedAt: now };
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const lockedTask = this.getTaskRecord(task.taskId);
+      const lockedAssignment = this.getAssignment(assignment.assignmentId);
+      if (!lockedTask || !lockedAssignment
+        || lockedTask.integrationBundle
+        || lockedTask.currentRevision !== revision
+        || lockedAssignment.auditRevision !== revision
+        || !identityMatches(lockedAssignment.identity, input.identity)) {
+        this.#db.exec('ROLLBACK');
+        return sameIntegrationBundleBinding(lockedTask?.integrationBundle, bundle)
+          ? { ok: true, value: lockedTask!, replay: true }
+          : { ok: false, reason: 'manifest_mismatch' };
+      }
+      this.#writeTask(bound, this.#taskEventFor(bound.status), {
+        source: 'immutable_integration_bundle_frozen',
+        assignmentId: assignment.assignmentId,
+        revision,
+        manifestSha256: bundle.manifestSha256,
+        bundlePath: bundle.bundlePath,
+        files: bundle.files,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: bound };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   finishAssignment(input: SupervisionTaskAssignmentFinishInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const existing = this.getAssignment(input.assignmentId);
     if (!existing) return { ok: false, reason: 'not_found' };
@@ -4367,6 +4464,21 @@ export class SupervisionTaskRegistry {
       && pushRemoteRef.startsWith('refs/')
     );
     if (!structurallyValid) return { ok: false, reason: 'invalid' };
+    if (task.integrationBundle) {
+      const bundle = task.integrationBundle;
+      const bundlePaths = bundle.files.map((file) => file.path).sort();
+      const bundleManifest = bundle.files
+        .filter((file): file is { path: string; sha256: string } => file.deleted !== true && Boolean(file.sha256))
+        .map((file) => ({ path: file.path, sha256: file.sha256 }))
+        .sort((left, right) => left.path.localeCompare(right.path));
+      if (!isValidSupervisionIntegrationBundleBinding(bundle)
+        || bundle.taskId !== task.taskId
+        || bundle.revision !== revision
+        || JSON.stringify(ownedFiles) !== JSON.stringify(bundlePaths)
+        || JSON.stringify(manifest) !== JSON.stringify(bundleManifest)) {
+        return { ok: false, reason: 'manifest_mismatch' };
+      }
+    }
 
     const finalizedAt = task.finalization?.finalizedAt ?? input.now ?? Date.now();
     const finalization: PersistedSupervisionIntegrationFinalization = {
@@ -5449,6 +5561,7 @@ export class SupervisionTaskRegistry {
       const reboundTask: PersistedSupervisionTaskRecord = {
         ...task,
         currentRevision: toRevision,
+        integrationBundle: undefined,
         status: 'implementing',
         blocker: undefined,
         updatedAt: now,

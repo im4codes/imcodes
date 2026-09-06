@@ -134,7 +134,11 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
-import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
+import {
+  inspectSupervisionAssignmentWorktree,
+  resolveSupervisionAssignmentWorktree,
+} from './supervision-worktree-inspector.js';
+import { verifySupervisionIntegrationCommit } from './supervision-integration-bundle.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
@@ -1643,7 +1647,24 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const identity = await supervisionTaskIdentity();
       if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
-      const finalized = getSupervisionTaskRegistry().finalizeIntegration({
+      const registry = getSupervisionTaskRegistry();
+      const owner = registry.getAssignment(parsed.data.assignmentId);
+      const task = owner ? registry.getTaskRecord(owner.taskId) : undefined;
+      if (task?.integrationBundle) {
+        const verified = verifySupervisionIntegrationCommit({
+          bundle: task.integrationBundle,
+          worktreePath: resolveSupervisionAssignmentWorktree({
+            sessionName: owner!.identity.sessionName,
+            assignmentId: owner!.assignmentId,
+          }),
+          commitSha: parsed.data.commitSha,
+        });
+        if (!verified.ok) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED,
+            `integration_finalize rejected: bundle_${verified.reason}${verified.path ? `:${verified.path}` : ''}`);
+        }
+      }
+      const finalized = registry.finalizeIntegration({
         ...parsed.data,
         // Keep the persisted record shape stable. Invalid caller metadata was
         // reduced to an empty record above and never supplies authorization.

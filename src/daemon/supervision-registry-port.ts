@@ -24,6 +24,10 @@ import {
   type SupervisionWorktreeGcResult,
 } from './supervision-worktree-gc.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
+import {
+  freezeSupervisionIntegrationBundle,
+  verifySupervisionIntegrationBundle,
+} from './supervision-integration-bundle.js';
 import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-ingress.js';
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
@@ -131,13 +135,37 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     convergeValidatedAssignment: ({ taskId, assignmentId }) => {
       const registry = getSupervisionTaskRegistry();
       const assignment = registry.getAssignment(assignmentId);
-      if (!assignment || assignment.taskId !== taskId) return [];
+      const task = registry.getTaskRecord(taskId);
+      if (!assignment || assignment.taskId !== taskId || !task) return { ok: false, reason: 'not_found' };
+      const revision = assignment.auditRevision?.trim() || task.currentRevision?.trim();
+      if (!revision || (assignment.auditRevision && assignment.auditRevision !== revision)
+        || (task.currentRevision && task.currentRevision !== revision)) {
+        return { ok: false, reason: 'old_revision' };
+      }
+      const inspected = inspectSupervisionAssignmentWorktree({
+        sessionName: assignment.identity.sessionName,
+        assignmentId: assignment.assignmentId,
+      });
+      if (!inspected.ok || inspected.snapshot.stagedPaths.length > 0
+        || inspected.snapshot.conflictedPaths.length > 0) {
+        return { ok: false, reason: inspected.ok ? 'manifest_mismatch' : inspected.reason };
+      }
+      const frozen = freezeSupervisionIntegrationBundle({
+        taskId, assignmentId, revision, snapshot: inspected.snapshot,
+      });
+      if (!frozen.ok) return { ok: false, reason: frozen.reason };
+      const verified = verifySupervisionIntegrationBundle(frozen.bundle);
+      if (!verified.ok) return { ok: false, reason: verified.reason };
+      const bound = registry.bindIntegrationBundle({
+        taskId, assignmentId, identity: assignment.identity, revision, bundle: frozen.bundle,
+      });
+      if (!bound.ok) return { ok: false, reason: bound.reason };
       return registry.convergeValidatedAssignment(assignmentId, Date.now(), (candidate) => {
-        const inspected = inspectSupervisionAssignmentWorktree({
+        const current = inspectSupervisionAssignmentWorktree({
           sessionName: candidate.identity.sessionName,
           assignmentId: candidate.assignmentId,
         });
-        return inspected.ok ? inspected.snapshot : undefined;
+        return current.ok ? current.snapshot : undefined;
       });
     },
     convergeExactReworkAssignment: ({ taskId, assignmentId }) => {

@@ -159,7 +159,8 @@ export interface SupervisionRegistryPort {
     };
     rebindProjectName?: string;
   }): { ok: true; value: unknown; replay?: boolean } | { ok: false; reason: string };
-  convergeValidatedAssignment?(input: { taskId: string; assignmentId: string }): unknown;
+  convergeValidatedAssignment?(input: { taskId: string; assignmentId: string }):
+    | unknown[] | { ok: false; reason: string };
   convergeExactReworkAssignment?(input: { taskId: string; assignmentId: string }): unknown;
   list(filter: {
     projectName?: string; status?: string; topLevelTaskId?: string; ownerSessionName?: string;
@@ -517,7 +518,10 @@ export function createSupervisionMcpToolHandlers(
         // Validation is the event that makes FINISHED/open_audit uniquely
         // decidable. Converge the exact object immediately; the periodic tick
         // is only a restart backstop, never the primary production wire.
-        reg.convergeValidatedAssignment?.({ taskId, assignmentId: intentAssignmentId });
+        const convergence = reg.convergeValidatedAssignment?.({ taskId, assignmentId: intentAssignmentId });
+        if (convergence && !Array.isArray(convergence) && convergence.ok === false) {
+          return err(convergence.reason, `integration bundle freeze rejected: ${convergence.reason}`);
+        }
         try {
           await deps.dispatchReadyAudit?.(taskId);
         } catch {
