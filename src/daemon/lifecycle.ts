@@ -1658,6 +1658,12 @@ async function performShutdown(exitCode: number): Promise<void> {
     },
     browser: async () => {
       logger.info({ shutdownPhase: 'browser' }, 'Daemon shutdown phase browser started');
+      try {
+        const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
+        await shutdownDefaultPreviewReadCoordinatorForDaemon();
+      } catch (err) {
+        logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
+      }
       const { terminalStreamer } = await import('./terminal-streamer.js');
       await terminalStreamer.destroyAsync();
       closeDaemonRemoteDesktop();
@@ -1739,13 +1745,6 @@ async function performShutdown(exitCode: number): Promise<void> {
     }, 'Daemon shutdown: timeline pipeline drained');
   } catch (err) {
     logger.warn({ err }, 'Daemon shutdown timeline drain failed');
-  }
-
-  try {
-    const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
-    await shutdownDefaultPreviewReadCoordinatorForDaemon();
-  } catch (err) {
-    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
   }
 
   try {

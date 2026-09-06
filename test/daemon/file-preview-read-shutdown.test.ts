@@ -61,15 +61,24 @@ describe('PreviewReadDrainController', () => {
 });
 
 describe('daemon lifecycle preview-read shutdown hook', () => {
-  it('drains the default preview coordinator before disconnecting serverLink', () => {
+  it('drains the default preview coordinator inside the browser phase before disconnecting serverLink', () => {
     const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
     const source = readFileSync(resolve(repoRoot, 'src/daemon/lifecycle.ts'), 'utf8');
+    const browserPhaseStart = source.indexOf('browser: async () => {');
+    const containerPhaseStart = source.indexOf('container: async () => {', browserPhaseStart);
 
-    const drainIndex = source.indexOf('shutdownDefaultPreviewReadCoordinatorForDaemon');
-    const disconnectIndex = source.indexOf('serverLink?.disconnect');
+    expect(browserPhaseStart).toBeGreaterThanOrEqual(0);
+    expect(containerPhaseStart).toBeGreaterThan(browserPhaseStart);
+
+    const browserPhase = source.slice(browserPhaseStart, containerPhaseStart);
+    const drainCall = 'await shutdownDefaultPreviewReadCoordinatorForDaemon();';
+    const disconnectCall = 'serverLink?.disconnect();';
+    const drainIndex = browserPhase.indexOf(drainCall);
+    const disconnectIndex = browserPhase.indexOf(disconnectCall);
 
     expect(drainIndex).toBeGreaterThanOrEqual(0);
     expect(disconnectIndex).toBeGreaterThanOrEqual(0);
     expect(drainIndex).toBeLessThan(disconnectIndex);
+    expect(browserPhase.match(/await shutdownDefaultPreviewReadCoordinatorForDaemon\(\);/g)).toHaveLength(1);
   });
 });
