@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import type WebSocket from 'ws';
 import {
   DIRECT_FILE_CONNECTION_STATUS,
@@ -31,6 +32,7 @@ const storageMocks = vi.hoisted(() => ({
 vi.mock('../src/api.js', () => apiMocks);
 vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   initFileTransfer: vi.fn(),
+  ensureUploadDirectory: vi.fn(async () => {}),
   createDirectUploadFilename: () => 'integrated-upload.bin',
   resolveUploadPath: () => storageMocks.storedPath,
   lookupAttachmentByClientUploadId: storageMocks.lookup,
@@ -207,6 +209,33 @@ type Harness = {
 
 async function createHarness(options: { operationPrepareDelayMs?: number } = {}): Promise<Harness> {
   const direct = await import('../../src/daemon/direct-file-transfer.js');
+  const workerRuntime = await import('../../src/daemon/direct-file-transfer-worker.js');
+  class InProcessWorker extends EventEmitter {
+    constructor(generation: number) {
+      super();
+      queueMicrotask(() => {
+        void workerRuntime.__startDirectFileTransferWorkerInProcessForTests(
+          generation,
+          (envelope) => this.emit('message', envelope),
+        ).catch((error: unknown) => this.emit('error', error));
+      });
+    }
+
+    postMessage(raw: unknown): void {
+      queueMicrotask(() => {
+        void workerRuntime.__dispatchDirectFileTransferWorkerInProcessForTests(raw)
+          .catch((error: unknown) => this.emit('error', error));
+      });
+    }
+
+    terminate(): Promise<number> {
+      queueMicrotask(() => this.emit('exit', 0));
+      return Promise.resolve(0);
+    }
+  }
+  direct.__setDirectFileTransferWorkerFactoryForTests((_url, workerOptions) => (
+    new InProcessWorker(workerOptions.workerData.generation) as never
+  ));
   const { DirectFileTransferRouter } = await import('../../server/src/ws/direct-file-transfer-router.js');
   expect(await direct.initializeDirectFileTransfer()).toBe(true);
 

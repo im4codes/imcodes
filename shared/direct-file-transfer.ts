@@ -1429,6 +1429,7 @@ export function getDirectFileTransferOperationId(value: Pick<DirectFileTransferO
  * ------------------------------------------------------------------------- */
 
 export const DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION = 1 as const;
+export const DIRECT_FILE_TRANSFER_WORKER_KIND = 'imcodes-direct-file-transfer' as const;
 
 export const DIRECT_FILE_TRANSFER_WORKER_MSG = {
   /** main -> worker: a validated daemon command plus the sender it replies to. */

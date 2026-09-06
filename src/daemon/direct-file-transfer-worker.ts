@@ -47,6 +47,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import {
   DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX,
   DIRECT_FILE_TRANSFER_HOST_METHOD,
+  DIRECT_FILE_TRANSFER_WORKER_KIND,
   DIRECT_FILE_TRANSFER_WORKER_MSG,
   DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
   validateDirectFileTransferWorkerEnvelope,
@@ -68,16 +69,21 @@ interface WorkerControlSender {
  * worker emits carries it so a reply that outlives a crash-and-replace is
  * recognisably stale on arrival and is dropped by the parent.
  */
-const WORKER_GENERATION: number = Number(
-  (workerData as { generation?: unknown } | undefined)?.generation ?? 0,
-);
+const directWorkerData = workerData as { kind?: unknown; generation?: unknown } | undefined;
+const directWorkerPort = directWorkerData?.kind === DIRECT_FILE_TRANSFER_WORKER_KIND
+  ? parentPort
+  : null;
+let activeWorkerGeneration: number = Number(directWorkerPort ? directWorkerData?.generation ?? 0 : 0);
+let inProcessPost: ((envelope: Record<string, unknown>) => void) | null = null;
 
 function post(envelope: Record<string, unknown>): void {
-  parentPort?.postMessage({
+  const stamped = {
     v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
-    generation: WORKER_GENERATION,
+    generation: activeWorkerGeneration,
     ...envelope,
-  });
+  };
+  if (directWorkerPort) directWorkerPort.postMessage(stamped);
+  else inProcessPost?.(stamped);
 }
 
 /* --------------------------------------------------------------------------
@@ -119,9 +125,11 @@ export function __setDirectFileTransferWorkerHostForTests(
 
 function callHost(method: string, args: unknown[]): Promise<unknown> {
   if (inProcessHost) return inProcessHost(method, args);
-  if (!parentPort) return Promise.reject(new Error('direct_file_transfer_host_unavailable'));
+  if (!directWorkerPort && !inProcessPost) {
+    return Promise.reject(new Error('direct_file_transfer_host_unavailable'));
+  }
   hostCallSeq += 1;
-  const callId = `dft-host-${WORKER_GENERATION}-${hostCallSeq}`;
+  const callId = `dft-host-${activeWorkerGeneration}-${hostCallSeq}`;
   return new Promise<unknown>((resolve, reject) => {
     pendingHostCalls.set(callId, { resolve, reject });
     post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL, callId, method, args });
@@ -2211,7 +2219,7 @@ async function handleWorkerEnvelope(raw: unknown): Promise<void> {
   const envelope = validateDirectFileTransferWorkerEnvelope(raw);
   // Fail closed: an envelope that is not exactly well-formed, or that is
   // addressed to a different worker generation, is dropped rather than coerced.
-  if (!envelope || envelope.generation !== WORKER_GENERATION) return;
+  if (!envelope || envelope.generation !== activeWorkerGeneration) return;
 
   if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT) {
     settleHostCall(envelope.callId, envelope.ok, envelope.value, envelope.error);
@@ -2275,8 +2283,38 @@ async function handleWorkerEnvelope(raw: unknown): Promise<void> {
   }
 }
 
-if (parentPort) {
-  parentPort.on('message', (raw: unknown) => {
+/**
+ * In-process transport seam for integration tests whose value is the complete
+ * browser↔daemon transfer protocol, not worker-thread isolation. Vite runs
+ * those tests under jsdom and cannot carry its mocked native DataChannel
+ * implementation into a new Node isolate. Production never calls this seam;
+ * the real-worker stall proof continues to exercise the actual thread.
+ */
+export async function __startDirectFileTransferWorkerInProcessForTests(
+  generation: number,
+  emit: (envelope: Record<string, unknown>) => void,
+): Promise<void> {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test-only direct transfer worker seam');
+  activeWorkerGeneration = generation;
+  inProcessPost = emit;
+  await initializeDirectFileTransfer().catch(() => false);
+  const status = getDirectConnectivityRuntimeStatus();
+  post({
+    type: DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY,
+    available: isDirectFileTransferAvailable(),
+    ...(status.error ? { detail: String(status.error) } : {}),
+  });
+  post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.READY });
+  void recoverInterruptedUploadCommits().catch(() => {});
+}
+
+export async function __dispatchDirectFileTransferWorkerInProcessForTests(raw: unknown): Promise<void> {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test-only direct transfer worker seam');
+  await handleWorkerEnvelope(raw);
+}
+
+if (directWorkerPort) {
+  directWorkerPort.on('message', (raw: unknown) => {
     void handleWorkerEnvelope(raw).catch((error: unknown) => {
       // A thrown handler must never take the worker down silently: the parent
       // would see an opaque exit and fail every in-flight lease.

@@ -137,7 +137,10 @@ describe('direct file transfer interrupted-commit recovery', () => {
         });
       })();
     };
-    vi.doMock('node:worker_threads', () => ({ parentPort: port, workerData: { generation: 1 } }));
+    vi.doMock('node:worker_threads', () => ({
+      parentPort: port,
+      workerData: { kind: 'imcodes-direct-file-transfer', generation: 1 },
+    }));
     vi.doMock('node-datachannel', () => ({ PeerConnection: class {}, initLogger: vi.fn(), cleanup: vi.fn() }));
 
     // Importing the module IS the worker starting up.

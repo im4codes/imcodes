@@ -950,7 +950,10 @@ describe('daemon direct file transfer v2 lease broker', () => {
       }
       posted.push(value);
     };
-    vi.doMock('node:worker_threads', () => ({ parentPort: port, workerData: { generation: 1 } }));
+    vi.doMock('node:worker_threads', () => ({
+      parentPort: port,
+      workerData: { kind: 'imcodes-direct-file-transfer', generation: 1 },
+    }));
 
     const direct = await import('../../src/daemon/direct-file-transfer-worker.js');
     const handler = await import('../../src/daemon/file-transfer-handler.js');

@@ -17,6 +17,7 @@ import logger from '../util/logger.js';
 import {
   DIRECT_CONNECTIVITY_RUNTIME_STATE,
   DIRECT_FILE_TRANSFER_HOST_METHOD,
+  DIRECT_FILE_TRANSFER_WORKER_KIND,
   DIRECT_FILE_TRANSFER_WORKER_MSG,
   DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
   isCurrentDirectFileTransferWorkerGeneration,
@@ -83,11 +84,21 @@ function senderIdFor(sender: FileTransferSender): string {
   return id;
 }
 
+// Keep the relative path in a variable. Vite rewrites a literal
+// `new URL('./asset', import.meta.url)` to its browser dev-server URL even when
+// this daemon module is imported by Node integration tests; Worker rejects
+// that http: URL. The runtime expression remains a file: URL in Node while
+// production builds still copy the bootstrap beside this module.
+const DIRECT_FILE_TRANSFER_WORKER_BOOTSTRAP = './direct-file-transfer-worker-bootstrap.mjs';
+
 function workerModuleUrl(): URL {
-  return new URL('./direct-file-transfer-worker-bootstrap.mjs', import.meta.url);
+  return new URL(DIRECT_FILE_TRANSFER_WORKER_BOOTSTRAP, import.meta.url);
 }
 
-type DirectFileTransferWorkerFactory = (url: URL, options: { workerData: { generation: number } }) => Worker;
+type DirectFileTransferWorkerFactory = (
+  url: URL,
+  options: { workerData: { kind: typeof DIRECT_FILE_TRANSFER_WORKER_KIND; generation: number } },
+) => Worker;
 
 const spawnRealWorker: DirectFileTransferWorkerFactory = (url, options) => new Worker(url, options);
 let workerFactory: DirectFileTransferWorkerFactory = spawnRealWorker;
@@ -290,7 +301,9 @@ function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () =
 function spawnWorker(): WorkerHandle {
   generationCounter += 1;
   const generation = generationCounter;
-  const worker = workerFactory(workerModuleUrl(), { workerData: { generation } });
+  const worker = workerFactory(workerModuleUrl(), {
+    workerData: { kind: DIRECT_FILE_TRANSFER_WORKER_KIND, generation },
+  });
   let markReady: () => void = () => {};
   const ready = new Promise<void>((resolve) => {
     const timer = setTimeout(() => resolve(), READY_TIMEOUT_MS);
