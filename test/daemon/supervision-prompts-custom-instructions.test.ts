@@ -416,6 +416,8 @@ describe('Brain work-delegation contract placement and budget', () => {
     // is the regression this placement exists to prevent.
     expect(execution + buildBrainSupervisedWorkDelegationContract('en').length)
       .toBeGreaterThan(5_000);
+    expect(audit + buildBrainSupervisedWorkDelegationContract('en').length)
+      .toBeGreaterThan(5_200);
   });
 
   it('does not disturb status, no-safe-work or waiting-heartbeat semantics', () => {

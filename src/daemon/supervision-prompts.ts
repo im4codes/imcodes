@@ -427,7 +427,6 @@ export function buildSupervisionContinuationRepairContract(_locale?: Supervision
 export function buildSupervisionContinuationRepairContractRef(): string {
   return JSON.stringify({
     contractRef: SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
-    fullText: 'supervisionDecision',
   });
 }
 
@@ -625,7 +624,7 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    'Authoritative auto-audit mode: enabled (supervised_audit). Brain coordinates and integrates; implementation is delegated to eligible distinct sessions, implementers validate and open the automatic audit, and Brain does not duplicate the audit lifecycle.',
+    'Authoritative auto-audit mode: enabled; Brain coordinates and integrates.',
     JSON.stringify({ auditMode: true, beforePass: 'no_delivery_finalization', rework: 'fix_validate_fresh_audit', evidence: 'frozen_first_minimal_rerun' }),
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
@@ -642,10 +641,10 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    'Authoritative auto-audit mode: disabled (supervised). Do not infer or dispatch an automatic peer audit; ordinary supervision remains active.',
+    'Authoritative auto-audit mode: disabled.',
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
-  ].join(' ');
+  ].join('');
 }
 
 /**
