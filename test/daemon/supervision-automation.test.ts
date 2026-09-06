@@ -3187,10 +3187,13 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
     supervisionAutomation.applySnapshotUpdate('deck_sub_impl', disabled);
 
-    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('autoAudit=enabled');
-    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('autoAudit=disabled');
-    expect(mockTransportRuntime.send.mock.calls[1]?.[4]).toMatchObject({
+    const implementationControls = mockTransportRuntime.send.mock.calls.filter((call) => (
+      String(call[0]).includes('sourceSession=deck_sub_impl')
+    ));
+    expect(implementationControls).toHaveLength(2);
+    expect(String(implementationControls[0]?.[0])).toContain('autoAudit=enabled');
+    expect(String(implementationControls[1]?.[0])).toContain('autoAudit=disabled');
+    expect(implementationControls[1]?.[4]).toMatchObject({
       timelineCommitted: true,
       deliveryMode: 'append',
     });
@@ -3249,14 +3252,14 @@ describe('SupervisionAutomation', () => {
 
     const prompts = mockTransportRuntime.send.mock.calls.map((call) => String(call[0]));
     expect(prompts.filter((prompt) => prompt.includes('sourceSession=deck_supervision_brain')))
-      .toHaveLength(2);
+      .toHaveLength(1);
     expect(prompts.filter((prompt) => prompt.includes('sourceSession=deck_sub_impl')))
       .toHaveLength(0);
     expect(prompts.every((prompt) => prompt.includes('autoAudit=disabled'))).toBe(true);
   });
 
-  it('replays current authoritative mode once when a project Brain runtime resumes', async () => {
-    await seedSession('supervised_audit');
+  it('deduplicates one stable Brain across reconnects but delivers to a new Brain instance', async () => {
+    const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
     supervisionAutomation.init();
 
@@ -3267,7 +3270,50 @@ describe('SupervisionAutomation', () => {
 
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+    const stoppedBrain = getSession('deck_supervision_brain')!;
+    const stoppedInstanceId = stoppedBrain.sessionInstanceId;
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'stopped' });
+    removeSession('deck_supervision_brain');
+    upsertSession({
+      ...stoppedBrain,
+      state: 'running',
+      transportConfig: { supervision: snapshot },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    expect(getSession('deck_supervision_brain')?.sessionInstanceId).not.toBe(stoppedInstanceId);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not rebroadcast unchanged mode across runtime-epoch and lifecycle churn', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
+    supervisionAutomation.init();
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', snapshot);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+    // Process memory is gone while the SQLite delivery authority remains.
+    // Removing the persisted same-mode guard makes this exact restore emit 2.
+    supervisionAutomation.__simulateProcessRestartForTests();
+    supervisionAutomation.applyPersistedSnapshot('deck_supervision_brain');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+    for (let index = 1; index <= 3; index += 1) {
+      upsertSession({
+        ...getSession('deck_supervision_brain')!,
+        runtimeEpoch: `replacement-runtime-${index}`,
+        updatedAt: Date.now() + index,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    }
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
   });
 
   it('emits an authoritative daemon status when supervised audit is applied', async () => {

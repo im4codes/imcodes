@@ -12,9 +12,11 @@ import {
 } from '../../shared/session-resource-lifecycle.js';
 import {
   SessionResourceRegistry,
+  sessionResourcePidHandleIsCurrent,
   type OrphanSweepSummary,
   type ReleaseSummary,
   type SessionResourceOwner,
+  type SessionResourceRecord,
 } from './session-resource-registry.js';
 
 const registry = new SessionResourceRegistry();
@@ -174,18 +176,44 @@ async function sampleProcessCpuMillis(pid: number): Promise<number | null> {
   }
 }
 
-async function sweepMemoryMcpCpu(now = Date.now()): Promise<void> {
-  const records = await registry.list();
+interface MemoryMcpWatchdogDependencies {
+  listResources: () => Promise<SessionResourceRecord[]>;
+  sampleCpuMillis: (pid: number) => Promise<number | null>;
+  pidHandleIsCurrent: typeof sessionResourcePidHandleIsCurrent;
+  releaseResource: typeof releaseSessionResource;
+  restartOwner: (owner: SessionResourceOwner, reason: string) => Promise<void>;
+}
+
+const memoryMcpWatchdogDependencies: MemoryMcpWatchdogDependencies = {
+  listResources: () => registry.list(),
+  sampleCpuMillis: sampleProcessCpuMillis,
+  pidHandleIsCurrent: sessionResourcePidHandleIsCurrent,
+  releaseResource: releaseSessionResource,
+  restartOwner: requestMcpOwnerRestart,
+};
+
+export async function sweepMemoryMcpCpu(
+  now = Date.now(),
+  dependencies: MemoryMcpWatchdogDependencies = memoryMcpWatchdogDependencies,
+): Promise<void> {
+  const records = await dependencies.listResources();
   const liveIds = new Set<string>();
   for (const record of records) {
     if (record.kind !== SESSION_RESOURCE_KIND.MCP || record.handle.type !== SESSION_RESOURCE_HANDLE_TYPE.PID) continue;
     liveIds.add(record.resourceId);
     if (record.handle.pid === process.pid) continue;
-    const cpuMs = await sampleProcessCpuMillis(record.handle.pid);
+    const cpuMs = await dependencies.sampleCpuMillis(record.handle.pid);
     if (cpuMs === null) {
       mcpCpuSamples.delete(record.resourceId);
-      const released = await releaseSessionResource(record.resourceId, record.owner, 'process_missing');
-      if (released.released > 0) await requestMcpOwnerRestart(record.owner, 'process_missing');
+      // CPU sampling can fail transiently (ps timeout/format/permission). It is
+      // not proof that the process vanished. Releasing here would make cleanup
+      // SIGTERM a healthy MCP and then relaunch the whole owner session, leaving
+      // the active host bound to a closed stdio generation. Only an exact PID +
+      // process-start observation may authorize that destructive recovery.
+      const exactProcessCurrent = await dependencies.pidHandleIsCurrent(record.handle);
+      if (exactProcessCurrent !== false) continue;
+      const released = await dependencies.releaseResource(record.resourceId, record.owner, 'process_missing');
+      if (released.released > 0) await dependencies.restartOwner(record.owner, 'process_missing');
       continue;
     }
     const previous = mcpCpuSamples.get(record.resourceId);
@@ -198,9 +226,9 @@ async function sweepMemoryMcpCpu(now = Date.now()): Promise<void> {
     const strikes = cpuRatio >= MEMORY_MCP_WATCHDOG.CPU_RATIO_THRESHOLD ? previous.strikes + 1 : 0;
     mcpCpuSamples.set(record.resourceId, { cpuMs, sampledAt: now, strikes });
     if (strikes >= MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT) {
-      const released = await releaseSessionResource(record.resourceId, record.owner, 'sustained_cpu');
+      const released = await dependencies.releaseResource(record.resourceId, record.owner, 'sustained_cpu');
       mcpCpuSamples.delete(record.resourceId);
-      if (released.released > 0) await requestMcpOwnerRestart(record.owner, 'sustained_cpu');
+      if (released.released > 0) await dependencies.restartOwner(record.owner, 'sustained_cpu');
     }
   }
   for (const resourceId of mcpCpuSamples.keys()) {

@@ -145,6 +145,22 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Verifies that a PID handle still names the exact process registered for the
+ * resource. A null result means the OS can still see the PID but could not
+ * provide a strong start-time identity, so callers must fail safe without
+ * killing or restarting anything.
+ */
+export async function sessionResourcePidHandleIsCurrent(
+  handle: Extract<SessionResourceHandle, { type: typeof SESSION_RESOURCE_HANDLE_TYPE.PID }>,
+): Promise<boolean | null> {
+  const currentStart = await readProcessStart(handle.pid);
+  if (currentStart) {
+    return handle.processStart ? currentStart === handle.processStart : null;
+  }
+  return processIsAlive(handle.pid) ? null : false;
+}
+
 export async function cleanupSessionResource(
   record: SessionResourceRecord,
   _reason: string,

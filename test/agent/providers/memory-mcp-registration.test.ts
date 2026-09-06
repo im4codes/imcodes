@@ -28,10 +28,13 @@ import {
   getDefaultMcpServers,
 } from '../../../src/agent/providers/getDefaultMcpServers.js';
 import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../../shared/session-resource-lifecycle.js';
 
 const sessionConfig = {
   sessionKey: 'route-1',
   sessionName: 'deck_alpha_worker',
+  sessionInstanceId: 'instance-bound',
+  runtimeEpoch: 'epoch-bound',
   projectName: 'alpha',
   serverId: 'srv-bound',
   providerId: 'codex-sdk',
@@ -96,6 +99,8 @@ describe('managed provider MCP registration helpers', () => {
     expect(server.env[IMCODES_DAEMON_PROJECT_ROOT_ENV]).toBe('/tmp/project');
     expect(server.env[IMCODES_DAEMON_SERVER_ID_ENV]).toBe('srv-bound');
     expect(server.env[IMCODES_DAEMON_PROVIDER_ID_ENV]).toBe('codex-sdk');
+    expect(server.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]).toBe('instance-bound');
+    expect(server.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]).toBe('epoch-bound');
     expect(server.env[IMCODES_MCP_TOOL_CATALOG_MODE_ENV]).toBe(MCP_TOOL_CATALOG_MODES.STATIC_FULL);
     expect(server.env.IMCODES_SERVER_TOKEN).toBeUndefined();
     expect(server.env.OAUTH_TOKEN).toBeUndefined();

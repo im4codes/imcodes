@@ -132,6 +132,44 @@ describe('SupervisionStateStore', () => {
     }
   });
 
+  it('reopens mode-control delivery authority without runtime-epoch identity', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-mode-control-state-'));
+    const dbPath = join(dir, 'state.sqlite');
+    const authority = {
+      sourceSessionName: 'deck_sub_impl',
+      sourceSessionInstanceId: 'source-stable-instance',
+      brainSessionName: 'deck_supervision_brain',
+      brainSessionInstanceId: 'brain-stable-instance',
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      enabledEver: true,
+      updatedAt: 1_000,
+    };
+    try {
+      const beforeRestart = new SupervisionStateStore({ dbPath });
+      beforeRestart.upsertModeControlDelivery(authority);
+      beforeRestart.close();
+
+      const afterRestart = new SupervisionStateStore({ dbPath });
+      expect(afterRestart.getModeControlDelivery(authority)).toEqual(authority);
+      afterRestart.upsertModeControlDelivery({
+        ...authority,
+        mode: SUPERVISION_MODE.OFF,
+        updatedAt: 2_000,
+      });
+      afterRestart.close();
+
+      const afterRevoke = new SupervisionStateStore({ dbPath });
+      expect(afterRevoke.getModeControlDelivery(authority)).toEqual({
+        ...authority,
+        mode: SUPERVISION_MODE.OFF,
+        updatedAt: 2_000,
+      });
+      afterRevoke.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('round-trips exact main/auditor identities and original deadlines', () => {
     const db = new DatabaseSync(':memory:');
     const store = new SupervisionStateStore({ database: db });

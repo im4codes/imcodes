@@ -955,10 +955,8 @@ class SupervisionAutomation {
   private emittedAuditResultAttemptIdSet = new Set<string>();
   private implementationBlockerEscalationsInFlight = new Set<string>();
   private implementationWatchdogTimer?: NodeJS.Timeout;
-  /** Last mode delivered for one source session to the current Brain runtime. */
-  private autoAuditModeDeliveryKeys = new Map<string, string>();
-  /** Source identities whose enabled state was successfully delivered. */
-  private autoAuditModeEnabledSourceAuthorities = new Map<string, string>();
+  /** Stable Brain identities whose initial/restore mode sweep already ran. */
+  private autoAuditModeSweptBrainAuthorities = new Set<string>();
 
   private implementationWatchdogRunning = false;
 
@@ -979,8 +977,8 @@ class SupervisionAutomation {
   __setAutomaticPeerAuditCompatibilityForTests(enabled: boolean): void {
     if (process.env.NODE_ENV !== 'test') return;
     this.automaticPeerAuditCompatibilityForTests = enabled;
-    this.autoAuditModeDeliveryKeys.clear();
-    this.autoAuditModeEnabledSourceAuthorities.clear();
+    this.autoAuditModeSweptBrainAuthorities.clear();
+    this.stateStore.clearModeControlDeliveries();
   }
 
   /** Presentation seam for the console; this is authoritative run state. */
@@ -1130,13 +1128,20 @@ class SupervisionAutomation {
     const runtime = getTransportRuntime(brain.name);
     if (!runtime) return;
     const mode = snapshot?.mode ?? SUPERVISION_MODE.OFF;
-    const sourceAuthority = `${source.sessionInstanceId ?? source.createdAt}:${source.runtimeEpoch ?? ''}`;
+    const sourceSessionInstanceId = source.sessionInstanceId?.trim();
+    const brainSessionInstanceId = brain.sessionInstanceId?.trim();
+    if (!sourceSessionInstanceId || !brainSessionInstanceId) return;
+    const authority = {
+      sourceSessionName: source.name,
+      sourceSessionInstanceId,
+      brainSessionName: brain.name,
+      brainSessionInstanceId,
+    };
+    const previous = this.stateStore.getModeControlDelivery(authority);
+    if (previous?.mode === mode) return;
     if (source.name !== brain.name
       && mode === SUPERVISION_MODE.OFF
-      && this.autoAuditModeEnabledSourceAuthorities.get(sourceSessionName) !== sourceAuthority) return;
-    const brainAuthority = `${brain.sessionInstanceId ?? brain.createdAt}:${brain.runtimeEpoch ?? ''}`;
-    const deliveryKey = `${sourceAuthority}:${brain.name}:${brainAuthority}:${mode}`;
-    if (this.autoAuditModeDeliveryKeys.get(sourceSessionName) === deliveryKey) return;
+      && previous?.enabledEver !== true) return;
 
     const prompt = buildAutoAuditModeControlPrompt({
       projectName: source.projectName,
@@ -1144,31 +1149,40 @@ class SupervisionAutomation {
       mode,
     });
     const clientMessageId = `supervision-mode-control:${sourceSessionName}:${randomUUID()}`;
-    timelineEmitter.emit(
-      brain.name,
-      'user.message',
-      {
-        text: prompt,
-        clientMessageId,
-        sourceSessionName,
-        supervisionMode: mode,
-        autoAuditEnabled: mode === SUPERVISION_MODE.SUPERVISED_AUDIT,
-        automation: true,
-        automationKind: SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
-        memoryExcluded: true,
-      },
-      { source: 'daemon', confidence: 'high', eventId: clientMessageId },
-    );
+    const nextAuthority = {
+      ...authority,
+      mode,
+      enabledEver: previous?.enabledEver === true || mode === SUPERVISION_MODE.SUPERVISED_AUDIT,
+      updatedAt: Date.now(),
+    };
     try {
+      // Reserve the stable delivery authority before exposing the message. A
+      // re-entrant lifecycle edge or store reopen therefore observes the new
+      // mode and cannot broadcast it twice. Synchronous send failure restores
+      // the prior authority so the next legitimate sweep/change can retry.
+      this.stateStore.upsertModeControlDelivery(nextAuthority);
+      timelineEmitter.emit(
+        brain.name,
+        'user.message',
+        {
+          text: prompt,
+          clientMessageId,
+          sourceSessionName,
+          supervisionMode: mode,
+          autoAuditEnabled: mode === SUPERVISION_MODE.SUPERVISED_AUDIT,
+          automation: true,
+          automationKind: SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
+          memoryExcluded: true,
+        },
+        { source: 'daemon', confidence: 'high', eventId: clientMessageId },
+      );
       runtime.send(prompt, clientMessageId, undefined, undefined, {
         timelineCommitted: true,
         deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       });
-      this.autoAuditModeDeliveryKeys.set(sourceSessionName, deliveryKey);
-      if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
-        this.autoAuditModeEnabledSourceAuthorities.set(sourceSessionName, sourceAuthority);
-      }
     } catch (error) {
+      if (previous) this.stateStore.upsertModeControlDelivery(previous);
+      else this.stateStore.deleteModeControlDelivery(authority);
       logger.warn({
         project: source.projectName,
         sourceSession: sourceSessionName,
@@ -1190,18 +1204,21 @@ class SupervisionAutomation {
     }
   }
 
-  private clearProjectBrainModeDelivery(brainSessionName: string): void {
+  private sweepProjectBrainModeStatesOnce(brainSessionName: string): void {
     const brain = getSession(brainSessionName);
-    if (!brain || brain.role !== 'brain') return;
-    for (const source of listSessions(brain.projectName)) {
-      this.autoAuditModeDeliveryKeys.delete(source.name);
-    }
+    if (!brain || brain.role !== 'brain' || brain.state === 'stopped') return;
+    const brainSessionInstanceId = brain.sessionInstanceId?.trim();
+    if (!brainSessionInstanceId || !getTransportRuntime(brain.name)) return;
+    const authority = `${brain.name}:${brainSessionInstanceId}`;
+    if (this.autoAuditModeSweptBrainAuthorities.has(authority)) return;
+    this.autoAuditModeSweptBrainAuthorities.add(authority);
+    this.syncProjectBrainModeStates(brainSessionName);
   }
 
   private syncAllProjectBrainModeStates(): void {
     for (const session of listSessions()) {
       if (session.role === 'brain' && session.state !== 'stopped') {
-        this.syncProjectBrainModeStates(session.name);
+        this.sweepProjectBrainModeStatesOnce(session.name);
       }
     }
   }
@@ -2203,6 +2220,7 @@ class SupervisionAutomation {
     this.recentTaskCandidates.clear();
     this.latestAssistantTexts.clear();
     this.implementationBlockerEscalationsInFlight.clear();
+    this.autoAuditModeSweptBrainAuthorities.clear();
     this.restorePersistedWaitStates();
   }
 
@@ -3022,16 +3040,13 @@ class SupervisionAutomation {
       const run = this.activeRuns.get(event.sessionId);
       const state = trimString(event.payload.state);
       if (state) this.lastObservedSessionStates.set(event.sessionId, state);
-      if (state === 'error' || state === 'stopped') {
-        this.clearProjectBrainModeDelivery(event.sessionId);
-      }
       // Restored transport runtimes normally reconnect directly to idle. Init
       // runs before that delayed restore, so its startup microtask can observe
       // no runtime and must be retried at the restore-complete idle boundary.
-      // The runtime-identity/mode delivery key keeps ordinary idle transitions
-      // exactly-once just like repeated running transitions.
+      // The stable SQLite authority plus one sweep per Brain identity keeps
+      // ordinary idle/running transitions from becoming broadcast triggers.
       if (state === 'running' || state === 'idle') {
-        this.syncProjectBrainModeStates(event.sessionId);
+        this.sweepProjectBrainModeStatesOnce(event.sessionId);
       }
       if (state === 'idle' && !run) {
         const candidate = this.recentTaskCandidates.get(event.sessionId);

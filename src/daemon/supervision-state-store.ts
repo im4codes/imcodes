@@ -26,6 +26,7 @@ import {
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_COMPLETION_EVIDENCE_DECISIONS,
+  SUPERVISION_MODE,
   type SupervisionTaskArchiveReason,
   type SupervisionBrainCoordinationRecoveryStatus,
   type SupervisionRecoveryLeaseAction,
@@ -178,6 +179,23 @@ export interface SupervisionWaitStateStore {
   list(): PersistedSupervisionWaitState[];
   delete(sessionName: string): void;
   clear(): void;
+  getModeControlDelivery(input: SupervisionModeControlDeliveryKey): PersistedSupervisionModeControlDelivery | undefined;
+  upsertModeControlDelivery(delivery: PersistedSupervisionModeControlDelivery): void;
+  deleteModeControlDelivery(input: SupervisionModeControlDeliveryKey): void;
+  clearModeControlDeliveries(): void;
+}
+
+export interface SupervisionModeControlDeliveryKey {
+  sourceSessionName: string;
+  sourceSessionInstanceId: string;
+  brainSessionName: string;
+  brainSessionInstanceId: string;
+}
+
+export interface PersistedSupervisionModeControlDelivery extends SupervisionModeControlDeliveryKey {
+  mode: SessionSupervisionSnapshot['mode'];
+  enabledEver: boolean;
+  updatedAt: number;
 }
 
 function isFiniteTimestamp(value: unknown): value is number {
@@ -240,6 +258,19 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
         );
         CREATE INDEX IF NOT EXISTS supervision_wait_states_deadline_idx
           ON supervision_wait_states(deadline_at);
+        CREATE TABLE IF NOT EXISTS supervision_mode_control_deliveries (
+          source_session_name TEXT NOT NULL,
+          source_session_instance_id TEXT NOT NULL,
+          brain_session_name TEXT NOT NULL,
+          brain_session_instance_id TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          enabled_ever INTEGER NOT NULL CHECK (enabled_ever IN (0, 1)),
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (
+            source_session_name, source_session_instance_id,
+            brain_session_name, brain_session_instance_id
+          )
+        );
       `);
     } catch (error) {
       if (ownsDb) {
@@ -320,6 +351,75 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
     if (this.#closed) return;
     this.#db.exec('DELETE FROM supervision_wait_states');
   }
+
+  getModeControlDelivery(input: SupervisionModeControlDeliveryKey): PersistedSupervisionModeControlDelivery | undefined {
+    if (this.#closed) return undefined;
+    const row = this.#db.prepare(`
+      SELECT mode, enabled_ever AS enabledEver, updated_at AS updatedAt
+      FROM supervision_mode_control_deliveries
+      WHERE source_session_name = ? AND source_session_instance_id = ?
+        AND brain_session_name = ? AND brain_session_instance_id = ?
+    `).get(
+      input.sourceSessionName,
+      input.sourceSessionInstanceId,
+      input.brainSessionName,
+      input.brainSessionInstanceId,
+    ) as { mode?: unknown; enabledEver?: unknown; updatedAt?: unknown } | undefined;
+    if (!row || !Object.values(SUPERVISION_MODE).includes(row.mode as SessionSupervisionSnapshot['mode'])) {
+      return undefined;
+    }
+    return {
+      ...input,
+      mode: row.mode as SessionSupervisionSnapshot['mode'],
+      enabledEver: row.enabledEver === 1,
+      updatedAt: Number(row.updatedAt),
+    };
+  }
+
+  upsertModeControlDelivery(delivery: PersistedSupervisionModeControlDelivery): void {
+    if (this.#closed) throw new Error('supervision state store is closed');
+    this.#db.prepare(`
+      INSERT INTO supervision_mode_control_deliveries (
+        source_session_name, source_session_instance_id,
+        brain_session_name, brain_session_instance_id,
+        mode, enabled_ever, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (
+        source_session_name, source_session_instance_id,
+        brain_session_name, brain_session_instance_id
+      ) DO UPDATE SET
+        mode = excluded.mode,
+        enabled_ever = excluded.enabled_ever,
+        updated_at = excluded.updated_at
+    `).run(
+      delivery.sourceSessionName,
+      delivery.sourceSessionInstanceId,
+      delivery.brainSessionName,
+      delivery.brainSessionInstanceId,
+      delivery.mode,
+      delivery.enabledEver ? 1 : 0,
+      delivery.updatedAt,
+    );
+  }
+
+  deleteModeControlDelivery(input: SupervisionModeControlDeliveryKey): void {
+    if (this.#closed) return;
+    this.#db.prepare(`
+      DELETE FROM supervision_mode_control_deliveries
+      WHERE source_session_name = ? AND source_session_instance_id = ?
+        AND brain_session_name = ? AND brain_session_instance_id = ?
+    `).run(
+      input.sourceSessionName,
+      input.sourceSessionInstanceId,
+      input.brainSessionName,
+      input.brainSessionInstanceId,
+    );
+  }
+
+  clearModeControlDeliveries(): void {
+    if (this.#closed) return;
+    this.#db.exec('DELETE FROM supervision_mode_control_deliveries');
+  }
 }
 
 class DisabledSupervisionStateStore implements SupervisionWaitStateStore {
@@ -329,6 +429,10 @@ class DisabledSupervisionStateStore implements SupervisionWaitStateStore {
   list(): PersistedSupervisionWaitState[] { return []; }
   delete(_sessionName: string): void {}
   clear(): void {}
+  getModeControlDelivery(_input: SupervisionModeControlDeliveryKey): PersistedSupervisionModeControlDelivery | undefined { return undefined; }
+  upsertModeControlDelivery(_delivery: PersistedSupervisionModeControlDelivery): void {}
+  deleteModeControlDelivery(_input: SupervisionModeControlDeliveryKey): void {}
+  clearModeControlDeliveries(): void {}
 }
 
 let supervisionStateStore: SupervisionWaitStateStore | undefined;
