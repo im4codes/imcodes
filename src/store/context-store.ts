@@ -3698,22 +3698,66 @@ export function writeContextObservation(input: ContextObservationInput): Context
 
 export function listContextObservations(filters: {
   namespaceId?: string;
+  namespaceIds?: readonly string[];
   scope?: MemoryScope;
   class?: ObservationClass;
   state?: ObservationState | readonly ObservationState[];
   projectionId?: string;
+  limit?: number;
 } = {}): ContextObservationRow[] {
+  const namespaceIds = filters.namespaceIds === undefined
+    ? undefined
+    : [...new Set(filters.namespaceIds.filter((id) => typeof id === 'string' && id.length > 0))];
+  const states = filters.state === undefined
+    ? undefined
+    : typeof filters.state === 'string'
+      ? [filters.state]
+      : [...new Set(filters.state)];
+  const limit = filters.limit === undefined
+    ? undefined
+    : Number.isFinite(filters.limit)
+      ? Math.max(0, Math.min(10_000, Math.floor(filters.limit)))
+      : 0;
+  if (namespaceIds?.length === 0 || states?.length === 0 || limit === 0) return [];
+
   const database = ensureDb();
-  const rows = database.prepare('SELECT * FROM context_observations ORDER BY updated_at DESC, id ASC').all() as Array<Record<string, unknown>>;
-  const states = Array.isArray(filters.state) ? new Set(filters.state) : undefined;
-  const state = typeof filters.state === 'string' ? filters.state : undefined;
-  return rows
-    .map(observationRowFromDb)
-    .filter((row) => !filters.namespaceId || row.namespaceId === filters.namespaceId)
-    .filter((row) => !filters.scope || row.scope === filters.scope)
-    .filter((row) => !filters.class || row.class === filters.class)
-    .filter((row) => !filters.state || (states ? states.has(row.state) : row.state === state))
-    .filter((row) => !filters.projectionId || row.projectionId === filters.projectionId);
+  const conditions: string[] = [];
+  const params: Array<string | number> = [];
+  if (filters.namespaceId) {
+    conditions.push('namespace_id = ?');
+    params.push(filters.namespaceId);
+  }
+  if (namespaceIds) {
+    conditions.push(`namespace_id IN (${namespaceIds.map(() => '?').join(',')})`);
+    params.push(...namespaceIds);
+  }
+  if (filters.scope) {
+    conditions.push('scope = ?');
+    params.push(filters.scope);
+  }
+  if (filters.class) {
+    conditions.push('class = ?');
+    params.push(filters.class);
+  }
+  if (states) {
+    conditions.push(`state IN (${states.map(() => '?').join(',')})`);
+    params.push(...states);
+  }
+  if (filters.projectionId) {
+    conditions.push('projection_id = ?');
+    params.push(filters.projectionId);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limitSql = limit === undefined ? '' : 'LIMIT ?';
+  if (limit !== undefined) params.push(limit);
+  const rows = database.prepare(`
+    SELECT *
+      FROM context_observations
+      ${where}
+     ORDER BY updated_at DESC, id ASC
+     ${limitSql}
+  `).all(...params) as Array<Record<string, unknown>>;
+  return rows.map(observationRowFromDb);
 }
 
 export function listStartupContextObservations(namespaceIds: readonly string[], limit: number): ContextObservationRow[] {
@@ -4549,6 +4593,7 @@ export function recordMemoryHits(ids: string[]): void {
 
 export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = {}): ProcessedProjectionStats {
   const database = ensureDb();
+  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   const conditions: string[] = [];
   const params: (string | number)[] = [];
   if (!filters.includeArchived) {
@@ -4560,12 +4605,14 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     params.push(filters.projectionClass);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  // content_json can be the dominant projection-table payload. Base stats do
+  // not inspect it, so do not materialize and clone it across the worker RPC.
+  const selectedContent = normalizedQuery ? ', content_json' : '';
   const rows = database.prepare(`
-    SELECT namespace_key, class, summary, content_json, status
+    SELECT namespace_key, class, summary, status${selectedContent}
     FROM context_processed_local
     ${where}
   `).all(...params) as Array<Record<string, unknown>>;
-  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   let totalRecords = 0;
   let matchedRecords = 0;
   let recentSummaryCount = 0;

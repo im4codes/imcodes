@@ -2413,6 +2413,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         if (!isCurrentMemoryAdminResponse('preferences', msg.requestId)) return;
         setPreferenceRecords(msg.records ?? []);
         if (msg.featureEnabled !== undefined) setPreferenceFeatureEnabled(msg.featureEnabled);
+        if (msg.errorCode) setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
         return;
       }
       if (msg.type === MEMORY_WS.CREATE_RESPONSE) {
@@ -2455,6 +2456,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         if (!isCurrentMemoryAdminResponse('observations', msg.requestId)) return;
         setObservationRecords(msg.records ?? []);
         if (msg.featureEnabled !== undefined) setObservationStoreFeatureEnabled(msg.featureEnabled);
+        if (msg.errorCode) setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
         return;
       }
       if (msg.type === MEMORY_WS.PREF_CREATE_RESPONSE) {

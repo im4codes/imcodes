@@ -300,6 +300,8 @@ export interface ContextMemoryStatsView {
   stagedEventCount: number;
   dirtyTargetCount: number;
   pendingJobCount: number;
+  /** The isolated local store could not answer this request; retry is safe. */
+  localUnavailable?: boolean;
 }
 
 export interface ContextMemoryProjectView {

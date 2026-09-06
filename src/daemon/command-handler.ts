@@ -11444,14 +11444,21 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
   const includeArchived = cmd.includeArchived === true;
-  const baseStats = await getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
-    scope: 'personal',
-    userId: ownerUserId,
-    includeLegacyPersonalOwner: true,
-    projectId: projectId || undefined,
-    projectionClass,
-    includeArchived,
-  }]);
+  let baseStats: ProcessedProjectionStats;
+  try {
+    baseStats = await getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
+      scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
+      projectId: projectId || undefined,
+      projectionClass,
+      includeArchived,
+    }]);
+  } catch (error) {
+    logger.warn({ error }, 'personal memory stats unavailable');
+    sendPersonalMemoryUnavailable(serverLink, requestId);
+    return;
+  }
 
   let records: Array<{
     id: string;
@@ -11491,14 +11498,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       semantic = await searchLocalMemorySemanticForManagement(semanticQuery);
     } catch (error) {
       logger.warn({ error }, 'personal memory semantic query unavailable');
-      serverLink.send({
-        type: MEMORY_WS.PERSONAL_RESPONSE,
-        requestId,
-        stats: { ...baseStats, matchedRecords: 0, localUnavailable: true },
-        records: [],
-        pendingRecords: [],
-        projects: [],
-      });
+      sendPersonalMemoryUnavailable(serverLink, requestId, { ...baseStats, matchedRecords: 0 });
       return;
     }
     records = semantic.items
@@ -11527,24 +11527,30 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       limit,
       includeArchived,
     };
-    records = (await getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [queryArgs])).map((projection) => ({
-      id: projection.id,
-      scope: projection.namespace.scope as 'personal',
-      projectId: projection.namespace.projectId ?? '',
-      ownerUserId: recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
-      createdByUserId: recordCreatedByUserIdFromContent(
-        projection.content,
-        recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
-      ),
-      updatedByUserId: recordUpdatedByUserIdFromContent(projection.content),
-      summary: projection.summary,
-      projectionClass: projection.class,
-      sourceEventCount: projection.sourceEventIds.length,
-      updatedAt: projection.updatedAt,
-      hitCount: projection.hitCount ?? 0,
-      lastUsedAt: projection.lastUsedAt,
-      status: projection.status ?? 'active' as const,
-    }));
+    try {
+      records = (await getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [queryArgs])).map((projection) => ({
+        id: projection.id,
+        scope: projection.namespace.scope as 'personal',
+        projectId: projection.namespace.projectId ?? '',
+        ownerUserId: recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+        createdByUserId: recordCreatedByUserIdFromContent(
+          projection.content,
+          recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+        ),
+        updatedByUserId: recordUpdatedByUserIdFromContent(projection.content),
+        summary: projection.summary,
+        projectionClass: projection.class,
+        sourceEventCount: projection.sourceEventIds.length,
+        updatedAt: projection.updatedAt,
+        hitCount: projection.hitCount ?? 0,
+        lastUsedAt: projection.lastUsedAt,
+        status: projection.status ?? 'active' as const,
+      }));
+    } catch (error) {
+      logger.warn({ error }, 'personal memory records unavailable');
+      sendPersonalMemoryUnavailable(serverLink, requestId, baseStats);
+      return;
+    }
     matchedRecords = baseStats.matchedRecords;
   }
 
@@ -11560,7 +11566,6 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     query: query || undefined,
     limit,
   };
-  const pendingRecords = await getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
   const summaryArgs: ProcessedProjectionQuery = {
     scope: 'personal',
     userId: ownerUserId,
@@ -11569,7 +11574,16 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     projectionClass,
     includeArchived,
   };
-  const projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+  let pendingRecords: ContextPendingEventView[];
+  let projects: ContextMemoryProjectView[];
+  try {
+    pendingRecords = await getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
+    projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+  } catch (error) {
+    logger.warn({ error }, 'personal memory supplemental views unavailable');
+    sendPersonalMemoryUnavailable(serverLink, requestId, stats);
+    return;
+  }
   // Any caller requesting short refs must consume handles issued by the daemon,
   // never values derived independently in UI code. Keep ordinary management-list
   // reads side-effect free; only an explicit includeShortRefs request registers
@@ -11854,6 +11868,22 @@ function emptyMemoryStatsView(): ContextMemoryStatsView {
     dirtyTargetCount: 0,
     pendingJobCount: 0,
   };
+}
+
+function sendPersonalMemoryUnavailable(
+  serverLink: ServerLink,
+  requestId: string,
+  stats: ContextMemoryStatsView = emptyMemoryStatsView(),
+): void {
+  serverLink.send({
+    type: MEMORY_WS.PERSONAL_RESPONSE,
+    requestId,
+    stats: { ...stats, localUnavailable: true },
+    records: [],
+    pendingRecords: [],
+    projects: [],
+    ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+  });
 }
 
 function memoryManagementError(code: MemoryManagementErrorCode): { errorCode: MemoryManagementErrorCode; error: string } {
@@ -12243,11 +12273,26 @@ async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records: [], featureEnabled: true, ...memoryManagementContextError() });
     return;
   }
-  const records = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
-    scope: PREFERENCE_INGEST_SCOPE,
-    class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  }]))
-    .filter((observation) => observation.state === PREFERENCE_INGEST_OBSERVATION_STATE)
+  let observations: ContextObservationRow[];
+  try {
+    observations = await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
+      scope: PREFERENCE_INGEST_SCOPE,
+      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      state: PREFERENCE_INGEST_OBSERVATION_STATE,
+    }]);
+  } catch (error) {
+    logger.warn({ error }, 'memory preference query unavailable');
+    serverLink.send({
+      type: MEMORY_WS.PREF_RESPONSE,
+      requestId,
+      records: [],
+      featureEnabled: true,
+      localUnavailable: true,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+    });
+    return;
+  }
+  const records = observations
     .map((observation) => {
       const userId = preferenceOwnerFromObservation(observation);
       const createdByUserId = recordCreatedByUserIdFromContent(observation.content, userId);
@@ -12687,19 +12732,34 @@ async function handleMemoryObservationsQuery(cmd: Record<string, unknown>, serve
     return;
   }
   const limit = Math.max(1, Math.min(200, typeof cmd.limit === 'number' ? cmd.limit : 50));
-  const observationsArgs = {
-    scope,
-    class: isObservationClass(observationClass) ? observationClass : undefined,
-  };
   const client = getContextStoreClient();
-  const observations = await client.run<ContextObservationRow[]>('listContextObservations', [observationsArgs]);
   const namespacesById = new Map<string, ContextNamespaceRow>();
-  for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
-    namespacesById.set(namespace.id, namespace);
+  let observations: ContextObservationRow[];
+  try {
+    for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
+      if (managementContextCanAccessNamespace(namespace, ctx)) {
+        namespacesById.set(namespace.id, namespace);
+      }
+    }
+    observations = await client.run<ContextObservationRow[]>('listContextObservations', [{
+      namespaceIds: [...namespacesById.keys()],
+      scope,
+      class: isObservationClass(observationClass) ? observationClass : undefined,
+      limit,
+    }]);
+  } catch (error) {
+    logger.warn({ error }, 'memory observation query unavailable');
+    serverLink.send({
+      type: MEMORY_WS.OBSERVATION_RESPONSE,
+      requestId,
+      records: [],
+      featureEnabled: true,
+      localUnavailable: true,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+    });
+    return;
   }
   const records = observations
-    .filter((observation) => managementContextCanAccessNamespace(namespacesById.get(observation.namespaceId), ctx))
-    .slice(0, limit)
     .map((observation) => {
       const namespace = namespacesById.get(observation.namespaceId);
       const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
