@@ -23,11 +23,6 @@ const registry = new SessionResourceRegistry();
 const execFile = promisify(execFileCallback);
 let stopExpirySweep: (() => void) | null = null;
 const mcpCpuSamples = new Map<string, { cpuMs: number; sampledAt: number; strikes: number }>();
-const mcpRestartTimestamps = new Map<string, number[]>();
-const mcpRestartsInFlight = new Set<string>();
-let restartMcpOwner: ((owner: SessionResourceOwner, reason: string) => Promise<void>) | null = null;
-const MCP_RESTART_WINDOW_MS = 5 * 60_000;
-const MCP_RESTART_LIMIT = 3;
 
 function usable(value: string | null | undefined): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -181,7 +176,6 @@ interface MemoryMcpWatchdogDependencies {
   sampleCpuMillis: (pid: number) => Promise<number | null>;
   pidHandleIsCurrent: typeof sessionResourcePidHandleIsCurrent;
   releaseResource: typeof releaseSessionResource;
-  restartOwner: (owner: SessionResourceOwner, reason: string) => Promise<void>;
 }
 
 const memoryMcpWatchdogDependencies: MemoryMcpWatchdogDependencies = {
@@ -189,7 +183,6 @@ const memoryMcpWatchdogDependencies: MemoryMcpWatchdogDependencies = {
   sampleCpuMillis: sampleProcessCpuMillis,
   pidHandleIsCurrent: sessionResourcePidHandleIsCurrent,
   releaseResource: releaseSessionResource,
-  restartOwner: requestMcpOwnerRestart,
 };
 
 export async function sweepMemoryMcpCpu(
@@ -233,35 +226,16 @@ export async function sweepMemoryMcpCpu(
     const strikes = cpuRatio >= MEMORY_MCP_WATCHDOG.CPU_RATIO_THRESHOLD ? previous.strikes + 1 : 0;
     mcpCpuSamples.set(record.resourceId, { cpuMs, sampledAt: now, strikes });
     if (strikes >= MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT) {
-      const released = await dependencies.releaseResource(
+      await dependencies.releaseResource(
         record.resourceId,
         record.owner,
         SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
       );
       mcpCpuSamples.delete(record.resourceId);
-      if (released.released > 0) {
-        await dependencies.restartOwner(record.owner, SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU);
-      }
     }
   }
   for (const resourceId of mcpCpuSamples.keys()) {
     if (!liveIds.has(resourceId)) mcpCpuSamples.delete(resourceId);
-  }
-}
-
-async function requestMcpOwnerRestart(owner: SessionResourceOwner, reason: string): Promise<void> {
-  if (!restartMcpOwner) return;
-  const key = JSON.stringify([owner.sessionName, owner.sessionInstanceId]);
-  if (mcpRestartsInFlight.has(key)) return;
-  const now = Date.now();
-  const recent = (mcpRestartTimestamps.get(key) ?? []).filter((timestamp) => now - timestamp < MCP_RESTART_WINDOW_MS);
-  if (recent.length >= MCP_RESTART_LIMIT) return;
-  mcpRestartTimestamps.set(key, [...recent, now]);
-  mcpRestartsInFlight.add(key);
-  try {
-    await restartMcpOwner(owner, reason);
-  } finally {
-    mcpRestartsInFlight.delete(key);
   }
 }
 
@@ -279,9 +253,7 @@ export function startSessionResourceExpirySweep(intervalMs = MEMORY_MCP_WATCHDOG
 
 export async function initializeSessionResourceLifecycle(
   records: readonly SessionRecord[],
-  onMcpRestart?: (owner: SessionResourceOwner, reason: string) => Promise<void>,
 ): Promise<OrphanSweepSummary> {
-  restartMcpOwner = onMcpRestart ?? null;
   const swept = await sweepOrphanedSessionResources(records);
   const registrationErrors: unknown[] = [];
   for (const record of records) {
@@ -371,8 +343,5 @@ export async function measureSessionProcessTreeRssBytes(record: SessionRecord): 
 export function stopSessionResourceLifecycle(): void {
   stopExpirySweep?.();
   stopExpirySweep = null;
-  restartMcpOwner = null;
   mcpCpuSamples.clear();
-  mcpRestartTimestamps.clear();
-  mcpRestartsInFlight.clear();
 }

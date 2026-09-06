@@ -486,14 +486,7 @@ export async function initOnStartup(): Promise<void> {
       if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) continue;
       if (await sessionExists(record.name)) activeProcessOwners.push(record);
     }
-    const swept = await initializeSessionResourceLifecycle(activeProcessOwners, async (owner, reason) => {
-      const record = getSession(owner.sessionName);
-      if (!record || record.sessionInstanceId !== owner.sessionInstanceId
-        || record.runtimeEpoch !== owner.runtimeEpoch
-        || record.state === 'stopped' || record.state === 'error') return;
-      logger.warn({ session: owner.sessionName, reason }, 'Restarting session after memory MCP watchdog termination');
-      await relaunchSessionWithSettings(record);
-    });
+    const swept = await initializeSessionResourceLifecycle(activeProcessOwners);
     logger.info({ ...swept }, 'Session resource orphan sweep completed');
   } catch (err) {
     logger.warn({ err }, 'Session resource orphan sweep failed — daemon continues');

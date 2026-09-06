@@ -30,7 +30,6 @@ function dependencies(record: SessionResourceRecord, exactProcessCurrent: boolea
     sampleCpuMillis: vi.fn().mockResolvedValue(null),
     pidHandleIsCurrent: vi.fn().mockResolvedValue(exactProcessCurrent),
     releaseResource: vi.fn().mockResolvedValue({ released: 1, failed: 0 }),
-    restartOwner: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -46,7 +45,6 @@ describe('memory MCP watchdog process identity', () => {
 
     expect(deps.pidHandleIsCurrent).toHaveBeenCalledWith(record.handle);
     expect(deps.releaseResource).not.toHaveBeenCalled();
-    expect(deps.restartOwner).not.toHaveBeenCalled();
   });
 
   it('releases a stale record without restarting the owner after the exact MCP is confirmed gone', async () => {
@@ -60,7 +58,6 @@ describe('memory MCP watchdog process identity', () => {
       owner,
       SESSION_RESOURCE_RELEASE_REASON.PROCESS_MISSING,
     );
-    expect(deps.restartOwner).not.toHaveBeenCalled();
   });
 
   it('does not restart when another sweep already released the missing resource', async () => {
@@ -70,10 +67,9 @@ describe('memory MCP watchdog process identity', () => {
 
     await sweepMemoryMcpCpu(10_000, deps);
 
-    expect(deps.restartOwner).not.toHaveBeenCalled();
   });
 
-  it('still restarts after sustained CPU is measured on the live MCP', async () => {
+  it('isolates sustained CPU to the live MCP without an owner restart path', async () => {
     const record = mcpRecord('mcp:sustained-cpu');
     let cpuMs = 0;
     const deps = {
@@ -93,9 +89,6 @@ describe('memory MCP watchdog process identity', () => {
       owner,
       SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
     );
-    expect(deps.restartOwner).toHaveBeenCalledWith(
-      owner,
-      SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
-    );
+    expect('restartOwner' in deps).toBe(false);
   });
 });
