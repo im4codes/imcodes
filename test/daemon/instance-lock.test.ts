@@ -1,96 +1,134 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
-import { acquireInstanceLock, releaseInstanceLock } from '../../src/daemon/lifecycle.js';
-import { mkdtempSync, existsSync, unlinkSync, writeFileSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
-import net from 'net';
+import { afterEach, describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  acquireInstanceLock,
+  releaseInstanceLock,
+  updateInstanceLockDiagnostics,
+  type InstanceLockHandle,
+} from '../../src/daemon/instance-lock.js';
 
-// Verify the default path uses Unix domain socket on non-Windows (not named pipe)
-// This ensures we didn't accidentally break Unix by introducing the Windows pipe path.
-
-function tmpSock(): string {
+function paths(): { socketPath: string; metadataPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'imcodes-lock-test-'));
-  return join(dir, 'daemon.sock');
+  return { socketPath: join(dir, 'daemon.sock'), metadataPath: join(dir, 'daemon.lock.json') };
 }
 
-// Track servers to clean up after each test
-const servers: net.Server[] = [];
-afterEach(() => {
-  for (const s of servers) {
-    try { s.close(); } catch { /* ignore */ }
-  }
-  servers.length = 0;
+const handles: InstanceLockHandle[] = [];
+afterEach(async () => {
+  await Promise.all(handles.splice(0).map((handle) => releaseInstanceLock(handle)));
 });
 
-describe('single-instance lock', () => {
-  it('acquires lock on fresh socket path', async () => {
-    const sock = tmpSock();
-    const server = await acquireInstanceLock(sock);
-    servers.push(server);
-    expect(server).toBeInstanceOf(net.Server);
-    expect(existsSync(sock)).toBe(true);
-    releaseInstanceLock(server, sock);
+describe('single-instance authority', () => {
+  it('rejects a live owner and reports its exact process identity and residual resources', async () => {
+    const lockPaths = paths();
+    const first = await acquireInstanceLock({
+      ...lockPaths,
+      currentIdentity: { pid: 111, startToken: 'boot-a:100' },
+      probeProcessStartToken: () => 'boot-a:100',
+    });
+    handles.push(first);
+    updateInstanceLockDiagnostics(first, {
+      sessionIds: ['deck_prod_brain'],
+      residualResources: ['browser:cdp-9222', 'container:worker-a'],
+    });
+
+    await expect(acquireInstanceLock({
+      ...lockPaths,
+      currentIdentity: { pid: 222, startToken: 'boot-a:200' },
+      probeProcessStartToken: () => 'boot-a:100',
+    })).rejects.toMatchObject({
+      code: 'DAEMON_ALREADY_RUNNING',
+      owner: expect.objectContaining({
+        pid: 111,
+        startToken: 'boot-a:100',
+        sessionIds: ['deck_prod_brain'],
+        residualResources: ['browser:cdp-9222', 'container:worker-a'],
+      }),
+    });
   });
 
-  it('rejects when another instance holds the lock', async () => {
-    const sock = tmpSock();
-    const first = await acquireInstanceLock(sock);
-    servers.push(first);
+  it('reclaims a stale socket only after proving the recorded PID no longer exists', async () => {
+    const lockPaths = paths();
+    writeFileSync(lockPaths.socketPath, 'stale');
+    writeFileSync(lockPaths.metadataPath, JSON.stringify({
+      version: 1, pid: 333, startToken: 'boot-old:1', acquiredAt: 1,
+      socketPath: lockPaths.socketPath, sessionIds: [], residualResources: [],
+    }));
 
-    await expect(acquireInstanceLock(sock)).rejects.toThrow('already running');
-
-    releaseInstanceLock(first, sock);
+    const handle = await acquireInstanceLock({
+      ...lockPaths,
+      currentIdentity: { pid: 444, startToken: 'boot-new:1' },
+      probeProcessStartToken: () => null,
+    });
+    handles.push(handle);
+    expect(handle.identity).toEqual({ pid: 444, startToken: 'boot-new:1' });
   });
 
-  it('reclaims stale socket from crashed process', async () => {
-    const sock = tmpSock();
-    // Simulate a stale socket file left by a crashed daemon:
-    // write a regular file at the socket path (mimics leftover after SIGKILL)
-    writeFileSync(sock, '');
-    expect(existsSync(sock)).toBe(true);
+  it('reclaims a stale socket when the PID was reused by a different process start', async () => {
+    const lockPaths = paths();
+    writeFileSync(lockPaths.socketPath, 'stale');
+    writeFileSync(lockPaths.metadataPath, JSON.stringify({
+      version: 1, pid: 333, startToken: 'boot-old:1', acquiredAt: 1,
+      socketPath: lockPaths.socketPath, sessionIds: ['deck_old_brain'], residualResources: ['container:old'],
+    }));
 
-    // acquireInstanceLock should detect EADDRINUSE, fail to connect, unlink stale, and reclaim
-    const server = await acquireInstanceLock(sock);
-    servers.push(server);
-    expect(server).toBeInstanceOf(net.Server);
-
-    releaseInstanceLock(server, sock);
+    const handle = await acquireInstanceLock({
+      ...lockPaths,
+      currentIdentity: { pid: 444, startToken: 'boot-new:1' },
+      probeProcessStartToken: (pid) => pid === 333 ? 'boot-new:99' : null,
+    });
+    handles.push(handle);
+    expect(handle.identity.pid).toBe(444);
   });
 
-  it('releases lock and cleans up socket file', async () => {
-    const sock = tmpSock();
-    const server = await acquireInstanceLock(sock);
-    expect(existsSync(sock)).toBe(true);
+  it('fails closed instead of unlinking an unreachable lock whose exact owner is alive', async () => {
+    const lockPaths = paths();
+    writeFileSync(lockPaths.socketPath, 'not-a-socket');
+    writeFileSync(lockPaths.metadataPath, JSON.stringify({
+      version: 1, pid: 333, startToken: 'boot-a:1', acquiredAt: 1,
+      socketPath: lockPaths.socketPath, sessionIds: ['deck_live_brain'], residualResources: ['socket:busy'],
+    }));
 
-    releaseInstanceLock(server, sock);
-    expect(existsSync(sock)).toBe(false);
+    await expect(acquireInstanceLock({
+      ...lockPaths,
+      currentIdentity: { pid: 444, startToken: 'boot-a:2' },
+      probeProcessStartToken: () => 'boot-a:1',
+    })).rejects.toMatchObject({ code: 'DAEMON_LOCK_OWNER_UNREACHABLE' });
+    expect(existsSync(lockPaths.socketPath)).toBe(true);
   });
 
-  it('second instance can acquire after first releases', async () => {
-    const sock = tmpSock();
-    const first = await acquireInstanceLock(sock);
-    releaseInstanceLock(first, sock);
-
-    const second = await acquireInstanceLock(sock);
-    servers.push(second);
-    expect(second).toBeInstanceOf(net.Server);
-
-    releaseInstanceLock(second, sock);
+  it('serializes concurrent stale recovery so exactly one contender becomes authoritative', async () => {
+    const lockPaths = paths();
+    writeFileSync(lockPaths.socketPath, 'stale');
+    const options = {
+      ...lockPaths,
+      currentIdentity: { pid: 444, startToken: 'same-process:1' },
+      probeProcessStartToken: () => 'same-process:1',
+    };
+    const outcomes = await Promise.allSettled([
+      acquireInstanceLock(options),
+      acquireInstanceLock(options),
+    ]);
+    const acquired = outcomes.filter((outcome): outcome is PromiseFulfilledResult<InstanceLockHandle> => outcome.status === 'fulfilled');
+    const rejected = outcomes.filter((outcome) => outcome.status === 'rejected');
+    expect(acquired).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    handles.push(acquired[0].value);
   });
 
-  it('uses Unix domain socket path on non-Windows (not named pipe)', async () => {
-    // On the current platform (Linux/Mac in CI), acquireInstanceLock with an explicit
-    // Unix path should work. This verifies the platform branch didn't break Unix.
-    const sock = tmpSock();
-    expect(sock).toContain('daemon.sock');
-    expect(sock).not.toContain('\\\\.\\pipe\\');
-
-    const server = await acquireInstanceLock(sock);
-    servers.push(server);
-    // The socket file should exist on Unix
-    expect(existsSync(sock)).toBe(true);
-    releaseInstanceLock(server, sock);
-    // Socket cleaned up on Unix
-    expect(existsSync(sock)).toBe(false);
+  it('survives 100 acquire/release cycles without socket or metadata residue', async () => {
+    const lockPaths = paths();
+    for (let i = 0; i < 100; i++) {
+      const handle = await acquireInstanceLock({
+        ...lockPaths,
+        currentIdentity: { pid: 500 + i, startToken: `stress:${i}` },
+        probeProcessStartToken: () => null,
+      });
+      await releaseInstanceLock(handle);
+      expect(existsSync(lockPaths.socketPath)).toBe(false);
+      expect(existsSync(lockPaths.metadataPath)).toBe(false);
+      expect(existsSync(handle.pidPath)).toBe(false);
+    }
   });
 });

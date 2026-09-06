@@ -59,14 +59,28 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   USER_SERVICE="$HOME/.config/systemd/user/imcodes.service"
   if [[ -f "$USER_SERVICE" ]]; then
     LOCAL_EXEC="ExecStart=$PROJECT_ROOT/bin/imcodes-launch.sh start --foreground"
-    if ! grep -Fxq "$LOCAL_EXEC" "$USER_SERVICE"; then
+    if ! grep -Fxq "$LOCAL_EXEC" "$USER_SERVICE" \
+      || ! grep -Fxq "KillMode=control-group" "$USER_SERVICE" \
+      || ! grep -Fxq "TimeoutStopSec=45s" "$USER_SERVICE" \
+      || ! grep -Fxq "SendSIGKILL=yes" "$USER_SERVICE"; then
       backup="$USER_SERVICE.bak.$(date +%Y%m%d%H%M%S)"
       cp -p -- "$USER_SERVICE" "$backup"
       tmp="$(mktemp)"
       awk -v exec_line="$LOCAL_EXEC" '
-        /^ExecStart=/ { print exec_line; replaced=1; next }
+        function emit_missing() {
+          if (!replaced) { print exec_line; replaced=1 }
+          if (!kill_mode) { print "KillMode=control-group"; kill_mode=1 }
+          if (!timeout_stop) { print "TimeoutStopSec=45s"; timeout_stop=1 }
+          if (!send_sigkill) { print "SendSIGKILL=yes"; send_sigkill=1 }
+        }
+        /^\[Service\]$/ { in_service=1; print; next }
+        /^\[/ { if (in_service) emit_missing(); in_service=0; print; next }
+        in_service && /^ExecStart=/ { print exec_line; replaced=1; next }
+        in_service && /^KillMode=/ { print "KillMode=control-group"; kill_mode=1; next }
+        in_service && /^TimeoutStopSec=/ { print "TimeoutStopSec=45s"; timeout_stop=1; next }
+        in_service && /^SendSIGKILL=/ { print "SendSIGKILL=yes"; send_sigkill=1; next }
         { print }
-        END { if (!replaced) print exec_line }
+        END { if (in_service) emit_missing() }
       ' "$USER_SERVICE" >"$tmp"
       mv "$tmp" "$USER_SERVICE"
       if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze --user verify "$USER_SERVICE" >/dev/null 2>&1; then
@@ -74,7 +88,7 @@ if [[ "$(uname -s)" == "Linux" ]]; then
         echo "Patched systemd unit failed verification; restored $backup" >&2
         exit 1
       fi
-      echo "Patched systemd ExecStart to current checkout: $PROJECT_ROOT"
+      echo "Patched systemd ExecStart and bounded cgroup shutdown authority: $PROJECT_ROOT"
     fi
   fi
 fi
@@ -104,6 +118,7 @@ elif [[ "$(uname -s)" == "Darwin" ]]; then
     plist="$HOME/Library/LaunchAgents/imcodes.daemon.plist"
     label="gui/$(id -u)/imcodes.daemon"
     pid_file="$HOME/.imcodes/daemon.pid"
+    identity_file="$HOME/.imcodes/daemon.lock.json"
     old_pid=""
     if [[ -f "$pid_file" ]]; then
       old_pid="$(tr -dc "0-9" <"$pid_file" 2>/dev/null || true)"
@@ -113,6 +128,17 @@ elif [[ "$(uname -s)" == "Darwin" ]]; then
     fi
     if ! [[ "$old_pid" =~ ^[0-9]+$ ]]; then
       old_pid=""
+    fi
+
+    # A numeric PID is not authority: the kernel may already have reused it.
+    # Require the exact lock-owner process-start token before sending signals.
+    if [[ -n "$old_pid" ]]; then
+      recorded_start="$(node -e "try { const m = JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\")); if (m.pid === Number(process.argv[2]) && typeof m.startToken === \"string\") process.stdout.write(m.startToken); } catch {}" "$identity_file" "$old_pid")"
+      current_start="$(ps -o lstart= -p "$old_pid" 2>/dev/null | awk "{\$1=\$1; if (length) print \"ps:\" \$0}")"
+      if [[ -z "$recorded_start" || "$recorded_start" != "$current_start" ]]; then
+        echo "refusing PID-only restart cleanup for $old_pid: exact PID+start identity unavailable or stale"
+        old_pid=""
+      fi
     fi
 
     launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || launchctl unload "$plist" 2>/dev/null || true

@@ -689,7 +689,9 @@ Type=simple
 ExecStart=${renderSystemdExecStart(target)}
 Restart=on-failure
 RestartSec=5
-KillMode=process
+KillMode=control-group
+TimeoutStopSec=45s
+SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
 Environment=NODE_ENV=production

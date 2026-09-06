@@ -93,6 +93,7 @@ import {
 import { PROJECT_ROOT } from './util/project-root.js';
 import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.js';
 import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
+import { isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
@@ -272,6 +273,12 @@ function killStaleImcodesProcesses(): void {
     if (!pid || pid <= 0 || pid === process.pid) return;
   } catch { return; /* no PID file — nothing to kill */ }
 
+  const owner = readInstanceLockMetadata();
+  if (!owner || owner.pid !== pid || !isRecordedProcessIdentityCurrent(owner)) {
+    console.warn(`[imcodes-daemon] refusing PID-only cleanup for ${pid}: exact PID+start identity is unavailable or stale`);
+    return;
+  }
+
   // Check if process is actually alive
   try { process.kill(pid, 0); } catch { return; /* already gone */ }
 
@@ -308,12 +315,24 @@ function ensureServiceForeground(): void {
     const svc = resolve(homedir(), '.config/systemd/user/imcodes.service');
     if (!existsSync(svc)) return;
     const content = readFileSync(svc, 'utf8');
-    if (content.includes('--foreground')) return;
-    const patched = content.replace(/^(ExecStart=.*imcodes start)$/m, '$1 --foreground');
+    if (content.includes('--foreground')
+      && /^KillMode=control-group$/m.test(content)
+      && /^TimeoutStopSec=45s$/m.test(content)
+      && /^SendSIGKILL=yes$/m.test(content)) return;
+    let patched = content.replace(/^(ExecStart=.*imcodes start)$/m, '$1 --foreground');
+    for (const [pattern, line] of [
+      [/^KillMode=.*$/m, 'KillMode=control-group'],
+      [/^TimeoutStopSec=.*$/m, 'TimeoutStopSec=45s'],
+      [/^SendSIGKILL=.*$/m, 'SendSIGKILL=yes'],
+    ] as const) {
+      patched = pattern.test(patched)
+        ? patched.replace(pattern, line)
+        : patched.replace(/^\[Service\]$/m, `[Service]\n${line}`);
+    }
     if (patched !== content) {
       writeFileSync(svc, patched, 'utf8');
       try { execSync('systemctl --user daemon-reload', { stdio: 'ignore' }); } catch { /* ok */ }
-      console.log('Patched systemd service: added --foreground');
+      console.log('Patched systemd service: foreground + bounded control-group shutdown authority');
     }
   }
 }
@@ -338,24 +357,16 @@ program
     if (opts.foreground) {
       // Acquire single-instance lock before installing global error handlers
       // so duplicate-instance errors propagate cleanly instead of being swallowed.
-      const { startup } = await import('./daemon/lifecycle.js');
+      const { startup, shutdown, describeDaemonStartupFailure } = await import('./daemon/lifecycle.js');
       try {
         await startup();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('already running')) {
-          // Duplicate instance: this is the ONLY startup error that should exit.
-          console.error(msg);
-          process.exit(1);
-        }
-        // All other startup errors: log + keep the daemon alive.
-        // Exiting here would cause systemd to rapid-restart in a crash loop
-        // (see pre-fix daemon.log — 479 fatal errors, all transient tmux issues).
-        // Subsystems that failed to initialize will retry lazily when used.
-        // Uncaught errors hitting the global handlers at the top of this file
-        // are the backstop for any post-startup crashes.
-        logger.error({ err }, 'startup() failed — daemon stays alive with degraded state');
+        const diagnostic = describeDaemonStartupFailure(err);
+        console.error(`[imcodes-daemon] startup failed: ${JSON.stringify(diagnostic)}`);
+        logger.error({ err, diagnostic }, 'startup() failed — releasing authority and exiting fail-closed');
         forwardDaemonError('uncaughtException', err);
+        await shutdown(1);
+        return;
       }
       // Called by launchd/systemd plist/unit — run inline.
       // Global error handlers are registered at the top of this file.

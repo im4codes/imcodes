@@ -28,16 +28,12 @@ import { startHookServer, drainQueue } from './hook-server.js';
 import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
-import net from 'node:net';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import logger from '../util/logger.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
 import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { pickReadableSessionDisplay } from '../../shared/session-display.js';
 import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersistMainSessionToWorkerOnStartup } from './session-bootstrap.js';
@@ -87,6 +83,20 @@ import {
 } from './supervision-console-binding.js';
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
+import {
+  acquireInstanceLock,
+  releaseInstanceLock,
+  updateInstanceLockDiagnostics,
+  type DaemonInstanceLockError,
+  type InstanceLockHandle,
+} from './instance-lock.js';
+import {
+  startDaemonCgroupValidationProbes,
+  type CgroupValidationProbeController,
+} from './cgroup-validation-probes.js';
+import { runOrderedDaemonShutdown } from './ordered-shutdown.js';
+
+export { acquireInstanceLock, releaseInstanceLock } from './instance-lock.js';
 
 let supervisionConsole: SupervisionConsoleBinding | undefined;
 
@@ -487,65 +497,29 @@ function scheduleDaemonStartupBackgroundTask(label: string, task: () => Promise<
   timer.unref?.();
 }
 
-/** Write PID file so restart can reliably find the old process. */
-function writePidFile(): void {
-  const pidPath = path.join(os.homedir(), '.imcodes', 'daemon.pid');
-  try {
-    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
-    fs.writeFileSync(pidPath, String(process.pid), 'utf8');
-  } catch { /* best-effort */ }
+let lockServer: InstanceLockHandle | null = null;
+let cgroupValidationProbes: CgroupValidationProbeController | null = null;
+
+export interface DaemonStartupFailureDiagnostic {
+  reason: string;
+  code: string;
+  sessionIds: string[];
+  residualResources: string[];
 }
 
-let lockServer: net.Server | null = null;
-
-/** Acquire a single-instance lock via Unix domain socket.
- *  If another daemon is already running, the socket is in use and we exit.
- *  The lock auto-releases when the process exits (even on crash).
- *  @param sockPath — override for testing; defaults to ~/.imcodes/daemon.sock */
-export async function acquireInstanceLock(sockPath?: string): Promise<net.Server> {
-  // Windows: use a named pipe instead of Unix domain socket (UDS has path length limits and AV issues)
-  const p = process.platform === 'win32'
-    ? '\\\\.\\pipe\\imcodes-daemon-lock'
-    : (sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock'));
-
-  if (process.platform !== 'win32') {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-  }
-
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-
-    server.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') {
-        // Socket/pipe exists — check if another daemon is actually alive
-        const client = net.connect(p, () => {
-          // Connection succeeded → another daemon is running
-          client.destroy();
-          reject(new Error(`Another imcodes daemon is already running. Use 'imcodes restart' to restart it.`));
-        });
-        client.on('error', () => {
-          // Connection failed → stale socket from a crashed process, reclaim it
-          if (process.platform !== 'win32') {
-            try { fs.unlinkSync(p); } catch { /* ignore */ }
-          }
-          server.listen(p, () => resolve(server));
-        });
-      } else {
-        reject(err);
-      }
-    });
-
-    server.listen(p, () => resolve(server));
-  });
-}
-
-/** Release a single-instance lock. */
-export function releaseInstanceLock(server: net.Server, sockPath?: string): void {
-  server.close();
-  if (process.platform !== 'win32') {
-    const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
-    try { fs.unlinkSync(p); } catch { /* ignore */ }
-  }
+export function describeDaemonStartupFailure(error: unknown): DaemonStartupFailureDiagnostic {
+  const lockError = error as Partial<DaemonInstanceLockError>;
+  const owner = lockError.owner;
+  const sessions = owner?.sessionIds ?? listSessions().map((session) => session.name);
+  const resources = owner?.residualResources
+    ?? lockServer?.metadata.residualResources
+    ?? sessions.map((sessionId) => `session:${sessionId}`);
+  return {
+    reason: error instanceof Error ? error.message : String(error),
+    code: typeof lockError.code === 'string' ? lockError.code : 'DAEMON_STARTUP_FAILED',
+    sessionIds: [...new Set(sessions)].sort(),
+    residualResources: [...new Set(resources)].sort(),
+  };
 }
 
 /** Startup sequence: config → store → memory → sessions → server link */
@@ -556,7 +530,7 @@ export async function startup(): Promise<DaemonContext> {
     changeId: 'memory-system-1.1-foundations',
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
-  writePidFile();
+  cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
   // Captures an initial heap snapshot into the runtime status; subsequent
   // refreshes ride the heartbeat write (no dedicated timer / extra I/O).
@@ -567,6 +541,17 @@ export async function startup(): Promise<DaemonContext> {
 
   await loadStore();
   logger.info('Session store loaded');
+  updateInstanceLockDiagnostics(lockServer, {
+    sessionIds: listSessions().map((session) => session.name),
+    residualResources: [
+      `instance-lock:${lockServer.socketPath}`,
+      ...listSessions().map((session) => (
+        session.runtimeType === 'transport' || isTransportAgent(session.agentType)
+          ? `transport-session:${session.name}`
+          : `terminal-session:${session.name}`
+      )),
+    ],
+  });
 
   await initTempFileStore();
   logger.info('Temp file store initialized');
@@ -1400,6 +1385,20 @@ export async function startup(): Promise<DaemonContext> {
   }
 
   ctx = { config, serverLink, persistBinding, removeBinding, sendSessionEvent };
+  updateInstanceLockDiagnostics(lockServer, {
+    sessionIds: listSessions().map((session) => session.name),
+    residualResources: [
+      `instance-lock:${lockServer.socketPath}`,
+      ...(hookServer ? ['mcp-ingress:hook-server'] : []),
+      ...(serverLink ? ['browser-link:server-websocket'] : []),
+      ...(process.platform === 'linux' ? ['container-authority:systemd-control-group'] : []),
+      ...listSessions().map((session) => (
+        session.runtimeType === 'transport' || isTransportAgent(session.agentType)
+          ? `transport-session:${session.name}`
+          : `terminal-session:${session.name}`
+      )),
+    ],
+  });
   setupSignalHandlers();
   startHealthPoller();
   startCodexQuotaPoller(serverLink);
@@ -1411,6 +1410,7 @@ export async function startup(): Promise<DaemonContext> {
   startLatencyTracer();
 
   logger.info('Daemon started');
+  cgroupValidationProbes?.markReady();
 
   if (serverLink) {
     serverLink.connect();
@@ -1618,43 +1618,81 @@ async function autoReconnectProviders(): Promise<void> {
   }
 }
 
-/** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly */
-export async function shutdown(exitCode = 0): Promise<void> {
+let shutdownInFlight: Promise<void> | null = null;
+
+/** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly. */
+export function shutdown(exitCode = 0): Promise<void> {
+  if (shutdownInFlight) return shutdownInFlight;
+  shutdownInFlight = performShutdown(exitCode);
+  return shutdownInFlight;
+}
+
+async function performShutdown(exitCode: number): Promise<void> {
   logger.info('Daemon shutting down');
-
-  // Peer-audit attempts are intentionally not restart-resumable. Cancel
-  // deadlines/queued dispatches and close the dedicated reply ingress before
-  // timeline and queue stores are drained.
-  peerAuditService.shutdown();
-
-  await shutdownDirectFileTransfers().catch((err) => {
-    logger.warn({ err }, 'Daemon shutdown direct file transfer cleanup failed');
-  });
-
-  // The native worker is a separate process; leaving it running would keep a
-  // capture session and its named pipe alive past the daemon that owns it.
-  closeDaemonRemoteDesktop();
-
-  // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
-  if ((BACKEND as string) === 'conpty') {
-    try {
-      const conpty = await import('../agent/conpty.js');
-      const names: string[] = conpty.conptyListSessions();
-      for (const name of names) {
-        try {
-          conpty.conptyKillSession(name);
-        } catch (e) {
-          logger.warn({ err: e, session: name }, 'Failed to kill ConPTY session during shutdown');
-        }
+  const orderedShutdown = await runOrderedDaemonShutdown({
+    session: async () => {
+      logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session started');
+      // Stop new delegated/session work before tearing down its transports.
+      peerAuditService.shutdown();
+      if ((BACKEND as string) === 'conpty') {
+        const conpty = await import('../agent/conpty.js');
+        for (const name of conpty.conptyListSessions()) conpty.conptyKillSession(name);
       }
-    } catch { /* conpty not available */ }
-  }
-
-  try {
-    const { terminalStreamer } = await import('./terminal-streamer.js');
-    await terminalStreamer.destroyAsync();
-  } catch (err) {
-    logger.warn({ err }, 'Daemon shutdown terminal streamer drain failed');
+      await cgroupValidationProbes?.stopPhase('session');
+      logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session completed');
+    },
+    mcp: async () => {
+      logger.info({ shutdownPhase: 'mcp' }, 'Daemon shutdown phase MCP started');
+      // SDK transport sessions own their MCP child processes. Disconnecting
+      // every provider closes those children before browser/container teardown.
+      const { disconnectAll } = await import('../agent/provider-registry.js');
+      await disconnectAll();
+      if (hookServer) {
+        await new Promise<void>((resolve, reject) => {
+          hookServer!.close((error) => error ? reject(error) : resolve());
+        });
+        hookServer = null;
+      }
+      await cgroupValidationProbes?.stopPhase('mcp');
+      logger.info({ shutdownPhase: 'mcp' }, 'Daemon shutdown phase MCP completed');
+    },
+    browser: async () => {
+      logger.info({ shutdownPhase: 'browser' }, 'Daemon shutdown phase browser started');
+      const { terminalStreamer } = await import('./terminal-streamer.js');
+      await terminalStreamer.destroyAsync();
+      closeDaemonRemoteDesktop();
+      ctx?.serverLink?.disconnect();
+      try {
+        const { closeComputerUseRuntimeForProcessExit } = await import('../node/computer-use-runner.js');
+        await closeComputerUseRuntimeForProcessExit();
+      } catch (error) {
+        logger.warn({ errorKind: error instanceof Error ? error.name : typeof error }, 'Daemon shutdown browser runtime cleanup failed');
+        throw error;
+      }
+      await cgroupValidationProbes?.stopPhase('browser');
+      logger.info({ shutdownPhase: 'browser' }, 'Daemon shutdown phase browser completed');
+    },
+    container: async () => {
+      logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container started');
+      await shutdownDirectFileTransfers();
+      await cgroupValidationProbes?.stopPhase('container');
+      logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container completed');
+    },
+  }, {
+    phaseTimeoutMs: 10_000,
+    forceKill: async (phase, failure) => {
+      // Individual runtime owners already perform TERM→KILL escalation. If a
+      // phase still times out, exit non-zero below; systemd's control-group
+      // authority then applies the final bounded SIGKILL to every descendant.
+      logger.error({ phase, failure }, 'Daemon shutdown phase failed; forcing bounded process-group cleanup');
+      if (phase === 'browser') {
+        closeDaemonRemoteDesktop();
+        ctx?.serverLink?.disconnect();
+      }
+    },
+  });
+  if (!orderedShutdown.ok) {
+    logger.error({ failures: orderedShutdown.failures }, 'Daemon shutdown failed closed');
   }
 
   try {
@@ -1704,11 +1742,6 @@ export async function shutdown(exitCode = 0): Promise<void> {
   }
 
   try {
-    const { disconnectAll } = await import('../agent/provider-registry.js');
-    await disconnectAll();
-  } catch { /* ignore */ }
-
-  try {
     const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
     await shutdownDefaultPreviewReadCoordinatorForDaemon();
   } catch (err) {
@@ -1750,8 +1783,6 @@ export async function shutdown(exitCode = 0): Promise<void> {
     }
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = null;
-    hookServer?.close();
-    ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
     const { stopSupervisorDefaultsCacheRefresh } = await import('./supervisor-defaults-cache.js');
     stopSupervisorDefaultsCacheRefresh();
@@ -1761,7 +1792,11 @@ export async function shutdown(exitCode = 0): Promise<void> {
     logger.error({ err: e }, 'Error during shutdown');
   }
 
-  if (lockServer) releaseInstanceLock(lockServer);
+  if (lockServer) {
+    await releaseInstanceLock(lockServer);
+    lockServer = null;
+  }
+  cgroupValidationProbes = null;
 
   if ((BACKEND as string) === 'conpty') {
     logger.info('Daemon stopped (ConPTY sessions killed)');
@@ -1769,7 +1804,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
     // tmux/wezterm sessions are intentionally NOT killed — they keep running
     logger.info('Daemon stopped (tmux sessions left running)');
   }
-  process.exit(exitCode);
+  process.exit(Math.max(exitCode, orderedShutdown.exitCode));
 }
 
 const HEALTH_POLL_MS = 30_000;

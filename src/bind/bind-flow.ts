@@ -327,7 +327,9 @@ After=network.target
 ExecStart=${renderSystemdExecStart(target)}
 Restart=always
 RestartSec=5
-KillMode=process
+KillMode=control-group
+TimeoutStopSec=45s
+SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
 # --expose-gc lets the daemon's startGcPoller proactively trigger major
