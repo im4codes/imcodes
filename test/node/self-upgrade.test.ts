@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -18,6 +18,7 @@ import {
 import {
   buildPosixControlledNodeUpgradeScript,
   buildWindowsControlledNodeUpgradeScript,
+  CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS,
   CONTROLLED_NODE_UPGRADE_DIR_PREFIX,
   CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER,
   CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
@@ -767,9 +768,12 @@ describe('controlled-node self-upgrade', () => {
     const linked = join(root, `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}linked1`);
     await symlink(external, linked, 'dir');
 
+    const diagnostics: Array<{ outcome: string; code: string }> = [];
     const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
       now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
       isProcessAlive: (pid) => pid === process.pid,
+      onCleanupDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
     });
     expect(removed).toBe(1);
     await expect(readFile(join(stale, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER))).rejects.toThrow();
@@ -785,6 +789,56 @@ describe('controlled-node self-upgrade', () => {
     expect(await readFile(join(recent, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), 'utf8')).toContain('recent1');
     expect(await readFile(join(live, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), 'utf8')).toContain('active1');
     expect(await readdir(unowned)).toEqual([]);
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ outcome: 'skipped', code: 'pid_alive' }),
+      expect.objectContaining({ outcome: 'skipped', code: 'marker_missing' }),
+    ]));
+  });
+
+  it('deletes a pre-boot staging directory even when its recorded pid was reused', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-preboot-'));
+    dirs.push(root);
+    const now = Date.now();
+    const candidate = await createOwnedUpgradeDir({
+      root,
+      suffix: 'preboot1',
+      createdAt: now - (2 * CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS),
+      pid: 2_805_176,
+    });
+    const isProcessAlive = vi.fn(() => true);
+
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      uptime: () => 24 * 60 * 60,
+      isProcessAlive,
+    });
+
+    expect(removed).toBe(1);
+    expect(isProcessAlive).not.toHaveBeenCalled();
+    await expect(lstat(candidate)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('deletes staging beyond the absolute TTL even when the system and pid stayed alive', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-ttl-'));
+    dirs.push(root);
+    const now = Date.now();
+    const candidate = await createOwnedUpgradeDir({
+      root,
+      suffix: 'expired1',
+      createdAt: now - CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS - 1,
+      pid: 4,
+    });
+    const isProcessAlive = vi.fn(() => true);
+
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
+      isProcessAlive,
+    });
+
+    expect(removed).toBe(1);
+    expect(isProcessAlive).not.toHaveBeenCalled();
+    await expect(lstat(candidate)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('fails open when stale cleanup cannot remove an owned directory and emits only a structured code', async () => {
@@ -825,11 +879,12 @@ describe('controlled-node self-upgrade', () => {
     const operations = { enumerate: 0, lstat: 0, marker_read: 0, delete: 0 };
     const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
       now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
       isProcessAlive: () => true,
       onStaleScavengeOperation: (operation) => { operations[operation] += 1; },
     });
     expect(removed).toBe(0);
-    expect(operations).toEqual({ enumerate: 128, lstat: 64, marker_read: 32, delete: 0 });
+    expect(operations).toEqual({ enumerate: 128, lstat: 128, marker_read: 64, delete: 0 });
     expect((await readdir(root))).toHaveLength(192);
   });
 
@@ -840,12 +895,12 @@ describe('controlled-node self-upgrade', () => {
     expect(source).not.toMatch(/await readdir\((?:tempRoot|canonicalRoot)/);
   });
 
-  it('deletes at most eight fully-qualified stale candidates per upgrade attempt', async () => {
+  it('deletes at most 32 fully-qualified stale candidates per upgrade attempt', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-delete-bound-'));
     dirs.push(root);
     const now = Date.now();
     const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 40; index += 1) {
       await createOwnedUpgradeDir({ root, suffix: `stale${String(index).padStart(2, '0')}`, createdAt: old });
     }
     const operations: string[] = [];
@@ -854,17 +909,17 @@ describe('controlled-node self-upgrade', () => {
       isProcessAlive: () => false,
       onStaleScavengeOperation: (operation) => operations.push(operation),
     });
-    expect(removed).toBe(8);
-    expect(operations.filter((operation) => operation === 'delete')).toHaveLength(8);
-    expect(await readdir(root)).toHaveLength(4);
+    expect(removed).toBe(32);
+    expect(operations.filter((operation) => operation === 'delete')).toHaveLength(32);
+    expect(await readdir(root)).toHaveLength(8);
   });
 
-  it('counts failed stale removals against the eight-attempt budget and continues the upgrade', async () => {
+  it('counts failed stale removals against the 32-attempt budget and continues the upgrade', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-failed-delete-bound-'));
     dirs.push(root);
     const now = Date.now();
     const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 40; index += 1) {
       await createOwnedUpgradeDir({ root, suffix: `failed${String(index).padStart(2, '0')}`, createdAt: old });
     }
     const operations = { enumerate: 0, lstat: 0, marker_read: 0, delete: 0 };
@@ -892,19 +947,19 @@ describe('controlled-node self-upgrade', () => {
 
     expect(result.ok).toBe(true);
     expect(scheduleWindowsUpgrade).toHaveBeenCalledOnce();
-    expect(removeCalls).toBe(8);
-    expect(operations.delete).toBe(8);
+    expect(removeCalls).toBe(32);
+    expect(operations.delete).toBe(32);
     expect(operations.enumerate).toBeLessThanOrEqual(128);
-    expect(operations.lstat).toBeLessThanOrEqual(64);
-    expect(operations.marker_read).toBeLessThanOrEqual(32);
-    expect(diagnostics).toHaveLength(8);
-    expect(diagnostics).toEqual(Array.from({ length: 8 }, () => expect.objectContaining({
+    expect(operations.lstat).toBeLessThanOrEqual(128);
+    expect(operations.marker_read).toBeLessThanOrEqual(64);
+    expect(diagnostics.filter((diagnostic) => diagnostic.outcome === 'failed')).toEqual(Array.from({ length: 32 }, () => expect.objectContaining({
       outcome: 'failed',
       code: 'ENOSPC',
     })));
+    expect(diagnostics).toContainEqual(expect.objectContaining({ outcome: 'skipped', code: 'budget_exhausted' }));
     expect(JSON.stringify(diagnostics)).not.toContain('unbounded private filesystem detail');
     expect(JSON.stringify(diagnostics)).not.toContain(root);
-    expect(await readdir(root)).toHaveLength(13);
+    expect(await readdir(root)).toHaveLength(41);
   });
 
   it.each([
@@ -924,6 +979,7 @@ describe('controlled-node self-upgrade', () => {
     let livenessChecks = 0;
     const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
       now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
       isProcessAlive: () => {
         livenessChecks += 1;
         return mutation === 'revived owner' && livenessChecks > 1;

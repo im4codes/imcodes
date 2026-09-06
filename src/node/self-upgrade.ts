@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, chmod, lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, uptime } from 'node:os';
 import { basename, dirname, join, resolve, win32 as pathWin32 } from 'node:path';
 import {
   CONTROLLED_NODE_ARCH_X64,
@@ -55,10 +55,11 @@ export const CONTROLLED_NODE_UPGRADE_DIR_PREFIX = 'imcodes-node-upgrade-';
 export const CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER = '.imcodes-controlled-node-upgrade.json';
 export const CONTROLLED_NODE_UPGRADE_PROGRESS_FILE = '.imcodes-controlled-node-upgrade.progress.jsonl';
 export const CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+export const CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE = 128;
-const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 64;
-const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 32;
-const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 8;
+const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 128;
+const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 64;
+const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 32;
 const CONTROLLED_NODE_ARTIFACT_IO_BUFFER_BYTES = 64 * 1024;
 const CONTROLLED_NODE_UPGRADE_PRODUCT = 'imcodes-controlled-node-upgrade';
 const CONTROLLED_NODE_UPGRADE_DIR_PATTERN = /^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$/;
@@ -68,7 +69,7 @@ const activeControlledNodeUpgradeDirs = new Set<string>();
 export interface ControlledNodeUpgradeCleanupDiagnostic {
   event: 'controlled_node_upgrade_cleanup';
   phase: 'pre_handoff' | 'stale_scavenge';
-  outcome: 'removed' | 'failed';
+  outcome: 'removed' | 'failed' | 'skipped';
   code: string;
 }
 
@@ -87,6 +88,7 @@ export interface ControlledNodeSelfUpgradeDeps {
   arch?: NodeJS.Architecture;
   tmpdir?: () => string;
   now?: () => number;
+  uptime?: () => number;
   journalPath?: string;
   writeUpgradeFile?: typeof writeFile;
   removeUpgradeDir?: (path: string) => Promise<void>;
@@ -202,6 +204,7 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
   tempRoot: string,
   deps: Pick<ControlledNodeSelfUpgradeDeps,
     | 'now'
+    | 'uptime'
     | 'removeUpgradeDir'
     | 'isProcessAlive'
     | 'onCleanupDiagnostic'
@@ -210,24 +213,56 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
 ): Promise<number> {
   const now = deps.now?.() ?? Date.now();
   const cutoff = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS;
+  const absoluteCutoff = now - CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS;
+  let bootedAt: number | null = null;
+  try {
+    const uptimeSeconds = deps.uptime?.() ?? uptime();
+    if (Number.isFinite(uptimeSeconds) && uptimeSeconds >= 0) bootedAt = now - (uptimeSeconds * 1_000);
+  } catch {
+    // Missing boot-time evidence must not weaken the normal liveness guard.
+  }
   const canonicalRoot = resolve(tempRoot);
   let removed = 0;
   let deleteAttempts = 0;
   let enumerated = 0;
   let lstatOperations = 0;
   let markerReads = 0;
+  let budgetDiagnosticEmitted = false;
   const isProcessAlive = deps.isProcessAlive ?? defaultIsProcessAlive;
+  const emitSkipped = (code: 'pid_alive' | 'marker_missing' | 'budget_exhausted'): void => {
+    emitCleanupDiagnostic({
+      event: 'controlled_node_upgrade_cleanup',
+      phase: 'stale_scavenge',
+      outcome: 'skipped',
+      code,
+    }, deps);
+  };
+  const emitBudgetExhausted = (): void => {
+    if (budgetDiagnosticEmitted) return;
+    budgetDiagnosticEmitted = true;
+    emitSkipped('budget_exhausted');
+  };
+  const markerOutlivedOwner = (marker: ControlledNodeUpgradeOwnershipMarker): boolean => (
+    marker.createdAt <= absoluteCutoff
+    || (bootedAt !== null && marker.createdAt < bootedAt)
+  );
   const recordOperation = (operation: 'enumerate' | 'lstat' | 'marker_read' | 'delete'): void => {
     try { deps.onStaleScavengeOperation?.(operation); } catch { /* test/telemetry seam is non-authoritative */ }
   };
   const boundedLstat = async (path: string) => {
-    if (lstatOperations >= CONTROLLED_NODE_UPGRADE_MAX_LSTAT) return null;
+    if (lstatOperations >= CONTROLLED_NODE_UPGRADE_MAX_LSTAT) {
+      emitBudgetExhausted();
+      return null;
+    }
     lstatOperations += 1;
     recordOperation('lstat');
     return lstat(path);
   };
   const boundedMarkerRead = async (path: string): Promise<string | null> => {
-    if (markerReads >= CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ) return null;
+    if (markerReads >= CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ) {
+      emitBudgetExhausted();
+      return null;
+    }
     markerReads += 1;
     recordOperation('marker_read');
     return readFile(path, 'utf8');
@@ -243,7 +278,10 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
     const directory = await opendir(canonicalRoot);
     for await (const entry of directory) {
       if (enumerated >= CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE
-        || deleteAttempts >= CONTROLLED_NODE_UPGRADE_MAX_DELETE) break;
+        || deleteAttempts >= CONTROLLED_NODE_UPGRADE_MAX_DELETE) {
+        emitBudgetExhausted();
+        break;
+      }
       enumerated += 1;
       recordOperation('enumerate');
       if (!CONTROLLED_NODE_UPGRADE_DIR_PATTERN.test(entry.name)) continue;
@@ -258,15 +296,26 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
           || directoryStat.mtimeMs > cutoff) continue;
         const markerPath = resolve(candidate, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
         if (dirname(markerPath) !== candidate) continue;
-        const markerStat = await boundedLstat(markerPath);
+        let markerStat: Awaited<ReturnType<typeof lstat>> | null;
+        try {
+          markerStat = await boundedLstat(markerPath);
+        } catch (error) {
+          if (cleanupErrorCode(error) === 'ENOENT') emitSkipped('marker_missing');
+          continue;
+        }
         if (!markerStat || !markerStat.isFile() || markerStat.isSymbolicLink() || markerStat.mtimeMs > cutoff) continue;
         const markerText = await boundedMarkerRead(markerPath);
         if (markerText === null) continue;
         const marker = parseUpgradeOwnershipMarker(markerText);
         if (!marker || marker.directoryName !== entry.name || marker.createdAt > cutoff) continue;
-        let alive = true;
-        try { alive = isProcessAlive(marker.pid); } catch { alive = true; }
-        if (alive) continue;
+        if (!markerOutlivedOwner(marker)) {
+          let alive = true;
+          try { alive = isProcessAlive(marker.pid); } catch { alive = true; }
+          if (alive) {
+            emitSkipped('pid_alive');
+            continue;
+          }
+        }
 
         await deps.beforeStaleCandidateRevalidation?.(candidate);
 
@@ -283,7 +332,13 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
           || !currentDirectoryStat.isDirectory() || currentDirectoryStat.isSymbolicLink()
           || !sameIdentity(directoryStat, currentDirectoryStat)
           || currentDirectoryStat.mtimeMs > cutoff) continue;
-        const currentMarkerStat = await boundedLstat(markerPath);
+        let currentMarkerStat: Awaited<ReturnType<typeof lstat>> | null;
+        try {
+          currentMarkerStat = await boundedLstat(markerPath);
+        } catch (error) {
+          if (cleanupErrorCode(error) === 'ENOENT') emitSkipped('marker_missing');
+          continue;
+        }
         if (!currentMarkerStat
           || !currentMarkerStat.isFile() || currentMarkerStat.isSymbolicLink()
           || !sameIdentity(markerStat, currentMarkerStat)
@@ -295,8 +350,15 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
           || currentMarker.ownerToken !== marker.ownerToken
           || currentMarker.directoryName !== entry.name
           || currentMarker.createdAt > cutoff) continue;
-        try { alive = isProcessAlive(currentMarker.pid); } catch { alive = true; }
-        if (alive || activeControlledNodeUpgradeDirs.has(candidate)) continue;
+        if (!markerOutlivedOwner(currentMarker)) {
+          let alive = true;
+          try { alive = isProcessAlive(currentMarker.pid); } catch { alive = true; }
+          if (alive) {
+            emitSkipped('pid_alive');
+            continue;
+          }
+        }
+        if (activeControlledNodeUpgradeDirs.has(candidate)) continue;
         // Consume the budget before calling an authority-external remover.
         // Failed/throwing attempts count just like successful removals, so a
         // full or hostile filesystem cannot turn fail-open cleanup into an
