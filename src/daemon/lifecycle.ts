@@ -1314,6 +1314,12 @@ export async function startup(): Promise<DaemonContext> {
         serverLink.send({ type: 'session.tool', session: payload.session, tool: null });
       }
     } catch { /* not connected */ }
+  }, {
+    // Memory MCP children receive this same daemon-owned ServerLink id in
+    // their sanitized environment. Supplying it independently here lets the
+    // hook accept legacy daemon-local namespaces without trusting a
+    // child-provided server id or waiting for capability authority hydration.
+    memoryMcpServerId: serverId || undefined,
   });
   hookServer = hookResult.server;
   // Rewrite all CC hook scripts with the actual port (may differ from last run)

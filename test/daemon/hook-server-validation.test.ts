@@ -229,6 +229,39 @@ describe('Hook server — session validation', () => {
     }), 'search_memory', { query: 'worker sharing' });
   });
 
+  it('accepts a legacy daemon-local namespace only for the daemon-bound server', async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const invokeMemoryMcpTool = vi.fn(async () => ({ status: 'ok', items: [] }));
+    const restarted = await startHookServer(hookCallback, {
+      invokeMemoryMcpTool,
+      memoryMcpServerId: 'server-1',
+    });
+    server = restarted.server;
+    port = restarted.port;
+    expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
+    getSessionMock.mockReturnValue({
+      name: 'deck_current_brain', state: 'idle', agentType: 'codex-sdk', providerId: 'codex-sdk',
+      projectName: 'current', projectDir: '/tmp/current',
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+
+    await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1', serverId: 'server-1',
+      tool: 'search_memory', input: { query: 'legacy worker sharing' },
+    })).resolves.toMatchObject({ status: 200 });
+    expect(invokeMemoryMcpTool).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'daemon-local',
+      namespace: { scope: 'personal', userId: 'daemon-local', projectId: 'repo-1' },
+      serverId: 'server-1',
+    }), 'search_memory', { query: 'legacy worker sharing' });
+
+    await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1', serverId: 'server-other',
+      tool: 'search_memory', input: {},
+    })).resolves.toMatchObject({ status: 403 });
+  });
+
   it('rejects stale or non-memory daemon worker requests before dispatch', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_current_brain', state: 'idle', agentType: 'codex-sdk',

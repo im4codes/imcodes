@@ -635,6 +635,8 @@ export interface HookServerOptions {
     tool: MemoryMcpDaemonToolName,
     input?: unknown,
   ) => Promise<Record<string, unknown>>;
+  /** Exact ServerLink identity injected by the daemon, never by the MCP child. */
+  memoryMcpServerId?: string;
 }
 
 async function invokeDaemonMemoryMcpTool(
@@ -687,11 +689,24 @@ export async function startHookServer(
         const authenticatedOwner = requestedServerId
           ? getAuthenticatedCapabilityOwner(requestedServerId)
           : undefined;
-        const storedNamespace = session.contextNamespace && validCapabilityNamespace(session.contextNamespace)
+        const daemonServerId = options.memoryMcpServerId?.trim() ?? '';
+        // Normalize the legacy implicit owner before validation. Validating
+        // first rejects persisted personal namespaces that intentionally omit
+        // userId, then silently falls back to a different user_private
+        // namespace and makes every existing project memory row disappear.
+        const normalizedStoredNamespace = session.contextNamespace
           ? normalizeDaemonLocalMemoryNamespace(session.contextNamespace)
+          : null;
+        const storedNamespace = validCapabilityNamespace(normalizedStoredNamespace)
+          ? normalizedStoredNamespace
           : { scope: 'user_private' as const, userId: LEGACY_DAEMON_LOCAL_USER_ID };
         const storedUserId = storedNamespace.userId?.trim() || LEGACY_DAEMON_LOCAL_USER_ID;
-        if (requestedServerId && authenticatedOwner !== storedUserId) {
+        const isDaemonBoundLegacyNamespace = storedUserId === LEGACY_DAEMON_LOCAL_USER_ID
+          && Boolean(daemonServerId)
+          && requestedServerId === daemonServerId;
+        if (requestedServerId
+          && authenticatedOwner !== storedUserId
+          && !isDaemonBoundLegacyNamespace) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_server_identity_unavailable' }));
           return;
