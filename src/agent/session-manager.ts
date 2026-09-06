@@ -3020,10 +3020,14 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const provider = await ensureProviderConnected(agentType, {});
 
   const launchRecord = getSession(name);
+  const launchRecipient = recipientFromSessionRecord(launchRecord) ?? {
+    sessionInstanceId: resourceSessionInstanceId,
+    runtimeEpoch: resourceRuntimeEpoch,
+  };
   const runtime = new TransportSessionRuntime(
     provider,
     name,
-    recipientFromSessionRecord(launchRecord),
+    launchRecipient,
     launchRecord ? { sessionCreatedAt: launchRecord.createdAt } : undefined,
   );
   wireTransportCallbacks(runtime, name);
@@ -3334,6 +3338,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
           : {}),
       });
+      const launchGapEntries = getResendEntries(name);
+      if (launchGapEntries.length > 0 && launchGapEntries.every((entry) => !entry.recipient)) {
+        const clientMessageIds = launchGapEntries.map((entry) => entry.clientMessageId?.trim() ?? '');
+        if (!getTransportQueueStore().bindFreshLaunchRecipient(name, launchRecipient, clientMessageIds)) {
+          throw new Error('transport queue fresh-launch recipient binding rejected');
+        }
+      }
       // Repair legacy NULL recipients and same-instance mixed epochs against
       // the CURRENT persisted SessionRecord before upsert is allowed to rotate
       // runtimeEpoch. Doing this after upsert is too late: the ordinary epoch

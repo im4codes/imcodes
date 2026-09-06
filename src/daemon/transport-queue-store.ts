@@ -691,10 +691,14 @@ export class TransportQueueStore {
     parsed.text = text;
     if (replacement?.providerText != null) parsed.providerText = replacement.providerText;
     if (replacement?.aliasAudit) parsed.aliasAudit = replacement.aliasAudit;
+    // This row was selected above, so update it in place. SQLite REPLACE is a
+    // delete+insert and would reset its recipient columns to NULL, splitting an
+    // otherwise owner-bound queue and making the fail-closed projection hide
+    // every pending entry after an edit.
     this.db.prepare(`
-      INSERT OR REPLACE INTO queue_private_material (session_name, client_message_id, material_json, updated_at)
-      VALUES (?, ?, ?, ?)
-    `).run(sessionName, clientMessageId, JSON.stringify(parsed), now);
+      UPDATE queue_private_material SET material_json = ?, updated_at = ?
+      WHERE session_name = ? AND client_message_id = ?
+    `).run(JSON.stringify(parsed), now, sessionName, clientMessageId);
   }
 
   markHandoffInFlight(
@@ -1410,6 +1414,96 @@ export class TransportQueueStore {
         migrated,
         ...(purged > 0 ? { purged } : {}),
       };
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Bind messages queued in this daemon before a brand-new SessionRecord was
+   * persisted. The in-memory resend ids are the launch-gap ownership proof:
+   * every durable live row must be legacy and match that exact set. Any
+   * foreign/partial row, tombstone, or unmatched durable id fails closed.
+   */
+  bindFreshLaunchRecipient(
+    sessionNameInput: string,
+    recipientInput: QueueRecipientIdentity,
+    expectedClientMessageIds: readonly string[],
+    now = Date.now(),
+  ): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const recipient = normalizeQueueRecipient(recipientInput);
+    const expected = [...new Set(expectedClientMessageIds.map((id) => id.trim()).filter(Boolean))].sort();
+    if (!recipient || expected.length === 0 || expected.length !== expectedClientMessageIds.length) return false;
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const meta = this.db.prepare(`
+        SELECT recipient_session_instance_id AS sessionInstanceId,
+          recipient_runtime_epoch AS runtimeEpoch
+        FROM queue_meta WHERE session_name = ?
+      `).get(sessionName) as { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | undefined;
+      const metaIsLegacy = meta?.sessionInstanceId == null && meta?.runtimeEpoch == null;
+      const metaIsCaller = meta?.sessionInstanceId === recipient.sessionInstanceId
+        && meta?.runtimeEpoch === recipient.runtimeEpoch;
+      // A provider-ready drain may have already bound legacy queue_meta via
+      // ensureMeta before its row-level lease correctly failed closed. That
+      // partially-bound shape is safe only when the exact rows below remain
+      // legacy and match the caller's in-memory launch-gap set.
+      if (!meta || (!metaIsLegacy && !metaIsCaller)) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+
+      const rows = this.db.prepare(`
+        SELECT client_message_id AS clientMessageId,
+          recipient_session_instance_id AS sessionInstanceId,
+          recipient_runtime_epoch AS runtimeEpoch
+        FROM queue_entries WHERE session_name = ? ORDER BY client_message_id
+      `).all(sessionName) as Array<{ clientMessageId: string; sessionInstanceId?: string | null; runtimeEpoch?: string | null }>;
+      if (rows.length !== expected.length
+        || rows.some((row, index) => row.clientMessageId !== expected[index]
+          || row.sessionInstanceId != null || row.runtimeEpoch != null)) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+
+      for (const table of ['queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones']) {
+        const invalid = this.db.prepare(`
+          SELECT 1 FROM ${table}
+          WHERE session_name = ? AND (
+            client_message_id NOT IN (${expected.map(() => '?').join(', ')})
+            OR recipient_session_instance_id IS NOT NULL
+            OR recipient_runtime_epoch IS NOT NULL
+          ) LIMIT 1
+        `).get(sessionName, ...expected);
+        if (invalid || (table !== 'queue_private_material' && this.db.prepare(
+          `SELECT 1 FROM ${table} WHERE session_name = ? LIMIT 1`,
+        ).get(sessionName))) {
+          this.db.exec('ROLLBACK');
+          return false;
+        }
+      }
+
+      for (const table of ['queue_entries', 'queue_private_material']) {
+        this.db.prepare(`
+          UPDATE ${table}
+          SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?
+          WHERE session_name = ?
+            AND recipient_session_instance_id IS NULL
+            AND recipient_runtime_epoch IS NULL
+        `).run(recipient.sessionInstanceId, recipient.runtimeEpoch, sessionName);
+      }
+      this.db.prepare(`
+        UPDATE queue_meta
+        SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?, updated_at = ?
+        WHERE session_name = ?
+          AND recipient_session_instance_id IS NULL
+          AND recipient_runtime_epoch IS NULL
+      `).run(recipient.sessionInstanceId, recipient.runtimeEpoch, now, sessionName);
+      this.db.exec('COMMIT');
+      return true;
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;

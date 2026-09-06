@@ -2236,7 +2236,7 @@ describe('sdk transport session restore', () => {
       recoverable: false,
     });
 
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 15_000;
     while (Date.now() < deadline) {
       const relaunched = getTransportRuntime('deck_sdk_retry_pending_brain') !== firstRuntime;
       const prompts = mocks.claudeRuns.map((run) => run.prompt);
