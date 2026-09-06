@@ -426,6 +426,24 @@ export function createServerWebSocketServer(): WebSocketServer {
   });
 }
 
+/**
+ * Per-IP ceiling for daemon WebSocket upgrades, in the same 10s window as the
+ * per-daemon budget. Deliberately far above a real fleet's steady state: a
+ * daemon at its 5s reconnect ceiling costs 2 attempts per 10s, so this leaves
+ * room for ~50 co-located daemons before the ceiling is the binding constraint.
+ * It exists to bound abuse from one source, not to pace legitimate reconnects.
+ */
+const DAEMON_CONNECT_PER_IP_CEILING = 100;
+
+/**
+ * `Retry-After` is included because the client cannot otherwise distinguish a
+ * rate-limit refusal from a network fault: both surface as a non-101 upgrade
+ * failure, and the daemon then retries on its short reconnect backoff, which is
+ * what kept the budget exhausted.
+ */
+const DAEMON_CONNECT_RATE_LIMIT_RESPONSE =
+  'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 10\r\nContent-Length: 0\r\n\r\n';
+
 export function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
   const wss = createServerWebSocketServer();
   // Compile trust function once — same proxy-addr library used by HTTP middleware
@@ -505,10 +523,31 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
     }
 
     if (!hasBrowserTicket) {
-      // Daemon connection — per-IP rate limit + global cap
+      // Daemon connection — per-DAEMON rate limit, then a per-IP abuse ceiling.
+      //
+      // This budget used to be keyed on the client IP alone, which made it one
+      // shared bucket for every daemon behind the same address. Two things then
+      // compounded: `TRUSTED_PROXIES` is empty in production, so `proxyAddr`
+      // returns the reverse proxy's own address and EVERY daemon collapsed onto
+      // a single key; and a node whose token had been revoked retried roughly
+      // twice a second forever. One such node consumed ~17 attempts per 10s
+      // against a 5-per-10s budget and every other daemon was answered 429 —
+      // a non-101 status, which their WebSocket client reports as close 1002.
+      // A single machine could therefore take the entire fleet offline.
+      //
+      // `serverId` comes from the URL and is unauthenticated at this point,
+      // which is exactly why the per-IP ceiling below is kept: identity is not
+      // trusted yet, so isolation is keyed on the claimed id while abuse from
+      // one source is still bounded. The ceiling is set far above what any
+      // legitimate fleet reaches, so it never schedules normal reconnects.
       const ip = proxyAddr(req as never, wsTrust);
-      if (!daemonConnectLimiter.check(`daemon:${ip}`, 5, 10_000)) {
-        socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+      if (!daemonConnectLimiter.check(`daemon:${serverId}`, 5, 10_000)) {
+        socket.write(DAEMON_CONNECT_RATE_LIMIT_RESPONSE);
+        socket.destroy();
+        return;
+      }
+      if (!daemonConnectLimiter.check(`daemon-ip:${ip}`, DAEMON_CONNECT_PER_IP_CEILING, 10_000)) {
+        socket.write(DAEMON_CONNECT_RATE_LIMIT_RESPONSE);
         socket.destroy();
         return;
       }
