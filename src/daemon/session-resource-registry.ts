@@ -18,6 +18,7 @@ const FIELD_LIMIT = 512;
 const PODMAN_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const REGISTRY_LOCK_FILE = '.registry.lock';
 const REGISTRY_LOCK_WAIT_MS = 30_000;
+const TMUX_IDENTITY_QUERY_TIMEOUT_MS = 2_000;
 
 export type SessionResourceOwner = SessionResourceOwnerIdentity;
 
@@ -50,6 +51,12 @@ export interface SessionResourceRegistryOptions {
   directory?: string;
   now?: () => number;
   cleanup?: SessionResourceCleanup;
+  resolveTmuxIdentity?: (name: string) => Promise<{
+    paneId: string;
+    sessionInstanceId: string;
+    runtimeEpoch: string;
+  } | undefined>;
+  tmuxIdentityTimeoutMs?: number;
 }
 
 export interface ReleaseSummary {
@@ -131,6 +138,19 @@ async function readProcessStart(pid: number): Promise<string | undefined> {
     const { stdout } = await execFile('ps', ['-o', 'lstart=', '-p', String(pid)], { timeout: 2_000 });
     const value = stdout.trim();
     return value || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveLiveTmuxIdentity(name: string): Promise<{
+  paneId: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+} | undefined> {
+  try {
+    const { getTmuxSessionResourceIdentity } = await import('../agent/tmux.js');
+    return await getTmuxSessionResourceIdentity(name, TMUX_IDENTITY_QUERY_TIMEOUT_MS);
   } catch {
     return undefined;
   }
@@ -234,6 +254,8 @@ export class SessionResourceRegistry {
   readonly directory: string;
   private readonly now: () => number;
   private readonly cleanup: SessionResourceCleanup;
+  private readonly resolveTmuxIdentity: NonNullable<SessionResourceRegistryOptions['resolveTmuxIdentity']>;
+  private readonly tmuxIdentityTimeoutMs: number;
   private readonly requiresStrongHandles: boolean;
   private mutationTail: Promise<void> = Promise.resolve();
 
@@ -244,6 +266,8 @@ export class SessionResourceRegistry {
     );
     this.now = options.now ?? Date.now;
     this.cleanup = options.cleanup ?? cleanupSessionResource;
+    this.resolveTmuxIdentity = options.resolveTmuxIdentity ?? resolveLiveTmuxIdentity;
+    this.tmuxIdentityTimeoutMs = options.tmuxIdentityTimeoutMs ?? TMUX_IDENTITY_QUERY_TIMEOUT_MS;
     this.requiresStrongHandles = options.cleanup === undefined;
   }
 
@@ -355,6 +379,7 @@ export class SessionResourceRegistry {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT' && error instanceof SyntaxError === false) throw error;
       }
+      let replacesStaleTmuxOwner = false;
       if (previous && ownerKey(previous.owner) !== ownerKey(registration.owner)) {
         const sameLogicalTmuxOwner = previous.kind === SESSION_RESOURCE_KIND.TMUX
           && registration.kind === SESSION_RESOURCE_KIND.TMUX
@@ -364,7 +389,33 @@ export class SessionResourceRegistry {
           && previous.owner.sessionInstanceId === registration.owner.sessionInstanceId
           && previous.handle.name === registration.handle.name
           && previous.handle.paneId === registration.handle.paneId;
-        if (!sameLogicalTmuxOwner) throw new Error('session_resource_owner_conflict');
+        if (!sameLogicalTmuxOwner
+          && previous.kind === SESSION_RESOURCE_KIND.TMUX
+          && registration.kind === SESSION_RESOURCE_KIND.TMUX
+          && previous.handle.type === SESSION_RESOURCE_HANDLE_TYPE.TMUX
+          && registration.handle.type === SESSION_RESOURCE_HANDLE_TYPE.TMUX
+          && previous.resourceId === registration.resourceId
+          && registration.resourceId === `${SESSION_RESOURCE_KIND.TMUX}:${registration.handle.name}`
+          && previous.owner.sessionName === previous.handle.name
+          && registration.owner.sessionName === registration.handle.name
+          && previous.handle.name === registration.handle.name) {
+          let timeout: number | undefined;
+          const liveIdentity = await Promise.race([
+            this.resolveTmuxIdentity(registration.handle.name).catch(() => undefined),
+            new Promise<undefined>((resolve) => {
+              timeout = globalThis.setTimeout(resolve, this.tmuxIdentityTimeoutMs);
+            }),
+          ]).finally(() => {
+            if (timeout) globalThis.clearTimeout(timeout);
+          });
+          replacesStaleTmuxOwner = Boolean(liveIdentity
+            && liveIdentity.paneId === registration.handle.paneId
+            && liveIdentity.sessionInstanceId === registration.owner.sessionInstanceId
+            && liveIdentity.runtimeEpoch === registration.owner.runtimeEpoch);
+        }
+        if (!sameLogicalTmuxOwner && !replacesStaleTmuxOwner) {
+          throw new Error('session_resource_owner_conflict');
+        }
       }
       const now = this.now();
       let handle = registration.handle;
@@ -385,7 +436,7 @@ export class SessionResourceRegistry {
         ...registration,
         handle,
         version: RECORD_VERSION,
-        createdAt: previous?.createdAt ?? now,
+        createdAt: previous && !replacesStaleTmuxOwner ? previous.createdAt : now,
         lastUsedAt: now,
       };
       const temporary = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;

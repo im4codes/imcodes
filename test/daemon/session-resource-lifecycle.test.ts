@@ -75,6 +75,89 @@ describe('session resource lifecycle', () => {
     })).rejects.toThrow('session_resource_owner_conflict');
   });
 
+  it('replaces a crash-left tmux owner only when live pane and owner identity prove the new authority', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
+    roots.push(directory);
+    const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
+    let liveIdentity = { paneId: '%1', sessionInstanceId: 'old-instance', runtimeEpoch: 'epoch-a' };
+    const registry = new SessionResourceRegistry({
+      directory,
+      now: () => 1_000,
+      cleanup,
+      resolveTmuxIdentity: async () => liveIdentity,
+    });
+    const prior = owner('old-instance');
+    const successor = { ...owner('new-instance'), runtimeEpoch: 'epoch-b' };
+    await registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: prior,
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%1' },
+    });
+
+    liveIdentity = { paneId: '%2', sessionInstanceId: 'new-instance', runtimeEpoch: 'epoch-b' };
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: successor,
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%2' },
+    })).resolves.toMatchObject({ owner: successor, handle: { paneId: '%2' } });
+    expect(await registry.list()).toEqual([
+      expect.objectContaining({ resourceId: 'tmux:deck_alpha_w1', owner: successor, handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%2' } }),
+    ]);
+    liveIdentity = { paneId: '%2', sessionInstanceId: 'foreign-instance', runtimeEpoch: 'epoch-a' };
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: owner('foreign-instance'),
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%3' },
+    })).rejects.toThrow('session_resource_owner_conflict');
+    expect((await registry.list())[0]).toMatchObject({ owner: successor, handle: { paneId: '%2' } });
+    expect(cleanup).not.toHaveBeenCalled();
+  });
+
+  it('accepts a recycled tmux pane id only when the live owner tuple matches the successor', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
+    roots.push(directory);
+    const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
+    let liveIdentity = { paneId: '%0', sessionInstanceId: 'old-instance', runtimeEpoch: 'epoch-a' };
+    const registry = new SessionResourceRegistry({
+      directory,
+      cleanup,
+      resolveTmuxIdentity: async () => liveIdentity,
+    });
+    await registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: owner('old-instance'),
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%0' },
+    });
+    const successor = { ...owner('new-instance'), runtimeEpoch: 'epoch-b' };
+
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: successor,
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%0' },
+    })).rejects.toThrow('session_resource_owner_conflict');
+    liveIdentity = { paneId: '%0', sessionInstanceId: 'new-instance', runtimeEpoch: 'epoch-b' };
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: successor,
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%0' },
+    })).resolves.toMatchObject({ owner: successor });
+  });
+
+  it('fails closed and releases the registry lock when live tmux identity lookup is unavailable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
+    roots.push(directory);
+    const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
+    const registry = new SessionResourceRegistry({
+      directory,
+      cleanup,
+      tmuxIdentityTimeoutMs: 5,
+      resolveTmuxIdentity: async () => new Promise(() => {}),
+    });
+    await registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: owner('old-instance'),
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%1' },
+    });
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: owner('new-instance'),
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%2' },
+    })).rejects.toThrow('session_resource_owner_conflict');
+    await expect(registry.list()).resolves.toHaveLength(1);
+  });
+
   it('releases only child resources during an in-place tmux respawn', async () => {
     const { registry, cleanup } = await fixture();
     await registry.register({ resourceId: 'mcp:old', kind: 'mcp', owner: owner(), handle: { type: 'pid', pid: 601 } });
