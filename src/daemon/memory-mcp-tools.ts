@@ -1607,7 +1607,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const existing = registry.getAssignment(mapped.assignmentId);
       if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: not_found');
       if (existing.status === 'cancelled' && existing.role !== 'auditor' && existing.role !== 'coordinator') {
-        const inspected = inspectSupervisionAssignmentWorktree({
+        const inspected = await inspectSupervisionAssignmentWorktree({
           sessionName: existing.identity.sessionName,
           assignmentId: existing.assignmentId,
         });

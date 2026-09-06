@@ -28,9 +28,9 @@ function fixture() {
 }
 
 describe('authoritative supervision worktree inspection', () => {
-  it('accepts an exact clean zero-source worktree without metadata paths', () => {
+  it('accepts an exact clean zero-source worktree without metadata paths', async () => {
     const shape = fixture();
-    expect(inspectSupervisionAssignmentWorktree({
+    expect(await inspectSupervisionAssignmentWorktree({
       sessionName: 'deck_worker', assignmentId: 'assignment_one',
       env: { IMCODES_WORKTREES_ROOT: shape.root, IMCODES_PROJECT_WORKTREE_NAMESPACE: 'imcodes' },
     })).toMatchObject({
@@ -39,7 +39,7 @@ describe('authoritative supervision worktree inspection', () => {
     });
   });
 
-  it('derives tracked and untracked exact paths and hashes from bytes, never registry metadata', () => {
+  it('derives tracked and untracked exact paths and hashes from bytes, never registry metadata', async () => {
     const shape = fixture();
     writeFileSync(join(shape.repo, 'base.txt'), 'changed\n');
     writeFileSync(join(shape.repo, 'new.txt'), 'new\n');
@@ -47,7 +47,7 @@ describe('authoritative supervision worktree inspection', () => {
       { path: 'base.txt', sha256: createHash('sha256').update('changed\n').digest('hex') },
       { path: 'new.txt', sha256: createHash('sha256').update('new\n').digest('hex') },
     ];
-    const result = inspectSupervisionAssignmentWorktree({
+    const result = await inspectSupervisionAssignmentWorktree({
       sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
     });
     expect(result).toMatchObject({
@@ -59,7 +59,7 @@ describe('authoritative supervision worktree inspection', () => {
     });
   });
 
-  it('omits an untracked dependency symlink without following it or hiding real source changes', () => {
+  it('omits an untracked dependency symlink without following it or hiding real source changes', async () => {
     const shape = fixture();
     const sharedCache = join(shape.root, 'shared-cache');
     mkdirSync(sharedCache);
@@ -71,7 +71,7 @@ describe('authoritative supervision worktree inspection', () => {
       cwd: shape.repo, encoding: 'utf8',
     }).split('\n')).toContain('node_modules');
 
-    expect(inspectSupervisionAssignmentWorktree({
+    expect(await inspectSupervisionAssignmentWorktree({
       sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
     })).toMatchObject({
       ok: true,
@@ -85,13 +85,13 @@ describe('authoritative supervision worktree inspection', () => {
     });
   });
 
-  it('ignores stale evidence metadata and binds current worktree bytes without mutation', () => {
+  it('ignores stale evidence metadata and binds current worktree bytes without mutation', async () => {
     const shape = fixture();
     const evidence = join(shape.assignmentRoot, 'evidence', 'candidate-manifest.sha256');
     writeFileSync(evidence, `${'0'.repeat(64)}  base.txt\n`);
     const evidenceBefore = readFileSync(evidence);
     writeFileSync(join(shape.repo, 'base.txt'), 'changed after freeze\n');
-    expect(inspectSupervisionAssignmentWorktree({
+    expect(await inspectSupervisionAssignmentWorktree({
       sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
     })).toMatchObject({
       ok: true,
@@ -104,24 +104,24 @@ describe('authoritative supervision worktree inspection', () => {
     expect(readFileSync(evidence)).toEqual(evidenceBefore);
   });
 
-  it('computes deletion markers directly from the current worktree', () => {
+  it('computes deletion markers directly from the current worktree', async () => {
     const shape = fixture();
     rmSync(join(shape.repo, 'base.txt'));
-    expect(inspectSupervisionAssignmentWorktree({
+    expect(await inspectSupervisionAssignmentWorktree({
       sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
     })).toMatchObject({ ok: true, snapshot: { files: [{ path: 'base.txt', deleted: true }] } });
   });
 
-  it('reports staged state for the registry gate', () => {
+  it('reports staged state for the registry gate', async () => {
     const shape = fixture();
     writeFileSync(join(shape.repo, 'base.txt'), 'staged\n');
     execFileSync('git', ['add', 'base.txt'], { cwd: shape.repo });
-    expect(inspectSupervisionAssignmentWorktree({
+    expect(await inspectSupervisionAssignmentWorktree({
       sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
     })).toMatchObject({ ok: true, snapshot: { stagedPaths: ['base.txt'] } });
   });
 
-  it('continues to report conflicted paths for the registry gate', () => {
+  it('continues to report conflicted paths for the registry gate', async () => {
     const shape = fixture();
     const mainBranch = execFileSync('git', ['branch', '--show-current'], {
       cwd: shape.repo, encoding: 'utf8',
@@ -134,7 +134,7 @@ describe('authoritative supervision worktree inspection', () => {
     execFileSync('git', ['commit', '-qam', 'main'], { cwd: shape.repo });
     expect(spawnSync('git', ['merge', 'conflict-side'], { cwd: shape.repo }).status).not.toBe(0);
 
-    expect(inspectSupervisionAssignmentWorktree({
+    expect(await inspectSupervisionAssignmentWorktree({
       sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
     })).toMatchObject({ ok: true, snapshot: { conflictedPaths: ['base.txt'] } });
   });

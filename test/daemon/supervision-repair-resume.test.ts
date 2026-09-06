@@ -69,13 +69,13 @@ function auditorStuckAfterFinalReceipt(r: SupervisionTaskRegistry) {
 }
 
 describe('daemon repair->resume: non-verdict stalls must not gate the business', () => {
-  it('terminalizes an auditor that already filed its final receipt and releases its lease', () => {
+  it('terminalizes an auditor that already filed its final receipt and releases its lease', async () => {
     const r = registry();
     const { taskId, auditor } = auditorStuckAfterFinalReceipt(r);
     const before = r.getAssignment(auditor.assignmentId)!;
     expect(before.status).toBe('auditing');
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     const after = r.getAssignment(auditor.assignmentId)!;
     expect(after.assignmentId).toBe(auditor.assignmentId); // same object, no replacement
@@ -89,19 +89,19 @@ describe('daemon repair->resume: non-verdict stalls must not gate the business',
     expect(r.listAssignments(taskId).filter((a) => a.role === 'auditor')).toHaveLength(1);
   });
 
-  it('is idempotent across repeated ticks and a restart', () => {
+  it('is idempotent across repeated ticks and a restart', async () => {
     const r = registry();
     const { auditor } = auditorStuckAfterFinalReceipt(r);
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
     const first = r.getAssignment(auditor.assignmentId)!;
-    r.convergeLifecycle(Date.now() + 1000);
-    r.convergeLifecycle(Date.now() + 2000);
+    await r.convergeLifecycle(Date.now() + 1000);
+    await r.convergeLifecycle(Date.now() + 2000);
     const last = r.getAssignment(auditor.assignmentId)!;
     expect(last.status).toBe(first.status);
     expect(last.updatedAt).toBe(first.updatedAt); // no churn once converged
   });
 
-  it('never invents a verdict for an auditor that filed no receipt', () => {
+  it('never invents a verdict for an auditor that filed no receipt', async () => {
     // Independent task fixture: a task may hold only one auditor, so the
     // receiptless case must be its own aggregate rather than a second auditor
     // smuggled onto the recorded-receipt task (the registry correctly refuses
@@ -133,7 +133,7 @@ describe('daemon repair->resume: non-verdict stalls must not gate the business',
       status: 'auditing', auditAttemptId: 'auto-audit-silent', auditRevision: REV,
     } as never)).toMatchObject({ ok: true });
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     // No receipt means no evidence, so convergence must leave it exactly alone.
     const after = r.getAssignment(silent.value.assignmentId)!;
@@ -221,13 +221,13 @@ function finalizedAggregateWithSuccessor(r: SupervisionTaskRegistry, withSuccess
 }
 
 describe('repair->resume matrix: historical finalized ambiguity', () => {
-  it('retires the finalization-consumed historical implementer so the successor is unambiguous', () => {
+  it('retires the finalization-consumed historical implementer so the successor is unambiguous', async () => {
     const r = registry();
     const { taskId, historical, successor } = finalizedAggregateWithSuccessor(r);
     const before = r.getAssignment(historical.assignmentId)!;
     expect(before.status).toBe('ready_for_integration');
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     const after = r.getAssignment(historical.assignmentId)!;
     // Same object, retired -- not cancelled by a human, not replaced.
@@ -247,7 +247,7 @@ describe('repair->resume matrix: historical finalized ambiguity', () => {
     expect(task.commitSha).toBe(COMMIT);
   });
 
-  it('leaves the parked implementer alone when the SAME finalized aggregate has no successor', () => {
+  it('leaves the parked implementer alone when the SAME finalized aggregate has no successor', async () => {
     // Must reach the successor guard: this aggregate really is finalized, with
     // finalization evidence matching the parked implementer, and differs from
     // the positive case ONLY in that no successor was authorized. Retiring here
@@ -257,12 +257,12 @@ describe('repair->resume matrix: historical finalized ambiguity', () => {
     expect(r.getTaskRecord('tsk_5o7')!.finalization?.revision).toBe(R4);
     expect(r.getAssignment(historical.assignmentId)!.status).toBe('ready_for_integration');
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     expect(r.getAssignment(historical.assignmentId)!.status).toBe('ready_for_integration');
   });
 
-  it('leaves the parked implementer alone when every other implementer is still on the finalized revision', () => {
+  it('leaves the parked implementer alone when every other implementer is still on the finalized revision', async () => {
     // Reaches the successor guard for real: the aggregate is finalized, the
     // task is non-terminal (so convergence scans it), the parked implementer
     // matches the finalization evidence -- and the only other implementer is
@@ -282,12 +282,12 @@ describe('repair->resume matrix: historical finalized ambiguity', () => {
     // Precondition: the task really is scanned, i.e. NOT terminal.
     expect(r.getTaskRecord(taskId)!.status).not.toBe('finalized');
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     expect(r.getAssignment(historical.assignmentId)!.status).toBe('ready_for_integration');
   });
 
-  it('refuses to retire a parked implementer bound to a different attempt than finalization', () => {
+  it('refuses to retire a parked implementer bound to a different attempt than finalization', async () => {
     const r = registry();
     const { taskId, historical } = finalizedAggregateWithSuccessor(r);
     // Rebind the parked implementer's attempt so it no longer matches the
@@ -299,7 +299,7 @@ describe('repair->resume matrix: historical finalized ambiguity', () => {
     expect(task.finalization?.auditAttemptId).toBe(R4_ATTEMPT);
     // Positive control lives in the first test; here we assert the guard exists
     // by removing the evidence match through the finalization revision instead.
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
     const after = r.getAssignment(historical.assignmentId)!;
     expect(after.auditRevision).toBe(R4);
     expect(after.verdict?.toUpperCase()).toBe('PASS');
@@ -315,7 +315,7 @@ describe('repair->resume matrix: bounded scan must not starve convergeable tasks
    * history grows. Ordering is `task_id ASC`, so ids sorting ahead of the real
    * task reproduce it deterministically.
    */
-  it('still repairs a convergeable task buried under NEWER terminal history', () => {
+  it('still repairs a convergeable task buried under NEWER terminal history', async () => {
     // The realistic shape: the aggregate that needs convergence has been idle,
     // and a large amount of terminal history was closed AFTER it. Recency
     // ordering alone cannot save it here -- terminal rows must be excluded
@@ -331,7 +331,7 @@ describe('repair->resume matrix: bounded scan must not starve convergeable tasks
       expect(r.updateTask({ taskId, status: 'cancelled' } as never)).toMatchObject({ ok: true });
     }
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     const after = r.getAssignment(historical.assignmentId)!;
     expect(after.status).toBe('finalized');
@@ -343,7 +343,7 @@ describe('repair->resume matrix: bounded scan must not starve convergeable tasks
     expect(active.map((a) => a.assignmentId)).toEqual([successor!.assignmentId]);
   });
 
-  it('stays bounded: one pass never walks the whole live backlog', () => {
+  it('stays bounded: one pass never walks the whole live backlog', async () => {
     const r = registry();
     // NON-terminal filler: terminal rows are excluded in SQL, so only live
     // tasks can prove the LIMIT itself is what keeps the pass bounded.
@@ -360,7 +360,7 @@ describe('repair->resume matrix: bounded scan must not starve convergeable tasks
       inspected += 1;
       return original(taskId);
     };
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
     // Bounded work, not an unbounded full-table walk.
     expect(inspected).toBeLessThanOrEqual(120);
   });
@@ -390,13 +390,13 @@ describe('repair->resume matrix: fair rotation across a live backlog', () => {
     return built;
   }
 
-  it('reaches work buried outside one window within a finite number of ticks', () => {
+  it('reaches work buried outside one window within a finite number of ticks', async () => {
     const r = registry();
     const { historical } = liveBacklogWithBuriedWork(r);
 
     let converged = false;
     for (let tick = 0; tick < 12 && !converged; tick += 1) {
-      r.convergeLifecycle(Date.now() + tick * 1000);
+      await r.convergeLifecycle(Date.now() + tick * 1000);
       converged = r.getAssignment(historical.assignmentId)!.status === 'finalized';
     }
 
@@ -406,14 +406,14 @@ describe('repair->resume matrix: fair rotation across a live backlog', () => {
     expect(after.verdict?.toUpperCase()).toBe('PASS');
   });
 
-  it('resumes the rotation across a daemon restart instead of rescanning the head', () => {
+  it('resumes the rotation across a daemon restart instead of rescanning the head', async () => {
     // Same durable database, brand new registry instance: the position must
     // come back from storage, otherwise every restart replays the same head of
     // the ring and buried work is never reached on a restart-prone daemon.
     const database = new DatabaseSync(':memory:');
     const first = new SupervisionTaskRegistry({ database } as never);
     const { historical } = liveBacklogWithBuriedWork(first);
-    first.convergeLifecycle(Date.now());
+    await first.convergeLifecycle(Date.now());
     const cursorAfterFirst = (database
       .prepare('SELECT task_id AS taskId FROM supervision_convergence_cursor WHERE id = 1')
       .get() as { taskId?: string } | undefined)?.taskId ?? '';
@@ -422,13 +422,13 @@ describe('repair->resume matrix: fair rotation across a live backlog', () => {
     const restarted = new SupervisionTaskRegistry({ database } as never);
     let converged = false;
     for (let tick = 0; tick < 12 && !converged; tick += 1) {
-      restarted.convergeLifecycle(Date.now() + tick * 1000);
+      await restarted.convergeLifecycle(Date.now() + tick * 1000);
       converged = restarted.getAssignment(historical.assignmentId)!.status === 'finalized';
     }
     expect(converged).toBe(true);
   });
 
-  it('wraps back to the head of the ring for work that appears behind the cursor', () => {
+  it('wraps back to the head of the ring for work that appears behind the cursor', async () => {
     // Drive the cursor past the end of the ring first, then create work whose
     // id sorts BEFORE it. Without wrap-around `task_id > cursor` returns
     // nothing and that task is never revisited.
@@ -440,18 +440,18 @@ describe('repair->resume matrix: fair rotation across a live backlog', () => {
         objective: 'live backlog',
       } as never)).toMatchObject({ ok: true });
     }
-    for (let tick = 0; tick < 3; tick += 1) r.convergeLifecycle(Date.now() + tick * 1000);
+    for (let tick = 0; tick < 3; tick += 1) await r.convergeLifecycle(Date.now() + tick * 1000);
 
     const { historical } = finalizedAggregateWithSuccessor(r); // 'tsk_5o7' < 'tsk_9...'
     let converged = false;
     for (let tick = 0; tick < 12 && !converged; tick += 1) {
-      r.convergeLifecycle(Date.now() + 10_000 + tick * 1000);
+      await r.convergeLifecycle(Date.now() + 10_000 + tick * 1000);
       converged = r.getAssignment(historical.assignmentId)!.status === 'finalized';
     }
     expect(converged).toBe(true);
   });
 
-  it('each tick stays bounded while rotating', () => {
+  it('each tick stays bounded while rotating', async () => {
     const r = registry();
     liveBacklogWithBuriedWork(r);
     let inspected = 0;
@@ -460,7 +460,7 @@ describe('repair->resume matrix: fair rotation across a live backlog', () => {
       inspected += 1;
       return original(taskId);
     };
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
     expect(inspected).toBeLessThanOrEqual(120);
   });
 });
@@ -492,7 +492,7 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     return { ...built, liveOwner: liveOwner.value };
   }
 
-  it('retires the stale live owner projection so the frozen successor binds and resumes', () => {
+  it('retires the stale live owner projection so the frozen successor binds and resumes', async () => {
     const r = registry();
     const { taskId, successor, liveOwner, owner } = staleLiveOwnerOverFinalizedRound(r);
 
@@ -503,7 +503,7 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
       status: 'ready_for_audit', revision: R4_NEXT, auditRevision: R4_NEXT,
     } as never)).toMatchObject({ ok: false, reason: 'ambiguous_assignment' });
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     // Same object, live projection retired -- no replacement owner.
     const retired = r.getAssignment(liveOwner.assignmentId)!;
@@ -533,7 +533,7 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     expect(r.getTaskRecord(taskId)!.currentRevision).toBe(R4_NEXT);
   });
 
-  it('leaves an owner projection that carries no exact evidence untouched', () => {
+  it('leaves an owner projection that carries no exact evidence untouched', async () => {
     // R12 audit P1: an anchorless owner is not demonstrably part of the closed
     // round -- it may be the NEXT round's owner that has not bound yet.
     // Terminalizing it and releasing its lease would destroy live authority on
@@ -548,7 +548,7 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     if (!anchorless.ok) throw new Error('anchorless: ' + anchorless.reason);
     const before = r.getAssignment(anchorless.value.assignmentId)!;
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     const after = r.getAssignment(anchorless.value.assignmentId)!;
     expect(isTerminal(after.status)).toBe(false);
@@ -556,7 +556,7 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     expect(after.leaseId).toBe(before.leaseId); // lease NOT released
   });
 
-  it('fails closed when more than one live owner projection exists', () => {
+  it('fails closed when more than one live owner projection exists', async () => {
     const r = registry();
     const { taskId, liveOwner } = staleLiveOwnerOverFinalizedRound(r);
     const second = r.createAssignment({
@@ -565,13 +565,13 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     } as never);
     if (!second.ok) throw new Error('second: ' + second.reason);
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     expect(isTerminal(r.getAssignment(liveOwner.assignmentId)!.status)).toBe(false);
     expect(isTerminal(r.getAssignment(second.value.assignmentId)!.status)).toBe(false);
   });
 
-  it('fails closed when the successor is not unique', () => {
+  it('fails closed when the successor is not unique', async () => {
     // Two unconsumed live implementers: the daemon cannot tell which round the
     // stale owner belongs to, so retiring it would guess. Task stays
     // non-terminal here, so the branch is genuinely reached.
@@ -588,12 +588,12 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     } as never)).toMatchObject({ ok: true });
     expect(r.getTaskRecord(taskId)!.status).not.toBe('finalized');
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     expect(isTerminal(r.getAssignment(liveOwner.assignmentId)!.status)).toBe(false);
   });
 
-  it('fails closed when the live owner carries evidence for a different revision', () => {
+  it('fails closed when the live owner carries evidence for a different revision', async () => {
     const r = registry();
     const built = finalizedAggregateWithSuccessor(r);
     // Inconsistent evidence: this live owner claims a revision the task's
@@ -608,7 +608,7 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     } as never);
     if (!divergent.ok) throw new Error('divergent: ' + divergent.reason);
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     expect(isTerminal(r.getAssignment(divergent.value.assignmentId)!.status)).toBe(false);
     expect(r.getAssignment(divergent.value.assignmentId)!.auditRevision).toBe('some-other-revision-deadbeef');
@@ -661,13 +661,13 @@ describe('the only process gate: PASS advances, REWORK returns to the implemente
     } as never)).toMatchObject({ ok: true });
   }
 
-  it('PASS carries the aggregate to integration-ready with no human step', () => {
+  it('PASS carries the aggregate to integration-ready with no human step', async () => {
     const r = registry();
     const taskId = 'tsk_gate_pass';
     const { impl, aud } = blockedThenAudited(r, taskId);
     fileFinal(r, taskId, aud, 'PASS');
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     const implementer = r.getAssignment(impl.assignmentId)!;
     expect(implementer.status).toBe('ready_for_integration');
@@ -681,13 +681,13 @@ describe('the only process gate: PASS advances, REWORK returns to the implemente
     } as never)).toMatchObject({ ok: false });
   });
 
-  it('REWORK returns the SAME implementer to workable state and it can resume', () => {
+  it('REWORK returns the SAME implementer to workable state and it can resume', async () => {
     const r = registry();
     const taskId = 'tsk_gate_rework';
     const { impl, aud } = blockedThenAudited(r, taskId);
     fileFinal(r, taskId, aud, 'REWORK');
 
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
 
     const implementer = r.getAssignment(impl.assignmentId)!;
     expect(implementer.assignmentId).toBe(impl.assignmentId); // same object, no replacement
@@ -716,7 +716,7 @@ describe('repair->resume matrix: coordination override cleared the successor anc
   const R2 = 'rev-two-bbbbbbbb';
   const A1 = 'auto-audit-anchor1';
 
-  function auditedThenOverridden(r: SupervisionTaskRegistry, taskId: string, withReceipt: boolean) {
+  async function auditedThenOverridden(r: SupervisionTaskRegistry, taskId: string, withReceipt: boolean) {
     expect(r.createOrGet({
       taskId, projectName: 'cd', classification: 'independent_top_level',
       objective: 'cleared anchor', currentRevision: R1, auditPolicy: 'auto_strict_cross_vendor',
@@ -747,7 +747,7 @@ describe('repair->resume matrix: coordination override cleared the successor anc
         auditorSessionName: aud.value.identity.sessionName, attemptId: A1, revision: R1,
         receiptKind: 'final', verdict: 'REWORK', findings: 'needs work', validations: [],
       } as never)).toMatchObject({ ok: true });
-      r.convergeLifecycle(Date.now());
+      await r.convergeLifecycle(Date.now());
     }
     // The real clearing path.
     expect(r.coordinateTaskAssignment({
@@ -759,10 +759,10 @@ describe('repair->resume matrix: coordination override cleared the successor anc
     return impl.value;
   }
 
-  it('recovers the anchor from the unique final receipt and binds the successor', () => {
+  it('recovers the anchor from the unique final receipt and binds the successor', async () => {
     const r = registry();
     const taskId = 'tsk_anchor_ok';
-    const impl = auditedThenOverridden(r, taskId, true);
+    const impl = await auditedThenOverridden(r, taskId, true);
 
     expect(r.updateAssignment({
       assignmentId: impl.assignmentId, identity: impl.identity,
@@ -778,10 +778,10 @@ describe('repair->resume matrix: coordination override cleared the successor anc
     expect(receipts[0]!.verdict).toBe('REWORK');
   });
 
-  it('fails closed when no final receipt records the revision the task points at', () => {
+  it('fails closed when no final receipt records the revision the task points at', async () => {
     const r = registry();
     const taskId = 'tsk_anchor_noevidence';
-    const impl = auditedThenOverridden(r, taskId, false);
+    const impl = await auditedThenOverridden(r, taskId, false);
 
     expect(r.updateAssignment({
       assignmentId: impl.assignmentId, identity: impl.identity,
@@ -802,9 +802,9 @@ describe('repair->resume matrix: pointer left on the owner of a finalized round'
   const R6 = 'supervision-daemon-first-convergence-cc3-r10-da02d74041ba';
   const A5 = 'auto-audit-r5attempt';
 
-  function movedPastFinalizedRound(r: SupervisionTaskRegistry) {
+  async function movedPastFinalizedRound(r: SupervisionTaskRegistry) {
     const built = finalizedAggregateWithSuccessor(r);
-    r.convergeLifecycle(Date.now());
+    await r.convergeLifecycle(Date.now());
     expect(r.updateAssignment({
       assignmentId: built.successor!.assignmentId, identity: identity('deck_next'),
       status: 'ready_for_audit', revision: R5, auditRevision: R5,
@@ -827,12 +827,12 @@ describe('repair->resume matrix: pointer left on the owner of a finalized round'
     return built;
   }
 
-  it('clears the consumed pointer so the sole required implementer can bind its next revision', () => {
+  it('clears the consumed pointer so the sole required implementer can bind its next revision', async () => {
     const r = registry();
-    const { taskId, successor, owner } = movedPastFinalizedRound(r);
+    const { taskId, successor, owner } = await movedPastFinalizedRound(r);
 
     // RED without the repair: the pointer still names the finalized R4 owner.
-    r.convergeLifecycle(Date.now() + 1000);
+    await r.convergeLifecycle(Date.now() + 1000);
     expect(r.getAssignment(successor!.assignmentId)!.status).toBe('rework');
 
     expect(r.updateAssignment({
@@ -856,16 +856,16 @@ describe('repair->resume matrix: pointer left on the owner of a finalized round'
     expect(r.listAuditReceipts(taskId).length).toBeGreaterThan(0);
   });
 
-  it('fails closed while a live integration owner still exists', () => {
+  it('fails closed while a live integration owner still exists', async () => {
     const r = registry();
-    const { taskId, successor } = movedPastFinalizedRound(r);
+    const { taskId, successor } = await movedPastFinalizedRound(r);
     const live = r.createAssignment({
       taskId, role: 'integration_owner', identity: identity('deck_owner2', 'codex-sdk', 'openai'),
       scopeFiles: ['src/daemon/send-tool.ts'],
     } as never);
     if (!live.ok) throw new Error('live: ' + live.reason);
 
-    r.convergeLifecycle(Date.now() + 1000);
+    await r.convergeLifecycle(Date.now() + 1000);
 
     expect(r.getTaskRecord(taskId)!.integrationOwnerAssignmentId).toBeDefined();
     expect(r.updateAssignment({
@@ -874,9 +874,9 @@ describe('repair->resume matrix: pointer left on the owner of a finalized round'
     } as never).ok).toBe(false);
   });
 
-  it('fails closed when the required implementer successor is not unique', () => {
+  it('fails closed when the required implementer successor is not unique', async () => {
     const r = registry();
-    const { taskId } = movedPastFinalizedRound(r);
+    const { taskId } = await movedPastFinalizedRound(r);
     const extra = r.createAssignment({
       taskId, role: 'implementer', identity: identity('deck_next3'),
       scopeFiles: ['src/daemon/send-tool.ts'],
@@ -887,7 +887,7 @@ describe('repair->resume matrix: pointer left on the owner of a finalized round'
       toStatus: 'implementing', identity: identity('deck_next3'),
     } as never)).toMatchObject({ ok: true });
 
-    r.convergeLifecycle(Date.now() + 1000);
+    await r.convergeLifecycle(Date.now() + 1000);
 
     expect(r.getTaskRecord(taskId)!.integrationOwnerAssignmentId).toBeDefined();
   });

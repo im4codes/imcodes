@@ -958,6 +958,8 @@ class SupervisionAutomation {
   /** Last mode delivered for one source session to the current Brain runtime. */
   private autoAuditModeDeliveryKeys = new Map<string, string>();
 
+  private implementationWatchdogRunning = false;
+
   /** Consecutive housekeeping batch failures; drives the backoff below. */
   private housekeepingFailureStreak = 0;
 
@@ -1091,7 +1093,14 @@ class SupervisionAutomation {
       this.applyPersistedSnapshot(session.name);
     }
     this.implementationWatchdogTimer = setInterval(() => {
-      this.checkImplementationAssignments(Date.now());
+      // The tick is asynchronous now, so it can outlive its interval. Guard
+      // re-entry: overlapping watchdog passes would re-create exactly the
+      // pile-up of concurrent worktree inspections this change removes.
+      if (this.implementationWatchdogRunning) return;
+      this.implementationWatchdogRunning = true;
+      void this.checkImplementationAssignments(Date.now())
+        .catch((error) => { logger.warn({ err: error }, 'Supervision implementation watchdog failed'); })
+        .finally(() => { this.implementationWatchdogRunning = false; });
     }, IMPLEMENTATION_WATCHDOG_TICK_MS);
     this.implementationWatchdogTimer.unref?.();
     // A runtime may already be live when lifecycle wiring finishes. The normal
@@ -1188,12 +1197,12 @@ class SupervisionAutomation {
   }
 
   /** Test seam for the durable single-implementer watchdog. */
-  __checkImplementationAssignmentsForTests(now: number): void {
+  async __checkImplementationAssignmentsForTests(now: number): Promise<void> {
     if (process.env.NODE_ENV !== 'test') return;
-    this.checkImplementationAssignments(now);
+    await this.checkImplementationAssignments(now);
   }
 
-  private checkImplementationAssignments(now: number): void {
+  private async checkImplementationAssignments(now: number): Promise<void> {
     const registry = getSupervisionTaskRegistry();
     // Production housekeeping is inert until an administrator has reviewed a
     // dry-run and explicitly called apply. Once authorized, this advances one
@@ -1228,14 +1237,14 @@ class SupervisionAutomation {
     // Convergence is called directly (the registry is already in hand) so it
     // cannot be silently skipped if the send path fails to load.
     try {
-      registry.convergeLifecycle(now, {
+      await registry.convergeLifecycle(now, {
         // Production wiring: a stale coordinator epoch is repaired against the
         // daemon's own live session registry, with no model or heartbeat.
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
           projectName, undefined, sessionName,
         ),
-        inspectAssignmentWorktree: (assignment) => {
-          const inspected = inspectSupervisionAssignmentWorktree({
+        inspectAssignmentWorktree: async (assignment) => {
+          const inspected = await inspectSupervisionAssignmentWorktree({
             sessionName: assignment.identity.sessionName,
             assignmentId: assignment.assignmentId,
           });

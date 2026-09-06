@@ -63,11 +63,11 @@ function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
       }
       return current.finishAssignment({ assignmentId: input.assignmentId, identity: callerIdentity });
     },
-    convergeValidatedAssignment: (input: { taskId: string; assignmentId: string }) => {
+    convergeValidatedAssignment: async (input: { taskId: string; assignmentId: string }) => {
       const current = registry();
       const assignment = current.getAssignment(input.assignmentId);
       if (!assignment || assignment.taskId !== input.taskId) return [];
-      return current.convergeValidatedAssignment(input.assignmentId, Date.now(), () => ({
+      return await current.convergeValidatedAssignment(input.assignmentId, Date.now(), () => ({
         worktreePath: `/worktrees/${input.assignmentId}/repo`,
         headSha: '5f3d543ace7e73b95e58849f890299cef93bd3c5',
         files: assignment.scopeFiles.map((path) => ({ path, sha256: 'a'.repeat(64) })),
@@ -556,7 +556,7 @@ describe('implementation heartbeat legacy authority convergence', () => {
     database.close();
   });
 
-  it('boundedly retires the exact terminal-task stale auditors and resumes after restart', () => {
+  it('boundedly retires the exact terminal-task stale auditors and resumes after restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'terminal-stale-auditor-cleanup-'));
     const dbPath = join(dir, 'registry.sqlite');
     let registry = new SupervisionTaskRegistry({ dbPath });
@@ -596,7 +596,7 @@ describe('implementation heartbeat legacy authority convergence', () => {
       }
       database.close();
 
-      const first = registry.convergeLifecycle(10, { limit: 2 });
+      const first = await registry.convergeLifecycle(10, { limit: 2 });
       expect(first).toEqual([
         expect.objectContaining({ taskId, action: 'retire_terminal_stale_auditor' }),
         expect.objectContaining({ taskId, action: 'retire_terminal_stale_auditor' }),
@@ -608,7 +608,7 @@ describe('implementation heartbeat legacy authority convergence', () => {
       // Startup's existing cancelled-task repair may consume the final row
       // before the periodic backstop runs; either way, no replacement object
       // is created and the next tick has no repeated cleanup.
-      const resumed = registry.convergeLifecycle(20, { limit: 2 });
+      const resumed = await registry.convergeLifecycle(20, { limit: 2 });
       expect(resumed.length).toBeLessThanOrEqual(1);
       expect(resumed.every((action) => (
         action.taskId === taskId && action.action === 'retire_terminal_stale_auditor'
@@ -620,7 +620,7 @@ describe('implementation heartbeat legacy authority convergence', () => {
       }
       expect(registry.listAuditReceipts(taskId)).toEqual([]);
       const eventCount = registry.listEvents(taskId).length;
-      expect(registry.convergeLifecycle(30, { limit: 2 })).toEqual([]);
+      expect(await registry.convergeLifecycle(30, { limit: 2 })).toEqual([]);
       expect(registry.listEvents(taskId)).toHaveLength(eventCount);
     } finally {
       registry.close();
@@ -5350,7 +5350,7 @@ describe('SupervisionTaskRegistry', () => {
     database.close();
   });
 
-  it('fails closed when cancelled-task recovery lacks exact revision-bound PASS evidence', async () => {
+  it('fails closed when cancelled-task recovery lacks exact revision-bound PASS evidence', () => {
     const registry = makeRegistry();
     expect(registry.createOrGet({
       taskId: 'task-cancelled-without-pass', projectName: 'alpha', objective: 'no evidence',
@@ -9396,7 +9396,7 @@ describe('cancelled implementation evidence adoption', () => {
     }
   });
 
-  it('keeps late file evidence immutable on the cancelled owner and auto-adopts it only into an untouched successor', () => {
+  it('keeps late file evidence immutable on the cancelled owner and auto-adopts it only into an untouched successor', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const shape = cancelledShape(registry, 'adopt');
@@ -9428,7 +9428,7 @@ describe('cancelled implementation evidence adoption', () => {
     });
     if (!successor.ok) throw new Error(successor.reason);
 
-    const actions = registry.convergeLifecycle(60, {
+    const actions = await registry.convergeLifecycle(60, {
       inspectAssignmentWorktree: (assignment: { assignmentId: string }) => assignment.assignmentId === successor.value.assignmentId
         ? frozenSnapshot([]) : undefined,
     } as any);
@@ -9450,7 +9450,7 @@ describe('cancelled implementation evidence adoption', () => {
     });
 
     const events = registry.listEvents(shape.taskId).length;
-    expect(registry.convergeLifecycle(70, {
+    expect(await registry.convergeLifecycle(70, {
       inspectAssignmentWorktree: () => frozenSnapshot([]),
     } as any)).not.toContainEqual(expect.objectContaining({ action: 'adopt_cancelled_completion_evidence' }));
     expect(registry.listEvents(shape.taskId)).toHaveLength(events);
@@ -9458,7 +9458,7 @@ describe('cancelled implementation evidence adoption', () => {
     database.close();
   });
 
-  it('refuses auto-adoption when the successor has a file event even if its inspected manifest is empty', () => {
+  it('refuses auto-adoption when the successor has a file event even if its inspected manifest is empty', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const shape = cancelledShape(registry, 'successor-file-event');
@@ -9478,7 +9478,7 @@ describe('cancelled implementation evidence adoption', () => {
       idempotencyKey: 'successor-file-event', now: 45,
     })).toMatchObject({ ok: true });
 
-    expect(registry.convergeLifecycle(50, {
+    expect(await registry.convergeLifecycle(50, {
       inspectAssignmentWorktree: () => frozenSnapshot([]),
     })).toContainEqual(expect.objectContaining({ action: 'request_cancelled_completion_evidence_decision' }));
     expect(registry.listCompletionEvidence(shape.taskId)).toEqual([
@@ -9490,7 +9490,7 @@ describe('cancelled implementation evidence adoption', () => {
     database.close();
   });
 
-  it('asks Brain exactly once when the replacement already has conflicting bytes', () => {
+  it('asks Brain exactly once when the replacement already has conflicting bytes', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const shape = cancelledShape(registry, 'conflict');
@@ -9511,7 +9511,7 @@ describe('cancelled implementation evidence adoption', () => {
       ...frozenSnapshot(), files: [{ path: 'src/late.ts', sha256: '9'.repeat(64) }],
     });
 
-    const first = registry.convergeLifecycle(60, { inspectAssignmentWorktree: inspect } as any);
+    const first = await registry.convergeLifecycle(60, { inspectAssignmentWorktree: inspect } as any);
     expect(first).toContainEqual(expect.objectContaining({
       taskId: shape.taskId, assignmentId: successor.value.assignmentId,
       action: 'request_cancelled_completion_evidence_decision',
@@ -9520,7 +9520,7 @@ describe('cancelled implementation evidence adoption', () => {
       blocker: expect.stringMatching(/adopt_or_discard.*existing-unrelated-blocker/),
     });
     const eventCount = registry.listEvents(shape.taskId).length;
-    expect(registry.convergeLifecycle(70, { inspectAssignmentWorktree: inspect } as any))
+    expect(await registry.convergeLifecycle(70, { inspectAssignmentWorktree: inspect } as any))
       .not.toContainEqual(expect.objectContaining({ action: 'request_cancelled_completion_evidence_decision' }));
     expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
     expect(registry.resolveCancelledCompletionEvidence({
@@ -9559,7 +9559,7 @@ describe('cancelled implementation evidence adoption', () => {
     ['tsk_7l9', 'ready_for_integration', 'ready_for_integration', 'integration_owner', 'a3c610eef5997990a9bf608aa0b0d7401dc3a79b'],
   ] as const)(
     'records already-present PASS bytes for %s from its live projection without duplicate Git',
-    (taskId, taskStatus, assignmentStatus, role, commitSha) => {
+    async (taskId, taskStatus, assignmentStatus, role, commitSha) => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const revision = 'r14-pass';
@@ -9604,7 +9604,7 @@ describe('cancelled implementation evidence adoption', () => {
       matchingRemoteRef: 'refs/remotes/origin/dev',
     };
 
-    expect(registry.convergeLifecycle(60, { inspectAssignmentWorktree: () => inspection } as any))
+    expect(await registry.convergeLifecycle(60, { inspectAssignmentWorktree: () => inspection } as any))
       .toContainEqual({ taskId, assignmentId: worker.value.assignmentId, action: 'record_already_present_delivery' });
     expect(registry.get(taskId)).toMatchObject({
       status: 'ready_for_integration', commitSha,
@@ -9617,14 +9617,14 @@ describe('cancelled implementation evidence adoption', () => {
     });
     expect(registry.get(taskId)).not.toHaveProperty('finalization');
     const events = registry.listEvents(taskId).length;
-    expect(registry.convergeLifecycle(70, { inspectAssignmentWorktree: () => inspection } as any))
+    expect(await registry.convergeLifecycle(70, { inspectAssignmentWorktree: () => inspection } as any))
       .not.toContainEqual(expect.objectContaining({ action: 'record_already_present_delivery' }));
     expect(registry.listEvents(taskId)).toHaveLength(events);
     registry.close();
     database.close();
   });
 
-  it('does not churn a zero-change ready_for_audit projection', () => {
+  it('does not churn a zero-change ready_for_audit projection', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'zero-change-ready';
@@ -9642,14 +9642,14 @@ describe('cancelled implementation evidence adoption', () => {
       ...registry.get(taskId)!, status: 'ready_for_audit', currentRevision: 'zero-r1', updatedAt: 20,
     });
     const before = registry.listEvents(taskId).length;
-    expect(registry.convergeLifecycle(30)).toEqual([]);
-    expect(registry.convergeLifecycle(40)).toEqual([]);
+    expect(await registry.convergeLifecycle(30)).toEqual([]);
+    expect(await registry.convergeLifecycle(40)).toEqual([]);
     expect(registry.listEvents(taskId)).toHaveLength(before);
     registry.close();
     database.close();
   });
 
-  it('binds tsk_7ax zero-byte validation to the authoritative base Git object and atomically opens audit', () => {
+  it('binds tsk_7ax zero-byte validation to the authoritative base Git object and atomically opens audit', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'tsk_7ax';
@@ -9672,7 +9672,7 @@ describe('cancelled implementation evidence adoption', () => {
       validationState: 'passed', toStatus: 'validated',
     })).toMatchObject({ ok: true });
 
-    expect(registry.convergeValidatedAssignment(worker.value.assignmentId, 50, () => ({
+    expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, 50, () => ({
       worktreePath: '/tmp/tsk_7ax/asg_7b0/repo', headSha: reviewedBase,
       files: [], stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
     }))).toEqual([
@@ -9687,7 +9687,7 @@ describe('cancelled implementation evidence adoption', () => {
     });
     // Replay is stable; neither a synthetic revision nor a second event appears.
     const eventCount = registry.listEvents(taskId).length;
-    expect(registry.convergeValidatedAssignment(worker.value.assignmentId, 60, () => ({
+    expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, 60, () => ({
       worktreePath: '/tmp/tsk_7ax/asg_7b0/repo', headSha: reviewedBase,
       files: [], stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
     }))).toEqual([]);
@@ -9696,7 +9696,7 @@ describe('cancelled implementation evidence adoption', () => {
     database.close();
   });
 
-  it('preserves the zero-byte base bind through the periodic restart backstop instead of overwriting it from a stale snapshot', () => {
+  it('preserves the zero-byte base bind through the periodic restart backstop instead of overwriting it from a stale snapshot', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'tsk_7ax-periodic-restart';
@@ -9720,7 +9720,7 @@ describe('cancelled implementation evidence adoption', () => {
       files: [], stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
     });
 
-    expect(registry.convergeLifecycle(50, { inspectAssignmentWorktree: inspect }))
+    expect(await registry.convergeLifecycle(50, { inspectAssignmentWorktree: inspect }))
       .toEqual(expect.arrayContaining([
         { taskId, assignmentId: worker.value.assignmentId, action: 'bind_zero_byte_base_revision' },
         { taskId, assignmentId: worker.value.assignmentId, action: 'project_validated_handoff' },
@@ -9732,13 +9732,13 @@ describe('cancelled implementation evidence adoption', () => {
       status: 'ready_for_audit', auditRevision: reviewedBase, validationState: 'passed', leaseId: '',
     });
     const eventCount = registry.listEvents(taskId).length;
-    expect(registry.convergeLifecycle(60, { inspectAssignmentWorktree: inspect })).toEqual([]);
+    expect(await registry.convergeLifecycle(60, { inspectAssignmentWorktree: inspect })).toEqual([]);
     expect(registry.listEvents(taskId)).toHaveLength(eventCount);
     registry.close();
     database.close();
   });
 
-  it('refuses to bind a missing revision when the validated worktree contains bytes', () => {
+  it('refuses to bind a missing revision when the validated worktree contains bytes', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'zero-byte-revision-negative';
@@ -9758,7 +9758,7 @@ describe('cancelled implementation evidence adoption', () => {
         ...(validationState ? { validationState } : {}),
       })).toMatchObject({ ok: true });
     }
-    expect(registry.convergeValidatedAssignment(worker.value.assignmentId, 50, () => ({
+    expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, 50, () => ({
       worktreePath: '/tmp/nonzero/repo', headSha: '5'.repeat(40),
       files: [{ path: 'src/change.ts', sha256: 'a'.repeat(64) }],
       stagedPaths: [], conflictedPaths: [], untrackedPaths: [],

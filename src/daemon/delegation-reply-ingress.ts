@@ -600,7 +600,7 @@ export async function submitDelegationReply(input: {
         && assignment.status === 'cancelled'
         && assignment.role !== 'auditor'
         && assignment.role !== 'coordinator') {
-        const inspected = inspectSupervisionAssignmentWorktree({
+        const inspected = await inspectSupervisionAssignmentWorktree({
           sessionName: assignment.identity.sessionName,
           assignmentId: assignment.assignmentId,
         });

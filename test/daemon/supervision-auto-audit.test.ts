@@ -610,7 +610,7 @@ describe('automatic supervision audit materialization', () => {
     expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'implementing' });
   });
 
-  it('aligns one validated R1/R2 split before the ordinary finish handoff and keeps stale finish rejected', () => {
+  it('aligns one validated R1/R2 split before the ordinary finish handoff and keeps stale finish rejected', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'validated-revision-split';
@@ -645,7 +645,7 @@ describe('automatic supervision audit materialization', () => {
     expect(registry.finishAssignment({
       assignmentId: worker.value.assignmentId, identity: worker.value.identity, revision: r2,
     })).toEqual({ ok: false, reason: 'old_revision' });
-    expect(registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 1))
+    expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 1))
       .toEqual([
         { taskId, assignmentId: worker.value.assignmentId, action: 'align_validated_revision' },
         { taskId, assignmentId: worker.value.assignmentId, action: 'project_validated_handoff' },
@@ -660,13 +660,13 @@ describe('automatic supervision audit materialization', () => {
       assignmentId: worker.value.assignmentId, identity: worker.value.identity, revision: r1,
     })).toEqual({ ok: false, reason: 'old_revision' });
     const eventCount = registry.listEvents(taskId).length;
-    expect(registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 2)).toEqual([]);
+    expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 2)).toEqual([]);
     expect(registry.listEvents(taskId)).toHaveLength(eventCount);
   });
 
   it.each(['ambiguous implementer', 'conflicting external evidence'] as const)(
     'leaves a validated revision split untouched with %s',
-    (conflict) => {
+    async (conflict) => {
       const database = new DatabaseSync(':memory:');
       const registry = new SupervisionTaskRegistry({ database });
       const taskId = `validated-revision-split-${conflict.replaceAll(' ', '-')}`;
@@ -709,13 +709,13 @@ describe('automatic supervision audit materialization', () => {
         'UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
       ).run(splitTask.status, r1, JSON.stringify(splitTask), splitTask.updatedAt, taskId);
 
-      expect(registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 1)).toEqual([]);
+      expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 1)).toEqual([]);
       expect(registry.getTaskRecord(taskId)).toMatchObject({ status: 'validated', currentRevision: r1 });
       expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({ status: 'validated', auditRevision: r2 });
     },
   );
 
-  it('repairs the exact validated revision split in the bounded sweep and is replay-idempotent', () => {
+  it('repairs the exact validated revision split in the bounded sweep and is replay-idempotent', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'validated-revision-split-sweep';
@@ -746,12 +746,12 @@ describe('automatic supervision audit materialization', () => {
       'UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
     ).run(split.status, r1, JSON.stringify(split), split.updatedAt, taskId);
 
-    expect(registry.convergeLifecycle(split.updatedAt + 1, { limit: 1 })).toEqual([
+    expect(await registry.convergeLifecycle(split.updatedAt + 1, { limit: 1 })).toEqual([
       { taskId, assignmentId: worker.value.assignmentId, action: 'align_validated_revision' },
       { taskId, assignmentId: worker.value.assignmentId, action: 'project_validated_handoff' },
     ]);
     const eventCount = registry.listEvents(taskId).length;
-    expect(registry.convergeLifecycle(split.updatedAt + 2, { limit: 1 })).toEqual([]);
+    expect(await registry.convergeLifecycle(split.updatedAt + 2, { limit: 1 })).toEqual([]);
     expect(registry.listEvents(taskId)).toHaveLength(eventCount);
   });
 
@@ -3289,7 +3289,7 @@ describe('periodic supervision convergence tick', () => {
       taskId, role: 'implementer', required: true, identity: identity('deck_alpha_successor'),
     });
     if (!successor.ok) throw new Error(successor.reason);
-    expect(registry.convergeLifecycle(30, {
+    expect(await registry.convergeLifecycle(30, {
       inspectAssignmentWorktree: () => ({
         worktreePath: '/tmp/successor/repo', headSha: 'b'.repeat(40),
         files: [{ path: 'src/late.ts', sha256: '9'.repeat(64) }],

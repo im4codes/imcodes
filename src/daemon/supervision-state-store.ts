@@ -635,10 +635,17 @@ export interface SupervisionLifecycleConvergenceAction {
 /** Runtime authority the registry cannot know by itself. */
 export interface SupervisionLifecycleConvergenceOptions {
   limit?: number;
-  /** Read-only inspection of the assignment's authoritative worktree. */
+  /**
+   * Read-only inspection of the assignment's authoritative worktree.
+   *
+   * Asynchronous: the inspector spawns git, and doing that synchronously on
+   * the daemon's only thread is what produced the 215 fork storm. Every
+   * consumer below resolves it BEFORE opening its transaction, so no await
+   * ever lands inside a BEGIN IMMEDIATE block.
+   */
   inspectAssignmentWorktree?: (
     assignment: PersistedSupervisionTaskAssignment,
-  ) => SupervisionWorktreeSnapshot | undefined;
+  ) => SupervisionWorktreeSnapshot | undefined | Promise<SupervisionWorktreeSnapshot | undefined>;
   /** The live runtime for the task's durable project + coordinator session. */
   resolveAuthoritativeBrain?: (
     projectName: string | null | undefined,
@@ -7259,10 +7266,10 @@ export class SupervisionTaskRegistry {
     }
   }
 
-  convergeLifecycle(
+  async convergeLifecycle(
     now = Date.now(),
     options: SupervisionLifecycleConvergenceOptions = {},
-  ): SupervisionLifecycleConvergenceAction[] {
+  ): Promise<SupervisionLifecycleConvergenceAction[]> {
     const limit = Math.max(1, Math.trunc(options.limit ?? SUPERVISION_LIFECYCLE_CONVERGENCE_LIMIT));
     const actions: SupervisionLifecycleConvergenceAction[] = [];
     let scanned = 0;
@@ -7341,7 +7348,7 @@ export class SupervisionTaskRegistry {
       let current = task;
       for (const runStep of steps) {
         if (isTerminalSupervisionTaskStatus(current.status)) break;
-        const step = runStep(current);
+        const step = await runStep(current);
         if (!step) continue;
         actions.push(step);
         // A returned action is the branch's durable mutation signal. Refresh
@@ -7429,11 +7436,11 @@ export class SupervisionTaskRegistry {
    * scanning remains a restart backstop, but a unique next step must not wait
    * for its cursor or heartbeat interval.
    */
-  convergeValidatedAssignment(
+  async convergeValidatedAssignment(
     assignmentId: string,
     now = Date.now(),
     inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
-  ): SupervisionLifecycleConvergenceAction[] {
+  ): Promise<SupervisionLifecycleConvergenceAction[]> {
     const assignment = this.getAssignment(assignmentId);
     const task = assignment ? this.getTaskRecord(assignment.taskId) : undefined;
     if (!assignment || !task || assignment.validationState !== 'passed') return [];
@@ -7442,7 +7449,7 @@ export class SupervisionTaskRegistry {
     if (aligned) actions.push(aligned);
     const alignedTask = this.getTaskRecord(task.taskId);
     if (!alignedTask) return actions;
-    const zeroByte = this.#convergeZeroByteBaseRevision(alignedTask, now, inspect);
+    const zeroByte = await this.#convergeZeroByteBaseRevision(alignedTask, now, inspect);
     if (zeroByte) actions.push(zeroByte);
     const refreshedTask = this.getTaskRecord(task.taskId);
     if (!refreshedTask) return actions;
@@ -7480,11 +7487,11 @@ export class SupervisionTaskRegistry {
     return { taskId: task.taskId, assignmentId, action: 'restore_exact_rework_implementer' };
   }
 
-  #convergeCancelledCompletionEvidence(
+  async #convergeCancelledCompletionEvidence(
     task: PersistedSupervisionTaskRecord,
     now: number,
     inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
-  ): SupervisionLifecycleConvergenceAction | undefined {
+  ): Promise<SupervisionLifecycleConvergenceAction | undefined> {
     if (!inspect) return undefined;
     const pending = this.listCompletionEvidence(task.taskId)
       .filter((record) => record.status === 'pending');
@@ -7501,7 +7508,7 @@ export class SupervisionTaskRegistry {
     ));
     if (successors.length !== 1) return undefined;
     const successor = successors[0]!;
-    const snapshot = inspect(successor);
+    const snapshot = await inspect(successor);
     if (!snapshot) return undefined;
     const successorHasFileEvents = this.listFileEvents(task.taskId)
       .some((event) => event.assignmentId === successor.assignmentId);
@@ -7665,11 +7672,11 @@ export class SupervisionTaskRegistry {
     };
   }
 
-  #convergeAlreadyPresentDelivery(
+  async #convergeAlreadyPresentDelivery(
     task: PersistedSupervisionTaskRecord,
     now: number,
     inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
-  ): SupervisionLifecycleConvergenceAction | undefined {
+  ): Promise<SupervisionLifecycleConvergenceAction | undefined> {
     if (!inspect || !['implementing', 'passed', 'ready_for_integration'].includes(task.status)
       || task.finalization) return undefined;
     const revision = normalizeTaskString(task.currentRevision);
@@ -7694,7 +7701,7 @@ export class SupervisionTaskRegistry {
       || auditor.auditRevision !== revision || auditor.auditAttemptId !== assignment.auditAttemptId
       || auditor.verdict?.trim().toUpperCase() !== 'PASS' || auditor.leaseId
       || auditor.identity.providerFamily === assignment.identity.providerFamily) return undefined;
-    const snapshot = inspect(assignment);
+    const snapshot = await inspect(assignment);
     if (!snapshot?.matchingRemoteCommitSha || !snapshot.matchingRemoteRef
       || !FINALIZATION_COMMIT_RE.test(snapshot.matchingRemoteCommitSha)) return undefined;
     const blocker = JSON.stringify({
@@ -7845,11 +7852,11 @@ export class SupervisionTaskRegistry {
    * revision.  A no-op review still has an immutable Git object and can proceed
    * through the same audit protocol as a byte-changing revision.
    */
-  #convergeZeroByteBaseRevision(
+  async #convergeZeroByteBaseRevision(
     task: PersistedSupervisionTaskRecord,
     now: number,
     inspect?: SupervisionLifecycleConvergenceOptions['inspectAssignmentWorktree'],
-  ): SupervisionLifecycleConvergenceAction | undefined {
+  ): Promise<SupervisionLifecycleConvergenceAction | undefined> {
     if (!inspect || normalizeTaskString(task.currentRevision)
       || task.finalization || task.commitSha || task.pushRemoteRef) return undefined;
     const candidates = this.listAssignments(task.taskId).filter((assignment) => (
@@ -7861,7 +7868,7 @@ export class SupervisionTaskRegistry {
     ));
     if (candidates.length !== 1) return undefined;
     const assignment = candidates[0]!;
-    const snapshot = inspect(assignment);
+    const snapshot = await inspect(assignment);
     if (!snapshot || !FINALIZATION_COMMIT_RE.test(snapshot.headSha)
       || snapshot.files.length !== 0
       || snapshot.stagedPaths.length !== 0

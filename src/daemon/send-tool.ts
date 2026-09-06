@@ -2614,7 +2614,8 @@ export interface ReadyAuditDispatchDeps {
   now?: () => number;
   inspectAssignmentWorktree?: (
     assignment: PersistedSupervisionTaskAssignment,
-  ) => import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined;
+  ) => import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined
+    | Promise<import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined>;
   /** Test seam for the existing bounded, persistent housekeeping scheduler. */
   runScheduledWorktreeGcBatch?: (now: number) => Promise<unknown>;
 }
@@ -3213,7 +3214,7 @@ export async function dispatchReadyAudit(
     return { status: 'blocked', reason: exactError, reported };
   }
 
-  const integrationArtifact = resolveIntegrationArtifact(task, implementer, deps, true);
+  const integrationArtifact = await resolveIntegrationArtifact(task, implementer, deps, true);
   if (!integrationArtifact) {
     const exactError = 'authoritative immutable integration bundle unavailable or mismatched';
     const reported = reporter && coordinator
@@ -3440,12 +3441,12 @@ export type DeterministicContinuationDispatchResult =
   | { status: 'dispatched'; assignmentId: string; messageId: SendMessageId }
   | { status: 'blocked'; reason: string; reported: boolean };
 
-function inspectAssignmentForConvergence(
+async function inspectAssignmentForConvergence(
   assignment: PersistedSupervisionTaskAssignment,
   deps: ReadyAuditDispatchDeps,
-): import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined {
+): Promise<import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined> {
   if (deps.inspectAssignmentWorktree) return deps.inspectAssignmentWorktree(assignment);
-  const inspected = inspectSupervisionAssignmentWorktree({
+  const inspected = await inspectSupervisionAssignmentWorktree({
     sessionName: assignment.identity.sessionName,
     assignmentId: assignment.assignmentId,
   });
@@ -3463,16 +3464,16 @@ interface ResolvedIntegrationArtifact {
  * injected worktree inspector is an explicit unit-test seam; production may
  * create a missing bundle only before audit, never after PASS.
  */
-function resolveIntegrationArtifact(
+async function resolveIntegrationArtifact(
   task: SupervisionTaskSnapshot,
   implementer: PersistedSupervisionTaskAssignment,
   deps: ReadyAuditDispatchDeps,
   allowFreeze: boolean,
-): ResolvedIntegrationArtifact | undefined {
+): Promise<ResolvedIntegrationArtifact | undefined> {
   const revision = task.currentRevision?.trim();
   if (!revision) return undefined;
   if (deps.inspectAssignmentWorktree) {
-    const snapshot = deps.inspectAssignmentWorktree(implementer);
+    const snapshot = await inspectAssignmentForConvergence(implementer, deps);
     return snapshot && snapshot.files.length > 0
       && snapshot.stagedPaths.length === 0 && snapshot.conflictedPaths.length === 0
       ? { path: snapshot.worktreePath, files: snapshot.files }
@@ -3487,7 +3488,7 @@ function resolveIntegrationArtifact(
     return { path: persisted.bundlePath, files: persisted.files, bundle: persisted };
   }
   if (!allowFreeze) return undefined;
-  const snapshot = inspectAssignmentForConvergence(implementer, deps);
+  const snapshot = await inspectAssignmentForConvergence(implementer, deps);
   if (!snapshot || snapshot.files.length === 0
     || snapshot.stagedPaths.length > 0 || snapshot.conflictedPaths.length > 0) return undefined;
   const frozen = freezeSupervisionIntegrationBundle({
@@ -3628,7 +3629,7 @@ export async function dispatchReadyIntegration(
     && item.receiptKind === 'final' && item.verdict === 'PASS'
   ));
   if (receipts.length !== 1) return { status: 'blocked', reason: 'exact PASS receipt unavailable', reported: false };
-  const integrationArtifact = resolveIntegrationArtifact(task, implementer, deps, false);
+  const integrationArtifact = await resolveIntegrationArtifact(task, implementer, deps, false);
   if (!integrationArtifact) {
     return { status: 'blocked', reason: 'authoritative immutable integration bundle unavailable or mismatched', reported: false };
   }
@@ -3910,15 +3911,15 @@ export async function runSupervisionConvergenceTick(
     const now = deps.now?.() ?? Date.now();
     let converged: SupervisionLifecycleConvergenceAction[] = [];
     try {
-      converged = registry.convergeLifecycle(now, {
+      converged = await registry.convergeLifecycle(now, {
         ...(deps.limit ? { limit: deps.limit } : {}),
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
           projectName,
           (deps.listSessions ?? listSessions)(),
           sessionName,
         ),
-        inspectAssignmentWorktree: (assignment) => {
-          const inspected = inspectSupervisionAssignmentWorktree({
+        inspectAssignmentWorktree: async (assignment) => {
+          const inspected = await inspectSupervisionAssignmentWorktree({
             sessionName: assignment.identity.sessionName,
             assignmentId: assignment.assignmentId,
           });

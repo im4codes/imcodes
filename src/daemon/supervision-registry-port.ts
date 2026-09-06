@@ -133,7 +133,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
         identity: callerIdentity,
       });
     },
-    convergeValidatedAssignment: ({ taskId, assignmentId }) => {
+    convergeValidatedAssignment: async ({ taskId, assignmentId }) => {
       const registry = getSupervisionTaskRegistry();
       const assignment = registry.getAssignment(assignmentId);
       const task = registry.getTaskRecord(taskId);
@@ -143,7 +143,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
         || (task.currentRevision && task.currentRevision !== revision)) {
         return { ok: false, reason: 'old_revision' };
       }
-      const inspected = inspectSupervisionAssignmentWorktree({
+      const inspected = await inspectSupervisionAssignmentWorktree({
         sessionName: assignment.identity.sessionName,
         assignmentId: assignment.assignmentId,
       });
@@ -161,8 +161,8 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
         taskId, assignmentId, identity: assignment.identity, revision, bundle: frozen.bundle,
       });
       if (!bound.ok) return { ok: false, reason: bound.reason };
-      return registry.convergeValidatedAssignment(assignmentId, Date.now(), (candidate) => {
-        const current = inspectSupervisionAssignmentWorktree({
+      return registry.convergeValidatedAssignment(assignmentId, Date.now(), async (candidate) => {
+        const current = await inspectSupervisionAssignmentWorktree({
           sessionName: candidate.identity.sessionName,
           assignmentId: candidate.assignmentId,
         });
@@ -186,11 +186,11 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       getSupervisionTaskRegistry().recoverOrphanedDelegatedAuditor(input)
     ),
     rebindValidatedImplementerAssignment: (input) => getSupervisionTaskRegistry().rebindValidatedImplementerAssignment(input),
-    rebindTaskAssignmentRevision: (input) => {
+    rebindTaskAssignmentRevision: async (input) => {
       const registry = getSupervisionTaskRegistry();
       const assignment = registry.getAssignment(input.assignmentId);
       if (!assignment || assignment.taskId !== input.taskId) return { ok: false, reason: 'not_found' };
-      const inspected = inspectSupervisionAssignmentWorktree({
+      const inspected = await inspectSupervisionAssignmentWorktree({
         sessionName: assignment.identity.sessionName,
         assignmentId: assignment.assignmentId,
       });

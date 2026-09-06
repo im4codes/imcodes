@@ -137,7 +137,7 @@ function finalizeParent(registry: SupervisionTaskRegistry, ownerAssignmentId: st
 }
 
 describe('supervision lifecycle convergence', () => {
-  it('retires an integration slice whose finalized parent already consumed its exact delivery evidence', () => {
+  it('retires an integration slice whose finalized parent already consumed its exact delivery evidence', async () => {
     const registry = memoryRegistry();
     const { childId, ownerAssignmentId, childAssignmentId, attemptId } = makeConsumedSlice(registry);
     finalizeParent(registry, ownerAssignmentId, attemptId);
@@ -149,7 +149,7 @@ describe('supervision lifecycle convergence', () => {
     expect(before.auditRevision ?? '').toBe('');
     expect(registry.getAssignment(childAssignmentId)!.leaseId).not.toBe('');
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions).toEqual(expect.arrayContaining([
       expect.objectContaining({ taskId: childId, action: 'retire_consumed_slice' }),
@@ -160,7 +160,7 @@ describe('supervision lifecycle convergence', () => {
     expect(registry.getAssignment(childAssignmentId)!.leaseId).toBe('');
   });
 
-  it('never converges a blocked task, because a blocker is not a uniquely derivable forward fact', () => {
+  it('never converges a blocked task, because a blocker is not a uniquely derivable forward fact', async () => {
     const registry = memoryRegistry();
     const { childId, ownerAssignmentId, childAssignmentId, attemptId } = makeConsumedSlice(registry);
     finalizeParent(registry, ownerAssignmentId, attemptId);
@@ -172,13 +172,13 @@ describe('supervision lifecycle convergence', () => {
     registry.updateTask({ taskId: childId, status: 'blocked' } as never);
     expect(registry.getTaskRecord(childId)!.status).toBe('blocked');
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions.some((a) => a.taskId === childId)).toBe(false);
     expect(registry.getTaskRecord(childId)!.status).toBe('blocked');
   });
 
-  it('refuses to converge when the delivery evidence matches more than one implementer', () => {
+  it('refuses to converge when the delivery evidence matches more than one implementer', async () => {
     const registry = memoryRegistry();
     const { childId, ownerAssignmentId, attemptId } = makeConsumedSlice(registry);
     const second = registry.createAssignment({
@@ -194,17 +194,17 @@ describe('supervision lifecycle convergence', () => {
     });
     finalizeParent(registry, ownerAssignmentId, attemptId);
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions.some((a) => a.taskId === childId && a.action === 'retire_consumed_slice')).toBe(false);
   });
 
-  it('does not retire a slice whose evidence does not match the parent finalization', () => {
+  it('does not retire a slice whose evidence does not match the parent finalization', async () => {
     const registry = memoryRegistry();
     const { childId, ownerAssignmentId, attemptId } = makeConsumedSlice(registry, { childRunId: '999' });
     finalizeParent(registry, ownerAssignmentId, attemptId);
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions.some((a) => a.taskId === childId && a.action === 'retire_consumed_slice')).toBe(false);
     // The slice must be left alive, not retired, when the evidence differs.
@@ -212,34 +212,34 @@ describe('supervision lifecycle convergence', () => {
     expect(registry.getAssignment(registry.listAssignments(childId)[0]!.assignmentId)!.leaseId).not.toBe('');
   });
 
-  it('is idempotent: a second pass produces no further actions for the same object', () => {
+  it('is idempotent: a second pass produces no further actions for the same object', async () => {
     const registry = memoryRegistry();
     const { ownerAssignmentId, attemptId } = makeConsumedSlice(registry);
     finalizeParent(registry, ownerAssignmentId, attemptId);
 
-    const first = registry.convergeLifecycle(2_000);
+    const first = await registry.convergeLifecycle(2_000);
     expect(first.length).toBeGreaterThan(0);
-    const second = registry.convergeLifecycle(3_000);
+    const second = await registry.convergeLifecycle(3_000);
     expect(second).toEqual([]);
   });
 
-  it('is restart-idempotent across a reopened database', () => {
+  it('is restart-idempotent across a reopened database', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'supervision-converge-'));
     const dbPath = join(dir, 'state.sqlite');
     try {
       let registry = new SupervisionTaskRegistry({ dbPath });
       const { ownerAssignmentId, attemptId } = makeConsumedSlice(registry);
       finalizeParent(registry, ownerAssignmentId, attemptId);
-      expect(registry.convergeLifecycle(2_000).length).toBeGreaterThan(0);
+      expect((await registry.convergeLifecycle(2_000)).length).toBeGreaterThan(0);
 
       registry = new SupervisionTaskRegistry({ dbPath });
-      expect(registry.convergeLifecycle(3_000)).toEqual([]);
+      expect(await registry.convergeLifecycle(3_000)).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('is bounded so one pass cannot walk the whole registry', () => {
+  it('is bounded so one pass cannot walk the whole registry', async () => {
     const registry = memoryRegistry();
     for (let i = 0; i < 6; i++) {
       expect(registry.createOrGet({
@@ -247,7 +247,7 @@ describe('supervision lifecycle convergence', () => {
         objective: 'bulk', currentRevision: `rev-${i}`,
       }).ok).toBe(true);
     }
-    const actions = registry.convergeLifecycle(2_000, { limit: 2 });
+    const actions = await registry.convergeLifecycle(2_000, { limit: 2 });
     expect(actions.length).toBeLessThanOrEqual(2);
   });
 });
@@ -271,12 +271,12 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     return { taskId, assignmentId: impl.value.assignmentId, identity: impl.value.identity };
   }
 
-  it('aligns a single-sided revision from the task onto the only authoritative assignment', () => {
+  it('aligns a single-sided revision from the task onto the only authoritative assignment', async () => {
     const registry = memoryRegistry();
     const { taskId, assignmentId } = simpleTask(registry, { currentRevision: 'r-authoritative' });
     expect(registry.getAssignment(assignmentId)!.auditRevision ?? '').toBe('');
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions).toEqual(expect.arrayContaining([
       expect.objectContaining({ taskId, action: 'align_revision_projection' }),
@@ -284,17 +284,17 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     expect(registry.getAssignment(assignmentId)!.auditRevision).toBe('r-authoritative');
   });
 
-  it('aligns a single-sided revision from the only assignment back onto the task', () => {
+  it('aligns a single-sided revision from the only assignment back onto the task', async () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { auditRevision: 'r-from-assignment' });
     expect(registry.getTaskRecord(taskId)!.currentRevision ?? '').toBe('');
 
-    registry.convergeLifecycle(2_000);
+    await registry.convergeLifecycle(2_000);
 
     expect(registry.getTaskRecord(taskId)!.currentRevision).toBe('r-from-assignment');
   });
 
-  it('fails closed when two assignments disagree about the revision', () => {
+  it('fails closed when two assignments disagree about the revision', async () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { auditRevision: 'r-one' });
     const second = registry.createAssignment({
@@ -303,13 +303,13 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     } as never);
     if (!second.ok) throw new Error(second.reason);
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions.some((a) => a.action === 'align_revision_projection')).toBe(false);
     expect(registry.getTaskRecord(taskId)!.currentRevision ?? '').toBe('');
   });
 
-  it('projects a passed validation forward without demanding a repeated record_validation call', () => {
+  it('projects a passed validation forward without demanding a repeated record_validation call', async () => {
     const registry = memoryRegistry();
     const { taskId, assignmentId, identity: workerIdentity } = simpleTask(registry, { currentRevision: 'r-v' });
     expect(registry.applyTaskIntent({
@@ -323,7 +323,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     // exactly what must NOT be a gate.
     expect(registry.getAssignment(assignmentId)!.status).toBe('validated');
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions).toEqual(expect.arrayContaining([
       expect.objectContaining({ taskId, action: 'project_validated_handoff' }),
@@ -332,7 +332,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     expect(registry.getAssignment(assignmentId)!.status).toBe('ready_for_audit');
   });
 
-  it('closes an auditor that already has its exact immutable final receipt', () => {
+  it('closes an auditor that already has its exact immutable final receipt', async () => {
     const registry = memoryRegistry();
     const { taskId, assignmentId: implAssignmentId, identity: implIdentity } = simpleTask(registry, { currentRevision: 'r-a' });
     // A real open_audit binds the implementer to the same attempt + revision so
@@ -358,7 +358,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
       auditorSessionName: auditor.value.identity.sessionName,
     } as never)).toMatchObject({ ok: true });
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions).toEqual(expect.arrayContaining([
       expect.objectContaining({ taskId, action: 'close_recorded_audit_receipt' }),
@@ -368,7 +368,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     expect(closed.leaseId).toBe('');
   });
 
-  it('never reuses a receipt recorded against a different revision', () => {
+  it('never reuses a receipt recorded against a different revision', async () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { currentRevision: 'r-old' });
     // The OLD auditor legitimately earned a PASS receipt at r-old and closed.
@@ -404,7 +404,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     } as never);
     if (!fresh.ok) throw new Error(fresh.reason);
 
-    const actions = registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions.some((a) => a.assignmentId === fresh.value.assignmentId
       && a.action === 'close_recorded_audit_receipt')).toBe(false);
@@ -485,7 +485,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     } as never)).toMatchObject({ ok: true });
   });
 
-  it('rebinds a stale coordinator epoch in place and refuses a same-named clone Brain', () => {
+  it('rebinds a stale coordinator epoch in place and refuses a same-named clone Brain', async () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { currentRevision: 'r-c' });
     const coordinator = registry.createAssignment({
@@ -496,7 +496,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
 
     // Same logical Brain, new runtime epoch/instance: an in-place rebind.
     const live = { ...identity('deck_alpha_brain'), runtimeEpoch: 'epoch-live', sessionInstanceId: 'instance-live' };
-    const actions = registry.convergeLifecycle(2_000, { resolveAuthoritativeBrain: () => live });
+    const actions = await registry.convergeLifecycle(2_000, { resolveAuthoritativeBrain: () => live });
 
     expect(actions).toEqual(expect.arrayContaining([
       expect.objectContaining({ taskId, action: 'rebind_stale_coordinator' }),
@@ -508,7 +508,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     expect(registry.listAssignments(taskId).filter((a) => a.role === 'coordinator')).toHaveLength(1);
   });
 
-  it('refuses to hand a coordinator assignment to a different durable Brain session', () => {
+  it('refuses to hand a coordinator assignment to a different durable Brain session', async () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { currentRevision: 'r-c' });
     const coordinator = registry.createAssignment({
@@ -517,7 +517,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     if (!coordinator.ok) throw new Error(coordinator.reason);
 
     const clone = { ...identity('deck_alpha_clone_brain'), agentType: 'codex-sdk', providerFamily: 'openai', runtimeEpoch: 'epoch-clone' };
-    const actions = registry.convergeLifecycle(2_000, { resolveAuthoritativeBrain: () => clone });
+    const actions = await registry.convergeLifecycle(2_000, { resolveAuthoritativeBrain: () => clone });
 
     expect(actions.some((a) => a.action === 'rebind_stale_coordinator')).toBe(false);
     expect(registry.getAssignment(coordinator.value.assignmentId)!.identity.agentType).toBe('claude-code-sdk');

@@ -5717,7 +5717,7 @@ describe('SupervisionAutomation', () => {
       return { registry, coordinator: coordinator.value };
     }
 
-    it('backs off a housekeeping batch that keeps failing instead of retrying every tick', () => {
+    it('backs off a housekeeping batch that keeps failing instead of retrying every tick', async () => {
       // The batch is synchronous SQLite on the daemon's only event loop. A
       // permanent failure used to retry every 60s forever -- this machine's log
       // holds 629 consecutive identical failures, roughly ten hours -- and each
@@ -5731,32 +5731,32 @@ describe('SupervisionAutomation', () => {
       });
       try {
         const t0 = 10_000_000;
-        supervisionAutomation.__checkImplementationAssignmentsForTests(t0);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(t0);
         expect(batch).toHaveBeenCalledTimes(1);
 
         // Ticks inside the backoff window must not touch it at all.
-        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 60_000);
-        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 120_000);
-        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 240_000);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 60_000);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 120_000);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 240_000);
         expect(batch).toHaveBeenCalledTimes(1);
 
         // It is a backoff, not a kill switch: once the window elapses it retries.
-        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 5 * 60_000 + 1);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 5 * 60_000 + 1);
         expect(batch).toHaveBeenCalledTimes(2);
 
         // And the window widens rather than settling into a fixed retry rate.
-        supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 11 * 60_000);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(t0 + 11 * 60_000);
         expect(batch).toHaveBeenCalledTimes(2);
       } finally {
         batch.mockRestore();
       }
     });
 
-    it('rebinds a stale coordinator epoch from the production tick with no injected resolver', () => {
+    it('rebinds a stale coordinator epoch from the production tick with no injected resolver', async () => {
       const brain = liveBrain('deck_r4a_brain', 'r4a');
       const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4a', 'r4a', 'deck_r4a_brain');
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(9_100_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(9_100_000);
 
       const rebound = registry.getAssignment(coordinator.assignmentId)!;
       expect(rebound.assignmentId).toBe(coordinator.assignmentId); // same object
@@ -5765,13 +5765,13 @@ describe('SupervisionAutomation', () => {
       expect(registry.listAssignments('tsk_r4a').filter((a) => a.role === 'coordinator')).toHaveLength(1);
     });
 
-    it('is idempotent: a repeated tick changes neither the identity nor the assignment count', () => {
+    it('is idempotent: a repeated tick changes neither the identity nor the assignment count', async () => {
       const brain = liveBrain('deck_r4b_brain', 'r4b');
       const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4b', 'r4b', 'deck_r4b_brain');
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(9_200_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(9_200_000);
       const first = registry.getAssignment(coordinator.assignmentId)!;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(9_300_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(9_300_000);
       const second = registry.getAssignment(coordinator.assignmentId)!;
 
       expect(first.identity.runtimeEpoch).toBe(brain.runtimeEpoch);
@@ -5779,23 +5779,23 @@ describe('SupervisionAutomation', () => {
       expect(registry.listAssignments('tsk_r4b').filter((a) => a.role === 'coordinator')).toHaveLength(1);
     });
 
-    it('keeps the same durable coordinator across agent/provider migration', () => {
+    it('keeps the same durable coordinator across agent/provider migration', async () => {
       const brain = liveBrain('deck_r4c_brain', 'r4c', 'codex-sdk');
       const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4c', 'r4c', 'deck_r4c_brain', 'claude-code-sdk');
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(9_400_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(9_400_000);
 
       const rebound = registry.getAssignment(coordinator.assignmentId)!;
       expect(rebound.identity.runtimeEpoch).toBe(brain.runtimeEpoch);
       expect(rebound.identity.agentType).toBe('codex-sdk');
     });
 
-    it('selects the exact durable session when the project has another live Brain', () => {
+    it('selects the exact durable session when the project has another live Brain', async () => {
       const brain = liveBrain('deck_r4d_brain', 'r4d');
       liveBrain('deck_r4d_other', 'r4d');
       const { registry, coordinator } = taskWithStaleCoordinator('tsk_r4d', 'r4d', 'deck_r4d_brain');
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(9_500_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(9_500_000);
 
       expect(registry.getAssignment(coordinator.assignmentId)!.identity.runtimeEpoch).toBe(brain.runtimeEpoch);
     });
@@ -5855,7 +5855,7 @@ describe('SupervisionAutomation', () => {
       const registry = getSupervisionTaskRegistry();
       const converge = vi.spyOn(registry, 'convergeLifecycle');
       try {
-        supervisionAutomation.__checkImplementationAssignmentsForTests(9_000_000);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(9_000_000);
         await sleep(30);
         expect(converge).toHaveBeenCalled();
       } finally {
@@ -5863,7 +5863,7 @@ describe('SupervisionAutomation', () => {
       }
     });
 
-    it('stops reminding a worker that already reported a durable blocker', () => {
+    it('stops reminding a worker that already reported a durable blocker', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-blocked-task';
       const assignmentId = 'watchdog-blocked-implementer';
@@ -5890,14 +5890,14 @@ describe('SupervisionAutomation', () => {
       mockTransportRuntimeWorking = false;
 
       const due = 3_500 + 10 * 60_000;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(due);
-      supervisionAutomation.__checkImplementationAssignmentsForTests(due + 60 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 60 * 60_000);
 
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
       expect(registry.getAssignment(assignmentId)!.blocker).toBe('needs Brain adjudication');
     });
 
-    it('wakes an idle delegated assignment on the same object before its first progress event', () => {
+    it('wakes an idle delegated assignment on the same object before its first progress event', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-delegated-task';
       const assignmentId = 'watchdog-delegated-implementer';
@@ -5912,7 +5912,7 @@ describe('SupervisionAutomation', () => {
       mockTransportRuntime.send.mockClear();
       mockTransportRuntimeWorking = false;
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
 
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       expect(mockTransportRuntime.send).toHaveBeenCalledWith(
@@ -5950,11 +5950,11 @@ describe('SupervisionAutomation', () => {
       mockTransportRuntimeWorking = false;
 
       const firstDue = 2_000 + 10 * 60_000;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       mockTransportRuntime.pendingEntries.length = 0;
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 10 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 10 * 60_000);
       await sleep(25);
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       const blocker = JSON.parse(registry.getAssignment(assignmentId)!.blocker!);
@@ -5968,14 +5968,14 @@ describe('SupervisionAutomation', () => {
 
       const eventsAfterEscalation = registry.listEvents(taskId).length;
       supervisionAutomation.__simulateProcessRestartForTests();
-      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 24 * 60 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 24 * 60 * 60_000);
       await sleep(25);
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       expect(registry.listEvents(taskId)).toHaveLength(eventsAfterEscalation);
       removeSession('deck_alpha_brain');
     });
 
-    it('deduplicates and backs off reminders, resets on progress, and stops permanently after FINISHED handoff', () => {
+    it('deduplicates and backs off reminders, resets on progress, and stops permanently after FINISHED handoff', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-one-task';
       const assignmentId = 'watchdog-one-implementer';
@@ -5996,13 +5996,13 @@ describe('SupervisionAutomation', () => {
       mockTransportRuntime.send.mockClear();
 
       const firstDue = 3_000 + 10 * 60_000;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue - 1);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue - 1);
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
       mockTransportRuntimeWorking = true;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       mockTransportRuntimeWorking = false;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       expect(mockTransportRuntime.send).toHaveBeenLastCalledWith(
         expect.stringContaining(`"mode":"continue_existing","taskId":"${taskId}","assignmentId":"${assignmentId}"`),
@@ -6014,15 +6014,15 @@ describe('SupervisionAutomation', () => {
       expect(registry.list()).toHaveLength(taskCount);
       expect(registry.get(taskId)!.assignments).toHaveLength(assignmentCount);
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       const progressAt = firstDue + 2 * 60_000;
       expect(registry.recordFileEvent({
         assignmentId, identity, path: 'src/watch.ts', operation: 'modify', now: progressAt,
       }).ok).toBe(true);
-      supervisionAutomation.__checkImplementationAssignmentsForTests(progressAt + 10 * 60_000 - 1);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(progressAt + 10 * 60_000 - 1);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-      supervisionAutomation.__checkImplementationAssignmentsForTests(progressAt + 10 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(progressAt + 10 * 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
 
       // Even after a full backoff window, durable FIFO retains at most one
@@ -6031,7 +6031,7 @@ describe('SupervisionAutomation', () => {
       (mockTransportRuntime.pendingEntries as Array<{ clientMessageId: string }>).push({
         clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:2`,
       });
-      supervisionAutomation.__checkImplementationAssignmentsForTests(progressAt + 2 * 60 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(progressAt + 2 * 60 * 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
       mockTransportRuntime.pendingEntries.length = 0;
 
@@ -6055,7 +6055,7 @@ describe('SupervisionAutomation', () => {
         }),
       ]));
       for (const future of [finishedAt + 30 * 60_000, finishedAt + 2 * 60 * 60_000]) {
-        supervisionAutomation.__checkImplementationAssignmentsForTests(future);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(future);
       }
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
       expect(registry.list()).toHaveLength(taskCount);
@@ -6078,7 +6078,7 @@ describe('SupervisionAutomation', () => {
         'supervision_task_d7f73972-b5f0-4c5b-8335-93eb3de9ef7a',
         'supervision_assignment_d0d3e64a-263f-412c-9742-199cf6723186',
       ],
-    ])('boundedly retries %s when its durable session runtime is transiently absent', (_label, taskId, assignmentId) => {
+    ])('boundedly retries %s when its durable session runtime is transiently absent', async (_label, taskId, assignmentId) => {
       const registry = getSupervisionTaskRegistry();
       const identity = {
         sessionName: `missing_${assignmentId}`,
@@ -6102,7 +6102,7 @@ describe('SupervisionAutomation', () => {
 
       let due = 2_000 + 10 * 60_000;
       for (let retry = 1; retry <= 6; retry += 1) {
-        supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
         if (retry < 6) {
           expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
           due += 10 * 60_000 * (2 ** (retry - 1));
@@ -6122,7 +6122,7 @@ describe('SupervisionAutomation', () => {
         && event.payload?.source === 'implementation_watchdog_runtime_unavailable'
       ))).toHaveLength(5);
       const eventsAfterPark = registry.listEvents(taskId).length;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
       expect(registry.listEvents(taskId)).toHaveLength(eventsAfterPark);
     });
 
@@ -6264,7 +6264,7 @@ describe('SupervisionAutomation', () => {
       });
     });
 
-    it('atomically rebinds a rotated runtime epoch before delivering to the same live participant', () => {
+    it('atomically rebinds a rotated runtime epoch before delivering to the same live participant', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-rotated-task';
       const assignmentId = 'watchdog-rotated-implementer';
@@ -6279,14 +6279,14 @@ describe('SupervisionAutomation', () => {
       if (!created.ok) throw new Error(created.reason);
       mockTransportRuntime.send.mockClear();
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
 
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       expect(registry.getAssignment(assignmentId)!.identity).toEqual(live);
       expect(registry.getAssignment(assignmentId)!.blocker).toBeUndefined();
     });
 
-    it('normalizes the legacy claude family while preserving the same assignment', () => {
+    it('normalizes the legacy claude family while preserving the same assignment', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-legacy-family-task';
       const assignmentId = 'watchdog-legacy-family-implementer';
@@ -6306,14 +6306,14 @@ describe('SupervisionAutomation', () => {
       if (!created.ok) throw new Error(created.reason);
       mockTransportRuntime.send.mockClear();
 
-      supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
 
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       expect(registry.getAssignment(assignmentId)).toMatchObject({ assignmentId, identity: live });
       expect(registry.listAssignments(taskId)).toHaveLength(1);
     });
 
-    it('appends one durable reminder while busy and does not enqueue a second across a restart tick', () => {
+    it('appends one durable reminder while busy and does not enqueue a second across a restart tick', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-busy-task';
       const assignmentId = 'watchdog-busy-implementer';
@@ -6331,10 +6331,10 @@ describe('SupervisionAutomation', () => {
       });
 
       const due = 2_000 + 10 * 60_000;
-      supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
       // A rehydrated automation tick observes the same durable FIFO entry and
       // must not append a duplicate, even long after the ordinary backoff.
-      supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
 
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_heartbeat')).toHaveLength(1);
