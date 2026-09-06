@@ -952,6 +952,32 @@ describe('recipient-sensitive store operations are identity-gated', () => {
     expect(store.readPrivateDispatchMaterial(NAME, 'm-a', next)).toBeTypeOf('string');
   });
 
+  it('repairs a crash-split epoch instead of repeatedly draining an old queued row', () => {
+    queueForA();
+    const next = { sessionInstanceId: A.sessionInstanceId, runtimeEpoch: 'epoch-A-next' };
+    const raw = new DatabaseSync(join(dir, 'queue.sqlite'));
+    try {
+      // Production incident shape: queue_meta advanced, but the queued entry
+      // and private material still carry the previous epoch.
+      raw.prepare(`
+        UPDATE queue_meta
+        SET recipient_session_instance_id = ?, recipient_runtime_epoch = ?
+        WHERE session_name = ?
+      `).run(next.sessionInstanceId, next.runtimeEpoch, NAME);
+    } finally {
+      raw.close();
+    }
+
+    expect(store.queueBelongsTo(NAME, next), 'meta alone must not authorize a mixed queue').toBe(false);
+    expect(store.rebindRecipientRuntimeEpoch(NAME, A, next, 20)).toBe(true);
+    expect(store.queueBelongsTo(NAME, next)).toBe(true);
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', A)).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial(NAME, 'm-a', next)).toBeTypeOf('string');
+    expect(store.readSnapshotForRecipient(NAME, next).pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'm-a', status: 'queued' }),
+    ]);
+  });
+
   it('refuses recipient recovery across logical session instances', () => {
     queueForA();
     const replacement = { sessionInstanceId: 'instance-replacement', runtimeEpoch: 'epoch-new' };
@@ -977,7 +1003,26 @@ describe('recipient-sensitive store operations are identity-gated', () => {
     const next = { sessionInstanceId: A.sessionInstanceId, runtimeEpoch: 'epoch-A-next' };
 
     expect(store.rebindRecipientRuntimeEpoch(NAME, A, next, 20)).toBe(false);
-    expect(store.queueBelongsTo(NAME, A)).toBe(true);
+    expect(store.queueBelongsTo(NAME, A), 'mixed child authority must quarantine the aggregate').toBe(false);
+    expect(store.queueBelongsTo(NAME, next)).toBe(false);
+  });
+
+  it('refuses epoch rebinding through an unexpected third epoch of the same instance', () => {
+    queueForA();
+    const raw = new DatabaseSync(join(dir, 'queue.sqlite'));
+    try {
+      raw.prepare(`
+        UPDATE queue_private_material
+        SET recipient_runtime_epoch = ?
+        WHERE session_name = ? AND client_message_id = ?
+      `).run('epoch-A-third', NAME, 'm-a');
+    } finally {
+      raw.close();
+    }
+    const next = { sessionInstanceId: A.sessionInstanceId, runtimeEpoch: 'epoch-A-next' };
+
+    expect(store.rebindRecipientRuntimeEpoch(NAME, A, next, 20)).toBe(false);
+    expect(store.queueBelongsTo(NAME, A)).toBe(false);
     expect(store.queueBelongsTo(NAME, next)).toBe(false);
   });
 

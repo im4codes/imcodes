@@ -1453,21 +1453,27 @@ export class TransportQueueStore {
         this.db.exec('ROLLBACK');
         return false;
       }
-      if (bound.sessionInstanceId === next.sessionInstanceId && bound.runtimeEpoch === next.runtimeEpoch) {
-        this.db.exec('COMMIT');
-        return true;
-      }
-      if (bound.sessionInstanceId !== previous.sessionInstanceId || bound.runtimeEpoch !== previous.runtimeEpoch) {
+      const metaIsPrevious = bound.sessionInstanceId === previous.sessionInstanceId
+        && bound.runtimeEpoch === previous.runtimeEpoch;
+      const metaIsNext = bound.sessionInstanceId === next.sessionInstanceId
+        && bound.runtimeEpoch === next.runtimeEpoch;
+      if (!metaIsPrevious && !metaIsNext) {
         this.db.exec('ROLLBACK');
         return false;
       }
+      // A crash can persist queue_meta's new epoch before every child row is
+      // rotated. Treat that mixed SAME-instance state as repairable, not as an
+      // already-complete rebind: trusting meta alone lets an old queued row be
+      // delivered repeatedly while its completion ack cannot match authority.
       for (const table of ['queue_entries', 'queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones']) {
         const conflicting = this.db.prepare(`
           SELECT 1 FROM ${table}
           WHERE session_name = ? AND (
-            recipient_session_instance_id IS NOT ? OR recipient_runtime_epoch IS NOT ?
+            recipient_session_instance_id IS NOT ? OR (
+              recipient_runtime_epoch IS NOT ? AND recipient_runtime_epoch IS NOT ?
+            )
           ) LIMIT 1
-        `).get(sessionName, previous.sessionInstanceId, previous.runtimeEpoch);
+        `).get(sessionName, next.sessionInstanceId, previous.runtimeEpoch, next.runtimeEpoch);
         if (conflicting) {
           this.db.exec('ROLLBACK');
           return false;
@@ -1514,7 +1520,21 @@ export class TransportQueueStore {
       runtimeEpoch: meta.runtimeEpoch ?? '',
     });
     if (!bound) return false;
-    return bound.sessionInstanceId === caller.sessionInstanceId && bound.runtimeEpoch === caller.runtimeEpoch;
+    if (bound.sessionInstanceId !== caller.sessionInstanceId || bound.runtimeEpoch !== caller.runtimeEpoch) return false;
+    // The aggregate row is not sufficient authority. A mid-rotation crash may
+    // leave meta on the new epoch while one queued/private/tombstone row still
+    // belongs to the old epoch. Quarantine that queue so runtime recovery can
+    // migrate it before any provider dispatch occurs.
+    for (const table of ['queue_entries', 'queue_private_material', 'queue_delivery_tombstones', 'queue_cancellation_tombstones']) {
+      const conflict = this.db.prepare(`
+        SELECT 1 FROM ${table}
+        WHERE session_name = ? AND (
+          recipient_session_instance_id IS NOT ? OR recipient_runtime_epoch IS NOT ?
+        ) LIMIT 1
+      `).get(sessionName, caller.sessionInstanceId, caller.runtimeEpoch);
+      if (conflict) return false;
+    }
+    return true;
   }
 
   /** Does any aggregate row still carry the pre-identity NULL/NULL shape? */
