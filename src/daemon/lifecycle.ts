@@ -817,7 +817,12 @@ export async function startup(): Promise<DaemonContext> {
             clearCapabilityAuthorizationKeys(ownerId, serverId);
           }
         }
-        logger.warn({ error, ...context }, 'Capability synchronization failed closed');
+        // Logged under `err` so pino's error serializer runs. Under a plain
+        // `error` key the Error's `message` and `stack` are non-enumerable and
+        // are silently dropped, leaving only own properties like `code` — which
+        // is how a Windows fleet spent hours emitting this warning every 30s
+        // with no indication of what actually failed.
+        logger.warn({ err: error, ...context }, 'Capability synchronization failed closed');
       },
     });
     // Heal the exact loss window observed on deck_sub_26624c1t: an
