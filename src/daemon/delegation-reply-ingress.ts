@@ -34,6 +34,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 import { advanceSupervisionTaskAfterAuditReceipt } from './supervision-convergence-wire.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const inFlight = new Map<string, Promise<DelegationReplyIngressResult>>();
@@ -75,7 +76,9 @@ function withTimeoutOutcome<T>(promise: Promise<T>, timeoutMs: number): Promise<
 function startBackgroundDelivery(record: DelegationReplyRecord): void {
   void deliverRecord(record).catch((error) => {
     logger.warn({ error, delegationId: record.delegationId }, 'delegation reply background delivery failed');
-    scheduleRetry(record.delegationId, record.notificationId, 1_000);
+    if (!(record.taskId && record.assignmentId)) {
+      scheduleRetry(record.delegationId, record.notificationId, 1_000);
+    }
   });
 }
 
@@ -320,7 +323,9 @@ function scheduleRetry(delegationId: string, notificationId: string, delayMs: nu
       }
       void deliverRecord(record).catch((error) => {
         logger.warn({ error, delegationId, notificationId }, 'delegation reply retry failed');
-        scheduleRetry(delegationId, notificationId, 5_000);
+        if (!(record.taskId && record.assignmentId)) {
+          scheduleRetry(delegationId, notificationId, 5_000);
+        }
       });
     }
   }, delayMs);
@@ -350,7 +355,6 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       // original coordinator, until that exact origin comes back or an
       // authorized rebind of the same coordinator assignment advances it.
       if (taskBound && !originMatches && targetMatches) {
-        scheduleRetry(record.delegationId, record.notificationId, 5_000);
         return {
           ok: true,
           delivered: false,
@@ -374,7 +378,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
           sessionName: record.origin.sessionName,
           timeoutMs: DELEGATION_REPLY_RUNTIME_RECOVERY_TIMEOUT_MS,
         }, 'delegation reply runtime recovery timed out; scheduling durable retry');
-        scheduleRetry(record.delegationId, record.notificationId, 1_000);
+        if (!taskBound) scheduleRetry(record.delegationId, record.notificationId, 1_000);
         return {
           ok: true,
           delivered: false,
@@ -385,7 +389,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       runtime = recovery.value;
     }
     if (!runtime) {
-      scheduleRetry(record.delegationId, record.notificationId, 5_000);
+      if (!taskBound) scheduleRetry(record.delegationId, record.notificationId, 5_000);
       return {
         ok: true,
         delivered: false,
@@ -410,7 +414,6 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
           delegationId: record.delegationId,
           sessionName: record.origin.sessionName,
         }, 'delegation reply origin runtime is not the bound coordinator origin; keeping reply pending');
-        scheduleRetry(record.delegationId, record.notificationId, 5_000);
         return {
           ok: true,
           delivered: false,
@@ -418,6 +421,70 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
           reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
         };
       }
+    }
+
+    // A task-bound structured return is exact coordinator work. Busy runtimes
+    // persist it in the ordinary FIFO; idle runtimes start one continuation.
+    // Once SQLite owns the queued clientMessageId the delegation outbox closes,
+    // so neither a timer nor a user reminder can duplicate the wake.
+    if (taskBound) {
+      const queueStore = getTransportQueueStore();
+      const alreadyCommitted = queueStore.hasDeliveryTombstone(
+        record.origin.sessionName,
+        record.notificationId,
+      ) || queueStore.readSnapshot(record.origin.sessionName)
+        .pendingMessageEntries.some((entry) => (
+          entry.clientMessageId === record.notificationId
+          && entry.status === 'queued'
+        ));
+      if (alreadyCommitted) {
+        if (getDelegationReplyStore().markDelivered(record.delegationId, record.notificationId)) {
+          const delivered = getDelegationReplyStore().getMessage(
+            record.delegationId,
+            record.notificationId,
+          ) ?? record;
+          emitDelegationReplyDelivered(delivered);
+        }
+        return { ok: true, delivered: true };
+      }
+      try {
+        const disposition = runtime.send(
+          notificationText(record),
+          record.notificationId,
+          undefined,
+          undefined,
+          {
+            timelineCommitted: true,
+            historyCommitted: true,
+            delegationReply: { delegationId: record.delegationId },
+          },
+        );
+        const durablyQueued = disposition === 'queued'
+          && queueStore.readSnapshot(record.origin.sessionName)
+            .pendingMessageEntries.some((entry) => (
+              entry.clientMessageId === record.notificationId
+              && entry.status === 'queued'
+            ));
+        if (disposition === 'sent' || durablyQueued) {
+          if (getDelegationReplyStore().markDelivered(record.delegationId, record.notificationId)) {
+            const delivered = getDelegationReplyStore().getMessage(
+              record.delegationId,
+              record.notificationId,
+            ) ?? record;
+            emitDelegationReplyDelivered(delivered);
+          }
+          return { ok: true, delivered: true };
+        }
+      } catch (error) {
+        logger.warn({ error, delegationId: record.delegationId },
+          'task-bound delegation reply durable FIFO admission failed');
+      }
+      return {
+        ok: true,
+        delivered: false,
+        pending: true,
+        reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+      };
     }
 
     let result;

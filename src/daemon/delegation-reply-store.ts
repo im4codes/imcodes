@@ -83,6 +83,8 @@ export type CurrentAssignmentReplyAuthority =
   | { status: 'matched'; record: DelegationReplyRecord }
   | { status: 'ambiguous' };
 
+export type PendingAuditDeliveryAuthority = CurrentAssignmentReplyAuthority;
+
 export interface DelegationReplyStoreOptions {
   dbPath?: string;
   database?: DatabaseSyncInstance;
@@ -650,6 +652,52 @@ export class DelegationReplyStore {
       && identityMatches(current.target, input.sender)
       ? current
       : undefined;
+  }
+
+  /**
+   * Find the ONE durable audit brief that already owns an exact attempt and
+   * revision, even when a crash left its registry assignment unmaterialised.
+   * The caller still authenticates every tuple field before adoption.
+   */
+  findPendingAuditDelivery(input: {
+    taskId: string;
+    auditAttemptId: string;
+    auditRevision: string;
+    auditedSessionName: string;
+  }): PendingAuditDeliveryAuthority {
+    const taskId = input.taskId.trim();
+    const auditAttemptId = input.auditAttemptId.trim();
+    const auditRevision = input.auditRevision.trim();
+    const auditedSessionName = input.auditedSessionName.trim();
+    if (!taskId || !auditAttemptId || !auditRevision || !auditedSessionName) {
+      return { status: 'none' };
+    }
+    const rows = this.#db.prepare(`
+      SELECT delegation_id AS delegationId
+      FROM delegation_replies
+      WHERE purpose = ?
+        AND task_id = ?
+        AND audit_attempt_id = ?
+        AND audit_revision = ?
+        AND audited_session_name = ?
+        AND assignment_id IS NOT NULL
+        AND assignment_id <> ''
+        AND status = ?
+      ORDER BY created_at ASC, delegation_id ASC
+    `).all(
+      AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      taskId,
+      auditAttemptId,
+      auditRevision,
+      auditedSessionName,
+      AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+    ) as Array<{ delegationId?: unknown }>;
+    if (rows.length === 0) return { status: 'none' };
+    if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') {
+      return { status: 'ambiguous' };
+    }
+    const record = this.get(rows[0].delegationId);
+    return record ? { status: 'matched', record } : { status: 'none' };
   }
 
   receive(input: {

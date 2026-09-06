@@ -312,6 +312,22 @@ describe('production MCP registration', () => {
     expect(dispatchReadyAudit).toHaveBeenCalledOnce();
     expect(dispatchReadyAudit).toHaveBeenCalledWith('tsk_a');
 
+    // A same-revision replay is a convergence event, not a second state
+    // transition. The production handler must run the idempotent dispatcher
+    // again so a durable delivery whose registry row was lost can be adopted.
+    directRegistry.statuses.set('tsk_a', 'ready_for_audit');
+    directRegistry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'worker-a', role: 'implementer', status: 'ready_for_audit', leaseId: '',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'worker-a',
+    })).resolves.toMatchObject({
+      status: 'ok', fromStatus: 'ready_for_audit', toStatus: 'ready_for_audit',
+    });
+    expect(dispatchReadyAudit).toHaveBeenCalledTimes(2);
+    expect(dispatchReadyAudit).toHaveBeenLastCalledWith('tsk_a');
+
     directRegistry.statuses.set('tsk_a', 'finalized');
     directRegistry.assignmentStates.set('tsk_a', [{
       assignmentId: 'worker-a', role: 'implementer', status: 'finalized', leaseId: '',
@@ -320,7 +336,7 @@ describe('production MCP registration', () => {
     await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'open_audit', taskId: 'tsk_a', assignmentId: 'worker-a',
     })).resolves.toMatchObject({ status: 'error' });
-    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledTimes(2);
   });
 
   it('carries the aggregate forward automatically after a successful implementer finish', async () => {

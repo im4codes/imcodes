@@ -191,6 +191,58 @@ describe('DelegationReplyStore', () => {
     }
   });
 
+  it('discovers one exact pending audit delivery across reopen and fails closed on ambiguity', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-pending-audit-delivery-'));
+    const dbPath = join(dir, 'replies.sqlite');
+    const exact = {
+      origin,
+      target,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-f1x',
+      auditRevision: 'revision-f1x',
+      auditedSessionName: 'deck_alpha_worker',
+      taskId: 'tsk_f1x',
+    } as const;
+    try {
+      const first = new DelegationReplyStore({ dbPath });
+      const only = first.create({
+        ...exact,
+        assignmentId: 'asg_f1x_auditor',
+        dispatchId: 'dispatch-f1x',
+        messageId: 'message-f1x',
+        now: 100,
+      });
+      first.close();
+
+      const reopened = new DelegationReplyStore({ dbPath });
+      expect(reopened.findPendingAuditDelivery({
+        taskId: exact.taskId,
+        auditAttemptId: exact.auditAttemptId,
+        auditRevision: exact.auditRevision,
+        auditedSessionName: exact.auditedSessionName,
+      })).toMatchObject({
+        status: 'matched',
+        record: { delegationId: only.record.delegationId, assignmentId: 'asg_f1x_auditor' },
+      });
+      reopened.create({
+        ...exact,
+        assignmentId: 'asg_f1x_conflict',
+        dispatchId: 'dispatch-f1x-conflict',
+        messageId: 'message-f1x-conflict',
+        now: 101,
+      });
+      expect(reopened.findPendingAuditDelivery({
+        taskId: exact.taskId,
+        auditAttemptId: exact.auditAttemptId,
+        auditRevision: exact.auditRevision,
+        auditedSessionName: exact.auditedSessionName,
+      })).toEqual({ status: 'ambiguous' });
+      reopened.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('selects one exact ordinary assignment authority and fails closed on duplicate current rows', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });

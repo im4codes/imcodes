@@ -126,7 +126,11 @@ import {
   createDelegationReplyAuthority,
   expireDelegationReplyAuthority,
 } from './delegation-reply-authority.js';
-import { getDelegationReplyStore } from './delegation-reply-store.js';
+import {
+  getDelegationReplyStore,
+  type DelegationReplyRecord,
+  type PendingAuditDeliveryAuthority,
+} from './delegation-reply-store.js';
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
 import {
@@ -2450,6 +2454,10 @@ export interface ReadyAuditDispatchDeps {
   hasActiveAuditExecutionClaim?: (input: {
     taskId: string; assignmentId: string; attemptId: string; revision: string;
   }) => boolean;
+  /** Recover a uniquely durable audit brief whose registry row was lost. */
+  findAdoptableAuditDelivery?: (input: {
+    taskId: string; attemptId: string; revision: string; auditedSessionName: string;
+  }) => PendingAuditDeliveryAuthority;
   /** Internal boot-sweep marker: prior-process handoffs are abandoned. */
   recoverRestartHandoffs?: boolean;
   now?: () => number;
@@ -2519,6 +2527,125 @@ function exactLiveSessionForAssignment(
   return sessions.find((session) => (
     session.name === assignment.identity.sessionName
   ));
+}
+
+function boundDelegationIdentityMatches(
+  bound: DelegationReplyRecord['origin'],
+  identity: PersistedSupervisionTaskAssignmentIdentity,
+): boolean {
+  return bound.sessionName === identity.sessionName
+    && bound.sessionInstanceId === identity.sessionInstanceId
+    && bound.runtimeEpoch === identity.runtimeEpoch;
+}
+
+function adoptExactDurableAuditDelivery(input: {
+  task: SupervisionTaskSnapshot;
+  implementer: PersistedSupervisionTaskAssignment;
+  attemptId: string;
+  revision: string;
+  sessions: readonly SessionRecord[];
+  registry: ReturnType<typeof getSupervisionTaskRegistry>;
+  deps: ReadyAuditDispatchDeps;
+}): { status: 'none' } | { status: 'blocked'; reason: string } | {
+  status: 'adopted'; assignment: PersistedSupervisionTaskAssignment; messageId: SendMessageId;
+} {
+  const lookup = input.deps.findAdoptableAuditDelivery
+    ?? ((query: { taskId: string; attemptId: string; revision: string; auditedSessionName: string }) => (
+      getDelegationReplyStore().findPendingAuditDelivery({
+        taskId: query.taskId,
+        auditAttemptId: query.attemptId,
+        auditRevision: query.revision,
+        auditedSessionName: query.auditedSessionName,
+      })
+    ));
+  const found = lookup({
+    taskId: input.task.taskId,
+    attemptId: input.attemptId,
+    revision: input.revision,
+    auditedSessionName: input.implementer.identity.sessionName,
+  });
+  if (found.status === 'none') return { status: 'none' };
+  if (found.status === 'ambiguous') {
+    return { status: 'blocked', reason: 'multiple durable audit deliveries claim the exact attempt and revision' };
+  }
+  const record = found.record;
+  if (record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+    || record.taskId !== input.task.taskId
+    || record.auditAttemptId !== input.attemptId
+    || record.auditRevision !== input.revision
+    || record.auditedSessionName !== input.implementer.identity.sessionName
+    || !record.assignmentId) {
+    return { status: 'blocked', reason: 'durable audit delivery binding conflicts with the task registry' };
+  }
+  const originOwnsTask = input.task.assignments.some((assignment) => (
+    (assignment.role === 'coordinator'
+      || assignment.role === 'implementer'
+      || assignment.role === 'integration_owner')
+    && boundDelegationIdentityMatches(record.origin, assignment.identity)
+  ));
+  if (!originOwnsTask) {
+    return { status: 'blocked', reason: 'durable audit delivery origin is not an exact task participant' };
+  }
+  const target = input.sessions.find((session) => (
+    session.name === record.target.sessionName
+    && session.sessionInstanceId === record.target.sessionInstanceId
+    && session.runtimeEpoch === record.target.runtimeEpoch
+  ));
+  const targetIdentity = target ? supervisionTaskIdentityForTarget(target) : undefined;
+  if (!target || !targetIdentity
+    || (target.runtimeType ?? getSessionRuntimeType(target.agentType)) !== 'transport'
+    || target.projectName !== input.task.projectName
+    || target.name === input.implementer.identity.sessionName) {
+    return { status: 'blocked', reason: 'durable audit delivery target is not the exact live transport auditor' };
+  }
+  const expectedMessageId = deterministicAutomaticAuditDeliveryMessageId(
+    record.assignmentId,
+    input.attemptId,
+    1,
+  );
+  if (record.messageId !== expectedMessageId) {
+    return { status: 'blocked', reason: 'durable audit delivery message id does not match its exact binding' };
+  }
+  const auditedSession = input.sessions.find((session) => session.name === input.implementer.identity.sessionName);
+  const auditedFamily = auditedSession
+    ? resolvePeerAuditProviderFamily(auditedSession)
+    : input.implementer.identity.providerFamily;
+  if (input.task.auditPolicy === 'auto_strict_cross_vendor'
+    && targetIdentity.providerFamily === auditedFamily) {
+    return { status: 'blocked', reason: 'durable audit delivery violates strict cross-vendor routing' };
+  }
+  const existing = input.registry.getAssignment(record.assignmentId);
+  if (existing) {
+    return existing.role === 'auditor'
+      && existing.taskId === input.task.taskId
+      && existing.auditAttemptId === input.attemptId
+      && existing.auditRevision === input.revision
+      && boundDelegationIdentityMatches(record.target, existing.identity)
+      ? { status: 'adopted', assignment: existing, messageId: expectedMessageId }
+      : { status: 'blocked', reason: 'durable audit delivery binding conflicts with the task registry' };
+  }
+  const created = input.registry.createAssignment({
+    assignmentId: record.assignmentId,
+    taskId: input.task.taskId,
+    role: 'auditor',
+    required: false,
+    identity: targetIdentity,
+    auditAttemptId: input.attemptId,
+    auditRevision: input.revision,
+    idempotencyKey: `adopt-durable-audit:${record.messageId}`,
+  });
+  if (!created.ok) {
+    const replay = input.registry.getAssignment(record.assignmentId);
+    if (replay?.role === 'auditor'
+      && replay.taskId === input.task.taskId
+      && replay.auditAttemptId === input.attemptId
+      && replay.auditRevision === input.revision
+      && boundDelegationIdentityMatches(record.target, replay.identity)) {
+      return { status: 'adopted', assignment: replay, messageId: expectedMessageId };
+    }
+    return { status: 'blocked', reason: `durable audit delivery adoption rejected: ${created.reason}` };
+  }
+  return { status: 'adopted', assignment: created.value, messageId: expectedMessageId };
 }
 
 interface AutomaticAuditTransportTargets {
@@ -2948,6 +3075,27 @@ export async function dispatchReadyAudit(
     return { status: 'blocked', reason, reported };
   }
   const existingAudit = existingAudits[0];
+  const adopted = adoptExactDurableAuditDelivery({
+    task,
+    implementer,
+    attemptId,
+    revision,
+    sessions,
+    registry,
+    deps,
+  });
+  if (adopted.status === 'blocked') {
+    const reported = await reportBlocker(implementer, adopted.reason);
+    return { status: 'blocked', reason: adopted.reason, reported };
+  }
+  if (adopted.status === 'adopted') {
+    return {
+      status: 'replayed',
+      assignmentId: adopted.assignment.assignmentId,
+      attemptId,
+      messageId: adopted.messageId,
+    };
+  }
   let recoveredExistingMessageId: SendMessageId | undefined;
   // A Brain may have used the documented manual fallback after an automatic
   // routing failure. Its live exact assignment is authoritative and must not

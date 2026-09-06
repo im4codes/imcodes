@@ -63,7 +63,10 @@ export const SUPERVISION_INTENT_TRANSITIONS: Readonly<Record<SupervisionIntent, 
   // A passed validation is a lifecycle edge, not merely an annotation. The
   // resolver keeps failed/unavailable observations non-advancing below.
   record_validation: { from: ['implementing', 'retrying_external_ci', 'rework'], to: 'validated' },
-  open_audit: { from: ['implementing', 'validated'], to: 'ready_for_audit' },
+  // Replaying the same handoff is convergence, not a second audit request.
+  // The registry/dispatcher still require the exact task, assignment and
+  // current revision before any auditor can be adopted or materialised.
+  open_audit: { from: ['implementing', 'validated', 'ready_for_audit'], to: 'ready_for_audit' },
   checkpoint: { from: [...SUPERVISION_TASK_LIFECYCLE_STATUSES], to: null },
   finish: { from: ['integrating', 'finalizing', 'committed', 'pushed'], to: 'finalized' },
   cancel: {

@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   sessions: new Map<string, Record<string, unknown>>(),
   runtime: undefined as undefined | {
     deliverDelegationNotification: ReturnType<typeof vi.fn>;
+    send?: ReturnType<typeof vi.fn>;
+    recipientIdentity?: { sessionInstanceId: string; runtimeEpoch: string };
   },
   restoredRuntime: undefined as undefined | {
     deliverDelegationNotification: ReturnType<typeof vi.fn>;
@@ -34,6 +36,8 @@ const mocks = vi.hoisted(() => ({
   appendMatchingAuditReceipt: vi.fn(),
   finishAssignment: vi.fn(),
   getAssignment: vi.fn(),
+  queueSnapshot: vi.fn(() => ({ pendingMessageEntries: [] })),
+  hasDeliveryTombstone: vi.fn(() => false),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -52,6 +56,13 @@ vi.mock('../../src/daemon/delegation-reply-store.js', async (importOriginal) => 
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: mocks.timelineEmit },
+}));
+
+vi.mock('../../src/daemon/transport-queue-store.js', () => ({
+  getTransportQueueStore: () => ({
+    readSnapshot: mocks.queueSnapshot,
+    hasDeliveryTombstone: mocks.hasDeliveryTombstone,
+  }),
 }));
 
 vi.mock('../../src/daemon/supervision-state-store.js', () => ({
@@ -145,6 +156,8 @@ describe('delegation reply ingress', () => {
     mocks.appendMatchingAuditReceipt.mockReset().mockReturnValue({ ok: true, value: {} });
     mocks.finishAssignment.mockReset().mockReturnValue({ ok: true, value: {}, replay: false });
     mocks.getAssignment.mockReset();
+    mocks.queueSnapshot.mockReset().mockReturnValue({ pendingMessageEntries: [] });
+    mocks.hasDeliveryTombstone.mockReset().mockReturnValue(false);
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
   });
 
@@ -747,6 +760,94 @@ describe('delegation reply ingress', () => {
     );
   });
 
+  it('moves a task-bound structured reply into one durable Brain FIFO entry instead of polling native admission', async () => {
+    const taskRecord = {
+      ...record,
+      taskId: 'tsk_f1u',
+      assignmentId: 'asg_f1v',
+      coordinatorAssignmentId: 'asg_f1u_brain',
+      auditRevision: 'revision-f1u',
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: taskRecord.assignmentId,
+      taskId: taskRecord.taskId,
+      role: 'implementer',
+      status: 'blocked',
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
+    const send = vi.fn(() => 'queued');
+    mocks.runtime = {
+      recipientIdentity: { sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch },
+      deliverDelegationNotification: vi.fn(async () => AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED),
+      send,
+    };
+    mocks.queueSnapshot
+      .mockReturnValueOnce({ pendingMessageEntries: [] })
+      .mockReturnValue({
+        pendingMessageEntries: [{ clientMessageId: taskRecord.notificationId, status: 'queued' }],
+      });
+
+    await expect(submitDelegationReply({
+      rawBody: envelope,
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true, pending: true }));
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith(
+      expect.stringContaining(taskRecord.result),
+      taskRecord.notificationId,
+      undefined,
+      undefined,
+      expect.objectContaining({
+        timelineCommitted: true,
+        historyCommitted: true,
+        delegationReply: { delegationId: taskRecord.delegationId },
+      }),
+    );
+    expect(mocks.runtime.deliverDelegationNotification).not.toHaveBeenCalled();
+    expect(mocks.store.markDelivered).toHaveBeenCalledWith(
+      taskRecord.delegationId,
+      taskRecord.notificationId,
+    );
+  });
+
+  it('closes a boot-swept task-bound reply from the existing exact FIFO entry without waking twice', async () => {
+    const taskRecord = {
+      ...record,
+      taskId: 'tsk_f1u',
+      assignmentId: 'asg_f1v',
+      coordinatorAssignmentId: 'asg_f1u_brain',
+      auditRevision: 'revision-f1u',
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: taskRecord.assignmentId,
+      taskId: taskRecord.taskId,
+      role: 'implementer',
+      status: 'blocked',
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
+    mocks.queueSnapshot.mockReturnValue({
+      pendingMessageEntries: [{ clientMessageId: taskRecord.notificationId, status: 'queued' }],
+    });
+    const send = vi.fn(() => 'queued');
+    mocks.runtime = {
+      recipientIdentity: { sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch },
+      deliverDelegationNotification: vi.fn(),
+      send,
+    };
+
+    await expect(submitDelegationReply({
+      rawBody: envelope,
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true, pending: true }));
+
+    await vi.waitFor(() => expect(mocks.store.markDelivered).toHaveBeenCalledOnce());
+    expect(send).not.toHaveBeenCalled();
+    expect(mocks.runtime.deliverDelegationNotification).not.toHaveBeenCalled();
+  });
+
   it('keeps the durable receipt pending when native notification admission throws', async () => {
     mocks.runtime = {
       deliverDelegationNotification: vi.fn(async () => {
@@ -887,6 +988,7 @@ describe('delegation reply ingress', () => {
       mocks.runtime = {
         recipientIdentity: { sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch },
         deliverDelegationNotification: vi.fn(async () => AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED),
+        send: vi.fn(() => 'sent'),
       };
 
       const result = await submitDelegationReply({
@@ -894,7 +996,8 @@ describe('delegation reply ingress', () => {
         senderSessionName: target.sessionName,
       });
 
-      expect(mocks.runtime.deliverDelegationNotification).toHaveBeenCalled();
+      expect(mocks.runtime.send).toHaveBeenCalled();
+      expect(mocks.runtime.deliverDelegationNotification).not.toHaveBeenCalled();
       expect(result).toMatchObject({ ok: true });
     });
   });

@@ -37,6 +37,10 @@ import {
   getTransportQueueStore,
   resetTransportQueueStoreForTests,
 } from '../../src/daemon/transport-queue-store.js';
+import {
+  getDelegationReplyStore,
+  resetDelegationReplyStoreForTests,
+} from '../../src/daemon/delegation-reply-store.js';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
 
 const require = createRequire(import.meta.url);
@@ -171,6 +175,7 @@ function makeReadyTask(options: {
 beforeEach(() => {
   resetSupervisionTaskRegistryForTests();
   resetTransportQueueStoreForTests();
+  resetDelegationReplyStoreForTests();
   clearSendIdempotencyCacheForTests();
 });
 
@@ -1089,6 +1094,65 @@ describe('automatic supervision audit materialization', () => {
     expect(swept).toEqual([expect.objectContaining({ status: 'replayed' })]);
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+  });
+
+  it('adopts one exact durable audit delivery when its auditor row was not materialized (tsk_f1x)', async () => {
+    const { registry, taskId, revision } = makeReadyTask({
+      taskId: 'tsk_f1x',
+      revision: 'supervision-preamble-headroom-cx5-r1-789e8604748b',
+      auditPolicy: 'auto_strict_cross_vendor',
+    });
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_cc11', 'w2', 'claude-code-sdk', 'anthropic');
+    const attemptId = automaticAttempt(taskId, revision);
+    const assignmentId = 'asg_f1x_durable_auditor';
+    const messageId = deterministicAutomaticAuditDeliveryMessageId(assignmentId, attemptId, 1);
+    getDelegationReplyStore().create({
+      taskId,
+      assignmentId,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      auditedSessionName: worker.name,
+      messageId,
+      origin: {
+        sessionName: brain.name,
+        sessionInstanceId: brain.sessionInstanceId!,
+        runtimeEpoch: brain.runtimeEpoch!,
+      },
+      target: {
+        sessionName: auditor.name,
+        sessionInstanceId: auditor.sessionInstanceId!,
+        runtimeEpoch: auditor.runtimeEpoch!,
+      },
+      dispatchId: 'dispatch-f1x-durable',
+      now: 100,
+    });
+    const dispatch = vi.fn();
+    const deps = {
+      registry,
+      listSessions: () => [brain, worker, auditor],
+      listTargets: listTargetRecords(auditor),
+      dispatch,
+    };
+
+    const first = await dispatchReadyAudit(taskId, deps);
+    const second = await dispatchReadyAudit(taskId, deps);
+
+    expect(first).toEqual({ status: 'replayed', assignmentId, attemptId, messageId });
+    expect(second).toEqual(first);
+    expect(dispatch, 'the already-durable brief must not be redelivered').not.toHaveBeenCalled();
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([
+      expect.objectContaining({
+        assignmentId,
+        taskId,
+        role: 'auditor',
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+        identity: expect.objectContaining({ sessionName: auditor.name }),
+      }),
+    ]);
   });
 
   it.each([

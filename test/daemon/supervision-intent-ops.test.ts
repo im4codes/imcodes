@@ -21,6 +21,18 @@ describe('intent resolution', () => {
       .toMatchObject({ ok: true, toStatus: 'ready_for_audit' });
   });
 
+  it('replays open_audit idempotently after the exact handoff is already ready', () => {
+    expect(resolveSupervisionIntent({
+      request: { intent: 'open_audit', taskId: 'tsk_f1u', assignmentId: 'asg_f1v' },
+      currentStatus: 'ready_for_audit',
+    })).toEqual({
+      ok: true,
+      intent: 'open_audit',
+      fromStatus: 'ready_for_audit',
+      toStatus: 'ready_for_audit',
+    });
+  });
+
   it('REFUSES a model-supplied status outright, before anything else', () => {
     const out = resolveSupervisionIntent({
       request: { intent: 'start', taskId: 't', status: 'finalized' }, currentStatus: 'planned',
