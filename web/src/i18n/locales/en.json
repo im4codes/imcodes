@@ -861,6 +861,7 @@
     "identitySaveAfterCreate": "Saved after the session is created",
     "identityTooLargeScoped": "Identity must be valid UTF-8 text within {{limit}} characters and 120,000 bytes.",
     "identityCreateSaveFailed": "The session started, but its session identity could not be saved.",
+    "identityCreateApplyFailed": "The session started and its identity was saved online, but the daemon did not confirm applying it. Retry in session settings before sending a message.",
     "identityApply": "Apply identity"
   },
   "server": {
@@ -3556,6 +3557,10 @@
     "viewers": "{{count}} viewing",
     "controllers": "{{count}} controlling",
     "diagnostics": "Connection diagnostics",
+    "connection_optimizing": "Optimizing connection…",
+    "nerd_stats": "Nerd",
+    "nerd_stats_show": "Show Nerd stats",
+    "nerd_stats_hide": "Hide Nerd stats",
     "route": "Route: {{route}}",
     "encoder": "Encoder: {{encoder}}",
     "quality": "Quality: {{preset}}",

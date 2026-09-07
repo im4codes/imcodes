@@ -10695,6 +10695,47 @@ button.quick-agent-delegation-preset.active {
   border-top: 1px solid rgb(122 178 218 / 14%);
 }
 
+.remote-desktop-connection-summary {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.remote-desktop-connection-summary > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.remote-desktop-connection-summary > span::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #64d2a4;
+  box-shadow: 0 0 8px rgb(100 210 164 / 60%);
+}
+
+.remote-desktop-nerd-toggle {
+  margin-left: auto;
+  padding: 2px 8px;
+  color: #8fb4d0;
+  background: transparent;
+  border: 1px solid rgb(122 178 218 / 20%);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.remote-desktop-nerd-toggle:hover,
+.remote-desktop-nerd-toggle[aria-expanded="true"] {
+  color: #d9f3ff;
+  background: rgb(79 193 235 / 10%);
+  border-color: rgb(79 193 235 / 34%);
+}
+
 .remote-desktop-file-drawer {
   position: absolute;
   z-index: 12;
@@ -11227,6 +11268,7 @@ button.quick-agent-delegation-preset.active {
 /* Telemetry reads as instrument fields, not a paragraph: each fact is its own
    chip with a hairline separator, so a glance can find one number. */
 .remote-desktop-diagnostics {
+  flex: 1 0 100%;
   gap: 0 14px;
   row-gap: 6px;
   color: #8fb4d0;

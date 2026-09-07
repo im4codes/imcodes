@@ -637,8 +637,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(stopButton?.classList.contains('subsession-close-btn')).toBe(true);
   });
 
-  it('moves audience facts into bottom diagnostics without counting controllers as viewers', async () => {
-    const { container } = await renderPanel();
+  it('hides connection diagnostics behind the Nerd toggle by default', async () => {
+    const { container, getByRole } = await renderPanel();
     act(() => clientHooks.at(-1)?.onSnapshot({
       state: REMOTE_DESKTOP_STATE.DIRECT,
       mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
@@ -654,6 +654,16 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
     expect(container.querySelector('.remote-desktop-header')).toBeNull();
     expect(container.querySelector('.remote-desktop-presence')).toBeNull();
+    expect(container.querySelector('.remote-desktop-connection-summary')?.textContent)
+      .toContain('remote_desktop.connection_optimizing');
+    expect(container.querySelector('.remote-desktop-diagnostics')).toBeNull();
+    expect(container.querySelector('[data-viewer-count="1"]')).toBeNull();
+    const toggle = getByRole('button', { name: 'remote_desktop.nerd_stats_show' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    act(() => (toggle as HTMLButtonElement).click());
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(container.querySelector('[data-viewer-count="1"]')?.closest('footer')).not.toBeNull();
     expect(container.querySelector('[data-controller-count="1"]')?.closest('footer')).not.toBeNull();
   });
@@ -920,6 +930,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       rawCapability: 'secret-capability-marker',
       inputHistory: 'KeyA',
     }));
+    expect(container.querySelector('.remote-desktop-diagnostics')).toBeNull();
+    act(() => (container.querySelector('.remote-desktop-nerd-toggle') as HTMLButtonElement).click());
     const diagnostics = container.querySelector('.remote-desktop-diagnostics');
     expect(diagnostics?.textContent).toContain('1920×1080');
     expect(diagnostics?.textContent).toContain('29 FPS');
@@ -1794,7 +1806,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       stream: null,
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
     }));
-    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    expect(container.textContent).toContain('remote_desktop.connection_retrying');
     // The closing client may publish another terminal snapshot after the retry
     // timer was armed. It must not replace the recovery UI with worker_failed.
     act(() => clientHooks[0]!.onSnapshot({
@@ -1807,7 +1819,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       stream: null,
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
     }));
-    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    expect(container.textContent).toContain('remote_desktop.connection_retrying');
     expect(container.textContent).not.toContain('remote_desktop.failed');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(
@@ -1841,9 +1853,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_STABILITY_RESET_MS);
     });
-    expect(container.textContent).toContain('remote_desktop.reconnects');
     act(() => clientHooks[1]!.onSnapshot(failed));
-    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    expect(container.textContent).toContain('remote_desktop.connection_retrying');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS);
     });
@@ -1866,7 +1877,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
     for (let attempt = 0; attempt < REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS; attempt++) {
       act(() => clientHooks[attempt]!.onSnapshot(failed));
-      expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+      expect(container.textContent).toContain('remote_desktop.connection_retrying');
       await act(async () => {
         await vi.advanceTimersByTimeAsync(
           REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS * (2 ** attempt),
@@ -1891,7 +1902,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     expect(clientHooks).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 2);
     expect(clientStarts.at(-1)).toBe(1);
-    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    expect(container.textContent).toContain('remote_desktop.connection_retrying');
   });
 
   it('treats a local-user Stop as terminal instead of reconnecting', async () => {

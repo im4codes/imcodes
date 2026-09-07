@@ -861,6 +861,7 @@
     "identitySaveAfterCreate": "Guardar tras crear la sesión",
     "identityTooLargeScoped": "La identidad debe ser texto UTF-8 válido de hasta {{limit}} caracteres y 120.000 bytes.",
     "identityCreateSaveFailed": "La sesión comenzó, pero no se pudo guardar su identidad.",
+    "identityCreateApplyFailed": "La sesión comenzó y la identidad se guardó en línea, pero el daemon no confirmó su aplicación. Reinténtalo en los ajustes antes de enviar un mensaje.",
     "identityApply": "Aplicar identidad"
   },
   "server": {
@@ -3556,6 +3557,10 @@
     "viewers": "{{count}} viendo",
     "controllers": "{{count}} controlando",
     "diagnostics": "Diagnóstico de conexión",
+    "connection_optimizing": "Optimizando la conexión…",
+    "nerd_stats": "Nerd",
+    "nerd_stats_show": "Mostrar estadísticas Nerd",
+    "nerd_stats_hide": "Ocultar estadísticas Nerd",
     "route": "Ruta: {{route}}",
     "encoder": "Codificador: {{encoder}}",
     "quality": "Calidad: {{preset}}",

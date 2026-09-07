@@ -861,6 +861,7 @@
     "identitySaveAfterCreate": "세션 생성 후 저장",
     "identityTooLargeScoped": "ID는 {{limit}}자 및 120,000바이트 이내의 유효한 UTF-8 텍스트여야 합니다.",
     "identityCreateSaveFailed": "세션은 시작되었지만 세션 ID를 저장하지 못했습니다.",
+    "identityCreateApplyFailed": "세션이 시작되고 ID가 온라인에 저장되었지만 daemon이 적용을 확인하지 않았습니다. 메시지를 보내기 전에 세션 설정에서 다시 시도하세요.",
     "identityApply": "ID 적용"
   },
   "server": {
@@ -3555,6 +3556,10 @@
     "viewers": "{{count}}명 보는 중",
     "controllers": "{{count}}명 제어 중",
     "diagnostics": "연결 진단",
+    "connection_optimizing": "연결 최적화 중…",
+    "nerd_stats": "Nerd",
+    "nerd_stats_show": "Nerd 통계 표시",
+    "nerd_stats_hide": "Nerd 통계 숨기기",
     "route": "경로: {{route}}",
     "encoder": "인코더: {{encoder}}",
     "quality": "화질: {{preset}}",

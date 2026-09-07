@@ -861,6 +861,7 @@
     "identitySaveAfterCreate": "建立會話後儲存",
     "identityTooLargeScoped": "身份內容必須是有效 UTF-8 文字，不超過 {{limit}} 字元和 120,000 位元組。",
     "identityCreateSaveFailed": "會話已啟動，但會話身份儲存失敗。",
+    "identityCreateApplyFailed": "會話已啟動且身份已線上儲存，但 daemon 未確認已套用。請先在會話設定中重試，再傳送訊息。",
     "identityApply": "套用身份"
   },
   "server": {
@@ -3556,6 +3557,10 @@
     "viewers": "{{count}} 人觀看",
     "controllers": "{{count}} 人控制",
     "diagnostics": "連線診斷",
+    "connection_optimizing": "正在最佳化連線…",
+    "nerd_stats": "Nerd",
+    "nerd_stats_show": "顯示 Nerd 統計",
+    "nerd_stats_hide": "隱藏 Nerd 統計",
     "route": "路徑：{{route}}",
     "encoder": "編碼器：{{encoder}}",
     "quality": "畫質：{{preset}}",

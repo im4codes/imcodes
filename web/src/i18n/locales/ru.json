@@ -861,6 +861,7 @@
     "identitySaveAfterCreate": "Сохранить после создания",
     "identityTooLargeScoped": "Идентификатор должен быть текстом UTF-8 до {{limit}} символов и 120 000 байт.",
     "identityCreateSaveFailed": "Сеанс запущен, но его идентификатор не удалось сохранить.",
+    "identityCreateApplyFailed": "Сеанс запущен, идентификатор сохранён онлайн, но daemon не подтвердил его применение. Повторите попытку в настройках сеанса перед отправкой сообщения.",
     "identityApply": "Применить идентификатор"
   },
   "server": {
@@ -3555,6 +3556,10 @@
     "viewers": "Смотрят: {{count}}",
     "controllers": "Управляют: {{count}}",
     "diagnostics": "Диагностика подключения",
+    "connection_optimizing": "Оптимизация соединения…",
+    "nerd_stats": "Nerd",
+    "nerd_stats_show": "Показать Nerd-статистику",
+    "nerd_stats_hide": "Скрыть Nerd-статистику",
     "route": "Маршрут: {{route}}",
     "encoder": "Кодировщик: {{encoder}}",
     "quality": "Качество: {{preset}}",

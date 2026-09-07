@@ -333,6 +333,7 @@ export function RemoteDesktopPanel({
   const [mediaRecovering, setMediaRecovering] = useState(false);
   const [hasCachedFrame, setHasCachedFrame] = useState(false);
   const [desktopMaximized, setDesktopMaximized] = useState(false);
+  const [nerdStatsOpen, setNerdStatsOpen] = useState(false);
   const [controlNotice, setControlNotice] = useState<{ id: number; text: string } | null>(null);
   const clientRef = useRef<RemoteDesktopManagedConnection | null>(null);
   const ownedConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
@@ -2703,50 +2704,67 @@ export function RemoteDesktopPanel({
         )}
 
         <footer class="remote-desktop-footer">
-          <div class="remote-desktop-diagnostics" aria-label={t('remote_desktop.diagnostics')}>
-            <span class="remote-desktop-diagnostic-machine">{machine.displayName}</span>
-            <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
-            <span aria-live="polite" data-viewer-count={viewerCount}>{t('remote_desktop.viewers', { count: viewerCount })}</span>
-            <span aria-live="polite" data-controller-count={controllerCount}>{t('remote_desktop.controllers', { count: controllerCount })}</span>
-            <span>{t('remote_desktop.route', { route: snapshot.route ?? '—' })}</span>
-            {selectedDisplay && <span>{selectedDisplay.width}×{selectedDisplay.height} · {Math.round(selectedDisplay.dpiScale * 100)}% DPI</span>}
-            {snapshot.quality && (
-              <>
-                <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
-                <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
-                <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
-                <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
-                <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
-              </>
-            )}
-            {snapshot.pointerMovesSent !== undefined && (
-              <span>{t('remote_desktop.pointer_move_connection', {
-                calls: snapshot.pointerMoveCalls ?? 0,
-                sent: snapshot.pointerMovesSent,
-                mirrored: snapshot.pointerMovesMirrored ?? 0,
-                gate: snapshot.pointerMoveGateRejected ?? 0,
-                channel: snapshot.pointerMoveChannelUnavailable ?? 0,
-                backpressure: snapshot.pointerMoveBackpressureDrops ?? 0,
-                failed: snapshot.pointerMoveSendFailures ?? 0,
-              })}</span>
-            )}
-            <span title={`window mouse ${pointerMoveIngressBySource['window-mouse']} · window pointer ${pointerMoveIngressBySource['window-pointer']} · stage mouse ${pointerMoveIngressBySource['stage-mouse']} · stage pointer ${pointerMoveIngressBySource['stage-pointer']}`}>
-              {t('remote_desktop.pointer_move_browser', {
-                ingress: pointerMovesIngress,
-                accepted: pointerMovesSeen,
-                unmapped: pointerMovesUnmapped,
-                outside: pointerMovesOutside,
-              })}
-            </span>
-            {/* Belongs with the session's other facts, not in the toolbar
-                between the buttons it explains. */}
-            {inputBlockedHint() && (
-              <span class="remote-desktop-input-blocked">{inputBlockedHint()}</span>
-            )}
-            <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
-            <span>{t('remote_desktop.reconnects', { count: snapshot.reconnectCount ?? 0 })}</span>
-            <span>{t('remote_desktop.capability', { version: snapshot.capabilityVersion ?? REMOTE_DESKTOP_CAPABILITY })}</span>
+          <div class="remote-desktop-connection-summary">
+            <span aria-live="polite">{t('remote_desktop.connection_optimizing')}</span>
+            <button
+              type="button"
+              class="remote-desktop-nerd-toggle"
+              aria-label={t(nerdStatsOpen
+                ? 'remote_desktop.nerd_stats_hide'
+                : 'remote_desktop.nerd_stats_show')}
+              aria-expanded={nerdStatsOpen}
+              aria-controls={`remote-desktop-diagnostics-${machine.serverId}`}
+              onClick={() => setNerdStatsOpen((open) => !open)}
+            >{t('remote_desktop.nerd_stats')}</button>
           </div>
+          {nerdStatsOpen && (
+            <div
+              id={`remote-desktop-diagnostics-${machine.serverId}`}
+              class="remote-desktop-diagnostics"
+              aria-label={t('remote_desktop.diagnostics')}
+            >
+              <span class="remote-desktop-diagnostic-machine">{machine.displayName}</span>
+              <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
+              <span aria-live="polite" data-viewer-count={viewerCount}>{t('remote_desktop.viewers', { count: viewerCount })}</span>
+              <span aria-live="polite" data-controller-count={controllerCount}>{t('remote_desktop.controllers', { count: controllerCount })}</span>
+              <span>{t('remote_desktop.route', { route: snapshot.route ?? '—' })}</span>
+              {selectedDisplay && <span>{selectedDisplay.width}×{selectedDisplay.height} · {Math.round(selectedDisplay.dpiScale * 100)}% DPI</span>}
+              {snapshot.quality && (
+                <>
+                  <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
+                  <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
+                  <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
+                  <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
+                  <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
+                </>
+              )}
+              {snapshot.pointerMovesSent !== undefined && (
+                <span>{t('remote_desktop.pointer_move_connection', {
+                  calls: snapshot.pointerMoveCalls ?? 0,
+                  sent: snapshot.pointerMovesSent,
+                  mirrored: snapshot.pointerMovesMirrored ?? 0,
+                  gate: snapshot.pointerMoveGateRejected ?? 0,
+                  channel: snapshot.pointerMoveChannelUnavailable ?? 0,
+                  backpressure: snapshot.pointerMoveBackpressureDrops ?? 0,
+                  failed: snapshot.pointerMoveSendFailures ?? 0,
+                })}</span>
+              )}
+              <span title={`window mouse ${pointerMoveIngressBySource['window-mouse']} · window pointer ${pointerMoveIngressBySource['window-pointer']} · stage mouse ${pointerMoveIngressBySource['stage-mouse']} · stage pointer ${pointerMoveIngressBySource['stage-pointer']}`}>
+                {t('remote_desktop.pointer_move_browser', {
+                  ingress: pointerMovesIngress,
+                  accepted: pointerMovesSeen,
+                  unmapped: pointerMovesUnmapped,
+                  outside: pointerMovesOutside,
+                })}
+              </span>
+              {inputBlockedHint() && (
+                <span class="remote-desktop-input-blocked">{inputBlockedHint()}</span>
+              )}
+              <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
+              <span>{t('remote_desktop.reconnects', { count: snapshot.reconnectCount ?? 0 })}</span>
+              <span>{t('remote_desktop.capability', { version: snapshot.capabilityVersion ?? REMOTE_DESKTOP_CAPABILITY })}</span>
+            </div>
+          )}
         </footer>
       </div>
   );

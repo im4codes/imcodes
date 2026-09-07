@@ -861,6 +861,7 @@
     "identitySaveAfterCreate": "创建会话后保存",
     "identityTooLargeScoped": "身份内容必须是有效 UTF-8 文本，不超过 {{limit}} 字符和 120,000 字节。",
     "identityCreateSaveFailed": "会话已启动，但会话身份保存失败。",
+    "identityCreateApplyFailed": "会话已启动且身份已在线保存，但 daemon 未确认已应用。请先在会话设置中重试，再发送消息。",
     "identityApply": "应用身份"
   },
   "server": {
@@ -3556,6 +3557,10 @@
     "viewers": "{{count}} 人观看",
     "controllers": "{{count}} 人控制",
     "diagnostics": "连接诊断",
+    "connection_optimizing": "优化连接中…",
+    "nerd_stats": "Nerd",
+    "nerd_stats_show": "显示 Nerd 统计",
+    "nerd_stats_hide": "隐藏 Nerd 统计",
     "route": "链路：{{route}}",
     "encoder": "编码器：{{encoder}}",
     "quality": "画质：{{preset}}",

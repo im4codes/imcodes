@@ -861,6 +861,7 @@
     "identitySaveAfterCreate": "セッション作成後に保存",
     "identityTooLargeScoped": "ID は {{limit}} 文字、120,000 バイト以内の有効な UTF-8 テキストにしてください。",
     "identityCreateSaveFailed": "セッションは開始しましたが、ID を保存できませんでした。",
+    "identityCreateApplyFailed": "セッションは開始され ID はオンラインに保存されましたが、daemon が適用を確認しませんでした。メッセージ送信前にセッション設定で再試行してください。",
     "identityApply": "ID を適用"
   },
   "server": {
@@ -3555,6 +3556,10 @@
     "viewers": "表示中 {{count}} 人",
     "controllers": "操作中 {{count}} 人",
     "diagnostics": "接続診断",
+    "connection_optimizing": "接続を最適化中…",
+    "nerd_stats": "Nerd",
+    "nerd_stats_show": "Nerd 統計を表示",
+    "nerd_stats_hide": "Nerd 統計を非表示",
     "route": "経路: {{route}}",
     "encoder": "エンコーダー: {{encoder}}",
     "quality": "画質: {{preset}}",
