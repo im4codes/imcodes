@@ -92,6 +92,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sessionExists: sessionExistsMock,
   capturePane: capturePaneMock,
   sendKey: vi.fn().mockResolvedValue(undefined),
+  sendKeys: vi.fn().mockResolvedValue(undefined),
   getPanePids: vi.fn().mockResolvedValue([]),
   getPaneId: vi.fn().mockResolvedValue('%resource-pane'),
 }));
@@ -238,6 +239,21 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     expect(upsertSession).toHaveBeenCalledWith(
       expect.objectContaining({ ccSessionId: 'abc-uuid-123' }),
     );
+  });
+
+  it('persists a process sub-session startup identity for restart reinjection', async () => {
+    await startSubSession({
+      id: 'identity-contract',
+      type: 'claude-code',
+      cwd: '/proj',
+      identityPrompt: 'You are the release engineer.',
+      provisionedIdentityHash: 'identity-sha256',
+    });
+
+    expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      identityPrompt: 'You are the release engineer.',
+      provisionedIdentityHash: 'identity-sha256',
+    }));
   });
 
   it('calls startWatchingFile (not startWatching) for cc sub-session with ccSessionId', async () => {
@@ -464,6 +480,7 @@ describe('startSubSession — transport SDK agents do not use tmux', () => {
       ccSessionId: 'cc-sdk-session-id',
       parentSession: 'deck_proj_brain',
       description: 'SDK test',
+      identityPrompt: 'You are the release engineer.',
     });
 
     expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -473,12 +490,49 @@ describe('startSubSession — transport SDK agents do not use tmux', () => {
       projectName: 'proj',
       parentSession: 'deck_proj_brain',
       description: 'SDK test',
+      identityPrompt: 'You are the release engineer.',
       fresh: true,
       userCreated: true,
     }));
     expect(String(launchTransportSessionMock.mock.calls[0][0].ccSessionId)).toMatch(/^[0-9a-f-]{36}$/);
     expect(getDriverMock).not.toHaveBeenCalled();
     expect(newSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('persists the auto-provision identity digest after a transport launch', async () => {
+    let childReads = 0;
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') return { name, projectName: 'proj' };
+      if (name !== 'deck_sub_sdk-identity') return null;
+      childReads += 1;
+      return childReads === 1 ? null : {
+        name,
+        projectName: 'proj',
+        role: 'w1',
+        agentType: 'claude-code-sdk',
+        projectDir: '/proj',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: 1,
+        updatedAt: 1,
+      };
+    });
+
+    await startSubSession({
+      id: 'sdk-identity',
+      type: 'claude-code-sdk',
+      cwd: '/proj',
+      parentSession: 'deck_proj_brain',
+      identityPrompt: 'You are the release engineer.',
+      provisionedIdentityHash: 'identity-sha256',
+      fresh: true,
+    });
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_sdk-identity',
+      provisionedIdentityHash: 'identity-sha256',
+    }));
   });
 });
 

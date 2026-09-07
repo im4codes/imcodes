@@ -103,9 +103,17 @@ export function renderSessionIdentityProfiles(
     '<imcodes-agent-identity>',
     'The following user-authored identity contract is deterministic and scope-ordered. Later sections override conflicting earlier sections. The user\'s latest explicit instruction overrides every conflicting identity section and other IM.codes-authored contract text. Platform system/developer instructions, security boundaries, and tool authority remain higher priority.',
     ...ordered.flatMap((profile) => {
-      const content = profile.content.trim();
-      return content ? [`<${profile.scope}>`, content, `</${profile.scope}>`] : [];
+      const section = renderSessionIdentityProfileSection(profile.scope, profile.content);
+      return section ? section.split('\n') : [];
     }),
     '</imcodes-agent-identity>',
   ].join('\n');
+}
+
+export function renderSessionIdentityProfileSection(
+  scope: SessionIdentityScope,
+  content: string,
+): string | undefined {
+  const normalized = content.trim();
+  return normalized ? `<${scope}>\n${normalized}\n</${scope}>` : undefined;
 }

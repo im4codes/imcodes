@@ -16,6 +16,10 @@ import {
 } from '../../src/daemon/supervision-auto-provision.js';
 import type { SubSessionRecord } from '../../src/daemon/subsession-manager.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
+import {
+  SESSION_IDENTITY_SCOPES,
+  renderSessionIdentityProfileSection,
+} from '../../shared/session-identity.js';
 
 const NOW = 1_800_000_000_000;
 
@@ -97,6 +101,8 @@ function harness(initial: SessionRecord[], override: Partial<SupervisionAutoProv
       providerId: sub.providerId ?? sub.type,
       activeModel: sub.requestedModel ?? undefined,
       ccPreset: sub.ccPreset ?? undefined,
+      identityPrompt: sub.identityPrompt ?? undefined,
+      provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
       projectDir: sub.cwd ?? '/repo',
     }));
   });
@@ -136,6 +142,76 @@ describe('supervision auto provisioning', () => {
     const manual = await provisionSupervisionTarget(request({ provenance: 'manual_explicit', idempotencyKey: 'manual' }), h.deps);
     expect(manual).toMatchObject({ ok: true });
     expect(h.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('manually provisions an explicitly selected SDK without configured pools and isolates startup identities', async () => {
+    const brain = session('deck_proj_brain', { role: 'brain', transportConfig: undefined });
+    let clock = NOW;
+    const h = harness([brain], { now: () => clock });
+    const first = await provisionSupervisionTarget(request({
+      provenance: 'manual_explicit',
+      requestedCapabilityId: ANTHROPIC.capabilityId,
+      requestedExecutionConfig: ANTHROPIC,
+      identityPrompt: 'You are the release engineer.',
+    }), h.deps);
+
+    expect(first).toMatchObject({
+      ok: true,
+      target: { agentType: 'claude-code-sdk', identityPrompt: 'You are the release engineer.' },
+      evidence: { selectedConfig: { ...ANTHROPIC, model: 'opus[1M]' }, origin: 'spawned' },
+    });
+    expect(h.start).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'claude-code-sdk',
+      requestedModel: 'opus[1M]',
+      identityPrompt: 'You are the release engineer.',
+    }));
+
+    clock += 2;
+    const second = await provisionSupervisionTarget(request({
+      provenance: 'manual_explicit',
+      idempotencyKey: 'task-2',
+      requestedCapabilityId: ANTHROPIC.capabilityId,
+      requestedExecutionConfig: ANTHROPIC,
+      identityPrompt: 'You are the security reviewer.',
+    }), h.deps);
+    expect(second).toMatchObject({ ok: true, evidence: { origin: 'spawned' } });
+    expect(second.ok && first.ok && second.target.name).not.toBe(first.ok ? first.target.name : '');
+    expect(h.start).toHaveBeenCalledTimes(2);
+
+    if (first.ok) {
+      first.target.provisionedIdentityHash = undefined;
+      first.target.identityPrompt = [
+        '<imcodes-agent-identity>',
+        renderSessionIdentityProfileSection(
+          SESSION_IDENTITY_SCOPES.SESSION,
+          'You are the release engineer.',
+        ),
+        '</imcodes-agent-identity>',
+      ].filter(Boolean).join('\n');
+    }
+    clock += 2;
+    const firstIdentityAgain = await provisionSupervisionTarget(request({
+      provenance: 'manual_explicit',
+      idempotencyKey: 'task-3',
+      requestedCapabilityId: ANTHROPIC.capabilityId,
+      requestedExecutionConfig: ANTHROPIC,
+      identityPrompt: 'You are the release engineer.',
+    }), h.deps);
+    expect(firstIdentityAgain).toMatchObject({
+      ok: true,
+      target: { name: first.ok ? first.target.name : '' },
+      evidence: { origin: 'reused' },
+    });
+    expect(h.start).toHaveBeenCalledTimes(2);
+
+    const automatic = await provisionSupervisionTarget(request({
+      provenance: 'automatic_supervision',
+      idempotencyKey: 'automatic-must-not-bypass',
+      requestedCapabilityId: ANTHROPIC.capabilityId,
+      requestedExecutionConfig: ANTHROPIC,
+    }), h.deps);
+    expect(automatic).toMatchObject({ ok: false, reason: 'no_selected_config' });
+    expect(h.start).toHaveBeenCalledTimes(2);
   });
 
   it('reuses an existing ready configured child without creating another session', async () => {

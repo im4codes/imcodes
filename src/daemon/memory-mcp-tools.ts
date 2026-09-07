@@ -134,7 +134,7 @@ import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
-import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
+import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
 import {
   inspectSupervisionAssignmentWorktree,
@@ -169,6 +169,7 @@ import {
 } from './alias-mcp-client.js';
 import {
   SESSION_IDENTITY_MAX_UTF8_BYTES,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS,
   SESSION_IDENTITY_SCOPE_LIST,
   SESSION_IDENTITY_SCOPES,
   isSessionIdentityScope,
@@ -1067,6 +1068,37 @@ async function readIdentityFile(
   return readFile(exact, 'utf8');
 }
 
+const SEND_IDENTITY_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['content', 'filePath']);
+
+async function parseSendIdentityArg(
+  value: unknown,
+  projectRoot: string | null,
+): Promise<SendMessageAgentIdentity | undefined | 'invalid'> {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !SEND_IDENTITY_ARG_ALLOWED_KEYS.has(key))) return 'invalid';
+  const inline = typeof record.content === 'string' && record.content.trim() ? record.content : undefined;
+  const filePath = typeof record.filePath === 'string' && record.filePath.trim() ? record.filePath.trim() : undefined;
+  if (Boolean(inline) === Boolean(filePath)) return 'invalid';
+  let content: string;
+  try {
+    if (filePath) {
+      if (!projectRoot || filePath.length > SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS) return 'invalid';
+      content = await readIdentityFile(filePath, projectRoot, true);
+    } else {
+      content = inline ?? '';
+    }
+  } catch {
+    return 'invalid';
+  }
+  if (sessionIdentityContentError(content, SESSION_IDENTITY_SCOPES.SESSION)) return 'invalid';
+  return {
+    content: normalizeSessionIdentityContent(content),
+    ...(filePath ? { sourceFile: filePath } : {}),
+  };
+}
+
 function canManageProjectionNamespace(projectionNamespace: ContextNamespace, callerNamespace: ContextNamespace, callerUserId: string): boolean {
   if (serializeContextNamespace(projectionNamespace) === serializeContextNamespace(callerNamespace)) return true;
   if (projectionNamespace.scope !== 'personal' || callerNamespace.scope !== 'personal') return false;
@@ -1840,13 +1872,15 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'task', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
       const audit = parseAuditArg(args.audit);
       if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
       const task = parseTaskArg(args.task);
       if (task === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task metadata is invalid');
+      const identity = await parseSendIdentityArg(args.identity, caller.projectRoot);
+      if (identity === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'identity is invalid');
       const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
       if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
       return dispatchSendMessage(caller, {
@@ -1856,6 +1890,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         reply: boolArg(args, 'reply'),
         ...(audit ? { audit } : {}),
         ...(task ? { task } : {}),
+        ...(identity ? { identity } : {}),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
         ...(deliveryMode ? { deliveryMode } : {}),
@@ -1863,6 +1898,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
+        applyProvisionedIdentity: async (target, provisionedIdentity) => {
+          const saved = await identitySet({
+            scope: SESSION_IDENTITY_SCOPES.SESSION,
+            scopeKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+            content: provisionedIdentity.content,
+            ...(provisionedIdentity.sourceFile ? { sourceFile: provisionedIdentity.sourceFile } : {}),
+          }, identityOptions);
+          if (saved.status !== 'ok') return { ok: false, error: saved.message };
+          const refreshed = await refreshIdentityTarget(target);
+          return refreshed.status === 'ok'
+            ? { ok: true }
+            : { ok: false, error: refreshed.message };
+        },
       })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: async (input) => {
@@ -2632,6 +2680,13 @@ const schemas = {
         ccPresetId: z.string().min(1).optional(),
       }).strict().optional(),
     }).strict().optional(),
+    identity: z.object({
+      content: z.string().optional().describe('Inline session-scoped Agent identity contract.'),
+      filePath: z.string().max(SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS).optional()
+        .describe('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for session-scoped startup identity.'),
+    }).strict().refine((value) => Boolean(value.content?.trim()) !== Boolean(value.filePath?.trim()), {
+      message: 'provide exactly one of content or filePath',
+    }).describe('Startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath.').optional(),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),

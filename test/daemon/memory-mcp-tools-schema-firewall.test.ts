@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
@@ -976,6 +976,135 @@ describe('memory MCP tool schema firewall', () => {
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+
+  it('resolves an Agent identity file and carries the complete explicit config through MCP auto-provisioning', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-agent-identity-'));
+    const identityPath = join(root, 'release-engineer.md');
+    writeFileSync(identityPath, '  You are the release engineer.  \n', 'utf8');
+    const requestedBase = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: 'opus[1M]',
+    };
+    const requestedExecutionType = {
+      ...requestedBase,
+      capabilityId: buildSupervisionExecutionCapabilityId(requestedBase),
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance',
+      runtimeEpoch: 'self-epoch',
+      projectDir: root,
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      activeModel: 'gpt-5.6-sol',
+    });
+    const target = sessionRecord({
+      name: 'deck_sub_identity_file_target',
+      role: 'w1',
+      parentSession: self.name,
+      userCreated: true,
+      projectDir: root,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      runtimeType: 'transport',
+      activeModel: 'opus[1M]',
+      identityPrompt: 'You are the release engineer.',
+      sessionInstanceId: undefined,
+      runtimeEpoch: undefined,
+    });
+    const provisionSupervisionTarget = vi.fn(async () => ({
+      ok: true as const,
+      target,
+      evidence: { selectedPool: 'primary' as const, selectedConfig: requestedExecutionType, origin: 'spawned' as const },
+    }));
+    const profile = {
+      scope: 'session' as const,
+      scopeKey: `srv-1:${target.name}`,
+      content: 'You are the release engineer.',
+      contentHash: 'identity-content-hash',
+      revision: 1,
+      updatedAt: 1,
+      source: 'mcp' as const,
+      sourceFile: identityPath,
+    };
+    const setIdentityProfile = vi.fn(async () => ({ status: 'ok' as const, profile }));
+    const getEffectiveIdentityProfiles = vi.fn(async () => ({ status: 'ok' as const, profiles: [profile] }));
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const server = createMemoryMcpServer(caller({ projectRoot: root }), {
+      sendDeps: { listSessions: () => [self, target], provisionSupervisionTarget },
+      setIdentityProfile,
+      getEffectiveIdentityProfiles,
+      applyEffectiveIdentity,
+    });
+    const client = new Client({ name: 'identity-auto-provision-ingress-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contractIdentity = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+        .inputSchema.properties?.identity;
+      expect(contractIdentity).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        anyOf: [{ required: ['content'] }, { required: ['filePath'] }],
+      });
+      const advertised = (await client.listTools()).tools
+        .find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      expect(advertised?.inputSchema.properties?.identity).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        properties: { content: { type: 'string' }, filePath: { type: 'string' } },
+      });
+
+      const result = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          message: 'ship the release',
+          idempotencyKey: 'identity-file-auto-provision-1',
+          identity: { filePath: identityPath },
+          task: {
+            objective: 'ship the release',
+            autoProvision: true,
+            requestedExecutionType,
+          },
+        },
+      });
+      expect(result.structuredContent).toMatchObject({ status: 'error' });
+      expect(provisionSupervisionTarget).toHaveBeenCalledWith(expect.objectContaining({
+        requestedCapabilityId: requestedExecutionType.capabilityId,
+        requestedExecutionConfig: requestedExecutionType,
+        identityPrompt: 'You are the release engineer.',
+        provenance: 'manual_explicit',
+      }));
+      expect(setIdentityProfile).toHaveBeenCalledWith(expect.objectContaining({
+        scope: 'session',
+        scopeKey: `srv-1:${target.name}`,
+        content: 'You are the release engineer.',
+        sourceFile: identityPath,
+      }), expect.any(Object));
+      expect(applyEffectiveIdentity).toHaveBeenCalledWith(
+        target.name,
+        expect.stringContaining('You are the release engineer.'),
+        { refresh: true },
+      );
+
+      const invalid = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          message: 'must reject ambiguous identity input',
+          idempotencyKey: 'identity-file-auto-provision-invalid',
+          identity: { content: 'inline', filePath: identityPath },
+          task: { objective: 'reject', autoProvision: true, requestedExecutionType },
+        },
+      });
+      expect(invalid.isError).toBe(true);
+      expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

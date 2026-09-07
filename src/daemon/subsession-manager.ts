@@ -58,6 +58,10 @@ export interface SubSessionRecord {
   ccInitPrompt?: string | null;
   /** Session description/persona — injected as background info on start and respawn. */
   description?: string | null;
+  /** Exact session-scoped Agent identity contract injected as stable system context. */
+  identityPrompt?: string | null;
+  /** Stable digest used to keep auto-provisioned Agent identity associations disjoint. */
+  provisionedIdentityHash?: string | null;
   effort?: TransportEffortLevel;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
@@ -142,6 +146,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         projectDir: sub.cwd ?? process.cwd(),
         label: sub.label ?? undefined,
         description: sub.description ?? undefined,
+        identityPrompt: sub.identityPrompt ?? undefined,
         requestedModel: sub.requestedModel ?? undefined,
         qwenModel: sub.qwenModel ?? undefined,
         transportConfig: sub.transportConfig ?? undefined,
@@ -153,6 +158,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         userCreated: true,
         parentSession: sub.parentSession ?? undefined,
       });
+      if (sub.provisionedIdentityHash) {
+        const created = getSession(sessionName);
+        if (created) upsertSession({ ...created, provisionedIdentityHash: sub.provisionedIdentityHash, updatedAt: Date.now() });
+      }
       return;
     }
     await launchTransportSession({
@@ -163,6 +172,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       projectDir: sub.cwd ?? process.cwd(),
       label: sub.label ?? undefined,
       description: sub.description ?? undefined,
+      identityPrompt: sub.identityPrompt ?? undefined,
       requestedModel: sub.requestedModel ?? undefined,
       qwenModel: sub.qwenModel ?? undefined,
       transportConfig: sub.transportConfig ?? undefined,
@@ -186,6 +196,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       userCreated: true,
       parentSession: sub.parentSession ?? undefined,
     });
+    if (sub.provisionedIdentityHash) {
+      const created = getSession(sessionName);
+      if (created) upsertSession({ ...created, provisionedIdentityHash: sub.provisionedIdentityHash, updatedAt: Date.now() });
+    }
     return;
   }
 
@@ -306,6 +320,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   // Auto-dismiss startup prompts, then inject init message
   const initParts: string[] = [];
   if (sub.description) initParts.push(sub.description);
+  if (sub.identityPrompt) initParts.push(sub.identityPrompt);
   if (presetInitMessage) initParts.push(presetInitMessage);
   if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
   const injectInit = async () => {
@@ -341,6 +356,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     parentSession: sub.parentSession ?? undefined,
     ccPreset: sub.ccPreset ?? undefined,
     description: sub.description ?? undefined,
+    identityPrompt: sub.identityPrompt ?? undefined,
+    provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
     // shellBin (already host-normalized above) persisted for shell/script so a
     // clone/restore that inherited it keeps a runnable launch binary. Config,
     // not identity.

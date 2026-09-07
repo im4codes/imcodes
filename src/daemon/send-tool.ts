@@ -146,6 +146,11 @@ import {
 } from './supervision-integration-bundle.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
+import {
+  SESSION_IDENTITY_SCOPES,
+  normalizeSessionIdentityContent,
+  sessionIdentityContentError,
+} from '../../shared/session-identity.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -266,6 +271,13 @@ export interface SendMessageCloneRequest {
   parentStage: ExecutionCloneParentStage;
 }
 
+export interface SendMessageAgentIdentity {
+  /** Normalized identity contract bytes resolved before dispatch. */
+  content: string;
+  /** Informational local source path when the MCP caller selected a file. */
+  sourceFile?: string;
+}
+
 export interface SendMessageInput {
   target?: string;
   message?: string;
@@ -281,6 +293,8 @@ export interface SendMessageInput {
   clone?: SendMessageCloneRequest;
   /** Optional supervised task metadata; when present daemon creates/binds a durable task assignment. */
   task?: SupervisionTaskMetadata;
+  /** Session-scoped identity applied to an explicitly auto-provisioned Agent. */
+  identity?: SendMessageAgentIdentity;
   /**
    * This send SPAWNS work rather than continuing a conversation (cron ticks,
    * clone bootstraps).
@@ -481,6 +495,11 @@ export interface SendToolDeps {
   destroyExecutionClone?: (req: DestroyExecutionCloneDepRequest) => Promise<void>;
   /** Explicit Brain-authorized pool reuse/provisioning. Ordinary sends never call it. */
   provisionSupervisionTarget?: (req: SupervisionAutoProvisionRequest) => Promise<SupervisionAutoProvisionResult>;
+  /** Persist and converge an explicit session identity before first task delivery. */
+  applyProvisionedIdentity?: (
+    target: SessionRecord,
+    identity: SendMessageAgentIdentity,
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Create or verify the exact assignment worktree before worker delivery. */
   ensureSupervisionAssignmentWorktree?: (req: {
     projectRoot: string;
@@ -1129,6 +1148,23 @@ export async function dispatchSendMessage(
       error: 'task.autoProvision requires no target/broadcast/clone and a non-empty idempotencyKey',
     };
   }
+  if (input.identity && !autoProvision) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'identity is available only with task.autoProvision=true',
+    };
+  }
+  if (input.identity) {
+    const identityError = sessionIdentityContentError(input.identity.content, SESSION_IDENTITY_SCOPES.SESSION);
+    if (identityError) {
+      return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: identityError };
+    }
+    input = {
+      ...input,
+      identity: { ...input.identity, content: normalizeSessionIdentityContent(input.identity.content) },
+    };
+  }
   if (!input.message || input.message.trim().length === 0) {
     return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'message is required' };
   }
@@ -1200,7 +1236,7 @@ export async function dispatchSendMessage(
   const idempotencyKey = typeof input.idempotencyKey === 'string' ? input.idempotencyKey.trim() : '';
   const idempotencyTarget = input.broadcast ? '*'
     : autoProvision
-      ? `@pool:${input.audit ? 'audit' : input.task?.executionPool ?? 'primary'}:${input.task?.requestedExecutionType?.capabilityId ?? '*'}`
+      ? `@pool:${input.audit ? 'audit' : input.task?.executionPool ?? 'primary'}:${input.task?.requestedExecutionType?.capabilityId ?? '*'}:${input.identity ? createHash('sha256').update(input.identity.content).digest('hex') : '*'}`
       : input.target ?? '';
   const cacheKey = idempotencyKey ? `${caller.userId}\0${caller.sessionName}\0${idempotencyTarget}\0${idempotencyKey}` : '';
   const now = d.now();
@@ -1274,6 +1310,8 @@ export async function dispatchSendMessage(
       parentSessionName: caller.sessionName,
       pool: input.task?.executionPool ?? 'primary',
       requestedCapabilityId: input.task?.requestedExecutionType?.capabilityId,
+      requestedExecutionConfig: input.task?.requestedExecutionType ?? undefined,
+      identityPrompt: input.identity?.content,
       idempotencyKey,
       auditedSessionName: input.audit?.auditedSessionName,
       strictCrossVendor: input.audit?.strictCrossVendor,
@@ -1290,6 +1328,17 @@ export async function dispatchSendMessage(
         ...(provision.auditDegradedReason ? { auditDegradedReason: provision.auditDegradedReason } : {}),
         provisioning: provision.evidence,
       };
+    }
+    if (input.identity && deps?.applyProvisionedIdentity) {
+      const appliedIdentity = await deps.applyProvisionedIdentity(provision.target, input.identity);
+      if (!appliedIdentity.ok) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.INTERNAL_ERROR,
+          error: `provisioned identity could not be persisted: ${sanitizeMcpErrorMessage(appliedIdentity.error)}`,
+          provisioning: provision.evidence,
+        };
+      }
     }
     auditRoutingReason = provision.auditRoutingReason;
     resolvedInput = { ...input, target: provision.target.name };
@@ -1589,6 +1638,17 @@ export async function dispatchSendMessage(
       requestedCapabilityId: input.task.requestedExecutionType?.capabilityId,
       economyPolicy: input.task.economyPolicy ?? undefined,
     });
+    const explicitManualSelection = Boolean(
+      autoProvision
+      && !input.automaticSupervision
+      && input.task.requestedExecutionType
+      && provisioning?.selectedConfig?.capabilityId === input.task.requestedExecutionType.capabilityId
+      && evaluateSupervisionObservedIdentity({
+        config: input.task.requestedExecutionType,
+        actual,
+        pool,
+      }).ok,
+    );
     const requestedTaskId = input.task.taskId?.trim();
     const recoveryTask = input.audit && requestedTaskId
       ? registry.get(requestedTaskId)
@@ -1656,7 +1716,7 @@ export async function dispatchSendMessage(
     }
     const poolSelected = targetMatchesConfiguredSupervisionPool(pools, pool, targetRecord, actual)
       && checked.ok;
-    if (!poolSelected && !exactUnconfiguredAuditRecovery) {
+    if (!poolSelected && !explicitManualSelection && !exactUnconfiguredAuditRecovery) {
       return {
         status: 'error',
         reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -1670,6 +1730,13 @@ export async function dispatchSendMessage(
           actual: actual as SupervisionObservedExecutionIdentity,
           origin: provisioning?.createdSessionName ? 'spawned' : 'reused',
         }
+      : explicitManualSelection && input.task.requestedExecutionType
+        ? {
+            pool,
+            requested: input.task.requestedExecutionType,
+            actual: actual as SupervisionObservedExecutionIdentity,
+            origin: provisioning?.createdSessionName ? 'spawned' : 'reused',
+          }
       : (() => {
           const exactActual = actual as SupervisionObservedExecutionIdentity;
           return {

@@ -64,6 +64,7 @@ import {
   SESSION_IDENTITY_MCP_TOOLS,
   SESSION_IDENTITY_SCOPE_LIST,
   SESSION_IDENTITY_MAX_UTF8_BYTES,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS,
 } from './session-identity.js';
 import {
   VERIFICATION_MACHINE_KIND_LIST,
@@ -615,7 +616,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
     description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Existing-task continuations MUST append (default), with durable FIFO fallback; queue always uses FIFO for new work. Returns delivered/queued/failed status.',
     inputSchema: objectSchema({
-      target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from the configured pool.'),
+      target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from an explicit execution identity or configured pool.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
       deliveryMode: {
         type: 'string',
@@ -652,10 +653,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
             description: 'Explicit Brain-owned automatic-audit policy. Omit to inherit the creating Brain session snapshot.',
           },
           executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
-          autoProvision: { type: 'boolean', description: 'When true, reuse or provision a pool-selected sub-session if target is omitted.' },
+          autoProvision: { type: 'boolean', description: 'When true, reuse or provision a sub-session if target is omitted. A complete requestedExecutionType is sufficient for a manual MCP send; automatic supervision still requires a configured pool.' },
           requestedExecutionType: objectSchema({
-            capabilityId: stringSchema('Exact configured capability id.'),
-            agentType: stringSchema('Configured SDK agent type.'),
+            capabilityId: stringSchema('Exact canonical capability id for the explicitly selected execution identity.'),
+            agentType: stringSchema('Explicitly selected SDK agent type.'),
             providerFamily: stringSchema('Canonical provider family.'),
             runtimeType: { type: 'string', enum: ['process', 'transport'] },
             model: stringSchema('Canonical selected model.'),
@@ -663,6 +664,14 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           }, ['capabilityId', 'agentType', 'providerFamily', 'runtimeType', 'model']),
         }),
         description: 'Optional daemon-authoritative supervision task metadata. When present, accepted result returns taskId and assignmentId; idempotency replay must reuse both.',
+      },
+      identity: {
+        ...objectSchema({
+          content: stringSchema('Inline session-scoped Agent identity contract, up to 30,000 characters.'),
+          filePath: stringSchema('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for this session-scoped startup identity.', { maxLength: SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS }),
+        }),
+        anyOf: [{ required: ['content'] }, { required: ['filePath'] }],
+        description: 'Optional startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath. Different identity content is never silently reused as the same Agent session.',
       },
       audit: {
         ...objectSchema({

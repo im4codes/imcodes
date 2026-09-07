@@ -442,6 +442,8 @@ describe('delegation send gate', () => {
         activeModel: sub.requestedModel ?? undefined,
         requestedModel: sub.requestedModel ?? undefined,
         ccPreset: sub.ccPreset ?? undefined,
+        identityPrompt: sub.identityPrompt ?? undefined,
+        provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
         executionCloneMetadata: undefined,
         userCreated: true,
       }));
@@ -506,6 +508,82 @@ describe('delegation send gate', () => {
       requested: presetA,
       actual: { sessionName: createdName, ccPresetId: 'preset-a' },
     });
+  });
+
+  it('uses a complete explicit execution identity when the primary pool is unconfigured', async () => {
+    const requested = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]');
+    const brain = session({
+      name: 'deck_alpha_brain',
+      projectName: 'alpha',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      activeModel: 'gpt-5.6-sol',
+      runtimeType: 'transport',
+    });
+    const sessions = [brain];
+    const startSubSession = vi.fn(async (sub: SubSessionRecord) => {
+      sessions.push(session({
+        name: `deck_sub_${sub.id}`,
+        projectName: 'alpha',
+        projectDir: sub.cwd ?? '/work/alpha',
+        role: 'w1',
+        parentSession: sub.parentSession ?? undefined,
+        label: sub.label ?? undefined,
+        agentType: sub.type,
+        providerId: sub.providerId ?? sub.type,
+        runtimeType: sub.runtimeType ?? 'transport',
+        activeModel: sub.requestedModel ?? undefined,
+        requestedModel: sub.requestedModel ?? undefined,
+        identityPrompt: sub.identityPrompt ?? undefined,
+        provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
+      }));
+    });
+    const dispatchMessage = vi.fn(async () => {});
+    const applyProvisionedIdentity = vi.fn(async () => ({ ok: true as const }));
+    const result = await dispatchSendMessage(caller, {
+      message: 'investigate the incident',
+      idempotencyKey: 'manual-explicit-unconfigured-pool-1',
+      identity: { content: 'You are the incident commander.' },
+      task: {
+        objective: 'investigate the incident',
+        autoProvision: true,
+        requestedExecutionType: requested,
+      },
+    }, {
+      ...deps(sessions, dispatchMessage),
+      applyProvisionedIdentity,
+      provisionSupervisionTarget: (request) => provisionSupervisionTarget(request, {
+        now: () => NOW,
+        listSessions: () => sessions,
+        getSession: (name) => sessions.find((candidate) => candidate.name === name),
+        startSubSession,
+        wait: async () => {},
+        readyTimeoutMs: 1,
+      }),
+    });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      provisioning: { selectedConfig: requested, origin: 'spawned' },
+      taskId: expect.any(String),
+      assignmentId: expect.any(String),
+    });
+    expect(startSubSession).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'claude-code-sdk',
+      requestedModel: 'opus[1M]',
+      identityPrompt: 'You are the incident commander.',
+    }));
+    expect(dispatchMessage.mock.calls[0]?.[0]).toMatchObject({
+      identityPrompt: 'You are the incident commander.',
+    });
+    expect(dispatchMessage.mock.calls[0]?.[1]).toContain('investigate the incident');
+    expect(applyProvisionedIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ identityPrompt: 'You are the incident commander.' }),
+      { content: 'You are the incident commander.' },
+    );
+    expect(applyProvisionedIdentity.mock.invocationCallOrder[0]).toBeLessThan(
+      dispatchMessage.mock.invocationCallOrder[0]!,
+    );
   });
 
   it('marks pool members as new-work, queue-only, or unavailable from authoritative availability', () => {

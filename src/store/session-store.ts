@@ -144,6 +144,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   description?: string;
   /** Effective synchronized user/project/session identity contract. */
   identityPrompt?: string;
+  /** SHA-256 of the explicit startup identity used for deterministic Agent reuse. */
+  provisionedIdentityHash?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */
   ccPreset?: string;
   /** Context window override carried by a provider preset (for example MiniMax-M3 1M). */
