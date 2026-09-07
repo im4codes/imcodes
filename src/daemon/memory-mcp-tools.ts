@@ -1904,6 +1904,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
+      const effectiveProjectRoot = sendIdentityProjectRoot(caller, sessions);
       const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
@@ -1915,11 +1916,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       // directory is not a Git checkout. Older/restored MCP registrations can
       // omit PROJECT_ROOT, so recover it from the live session record before
       // resolving a relative identity document.
-      const identity = await parseSendIdentityArg(args.identity, sendIdentityProjectRoot(caller, sessions));
+      const identity = await parseSendIdentityArg(args.identity, effectiveProjectRoot);
       if (identity === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'identity is invalid');
       const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
       if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
-      return dispatchSendMessage(caller, {
+      return dispatchSendMessage({ ...caller, projectRoot: effectiveProjectRoot }, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
         files: stringArrayArg(args, 'files'),

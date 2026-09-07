@@ -1013,8 +1013,8 @@ describe('memory MCP tool schema firewall', () => {
       runtimeType: 'transport',
       activeModel: 'opus[1M]',
       identityPrompt: 'You are the release engineer.',
-      sessionInstanceId: undefined,
-      runtimeEpoch: undefined,
+      sessionInstanceId: 'target-instance',
+      runtimeEpoch: 'target-epoch',
     });
     let liveSessions = [self];
     const provisionSupervisionTarget = vi.fn(async () => {
@@ -1022,7 +1022,12 @@ describe('memory MCP tool schema firewall', () => {
       return {
         ok: true as const,
         target,
-        evidence: { selectedPool: 'primary' as const, selectedConfig: requestedExecutionType, origin: 'spawned' as const },
+        evidence: {
+          selectedPool: 'primary' as const,
+          selectedConfig: requestedExecutionType,
+          origin: 'spawned' as const,
+          createdSessionName: target.name,
+        },
       };
     });
     const profile = {
@@ -1038,8 +1043,20 @@ describe('memory MCP tool schema firewall', () => {
     const setIdentityProfile = vi.fn(async () => ({ status: 'ok' as const, profile }));
     const getEffectiveIdentityProfiles = vi.fn(async () => ({ status: 'ok' as const, profiles: [profile] }));
     const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { projectRoot: string; assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: join(input.projectRoot, '.imcodes-worktrees', input.assignmentId),
+      baseRevision: 'a'.repeat(40),
+      created: true,
+    }));
+    const dispatchMessage = vi.fn(async () => undefined);
     const server = createMemoryMcpServer(caller({ projectRoot: null }), {
-      sendDeps: { listSessions: () => liveSessions, provisionSupervisionTarget },
+      sendDeps: {
+        listSessions: () => liveSessions,
+        provisionSupervisionTarget,
+        ensureSupervisionAssignmentWorktree,
+        dispatchMessage,
+      },
       setIdentityProfile,
       getEffectiveIdentityProfiles,
       applyEffectiveIdentity,
@@ -1076,8 +1093,10 @@ describe('memory MCP tool schema firewall', () => {
           },
         },
       });
-      expect(result.structuredContent).toMatchObject({ status: 'error' });
-      expect(JSON.stringify(result.structuredContent)).not.toContain(`target \\"${target.name}\\" not found`);
+      expect(result.structuredContent).toMatchObject({
+        status: 'accepted',
+        provisioning: { origin: 'spawned', createdSessionName: target.name },
+      });
       expect(provisionSupervisionTarget).toHaveBeenCalledWith(expect.objectContaining({
         requestedCapabilityId: requestedExecutionType.capabilityId,
         requestedExecutionConfig: requestedExecutionType,
@@ -1095,6 +1114,10 @@ describe('memory MCP tool schema firewall', () => {
         expect.stringContaining('You are the release engineer.'),
         { refresh: true },
       );
+      expect(ensureSupervisionAssignmentWorktree).toHaveBeenCalledWith(expect.objectContaining({
+        projectRoot: root,
+      }));
+      expect(dispatchMessage).toHaveBeenCalledOnce();
 
       const invalid = await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
