@@ -24,10 +24,33 @@ const left = new rtc.PeerConnection('native-retire-left', { iceServers: [] });
 const right = new rtc.PeerConnection('native-retire-right', { iceServers: [] });
 const retained = [left, right];
 
-left.onLocalDescription((sdp, type) => right.setRemoteDescription(sdp, type));
-right.onLocalDescription((sdp, type) => left.setRemoteDescription(sdp, type));
-left.onLocalCandidate((candidate, mid) => right.addRemoteCandidate(candidate, mid));
-right.onLocalCandidate((candidate, mid) => left.addRemoteCandidate(candidate, mid));
+let leftHasRemoteDescription = false;
+let rightHasRemoteDescription = false;
+const pendingForLeft = [];
+const pendingForRight = [];
+
+left.onLocalDescription((sdp, type) => {
+  right.setRemoteDescription(sdp, type);
+  rightHasRemoteDescription = true;
+  for (const [candidate, mid] of pendingForRight.splice(0)) {
+    right.addRemoteCandidate(candidate, mid);
+  }
+});
+right.onLocalDescription((sdp, type) => {
+  left.setRemoteDescription(sdp, type);
+  leftHasRemoteDescription = true;
+  for (const [candidate, mid] of pendingForLeft.splice(0)) {
+    left.addRemoteCandidate(candidate, mid);
+  }
+});
+left.onLocalCandidate((candidate, mid) => {
+  if (rightHasRemoteDescription) right.addRemoteCandidate(candidate, mid);
+  else pendingForRight.push([candidate, mid]);
+});
+right.onLocalCandidate((candidate, mid) => {
+  if (leftHasRemoteDescription) left.addRemoteCandidate(candidate, mid);
+  else pendingForLeft.push([candidate, mid]);
+});
 
 const received = new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error('native_peer_message_timeout')), 10_000);

@@ -6,6 +6,15 @@ import { describe, expect, it } from 'vitest';
 import { DIRECT_FILE_TRANSFER_WORKER_KIND } from '../../shared/direct-file-transfer.js';
 import { spawnDirectFileTransferChild } from '../../src/daemon/direct-file-transfer-ipc.js';
 
+async function waitForChildMessage(child: ReturnType<typeof spawnDirectFileTransferChild>): Promise<unknown> {
+  return await Promise.race([
+    once(child, 'message').then(([message]) => message),
+    once(child, 'exit').then(([code, signal]) => {
+      throw new Error(`direct transfer fixture exited before ready: code=${String(code)} signal=${String(signal)}`);
+    }),
+  ]);
+}
+
 describe('P0 direct transfer native crash containment', () => {
   it('loads node-datachannel only behind an OS child-process boundary', async () => {
     const proxy = await readFile(path.join(process.cwd(), 'src/daemon/direct-file-transfer.ts'), 'utf8');
@@ -25,7 +34,7 @@ describe('P0 direct transfer native crash containment', () => {
       pathToFileURL(path.join(process.cwd(), 'test/daemon/fixtures/direct-file-transfer-sigsegv-child.mjs')),
       { workerData: { kind: DIRECT_FILE_TRANSFER_WORKER_KIND, generation: 1 } },
     );
-    const [ready] = await once(child, 'message') as [{ type: string; pid: number }];
+    const ready = await waitForChildMessage(child) as { type: string; pid: number };
     expect(ready).toMatchObject({ type: 'fixture.ready' });
     expect(ready.pid).not.toBe(parentPid);
     const [code, signal] = await once(child, 'exit') as [number | null, NodeJS.Signals | null];
@@ -41,7 +50,7 @@ describe('P0 direct transfer native crash containment', () => {
         pathToFileURL(path.join(process.cwd(), 'test/daemon/fixtures/direct-file-transfer-native-retire-child.mjs')),
         { workerData: { kind: DIRECT_FILE_TRANSFER_WORKER_KIND, generation } },
       );
-      const [ready] = await once(child, 'message') as [{ type: string; pid: number }];
+      const ready = await waitForChildMessage(child) as { type: string; pid: number };
       expect(ready).toMatchObject({ type: 'fixture.native-peer-negotiated' });
       expect(ready.pid).not.toBe(parentPid);
       const [code, signal] = await once(child, 'exit') as [number | null, NodeJS.Signals | null];
