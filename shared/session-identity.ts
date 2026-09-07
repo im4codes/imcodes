@@ -13,7 +13,16 @@ export const SESSION_IDENTITY_SCOPE_LIST = Object.freeze(
   Object.values(SESSION_IDENTITY_SCOPES),
 ) as readonly SessionIdentityScope[];
 
-export const SESSION_IDENTITY_MAX_CHARS = 30_000;
+export const SESSION_IDENTITY_USER_MAX_CHARS = 10_000;
+export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 20_000;
+export const SESSION_IDENTITY_SESSION_MAX_CHARS = 30_000;
+/** Backward-compatible alias for the largest single profile (session scope). */
+export const SESSION_IDENTITY_MAX_CHARS = SESSION_IDENTITY_SESSION_MAX_CHARS;
+export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentityScope, number>> = Object.freeze({
+  [SESSION_IDENTITY_SCOPES.USER]: SESSION_IDENTITY_USER_MAX_CHARS,
+  [SESSION_IDENTITY_SCOPES.PROJECT]: SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  [SESSION_IDENTITY_SCOPES.SESSION]: SESSION_IDENTITY_SESSION_MAX_CHARS,
+});
 export const SESSION_IDENTITY_MAX_UTF8_BYTES = 120_000;
 export const SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS = 512;
 export const SESSION_IDENTITY_API_PATH = '/api/session-identities';
@@ -47,11 +56,18 @@ export function normalizeSessionIdentityContent(value: string): string {
   return value.normalize('NFC').trim();
 }
 
-export function sessionIdentityContentError(value: unknown): string | null {
+export function sessionIdentityMaxChars(scope: SessionIdentityScope): number {
+  return SESSION_IDENTITY_MAX_CHARS_BY_SCOPE[scope];
+}
+
+export function sessionIdentityContentError(
+  value: unknown,
+  scope: SessionIdentityScope = SESSION_IDENTITY_SCOPES.SESSION,
+): string | null {
   if (typeof value !== 'string') return 'identity_content_required';
   const normalized = normalizeSessionIdentityContent(value);
   if (!normalized) return 'identity_content_required';
-  if (Array.from(normalized).length > SESSION_IDENTITY_MAX_CHARS) return 'identity_content_too_large';
+  if (Array.from(normalized).length > sessionIdentityMaxChars(scope)) return 'identity_content_too_large';
   if (new TextEncoder().encode(normalized).byteLength > SESSION_IDENTITY_MAX_UTF8_BYTES) {
     return 'identity_content_too_large';
   }

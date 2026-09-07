@@ -130,6 +130,30 @@ describe('session identity MCP tools', () => {
     ]);
   });
 
+  it('enforces the scope-specific character budget before online storage', async () => {
+    const setIdentityProfile = vi.fn();
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => [session()] },
+      setIdentityProfile,
+    });
+
+    for (const [identityScope, length] of [
+      ['user', 10_001],
+      ['project', 20_001],
+      ['session', 30_001],
+    ] as const) {
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+        identityScope,
+        content: 'x'.repeat(length),
+      })).resolves.toMatchObject({
+        status: 'error',
+        reason: 'validation_failed',
+        message: 'identity_content_too_large',
+      });
+    }
+    expect(setIdentityProfile).not.toHaveBeenCalled();
+  });
+
   it('allows only session scope to load an explicitly selected file outside the project', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-identity-mcp-'));
     const projectDir = join(root, 'project');

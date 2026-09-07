@@ -142,12 +142,12 @@ const CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT = 1;
 const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
-// A synchronized identity contract alone may be 30k characters. Leave room
-// for Codex's stable IM.codes guidance and image-reporting tail so a valid
-// identity is never silently truncated out of prefix-cacheable instructions.
-const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 64_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+// User + project + session identity contracts may total 60k characters. Keep
+// the default at the supported ceiling so stable IM.codes guidance, authored
+// context, and image-reporting remain intact instead of being silently cut.
+const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const CODEX_COLLAB_MAX_RECEIVERS = 100;

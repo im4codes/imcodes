@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   SESSION_IDENTITY_MAX_CHARS,
+  SESSION_IDENTITY_PROJECT_MAX_CHARS,
   SESSION_IDENTITY_SCOPES,
+  SESSION_IDENTITY_SESSION_MAX_CHARS,
+  SESSION_IDENTITY_USER_MAX_CHARS,
   renderSessionIdentityProfiles,
   sessionIdentityContentError,
   sessionIdentityScopeKeyError,
@@ -34,9 +37,16 @@ describe('session identity contracts', () => {
     expect(rendered).toContain('Platform system/developer instructions');
   });
 
-  it('accepts 30k characters and rejects the next character or oversized UTF-8', () => {
-    expect(sessionIdentityContentError('x'.repeat(SESSION_IDENTITY_MAX_CHARS))).toBeNull();
-    expect(sessionIdentityContentError('x'.repeat(SESSION_IDENTITY_MAX_CHARS + 1))).toBe('identity_content_too_large');
+  it('enforces user 10k, project 20k, and session 30k character limits', () => {
+    expect(SESSION_IDENTITY_MAX_CHARS).toBe(SESSION_IDENTITY_SESSION_MAX_CHARS);
+    for (const [scope, limit] of [
+      [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_USER_MAX_CHARS],
+      [SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_PROJECT_MAX_CHARS],
+      [SESSION_IDENTITY_SCOPES.SESSION, SESSION_IDENTITY_SESSION_MAX_CHARS],
+    ] as const) {
+      expect(sessionIdentityContentError('x'.repeat(limit), scope)).toBeNull();
+      expect(sessionIdentityContentError('x'.repeat(limit + 1), scope)).toBe('identity_content_too_large');
+    }
     expect(sessionIdentityContentError('\0')).toBe('identity_content_invalid');
   });
 

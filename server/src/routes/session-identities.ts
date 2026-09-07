@@ -57,7 +57,7 @@ sessionIdentityRoutes.put('/', async (c) => {
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
   const scopeKey = normalizedScopeKey(scope, body.scopeKey);
   if (scopeKey === null) return c.json({ error: 'identity_scope_key_invalid' }, 400);
-  const contentReason = sessionIdentityContentError(body.content);
+  const contentReason = sessionIdentityContentError(body.content, scope);
   if (contentReason) return c.json({ error: contentReason }, 400);
   const content = normalizeSessionIdentityContent(String(body.content));
   const expectedRevision = typeof body.expectedRevision === 'number'

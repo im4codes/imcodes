@@ -1550,7 +1550,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       } catch (err) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'identity_file_invalid');
       }
-      const contentReason = sessionIdentityContentError(content);
+      const contentReason = sessionIdentityContentError(content, scopeValue);
       if (contentReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, contentReason);
       const expectedRevision = numberArg(args, 'expectedRevision');
       const saved = await identitySet({
