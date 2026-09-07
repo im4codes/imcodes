@@ -1334,7 +1334,7 @@ describe('automatic supervision audit materialization', () => {
     ['origin', 'stale-brain-instance', 'stale-brain-epoch'],
     ['target', 'stale-auditor-instance', 'stale-auditor-epoch'],
   ] as const)(
-    'keeps the production audit delivery fail-closed when only %s runtime identity drifts',
+    'handles %s runtime identity drift without weakening auditor authority',
     async (driftedSide, staleSessionInstanceId, staleRuntimeEpoch) => {
       const { registry, taskId, revision } = makeReadyTask({
         taskId: `tsk_3xl-${driftedSide}-identity-drift`,
@@ -1388,19 +1388,159 @@ describe('automatic supervision audit materialization', () => {
       const delegationRowsBefore = [store.get(delivery.record.delegationId)];
       const dispatch = vi.fn();
 
-      await expect(dispatchReadyAudit(taskId, {
+      const result = await dispatchReadyAudit(taskId, {
         registry,
         listSessions: () => [worker, auditor],
         listTargets: listTargetRecords(auditor),
         dispatch,
-      })).resolves.toMatchObject({
-        status: 'blocked',
-        reason: 'multiple durable audit deliveries claim the exact attempt and revision',
       });
       expect(dispatch).not.toHaveBeenCalled();
-      expect([store.get(delivery.record.delegationId)]).toEqual(delegationRowsBefore);
+      if (driftedSide === 'origin') {
+        expect(result).toEqual({
+          status: 'replayed',
+          assignmentId,
+          attemptId,
+          messageId: delivery.record.messageId,
+        });
+        expect(store.get(delivery.record.delegationId)).toMatchObject({
+          origin: exactOrigin,
+          target: exactTarget,
+          status: AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+        });
+      } else {
+        expect(result).toMatchObject({
+          status: 'blocked',
+          reason: 'multiple durable audit deliveries claim the exact attempt and revision',
+        });
+        expect([store.get(delivery.record.delegationId)]).toEqual(delegationRowsBefore);
+      }
     },
   );
+
+  it('does not adopt a stale-origin delivery from a superseded message generation', () => {
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_auditor', 'w2');
+    const taskId = 'tsk_3xl-stale-origin-superseded-message';
+    const assignmentId = 'asg_aon_stale_origin_superseded';
+    const attemptId = automaticAttempt(taskId, 'revision-stale-origin-superseded');
+    const revision = 'revision-stale-origin-superseded';
+    const currentMessageId = deterministicAutomaticAuditDeliveryMessageId(
+      assignmentId, attemptId, 2,
+    );
+    const supersededMessageId = deterministicAutomaticAuditDeliveryMessageId(
+      assignmentId, attemptId, 1,
+    );
+    const currentOrigin = {
+      sessionName: brain.name,
+      sessionInstanceId: brain.sessionInstanceId!,
+      runtimeEpoch: brain.runtimeEpoch!,
+    };
+    const currentTarget = {
+      sessionName: auditor.name,
+      sessionInstanceId: auditor.sessionInstanceId!,
+      runtimeEpoch: auditor.runtimeEpoch!,
+    };
+    const store = getDelegationReplyStore();
+    const stale = store.create({
+      taskId,
+      assignmentId,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      auditedSessionName: worker.name,
+      messageId: supersededMessageId,
+      dispatchId: 'dispatch-stale-origin-superseded-message',
+      origin: {
+        ...currentOrigin,
+        sessionInstanceId: 'stale-brain-instance',
+        runtimeEpoch: 'stale-brain-epoch',
+      },
+      target: currentTarget,
+      now: 100,
+    });
+    const before = store.get(stale.record.delegationId);
+
+    expect(store.findPendingAuditDelivery({
+      taskId,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      auditedSessionName: worker.name,
+      assignmentAuthority: {
+        assignmentId,
+        messageId: currentMessageId,
+        supersededMessageIds: [supersededMessageId],
+        origins: [currentOrigin],
+        target: currentTarget,
+      },
+      now: 200,
+    })).toEqual({ status: 'ambiguous' });
+    expect(store.get(stale.record.delegationId)).toEqual(before);
+  });
+
+  it('does not choose between two canonical stale-origin delivery claims', () => {
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_auditor', 'w2');
+    const taskId = 'tsk_3xl-stale-origin-canonical-ambiguity';
+    const assignmentId = 'asg_aon_stale_origin_ambiguity';
+    const revision = 'revision-stale-origin-ambiguity';
+    const attemptId = automaticAttempt(taskId, revision);
+    const messageId = deterministicAutomaticAuditDeliveryMessageId(assignmentId, attemptId, 1);
+    const currentOrigin = {
+      sessionName: brain.name,
+      sessionInstanceId: brain.sessionInstanceId!,
+      runtimeEpoch: brain.runtimeEpoch!,
+    };
+    const currentTarget = {
+      sessionName: auditor.name,
+      sessionInstanceId: auditor.sessionInstanceId!,
+      runtimeEpoch: auditor.runtimeEpoch!,
+    };
+    const store = getDelegationReplyStore();
+    const createStale = (suffix: string, now: number) => store.create({
+      taskId,
+      assignmentId,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      auditedSessionName: worker.name,
+      messageId,
+      dispatchId: `dispatch-stale-origin-${suffix}`,
+      origin: {
+        ...currentOrigin,
+        sessionInstanceId: `stale-brain-instance-${suffix}`,
+        runtimeEpoch: `stale-brain-epoch-${suffix}`,
+      },
+      target: currentTarget,
+      now,
+    });
+    const first = createStale('one', 100);
+    const second = createStale('two', 101);
+    const before = [
+      store.get(first.record.delegationId),
+      store.get(second.record.delegationId),
+    ];
+
+    expect(store.findPendingAuditDelivery({
+      taskId,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      auditedSessionName: worker.name,
+      assignmentAuthority: {
+        assignmentId,
+        messageId,
+        supersededMessageIds: [],
+        origins: [currentOrigin],
+        target: currentTarget,
+      },
+      now: 200,
+    })).toEqual({ status: 'ambiguous' });
+    expect([
+      store.get(first.record.delegationId),
+      store.get(second.record.delegationId),
+    ]).toEqual(before);
+  });
 
   it('keeps different assignment claims for one attempt fail-closed as true ambiguity', async () => {
     const { registry, taskId, revision } = makeReadyTask({

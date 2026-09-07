@@ -743,13 +743,9 @@ export class DelegationReplyStore {
         this.#db.exec('ROLLBACK');
         return { status: 'ambiguous' };
       }
-      const current = records.filter((record) => (
+      let current = records.filter((record) => (
         record.messageId === authority.messageId
         && identityMatches(record.target, authority.target)
-        // A same-name old coordinator epoch is stale, not current authority.
-        // The existing coordinator-rebind path can advance it first; selecting
-        // it here would commit cleanup and then fail the caller's exact identity
-        // check after mutation.
         && authority.origins.some((origin) => identityMatches(record.origin, origin))
       )).reduce<DelegationReplyRecord | undefined>((latest, candidate) => (
         !latest
@@ -758,8 +754,40 @@ export class DelegationReplyStore {
           ? candidate
           : latest
       ), undefined);
-      // Stale runtime identities are never selected. Without one exact current
-      // claim there is no proof a resend is safe, so leave every row untouched.
+      // The audit target and canonical message id are the delivery authority.
+      // A Brain restart can rotate only the origin epoch after the durable
+      // brief was accepted. When there is exactly one such row and exactly one
+      // current task participant with that session name, advance the origin
+      // identity in this same transaction rather than misreporting one stale
+      // row as multiple competing deliveries. A stale target remains closed:
+      // it is the principal allowed to return the verdict.
+      if (!current) {
+        const staleOriginCandidates = records.filter((record) => (
+          record.messageId === authority.messageId
+          && identityMatches(record.target, authority.target)
+          && authority.origins.filter((origin) => origin.sessionName === record.origin.sessionName).length === 1
+        ));
+        if (staleOriginCandidates.length === 1) {
+          const candidate = staleOriginCandidates[0]!;
+          const reboundOrigin = authority.origins.find(
+            (origin) => origin.sessionName === candidate.origin.sessionName,
+          )!;
+          this.#db.prepare(`
+            UPDATE delegation_replies
+            SET origin_session_instance_id = ?, origin_runtime_epoch = ?, updated_at = ?
+            WHERE delegation_id = ? AND status = ?
+          `).run(
+            reboundOrigin.sessionInstanceId,
+            reboundOrigin.runtimeEpoch,
+            input.now ?? Date.now(),
+            candidate.delegationId,
+            AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+          );
+          current = { ...candidate, origin: reboundOrigin };
+        }
+      }
+      // Without one exact current target/canonical-delivery claim there is no
+      // proof a resend or adoption is safe, so leave every row untouched.
       if (!current) {
         this.#db.exec('ROLLBACK');
         return { status: 'ambiguous' };
