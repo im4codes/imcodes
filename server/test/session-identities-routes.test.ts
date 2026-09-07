@@ -138,7 +138,7 @@ describe('/api/session-identities', () => {
     expect(badKey.status).toBe(400);
     const oversized = await app.request('/api/session-identities', {
       method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scope: 'user', content: 'x'.repeat(10_001) }),
+      body: JSON.stringify({ scope: 'user', content: 'x'.repeat(20_001) }),
     });
     expect(oversized.status).toBe(400);
   });

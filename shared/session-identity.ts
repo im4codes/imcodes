@@ -13,9 +13,9 @@ export const SESSION_IDENTITY_SCOPE_LIST = Object.freeze(
   Object.values(SESSION_IDENTITY_SCOPES),
 ) as readonly SessionIdentityScope[];
 
-export const SESSION_IDENTITY_USER_MAX_CHARS = 10_000;
-export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 20_000;
-export const SESSION_IDENTITY_SESSION_MAX_CHARS = 30_000;
+export const SESSION_IDENTITY_USER_MAX_CHARS = 20_000;
+export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 40_000;
+export const SESSION_IDENTITY_SESSION_MAX_CHARS = 80_000;
 /** Backward-compatible alias for the largest single profile (session scope). */
 export const SESSION_IDENTITY_MAX_CHARS = SESSION_IDENTITY_SESSION_MAX_CHARS;
 export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentityScope, number>> = Object.freeze({
@@ -23,7 +23,8 @@ export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentit
   [SESSION_IDENTITY_SCOPES.PROJECT]: SESSION_IDENTITY_PROJECT_MAX_CHARS,
   [SESSION_IDENTITY_SCOPES.SESSION]: SESSION_IDENTITY_SESSION_MAX_CHARS,
 });
-export const SESSION_IDENTITY_MAX_UTF8_BYTES = 120_000;
+/** Worst-case UTF-8 size of the largest (session-scoped) identity profile. */
+export const SESSION_IDENTITY_MAX_UTF8_BYTES = 320_000;
 export const SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS = 512;
 export const SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS = 1_024;
 export const SESSION_IDENTITY_API_PATH = '/api/session-identities';

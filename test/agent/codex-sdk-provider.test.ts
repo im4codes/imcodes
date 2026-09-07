@@ -4568,6 +4568,48 @@ describe('CodexSdkProvider', () => {
     expect(contextText).toContain('injected context truncated');
   });
 
+  it('clamps an oversized Codex context limit override to the 160k supported ceiling', async () => {
+    vi.stubEnv('IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS', '999999');
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-context-max-cap', cwd: '/tmp/project' });
+    const userMessage = 'keep the user request';
+    const systemText = `Identity contracts ${'i'.repeat(170_000)}`;
+
+    await provider.send('route-context-max-cap', {
+      userMessage,
+      assembledMessage: userMessage,
+      systemText,
+      attachments: undefined,
+      context: {
+        systemText,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'repo' },
+        authoritySource: 'processed_local',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    const child = childProcessMock.children[0];
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+    const inputText = String(turnStartReq?.params?.input?.[0]?.text ?? '');
+    const separator = `\n\n${userMessage}`;
+    const contextText = inputText.slice(0, inputText.indexOf(separator));
+    expect(inputText).toContain(userMessage);
+    expect(contextText).toHaveLength(160_000);
+    expect(contextText).toContain('to 160000 chars');
+  });
+
   it('maps normalized system context into the turn input text', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });

@@ -455,7 +455,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     inputSchema: objectSchema({
       identityScope: { type: 'string', enum: [...SESSION_IDENTITY_SCOPE_LIST], description: 'user, project, or session.' },
       target: stringSchema('Exact session name. Omit for the current session.'),
-      content: stringSchema(`Inline identity contract: user scope up to 10,000 characters, project up to 20,000, session up to 30,000; all scopes also enforce ${SESSION_IDENTITY_MAX_UTF8_BYTES} UTF-8 bytes.`),
+      content: stringSchema(`Inline identity contract: user scope up to 20,000 characters, project up to 40,000, session up to 80,000; all scopes also enforce ${SESSION_IDENTITY_MAX_UTF8_BYTES} UTF-8 bytes.`),
       filePath: stringSchema('Identity document path. User/project scope requires a project-relative path; session scope also accepts an absolute daemon-host path. The daemon uploads content, never the local path.'),
       expectedRevision: numberSchema('Deprecated compatibility field; ignored because identity saves are explicit last-write-wins operations.', { minimum: 0 }),
     }, ['identityScope']),
@@ -667,7 +667,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       },
       identity: {
         ...objectSchema({
-          content: stringSchema('Inline session-scoped Agent identity contract, up to 30,000 characters.'),
+          content: stringSchema('Inline session-scoped Agent identity contract, up to 80,000 characters.'),
           filePath: stringSchema('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for this session-scoped startup identity.', { maxLength: SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS }),
         }),
         anyOf: [{ required: ['content'] }, { required: ['filePath'] }],

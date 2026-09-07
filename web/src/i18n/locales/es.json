@@ -701,7 +701,7 @@
     "identityCharacterCount": "{{count}} / {{limit}} caracteres",
     "identitySelectedFile": "Cargado desde {{path}}",
     "identityPreviewRequired": "Espera a que termine la vista previa del archivo y vuelve a confirmar.",
-    "identityTooLarge": "La identidad debe ser texto UTF-8 válido de hasta 30.000 caracteres y 120.000 bytes.",
+    "identityTooLarge": "La identidad debe ser texto UTF-8 válido de hasta 80.000 caracteres y 320.000 bytes.",
     "sessionKey": "Clave de sesión",
     "autoGenerate": "Generar automáticamente",
     "codex_ctx_short": "ctx",
@@ -859,7 +859,7 @@
     "identityHelp_project": "Se aplica a este proyecto y se sincroniza en línea. Solo se sube el texto.",
     "identityHelp_session": "Se aplica solo a esta sesión. Escribe texto o elige cualquier archivo legible del host daemon.",
     "identitySaveAfterCreate": "Guardar tras crear la sesión",
-    "identityTooLargeScoped": "La identidad debe ser texto UTF-8 válido de hasta {{limit}} caracteres y 120.000 bytes.",
+    "identityTooLargeScoped": "La identidad debe ser texto UTF-8 válido de hasta {{limit}} caracteres y 320.000 bytes.",
     "identityCreateSaveFailed": "La sesión comenzó, pero no se pudo guardar su identidad.",
     "identityCreateApplyFailed": "La sesión comenzó y la identidad se guardó en línea, pero el daemon no confirmó su aplicación. Reinténtalo en los ajustes antes de enviar un mensaje.",
     "identityApply": "Aplicar identidad"

@@ -701,7 +701,7 @@
     "identityCharacterCount": "{{count}} / {{limit}} characters",
     "identitySelectedFile": "Loaded from {{path}}",
     "identityPreviewRequired": "Wait for the selected text file preview to finish, then select it again.",
-    "identityTooLarge": "Identity must be valid UTF-8 text within 30,000 characters and 120,000 bytes.",
+    "identityTooLarge": "Identity must be valid UTF-8 text within 80,000 characters and 320,000 bytes.",
     "sessionKey": "Session Key",
     "autoGenerate": "Auto-generate",
     "codex_ctx_short": "ctx",
@@ -859,7 +859,7 @@
     "identityHelp_project": "Applied to this project and synchronized online. The selected file name is recorded for reference; only its text is uploaded.",
     "identityHelp_session": "Applied only to this session. You may type text or select any readable file on the daemon host.",
     "identitySaveAfterCreate": "Saved after the session is created",
-    "identityTooLargeScoped": "Identity must be valid UTF-8 text within {{limit}} characters and 120,000 bytes.",
+    "identityTooLargeScoped": "Identity must be valid UTF-8 text within {{limit}} characters and 320,000 bytes.",
     "identityCreateSaveFailed": "The session started, but its session identity could not be saved.",
     "identityCreateApplyFailed": "The session started and its identity was saved online, but the daemon did not confirm applying it. Retry in session settings before sending a message.",
     "identityApply": "Apply identity"

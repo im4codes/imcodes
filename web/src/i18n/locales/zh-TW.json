@@ -701,7 +701,7 @@
     "identityCharacterCount": "{{count}} / {{limit}} 字元",
     "identitySelectedFile": "已從 {{path}} 載入",
     "identityPreviewRequired": "請等待所選文字檔預覽完成，然後再次確認選擇。",
-    "identityTooLarge": "身分必須是有效 UTF-8 文字，且不超過 30,000 字元與 120,000 位元組。",
+    "identityTooLarge": "身分必須是有效 UTF-8 文字，且不超過 80,000 字元與 320,000 位元組。",
     "sessionKey": "Session 金鑰",
     "autoGenerate": "自動產生",
     "codex_ctx_short": "上下文",
@@ -859,7 +859,7 @@
     "identityHelp_project": "套用到目前專案並在線同步。記錄所選檔名以供識別，只上傳文字內容。",
     "identityHelp_session": "僅套用到目前會話。可手動輸入，或選擇 daemon 主機上的任意可讀檔案。",
     "identitySaveAfterCreate": "建立會話後儲存",
-    "identityTooLargeScoped": "身份內容必須是有效 UTF-8 文字，不超過 {{limit}} 字元和 120,000 位元組。",
+    "identityTooLargeScoped": "身份內容必須是有效 UTF-8 文字，不超過 {{limit}} 字元和 320,000 位元組。",
     "identityCreateSaveFailed": "會話已啟動，但會話身份儲存失敗。",
     "identityCreateApplyFailed": "會話已啟動且身份已線上儲存，但 daemon 未確認已套用。請先在會話設定中重試，再傳送訊息。",
     "identityApply": "套用身份"

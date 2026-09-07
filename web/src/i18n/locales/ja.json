@@ -701,7 +701,7 @@
     "identityCharacterCount": "{{count}} / {{limit}} 文字",
     "identitySelectedFile": "{{path}} から読み込み済み",
     "identityPreviewRequired": "選択したテキストファイルのプレビュー完了後、もう一度確定してください。",
-    "identityTooLarge": "ID は 30,000 文字、120,000 バイト以内の有効な UTF-8 テキストである必要があります。",
+    "identityTooLarge": "ID は 80,000 文字、320,000 バイト以内の有効な UTF-8 テキストである必要があります。",
     "sessionKey": "セッションキー",
     "autoGenerate": "自動生成",
     "codex_ctx_short": "文脈",
@@ -859,7 +859,7 @@
     "identityHelp_project": "このプロジェクトに適用しオンライン同期します。アップロードするのはテキストのみです。",
     "identityHelp_session": "このセッションだけに適用します。入力または daemon ホスト上の任意の読取可能ファイルを選択できます。",
     "identitySaveAfterCreate": "セッション作成後に保存",
-    "identityTooLargeScoped": "ID は {{limit}} 文字、120,000 バイト以内の有効な UTF-8 テキストにしてください。",
+    "identityTooLargeScoped": "ID は {{limit}} 文字、320,000 バイト以内の有効な UTF-8 テキストにしてください。",
     "identityCreateSaveFailed": "セッションは開始しましたが、ID を保存できませんでした。",
     "identityCreateApplyFailed": "セッションは開始され ID はオンラインに保存されましたが、daemon が適用を確認しませんでした。メッセージ送信前にセッション設定で再試行してください。",
     "identityApply": "ID を適用"

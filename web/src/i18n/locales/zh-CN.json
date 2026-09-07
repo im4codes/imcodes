@@ -701,7 +701,7 @@
     "identityCharacterCount": "{{count}} / {{limit}} 字符",
     "identitySelectedFile": "已从 {{path}} 加载",
     "identityPreviewRequired": "请等待所选文本文件预览完成，然后再次确认选择。",
-    "identityTooLarge": "身份必须是有效 UTF-8 文本，且不超过 30,000 字符和 120,000 字节。",
+    "identityTooLarge": "身份必须是有效 UTF-8 文本，且不超过 80,000 字符和 320,000 字节。",
     "sessionKey": "会话密钥",
     "autoGenerate": "自动生成",
     "codex_ctx_short": "上下文",
@@ -859,7 +859,7 @@
     "identityHelp_project": "应用到当前项目并在线同步。记录所选文件名以供识别，只上传文本内容。",
     "identityHelp_session": "仅应用到当前会话。可手动输入，或选择 daemon 主机上的任意可读文件。",
     "identitySaveAfterCreate": "创建会话后保存",
-    "identityTooLargeScoped": "身份内容必须是有效 UTF-8 文本，不超过 {{limit}} 字符和 120,000 字节。",
+    "identityTooLargeScoped": "身份内容必须是有效 UTF-8 文本，不超过 {{limit}} 字符和 320,000 字节。",
     "identityCreateSaveFailed": "会话已启动，但会话身份保存失败。",
     "identityCreateApplyFailed": "会话已启动且身份已在线保存，但 daemon 未确认已应用。请先在会话设置中重试，再发送消息。",
     "identityApply": "应用身份"

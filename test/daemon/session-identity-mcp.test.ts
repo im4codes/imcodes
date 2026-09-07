@@ -137,9 +137,9 @@ describe('session identity MCP tools', () => {
     });
 
     for (const [identityScope, length] of [
-      ['user', 10_001],
-      ['project', 20_001],
-      ['session', 30_001],
+      ['user', 20_001],
+      ['project', 40_001],
+      ['session', 80_001],
     ] as const) {
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
         identityScope,
