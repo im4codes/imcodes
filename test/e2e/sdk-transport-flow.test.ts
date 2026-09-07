@@ -1262,6 +1262,36 @@ describe('sdk transport flow e2e', () => {
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error' }));
   });
 
+  it('carries a selected-file identity from session.start into the first SDK system prompt', async () => {
+    const serverLink = { send: vi.fn() } as any;
+    const sessionName = 'deck_identity_file_prompt_brain';
+    const identityDocument = '中'.repeat(49_323);
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'identity file prompt',
+      dir: '/tmp/identity-file-prompt-e2e',
+      agentType: 'claude-code-sdk',
+      identityPrompt: identityDocument,
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => !!mocks.store.get(sessionName));
+
+    handleWebCommand({
+      type: 'session.send',
+      session: sessionName,
+      text: 'Report your identity.',
+      commandId: 'cmd-identity-file-first-turn',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => mocks.claudeCalls.some((call) => (
+      String(call.options.appendSystemPrompt ?? '').includes(identityDocument)
+    )));
+
+    expect(mocks.store.get(sessionName)?.identityPrompt).toBe(identityDocument);
+    expect(mocks.claudeCalls.at(-1)?.options.appendSystemPrompt).toContain(identityDocument);
+  });
+
   it('starts a selected compatible model without duplicating the CC preset', async () => {
     const serverLink = { send: vi.fn() } as any;
 

@@ -106,6 +106,10 @@ import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-
 import { supervisionAutomation } from './supervision-automation.js';
 import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
 import {
+  normalizeSessionIdentityContent,
+  sessionIdentityContentError,
+} from '../../shared/session-identity.js';
+import {
   buildSupervisedAuditExecutionPreamble,
   buildSupervisionExecutionPreamble,
 } from './supervision-prompts.js';
@@ -2258,6 +2262,19 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     return;
   }
   const project = sanitizeProjectName(rawProject);
+  const rawIdentityPrompt = cmd.identityPrompt;
+  if (rawIdentityPrompt !== undefined && (
+    typeof rawIdentityPrompt !== 'string'
+    || sessionIdentityContentError(rawIdentityPrompt) !== null
+  )) {
+    const message = 'session.start: invalid Agent identity';
+    logger.warn({ project, agentType }, message);
+    try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
+    return;
+  }
+  const identityPrompt = typeof rawIdentityPrompt === 'string'
+    ? normalizeSessionIdentityContent(rawIdentityPrompt)
+    : undefined;
   const sessionName = `deck_${project}_brain`;
   // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
@@ -2307,6 +2324,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       extraEnv,
       ccPreset: ccPresetName,
       effort,
+      identityPrompt,
     };
     if (agentType === 'claude-code-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
@@ -2323,6 +2341,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'codex-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
@@ -2336,6 +2355,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'copilot-sdk' || agentType === 'cursor-headless') {
       logger.info({ project, agentType }, 'SDK fresh session.start launching new transport main session');
@@ -2349,6 +2369,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) {
       // Transport providers share the codex-sdk launch shape. DSH/Pi additionally
@@ -2366,6 +2387,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'qwen') {
       logger.info({ project }, 'SDK fresh session.start launching new Qwen main session');
@@ -2380,6 +2402,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else {
       await startProject(config);

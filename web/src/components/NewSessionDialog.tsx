@@ -458,6 +458,9 @@ export function NewSessionDialog({
     }
 
     const slug = sanitizeProjectName(project.trim());
+    const identityPrompt = pendingSessionIdentity.trim()
+      ? normalizeSessionIdentityContent(pendingSessionIdentity)
+      : undefined;
     pendingStartRef.current = {
       project: slug,
       sessionName: `deck_${slug}_brain`,
@@ -483,6 +486,7 @@ export function NewSessionDialog({
         ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
         ...extra,
         thinking,
+        ...(identityPrompt ? { identityPrompt } : {}),
       });
     } else {
       const extra: Record<string, unknown> = {};
@@ -514,6 +518,7 @@ export function NewSessionDialog({
         agentType,
         ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
         ...extra,
+        ...(identityPrompt ? { identityPrompt } : {}),
         ...(agentType === "claude-code-sdk" ||
         agentType === "codex-sdk" ||
         agentType === "copilot-sdk" ||

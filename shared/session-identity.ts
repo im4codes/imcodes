@@ -23,8 +23,12 @@ export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentit
   [SESSION_IDENTITY_SCOPES.PROJECT]: SESSION_IDENTITY_PROJECT_MAX_CHARS,
   [SESSION_IDENTITY_SCOPES.SESSION]: SESSION_IDENTITY_SESSION_MAX_CHARS,
 });
-/** Worst-case UTF-8 size of the largest (session-scoped) identity profile. */
-export const SESSION_IDENTITY_MAX_UTF8_BYTES = 320_000;
+/**
+ * Bounded pre-read size for a UTF-8 identity file. This is not a second user
+ * content limit: every valid profile within the 80,000-code-point session cap
+ * fits in at most four UTF-8 bytes per code point, plus an optional BOM.
+ */
+export const SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES = SESSION_IDENTITY_SESSION_MAX_CHARS * 4 + 3;
 export const SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS = 512;
 export const SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS = 1_024;
 export const SESSION_IDENTITY_API_PATH = '/api/session-identities';
@@ -72,9 +76,6 @@ export function sessionIdentityContentError(
   const normalized = normalizeSessionIdentityContent(value);
   if (!normalized) return 'identity_content_required';
   if (Array.from(normalized).length > sessionIdentityMaxChars(scope)) return 'identity_content_too_large';
-  if (new TextEncoder().encode(normalized).byteLength > SESSION_IDENTITY_MAX_UTF8_BYTES) {
-    return 'identity_content_too_large';
-  }
   if (normalized.includes('\0')) return 'identity_content_invalid';
   return null;
 }

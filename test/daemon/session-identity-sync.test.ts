@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { syncSessionIdentities, syncSessionIdentitiesForCommand } from '../../src/daemon/session-identity-sync.js';
+import { syncSessionIdentities, syncSessionIdentity, syncSessionIdentitiesForCommand } from '../../src/daemon/session-identity-sync.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
   renderSessionIdentityProfiles,
@@ -85,6 +85,34 @@ describe('cross-machine session identity synchronization', () => {
     await expect(periodic).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
     await expect(explicit).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
     expect(applyIdentity).toHaveBeenCalledTimes(1);
+  });
+
+  it('fetches a post-write snapshot for an explicit target instead of joining a stale periodic snapshot', async () => {
+    let releasePeriodic!: (value: {
+      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[];
+    }) => void;
+    const target = session({ identityPrompt: undefined });
+    const listProfiles = vi.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { releasePeriodic = resolve; }))
+      .mockResolvedValueOnce({
+        status: 'ok' as const,
+        serverId: 'srv-9',
+        profiles: [{ ...profile('session', 'srv-9:deck_proj_brain', 'Identity loaded from a selected file.'), sourceFile: '/identity.md' }],
+      });
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+    const deps = { listProfiles, listLocalSessions: () => [target], applyIdentity };
+
+    const periodic = syncSessionIdentities({}, deps);
+    const explicit = syncSessionIdentity(target.name, {}, deps);
+    await expect(explicit).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(applyIdentity).toHaveBeenCalledWith(
+      target.name,
+      expect.stringContaining('Identity loaded from a selected file.'),
+      { refresh: true },
+    );
+    releasePeriodic({ status: 'ok', serverId: 'srv-9', profiles: [] });
+    await periodic;
+    expect(listProfiles).toHaveBeenCalledTimes(2);
   });
 
   it('builds the explicit refresh ack only after convergence and carries failures', async () => {

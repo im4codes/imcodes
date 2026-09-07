@@ -142,4 +142,21 @@ describe('/api/session-identities', () => {
     });
     expect(oversized.status).toBe(400);
   });
+
+  it('stores a 49,323-character Chinese session identity independent of encoded request bytes', async () => {
+    const content = '中'.repeat(49_323);
+    const body = JSON.stringify({ scope: 'session', scopeKey: 'server-1:deck_project_brain', content });
+    expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(120_000);
+
+    const put = await app.request('/api/session-identities', {
+      method: 'PUT',
+      headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
+      body,
+    });
+
+    expect(put.status).toBe(200);
+    const result = await put.json() as { profile: { content: string } };
+    expect(Array.from(result.profile.content)).toHaveLength(49_323);
+    expect(result.profile.content).toBe(content);
+  });
 });

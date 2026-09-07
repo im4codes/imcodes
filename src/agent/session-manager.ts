@@ -304,6 +304,8 @@ export interface ProjectConfig {
   ccPreset?: string;
   /** Transport thinking level for supported main sessions. */
   effort?: TransportEffortLevel;
+  /** Session-scoped Agent identity available before the first provider turn. */
+  identityPrompt?: string;
 }
 
 export function getDriver(type: AgentType): AgentDriver {
@@ -325,9 +327,9 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort, identityPrompt } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label, effort });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label, effort, identityPrompt });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
@@ -3654,6 +3656,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
       ...(label ? { label } : {}),
       ...(opts.description ? { description: opts.description } : {}),
+      ...(opts.identityPrompt ? { identityPrompt: opts.identityPrompt } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
@@ -3681,6 +3684,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
         ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
         ...(opts.description ? { description: opts.description } : {}),
+        ...(opts.identityPrompt ? { identityPrompt: opts.identityPrompt } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
         updatedAt: Date.now(),
@@ -3697,13 +3701,25 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   // Start structured-event watchers for supported agent types
   startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
 
-  // Auto-dismiss startup prompts (trust folder, settings errors, update dialogs)
-  if (driver.postLaunch) {
-    driver.postLaunch(
-      () => capturePane(name),
-      (key) => sendKey(name, key),
-    ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
-  }
+  // Auto-dismiss startup prompts before delivering the initial context. A
+  // selected identity file has already been resolved to bytes by the UI/MCP;
+  // process agents must receive those same bytes on their first launch rather
+  // than only after a later respawn.
+  void (async () => {
+    if (driver.postLaunch) {
+      await driver.postLaunch(
+        () => capturePane(name),
+        (key) => sendKey(name, key),
+      ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
+    }
+    const initialContext = [opts.description, opts.identityPrompt].filter(Boolean).join('\n\n');
+    if (!initialContext || agentType === 'shell' || agentType === 'script') return;
+    try {
+      await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
+    } catch (error) {
+      logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
+    }
+  })();
 }
 
 /** Bound ops for a session (used by status poller / response collector). */

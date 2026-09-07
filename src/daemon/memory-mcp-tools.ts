@@ -168,7 +168,7 @@ import {
   type AliasMcpClientOptions,
 } from './alias-mcp-client.js';
 import {
-  SESSION_IDENTITY_MAX_UTF8_BYTES,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES,
   SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS,
   SESSION_IDENTITY_SCOPE_LIST,
   SESSION_IDENTITY_SCOPES,
@@ -1071,7 +1071,7 @@ async function readIdentityFile(
     throw new Error('identity_file_path_invalid');
   }
   const stat = await lstat(candidate);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > SESSION_IDENTITY_MAX_UTF8_BYTES) {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES) {
     throw new Error('identity_file_invalid');
   }
   const exact = await realpath(candidate);

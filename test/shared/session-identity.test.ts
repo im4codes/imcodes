@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   SESSION_IDENTITY_MAX_CHARS,
-  SESSION_IDENTITY_MAX_UTF8_BYTES,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES,
   SESSION_IDENTITY_PROJECT_MAX_CHARS,
   SESSION_IDENTITY_SCOPES,
   SESSION_IDENTITY_SESSION_MAX_CHARS,
@@ -42,7 +42,7 @@ describe('session identity contracts', () => {
     expect(SESSION_IDENTITY_USER_MAX_CHARS).toBe(20_000);
     expect(SESSION_IDENTITY_PROJECT_MAX_CHARS).toBe(40_000);
     expect(SESSION_IDENTITY_SESSION_MAX_CHARS).toBe(80_000);
-    expect(SESSION_IDENTITY_MAX_UTF8_BYTES).toBe(320_000);
+    expect(SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES).toBe(320_003);
     expect(SESSION_IDENTITY_MAX_CHARS).toBe(SESSION_IDENTITY_SESSION_MAX_CHARS);
     for (const [scope, limit] of [
       [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_USER_MAX_CHARS],
@@ -53,6 +53,7 @@ describe('session identity contracts', () => {
       expect(sessionIdentityContentError('x'.repeat(limit + 1), scope)).toBe('identity_content_too_large');
     }
     expect(sessionIdentityContentError('😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS), 'session')).toBeNull();
+    expect(sessionIdentityContentError('中'.repeat(49_323), 'session')).toBeNull();
     expect(sessionIdentityContentError('\0')).toBe('identity_content_invalid');
   });
 

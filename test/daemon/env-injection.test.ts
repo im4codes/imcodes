@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   upsertSession: vi.fn(),
   getSession: vi.fn(() => null),
   sessionExists: vi.fn().mockResolvedValue(false),
+  sendKeys: vi.fn().mockResolvedValue(undefined),
+  capturePane: vi.fn().mockResolvedValue(['›']),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -29,8 +31,8 @@ vi.mock('../../src/agent/tmux.js', () => ({
   cleanupOrphanFifos: vi.fn(),
   newSession: mocks.newSession,
   killSession: vi.fn().mockResolvedValue(undefined),
-  sendKeys: vi.fn().mockResolvedValue(undefined),
-  capturePane: vi.fn().mockResolvedValue([]),
+  sendKeys: mocks.sendKeys,
+  capturePane: mocks.capturePane,
 }));
 
 vi.mock('../../src/daemon/codex-watcher.js', () => ({
@@ -122,6 +124,20 @@ describe('IMCODES_SESSION env injection', () => {
     expect(opts.env.IMCODES_SESSION).toBe('deck_proj_brain');
   });
 
+  it('does not execute identity prose as a shell command', async () => {
+    await launchSession({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/proj',
+      identityPrompt: 'Never execute this as shell input.',
+    });
+    await Promise.resolve();
+
+    expect(mocks.sendKeys).not.toHaveBeenCalled();
+  });
+
   it('injects IMCODES_SESSION into newSession env for claude-code agent', async () => {
     await launchSession({
       name: 'deck_proj_w1',
@@ -150,6 +166,26 @@ describe('IMCODES_SESSION env injection', () => {
     const opts = mocks.newSession.mock.calls[0][2];
     expect(opts.env.IMCODES_SESSION).toBe('deck_proj_brain');
     expect(opts.env.RCC_AUTOFIX_MODE).toBe('1');
+  });
+
+  it('injects a selected-file identity into a process agent on its first launch', async () => {
+    await launchSession({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      projectDir: '/proj',
+      identityPrompt: 'Identity loaded from the selected document.',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+
+    expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      identityPrompt: 'Identity loaded from the selected document.',
+    }));
+    expect(mocks.sendKeys).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('Identity loaded from the selected document.'),
+    );
   });
 
   it('does not call newSession when tmux session already exists', async () => {

@@ -1661,6 +1661,40 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('passes a validated selected-file identity into the initial SDK launch', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'identity startup',
+      dir: '/proj',
+      agentType: 'codex-sdk',
+      identityPrompt: 'Identity loaded from a selected file.',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_identity_startup_brain',
+      agentType: 'codex-sdk',
+      identityPrompt: 'Identity loaded from a selected file.',
+    }));
+  });
+
+  it('rejects an invalid startup identity before creating an SDK runtime', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'invalid identity startup',
+      dir: '/proj',
+      agentType: 'codex-sdk',
+      identityPrompt: 'x'.repeat(80_001),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.error',
+      project: 'invalid_identity_startup',
+    }));
+  });
+
   it('passes requestedModel when starting a cursor-headless main session', async () => {
     handleWebCommand({
       type: 'session.start',

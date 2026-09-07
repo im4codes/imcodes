@@ -8,6 +8,23 @@ import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.j
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
+const {
+  fetchSessionIdentityProfileMock,
+  saveSessionIdentityProfileMock,
+  clearSessionIdentityProfileMock,
+} = vi.hoisted(() => ({
+  fetchSessionIdentityProfileMock: vi.fn(async () => null),
+  saveSessionIdentityProfileMock: vi.fn(),
+  clearSessionIdentityProfileMock: vi.fn(),
+}));
+
+vi.mock('../../src/api.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/api.js')>(),
+  fetchSessionIdentityProfile: (...args: unknown[]) => fetchSessionIdentityProfileMock(...args),
+  saveSessionIdentityProfile: (...args: unknown[]) => saveSessionIdentityProfileMock(...args),
+  clearSessionIdentityProfile: (...args: unknown[]) => clearSessionIdentityProfileMock(...args),
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, _opts?: Record<string, unknown>) => {
@@ -26,11 +43,16 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
 
 vi.mock('../../src/components/file-browser-lazy.js', () => ({
   FileBrowser: (props: {
-    onConfirm?: (paths: string[]) => void;
+    mode?: string;
+    onConfirm?: (paths: string[], preview?: unknown) => void;
     onDirectoryCreated?: (path: string) => void;
   }) => (
     <div data-testid="mock-file-browser">
       <button onClick={() => props.onConfirm?.(['/home/user/selected'])}>mock-select-dir</button>
+      {props.mode === 'file-single' && <button onClick={() => props.onConfirm?.(
+        ['/home/user/agent-identity.md'],
+        { status: 'ok', path: '/home/user/agent-identity.md', content: 'Identity loaded from a selected file.' },
+      )}>mock-select-identity-file</button>}
       <button onClick={() => props.onDirectoryCreated?.('/home/user/new-project')}>mock-create-folder</button>
     </div>
   ),
@@ -100,6 +122,24 @@ describe('NewSessionDialog', () => {
     expect(screen.getByRole('tab', { name: 'identityScope_project' })).toBeDefined();
     expect(screen.getByRole('tab', { name: 'identityScope_session' })).toBeDefined();
     expect(screen.getAllByLabelText('session-identity-content')).toHaveLength(1);
+  });
+
+  it('sends selected identity file content in session.start so the first SDK system prompt has it', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog serverId="srv-1" ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'identity-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '/tmp/identity-app' } });
+    const identity = await screen.findByLabelText('session-identity-content') as HTMLTextAreaElement;
+    await waitFor(() => expect(identity.disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'identityChooseFile' }));
+    fireEvent.click(screen.getByText('mock-select-identity-file'));
+    expect(identity.value).toBe('Identity loaded from a selected file.');
+
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: 'identity-app',
+      identityPrompt: 'Identity loaded from a selected file.',
+    }));
   });
 
   it('uses a newly created folder from the directory picker as the working directory', async () => {

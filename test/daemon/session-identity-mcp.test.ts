@@ -158,7 +158,8 @@ describe('session identity MCP tools', () => {
     const projectDir = join(root, 'project');
     const externalPath = join(root, 'identity.md');
     await mkdir(projectDir);
-    await writeFile(externalPath, 'External exact-session identity.');
+    const externalIdentity = '中'.repeat(49_323);
+    await writeFile(externalPath, externalIdentity);
     const target = session({ projectDir });
     const setIdentityProfile = vi.fn(async (input: {
       scope: 'session'; scopeKey: string; content: string;
@@ -176,7 +177,7 @@ describe('session identity MCP tools', () => {
         filePath: externalPath,
       })).resolves.toMatchObject({ status: 'ok', saved: true });
       expect(setIdentityProfile).toHaveBeenCalledWith(expect.objectContaining({
-        content: 'External exact-session identity.',
+        content: externalIdentity,
       }), {});
 
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({

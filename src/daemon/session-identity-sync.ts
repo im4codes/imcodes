@@ -84,17 +84,46 @@ export async function syncSessionIdentities(
   }
 }
 
+/**
+ * Refresh one exact session from a snapshot fetched after the user's write.
+ * Do not join the periodic all-session request: that request may already hold
+ * a pre-write snapshot and would acknowledge the save without applying it.
+ */
+export async function syncSessionIdentity(
+  sessionName: string,
+  options: SessionIdentityClientOptions = {},
+  deps: SessionIdentitySyncDeps = {},
+): Promise<SessionIdentitySyncResult> {
+  const session = (deps.listLocalSessions ?? listSessions)()
+    .find((candidate) => candidate.name === sessionName && candidate.state !== 'stopped');
+  if (!session) return { status: 'error', checked: 0, changed: 0, message: 'session identity target is unavailable' };
+  const snapshot = await (deps.listProfiles ?? listSessionIdentityProfiles)(options);
+  if (snapshot.status !== 'ok') {
+    return { status: 'error', checked: 1, changed: 0, message: snapshot.message };
+  }
+  const prompt = renderSessionIdentityProfiles(
+    profilesForSession(snapshot.profiles, session, snapshot.serverId),
+  );
+  if ((session.identityPrompt?.trim() || undefined) === prompt) {
+    return { status: 'ok', checked: 1, changed: 0 };
+  }
+  (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, prompt, { refresh: true });
+  return { status: 'ok', checked: 1, changed: 1 };
+}
+
 /** Translate an explicit browser refresh into an acknowledgement only after
  * the runtime convergence has settled. Legacy fire-and-forget callers without
  * a command id still run the sync but do not receive an unsolicited ack. */
 export async function syncSessionIdentitiesForCommand(
   command: Record<string, unknown>,
-  runSync: () => Promise<SessionIdentitySyncResult> = () => syncSessionIdentities(),
+  runSync?: () => Promise<SessionIdentitySyncResult>,
 ): Promise<SessionIdentityRefreshAck | null> {
   const commandId = typeof command.commandId === 'string' ? command.commandId : '';
   const sessionName = typeof command.sessionName === 'string' ? command.sessionName : '';
   try {
-    const result = await runSync();
+    const result = await (runSync
+      ? runSync()
+      : sessionName ? syncSessionIdentity(sessionName) : syncSessionIdentities());
     if (!commandId || !sessionName) return null;
     return {
       commandId,
