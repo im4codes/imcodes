@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
 import { access, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -386,6 +385,112 @@ describe('daemon direct file transfer v2 lease broker', () => {
       candidate: 'candidate:stale 1 udp 1 192.168.1.11 4001 typ host', mid: '0',
     }, sender);
     expect(replacement.addRemoteCandidate).toHaveBeenCalledTimes(1);
+    const replacementAuthority = uploadPrepare({
+      requestId: retryRequestId,
+      attemptId: 'replacement-attempt-0001',
+      operationId: 'replacement-operation-0001',
+      clientUploadId: 'replacement-operation-0001',
+      channelLabel: 'imcodes-file-replacement-0001',
+    });
+    await direct.handleDirectFileTransferCommand(replacementAuthority, sender);
+    replacement.emitDataChannel(new FakeDataChannel(replacementAuthority.channelLabel as string));
+    // Native close may synchronously or belatedly report state from the old
+    // peer. Its callback generation is retired and must not fail the new one.
+    previous.emitState('disconnected');
+    expect(sent).not.toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      attemptId: replacementAuthority.attemptId,
+    }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('serializes cancel, disconnect, and repeated shutdown into one native close', async () => {
+    const { direct, sent, sender } = await readyLease();
+    const authority = uploadPrepare({
+      requestId: 'close-race-request-0001',
+      attemptId: 'close-race-attempt-0001',
+      operationId: 'close-race-operation-0001',
+      clientUploadId: 'close-race-operation-0001',
+      channelLabel: 'imcodes-file-close-race-0001',
+    });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const peer = FakePeerConnection.latest!;
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    peer.emitDataChannel(channel);
+    const cancel = direct.handleDirectFileTransferCommand({
+      type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({
+        requestId: authority.requestId,
+        attemptId: authority.attemptId,
+        operationId: authority.operationId,
+      }),
+      authority: authority.authority,
+      reason: DIRECT_FILE_TRANSFER_ERROR.CANCELED,
+    }, sender);
+    peer.emitState('disconnected');
+    const firstShutdown = direct.shutdownDirectFileTransfers();
+    const secondShutdown = direct.shutdownDirectFileTransfers();
+    await Promise.all([cancel, firstShutdown, secondShutdown]);
+
+    expect(peer.close, 'one lease teardown owns peer.close').toHaveBeenCalledOnce();
+    expect(channel.close, 'one transfer teardown owns channel.close').toHaveBeenCalledOnce();
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
+      && message.attemptId === authority.attemptId)).toHaveLength(1);
+  });
+
+  it('repeats create, transfer, renew, expire without stale callbacks or native close duplication', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { direct, sent, sender } = await readyLease();
+    for (let round = 0; round < 3; round += 1) {
+      const suffix = String(round + 1).padStart(4, '0');
+      const roundLeaseId = round === 0 ? leaseId : `cycle-lease-${suffix}`;
+      const roundRequestId = `cycle-request-${suffix}`;
+      if (round > 0) {
+        await direct.handleDirectFileTransferCommand(leasePrepare({
+          leaseId: roundLeaseId,
+          requestId: roundRequestId,
+        }), sender);
+      }
+      const peer = FakePeerConnection.latest!;
+      const authority = uploadPrepare({
+        leaseId: roundLeaseId,
+        requestId: roundRequestId,
+        attemptId: `cycle-attempt-${suffix}`,
+        operationId: `cycle-operation-${suffix}`,
+        clientUploadId: `cycle-operation-${suffix}`,
+        channelLabel: `imcodes-file-cycle-${suffix}`,
+      });
+      await direct.handleDirectFileTransferCommand(authority, sender);
+      const channel = new FakeDataChannel(authority.channelLabel as string);
+      peer.emitDataChannel(channel);
+
+      // Renew the control generation while the data attempt is live.
+      await direct.handleDirectFileTransferCommand(leasePrepare({
+        leaseId: roundLeaseId,
+        requestId: `cycle-renew-${suffix}`,
+        daemonGeneration: 2,
+      }), sender);
+      await direct.handleDirectFileTransferCommand({
+        type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...binding({
+          leaseId: roundLeaseId,
+          requestId: roundRequestId,
+          attemptId: authority.attemptId,
+          operationId: authority.operationId,
+        }),
+        authority: authority.authority,
+        reason: DIRECT_FILE_TRANSFER_ERROR.CANCELED,
+      }, sender);
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS);
+
+      expect(channel.close, `round ${round + 1} transfer close`).toHaveBeenCalledOnce();
+      expect(peer.close, `round ${round + 1} lease close`).toHaveBeenCalledOnce();
+      const errorsBeforeStaleCallback = sent.length;
+      peer.emitState('disconnected');
+      expect(sent, 'retired generation callback must be inert').toHaveLength(errorsBeforeStaleCallback);
+    }
     await direct.shutdownDirectFileTransfers();
   });
 
@@ -966,22 +1071,18 @@ describe('daemon direct file transfer v2 lease broker', () => {
   });
 
   it('acks a shutdown whose cleanup failed as failed, rather than as a clean stop', async () => {
-    // Driven through a real parent port so the worker's own dispatcher, control
+    // Driven through the child transport so the runtime dispatcher, control
     // shim and shutdown handler all run as they do in production.
     const posted: Record<string, unknown>[] = [];
     let controlPostsFail = false;
-    const port = new EventEmitter() as EventEmitter & { postMessage(value: Record<string, unknown>): void };
-    port.postMessage = (value: Record<string, unknown>) => {
+    let dispatch: ((value: Record<string, unknown>) => void) | null = null;
+    const postMessage = (value: Record<string, unknown>) => {
       if (controlPostsFail && value.type === DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL) {
-        // What postMessage actually does when a payload cannot cross.
+        // What process.send does when a payload cannot cross.
         throw new Error('DataCloneError: control message could not be cloned');
       }
       posted.push(value);
     };
-    vi.doMock('node:worker_threads', () => ({
-      parentPort: port,
-      workerData: { kind: 'imcodes-direct-file-transfer', generation: 1 },
-    }));
 
     const direct = await import('../../src/daemon/direct-file-transfer-worker.js');
     const handler = await import('../../src/daemon/file-transfer-handler.js');
@@ -1004,7 +1105,14 @@ describe('daemon direct file transfer v2 lease broker', () => {
       return null;
     });
 
-    const emit = (envelope: Record<string, unknown>) => port.emit('message', {
+    await direct.startDirectFileTransferChildRuntime({
+      kind: 'imcodes-direct-file-transfer',
+      generation: 1,
+      send: postMessage,
+      subscribe: (handler) => { dispatch = handler; },
+      requestHardRecycle: () => {},
+    });
+    const emit = (envelope: Record<string, unknown>) => dispatch?.({
       v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION, generation: 1, ...envelope,
     });
     const typesPosted = () => posted.map((p) => p.type);
@@ -1039,8 +1147,6 @@ describe('daemon direct file transfer v2 lease broker', () => {
     const ack = posted.find((p) => p.type === DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK)!;
     expect(ack.cleanupOk, 'the ack states the outcome instead of implying success').toBe(false);
     expect(String(ack.detail), 'and says what went wrong').toContain('DataCloneError');
-
-    vi.doUnmock('node:worker_threads');
   });
 
   it('rejects a data START whose exact authority binding differs from the prepared attempt', async () => {

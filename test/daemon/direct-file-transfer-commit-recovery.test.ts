@@ -1,4 +1,3 @@
-import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX,
@@ -121,9 +120,9 @@ describe('direct file transfer interrupted-commit recovery', () => {
     await writeFile(storedPath, 'hello');
     await writeIntent();
 
-    const port = new EventEmitter() as EventEmitter & { postMessage(value: Record<string, unknown>): void };
+    let dispatch: ((value: Record<string, unknown>) => void) | null = null;
     const handler = await import('../../src/daemon/file-transfer-handler.js');
-    port.postMessage = (value: Record<string, unknown>) => {
+    const postMessage = (value: Record<string, unknown>) => {
       if (value.type !== DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL) return;
       // The host half of the call, as the main-thread proxy performs it.
       void (async () => {
@@ -131,24 +130,24 @@ describe('direct file transfer interrupted-commit recovery', () => {
         const result = value.method === 'lookupAttachmentByClientUploadId'
           ? handler.lookupAttachmentByClientUploadId(String(args[0] ?? '')) ?? null
           : await handler.finalizeDirectUploadedFile(args[0] as never);
-        port.emit('message', {
+        dispatch?.({
           v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION, generation: 1,
           type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT, callId: value.callId, ok: true, value: result,
         });
       })();
     };
-    vi.doMock('node:worker_threads', () => ({
-      parentPort: port,
-      workerData: { kind: 'imcodes-direct-file-transfer', generation: 1 },
-    }));
     vi.doMock('node-datachannel', () => ({ PeerConnection: class {}, initLogger: vi.fn(), cleanup: vi.fn() }));
 
-    // Importing the module IS the worker starting up.
-    await import('../../src/daemon/direct-file-transfer-worker.js');
+    const direct = await import('../../src/daemon/direct-file-transfer-worker.js');
+    await direct.startDirectFileTransferChildRuntime({
+      kind: 'imcodes-direct-file-transfer', generation: 1,
+      send: postMessage,
+      subscribe: (handler) => { dispatch = handler; },
+      requestHardRecycle: () => {},
+    });
 
     await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(1));
     await vi.waitFor(async () => expect(await exists(intentPath)).toBe(false));
-    vi.doUnmock('node:worker_threads');
     vi.doUnmock('node-datachannel');
   });
 

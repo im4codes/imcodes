@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_HOST_METHOD,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
@@ -14,7 +15,12 @@ import {
 import {
   __directFileTransferWorkerGenerationForTests as workerGeneration,
   __resetDirectFileTransferForTests as resetProxy,
+  __setDirectFileTransferFinalizeForTests as setFinalizeHost,
   __setDirectFileTransferWorkerFactoryForTests as setWorkerFactory,
+  DIRECT_FILE_TRANSFER_READY_TIMEOUT_MS,
+  DIRECT_FILE_TRANSFER_RESTART_BASE_MS,
+  DIRECT_FILE_TRANSFER_RESTART_MAX_MS,
+  DIRECT_FILE_TRANSFER_STABLE_WINDOW_MS,
   getDirectConnectivityRuntimeStatus,
   handleDirectFileTransferCommand,
   isDirectFileTransferAvailable,
@@ -31,7 +37,7 @@ import {
 /**
  * Controllable stand-in for the transfer worker.
  *
- * Crash, restart-budget and stale-generation behaviour has to be provable
+ * Crash retry/backoff and stale-generation behaviour has to be provable
  * without racing a real thread to die on cue, so these cases drive the double
  * directly. The real worker is exercised separately by the stall proof below.
  */
@@ -46,6 +52,19 @@ class FakeWorker extends EventEmitter {
     this.emit('message', { v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION, generation: this.generation, ...envelope });
   }
   emitRaw(value: unknown): void { this.emit('message', value); }
+}
+
+class DeferredTerminateWorker extends FakeWorker {
+  private resolveTermination: ((code: number) => void) | null = null;
+  override terminate(): Promise<number> {
+    this.terminated += 1;
+    return new Promise<number>((resolve) => { this.resolveTermination = resolve; });
+  }
+  finishTermination(code = 0): void {
+    this.emit('exit', code);
+    this.resolveTermination?.(code);
+    this.resolveTermination = null;
+  }
 }
 
 /**
@@ -99,17 +118,38 @@ function leasePreparedControl(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function operationPrepareCommand(overrides: Record<string, unknown> = {}) {
+  return {
+    type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...BINDING,
+    attemptId: 'attempt-0001',
+    attempt: 1,
+    direction: 'upload',
+    operationId: 'operation-0001',
+    clientUploadId: 'operation-0001',
+    filename: 'source.bin',
+    size: 5,
+    authority: 'A'.repeat(43),
+    authorityExpiresAt: Date.now() + 60_000,
+    channelLabel: 'imcodes-file-attempt-0001',
+    iceServers: [],
+    ...overrides,
+  };
+}
+
 let spawned: FakeWorker[] = [];
 
 function installFakeWorkers(): void {
   setWorkerFactory((_url, options) => {
     const fake = new FakeWorker(options.workerData.generation);
     spawned.push(fake);
-    return fake as unknown as import('node:worker_threads').Worker;
+    return fake as unknown as import('../../src/daemon/direct-file-transfer-ipc.js').DirectFileTransferIsolate;
   });
 }
 
 function ready(worker: FakeWorker): void {
+  worker.emitEnvelope({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY, available: true });
   worker.emitEnvelope({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.READY });
 }
 
@@ -119,7 +159,7 @@ function sender() {
 }
 
 beforeEach(() => { spawned = []; resetProxy(); installFakeWorkers(); });
-afterEach(() => { setWorkerFactory(null); resetProxy(); });
+afterEach(() => { vi.useRealTimers(); setWorkerFactory(null); resetProxy(); });
 
 describe('direct file transfer worker boundary', () => {
   it('R-3: routes one control envelope to exactly its own sender', async () => {
@@ -170,6 +210,7 @@ describe('direct file transfer worker boundary', () => {
   });
 
   it('drops a late envelope from a superseded worker generation', async () => {
+    vi.useFakeTimers();
     const a = sender();
     await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
     const first = spawned[0]!;
@@ -177,16 +218,19 @@ describe('direct file transfer worker boundary', () => {
     const firstSenderId = (first.posted.find((p) => p.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND)!.senderId) as string;
 
     first.emit('exit', 1);                    // crash
-    expect(spawned).toHaveLength(2);          // replaced
+    expect(spawned, 'backoff prevents an immediate crash loop').toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
+    expect(spawned).toHaveLength(2);          // replaced after bounded backoff
     const second = spawned[1]!;
     expect(second.generation).toBeGreaterThan(first.generation);
+    const fallbackAfterCrash = [...a.sent];
 
     // The dead worker speaks after being replaced. Its generation is stale.
     first.emitEnvelope({
       type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL, senderId: firstSenderId,
       message: leasePreparedControl({ requestId: 'request-dead' }), emittedAt: Date.now(),
     });
-    expect(a.sent, 'a replaced worker must not drive a live transport').toEqual([]);
+    expect(a.sent, 'a replaced worker must not drive a live transport').toEqual(fallbackAfterCrash);
 
     // The live worker still works.
     ready(second);
@@ -194,7 +238,7 @@ describe('direct file transfer worker boundary', () => {
       type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL, senderId: firstSenderId,
       message: leasePreparedControl({ requestId: 'request-live' }), emittedAt: Date.now(),
     });
-    expect(a.sent).toEqual([leasePreparedControl({ requestId: 'request-live' })]);
+    expect(a.sent).toEqual([...fallbackAfterCrash, leasePreparedControl({ requestId: 'request-live' })]);
   });
 
   it('rejects an envelope whose stamped generation is not the live one', async () => {
@@ -226,24 +270,274 @@ describe('direct file transfer worker boundary', () => {
     expect(a.sent).toEqual([leasePreparedControl()]);
   });
 
-  it('restarts a crashed worker but stops at the restart budget', async () => {
+  it('retries forever with capped backoff, stays advertised, and rejects recovery-window work transiently', async () => {
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand({ requestId: 'crash-request-0' }), a.handle);
+    ready(spawned[0]!);
+    for (let i = 0; i < 12; i += 1) {
+      a.sent.length = 0;
+      spawned[spawned.length - 1]!.emit('exit', null, 'SIGSEGV');
+      expect(spawned).toHaveLength(i + 1);
+      expect(isDirectFileTransferAvailable(), 'a child crash must not withdraw P2P').toBe(true);
+      expect(getDirectConnectivityRuntimeStatus().state).toBe('available');
+      await expect(handleDirectFileTransferCommand(leasePrepareCommand({
+        requestId: `during-recovery-${i}`,
+      }), a.handle)).resolves.toBe(false);
+      expect(a.sent).not.toContainEqual(expect.objectContaining({ error: 'capability_unavailable' }));
+      expect(a.sent).toEqual(expect.arrayContaining([expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        error: 'connection_failed',
+        retryable: true,
+        detail: 'direct_runtime_child_recovering',
+      })]));
+      const delay = Math.min(
+        DIRECT_FILE_TRANSFER_RESTART_MAX_MS,
+        DIRECT_FILE_TRANSFER_RESTART_BASE_MS * (2 ** Math.min(7, i)),
+      );
+      expect(delay).toBeLessThanOrEqual(10_000);
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(spawned, 'no retry before the bounded backoff elapses').toHaveLength(i + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(spawned, 'every crash schedules another generation').toHaveLength(i + 2);
+      ready(spawned.at(-1)!);
+      expect(isDirectFileTransferAvailable()).toBe(true);
+      expect(getDirectConnectivityRuntimeStatus().state).toBe('available');
+      await handleDirectFileTransferCommand(leasePrepareCommand({
+        requestId: `crash-request-${i + 1}`,
+      }), a.handle);
+    }
+    expect(spawned).toHaveLength(13);
+    expect(workerGeneration()).toBe(spawned.at(-1)!.generation);
+  });
+
+  it('resets the exponential delay after one healthy stable-running window', async () => {
+    vi.useFakeTimers();
     const a = sender();
     await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
     ready(spawned[0]!);
-    for (let i = 0; i < 8; i += 1) spawned[spawned.length - 1]!.emit('exit', 1);
-    // 1 initial + 5 permitted restarts; the budget must bound it.
-    expect(spawned).toHaveLength(6);
-    expect(workerGeneration(), 'no live worker once the budget is exhausted').toBe(0);
-    expect(isDirectFileTransferAvailable(), 'availability must fail closed').toBe(false);
-    expect(getDirectConnectivityRuntimeStatus().state).toBe('runtime_unavailable');
+    for (let i = 0; i < 3; i += 1) {
+      spawned.at(-1)!.emit('exit', 1);
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS * (2 ** i));
+      ready(spawned.at(-1)!);
+    }
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_STABLE_WINDOW_MS);
+    const before = spawned.length;
+    spawned.at(-1)!.emit('exit', 1);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS - 1);
+    expect(spawned).toHaveLength(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(spawned, 'stable health resets the next retry to the base delay').toHaveLength(before + 1);
+  });
+
+  it('returns one explicit transient recovery outcome when the child SIGSEGVs', async () => {
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const first = spawned[0]!;
+    ready(first);
+
+    first.emit('exit', null, 'SIGSEGV');
+    expect(a.sent).toEqual([expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      scope: 'lease',
+      requestId: BINDING.requestId,
+      error: 'connection_failed',
+      retryable: true,
+      detail: 'direct_runtime_child_recovering',
+    })]);
+
+    // Duplicate/late lifecycle signals from the corpse cannot redispatch the
+    // recovery outcome or schedule another retry.
+    first.emit('exit', null, 'SIGSEGV');
+    expect(a.sent).toHaveLength(1);
+    expect(spawned).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
+    expect(spawned).toHaveLength(2);
+  });
+
+  it('binds child-crash fallback to the exact in-flight operation tuple', async () => {
+    vi.useFakeTimers();
+    const a = sender();
+    const command = operationPrepareCommand();
+    await expect(handleDirectFileTransferCommand(command, a.handle)).resolves.toBe(true);
+    const first = spawned[0]!;
+    ready(first);
+    first.emit('exit', null, 'SIGSEGV');
+
+    expect(a.sent).toEqual([expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      scope: 'operation',
+      requestId: command.requestId,
+      attemptId: command.attemptId,
+      operationId: command.operationId,
+      error: 'connection_failed',
+      retryable: true,
+      detail: 'direct_runtime_child_recovering',
+    })]);
+  });
+
+  it('bounds proxy-owned pending IPC state and rejects excess work as transiently recovering', async () => {
+    const results: boolean[] = [];
+    const transports: ReturnType<typeof sender>[] = [];
+    for (let i = 0; i <= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY; i += 1) {
+      const transport = sender();
+      transports.push(transport);
+      results.push(await handleDirectFileTransferCommand(leasePrepareCommand({
+        requestId: `bounded-request-${i}`,
+        leaseId: `bounded-lease-${i}`,
+      }), transport.handle));
+    }
+    const worker = spawned[0]!;
+    expect(worker.posted.filter((entry) => entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND))
+      .toHaveLength(DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY);
+    expect(results.at(-1)).toBe(false);
+    expect(transports.at(-1)!.sent).toEqual([expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      error: 'connection_failed',
+      retryable: true,
+      detail: 'direct_runtime_child_recovering',
+    })]);
+  });
+
+  it('does not charge acknowledgement-free ICE events against the pending request bound', async () => {
+    const transport = sender();
+    for (let i = 0; i < DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY * 2; i += 1) {
+      await expect(handleDirectFileTransferCommand({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...BINDING,
+        requestId: `ice-event-${i}`,
+        candidate: `candidate:${i} 1 udp 1 127.0.0.1 9 typ host`,
+        mid: '0',
+      }, transport.handle)).resolves.toBe(true);
+    }
+    await expect(handleDirectFileTransferCommand(leasePrepareCommand({
+      requestId: 'request-after-ice-storm',
+      leaseId: 'lease-after-ice-storm',
+    }), transport.handle)).resolves.toBe(true);
+    expect(transport.sent).toEqual([]);
+  });
+
+  it('fails the exact command once when IPC closes between selection and send', async () => {
+    const transport = sender();
+    await handleDirectFileTransferCommand(
+      leasePrepareCommand({ requestId: 'bootstrap-request' }), transport.handle,
+    );
+    const worker = spawned[0]!;
+    ready(worker);
+    const senderId = worker.posted.find((entry) => (
+      entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND
+    ))!.senderId as string;
+    worker.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: leasePreparedControl({ requestId: 'bootstrap-request' }),
+      emittedAt: Date.now(),
+    });
+    transport.sent.length = 0;
+    worker.postMessage = () => { throw new Error('channel closed'); };
+    const command = operationPrepareCommand({ requestId: 'ipc-race-request' });
+
+    await expect(handleDirectFileTransferCommand(command, transport.handle)).resolves.toBe(false);
+    expect(transport.sent).toEqual([expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      requestId: command.requestId,
+      attemptId: command.attemptId,
+      operationId: command.operationId,
+      error: 'connection_failed',
+      retryable: true,
+      detail: 'direct_runtime_child_recovering',
+    })]);
+    expect(workerGeneration(), 'broken IPC retires the generation instead of leaving a sink').toBe(0);
+  });
+
+  it('does not release authority or spawn a replacement before a failed child is reaped', async () => {
+    vi.useFakeTimers();
+    spawned = [];
+    setWorkerFactory((_url, options) => {
+      const fake = new DeferredTerminateWorker(options.workerData.generation);
+      spawned.push(fake);
+      return fake as unknown as import('../../src/daemon/direct-file-transfer-ipc.js').DirectFileTransferIsolate;
+    });
+    const transport = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), transport.handle);
+    const first = spawned[0] as DeferredTerminateWorker;
+    ready(first);
+    await hostCall(first, DIRECT_FILE_TRANSFER_HOST_METHOD.TRY_CLAIM_CLIENT_UPLOAD, ['overlap-upload']);
+    expect(tryClaimClientUpload('overlap-upload')).toBeNull();
+
+    first.emit('error', new Error('ipc failed while the OS child remains alive'));
+    expect(first.terminated).toBe(1);
+    expect(tryClaimClientUpload('overlap-upload'), 'the old process still owns its claim').toBeNull();
+    first.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL,
+      callId: 'post-failure-claim',
+      method: DIRECT_FILE_TRANSFER_HOST_METHOD.TRY_CLAIM_CLIENT_UPLOAD,
+      args: ['post-failure-upload'],
+    });
+    await Promise.resolve();
+    const postFailureClaim = tryClaimClientUpload('post-failure-upload');
+    expect(postFailureClaim, 'a failed generation cannot start another host mutation').not.toBeNull();
+    if (postFailureClaim) releaseClientUploadClaim('post-failure-upload', postFailureClaim);
+    await expect(handleDirectFileTransferCommand(leasePrepareCommand({
+      requestId: 'while-old-child-is-retiring',
+    }), transport.handle)).resolves.toBe(false);
+    expect(transport.sent.at(-1)).toEqual(expect.objectContaining({
+      error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+      detail: 'direct_runtime_child_recovering',
+    }));
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS * 4);
+    expect(spawned, 'no generation may overlap the still-live failed child').toHaveLength(1);
+
+    first.finishTermination();
+    await Promise.resolve();
+    const reclaimed = tryClaimClientUpload('overlap-upload');
+    expect(reclaimed, 'authority is released only after the exact child exits').not.toBeNull();
+    if (reclaimed) releaseClientUploadClaim('overlap-upload', reclaimed);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
+    expect(spawned).toHaveLength(2);
+  });
+
+  it('retires a child that misses READY and stays retryable until a ready replacement exists', async () => {
+    vi.useFakeTimers();
+    const transport = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), transport.handle);
+    const first = spawned[0]!;
+    ready(first);
+    first.emit('exit', null, 'SIGSEGV');
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
+    const mute = spawned[1]!;
+
+    await expect(handleDirectFileTransferCommand(leasePrepareCommand({
+      requestId: 'during-mute-generation',
+    }), transport.handle)).resolves.toBe(false);
+    expect(transport.sent.at(-1)).toEqual(expect.objectContaining({
+      error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+      retryable: true,
+      detail: 'direct_runtime_child_recovering',
+    }));
+
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_READY_TIMEOUT_MS);
+    expect(mute.terminated, 'a live-but-mute generation is forcibly retired').toBe(1);
+    expect(workerGeneration()).toBe(0);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS * 2);
+    const replacement = spawned[2]!;
+    ready(replacement);
+    await expect(handleDirectFileTransferCommand(leasePrepareCommand({
+      requestId: 'after-ready-replacement',
+    }), transport.handle)).resolves.toBe(true);
   });
 
   it('a late exit from an already-replaced generation does not disturb the live worker', async () => {
+    vi.useFakeTimers();
     const a = sender();
     await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
     const first = spawned[0]!;
     ready(first);
     first.emit('exit', 1);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
     const second = spawned[1]!;
     ready(second);
     const liveGeneration = workerGeneration();
@@ -386,6 +680,38 @@ describe('direct file transfer worker boundary', () => {
       const reclaimed = tryClaimClientUpload('upload-crashed');
       expect(reclaimed, 'the relay can take over an upload the dead worker held').not.toBeNull();
       releaseClientUploadClaim('upload-crashed', reclaimed!);
+    });
+
+    it('retains a crashed generation claim until its admitted finalization settles', async () => {
+      let finish!: () => void;
+      const finalizing = new Promise<never>((_resolve, reject) => { finish = () => reject(new Error('expected-test-finalize-stop')); });
+      setFinalizeHost((async () => await finalizing) as typeof import('../../src/daemon/file-transfer-handler.js').finalizeDirectUploadedFile);
+      const transport = sender();
+      await handleDirectFileTransferCommand(leasePrepareCommand(), transport.handle);
+      const worker = spawned[0]!;
+      ready(worker);
+      await hostCall(worker, DIRECT_FILE_TRANSFER_HOST_METHOD.TRY_CLAIM_CLIENT_UPLOAD, ['upload-finalizing']);
+
+      const callId = 'test-finalize-in-flight';
+      worker.emitEnvelope({
+        type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL,
+        callId,
+        method: DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE,
+        args: [{ clientUploadId: 'upload-finalizing' }],
+      });
+      await Promise.resolve();
+      worker.emit('exit', null, 'SIGSEGV');
+
+      expect(tryClaimClientUpload('upload-finalizing'),
+        'relay/replacement cannot overlap an admitted mutation').toBeNull();
+      finish();
+      await vi.waitFor(() => {
+        const reclaimed = tryClaimClientUpload('upload-finalizing');
+        expect(reclaimed, 'claim releases only after finalization settles').not.toBeNull();
+        if (reclaimed) releaseClientUploadClaim('upload-finalizing', reclaimed);
+      });
+      expect(worker.posted.some((entry) => entry.callId === callId),
+        'late HOST_RESULT is suppressed for the dead generation').toBe(false);
     });
 
     it('releases claims held at shutdown as well as at crash', async () => {

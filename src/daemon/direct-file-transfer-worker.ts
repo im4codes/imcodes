@@ -43,7 +43,6 @@ import {
   type DirectFileDownloadSource,
 } from './file-transfer-handler.js';
 
-import { parentPort, workerData } from 'node:worker_threads';
 import {
   DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX,
   DIRECT_FILE_TRANSFER_HOST_METHOD,
@@ -69,12 +68,10 @@ interface WorkerControlSender {
  * worker emits carries it so a reply that outlives a crash-and-replace is
  * recognisably stale on arrival and is dropped by the parent.
  */
-const directWorkerData = workerData as { kind?: unknown; generation?: unknown } | undefined;
-const directWorkerPort = directWorkerData?.kind === DIRECT_FILE_TRANSFER_WORKER_KIND
-  ? parentPort
-  : null;
-let activeWorkerGeneration: number = Number(directWorkerPort ? directWorkerData?.generation ?? 0 : 0);
+let activeWorkerGeneration = 0;
+let childProcessPost: ((envelope: Record<string, unknown>) => void) | null = null;
 let inProcessPost: ((envelope: Record<string, unknown>) => void) | null = null;
+let requestHardRecycle: (() => void) | null = null;
 
 function post(envelope: Record<string, unknown>): void {
   const stamped = {
@@ -82,7 +79,7 @@ function post(envelope: Record<string, unknown>): void {
     generation: activeWorkerGeneration,
     ...envelope,
   };
-  if (directWorkerPort) directWorkerPort.postMessage(stamped);
+  if (childProcessPost) childProcessPost(stamped);
   else inProcessPost?.(stamped);
 }
 
@@ -110,8 +107,8 @@ let hostCallSeq = 0;
 /**
  * In-process host, for tests that exercise the state machine directly.
  *
- * Deliberately an explicit seam rather than an implicit "no parentPort means I
- * am the host" fallback: that fallback would silently reinstate the two-copy
+ * Deliberately an explicit seam rather than an implicit "no child transport
+ * means I am the host" fallback: that fallback would silently reinstate the two-copy
  * authority bug the host call exists to remove, in any future path where
  * parentPort happened to be absent. Production must fail closed instead.
  */
@@ -125,7 +122,7 @@ export function __setDirectFileTransferWorkerHostForTests(
 
 function callHost(method: string, args: unknown[]): Promise<unknown> {
   if (inProcessHost) return inProcessHost(method, args);
-  if (!directWorkerPort && !inProcessPost) {
+  if (!childProcessPost && !inProcessPost) {
     return Promise.reject(new Error('direct_file_transfer_host_unavailable'));
   }
   hostCallSeq += 1;
@@ -248,6 +245,11 @@ interface DirectLease {
   activeAttempts: Set<string>;
   /** Channels that reached an already-warm peer just before their PREPARE. */
   pendingOperationChannels: Map<string, PendingOperationChannel>;
+  /** Native callbacks from a replaced peer are fenced by this epoch. */
+  callbackGeneration: number;
+  /** One serialized teardown owns all native close calls for this lease. */
+  closePromise: Promise<void> | null;
+  closing: boolean;
 }
 
 interface ActiveDirectTransfer {
@@ -623,9 +625,10 @@ let inFlightNativeQuiesce: Promise<{ ok: boolean; reason?: string; closedLeases:
  * The REAL drain, retained across deadline responses.
  *
  * closeLease() removes a lease from `leases` BEFORE awaiting active transfer
- * shutdown, and it still calls into the addon afterwards
- * (pendingOperationChannels close, lease.peer.close). So a drain that outran
- * its deadline leaves `leases` empty while native calls are still pending: a
+ * shutdown. In an in-process test transport it can still call into the addon
+ * afterwards; in the shipped child it retires those wrappers and requests a
+ * process recycle. So a drain that outran
+ * its deadline leaves `leases` empty while teardown is still pending: a
  * retry that re-snapshotted the map would see nothing to drain, clean up
  * immediately, and report success while the original close was still running —
  * re-creating the native-entry-after-replacement hazard this whole path exists
@@ -651,6 +654,44 @@ let rtcLoadError: DirectConnectivityRuntimeError | undefined;
 const leases = new Map<string, DirectLease>();
 const activeAttempts = new Map<string, ActiveDirectTransfer>();
 const recentOperations = new Map<string, LedgerRecord>();
+const retiredNativeResources: unknown[] = [];
+let nativeRecycleTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Never call node-datachannel close() in the shipped child process.
+ *
+ * node-datachannel 0.32.3 resets its ThreadSafeCallback holders only after
+ * rtc::PeerConnection::close(), while native callbacks may concurrently be
+ * constructing their JS arguments. That is the exact close/callback race that
+ * produced the production SIGSEGV. JS generation checks run too late to make
+ * that C++ boundary safe. The isolated child therefore retires the wrappers
+ * without entering native close, keeps them strongly reachable, and lets the
+ * OS reclaim the entire address space once no live lease/attempt remains.
+ * In-process tests retain the old close behavior because no OS boundary exists.
+ */
+function closeOrRetireNative(resource: { close(): void } | null | undefined): void {
+  if (!resource) return;
+  if (!childProcessPost) {
+    try { resource.close(); } catch { /* already closed */ }
+    return;
+  }
+  retiredNativeResources.push(resource);
+  scheduleNativeRecycleWhenIdle();
+}
+
+function scheduleNativeRecycleWhenIdle(): void {
+  if (!requestHardRecycle || nativeAdmissionClosed || nativeRecycleTimer
+    || retiredNativeResources.length === 0 || activeAttempts.size > 0) return;
+  // Let the current IPC dispatch finish and flush its terminal/control messages
+  // before killing the child. The parent treats this exactly like any other
+  // isolated-child loss and starts a fresh generation with capped backoff.
+  nativeRecycleTimer = setTimeout(() => {
+    nativeRecycleTimer = null;
+    if (!requestHardRecycle || nativeAdmissionClosed || activeAttempts.size > 0) return;
+    requestHardRecycle();
+  }, 0);
+  nativeRecycleTimer.unref?.();
+}
 
 const TURN_URL_RE = /^(turn|turns):(\[[^\]]+\]|[^:?]+)(?::(\d{1,5}))?(?:\?transport=(udp|tcp))?$/i;
 
@@ -837,6 +878,10 @@ function findLedger(binding: DirectFileTransferAttemptBinding): LedgerRecord | u
 
 function resetLeaseIdleTimer(lease: DirectLease): void {
   if (lease.idleTimer) clearTimeout(lease.idleTimer);
+  if (lease.closing) {
+    lease.idleTimer = null;
+    return;
+  }
   if (lease.activeAttempts.size > 0) {
     lease.idleTimer = null;
     return;
@@ -847,6 +892,10 @@ function resetLeaseIdleTimer(lease: DirectLease): void {
 
 function resetTransferIdleTimer(transfer: ActiveDirectTransfer): void {
   if (transfer.idleTimer) clearTimeout(transfer.idleTimer);
+  if (transfer.settled || transfer.lease.closing) {
+    transfer.idleTimer = null;
+    return;
+  }
   transfer.idleTimer = setTimeout(() => {
     void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT, true, 'Direct file attempt made no progress');
   }, DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
@@ -873,7 +922,7 @@ async function closeTransferResources(transfer: ActiveDirectTransfer, removePart
   if (transfer.downloadFileHandle) await transfer.downloadFileHandle.close().catch(() => {});
   transfer.uploadFileHandle = null;
   transfer.downloadFileHandle = null;
-  try { transfer.channel?.close(); } catch { /* already closed */ }
+  closeOrRetireNative(transfer.channel);
   if (removePart) {
     // `removePart` marks a terminal outcome — explicit cancel, expiry, or a
     // final integrity failure — so the resume state goes with the bytes. A
@@ -900,23 +949,51 @@ async function closeTransferResources(transfer: ActiveDirectTransfer, removePart
       .catch(() => undefined);
   }
   resetLeaseIdleTimer(transfer.lease);
+  // A warm/renewed lease must not pin retired native wrappers forever. Once
+  // the last operation is settled, recycle this child generation even if the
+  // signalling lease remains warm; the next P2P request is retried against a
+  // fresh generation by the parent proxy.
+  scheduleNativeRecycleWhenIdle();
+}
+
+function isCurrentLeaseCallback(lease: DirectLease, callbackGeneration: number): boolean {
+  return !lease.closing
+    && lease.callbackGeneration === callbackGeneration
+    && leases.get(leaseKey(lease.binding.leaseId, lease.binding.leaseGeneration)) === lease;
 }
 
 async function closeLease(lease: DirectLease, cancelActive: boolean): Promise<void> {
+  if (lease.closePromise) return lease.closePromise;
+  lease.closing = true;
+  // Fence every already-registered callback before the first await or native
+  // close. A close() implementation is allowed to invoke callbacks inline.
+  lease.callbackGeneration += 1;
   if (lease.idleTimer) clearTimeout(lease.idleTimer);
   lease.idleTimer = null;
-  leases.delete(leaseKey(lease.binding.leaseId, lease.binding.leaseGeneration));
-  directFileMetric('lease_evicted', { activeAttempts: lease.activeAttempts.size, canceled: cancelActive });
-  if (cancelActive) {
-    const transfers = [...activeAttempts.values()].filter((transfer) => transfer.lease === lease);
-    await Promise.all(transfers.map((transfer) => failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false)));
-  }
-  for (const pending of lease.pendingOperationChannels.values()) {
-    clearTimeout(pending.timer);
-    try { pending.channel.close(); } catch { /* already closed */ }
-  }
-  lease.pendingOperationChannels.clear();
-  try { lease.peer.close(); } catch { /* already closed */ }
+  const key = leaseKey(lease.binding.leaseId, lease.binding.leaseGeneration);
+  if (leases.get(key) === lease) leases.delete(key);
+  const run = Promise.resolve().then(async () => {
+    directFileMetric('lease_evicted', { activeAttempts: lease.activeAttempts.size, canceled: cancelActive });
+    if (cancelActive) {
+      const transfers = [...activeAttempts.values()].filter((transfer) => transfer.lease === lease);
+      await Promise.all(transfers.map((transfer) => failTransfer(
+        transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false,
+      )));
+    }
+    for (const pending of lease.pendingOperationChannels.values()) {
+      clearTimeout(pending.timer);
+      closeOrRetireNative(pending.channel);
+    }
+    lease.pendingOperationChannels.clear();
+    // JS callbacks were fenced synchronously above, but the C++ addon may still
+    // be constructing one before JS can observe that fence. In the OS child we
+    // therefore retire instead of entering peer.close(); once this was the last
+    // live lease the child hard-recycles and the kernel tears down the mapping.
+    closeOrRetireNative(lease.peer);
+    scheduleNativeRecycleWhenIdle();
+  });
+  lease.closePromise = run;
+  return run;
 }
 
 /**
@@ -1055,6 +1132,7 @@ function retainPendingOperationChannel(lease: DirectLease, channel: DataChannel)
     || lease.pendingOperationChannels.size + lease.activeAttempts.size >= DIRECT_FILE_TRANSFER_LIMITS.MAX_ACTIVE_CHANNELS_PER_LEASE) return false;
 
   const pending = {} as PendingOperationChannel;
+  const callbackGeneration = lease.callbackGeneration;
   const discard = () => {
     if (lease.pendingOperationChannels.get(label) !== pending) return;
     lease.pendingOperationChannels.delete(label);
@@ -1065,14 +1143,18 @@ function retainPendingOperationChannel(lease: DirectLease, channel: DataChannel)
   pending.timer = setTimeout(() => {
     discard();
     directFileMetric('channel_prepare_timeout');
-    try { channel.close(); } catch { /* already closed */ }
+    closeOrRetireNative(channel);
   }, DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
   lease.pendingOperationChannels.set(label, pending);
   channel.onMessage((message) => {
+    if (!isCurrentLeaseCallback(lease, callbackGeneration)) {
+      closeOrRetireNative(channel);
+      return;
+    }
     if (lease.pendingOperationChannels.get(label) !== pending) return;
     if (typeof message !== 'string' || pending.startMessage !== null) {
       discard();
-      try { channel.close(); } catch { /* invalid early payload */ }
+      closeOrRetireNative(channel);
       return;
     }
     let raw: unknown;
@@ -1080,7 +1162,7 @@ function retainPendingOperationChannel(lease: DirectLease, channel: DataChannel)
     const parsed = validateDirectFileTransferDataMessage(raw);
     if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.START) {
       discard();
-      try { channel.close(); } catch { /* invalid early payload */ }
+      closeOrRetireNative(channel);
       return;
     }
     pending.startMessage = message;
@@ -1111,9 +1193,14 @@ function toCandidateInfo(value: unknown): DirectConnectivityCandidateInfo | null
  * no operation binding, and accepts only a bounded nonce probe.
  */
 function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): void {
+  const callbackGeneration = lease.callbackGeneration;
   channel.onMessage((message) => {
+    if (!isCurrentLeaseCallback(lease, callbackGeneration)) {
+      closeOrRetireNative(channel);
+      return;
+    }
     if (typeof message !== 'string') {
-      try { channel.close(); } catch { /* invalid health payload */ }
+      closeOrRetireNative(channel);
       return;
     }
     let raw: unknown;
@@ -1125,14 +1212,14 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
       || parsed.value.leaseId !== lease.binding.leaseId
       || parsed.value.leaseGeneration !== lease.binding.leaseGeneration
       || parsed.value.daemonGeneration !== lease.binding.daemonGeneration) {
-      try { channel.close(); } catch { /* invalid health payload */ }
+      closeOrRetireNative(channel);
       return;
     }
     const selected = lease.peer.getSelectedCandidatePair();
     const localCandidate = toCandidateInfo(selected?.local);
     const remoteCandidate = toCandidateInfo(selected?.remote);
     if (!localCandidate || !remoteCandidate) {
-      try { channel.close(); } catch { /* no route to report */ }
+      closeOrRetireNative(channel);
       return;
     }
     try {
@@ -1150,7 +1237,7 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
         remoteCandidate,
       }));
     } finally {
-      try { channel.close(); } catch { /* diagnostic complete */ }
+      closeOrRetireNative(channel);
     }
   });
 }
@@ -1463,6 +1550,8 @@ async function pumpDownload(transfer: ActiveDirectTransfer): Promise<void> {
   try {
     while (!transfer.settled && transfer.downloadCredit > 0 && transfer.received < transfer.downloadSource.size) {
       await waitForChannelBuffer(transfer.channel);
+      if (transfer.settled
+        || !isCurrentLeaseCallback(transfer.lease, transfer.lease.callbackGeneration)) return;
       const count = Math.min(
         DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
         transfer.downloadCredit,
@@ -1522,10 +1611,11 @@ async function completeDownload(transfer: ActiveDirectTransfer, totalBytes: numb
 
 function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, earlyStartMessage?: string | null): void {
   if (!channelMatches(transfer, channel)) {
-    try { channel.close(); } catch { /* invalid channel */ }
+    closeOrRetireNative(channel);
     return;
   }
   transfer.channel = channel;
+  const callbackGeneration = transfer.lease.callbackGeneration;
   // A channel arriving is progress, so the no-progress window restarts here.
   // It is armed at authorization, before any channel exists, which means the
   // browser's ICE and DTLS work was being charged against a timer meant to
@@ -1534,6 +1624,7 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
   // open, keep the two independent rather than merely far enough apart.
   resetTransferIdleTimer(transfer);
   const onMessage = (message: string | Buffer | ArrayBuffer) => {
+    if (!isCurrentLeaseCallback(transfer.lease, callbackGeneration) || transfer.settled) return;
     if (typeof message !== 'string') {
       const bytes = message instanceof ArrayBuffer
         ? new Uint8Array(message)
@@ -1580,13 +1671,26 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
     }
   };
   channel.onMessage(onMessage);
-  channel.onClosed(() => { if (!transfer.settled) void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false); });
-  channel.onError((error) => { void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, error); });
+  channel.onClosed(() => {
+    if (isCurrentLeaseCallback(transfer.lease, callbackGeneration) && !transfer.settled) {
+      void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true, undefined, false);
+    }
+  });
+  channel.onError((error) => {
+    if (isCurrentLeaseCallback(transfer.lease, callbackGeneration) && !transfer.settled) {
+      void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, error);
+    }
+  });
   if (earlyStartMessage) onMessage(earlyStartMessage);
 }
 
 function attachLeasePeer(lease: DirectLease): void {
+  const callbackGeneration = lease.callbackGeneration;
   lease.peer.onDataChannel((channel) => {
+    if (!isCurrentLeaseCallback(lease, callbackGeneration)) {
+      closeOrRetireNative(channel);
+      return;
+    }
     const transfer = [...activeAttempts.values()].find((candidate) => candidate.lease === lease && channelMatches(candidate, channel));
     if (!transfer) {
       if (isLeaseHealthChannel(channel)) {
@@ -1594,12 +1698,13 @@ function attachLeasePeer(lease: DirectLease): void {
         return;
       }
       if (retainPendingOperationChannel(lease, channel)) return;
-      try { channel.close(); } catch { /* unknown channel */ }
+      closeOrRetireNative(channel);
       return;
     }
     attachChannel(transfer, channel);
   });
   lease.peer.onLocalDescription((sdp, type) => {
+    if (!isCurrentLeaseCallback(lease, callbackGeneration)) return;
     if (type !== 'answer') return;
     if (!lease.negotiationRequestId) return;
     sendControl(lease, {
@@ -1615,6 +1720,7 @@ function attachLeasePeer(lease: DirectLease): void {
     });
   });
   lease.peer.onLocalCandidate((candidate, mid) => {
+    if (!isCurrentLeaseCallback(lease, callbackGeneration)) return;
     if (!lease.negotiationRequestId) return;
     sendControl(lease, {
       type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
@@ -1630,6 +1736,7 @@ function attachLeasePeer(lease: DirectLease): void {
     });
   });
   lease.peer.onStateChange((state) => {
+    if (!isCurrentLeaseCallback(lease, callbackGeneration)) return;
     if (state !== 'failed' && state !== 'closed' && state !== 'disconnected') return;
     for (const transfer of [...activeAttempts.values()]) {
       if (transfer.lease === lease && !transfer.settled) void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, state);
@@ -1697,6 +1804,9 @@ async function prepareLease(command: DirectFileTransferLeasePrepare, sender: Wor
     negotiationRequestId: null,
     activeAttempts: new Set(),
     pendingOperationChannels: new Map(),
+    callbackGeneration: 1,
+    closePromise: null,
+    closing: false,
   };
   leases.set(key, lease);
   directFileMetric('lease_prepared');
@@ -1861,7 +1971,7 @@ function findLeaseForSignal(command: DirectFileTransferLeaseOffer | DirectFileTr
  * accepting it; never do this while a file channel is active.
  */
 function replaceInactiveLeasePeer(lease: DirectLease): boolean {
-  if (!rtc || lease.activeAttempts.size > 0) return false;
+  if (!rtc || lease.closing || lease.activeAttempts.size > 0) return false;
   let peer: PeerConnection;
   try {
     peer = new rtc.PeerConnection(`imcodes-file-lease-${lease.binding.leaseId}`, {
@@ -1874,14 +1984,17 @@ function replaceInactiveLeasePeer(lease: DirectLease): boolean {
   const previous = lease.peer;
   for (const pending of lease.pendingOperationChannels.values()) {
     clearTimeout(pending.timer);
-    try { pending.channel.close(); } catch { /* already closed */ }
+    closeOrRetireNative(pending.channel);
   }
   lease.pendingOperationChannels.clear();
+  // Invalidate every callback registered on the previous native peer before
+  // closing it; close() may synchronously emit state/data callbacks.
+  lease.callbackGeneration += 1;
   lease.peer = peer;
   lease.remoteDescriptionSet = false;
   lease.negotiationRequestId = null;
   attachLeasePeer(lease);
-  try { previous.close(); } catch { /* already closed */ }
+  closeOrRetireNative(previous);
   return true;
 }
 
@@ -2015,6 +2128,11 @@ export async function handleDirectFileTransferCommand(message: unknown, sender: 
 }
 
 export async function shutdownDirectFileTransfers(): Promise<void> {
+  // Close admission before retiring native wrappers so the ordinary idle
+  // recycle cannot race the explicit shutdown/quiesce handshake.
+  nativeAdmissionClosed = true;
+  if (nativeRecycleTimer) clearTimeout(nativeRecycleTimer);
+  nativeRecycleTimer = null;
   const current = [...leases.values()];
   await Promise.all(current.map((lease) => closeLease(lease, true)));
   recentOperations.clear();
@@ -2027,13 +2145,12 @@ export async function shutdownDirectFileTransfers(): Promise<void> {
   // removed — it was provably redundant, and its only effect was to look
   // load-bearing while no test could distinguish it.
   const pending = rtc ?? (nativeQuiesceCompleted ? null : quiescedNativeRef);
-  if (pending) {
+  if (pending && !childProcessPost) {
     try { pending.cleanup(); } catch { /* native runtime already cleaned */ }
     nativeQuiesceCompleted = true;
   }
   quiescedNativeRef = null;
   rtc = null;
-  nativeAdmissionClosed = true;
 }
 
 /**
@@ -2117,7 +2234,7 @@ export async function quiesceDirectFileTransferNative(
       if (timer) clearTimeout(timer);
     }
     recentOperations.clear();
-    if (quiescedNativeRef) {
+    if (quiescedNativeRef && !childProcessPost) {
       try {
         quiescedNativeRef.cleanup();
       } catch (error) {
@@ -2132,6 +2249,10 @@ export async function quiesceDirectFileTransferNative(
       }
       quiescedNativeRef = null;
     }
+    // In a shipped child the parent terminates the entire process immediately
+    // after this acknowledgement. Skipping addon cleanup is deliberate: cleanup
+    // itself calls PeerConnection::close and re-enters the unsafe native race.
+    if (childProcessPost) quiescedNativeRef = null;
     nativeQuiesceCompleted = true;
     logger.info({ event: 'direct_file_v2.native_quiesced', closedLeases: current.length }, 'Direct file transfer native runtime quiesced');
     return { ok: true, closedLeases: current.length };
@@ -2176,12 +2297,15 @@ export function __installBlockedLeaseForTests(): {
     binding,
     sender: { send: () => {} },
     peer: { close: () => { nativeCalls += 1; } },
-    activeAttempts: new Map(),
+    activeAttempts: new Set(),
     pendingOperationChannels: new Map(),
     idleTimer: null,
     iceServers: [],
     controlEpoch: 0,
     terminalGrace: new Map(),
+    callbackGeneration: 1,
+    closePromise: null,
+    closing: false,
   } as unknown as DirectLease;
   const transfer = {
     lease,
@@ -2207,6 +2331,107 @@ export function __installBlockedLeaseForTests(): {
     release: () => releaseWrite?.(),
     nativeCallsAfterDrain: () => nativeCalls,
   };
+}
+
+/**
+ * Exercise the production lease-retirement path with an actual native peer.
+ * The caller must run this in an expendable OS child: successful retirement
+ * deliberately hard-recycles that child instead of invoking peer.close().
+ */
+export async function __retireNativePeerThroughLeaseForTests(peer: PeerConnection): Promise<void> {
+  if (process.env.NODE_ENV !== 'test' || !childProcessPost || !requestHardRecycle) {
+    throw new Error('test-only isolated native retirement seam');
+  }
+  const id = `native-retire-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const binding = {
+    serverId: 'native-retire-server',
+    browserTabId: 'native-retire-tab',
+    leaseId: id,
+    leaseGeneration: 1,
+    daemonGeneration: 1,
+    requestId: `${id}-request`,
+    expiresAt: Date.now() + 60_000,
+  };
+  const lease = {
+    binding,
+    sender: { send: () => {} },
+    peer,
+    activeAttempts: new Set(),
+    pendingOperationChannels: new Map(),
+    idleTimer: null,
+    iceServers: [],
+    controlEpoch: 0,
+    terminalGrace: new Map(),
+    callbackGeneration: 1,
+    closePromise: null,
+    closing: false,
+  } as unknown as DirectLease;
+  leases.set(leaseKey(binding.leaseId, binding.leaseGeneration), lease);
+  await closeLease(lease, true);
+}
+
+/**
+ * Exercise normal transfer completion while its lease remains warm/renewed.
+ * The child must still recycle, otherwise each completed native channel would
+ * remain strongly reachable for the lifetime of a continuously renewed lease.
+ */
+export async function __retireNativeChannelUnderLiveLeaseForTests(
+  peer: PeerConnection,
+  channel: DataChannel,
+): Promise<void> {
+  if (process.env.NODE_ENV !== 'test' || !childProcessPost || !requestHardRecycle) {
+    throw new Error('test-only isolated native retirement seam');
+  }
+  const id = `native-live-lease-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const binding = {
+    serverId: 'native-live-lease-server',
+    browserTabId: 'native-live-lease-tab',
+    leaseId: id,
+    leaseGeneration: 1,
+    daemonGeneration: 1,
+    requestId: `${id}-request`,
+    expiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+  };
+  const lease = {
+    binding,
+    sender: { send: () => {} },
+    peer,
+    activeAttempts: new Set(),
+    pendingOperationChannels: new Map(),
+    idleTimer: null,
+    iceServers: [],
+    controlEpoch: 0,
+    terminalGrace: new Map(),
+    callbackGeneration: 1,
+    closePromise: null,
+    closing: false,
+  } as unknown as DirectLease;
+  const transfer = {
+    lease,
+    settled: true,
+    received: 0,
+    writeChain: Promise.resolve(),
+    idleTimer: null,
+    uploadFileHandle: null,
+    downloadFileHandle: null,
+    partPath: null,
+    finalPath: null,
+    channel,
+    authority: {
+      ...binding,
+      attemptId: `${id}-attempt`,
+      attempt: 1,
+      operationId: `${id}-operation`,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      previewHandle: 'native-live-lease-preview',
+      channelLabel: channel.getLabel(),
+    },
+  } as unknown as ActiveDirectTransfer;
+  leases.set(leaseKey(binding.leaseId, binding.leaseGeneration), lease);
+  lease.activeAttempts.add(transfer.authority.attemptId);
+  activeAttempts.set(transfer.authority.attemptId, transfer);
+  resetLeaseIdleTimer(lease);
+  await closeTransferResources(transfer, false);
 }
 
 /** Whether new peers/leases are refused because the addon was quiesced. */
@@ -2323,35 +2548,56 @@ export async function __dispatchDirectFileTransferWorkerInProcessForTests(raw: u
   await handleWorkerEnvelope(raw);
 }
 
-if (directWorkerPort) {
-  directWorkerPort.on('message', (raw: unknown) => {
-    void handleWorkerEnvelope(raw).catch((error: unknown) => {
-      // A thrown handler must never take the worker down silently: the parent
-      // would see an opaque exit and fail every in-flight lease.
-      logger.warn({ err: error, event: 'direct_file_v2.worker_dispatch_error' }, 'worker dispatch failed');
-    });
+export interface DirectFileTransferChildTransport {
+  kind: unknown;
+  generation: number;
+  send(envelope: Record<string, unknown>): void;
+  subscribe(handler: (raw: unknown) => void): void;
+  requestHardRecycle(): void;
+}
+
+/** Start exactly one OS-child-owned native runtime. */
+export async function startDirectFileTransferChildRuntime(
+  transport: DirectFileTransferChildTransport,
+): Promise<void> {
+  if (transport.kind !== DIRECT_FILE_TRANSFER_WORKER_KIND
+    || !Number.isSafeInteger(transport.generation)
+    || transport.generation <= 0
+    || childProcessPost) {
+    throw new Error('invalid_direct_file_transfer_child_identity');
+  }
+  activeWorkerGeneration = transport.generation;
+  childProcessPost = transport.send;
+  requestHardRecycle = transport.requestHardRecycle;
+  let dispatchTail = Promise.resolve();
+  transport.subscribe((raw: unknown) => {
+    const envelope = validateDirectFileTransferWorkerEnvelope(raw);
+    // HOST_RESULT must bypass the serial command tail: a command can be
+    // awaiting that very host call, and queueing its result behind itself
+    // would deadlock the child. All lifecycle/command messages stay ordered.
+    if (envelope?.type === DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT) {
+      void handleWorkerEnvelope(raw);
+      return;
+    }
+    dispatchTail = dispatchTail
+      .then(() => handleWorkerEnvelope(raw))
+      .catch((error: unknown) => {
+        logger.warn({ err: error, event: 'direct_file_v2.worker_dispatch_error' }, 'worker dispatch failed');
+      });
   });
-  void initializeDirectFileTransfer()
-    .catch(() => false)
-    .then(() => {
-      // Availability is declared BEFORE ready. The parent resolves its boot
-      // promise on READY, so publishing status first means a caller that awaits
-      // initialization never observes a stale "unavailable" projection.
-      const status = getDirectConnectivityRuntimeStatus();
-      post({
-        type: DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY,
-        available: isDirectFileTransferAvailable(),
-        ...(status.error ? { detail: String(status.error) } : {}),
-      });
-      post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.READY });
-      // After READY on purpose. Replay needs the host RPC, and `callHost` has no
-      // deadline, so awaiting it before READY would let an unresponsive host
-      // wedge worker startup. Recovery is independent of live traffic.
-      void recoverInterruptedUploadCommits().catch((error: unknown) => {
-        logger.warn(
-          { err: error, event: 'direct_file_v2.commit_recovery_failed' },
-          'Upload commit recovery sweep failed',
-        );
-      });
-    });
+  await initializeDirectFileTransfer().catch(() => false);
+  const status = getDirectConnectivityRuntimeStatus();
+  post({
+    type: DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY,
+    available: isDirectFileTransferAvailable(),
+    ...(status.error ? { detail: String(status.error) } : {}),
+  });
+  post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.READY });
+  // After READY on purpose. Recovery needs host RPC and must not wedge boot.
+  void recoverInterruptedUploadCommits().catch((error: unknown) => {
+    logger.warn(
+      { err: error, event: 'direct_file_v2.commit_recovery_failed' },
+      'Upload commit recovery sweep failed',
+    );
+  });
 }

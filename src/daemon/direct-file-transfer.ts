@@ -2,21 +2,25 @@
  * Main-thread proxy for the direct file transfer data plane.
  *
  * The transfer state machine itself lives in `direct-file-transfer-worker.ts`
- * and runs on a worker thread: RTC/ICE/DataChannel callbacks, no-progress and
+ * and runs in an OS child process: RTC/ICE/DataChannel callbacks, no-progress and
  * lease timers, sha256 hashing and every file read/write execute there. A
  * blocked daemon event loop therefore cannot starve them, which is the failure
  * this split exists to remove — transfers previously died because the loop was
  * busy, not because the peer connection was broken.
  *
  * This file owns only what must stay on the main thread: the WebSocket senders,
- * worker lifecycle, and a bounded capability projection. File bytes never cross
+ * child lifecycle, and a bounded capability projection. File bytes never cross
  * the boundary; only control envelopes do.
  */
-import { Worker } from 'node:worker_threads';
 import logger from '../util/logger.js';
 import {
   DIRECT_CONNECTIVITY_RUNTIME_STATE,
+  DIRECT_FILE_TRANSFER_ERROR,
+  DIRECT_FILE_TRANSFER_ERROR_SCOPE,
   DIRECT_FILE_TRANSFER_HOST_METHOD,
+  DIRECT_FILE_TRANSFER_LIMITS,
+  DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_WORKER_KIND,
   DIRECT_FILE_TRANSFER_WORKER_MSG,
   DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
@@ -25,7 +29,13 @@ import {
   validateDirectFileTransferDaemonMessage,
   validateDirectFileTransferWorkerEnvelope,
   type DirectConnectivityRuntimeStatus,
+  type DirectFileTransferDaemonCommand,
 } from '../../shared/direct-file-transfer.js';
+import {
+  spawnDirectFileTransferChild,
+  type DirectFileTransferIsolate,
+  type DirectFileTransferIsolateOptions,
+} from './direct-file-transfer-ipc.js';
 import type { FileTransferSender } from './file-transfer-handler.js';
 import {
   finalizeDirectUploadedFile,
@@ -37,27 +47,33 @@ import {
 
 export { toNodeDataChannelIceServers } from './direct-file-transfer-worker.js';
 
-/** Bounded so a worker that crashes on every boot cannot spin the daemon. */
-const MAX_WORKER_RESTARTS = 5;
-const READY_TIMEOUT_MS = 15_000;
+export const DIRECT_FILE_TRANSFER_RESTART_BASE_MS = 100;
+export const DIRECT_FILE_TRANSFER_RESTART_MAX_MS = 10_000;
+export const DIRECT_FILE_TRANSFER_STABLE_WINDOW_MS = 60_000;
+export const DIRECT_FILE_TRANSFER_READY_TIMEOUT_MS = 15_000;
 export const SHUTDOWN_ACK_TIMEOUT_MS = 5_000;
 
 interface WorkerHandle {
-  worker: Worker;
+  worker: DirectFileTransferIsolate;
   generation: number;
-  ready: Promise<void>;
+  ready: Promise<boolean>;
+  state: 'pending' | 'ready' | 'failed';
+  settleReady: (ready: boolean) => void;
+  retirement: Promise<number> | null;
 }
 
 let handle: WorkerHandle | null = null;
 let generationCounter = 0;
 let restarts = 0;
 let shuttingDown = false;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+let stableTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Availability is projected, not queried.
  *
  * `server-link` asks for this synchronously while building a capability
- * payload, and the answer lives in another thread. Caching the worker's last
+ * payload, and the answer lives in another process. Caching the child's last
  * declaration keeps that call synchronous without blocking the loop on IPC —
  * which would reintroduce exactly the stall being removed.
  */
@@ -69,6 +85,7 @@ let runtimeStatusProjection: DirectConnectivityRuntimeStatus = {
 const sendersById = new Map<string, FileTransferSender>();
 const idsBySender = new WeakMap<FileTransferSender, string>();
 let senderSeq = 0;
+const MAX_PROXY_SENDERS = DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY * 2;
 
 /** Stable opaque id per transport, so the worker can address it without holding it. */
 function senderIdFor(sender: FileTransferSender): string {
@@ -81,6 +98,11 @@ function senderIdFor(sender: FileTransferSender): string {
   const id = `dft-sender-${senderSeq}`;
   idsBySender.set(sender, id);
   sendersById.set(id, sender);
+  while (sendersById.size > MAX_PROXY_SENDERS) {
+    const oldest = sendersById.keys().next().value as string | undefined;
+    if (!oldest) break;
+    sendersById.delete(oldest);
+  }
   return id;
 }
 
@@ -97,16 +119,17 @@ function workerModuleUrl(): URL {
 
 type DirectFileTransferWorkerFactory = (
   url: URL,
-  options: { workerData: { kind: typeof DIRECT_FILE_TRANSFER_WORKER_KIND; generation: number } },
-) => Worker;
+  options: DirectFileTransferIsolateOptions,
+) => DirectFileTransferIsolate;
 
-const spawnRealWorker: DirectFileTransferWorkerFactory = (url, options) => new Worker(url, options);
+const spawnRealWorker: DirectFileTransferWorkerFactory = spawnDirectFileTransferChild;
 let workerFactory: DirectFileTransferWorkerFactory = spawnRealWorker;
+let finalizeUploadedFileOnHost = finalizeDirectUploadedFile;
 
 /**
  * Test seam for the worker factory.
  *
- * Crash, restart-budget and stale-generation behaviour must be provable
+ * Crash retry/backoff and stale-generation behaviour must be provable
  * deterministically. Racing a real thread to die on cue would make those tests
  * timing-dependent, so tests substitute a controllable double here. Production
  * always uses the real spawn.
@@ -117,8 +140,19 @@ export function __setDirectFileTransferWorkerFactoryForTests(
   workerFactory = factory ?? spawnRealWorker;
 }
 
+export function __setDirectFileTransferFinalizeForTests(
+  finalize: typeof finalizeDirectUploadedFile | null,
+): void {
+  finalizeUploadedFileOnHost = finalize ?? finalizeDirectUploadedFile;
+}
+
 /** Reset all module state between tests so cases cannot leak into each other. */
 export function __resetDirectFileTransferForTests(): void {
+  if (restartTimer) clearTimeout(restartTimer);
+  if (stableTimer) clearTimeout(stableTimer);
+  restartTimer = null;
+  stableTimer = null;
+  void handle?.worker.terminate().catch(() => undefined);
   nativeAdmissionClosed = false;
   nativeQuiesceCompleted = false;
   inFlightNativeQuiesce = null;
@@ -131,6 +165,11 @@ export function __resetDirectFileTransferForTests(): void {
   sendersById.clear();
   senderSeq = 0;
   controlEnvelopeObserver = null;
+  pendingByKey.clear();
+  claimTokensByHandle.clear();
+  claimHandleSeq = 0;
+  inFlightHostMutations.clear();
+  finalizeUploadedFileOnHost = finalizeDirectUploadedFile;
 }
 
 /**
@@ -153,12 +192,103 @@ export function __directFileTransferWorkerGenerationForTests(): number {
   return handle?.generation ?? 0;
 }
 
+export function __directFileTransferChildPidForTests(): number | undefined {
+  return handle?.worker.pid;
+}
+
 function postToWorker(active: WorkerHandle, envelope: Record<string, unknown>): void {
   active.worker.postMessage({
     v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
     generation: active.generation,
     ...envelope,
   });
+}
+
+interface PendingDispatch {
+  senderId: string;
+  failure: Record<string, unknown>;
+}
+
+const pendingByKey = new Map<string, PendingDispatch>();
+
+function pendingKey(senderId: string, requestId: string): string {
+  return `${senderId}\u0000${requestId}`;
+}
+
+function rememberPending(senderId: string, command: DirectFileTransferDaemonCommand): boolean {
+  // ICE is an event, not a request: the child intentionally emits no matching
+  // acknowledgement. Retaining it would fill the bounded proxy ledger during
+  // a long negotiation and eventually reject real work even though nothing is
+  // in flight. Every other command has a correlated response or terminal.
+  if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE) return true;
+  const requestId = (command as { requestId?: unknown }).requestId;
+  if (typeof requestId === 'string') {
+    const key = pendingKey(senderId, requestId);
+    if (!pendingByKey.has(key)
+      && pendingByKey.size >= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY) return false;
+    pendingByKey.set(key, { senderId, failure: runtimeRecoveringMessage(command) });
+  }
+  return true;
+}
+
+function settlePending(senderId: string, message: Record<string, unknown>): void {
+  if (typeof message.requestId === 'string') {
+    pendingByKey.delete(pendingKey(senderId, message.requestId));
+  }
+}
+
+function runtimeRecoveringMessage(command: DirectFileTransferDaemonCommand): Record<string, unknown> {
+  const value = command as unknown as Record<string, unknown>;
+  const operation = typeof value.attemptId === 'string'
+    && typeof value.operationId === 'string'
+    && typeof value.direction === 'string';
+  if (operation) {
+    return {
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION,
+      serverId: value.serverId,
+      browserTabId: value.browserTabId,
+      leaseId: value.leaseId,
+      leaseGeneration: value.leaseGeneration,
+      daemonGeneration: value.daemonGeneration,
+      requestId: value.requestId,
+      attemptId: value.attemptId,
+      attempt: value.attempt,
+      direction: value.direction,
+      operationId: value.operationId,
+      error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+      retryable: true,
+      detail: 'direct_runtime_child_recovering',
+    };
+  }
+  return {
+    type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+    requestId: value.requestId,
+    error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+    retryable: true,
+    detail: 'direct_runtime_child_recovering',
+  };
+}
+
+function sendRuntimeRecovering(sender: FileTransferSender, command: DirectFileTransferDaemonCommand): void {
+  const message = runtimeRecoveringMessage(command);
+  sendFailClosedMessage(sender, message);
+}
+
+function sendFailClosedMessage(sender: FileTransferSender, message: Record<string, unknown>): void {
+  if (!validateDirectFileTransferDaemonMessage(message).ok) return;
+  try { sender.send(message); } catch { /* disconnected sender */ }
+}
+
+function failPendingForLostWorker(): void {
+  for (const pending of pendingByKey.values()) {
+    const sender = sendersById.get(pending.senderId);
+    if (sender) sendFailClosedMessage(sender, pending.failure);
+  }
+  pendingByKey.clear();
 }
 
 /* --------------------------------------------------------------------------
@@ -178,10 +308,55 @@ function postToWorker(active: WorkerHandle, envelope: Record<string, unknown>): 
  * transfer's claim would stay held in the registry forever and the relay could
  * never take over that upload.
  */
-const claimTokensByHandle = new Map<string, { clientUploadId: string; token: symbol }>();
+const claimTokensByHandle = new Map<string, {
+  clientUploadId: string;
+  token: symbol;
+  generation: number;
+}>();
 let claimHandleSeq = 0;
 
-async function invokeHostMethod(method: string, args: unknown[]): Promise<unknown> {
+/**
+ * Mutating host calls that have crossed the child boundary and started on the
+ * daemon thread. A dead child cannot cancel such a continuation: finalization
+ * may already have renamed a file and be committing attachment metadata. The
+ * claim must therefore remain authoritative until that admitted mutation has
+ * settled, even though its HOST_RESULT is no longer deliverable.
+ */
+const inFlightHostMutations = new Map<string, number>();
+
+function hostMutationKey(generation: number, clientUploadId: string): string {
+  return `${generation}\u0000${clientUploadId}`;
+}
+
+function finalizationClientUploadId(method: string, args: unknown[]): string | null {
+  if (method !== DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE) return null;
+  const value = args[0];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const clientUploadId = (value as { clientUploadId?: unknown }).clientUploadId;
+  return typeof clientUploadId === 'string' && clientUploadId ? clientUploadId : null;
+}
+
+function beginHostMutation(generation: number, method: string, args: unknown[]): string | null {
+  const clientUploadId = finalizationClientUploadId(method, args);
+  if (!clientUploadId) return null;
+  const key = hostMutationKey(generation, clientUploadId);
+  inFlightHostMutations.set(key, (inFlightHostMutations.get(key) ?? 0) + 1);
+  return clientUploadId;
+}
+
+function finishHostMutation(generation: number, clientUploadId: string | null): void {
+  if (!clientUploadId) return;
+  const key = hostMutationKey(generation, clientUploadId);
+  const remaining = (inFlightHostMutations.get(key) ?? 1) - 1;
+  if (remaining > 0) inFlightHostMutations.set(key, remaining);
+  else inFlightHostMutations.delete(key);
+  // If this generation died while the mutation was running, its claim was
+  // deliberately retained. Release it now that no admitted mutation can still
+  // publish under that authority.
+  if (!handle || handle.generation !== generation) releaseClaimsForLostWorker(generation);
+}
+
+async function invokeHostMethod(generation: number, method: string, args: unknown[]): Promise<unknown> {
   switch (method) {
     case DIRECT_FILE_TRANSFER_HOST_METHOD.TRY_CLAIM_CLIENT_UPLOAD: {
       const clientUploadId = String(args[0] ?? '');
@@ -189,7 +364,7 @@ async function invokeHostMethod(method: string, args: unknown[]): Promise<unknow
       if (!token) return null;
       claimHandleSeq += 1;
       const handle = `dft-claim-${claimHandleSeq}`;
-      claimTokensByHandle.set(handle, { clientUploadId, token });
+      claimTokensByHandle.set(handle, { clientUploadId, token, generation });
       return handle;
     }
     case DIRECT_FILE_TRANSFER_HOST_METHOD.RELEASE_CLIENT_UPLOAD_CLAIM: {
@@ -207,7 +382,7 @@ async function invokeHostMethod(method: string, args: unknown[]): Promise<unknow
     case DIRECT_FILE_TRANSFER_HOST_METHOD.RESOLVE_DIRECT_FILE_DOWNLOAD_SOURCE:
       return await resolveDirectFileDownloadSource(String(args[0] ?? ''));
     case DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE:
-      return await finalizeDirectUploadedFile(
+      return await finalizeUploadedFileOnHost(
         args[0] as Parameters<typeof finalizeDirectUploadedFile>[0],
       );
     default:
@@ -224,8 +399,12 @@ async function invokeHostMethod(method: string, args: unknown[]): Promise<unknow
  * relay path and any retry for the lifetime of the daemon. Each one is handed
  * back explicitly.
  */
-function releaseClaimsForLostWorker(): void {
+function releaseClaimsForLostWorker(generation?: number): void {
   for (const [handle, claim] of [...claimTokensByHandle]) {
+    if (generation !== undefined && claim.generation !== generation) continue;
+    if ((inFlightHostMutations.get(hostMutationKey(claim.generation, claim.clientUploadId)) ?? 0) > 0) {
+      continue;
+    }
     claimTokensByHandle.delete(handle);
     try {
       releaseClientUploadClaim(claim.clientUploadId, claim.token);
@@ -241,6 +420,10 @@ function releaseClaimsForLostWorker(): void {
 function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () => void): void {
   const envelope = validateDirectFileTransferWorkerEnvelope(raw);
   if (!envelope) return;
+  // An error/timeout can precede OS-process exit. The failed generation stays
+  // registered only as a reap fence; it has no authority to drive transports
+  // or start new host mutations while termination is pending.
+  if (active.state === 'failed') return;
   // Fail closed on identity: a reply from a worker that has since crashed and
   // been replaced carries the previous generation. Applying it would let a dead
   // worker drive live transports, so it is dropped.
@@ -261,6 +444,14 @@ function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () =
       );
       return;
     }
+    if (envelope.message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.STATUS) {
+      settlePending(envelope.senderId, envelope.message);
+    }
     try {
       sender.send(envelope.message);
     } catch (error) {
@@ -270,16 +461,32 @@ function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () =
   }
 
   if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL) {
-    void invokeHostMethod(envelope.method, envelope.args)
-      .then((value) => postToWorker(active, {
-        type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT, callId: envelope.callId, ok: true, value,
-      }))
-      .catch((error: unknown) => postToWorker(active, {
-        type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT,
-        callId: envelope.callId,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      }));
+    const mutationClientUploadId = beginHostMutation(active.generation, envelope.method, envelope.args);
+    void invokeHostMethod(active.generation, envelope.method, envelope.args)
+      .then((value) => {
+        if (handle?.generation !== active.generation || active.state === 'failed') return;
+        try {
+          postToWorker(active, {
+            type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT, callId: envelope.callId, ok: true, value,
+          });
+        } catch {
+          failWorkerGeneration(active, 'ipc_send_failed', null, null, true);
+        }
+      })
+      .catch((error: unknown) => {
+        if (handle?.generation !== active.generation || active.state === 'failed') return;
+        try {
+          postToWorker(active, {
+            type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT,
+            callId: envelope.callId,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch {
+          failWorkerGeneration(active, 'ipc_send_failed', null, null, true);
+        }
+      })
+      .finally(() => finishHostMutation(active.generation, mutationClientUploadId));
     return;
   }
 
@@ -298,62 +505,177 @@ function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () =
   }
 }
 
+function armStableWorkerWindow(active: WorkerHandle): void {
+  if (stableTimer) clearTimeout(stableTimer);
+  stableTimer = setTimeout(() => {
+    stableTimer = null;
+    if (!handle || handle.generation !== active.generation) return;
+    restarts = 0;
+  }, DIRECT_FILE_TRANSFER_STABLE_WINDOW_MS);
+  stableTimer.unref?.();
+}
+
+function finalizeWorkerGenerationFailure(
+  active: WorkerHandle,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): void {
+  if (!handle || handle.generation !== active.generation || active.state !== 'failed') return;
+  handle = null;
+  releaseClaimsForLostWorker(active.generation);
+  scheduleWorkerRestart(code, signal, active.generation);
+}
+
+function failWorkerGeneration(
+  active: WorkerHandle,
+  reason: string,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  terminate: boolean,
+): void {
+  if (!handle || handle.generation !== active.generation) return;
+  if (active.state !== 'failed') {
+    active.state = 'failed';
+    active.settleReady(false);
+    if (stableTimer) clearTimeout(stableTimer);
+    stableTimer = null;
+    failPendingForLostWorker();
+    availableProjection = true;
+    runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE };
+    logger.warn(
+      { event: 'direct_file_v2.child_generation_failed', generation: active.generation, reason },
+      'transfer child generation failed',
+    );
+  }
+  if (!terminate) {
+    // An exit event is the authority that this OS generation can no longer
+    // mutate files. Only now may its claims be released and a successor spawn.
+    finalizeWorkerGenerationFailure(active, code, signal);
+    return;
+  }
+  if (active.retirement) return;
+  // IPC/error/READY-timeout paths observe a still-live process. Keep the
+  // failed handle and its claims authoritative until terminate() has reaped
+  // that exact child; otherwise old and replacement generations can overlap.
+  active.retirement = active.worker.terminate();
+  void active.retirement
+    .then((exitCode) => finalizeWorkerGenerationFailure(active, exitCode, signal))
+    .catch((error: unknown) => {
+      logger.error(
+        { err: error, event: 'direct_file_v2.child_reap_failed', generation: active.generation },
+        'transfer child could not be reaped; refusing an overlapping replacement',
+      );
+    });
+}
+
+function scheduleWorkerRestart(code: number | null, signal: NodeJS.Signals | null, generation: number): void {
+  if (shuttingDown || nativeAdmissionClosed || restartTimer) return;
+  restarts = Math.min(Number.MAX_SAFE_INTEGER, restarts + 1);
+  const delayMs = Math.min(
+    DIRECT_FILE_TRANSFER_RESTART_MAX_MS,
+    DIRECT_FILE_TRANSFER_RESTART_BASE_MS * (2 ** Math.min(7, restarts - 1)),
+  );
+  logger.warn(
+    { event: 'direct_file_v2.child_crash', code, signal, generation, crashCount: restarts },
+    'transfer child exited; daemon and sessions remain online',
+  );
+  logger.warn(
+    { event: 'direct_file_v2.retry_scheduled', generation, crashCount: restarts, delayMs },
+    'scheduling transfer child recovery',
+  );
+  logger.info(
+    { event: 'direct_file_v2.recovering', generation, delayMs },
+    'direct transfer child recovering; capability remains advertised',
+  );
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+    if (handle || shuttingDown || nativeAdmissionClosed) return;
+    try {
+      spawnWorker();
+    } catch (error) {
+      availableProjection = true;
+      runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE };
+      logger.warn(
+        { err: error, event: 'direct_file_v2.child_spawn_failed', generation },
+        'transfer child spawn failed; recovery remains scheduled',
+      );
+      scheduleWorkerRestart(null, null, generation);
+    }
+  }, delayMs);
+  restartTimer.unref?.();
+}
+
 function spawnWorker(): WorkerHandle {
   generationCounter += 1;
   const generation = generationCounter;
   const worker = workerFactory(workerModuleUrl(), {
     workerData: { kind: DIRECT_FILE_TRANSFER_WORKER_KIND, generation },
   });
-  let markReady: () => void = () => {};
-  const ready = new Promise<void>((resolve) => {
-    const timer = setTimeout(() => resolve(), READY_TIMEOUT_MS);
-    if (typeof timer.unref === 'function') timer.unref();
-    markReady = () => { clearTimeout(timer); resolve(); };
-  });
-  const active: WorkerHandle = { worker, generation, ready };
+  let resolveReady: (ready: boolean) => void = () => {};
+  const ready = new Promise<boolean>((resolve) => { resolveReady = resolve; });
+  let readySettled = false;
+  let readyTimer: ReturnType<typeof setTimeout>;
+  const active: WorkerHandle = {
+    worker,
+    generation,
+    ready,
+    state: 'pending',
+    retirement: null,
+    settleReady(workerBecameReady) {
+      if (readySettled) return;
+      readySettled = true;
+      clearTimeout(readyTimer);
+      if (workerBecameReady) active.state = 'ready';
+      resolveReady(workerBecameReady);
+      if (!workerBecameReady) return;
+      armStableWorkerWindow(active);
+      if (restarts > 0 && availableProjection) {
+        logger.info(
+          { event: 'direct_file_v2.recovered', generation: active.generation, crashCount: restarts },
+          'direct transfer child recovered',
+        );
+      }
+    },
+  };
+  readyTimer = setTimeout(() => {
+    if (!handle || handle.generation !== generation || active.state !== 'pending') return;
+    failWorkerGeneration(active, 'ready_timeout', null, null, true);
+  }, DIRECT_FILE_TRANSFER_READY_TIMEOUT_MS);
+  readyTimer.unref?.();
 
-  worker.on('message', (raw: unknown) => handleWorkerMessage(active, raw, () => markReady()));
+  worker.on('message', (raw: unknown) => handleWorkerMessage(active, raw, () => active.settleReady(true)));
   worker.on('error', (error) => {
     logger.warn({ err: error, event: 'direct_file_v2.worker_error', generation }, 'transfer worker error');
+    failWorkerGeneration(active, 'child_process_error', null, null, true);
   });
-  worker.on('exit', (code) => {
-    markReady();
-    // Only the CURRENT worker's exit may recycle state; a late exit from an
-    // already-replaced generation must not clobber the live one.
-    if (!handle || handle.generation !== generation) return;
-    handle = null;
-    // A dead worker's claims must not outlive it: leaving them held would block
-    // the relay path from ever claiming the same client upload id again.
-    releaseClaimsForLostWorker();
-    // Availability is worker-owned; with no worker there is nothing to project.
-    availableProjection = false;
-    runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
-    if (shuttingDown || nativeAdmissionClosed) return;
-    if (restarts >= MAX_WORKER_RESTARTS) {
-      logger.error({ event: 'direct_file_v2.worker_restart_exhausted', code, generation },
-        'transfer worker restart budget exhausted; direct transfer stays unavailable and relay remains enabled');
-      return;
-    }
-    restarts += 1;
-    logger.warn({ event: 'direct_file_v2.worker_restart', code, generation, restarts }, 'restarting transfer worker');
-    handle = spawnWorker();
+  worker.on('exit', (code: number | null, signal: NodeJS.Signals | null = null) => {
+    failWorkerGeneration(active, 'child_exit', code, signal, false);
   });
 
   handle = active;
   return active;
 }
 
-function ensureWorker(): WorkerHandle {
+function ensureWorker(): WorkerHandle | null {
   if (handle) return handle;
-  return spawnWorker();
+  if (restartTimer) return null;
+  try {
+    return spawnWorker();
+  } catch (error) {
+    availableProjection = true;
+    runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE };
+    logger.warn({ err: error, event: 'direct_file_v2.child_spawn_failed' }, 'transfer child spawn failed');
+    scheduleWorkerRestart(null, null, generationCounter);
+    return null;
+  }
 }
 
 export async function initializeDirectFileTransfer(): Promise<boolean> {
   shuttingDown = false;
-  restarts = 0;
   const active = ensureWorker();
-  await active.ready;
-  return availableProjection;
+  if (!active) return false;
+  const ready = await active.ready;
+  return ready && availableProjection;
 }
 
 export function isDirectFileTransferAvailable(): boolean {
@@ -378,11 +700,40 @@ export async function handleDirectFileTransferCommand(
   const parsed = validateDirectFileTransferDaemonCommand(message);
   if (!parsed.ok) return false;
   const active = ensureWorker();
-  postToWorker(active, {
-    type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND,
-    senderId: senderIdFor(sender),
-    command: parsed.value,
-  });
+  if (!active) {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
+  }
+  if (active.state === 'failed') {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
+  }
+  // The initial child may accept a bounded command while bootstrapping, but a
+  // replacement generation is not trusted until it has emitted READY. During
+  // recovery callers receive the explicit retryable outcome instead of writing
+  // into a live-but-mute child.
+  if (active.state !== 'ready' && restarts > 0) {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
+  }
+  const senderId = senderIdFor(sender);
+  if (!rememberPending(senderId, parsed.value)) {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
+  }
+  try {
+    postToWorker(active, {
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND,
+      senderId,
+      command: parsed.value,
+    });
+  } catch {
+    const requestId = (parsed.value as { requestId?: unknown }).requestId;
+    if (typeof requestId === 'string') pendingByKey.delete(pendingKey(senderId, requestId));
+    failWorkerGeneration(active, 'ipc_send_failed', null, null, true);
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
+  }
   // Handing the command to the worker is the main thread's whole job here; the
   // reply arrives asynchronously as a CONTROL envelope.
   return true;
@@ -466,6 +817,8 @@ export async function quiesceDirectFileTransferNative(
     // worker that dies during it is not replaced by a fresh one that would map
     // the addon all over again.
     nativeAdmissionClosed = true;
+    if (restartTimer) clearTimeout(restartTimer);
+    restartTimer = null;
     const active = handle;
     if (!active) {
       // No isolate holds the mapping, so there is nothing that could fault.
@@ -479,9 +832,9 @@ export async function quiesceDirectFileTransferNative(
     handle = null;
     availableProjection = false;
     runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
-    // Ending the thread is what turns "drained" into "unreachable".
+    // Ending the child process is what turns "drained" into "unreachable".
     await active.worker.terminate();
-    releaseClaimsForLostWorker();
+    releaseClaimsForLostWorker(active.generation);
     sendersById.clear();
     nativeQuiesceCompleted = true;
     logger.info(
@@ -506,6 +859,9 @@ export function isDirectTransferNativeQuiesced(): boolean {
 export async function shutdownDirectFileTransfers(): Promise<void> {
   shuttingDown = true;
   nativeAdmissionClosed = true;
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = null;
+  failPendingForLostWorker();
   const active = handle;
   if (!active) {
     // Nothing holds the addon, which is exactly what completion means here.
@@ -537,7 +893,7 @@ export async function shutdownDirectFileTransfers(): Promise<void> {
   availableProjection = false;
   runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
   await active.worker.terminate();
-  releaseClaimsForLostWorker();
+  releaseClaimsForLostWorker(active.generation);
   sendersById.clear();
   nativeQuiesceCompleted = true;
   if (!outcome.cleanupOk) {
