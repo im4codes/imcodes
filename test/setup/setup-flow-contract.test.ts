@@ -335,8 +335,9 @@ describe('setupFlow contracts', () => {
       turnSharedSecret: turnSecret,
     }));
 
-    execFileSyncMock.mockImplementation(() => {
-      throw new Error('dig unavailable');
+    execFileSyncMock.mockImplementation((command: string) => {
+      if (command === 'dig') throw new Error('dig unavailable');
+      return '';
     });
     const { setupFlow } = await import('../../src/setup/setup-flow.js');
     await setupFlow('turn.example.com');
@@ -369,8 +370,9 @@ describe('setupFlow contracts', () => {
       apiKeyId: 'api-key-id',
       turnSharedSecret: turnSecret,
     }));
-    execFileSyncMock.mockImplementation(() => {
-      throw new Error('dig unavailable');
+    execFileSyncMock.mockImplementation((command: string) => {
+      if (command === 'dig') throw new Error('dig unavailable');
+      return '';
     });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { setupFlow } = await import('../../src/setup/setup-flow.js');
