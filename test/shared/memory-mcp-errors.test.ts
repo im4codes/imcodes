@@ -16,6 +16,7 @@ describe('memory MCP error reasons', () => {
       'scope_forbidden',
       'projection_unavailable',
       'validation_failed',
+      'revision_conflict',
       'rate_limited',
       'internal_error',
       // Machine remote-exec (list_machines / exec_remote) — controlled-node-remote-exec 10.12.

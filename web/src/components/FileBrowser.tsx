@@ -1669,7 +1669,12 @@ export function FileBrowser({
       if (mode === 'dir-only') onConfirm([currentLabel]);
       return;
     }
-    onConfirm([...selectedPaths], preview);
+    const paths = [...selectedPaths];
+    if (mode === 'file-single') {
+      onConfirm(paths, preview);
+      return;
+    }
+    onConfirm(paths);
   };
 
   const copyCurrentPath = useCallback(() => {
