@@ -1033,7 +1033,7 @@ describe('memory MCP tool schema firewall', () => {
     const setIdentityProfile = vi.fn(async () => ({ status: 'ok' as const, profile }));
     const getEffectiveIdentityProfiles = vi.fn(async () => ({ status: 'ok' as const, profiles: [profile] }));
     const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
-    const server = createMemoryMcpServer(caller({ projectRoot: root }), {
+    const server = createMemoryMcpServer(caller({ projectRoot: null }), {
       sendDeps: { listSessions: () => [self, target], provisionSupervisionTarget },
       setIdentityProfile,
       getEffectiveIdentityProfiles,

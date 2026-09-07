@@ -1045,26 +1045,33 @@ function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'
 
 async function readIdentityFile(
   filePath: string,
-  projectRoot: string,
+  projectRoot: string | null,
   allowOutsideProject: boolean,
 ): Promise<string> {
   const requested = filePath.trim();
   if (!requested || (!isAbsolute(requested) && requested.split(/[\\/]+/u).includes('..'))) {
     throw new Error('identity_file_path_invalid');
   }
-  const root = await realpath(projectRoot);
-  const candidate = isAbsolute(requested) ? requested : resolve(root, requested);
-  const rel = relative(root, candidate);
-  const insideProject = !!rel && !rel.startsWith('..') && !isAbsolute(rel);
-  if (!insideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  const root = projectRoot ? await realpath(projectRoot) : null;
+  if (!isAbsolute(requested) && !root) throw new Error('identity_file_path_invalid');
+  const candidate = isAbsolute(requested) ? requested : resolve(root!, requested);
+  if (root) {
+    const rel = relative(root, candidate);
+    const insideProject = !!rel && !rel.startsWith('..') && !isAbsolute(rel);
+    if (!insideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  } else if (!allowOutsideProject) {
+    throw new Error('identity_file_path_invalid');
+  }
   const stat = await lstat(candidate);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > SESSION_IDENTITY_MAX_UTF8_BYTES) {
     throw new Error('identity_file_invalid');
   }
   const exact = await realpath(candidate);
-  const exactRel = relative(root, exact);
-  const exactInsideProject = !!exactRel && !exactRel.startsWith('..') && !isAbsolute(exactRel);
-  if (!exactInsideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  if (root) {
+    const exactRel = relative(root, exact);
+    const exactInsideProject = !!exactRel && !exactRel.startsWith('..') && !isAbsolute(exactRel);
+    if (!exactInsideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  }
   return readFile(exact, 'utf8');
 }
 
@@ -1084,7 +1091,7 @@ async function parseSendIdentityArg(
   let content: string;
   try {
     if (filePath) {
-      if (!projectRoot || filePath.length > SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS) return 'invalid';
+      if (filePath.length > SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS) return 'invalid';
       content = await readIdentityFile(filePath, projectRoot, true);
     } else {
       content = inline ?? '';
