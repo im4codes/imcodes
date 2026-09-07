@@ -393,12 +393,12 @@ export class DirectFileTransferRouter {
       this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, true);
       return;
     }
-    const signingKey = this.hooks.resumeTicketSigningKey();
-    if (!signingKey) {
+    // Do not expose or reuse a resumable route while its signing authority is
+    // unavailable. This preserves the fail-closed behavior across key reloads.
+    if (!this.hooks.resumeTicketSigningKey()) {
       this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true);
       return;
     }
-
     const now = this.now();
     const existing = [...this.leases.values()].find((lease) => (
       lease.userId === userId && lease.browserTabId === init.browserTabId
@@ -414,32 +414,26 @@ export class DirectFileTransferRouter {
 
     const generation = this.hooks.daemonGeneration();
     const resolvedIce = this.resolveIceServers(userId);
-    const ticketExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS;
     const authorityExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
     const leaseId = mintOpaque(24);
-    const claims: DirectFileTransferResumeTicketClaims = {
-      type: DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    const ticket = this.mintResumeTicket({
       userId,
       browserTabId: init.browserTabId,
-      serverId: this.hooks.serverId(),
       leaseId,
       leaseGeneration: 1,
-      expiresAt: ticketExpiresAt,
-    };
-    const resumeTicket = signJwt(
-      claims as unknown as Record<string, unknown>,
-      signingKey,
-      Math.ceil(DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS / 1000),
-    );
+    }, now);
+    if (!ticket) {
+      this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true);
+      return;
+    }
     const lease = this.newLeaseRoute({
       leaseId,
       browserTabId: init.browserTabId,
       userId,
       daemonGeneration: generation,
       leaseGeneration: 1,
-      resumeTicket,
-      ticketExpiresAt,
+      resumeTicket: ticket.resumeTicket,
+      ticketExpiresAt: ticket.ticketExpiresAt,
       authorityExpiresAt,
       iceServers: resolvedIce.iceServers,
       socket,
@@ -482,10 +476,11 @@ export class DirectFileTransferRouter {
         : DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, rebind.serverId === this.hooks.serverId());
       return;
     }
+    const now = this.now();
     const claims = this.verifyTicket(rebind.resumeTicket);
     if (!claims || claims.userId !== userId || claims.browserTabId !== rebind.browserTabId
       || claims.serverId !== rebind.serverId || claims.leaseId !== rebind.leaseId
-      || claims.leaseGeneration !== rebind.leaseGeneration || claims.expiresAt <= this.now()) {
+      || claims.leaseGeneration !== rebind.leaseGeneration || claims.expiresAt <= now) {
       this.sendLeaseError(socket, rebind.requestId, DIRECT_FILE_TRANSFER_ERROR.LEASE_REBIND_FAILED, false);
       return;
     }
@@ -497,23 +492,36 @@ export class DirectFileTransferRouter {
       return;
     }
     const generation = this.hooks.daemonGeneration();
+    const ticket = this.mintResumeTicket({
+      userId,
+      browserTabId: claims.browserTabId,
+      leaseId: claims.leaseId,
+      leaseGeneration: claims.leaseGeneration,
+    }, now);
+    if (!ticket) {
+      this.sendLeaseError(socket, rebind.requestId, DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true);
+      return;
+    }
     const lease = current ?? this.newLeaseRoute({
       leaseId: claims.leaseId,
       browserTabId: claims.browserTabId,
       userId,
       daemonGeneration: generation,
       leaseGeneration: claims.leaseGeneration,
-      resumeTicket: rebind.resumeTicket,
-      ticketExpiresAt: claims.expiresAt,
-      authorityExpiresAt: this.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+      resumeTicket: ticket.resumeTicket,
+      ticketExpiresAt: ticket.ticketExpiresAt,
+      authorityExpiresAt: now + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
       iceServers: this.resolveIceServers(userId).iceServers,
       socket,
-      lastActivityAt: this.now(),
-      idleExpiresAt: this.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+      lastActivityAt: now,
+      idleExpiresAt: now + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
       needsRebind: true,
       prepared: false,
     });
     if (!current) this.leases.set(lease.leaseId, lease);
+    lease.resumeTicket = ticket.resumeTicket;
+    lease.ticketExpiresAt = ticket.ticketExpiresAt;
+    lease.authorityExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
     lease.socket = socket;
     lease.daemonGeneration = generation;
     // A signed ticket restores only the Server-side route.  Do not accept a
@@ -1115,6 +1123,31 @@ export class DirectFileTransferRouter {
     if (!raw) return null;
     const parsed = validateDirectFileTransferResumeTicketClaims(raw);
     return parsed.ok ? parsed.value : null;
+  }
+
+  private mintResumeTicket(
+    binding: Pick<DirectFileTransferResumeTicketClaims,
+      'userId' | 'browserTabId' | 'leaseId' | 'leaseGeneration'>,
+    now: number,
+  ): { resumeTicket: string; ticketExpiresAt: number } | null {
+    const key = this.hooks.resumeTicketSigningKey();
+    if (!key) return null;
+    const ticketExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS;
+    const claims: DirectFileTransferResumeTicketClaims = {
+      type: DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding,
+      serverId: this.hooks.serverId(),
+      expiresAt: ticketExpiresAt,
+    };
+    return {
+      resumeTicket: signJwt(
+        claims as unknown as Record<string, unknown>,
+        key,
+        Math.ceil(DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS / 1000),
+      ),
+      ticketExpiresAt,
+    };
   }
 
   private newLeaseRoute(input: Omit<DirectFileTransferLeaseRoute, 'timer'>): DirectFileTransferLeaseRoute {

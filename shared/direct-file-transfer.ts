@@ -216,6 +216,8 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   RETRY_MAX_POSITIVE_JITTER_RATIO: 0.25,
   NO_PROGRESS_TIMEOUT_MS: 45 * 1000,
   LEASE_IDLE_TTL_MS: 5 * 60 * 1000,
+  /** Renew a retained warm lease before its server-authoritative idle deadline. */
+  LEASE_RENEW_LEAD_MS: 2 * 60 * 1000,
   RESUME_TICKET_TTL_MS: 10 * 60 * 1000,
   STATUS_RECOVERY_DEADLINE_MS: 15 * 1000,
   OPERATION_LEDGER_TTL_MS: 60 * 60 * 1000,

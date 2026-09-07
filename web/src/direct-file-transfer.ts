@@ -517,17 +517,28 @@ function armLeaseIdleTimer(lease: Lease): void {
   // treating the zeroed timestamp as an expiry would immediately erase that
   // truthful route status.
   if (!lease.leaseId) return;
-  // Unlike the browser's old relative five-minute timer, this deadline starts
-  // when the server accepts LEASE_INIT. A delayed LEASE_READY/SDP exchange
-  // therefore cannot extend a ticket the authority has already retired.
-  const delay = lease.idleExpiresAt - Date.now();
+  // A mounted attachment surface explicitly retains its warmed data plane.
+  // Refresh the exact signed binding before either authoritative deadline,
+  // rather than destroying a healthy peer every five minutes. Once the
+  // surface releases its prewarm reference, the original bounded expiry again
+  // owns cleanup and no keepalive traffic is emitted.
+  const deadline = Math.min(lease.idleExpiresAt, lease.expiresAt);
+  const retainedWarmLease = lease.prewarmRefs > 0 && lease.refs > 0;
+  const renewLead = retainedWarmLease ? DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS : 0;
+  const delay = deadline - renewLead - Date.now();
   if (!Number.isFinite(delay) || delay <= 0) {
-    if (lease.refs === 0) disposeLease(lease);
+    if (retainedWarmLease && deadline > Date.now()) {
+      renewRetainedLease(lease);
+    } else if (lease.refs === 0) disposeLease(lease);
     else clearLeaseBinding(lease);
     return;
   }
   lease.idleTimer = setTimeout(() => {
     if (lease.active.size !== 0) return;
+    if (lease.prewarmRefs > 0 && lease.refs > 0) {
+      renewRetainedLease(lease);
+      return;
+    }
     if (lease.refs === 0) {
       disposeLease(lease);
       return;
@@ -539,6 +550,25 @@ function armLeaseIdleTimer(lease: Lease): void {
     clearLeaseBinding(lease);
     if (lease.prewarmRefs > 0) queueMicrotask(() => warmRetainedLease(lease));
   }, delay);
+}
+
+function renewRetainedLease(lease: Lease): void {
+  if (lease.active.size !== 0 || lease.terminalGrace.size !== 0
+    || lease.prewarmRefs === 0 || lease.refs === 0) {
+    armLeaseIdleTimer(lease);
+    return;
+  }
+  void rebindLease(lease).then(() => {
+    // leaseFromReady observes the authoritative deadlines while rebindLease
+    // still owns the in-flight slot, so re-arm after that slot is released.
+    armLeaseIdleTimer(lease);
+  }).catch(() => {
+    if (lease.active.size !== 0) return;
+    clearLeaseBinding(lease);
+    if (lease.prewarmRefs > 0 && supportsLease(lease.ws)) {
+      queueMicrotask(() => warmRetainedLease(lease));
+    }
+  });
 }
 
 function releaseLease(lease: Lease): void {

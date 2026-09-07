@@ -768,9 +768,12 @@ describe('DirectFileTransferRouter v2', () => {
   });
 
   it('rebinds a signed ticket only for the exact user/tab/server/lease binding', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     const first = fixture();
     const lease = readyLease(first);
     first.router.dropSocket(first.browserA);
+    vi.advanceTimersByTime(1_000);
 
     const recovered = fixture();
     recovered.router.handleBrowser(recovered.browserA, 'user-a', {
@@ -796,7 +799,10 @@ describe('DirectFileTransferRouter v2', () => {
       leaseGeneration: lease.leaseGeneration,
       daemonGeneration: 3,
     }, 3);
-    expect(recovered.messages(recovered.browserA).at(-1)).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND });
+    const rebound = recovered.messages(recovered.browserA).at(-1) as DirectFileTransferLeaseReady;
+    expect(rebound).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND });
+    expect(rebound.resumeTicket).not.toBe(lease.resumeTicket);
+    expect(rebound.expiresAt).toBeGreaterThan(lease.expiresAt);
 
     const forged = fixture();
     forged.router.handleBrowser(forged.browserA, 'other-user', {
@@ -811,6 +817,65 @@ describe('DirectFileTransferRouter v2', () => {
     });
     expect(forged.daemonMessages).toEqual([]);
     expect(forged.messages(forged.browserA).at(-1)).toMatchObject({ error: DIRECT_FILE_TRANSFER_ERROR.LEASE_REBIND_FAILED });
+  });
+
+  it('keeps a retained route renewable after its original resume ticket expires', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const f = fixture();
+    const original = readyLease(f);
+
+    const renew = (requestId: string, ready: DirectFileTransferLeaseReady) => {
+      f.router.handleBrowser(f.browserA, 'user-a', {
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId,
+        serverId: SERVER_ID,
+        browserTabId: TAB_A,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        resumeTicket: ready.resumeTicket,
+      });
+      const prepare = f.daemonMessages.at(-1)!;
+      expect(prepare).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE, requestId });
+      f.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId,
+        serverId: SERVER_ID,
+        browserTabId: TAB_A,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        daemonGeneration: prepare.daemonGeneration,
+      }, prepare.daemonGeneration as number);
+      return f.messages(f.browserA).at(-1) as DirectFileTransferLeaseReady;
+    };
+
+    vi.advanceTimersByTime(4 * 60 * 1000);
+    const first = renew('rebind-request-1', original);
+    vi.advanceTimersByTime(4 * 60 * 1000);
+    const second = renew('rebind-request-2', first);
+    vi.advanceTimersByTime(4 * 60 * 1000);
+
+    // The original ten-minute ticket is now stale, but the last rotated ticket
+    // still authorizes this exact live route and advances it another window.
+    const beforeExpired = f.daemonMessages.length;
+    f.router.handleBrowser(f.browserA, 'user-a', {
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'expired-ticket-request',
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: original.leaseId,
+      leaseGeneration: original.leaseGeneration,
+      resumeTicket: original.resumeTicket,
+    });
+    expect(f.daemonMessages).toHaveLength(beforeExpired);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({ error: DIRECT_FILE_TRANSFER_ERROR.LEASE_REBIND_FAILED });
+
+    const third = renew('rebind-request-3', second);
+    expect(third.resumeTicket).not.toBe(second.resumeTicket);
+    expect(third.expiresAt).toBeGreaterThan(second.expiresAt);
   });
 
   it('forwards an exact status query after Server-memory-loss rebind to the daemon ledger', () => {

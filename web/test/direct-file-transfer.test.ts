@@ -1855,19 +1855,30 @@ describe('direct file transfer v2 browser broker', () => {
     expect(FakePeerConnection.instances.at(-1)?.connectionState).toBe('new');
   });
 
-  it('retires the lease-bound peer after five minutes and automatically prewarms its replacement', async () => {
+  it('renews a retained warm lease before idle expiry without replacing its healthy peer', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities);
     const release = prewarmDirectFileLease(ws, 'server-1');
     await vi.advanceTimersByTimeAsync(0);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
-    const expiredPeer = FakePeerConnection.instances[0]!;
+    const retainedPeer = FakePeerConnection.instances[0]!;
 
-    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1);
-    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
-    expect(expiredPeer.connectionState).toBe('closed');
-    expect(FakePeerConnection.instances).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(
+      DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS
+        - DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS + 1,
+    );
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(retainedPeer.connectionState).not.toBe('closed');
+    expect(FakePeerConnection.instances).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(
+      DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS
+        - DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS + 1,
+    );
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND)).toHaveLength(2);
+    expect(FakePeerConnection.instances).toHaveLength(1);
 
     const bytes = new TextEncoder().encode('after-idle');
     const file = {
@@ -1878,22 +1889,26 @@ describe('direct file transfer v2 browser broker', () => {
     await vi.advanceTimersByTimeAsync(0);
     await expect(pending).resolves.toMatchObject({ ok: true });
 
-    // The mounted surface already rebuilt the exact lease+peer pair, so the
-    // upload neither waits for expiry recovery nor opens a third peer.
-    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
-    expect(FakePeerConnection.instances).toHaveLength(2);
+    // The mounted surface retained the exact healthy lease+peer pair, so the
+    // upload neither waits for expiry recovery nor opens another peer.
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(FakePeerConnection.instances).toHaveLength(1);
     release?.();
   });
 
-  it('binds trickled ICE to the replacement lease and never the expired peer', async () => {
+  it('binds trickled ICE to the renewed generation and never the retired peer', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws, sent, emit } = createWs(directCapabilities, 'success', {
       idleWindowMs: DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+      rebindDaemonGeneration: 2,
     });
     const release = prewarmDirectFileLease(ws, 'server-1');
     await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1);
+    await vi.advanceTimersByTimeAsync(
+      DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS
+        - DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS + 1,
+    );
 
     expect(FakePeerConnection.instances).toHaveLength(2);
     const expiredPeer = FakePeerConnection.instances[0]!;
@@ -1914,7 +1929,8 @@ describe('direct file transfer v2 browser broker', () => {
     await expect(second).resolves.toMatchObject({ ok: true });
 
     expect(FakePeerConnection.instances).toHaveLength(2);
-    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND)).toHaveLength(1);
     const before = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE).length;
     peer.emitIceCandidate('candidate:31 1 UDP 1 10.0.0.2 5001 typ host');
     peer.emitIceCandidate('candidate:32 1 UDP 1 10.0.0.3 5002 typ host');
@@ -2309,12 +2325,12 @@ describe('direct file transfer v2 browser broker', () => {
    * documented state transitions and asserts the REASON the peer was reused or
    * rebuilt, which is the thing that actually differs.
    */
-  /** A new daemon generation makes the expired-peer boundary explicit. */
-  it('rebuilds the transport when the replacement lease reports a different daemon generation', async () => {
+  /** A new daemon generation makes the renewal peer boundary explicit. */
+  it('rebuilds the transport when the renewed lease reports a different daemon generation', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
     const { DIRECT_FILE_TRANSFER_CLIENT_METRIC, DIRECT_FILE_TRANSFER_PEER_REASON } = await import('../src/direct-file-transfer.js');
-    const { ws } = createWs(directCapabilities, undefined, { secondLeaseDaemonGeneration: 2 });
+    const { ws } = createWs(directCapabilities, undefined, { rebindDaemonGeneration: 2 });
 
     const peerReasons: string[] = [];
     const debugSpy = vi.spyOn(console, 'debug').mockImplementation((...args: unknown[]) => {
@@ -2327,11 +2343,14 @@ describe('direct file transfer v2 browser broker', () => {
       await vi.advanceTimersByTimeAsync(0);
       const peersAfterPrewarm = FakePeerConnection.instances.length;
 
-      // Authority expires; the daemon comes back as a different generation.
-      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1_000);
+      // The renewal observes that the daemon came back as a new generation.
+      await vi.advanceTimersByTimeAsync(
+        DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS
+          - DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS + 1_000,
+      );
       expect(
         peerReasons,
-        'lease expiry must cold-build the replacement while the surface remains mounted',
+        'generation replacement must cold-build the peer while the surface remains mounted',
       ).toContain(DIRECT_FILE_TRANSFER_PEER_REASON.BUILT_COLD);
       expect(FakePeerConnection.instances.length).toBeGreaterThan(peersAfterPrewarm);
 
@@ -2913,11 +2932,11 @@ describe('direct file transfer v2 browser broker', () => {
   });
 
   /**
-   * A mounted surface must refresh the complete lease+peer pair at expiry.
-   * Reusing only the browser half leaves an open-looking channel whose remote
-   * peer was deleted by the daemon, causing the mobile 6/7 verification stall.
+   * A mounted surface must renew its exact lease before expiry and retain the
+   * healthy peer. The daemon therefore does not delete the remote half while
+   * the browser still advertises an explicit prewarm reference.
    */
-  it('automatically replaces the probe transport at authority expiry', async () => {
+  it('automatically renews the probe transport before authority expiry', async () => {
     vi.useFakeTimers();
     const { prewarmDirectFileLease, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
     const { DIRECT_FILE_TRANSFER_CLIENT_METRIC, DIRECT_FILE_TRANSFER_PEER_REASON } = await import('../src/direct-file-transfer.js');
@@ -2938,12 +2957,12 @@ describe('direct file transfer v2 browser broker', () => {
       await vi.advanceTimersByTimeAsync(0);
       const peersAfterProbe = FakePeerConnection.instances.length;
 
-      // Authority expires while the server stays open.
+      // The lease renews before authority expiry while the server stays open.
       await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS + 1_000);
       expect(
         FakePeerConnection.instances.length,
-        'the expired browser peer must be replaced together with the daemon peer',
-      ).toBe(peersAfterProbe + 1);
+        'a successful exact-bound renewal must retain the healthy data plane',
+      ).toBe(peersAfterProbe);
 
       const before = peerReasons.length;
       await uploadFileWithDirectFallback({
