@@ -1194,7 +1194,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const sendDepsWithSessions = (sessions: SessionRecord[], extra: Partial<SendToolDeps> = {}): SendToolDeps => ({
     ...deps.sendDeps,
     ...extra,
-    listSessions: () => sessions,
+    // Keep the authority-filtered call snapshot stable, but admit sessions
+    // created by auto-provisioning during this same send. Without this merge,
+    // provisioning succeeded and the immediately following exact-target
+    // resolution falsely returned `target not found`.
+    listSessions: () => {
+      const current = deps.sendDeps?.listSessions
+        ? deps.sendDeps.listSessions()
+        : listStoredSessions();
+      const combined = [...sessions];
+      const names = new Set(combined.map((session) => session.name));
+      for (const session of current) {
+        if (!names.has(session.name)) combined.push(session);
+      }
+      return combined;
+    },
   });
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite

@@ -1016,11 +1016,15 @@ describe('memory MCP tool schema firewall', () => {
       sessionInstanceId: undefined,
       runtimeEpoch: undefined,
     });
-    const provisionSupervisionTarget = vi.fn(async () => ({
-      ok: true as const,
-      target,
-      evidence: { selectedPool: 'primary' as const, selectedConfig: requestedExecutionType, origin: 'spawned' as const },
-    }));
+    let liveSessions = [self];
+    const provisionSupervisionTarget = vi.fn(async () => {
+      liveSessions = [self, target];
+      return {
+        ok: true as const,
+        target,
+        evidence: { selectedPool: 'primary' as const, selectedConfig: requestedExecutionType, origin: 'spawned' as const },
+      };
+    });
     const profile = {
       scope: 'session' as const,
       scopeKey: `srv-1:${target.name}`,
@@ -1035,7 +1039,7 @@ describe('memory MCP tool schema firewall', () => {
     const getEffectiveIdentityProfiles = vi.fn(async () => ({ status: 'ok' as const, profiles: [profile] }));
     const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
     const server = createMemoryMcpServer(caller({ projectRoot: null }), {
-      sendDeps: { listSessions: () => [self, target], provisionSupervisionTarget },
+      sendDeps: { listSessions: () => liveSessions, provisionSupervisionTarget },
       setIdentityProfile,
       getEffectiveIdentityProfiles,
       applyEffectiveIdentity,
@@ -1073,6 +1077,7 @@ describe('memory MCP tool schema firewall', () => {
         },
       });
       expect(result.structuredContent).toMatchObject({ status: 'error' });
+      expect(JSON.stringify(result.structuredContent)).not.toContain(`target \\"${target.name}\\" not found`);
       expect(provisionSupervisionTarget).toHaveBeenCalledWith(expect.objectContaining({
         requestedCapabilityId: requestedExecutionType.capabilityId,
         requestedExecutionConfig: requestedExecutionType,
