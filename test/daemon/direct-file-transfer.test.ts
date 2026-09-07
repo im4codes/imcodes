@@ -11,6 +11,7 @@ import {
   DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_ERROR,
+  DIRECT_FILE_TRANSFER_ERROR_SCOPE,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX,
@@ -287,6 +288,33 @@ describe('daemon direct file transfer v2 lease broker', () => {
     expect(pong).toMatchObject({ nonce: 'probe-nonce-0001', localCandidate: { address: '192.168.1.2' } });
     expect(sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED)).toBeUndefined();
     await direct.shutdownDirectFileTransfers();
+  });
+
+  it('reports an offer for an already-evicted lease instead of silently timing out', async () => {
+    const direct = await import('../../src/daemon/direct-file-transfer-worker.js');
+    const sent: Array<Record<string, unknown>> = [];
+    const sender = { send: (message: unknown) => sent.push(message as Record<string, unknown>) };
+
+    await direct.handleDirectFileTransferCommand({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId,
+      browserTabId,
+      leaseId: 'already-evicted-lease-1',
+      leaseGeneration: 1,
+      daemonGeneration: 1,
+      requestId: 'missing-lease-offer-1',
+      sdp: 'browser-lease-offer',
+    }, sender);
+
+    expect(sent).toContainEqual({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+      requestId: 'missing-lease-offer-1',
+      error: DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED,
+      retryable: true,
+    });
   });
 
   it('retains an operation channel that wins the PREPARE race on a warm peer', async () => {

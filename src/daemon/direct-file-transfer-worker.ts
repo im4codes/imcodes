@@ -1885,27 +1885,34 @@ function replaceInactiveLeasePeer(lease: DirectLease): boolean {
   return true;
 }
 
-function sendLeaseSignalFailure(lease: DirectLease, requestId: string): void {
-  sendControl(lease, {
+function sendLeaseSignalFailure(
+  sender: WorkerControlSender,
+  requestId: string,
+  error: DirectFileTransferError = DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+): void {
+  sender.send({
     type: DIRECT_FILE_TRANSFER_MSG.ERROR,
     protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
     scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
     requestId,
-    error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+    error,
     retryable: true,
   });
 }
 
-async function receiveLeaseOffer(command: DirectFileTransferLeaseOffer): Promise<void> {
+async function receiveLeaseOffer(command: DirectFileTransferLeaseOffer, sender: WorkerControlSender): Promise<void> {
   const lease = findLeaseForSignal(command);
-  if (!lease) return;
+  if (!lease) {
+    sendLeaseSignalFailure(sender, command.requestId, DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+    return;
+  }
   if (lease.remoteDescriptionSet && lease.negotiationRequestId === command.requestId) return;
   if (lease.negotiationRequestId !== null && lease.negotiationRequestId !== command.requestId
     && !replaceInactiveLeasePeer(lease)) {
     // An active file channel cannot be silently replaced. Let the browser
     // retry after its authoritative operation outcome instead of stranding it
     // behind an 8-second answer timeout.
-    sendLeaseSignalFailure(lease, command.requestId);
+    sendLeaseSignalFailure(lease.sender, command.requestId);
     return;
   }
   try {
@@ -1920,13 +1927,16 @@ async function receiveLeaseOffer(command: DirectFileTransferLeaseOffer): Promise
   } catch {
     lease.remoteDescriptionSet = false;
     logger.warn({ event: 'direct_file_v2.lease_offer_failed' }, 'Failed to accept direct file lease offer');
-    sendLeaseSignalFailure(lease, command.requestId);
+    sendLeaseSignalFailure(lease.sender, command.requestId);
   }
 }
 
-async function receiveLeaseIce(command: DirectFileTransferLeaseIce): Promise<void> {
+async function receiveLeaseIce(command: DirectFileTransferLeaseIce, sender: WorkerControlSender): Promise<void> {
   const lease = findLeaseForSignal(command);
-  if (!lease) return;
+  if (!lease) {
+    sendLeaseSignalFailure(sender, command.requestId, DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+    return;
+  }
   try {
     if (!lease.remoteDescriptionSet || lease.negotiationRequestId !== command.requestId) {
       // setLocalDescription() can emit a trickle candidate before the browser
@@ -1988,11 +1998,11 @@ export async function handleDirectFileTransferCommand(message: unknown, sender: 
     return true;
   }
   if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
-    await receiveLeaseOffer(command);
+    await receiveLeaseOffer(command, sender);
     return true;
   }
   if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE) {
-    await receiveLeaseIce(command);
+    await receiveLeaseIce(command, sender);
     return true;
   }
   const transfer = findActive(command);

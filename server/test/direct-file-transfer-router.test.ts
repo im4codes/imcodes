@@ -198,6 +198,138 @@ describe('DirectFileTransferRouter v2', () => {
     expect(f.daemonMessages.at(-1)).not.toHaveProperty('authority');
   });
 
+  it('re-prepares an existing Server route before declaring it reusable', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const f = fixture();
+    const original = readyLease(f);
+
+    // Browser socket loss extends only the Server route. The daemon does not
+    // observe that event and will independently evict its peer at the original
+    // idle deadline. A later LEASE_INIT must therefore prove the daemon peer
+    // exists again instead of returning an immediately-stale LEASE_READY.
+    vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS - 1_000);
+    f.router.dropSocket(f.browserA);
+    vi.advanceTimersByTime(2_000);
+
+    const daemonCount = f.daemonMessages.length;
+    f.router.handleBrowser(f.browserB, 'user-a', leaseInit('lease-request-reuse-1'));
+    expect(f.daemonMessages).toHaveLength(daemonCount + 1);
+    const prepare = f.daemonMessages.at(-1)!;
+    expect(prepare).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE,
+      requestId: 'lease-request-reuse-1',
+      leaseId: original.leaseId,
+    });
+    expect(f.messages(f.browserB)).toEqual([]);
+
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'lease-request-reuse-1',
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: prepare.leaseId,
+      leaseGeneration: prepare.leaseGeneration,
+      daemonGeneration: prepare.daemonGeneration,
+    }, prepare.daemonGeneration as number);
+    expect(f.messages(f.browserB).at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
+      requestId: 'lease-request-reuse-1',
+      leaseId: original.leaseId,
+    });
+  });
+
+  it('routes a daemon missing-lease signal error back to the exact browser offer', () => {
+    const f = fixture();
+    const lease = readyLease(f);
+    const offer = {
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'missing-lease-offer-1',
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+      sdp: 'v=0\r\no=browser 1 1 IN IP4 127.0.0.1',
+    } as const;
+    f.router.handleBrowser(f.browserA, 'user-a', offer);
+
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+      requestId: offer.requestId,
+      error: DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED,
+      retryable: true,
+    }, lease.daemonGeneration);
+
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+      requestId: offer.requestId,
+      error: DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED,
+      retryable: true,
+    });
+  });
+
+  it('renews an attached prepared lease on Server even when the browser timer is suspended', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const f = fixture();
+    const lease = readyLease(f);
+    const daemonCount = f.daemonMessages.length;
+    const browserCount = f.messages(f.browserA).length;
+
+    vi.advanceTimersByTime(
+      DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS
+        - DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS + 1,
+    );
+
+    expect(f.daemonMessages).toHaveLength(daemonCount + 1);
+    const renewal = f.daemonMessages.at(-1)!;
+    expect(renewal).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+    });
+    expect(renewal.requestId).not.toBe(LEASE_REQUEST);
+    expect(f.messages(f.browserA)).toHaveLength(browserCount);
+
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: renewal.requestId,
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: renewal.leaseId,
+      leaseGeneration: renewal.leaseGeneration,
+      daemonGeneration: renewal.daemonGeneration,
+    }, renewal.daemonGeneration as number);
+
+    // Server-owned keepalive refreshes daemon state only. The browser gets a
+    // rotated ticket on its next normal INIT/REBIND, not an unsolicited frame.
+    expect(f.messages(f.browserA)).toHaveLength(browserCount);
+  });
+
+  it('stops Server-owned renewal as soon as the browser socket is gone', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const f = fixture();
+    readyLease(f);
+    const daemonCount = f.daemonMessages.length;
+
+    f.router.dropSocket(f.browserA);
+    vi.advanceTimersByTime(
+      DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS
+        - DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS + 1,
+    );
+
+    expect(f.daemonMessages).toHaveLength(daemonCount);
+  });
+
   it('marks matching lease signaling during daemon rebind as retryable without forwarding it', () => {
     const f = fixture();
     const lease = readyLease(f);
@@ -493,7 +625,25 @@ describe('DirectFileTransferRouter v2', () => {
     vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS - 1);
     f.router.handleBrowser(f.browserA, 'user-a', leaseInit('lease-request-2'));
 
-    expect(f.daemonMessages).toHaveLength(daemonCountBeforeReuse);
+    // The attached socket also drives one Server-owned three-minute renewal
+    // while this post-terminal idle window remains open.
+    expect(f.daemonMessages).toHaveLength(daemonCountBeforeReuse + 2);
+    const reusePrepare = f.daemonMessages.at(-1)!;
+    expect(reusePrepare).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE,
+      requestId: 'lease-request-2',
+      leaseId: lease.leaseId,
+    });
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'lease-request-2',
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: reusePrepare.leaseId,
+      leaseGeneration: reusePrepare.leaseGeneration,
+      daemonGeneration: reusePrepare.daemonGeneration,
+    }, reusePrepare.daemonGeneration as number);
     expect(f.messages(f.browserA).at(-1)).toMatchObject({
       type: DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
       requestId: 'lease-request-2',
@@ -551,7 +701,23 @@ describe('DirectFileTransferRouter v2', () => {
     const daemonCountBeforeReuse = f.daemonMessages.length;
     vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS - 1);
     f.router.handleBrowser(f.browserA, 'user-a', leaseInit('lease-request-2'));
-    expect(f.daemonMessages).toHaveLength(daemonCountBeforeReuse);
+    expect(f.daemonMessages).toHaveLength(daemonCountBeforeReuse + 2);
+    const reusePrepare = f.daemonMessages.at(-1)!;
+    expect(reusePrepare).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE,
+      requestId: 'lease-request-2',
+      leaseId: lease.leaseId,
+    });
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'lease-request-2',
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: reusePrepare.leaseId,
+      leaseGeneration: reusePrepare.leaseGeneration,
+      daemonGeneration: reusePrepare.daemonGeneration,
+    }, reusePrepare.daemonGeneration as number);
     expect(f.messages(f.browserA).at(-1)).toMatchObject({
       type: DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
       requestId: 'lease-request-2',
