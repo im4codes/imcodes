@@ -22,7 +22,11 @@ import type {
 } from '../../shared/context-types.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
-import { buildFilePathReportingPrompt, buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
+import {
+  buildFilePathReportingPrompt,
+  buildTransportImcodesIdentityPrompt,
+  REAL_DEVICE_TESTING_SYSTEM_GUIDANCE,
+} from '../../shared/transport-runtime-prompts.js';
 import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
 import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
 import {
@@ -378,6 +382,9 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     : MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS;
   const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
   const filePathReportingGuidance = input.suppressFilePathReportingGuidance ? undefined : buildFilePathReportingPrompt();
+  const realDeviceTestingGuidance = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : REAL_DEVICE_TESTING_SYSTEM_GUIDANCE;
   // Daemon-injected, session-stable identity block. NOT subject to
   // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
   // the model must always follow. p2p audit 37bfbb85-430 N-A: this used
@@ -404,6 +411,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     input.identityPrompt?.trim(),
     identityPart,
     filePathReportingGuidance,
+    realDeviceTestingGuidance,
     memorySearchGuidance,
     agentProgressGuidance,
   ].filter(Boolean).join('\n\n') || undefined;

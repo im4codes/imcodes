@@ -40,6 +40,17 @@
 import { IMCODES_SESSION_ENV } from './imcodes-send.js';
 
 /**
+ * Prefer evidence from an authorized real machine over a purely textual audit.
+ * This is provider-neutral and session-stable, so it belongs in the shared
+ * system prompt rather than in one SDK adapter or a supervision-only preamble.
+ */
+export const REAL_DEVICE_TESTING_SYSTEM_GUIDANCE = [
+  'REAL-DEVICE TESTING PRIORITY: when suitable authorized real-device testing is available, perform it before audit because it can expose actual code defects quickly.',
+  'Use IM.codes controlled nodes to test relevant operating systems and devices when applicable.',
+  'If the required machine or permission is not already available, ask the user for the specific authorization needed.',
+].join(' ');
+
+/**
  * Render the IM.codes session identity block. Includes the exact
  * session name and the display label so the model knows to prefer
  * `$IMCODES_SESSION` (or the exact name) over the human-friendly label

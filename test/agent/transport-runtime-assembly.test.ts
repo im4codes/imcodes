@@ -10,6 +10,7 @@ import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-manag
 import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { SUPERVISION_CONTRACT_IDS } from '../../shared/supervision-config.js';
+import { REAL_DEVICE_TESTING_SYSTEM_GUIDANCE } from '../../shared/transport-runtime-prompts.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -719,6 +720,9 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('Display label: My App Brain');
       expect(systemText).toContain('imcodes send');
       expect(systemText).toContain('full absolute filesystem path');
+      expect(systemText).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
+      expect(systemText).toContain('perform it before audit');
+      expect(systemText).toContain('ask the user for the specific authorization needed');
       expect(systemText).toContain(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
       expect(systemText).toContain('the user\'s latest explicit instruction is authoritative');
       expect(systemText).toContain('This does not override platform system/developer instructions');
@@ -785,6 +789,7 @@ describe('buildProviderContextPayload', () => {
       const userAuthorityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes USER-AUTHORITY POLICY');
       const capabilityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
+      const realDeviceIdx = systemText.indexOf('REAL-DEVICE TESTING PRIORITY');
       const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
       expect(userAuthorityIdx).toBe(0);
       expect(capabilityIdx).toBeGreaterThan(userAuthorityIdx);
@@ -792,7 +797,8 @@ describe('buildProviderContextPayload', () => {
       expect(descIdx).toBeGreaterThan(capabilityIdx);
       expect(spIdx).toBeGreaterThan(descIdx);
       expect(identityIdx).toBeGreaterThan(spIdx);
-      expect(memoryIdx).toBeGreaterThan(identityIdx);
+      expect(realDeviceIdx).toBeGreaterThan(identityIdx);
+      expect(memoryIdx).toBeGreaterThan(realDeviceIdx);
       expect(progressIdx).toBeGreaterThan(memoryIdx);
     });
   });
