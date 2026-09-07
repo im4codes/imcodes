@@ -4320,7 +4320,7 @@ describe('App shell', () => {
     fireEvent.click(within(sharedPane).getByRole('button', { name: 'pane-settings' }));
     const settings = await screen.findByTestId('session-settings-dialog');
     expect(settings.getAttribute('data-supervision-mode')).toBe('supervised_audit');
-    expect(settings.getAttribute('data-can-control-supervision')).toBe('false');
+    expect(settings.getAttribute('data-can-control-supervision')).toBe('true');
     fireEvent.click(within(settings).getByRole('button', { name: 'settings-close' }));
     await waitFor(() => expect(wsInstances.length).toBeGreaterThan(ownServerWsCount));
     await waitFor(() => expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true));
