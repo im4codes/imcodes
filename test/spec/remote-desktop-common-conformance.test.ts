@@ -13,6 +13,7 @@ const SANITIZER_FLAGS = [
   '-fsanitize=address,undefined',
   '-fno-omit-frame-pointer',
 ];
+const NATIVE_CONFORMANCE_TIMEOUT_MS = 60_000;
 
 async function findCompiler(): Promise<string> {
   for (const candidate of [process.env.CXX, 'clang++', 'c++', 'g++']) {
@@ -85,7 +86,7 @@ describe.skipIf(process.platform === 'win32')('remote-desktop common conformance
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }
-  });
+  }, NATIVE_CONFORMANCE_TIMEOUT_MS);
 
   it('pins every requested failure-mode assertion in the executable fake', async () => {
     const fake = readFileSync(FAKE, 'utf8');
