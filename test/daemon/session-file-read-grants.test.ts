@@ -9,12 +9,16 @@ import {
 describe('assistant-published session file read grants', () => {
   beforeEach(() => __resetSessionFileReadGrantsForTests());
 
-  it('extracts only absolute paths delimited as inline code', () => {
+  it('extracts inline-code paths and standalone absolute paths shown as file actions', () => {
     expect(extractAssistantFileReadGrants([
       '下载：`/srv/worktree/public/templates/承诺书.docx`',
+      '/home/ai/share/客车制动防滑设备故障信息归集系统V1.0_09070655.zip',
       '相对路径 `public/templates/承诺书.pdf` 不授权',
-      '普通文本 /etc/passwd 也不授权',
-    ].join('\n'))).toEqual(['/srv/worktree/public/templates/承诺书.docx']);
+      '正文中偶然提及 /etc/passwd 不授权',
+    ].join('\n'))).toEqual([
+      '/srv/worktree/public/templates/承诺书.docx',
+      '/home/ai/share/客车制动防滑设备故障信息归集系统V1.0_09070655.zip',
+    ]);
   });
 
   it('keeps grants exact and session-scoped', async () => {

@@ -272,7 +272,7 @@ describe('fs.ls handler', () => {
     });
   });
 
-  it('previews one exact file path published by the assistant in the shared session', async () => {
+  it('previews one exact standalone file path published by the assistant in the shared session', async () => {
     const projectDir = path.join(homedir(), 'project');
     const publishedFile = path.join(homedir(), 'worktrees', 'release', 'public', 'templates', '承诺书.pdf');
     vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
@@ -285,7 +285,7 @@ describe('fs.ls handler', () => {
       source: 'daemon',
       confidence: 'high',
       type: 'assistant.text',
-      payload: { text: `Word 下载和 PDF 预览：\`${publishedFile}\`` },
+      payload: { text: `文件已生成：\n${publishedFile}` },
     }] as never);
     vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
     mockRealpath.mockImplementation(async (target) => String(target));
