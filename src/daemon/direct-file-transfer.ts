@@ -38,7 +38,6 @@ import {
 } from './direct-file-transfer-ipc.js';
 import type { FileTransferSender } from './file-transfer-handler.js';
 import {
-  finalizeDirectUploadedFile,
   lookupAttachmentByClientUploadId,
   releaseClientUploadClaim,
   resolveDirectFileDownloadSource,
@@ -124,7 +123,22 @@ type DirectFileTransferWorkerFactory = (
 
 const spawnRealWorker: DirectFileTransferWorkerFactory = spawnDirectFileTransferChild;
 let workerFactory: DirectFileTransferWorkerFactory = spawnRealWorker;
-let finalizeUploadedFileOnHost = finalizeDirectUploadedFile;
+type FinalizeDirectUploadedFile = typeof import('./file-transfer-handler.js').finalizeDirectUploadedFile;
+
+/**
+ * Keep the newly added finalization authority out of this module's eager import
+ * surface. A large set of command-handler tests intentionally replaces
+ * file-transfer-handler with a narrow mock that predates direct P2P uploads;
+ * eagerly reading the new named export makes Vitest abort those suites during
+ * module evaluation even though they never execute a direct upload. Production
+ * still resolves the exact authority module at the first real finalization.
+ */
+const finalizeDirectUploadedFileOnDemand: FinalizeDirectUploadedFile = async (params) => {
+  const handler = await import('./file-transfer-handler.js');
+  return await handler.finalizeDirectUploadedFile(params);
+};
+
+let finalizeUploadedFileOnHost: FinalizeDirectUploadedFile = finalizeDirectUploadedFileOnDemand;
 
 /**
  * Test seam for the worker factory.
@@ -141,9 +155,9 @@ export function __setDirectFileTransferWorkerFactoryForTests(
 }
 
 export function __setDirectFileTransferFinalizeForTests(
-  finalize: typeof finalizeDirectUploadedFile | null,
+  finalize: FinalizeDirectUploadedFile | null,
 ): void {
-  finalizeUploadedFileOnHost = finalize ?? finalizeDirectUploadedFile;
+  finalizeUploadedFileOnHost = finalize ?? finalizeDirectUploadedFileOnDemand;
 }
 
 /** Reset all module state between tests so cases cannot leak into each other. */
@@ -169,7 +183,7 @@ export function __resetDirectFileTransferForTests(): void {
   claimTokensByHandle.clear();
   claimHandleSeq = 0;
   inFlightHostMutations.clear();
-  finalizeUploadedFileOnHost = finalizeDirectUploadedFile;
+  finalizeUploadedFileOnHost = finalizeDirectUploadedFileOnDemand;
 }
 
 /**
@@ -383,7 +397,7 @@ async function invokeHostMethod(generation: number, method: string, args: unknow
       return await resolveDirectFileDownloadSource(String(args[0] ?? ''));
     case DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE:
       return await finalizeUploadedFileOnHost(
-        args[0] as Parameters<typeof finalizeDirectUploadedFile>[0],
+        args[0] as Parameters<FinalizeDirectUploadedFile>[0],
       );
     default:
       // Unreachable: the validator allowlists the method before we get here.
