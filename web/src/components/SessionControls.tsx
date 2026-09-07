@@ -85,7 +85,7 @@ import {
   hasTransportPendingSyncSnapshot,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
-import { formatSharedActorLabel } from '../tab-sharing-ui.js';
+import { canSharedActorControlSession, formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
@@ -1888,7 +1888,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       sharedState?.status === 'active'
       && sharedState.effectiveRole === 'participant'
     ));
-  const canQuickControlSupervision = canQuickViewSupervision && !isShareScopedSession;
+  const canQuickControlSupervision = canQuickViewSupervision && canSharedActorControlSession(sharedState);
   const supervisorDefaultsPref = useSupervisorDefaults(
     canQuickControlSupervision,
     serverId && activeSession?.name ? { serverId, sessionName: activeSession.name } : null,

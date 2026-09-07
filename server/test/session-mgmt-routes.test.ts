@@ -639,7 +639,10 @@ describe('session-mgmt persistence routes', () => {
     });
   });
 
-  it('PATCH /sessions/:name/supervision keeps covered participants read-only', async () => {
+  it('lets a covered participant switch an already-configured supervision', async () => {
+    // A participant drives the session like its owner, so it owns this switch
+    // too. What it must NOT be able to do is author the configuration — every
+    // field except the mode keeps coming from the stored snapshot.
     const coverage = {
       target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
       effectiveRole: 'participant',
@@ -652,29 +655,55 @@ describe('session-mgmt persistence routes', () => {
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
     });
-    mockGetDbSessionByName.mockResolvedValue({
+    let storedTransportConfig: Record<string, unknown> = {
+      provider: { privateSetting: 'preserved' },
+      supervision: {
+        mode: 'supervised_audit',
+        backend: 'codex-sdk',
+        model: 'gpt-5.6-sol',
+        timeoutMs: 45_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        maxAutoContinueStreak: 2,
+        maxAutoContinueTotal: 0,
+        maxAuditLoops: 2,
+        taskRunPromptVersion: 'task_run_status_v1',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{
+              capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+              agentType: 'codex-sdk',
+              providerFamily: 'openai',
+              runtimeType: 'transport',
+              model: 'gpt-5.6-sol',
+            }],
+            controls: {},
+          },
+          economyTaskPool: { configs: [], controls: {} },
+        },
+      },
+    };
+    mockGetDbSessionByName.mockImplementation(async () => ({
       name: 'deck_proj_brain',
       role: 'brain',
       agent_type: 'codex-sdk',
-      transport_config: {
-        provider: { privateSetting: 'preserved' },
-        supervision: {
-          mode: 'off',
-          backend: 'codex-sdk',
-          model: 'gpt-5.4',
-          timeoutMs: 45_000,
-          promptVersion: 'supervision_decision_v1',
-          maxParseRetries: 1,
-          maxAutoContinueStreak: 2,
-          maxAutoContinueTotal: 0,
-          maxAuditLoops: 2,
-          taskRunPromptVersion: 'task_run_status_v1',
-        },
-      },
+      transport_config: storedTransportConfig,
+    }));
+    mockUpdateSession.mockImplementation(async (
+      _db: unknown,
+      _serverId: string,
+      _sessionName: string,
+      patch: { transport_config?: Record<string, unknown> | null },
+    ) => {
+      storedTransportConfig = patch.transport_config ?? {};
     });
     const app = await buildApp();
 
-    for (const mode of ['off', 'supervised', 'supervised_audit'] as const) {
+    // Exercise a real sequential disable -> re-enable. If the off transition
+    // deletes the stored configuration, the second request must fail closed.
+    for (const mode of ['off', 'supervised_audit'] as const) {
+      mockUpdateSession.mockClear();
       const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -688,34 +717,63 @@ describe('session-mgmt persistence routes', () => {
             maxParseRetries: 1,
             maxAutoContinueStreak: 1,
             maxAutoContinueTotal: 1,
-            ...(mode === 'supervised_audit' ? {
-              maxAuditLoops: 2,
-              taskRunPromptVersion: 'task_run_status_v1',
-              executionPools: {
-                state: 'configured',
-                primaryDevelopmentPool: {
-                  configs: [{
-                    capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.4',
-                    agentType: 'codex-sdk',
-                    providerFamily: 'openai',
-                    runtimeType: 'transport',
-                    model: 'gpt-5.4',
-                  }],
-                  controls: {},
-                },
-                economyTaskPool: { configs: [], controls: {} },
-              },
-            } : {}),
+            auditTargetSessionName: 'deck_other_brain',
           },
         }),
       });
 
-      expect(res.status, mode).toBe(403);
-      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+      expect(res.status, mode).toBe(200);
+      const persisted = mockUpdateSession.mock.calls.at(-1)?.[3] as {
+        transport_config?: { provider?: Record<string, unknown>; supervision?: Record<string, unknown> };
+      };
+      // Unrelated stored config is never collateral damage.
+      expect(persisted.transport_config?.provider).toEqual({ privateSetting: 'preserved' });
+      // Every field except the mode comes from the STORED snapshot, so the
+      // request's model and its forged audit target are both discarded. Off
+      // deliberately retains those fields so re-enabling remains possible.
+      expect(persisted.transport_config?.supervision).toMatchObject({
+        mode,
+        backend: 'codex-sdk',
+        model: 'gpt-5.6-sol',
+        timeoutMs: 45_000,
+        maxAuditLoops: 2,
+      });
+      expect(persisted.transport_config?.supervision).not.toHaveProperty('auditTargetSessionName');
+      expect(JSON.stringify(persisted.transport_config?.supervision?.executionPools)).toContain('gpt-5.6-sol');
     }
+  });
+
+  it('PATCH /sessions/:name/supervision still denies a viewer', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+        },
+      },
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        supervision: {
+          mode: 'off',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 1,
+          maxAutoContinueTotal: 1,
+        },
+      }),
+    });
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
     expect(mockUpdateSession).not.toHaveBeenCalled();
-    expect(mockUpdateSubSession).not.toHaveBeenCalled();
-    expect(mockDbExecute).not.toHaveBeenCalled();
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
@@ -926,10 +984,14 @@ describe('session-mgmt persistence routes', () => {
       }),
     });
 
+    // The session has no stored supervision, so there is nothing to merge the
+    // forged `auditTargetSessionName` away against. A participant controls an
+    // existing configuration; it never authors one, so this is refused before
+    // any write or daemon relay.
     expect(res.status).toBe(403);
     await expect(res.json()).resolves.toEqual({
       error: 'forbidden',
-      reason: 'share-role-denied',
+      reason: 'share_supervision_not_configured',
     });
     expect(mockUpdateSession).not.toHaveBeenCalled();
     expect(sendToDaemonMock).not.toHaveBeenCalled();

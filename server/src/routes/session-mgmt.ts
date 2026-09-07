@@ -60,6 +60,7 @@ import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 import {
   buildTransportConfigWithSupervision,
   canSessionRoleOwnAutomaticSupervision,
+  embedSessionSupervisionSnapshot,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
@@ -287,11 +288,11 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
   }
 
-  // Automatic supervision belongs to the owner Brain. A participant may read
-  // the minimal authoritative mode projection, but a projected row.role must
-  // never be treated as an owner capability for writes. Reject before any DB
-  // write or daemon relay: the shared actor has read authority only.
-  if (access.actor.kind === 'share') {
+  // A share participant drives the session exactly like its owner — it already
+  // sends, restarts and edits settings — so it also controls supervision. A
+  // viewer does not. This is the same participant gate every other write on
+  // this router uses; the Brain-only rule below is separate and still applies.
+  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
@@ -314,6 +315,15 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
 
   const existingTransportConfig = parseStoredTransportConfig(row.transport_config);
   const existingSnapshot = extractSessionSupervisionSnapshot(existingTransportConfig);
+  // A share participant may flip an already-configured supervision on or off.
+  // It may NOT author the configuration: without an existing snapshot the
+  // whole proposed payload would be persisted verbatim, which is how a forged
+  // `auditTargetSessionName` would reach a session the actor has no coverage
+  // for. Only the owner establishes the configuration; the participant then
+  // controls its mode, and every other field keeps coming from the stored one.
+  if (access.actor.kind === 'share' && !existingSnapshot) {
+    return c.json({ error: 'forbidden', reason: 'share_supervision_not_configured' }, 403);
+  }
   const nextSnapshot: SessionSupervisionSnapshot = existingSnapshot
     ? { ...existingSnapshot, mode: proposed.mode }
     : proposed;
@@ -332,7 +342,14 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
       guidance: poolGate.guidance,
     }, 400);
   }
-  const nextTransportConfig = buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
+  // Owners may keep the historical compact representation where `off` removes
+  // the block. A participant, however, is only allowed to toggle an existing
+  // configuration; deleting that configuration would make the first off
+  // transition irreversible. Preserve it with mode=off so the same participant
+  // can later turn it back on without gaining authority to author new fields.
+  const nextTransportConfig = access.actor.kind === 'share'
+    ? embedSessionSupervisionSnapshot(existingTransportConfig, nextSnapshot)
+    : buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
 
   if (target.kind === 'subsession') {
     await updateSubSession(c.env.DB, target.subSessionId, serverId, { transport_config: nextTransportConfig });

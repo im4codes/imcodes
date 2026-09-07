@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 
@@ -120,7 +120,7 @@ describe('SessionControls shared participant settings entry points', () => {
     expect(onSettings).toHaveBeenCalledTimes(1);
   });
 
-  it('renders the owner-authoritative audit mode but keeps every quick mode choice read-only', () => {
+  it('lets an active participant change the mode, because a participant drives the session', async () => {
     renderControls('participant', vi.fn());
 
     const auto = screen.getByRole('button', { name: 'Auto' });
@@ -131,10 +131,18 @@ describe('SessionControls shared participant settings entry points', () => {
     const options = within(menu).getAllByRole('button').filter((button) => button.textContent !== 'Settings');
     expect(options).toHaveLength(2);
     for (const option of options) {
-      expect((option as HTMLButtonElement).disabled).toBe(true);
-      fireEvent.click(option);
+      expect((option as HTMLButtonElement).disabled).toBe(false);
     }
-    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
+
+    // The session is a Brain, so supervision is ownable; the participant is a
+    // full actor on it, so the write goes out exactly as the owner's would.
+    fireEvent.click(options[0]!);
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledTimes(1));
+  });
+
+  it('never offers the control to a viewer', () => {
+    renderControls('viewer', vi.fn());
+    expect(screen.queryByRole('button', { name: 'Auto' })).toBeNull();
   });
 
   it('opens the same settings surface from the session action menu for an active participant', () => {
