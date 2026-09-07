@@ -6,6 +6,7 @@ import type { Env } from '../src/env.js';
 import { signJwt } from '../src/security/crypto.js';
 
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
+const ALIAS_ID = 'b'.repeat(32);
 type Row = {
   id: string; user_id: string; scope: 'user' | 'project'; scope_key: string; alias: string;
   kind: 'controlled_node' | 'ssh'; target: string; enabled: boolean; revision: number;
@@ -23,6 +24,12 @@ function makeMemDb(): Database {
         && (row.scope === 'user' || (row.scope === 'project' && row.scope_key === projectKey))) as T[];
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      if (sql.includes('FROM user_aliases')) {
+        return (params[0] === 'user-1' && params[1] === ALIAS_ID ? {
+          id: ALIAS_ID, name: '211', value: 'ssh k@172.16.253.211', description: null,
+          tags: [], source: 'web', created_at: 1, updated_at: 1,
+        } : null) as T | null;
+      }
       if (sql.includes('INSERT INTO verification_machine_profiles')) {
         const [id, userId, scope, scopeKey, alias, kind, target, enabled, now, source, expected] = params as [
           string, string, Row['scope'], string, string, Row['kind'], string, boolean, number, Row['source'], number | null,
@@ -79,7 +86,7 @@ describe('/api/verification-machines', () => {
   it('stores an SSH reference online and renames it without changing its stable id', async () => {
     const create = await app.request('/api/verification-machines', { method: 'PUT', headers: {
       Authorization: bearer(), 'Content-Type': 'application/json',
-    }, body: JSON.stringify({ scope: 'project', scopeKey: 'repo-1', alias: 'Linux rig', kind: 'ssh', target: '211' }) });
+    }, body: JSON.stringify({ scope: 'project', scopeKey: 'repo-1', alias: 'Linux rig', kind: 'ssh', target: ALIAS_ID }) });
     expect(create.status).toBe(200);
     const first = (await create.json() as { profile: Row }).profile;
     expect(first).toMatchObject({ alias: 'Linux rig', source: 'web', revision: 1 });
@@ -87,7 +94,7 @@ describe('/api/verification-machines', () => {
 
     const rename = await app.request('/api/verification-machines', { method: 'PUT', headers: {
       Authorization: bearer(), 'Content-Type': 'application/json',
-    }, body: JSON.stringify({ id: first.id, scope: 'project', scopeKey: 'repo-1', alias: 'Build rig', kind: 'ssh', target: '211', expectedRevision: 1 }) });
+    }, body: JSON.stringify({ id: first.id, scope: 'project', scopeKey: 'repo-1', alias: 'Build rig', kind: 'ssh', target: ALIAS_ID, expectedRevision: 1 }) });
     expect(await rename.json()).toMatchObject({ profile: { id: first.id, alias: 'Build rig', revision: 2 } });
     const list = await app.request('/api/verification-machines?projectKey=repo-1', { headers: { Authorization: bearer() } });
     expect(await list.json()).toMatchObject({ profiles: [{ id: first.id, alias: 'Build rig' }] });

@@ -104,7 +104,7 @@ import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
-import { syncSessionIdentities } from './session-identity-sync.js';
+import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
 import {
   buildSupervisedAuditExecutionPreamble,
   buildSupervisionExecutionPreamble,
@@ -1708,8 +1708,17 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleSessionTransportConfigUpdate(cmd, serverLink);
       break;
     case DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH:
-      void syncSessionIdentities().catch((err) => {
-        logger.warn({ err }, 'session identity refresh failed');
+      void syncSessionIdentitiesForCommand(cmd).then((ack) => {
+        if (!ack) return;
+        if (ack.status === 'error') logger.warn({ error: ack.error }, 'session identity refresh failed');
+        emitCommandAckReliable(serverLink, {
+          commandId: ack.commandId,
+          sessionName: ack.sessionName,
+          status: ack.status,
+          ...(ack.error ? { error: ack.error } : {}),
+        });
+      }).catch((err) => {
+        logger.warn({ err }, 'legacy session identity refresh failed');
       });
       break;
     case 'session.send':

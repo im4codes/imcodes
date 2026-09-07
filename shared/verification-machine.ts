@@ -1,4 +1,5 @@
 import { isControlledNodeId } from './controlled-node-identity.js';
+import { isAliasId } from './alias-types.js';
 
 export const VERIFICATION_MACHINE_API_PATH = '/api/verification-machines';
 
@@ -135,9 +136,10 @@ export function verificationMachineTargetError(
   if (kind === VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE) {
     return isControlledNodeId(normalized) ? null : 'verification_machine_target_invalid';
   }
-  // SSH config Host token only. Never accept command-line options, whitespace,
-  // paths or shell metacharacters; the daemon invokes ssh without a shell.
-  return /^[A-Za-z0-9_.:@%+-]+$/u.test(normalized)
+  // SSH verification targets are durable alias row IDs, not connection text.
+  // The alias value remains the single source of truth and may change without
+  // breaking this association.
+  return isAliasId(normalized)
     ? null
     : 'verification_machine_target_invalid';
 }

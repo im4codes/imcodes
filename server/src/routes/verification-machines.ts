@@ -10,6 +10,7 @@ import {
   upsertVerificationMachine,
 } from '../db/verification-machine-queries.js';
 import { listControlledMachines } from './machines.js';
+import { getAliasById } from '../db/alias-queries.js';
 import {
   VERIFICATION_MACHINE_KINDS,
   VERIFICATION_MACHINE_LIMITS,
@@ -71,6 +72,11 @@ verificationMachineRoutes.put('/', async (c) => {
     const target = normalizeVerificationMachineTarget(String(body.target));
     const { machines } = await listControlledMachines(c.env.DB, userId, Date.now());
     if (!machines.some((machine) => machine.nodeId === target)) {
+      return c.json({ error: 'verification_machine_target_unauthorized' }, 403);
+    }
+  } else {
+    const target = normalizeVerificationMachineTarget(String(body.target));
+    if (!(await getAliasById(c.env.DB, userId, target))) {
       return c.json({ error: 'verification_machine_target_unauthorized' }, 403);
     }
   }

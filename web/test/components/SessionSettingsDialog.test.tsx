@@ -118,6 +118,27 @@ function makePeerAuditSession(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function makeIdentityAckWs() {
+  const handlers = new Set<(message: any) => void>();
+  const ws = {
+    connected: true,
+    send: vi.fn((message: Record<string, unknown>) => {
+      if (message.type !== 'session.identity.refresh') return;
+      queueMicrotask(() => handlers.forEach((handler) => handler({
+        type: 'command.ack',
+        commandId: message.commandId,
+        session: message.sessionName,
+        status: 'ok',
+      })));
+    }),
+    onMessage: vi.fn((handler: (message: any) => void) => {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    }),
+  };
+  return ws;
+}
+
 describe('SessionSettingsDialog supervision', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -140,7 +161,7 @@ describe('SessionSettingsDialog supervision', () => {
   });
 
   it('saves a manually entered exact-session identity online and requests an immediate runtime refresh', async () => {
-    const send = vi.fn();
+    const ws = makeIdentityAckWs();
     render(
       <SessionSettingsDialog
         serverId="srv-1"
@@ -150,7 +171,7 @@ describe('SessionSettingsDialog supervision', () => {
         cwd="/proj"
         type="codex-sdk"
         transportConfig={null}
-        ws={{ connected: true, send, onMessage: () => () => undefined } as any}
+        ws={ws as any}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
@@ -167,9 +188,10 @@ describe('SessionSettingsDialog supervision', () => {
       content: 'You are the release engineer.',
       expectedRevision: 0,
     }));
-    expect(send).toHaveBeenCalledWith({
+    expect(ws.send).toHaveBeenCalledWith({
       type: 'session.identity.refresh',
       sessionName: 'deck_proj_brain',
+      commandId: expect.any(String),
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
@@ -184,7 +206,7 @@ describe('SessionSettingsDialog supervision', () => {
         cwd="/proj"
         type="codex-sdk"
         transportConfig={null}
-        ws={{ connected: true, send: vi.fn(), onMessage: () => () => undefined } as any}
+        ws={makeIdentityAckWs() as any}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
@@ -218,7 +240,7 @@ describe('SessionSettingsDialog supervision', () => {
         cwd="/proj"
         type="codex-sdk"
         transportConfig={null}
-        ws={{ connected: true, send: vi.fn(), onMessage: () => () => undefined } as any}
+        ws={makeIdentityAckWs() as any}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,

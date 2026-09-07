@@ -55,9 +55,9 @@ import {
 } from "@shared/codebuddy.js";
 import { HERMES_AGENT_PROVIDER_ID } from "@shared/hermes-agent.js";
 import { SESSION_IDENTITY_SCOPES, normalizeSessionIdentityContent } from '@shared/session-identity.js';
-import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { saveSessionIdentityProfile } from '../api.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
+import { requestSessionIdentityRefresh } from '../session-identity-refresh.js';
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
@@ -349,9 +349,9 @@ export function NewSessionDialog({
               content: normalizeSessionIdentityContent(pendingSessionIdentity),
               ...(pendingSessionIdentitySourceFile ? { sourceFile: pendingSessionIdentitySourceFile } : {}),
             });
-            ws.send({ type: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH, sessionName });
+            await requestSessionIdentityRefresh(ws, sessionName);
           } catch {
-            onToast?.(t('session.identityCreateSaveFailed'));
+            onToast?.(t('session.identityCreateApplyFailed'));
           }
         }
         onSessionStarted(sessionName);

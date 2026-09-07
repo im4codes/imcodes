@@ -85,6 +85,8 @@ describe('QuickInputPanel verification-machine tab', () => {
     const tab = Array.from(document.body.querySelectorAll('button'))
       .find((button) => button.textContent?.includes('quick_input.tab_verification'))!;
     expect(tab).toBeDefined();
+    const tabs = Array.from(document.body.querySelectorAll('.qp-tab'));
+    expect(tabs.at(-1)).toBe(tab);
     fireEvent.click(tab);
 
     await waitFor(() => expect(mocks.listVerificationMachines).toHaveBeenCalledWith('repo-1'));
@@ -112,8 +114,9 @@ describe('QuickInputPanel verification-machine tab', () => {
 
   it('authorizes a clicked SSH alias or controlled node without retyping its target', async () => {
     mocks.aliases = [{
+      id: 'b'.repeat(32),
       name: '211-gitlab',
-      value: 'ssh k@172.16.253.211',
+      value: 'not-a-host; the agent decides how to use this alias',
       tags: [],
       createdAt: '',
       updatedAt: '',
@@ -133,10 +136,22 @@ describe('QuickInputPanel verification-machine tab', () => {
       }],
     })} />);
 
+    const orderedTabs = Array.from(document.body.querySelectorAll('.qp-tab'));
+    const machineTabIndex = orderedTabs.findIndex((button) => button.textContent?.includes('quick_input.tab_machines'));
+    const verificationTabIndex = orderedTabs.findIndex((button) => button.textContent?.includes('quick_input.tab_verification'));
+    expect(machineTabIndex).toBeGreaterThanOrEqual(0);
+    expect(verificationTabIndex).toBe(machineTabIndex + 1);
+    expect(verificationTabIndex).toBe(orderedTabs.length - 1);
+
     const tab = Array.from(document.body.querySelectorAll('button'))
       .find((button) => button.textContent?.includes('quick_input.tab_verification'))!;
     fireEvent.click(tab);
     await waitFor(() => expect(mocks.listVerificationMachines).toHaveBeenCalledOnce());
+
+    const addButton = Array.from(document.body.querySelectorAll('button'))
+      .find((button) => button.textContent?.includes('quick_input.verification_add'))!;
+    expect(addButton).toBeDefined();
+    fireEvent.click(addButton);
 
     const aliasButton = Array.from(document.body.querySelectorAll('button'))
       .find((button) => button.textContent?.includes('quick_input.verification_authorize_alias'))!;
@@ -146,7 +161,7 @@ describe('QuickInputPanel verification-machine tab', () => {
       scopeKey: 'repo-1',
       alias: '211-gitlab',
       kind: 'ssh',
-      target: 'k@172.16.253.211',
+      target: 'b'.repeat(32),
     })));
 
     const nodeButton = Array.from(document.body.querySelectorAll('button'))

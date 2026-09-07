@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { syncSessionIdentities } from '../../src/daemon/session-identity-sync.js';
+import { syncSessionIdentities, syncSessionIdentitiesForCommand } from '../../src/daemon/session-identity-sync.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
   renderSessionIdentityProfiles,
@@ -61,5 +61,50 @@ describe('cross-machine session identity synchronization', () => {
       { refresh: true },
     );
     expect(applyIdentity).not.toHaveBeenCalledWith('deck_stopped', expect.anything(), expect.anything());
+  });
+
+  it('joins a concurrent periodic sync instead of falsely reporting skipped before apply completes', async () => {
+    let releaseSnapshot!: (value: {
+      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[];
+    }) => void;
+    const listProfiles = vi.fn(() => new Promise<{
+      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[];
+    }>((resolve) => { releaseSnapshot = resolve; }));
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+    const deps = {
+      listProfiles,
+      listLocalSessions: () => [session({ identityPrompt: undefined })],
+      applyIdentity,
+    };
+
+    const periodic = syncSessionIdentities({}, deps);
+    const explicit = syncSessionIdentities({}, deps);
+    expect(listProfiles).toHaveBeenCalledTimes(1);
+    releaseSnapshot({ status: 'ok', serverId: 'srv-9', profiles: [profile('user', '', 'global')] });
+
+    await expect(periodic).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
+    await expect(explicit).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(applyIdentity).toHaveBeenCalledTimes(1);
+  });
+
+  it('builds the explicit refresh ack only after convergence and carries failures', async () => {
+    const runSync = vi.fn(async () => ({ status: 'ok' as const, checked: 1, changed: 1 }));
+    await expect(syncSessionIdentitiesForCommand({
+      commandId: 'identity-1',
+      sessionName: 'deck_proj_brain',
+    }, runSync)).resolves.toEqual({
+      commandId: 'identity-1',
+      sessionName: 'deck_proj_brain',
+      status: 'ok',
+    });
+    await expect(syncSessionIdentitiesForCommand({
+      commandId: 'identity-2',
+      sessionName: 'deck_proj_brain',
+    }, async () => { throw new Error('profile fetch failed'); })).resolves.toEqual({
+      commandId: 'identity-2',
+      sessionName: 'deck_proj_brain',
+      status: 'error',
+      error: 'profile fetch failed',
+    });
   });
 });

@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { execFile } from 'node:child_process';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -317,7 +316,7 @@ export interface MemoryMcpToolDeps {
   setVerificationMachine?: typeof setVerificationMachineProfile;
   removeVerificationMachine?: typeof removeVerificationMachineProfile;
   recordVerificationMachineStatus?: typeof recordVerificationMachineProfileStatus;
-  verifySshHost?: (host: string) => Promise<boolean>;
+  listVerificationAliases?: typeof aliasMcpList;
   applyEffectiveIdentity?: (
     sessionName: string,
     prompt: string | undefined,
@@ -1191,15 +1190,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const verificationSet = deps.setVerificationMachine ?? setVerificationMachineProfile;
   const verificationRemove = deps.removeVerificationMachine ?? removeVerificationMachineProfile;
   const verificationRecordStatus = deps.recordVerificationMachineStatus ?? recordVerificationMachineProfileStatus;
-  const verifySshHost = deps.verifySshHost ?? ((host: string) => new Promise<boolean>((resolveResult) => {
-    execFile('ssh', [
-      '-o', 'BatchMode=yes',
-      '-o', 'ConnectTimeout=5',
-      '-o', 'ConnectionAttempts=1',
-      host,
-      'true',
-    ], { timeout: 8_000, windowsHide: true }, (err) => resolveResult(!err));
-  }));
+  const verificationAliasList = deps.listVerificationAliases ?? aliasMcpList;
   const identityApply = deps.applyEffectiveIdentity ?? (async (sessionName, prompt, options) => {
     const { applyEffectiveSessionIdentity } = await import('../agent/session-manager.js');
     return applyEffectiveSessionIdentity(sessionName, prompt, options);
@@ -1725,9 +1716,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!profile.enabled) {
         status = VERIFICATION_MACHINE_STATUSES.UNAUTHORIZED;
       } else if (profile.kind === VERIFICATION_MACHINE_KINDS.SSH) {
-        status = await verifySshHost(profile.target)
+        // An SSH entry authorizes a stable alias association. Connectivity is
+        // deliberately not registry authority: the model resolves/uses the
+        // alias when the task actually needs the machine.
+        const aliases = await verificationAliasList();
+        status = aliases.status === 'ok' && aliases.aliases.some((entry) => entry.id === profile.target)
           ? VERIFICATION_MACHINE_STATUSES.VERIFIED
-          : VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+          : VERIFICATION_MACHINE_STATUSES.UNAUTHORIZED;
       } else if (!deps.machineDeps) {
         status = VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
       } else {

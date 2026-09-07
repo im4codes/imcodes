@@ -3139,6 +3139,8 @@
       "add_ssh": "Авторизовать SSH-хост",
       "authorize_node": "Авторизовать {{name}}",
       "update_node": "Обновить {{name}}",
+      "authorize_alias": "Авторизовать псевдоним {{name}}",
+      "update_alias": "Обновить псевдоним {{name}}",
       "kind_controlled_node": "Управляемый узел",
       "kind_ssh": "SSH",
       "status_unverified": "Не проверено",

@@ -12,6 +12,7 @@ import {
   validateAliasValue,
   validateAliasDescription,
   validateAliasTags,
+  isAliasId,
   type AliasReason,
 } from '@shared/alias-types.js';
 import type { WsClient } from '../ws-client.js';
@@ -22,7 +23,6 @@ import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import {
   VERIFICATION_MACHINE_KINDS,
   VERIFICATION_MACHINE_SCOPES,
-  verificationMachineTargetError,
   type VerificationMachineProfile,
   type VerificationMachineScope,
 } from '@shared/verification-machine.js';
@@ -440,16 +440,6 @@ function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
   return text.slice(0, half) + '...' + text.slice(-half);
 }
 
-/** Accept a plain SSH Host token or the common alias value `ssh <host>`. */
-export function verificationTargetFromAliasValue(value: string): string | null {
-  const trimmed = value.trim();
-  const commandMatch = /^ssh\s+([^\s]+)$/u.exec(trimmed);
-  const target = commandMatch?.[1] ?? trimmed;
-  return verificationMachineTargetError(VERIFICATION_MACHINE_KINDS.SSH, target) === null
-    ? target
-    : null;
-}
-
 function formatPreviewText(text: string, max = TRUNCATE_THRESHOLD): string {
   return truncateMiddle(text.replace(/\r\n?/g, '\n').replace(/\n/g, ' ↵ '), max);
 }
@@ -479,6 +469,7 @@ export function QuickInputPanel({
   const [verificationLoading, setVerificationLoading] = useState(false);
   const [verificationError, setVerificationError] = useState(false);
   const [verificationBusyTarget, setVerificationBusyTarget] = useState<string | null>(null);
+  const [verificationPickerOpen, setVerificationPickerOpen] = useState(false);
   const [verificationScope, setVerificationScope] = useState<VerificationMachineScope>(
     projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER,
   );
@@ -756,11 +747,18 @@ export function QuickInputPanel({
     setAliasSaving(true);
     setAliasError(null);
     try {
-      // Rename = upsert new name + delete the old record (name is the key).
-      await createAlias({ name, value, ...(description ? { description } : {}), ...(tags.length > 0 ? { tags } : {}) });
-      if (aliasForm.original && aliasForm.original !== name) {
-        await removeAlias(aliasForm.original);
-      }
+      const existing = aliasForm.original
+        ? allAliases.find((entry) => entry.name === aliasForm.original)
+        : undefined;
+      // Preserve the server row id on rename so durable verification-machine
+      // associations follow the alias automatically.
+      await createAlias({
+        ...(existing?.id ? { id: existing.id } : {}),
+        name,
+        value,
+        ...(description ? { description } : {}),
+        ...(tags.length > 0 ? { tags } : {}),
+      });
       closeAliasForm();
     } catch (err) {
       setAliasSaving(false);
@@ -805,14 +803,14 @@ export function QuickInputPanel({
           <button class={`qp-tab${activeTab === 'alias' ? ' active' : ''}`} onClick={() => setActiveTab('alias')}>
             🔖 {t('alias.tab')}
           </button>
-          <button class={`qp-tab${activeTab === 'verification' ? ' active' : ''}`} onClick={() => setActiveTab('verification')}>
-            🧪 {t('quick_input.tab_verification')}
-          </button>
           {machines.length > 0 && (
             <button class={`qp-tab${activeTab === 'machines' ? ' active' : ''}`} onClick={() => setActiveTab('machines')}>
               🖥 {t('quick_input.tab_machines')}
             </button>
           )}
+          <button class={`qp-tab${activeTab === 'verification' ? ' active' : ''}`} onClick={() => setActiveTab('verification')}>
+            🧪 {t('quick_input.tab_verification')}
+          </button>
         </div>
 
         {/* Controlled-node tab — display names are mutable, canonical node IDs
@@ -875,7 +873,15 @@ export function QuickInputPanel({
                 </span>
               </button>
             ))}
-            <div class="qp-verification-authorize">
+            <button
+              type="button"
+              class="qp-toolbar-btn"
+              aria-expanded={verificationPickerOpen}
+              onClick={() => setVerificationPickerOpen((current) => !current)}
+            >
+              ＋ {t('quick_input.verification_add')}
+            </button>
+            {verificationPickerOpen && <div class="qp-verification-authorize">
               <div class="qp-verification-authorize-header">
                 <strong>{t('quick_input.verification_add')}</strong>
                 <select
@@ -897,18 +903,18 @@ export function QuickInputPanel({
               </div>
               <div class="qp-verification-source-list">
                 {allAliases.map((entry) => {
-                  const target = verificationTargetFromAliasValue(entry.value);
-                  if (!target) return null;
-                  const busyKey = `${VERIFICATION_MACHINE_KINDS.SSH}:${target}`;
+                  if (!isAliasId(entry.id)) return null;
+                  const aliasId = entry.id;
+                  const busyKey = `${VERIFICATION_MACHINE_KINDS.SSH}:${aliasId}`;
                   return (
                     <button
                       type="button"
-                      key={`alias:${entry.name}`}
+                      key={`alias:${aliasId}`}
                       disabled={verificationBusyTarget !== null}
                       onClick={() => { void authorizeVerificationTarget({
                         alias: entry.name,
                         kind: VERIFICATION_MACHINE_KINDS.SSH,
-                        target,
+                        target: aliasId,
                       }); }}
                     >
                       🔖 {t('quick_input.verification_authorize_alias', { name: entry.name })}
@@ -935,7 +941,7 @@ export function QuickInputPanel({
                   );
                 })}
               </div>
-            </div>
+            </div>}
           </div>
         )}
 

@@ -8,6 +8,8 @@ import { VerificationMachinesSection } from '../../src/components/VerificationMa
 const listMock = vi.fn();
 const setMock = vi.fn();
 const removeMock = vi.fn();
+const refetchAliasesMock = vi.fn();
+const aliasId = 'b'.repeat(32);
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -21,6 +23,14 @@ vi.mock('../../src/api/verification-machines.js', () => ({
   listVerificationMachines: (...args: unknown[]) => listMock(...args),
   setVerificationMachine: (...args: unknown[]) => setMock(...args),
   removeVerificationMachine: (...args: unknown[]) => removeMock(...args),
+}));
+
+vi.mock('../../src/hooks/useAliases.js', () => ({
+  useAliases: () => ({
+    aliases: [{ id: aliasId, name: '211-gitlab', value: 'ssh k@172.16.253.211', tags: [], createdAt: '', updatedAt: '', source: 'web' }],
+    filtered: [], loaded: true, loading: false, error: null, stale: false,
+    refetch: refetchAliasesMock, create: vi.fn(), remove: vi.fn(),
+  }),
 }));
 
 const profile = {
@@ -66,6 +76,7 @@ describe('VerificationMachinesSection', () => {
       nodeId: '0987654321',
       displayName: 'Windows 11',
     } as any]} projectKey="repo-1" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'quick_input.verification_add' }));
     fireEvent.click(await screen.findByRole('button', {
       name: 'controlled_nodes.verification.authorize_node:Windows 11',
     }));
@@ -75,6 +86,18 @@ describe('VerificationMachinesSection', () => {
       alias: 'Windows 11',
       kind: 'controlled_node',
       target: '0987654321',
+    })));
+  });
+
+  it('authorizes an existing alias by its stable id instead of accepting an SSH host field', async () => {
+    render(<VerificationMachinesSection machines={[]} projectKey="repo-1" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'quick_input.verification_add' }));
+    expect(screen.queryByPlaceholderText('controlled_nodes.verification.ssh_host')).toBeNull();
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'controlled_nodes.verification.authorize_alias:211-gitlab',
+    }));
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'ssh', target: aliasId, alias: '211-gitlab', scope: 'project', scopeKey: 'repo-1',
     })));
   });
 });

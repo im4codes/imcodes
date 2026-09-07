@@ -3139,6 +3139,8 @@
       "add_ssh": "SSH ホストを認可",
       "authorize_node": "{{name}} を認可",
       "update_node": "{{name}} を更新",
+      "authorize_alias": "エイリアス {{name}} を承認",
+      "update_alias": "エイリアス {{name}} を更新",
       "kind_controlled_node": "管理対象ノード",
       "kind_ssh": "SSH",
       "status_unverified": "未検証",

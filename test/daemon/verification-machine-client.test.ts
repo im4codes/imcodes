@@ -7,7 +7,7 @@ import {
 
 const endpoint = { workerUrl: 'https://im.example.test/', serverId: 'srv-1', token: 'secret-token' };
 const profile = {
-  id: 'a'.repeat(32), scope: 'project', scopeKey: 'repo-1', alias: '211 rig', kind: 'ssh', target: '211',
+  id: 'a'.repeat(32), scope: 'project', scopeKey: 'repo-1', alias: '211 rig', kind: 'ssh', target: 'b'.repeat(32),
   enabled: true, revision: 1, createdAt: 1, updatedAt: 1, lastVerificationStatus: 'unverified', source: 'mcp',
 };
 

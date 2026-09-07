@@ -25,6 +25,13 @@ export interface SessionIdentitySyncDeps {
   applyIdentity?: typeof applyEffectiveSessionIdentity;
 }
 
+export interface SessionIdentityRefreshAck {
+  commandId: string;
+  sessionName: string;
+  status: 'ok' | 'error';
+  error?: string;
+}
+
 let syncInFlight: Promise<SessionIdentitySyncResult> | null = null;
 let syncTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -50,7 +57,9 @@ export async function syncSessionIdentities(
   options: SessionIdentityClientOptions = {},
   deps: SessionIdentitySyncDeps = {},
 ): Promise<SessionIdentitySyncResult> {
-  if (syncInFlight) return { status: 'skipped', checked: 0, changed: 0 };
+  // An explicit UI/MCP refresh must join an already-running periodic sync,
+  // rather than report a false success before that sync has applied anything.
+  if (syncInFlight) return syncInFlight;
   syncInFlight = (async () => {
     const snapshot = await (deps.listProfiles ?? listSessionIdentityProfiles)(options);
     if (snapshot.status !== 'ok') {
@@ -72,6 +81,35 @@ export async function syncSessionIdentities(
     return await syncInFlight;
   } finally {
     syncInFlight = null;
+  }
+}
+
+/** Translate an explicit browser refresh into an acknowledgement only after
+ * the runtime convergence has settled. Legacy fire-and-forget callers without
+ * a command id still run the sync but do not receive an unsolicited ack. */
+export async function syncSessionIdentitiesForCommand(
+  command: Record<string, unknown>,
+  runSync: () => Promise<SessionIdentitySyncResult> = () => syncSessionIdentities(),
+): Promise<SessionIdentityRefreshAck | null> {
+  const commandId = typeof command.commandId === 'string' ? command.commandId : '';
+  const sessionName = typeof command.sessionName === 'string' ? command.sessionName : '';
+  try {
+    const result = await runSync();
+    if (!commandId || !sessionName) return null;
+    return {
+      commandId,
+      sessionName,
+      status: result.status === 'ok' ? 'ok' : 'error',
+      ...(result.message ? { error: result.message } : {}),
+    };
+  } catch (reason) {
+    if (!commandId || !sessionName) throw reason;
+    return {
+      commandId,
+      sessionName,
+      status: 'error',
+      error: reason instanceof Error ? reason.message : String(reason),
+    };
   }
 }
 

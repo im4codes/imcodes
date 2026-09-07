@@ -3140,6 +3140,8 @@
       "add_ssh": "Autorizar host SSH",
       "authorize_node": "Autorizar {{name}}",
       "update_node": "Actualizar {{name}}",
+      "authorize_alias": "Autorizar alias {{name}}",
+      "update_alias": "Actualizar alias {{name}}",
       "kind_controlled_node": "Nodo controlado",
       "kind_ssh": "SSH",
       "status_unverified": "Sin verificar",

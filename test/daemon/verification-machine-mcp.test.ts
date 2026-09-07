@@ -27,19 +27,20 @@ describe('verification machine MCP', () => {
     }));
   });
 
-  it('verifies SSH through execFile-shaped injection and persists only the status', async () => {
-    const verifySshHost = vi.fn(async () => true);
+  it('verifies an SSH alias association without probing connectivity', async () => {
+    const aliasId = 'b'.repeat(32);
     const recordVerificationMachineStatus = vi.fn(async (_id, status) => ({
-      status: 'ok' as const, profile: { ...base, kind: 'ssh' as const, target: '211', lastVerificationStatus: status },
+      status: 'ok' as const, profile: { ...base, kind: 'ssh' as const, target: aliasId, lastVerificationStatus: status },
     }));
     const handlers = createMemoryMcpToolHandlers(caller, {
-      listVerificationMachines: async () => ({ status: 'ok', profiles: [{ ...base, kind: 'ssh', target: '211' }] }),
-      verifySshHost,
+      listVerificationMachines: async () => ({ status: 'ok', profiles: [{ ...base, kind: 'ssh', target: aliasId }] }),
+      listVerificationAliases: async () => ({ status: 'ok', aliases: [{
+        id: aliasId, name: '211', value: 'ssh k@172.16.253.211', tags: [], createdAt: '', updatedAt: '', source: 'web',
+      }] }),
       recordVerificationMachineStatus,
     });
     const result = await handlers[MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]({ id: base.id });
     expect(result).toMatchObject({ status: 'ok', verificationStatus: 'verified' });
-    expect(verifySshHost).toHaveBeenCalledWith('211');
     expect(recordVerificationMachineStatus).toHaveBeenCalledWith(base.id, 'verified');
   });
 

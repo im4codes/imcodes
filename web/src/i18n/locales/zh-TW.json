@@ -3140,6 +3140,8 @@
       "add_ssh": "授權 SSH 主機",
       "authorize_node": "授權 {{name}}",
       "update_node": "更新 {{name}}",
+      "authorize_alias": "授權別名 {{name}}",
+      "update_alias": "更新別名 {{name}}",
       "kind_controlled_node": "受控節點",
       "kind_ssh": "SSH",
       "status_unverified": "未驗證",

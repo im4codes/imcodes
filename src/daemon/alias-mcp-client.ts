@@ -132,6 +132,7 @@ function coerceAliasEntry(raw: unknown): AliasEntry | null {
     ? record.tags.filter((tag): tag is string => typeof tag === 'string')
     : [];
   return {
+    ...(typeof record.id === 'string' ? { id: record.id } : {}),
     name,
     value,
     ...(typeof record.description === 'string' ? { description: record.description } : {}),

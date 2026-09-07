@@ -44,13 +44,23 @@ function mapRow(row: VerificationMachineRow): VerificationMachineProfile {
 const COLUMNS = `id, scope, scope_key, alias, kind, target, enabled, revision,
   created_at, updated_at, last_verified_at, last_verification_status, source`;
 
+const LIST_COLUMNS = `id, scope, scope_key,
+  CASE WHEN kind = 'ssh' THEN COALESCE(
+    (SELECT name FROM user_aliases
+      WHERE user_id = verification_machine_profiles.user_id
+        AND id = verification_machine_profiles.target),
+    alias
+  ) ELSE alias END AS alias,
+  kind, target, enabled, revision, created_at, updated_at,
+  last_verified_at, last_verification_status, source`;
+
 export async function listVerificationMachines(
   db: Database,
   userId: string,
   projectKey?: string,
 ): Promise<VerificationMachineProfile[]> {
   const rows = await db.query<VerificationMachineRow>(
-    `SELECT ${COLUMNS}
+    `SELECT ${LIST_COLUMNS}
        FROM verification_machine_profiles
       WHERE user_id = $1
         AND (scope = 'user' OR ($2::text IS NOT NULL AND scope = 'project' AND scope_key = $2))

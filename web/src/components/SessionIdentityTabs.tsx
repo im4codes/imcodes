@@ -9,13 +9,13 @@ import {
   type SessionIdentityProfile,
   type SessionIdentityScope,
 } from '@shared/session-identity.js';
-import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import {
   clearSessionIdentityProfile,
   fetchSessionIdentityProfile,
   saveSessionIdentityProfile,
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
+import { requestSessionIdentityRefresh } from '../session-identity-refresh.js';
 import { FileBrowser, type FileBrowserPreviewState } from './file-browser-lazy.js';
 
 type Draft = { content: string; initial: string; revision: number; sourceFile: string; loaded: boolean };
@@ -45,6 +45,7 @@ export function SessionIdentityTabs({
   });
   const [showBrowser, setShowBrowser] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [refreshPending, setRefreshPending] = useState(false);
   const [error, setError] = useState('');
 
   const scopeKey = useMemo(() => ({
@@ -96,7 +97,8 @@ export function SessionIdentityTabs({
     try {
       const content = draft.content.trim() ? normalizeSessionIdentityContent(draft.content) : '';
       let profile: SessionIdentityProfile | null = null;
-      if (content) {
+      const contentChanged = content !== draft.initial;
+      if (content && contentChanged) {
         profile = await saveSessionIdentityProfile({
           scope: activeScope,
           scopeKey: scopeKey[activeScope],
@@ -104,17 +106,23 @@ export function SessionIdentityTabs({
           expectedRevision: draft.revision,
           ...(draft.sourceFile ? { sourceFile: draft.sourceFile } : {}),
         });
-      } else if (draft.revision > 0) {
+      } else if (!content && contentChanged && draft.revision > 0) {
         await clearSessionIdentityProfile(activeScope, scopeKey[activeScope], draft.revision);
       }
-      setDrafts((current) => ({
-        ...current,
-        [activeScope]: {
-          ...current[activeScope], content, initial: content, revision: profile?.revision ?? 0,
-          sourceFile: profile?.sourceFile ?? (content ? draft.sourceFile : ''), loaded: true,
-        },
-      }));
-      if (sessionName) ws?.send({ type: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH, sessionName });
+      if (contentChanged) {
+        setDrafts((current) => ({
+          ...current,
+          [activeScope]: {
+            ...current[activeScope], content, initial: content, revision: profile?.revision ?? 0,
+            sourceFile: profile?.sourceFile ?? (content ? draft.sourceFile : ''), loaded: true,
+          },
+        }));
+      }
+      if (sessionName && ws) {
+        setRefreshPending(true);
+        await requestSessionIdentityRefresh(ws, sessionName);
+      }
+      setRefreshPending(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -151,7 +159,7 @@ export function SessionIdentityTabs({
         <button type="button" class="btn btn-secondary" disabled={disabled || saving || !draft.content}
           onClick={() => updateDraft({ content: '', sourceFile: '' })}>{t('session.identityClear')}</button>
         <button type="button" class="btn btn-primary"
-          disabled={disabled || saving || !draft.loaded || Boolean(validationError) || draft.content === draft.initial || !canPersist}
+          disabled={disabled || saving || !draft.loaded || Boolean(validationError) || (!refreshPending && draft.content === draft.initial) || !canPersist}
           onClick={() => { void save(); }}>
           {canPersist ? t('session.identityApply') : t('session.identitySaveAfterCreate')}
         </button>

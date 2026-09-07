@@ -3139,6 +3139,8 @@
       "add_ssh": "SSH 호스트 승인",
       "authorize_node": "{{name}} 승인",
       "update_node": "{{name}} 업데이트",
+      "authorize_alias": "별칭 {{name}} 승인",
+      "update_alias": "별칭 {{name}} 업데이트",
       "kind_controlled_node": "제어 노드",
       "kind_ssh": "SSH",
       "status_unverified": "미검증",

@@ -12,6 +12,8 @@ import {
   removeVerificationMachine,
   setVerificationMachine,
 } from '../api/verification-machines.js';
+import { useAliases } from '../hooks/useAliases.js';
+import { isAliasId } from '@shared/alias-types.js';
 
 export function VerificationMachinesSection({
   machines,
@@ -24,14 +26,14 @@ export function VerificationMachinesSection({
   const [profiles, setProfiles] = useState<VerificationMachineProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
-  const [alias, setAlias] = useState('');
-  const [sshHost, setSshHost] = useState('');
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [scope, setScope] = useState<VerificationMachineScope>(
     projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER,
   );
   const [busyTarget, setBusyTarget] = useState<string | null>(null);
   const [aliasEdits, setAliasEdits] = useState<Record<string, string>>({});
   const [scopeEdits, setScopeEdits] = useState<Record<string, VerificationMachineScope>>({});
+  const { aliases, refetch: refetchAliases } = useAliases();
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -45,7 +47,7 @@ export function VerificationMachinesSection({
     }
   }, [projectKey]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { void refresh(); refetchAliases(); }, [refresh, refetchAliases]);
 
   const saveControlled = async (machine: MachineListItem) => {
     if (!machine.nodeId) return;
@@ -71,21 +73,23 @@ export function VerificationMachinesSection({
     }
   };
 
-  const addSsh = async (event: Event) => {
-    event.preventDefault();
-    if (!alias.trim() || !sshHost.trim()) return;
-    setBusyTarget(sshHost.trim());
+  const saveAlias = async (entry: (typeof aliases)[number]) => {
+    if (!isAliasId(entry.id)) return;
+    const aliasId = entry.id;
+    const current = profiles.find((item) => item.kind === VERIFICATION_MACHINE_KINDS.SSH
+      && item.target === aliasId && item.scope === scope);
+    setBusyTarget(aliasId);
     setError(false);
     try {
       await setVerificationMachine({
+        ...(current ? { id: current.id, expectedRevision: current.revision } : {}),
         scope,
         scopeKey: scope === VERIFICATION_MACHINE_SCOPES.PROJECT ? projectKey ?? '' : '',
-        alias: alias.trim(),
+        alias: entry.name,
         kind: VERIFICATION_MACHINE_KINDS.SSH,
-        target: sshHost.trim(),
+        target: aliasId,
+        enabled: true,
       });
-      setAlias('');
-      setSshHost('');
       await refresh();
     } catch {
       setError(true);
@@ -182,13 +186,32 @@ export function VerificationMachinesSection({
                 {t('common.save')}
               </button>
               <button type="button" disabled={busyTarget === profile.id} onClick={() => { void remove(profile); }}>
-                {t('common.remove')}
+                {t('common.delete')}
               </button>
             </li>
           ))}
         </ul>
       )}
-      <div class="verification-machine-node-actions">
+      <button type="button" onClick={() => setPickerOpen((current) => !current)} aria-expanded={pickerOpen}>
+        {t('quick_input.verification_add')}
+      </button>
+      {pickerOpen && <div class="verification-machine-node-actions">
+        {aliases.filter((entry) => isAliasId(entry.id)).map((entry) => {
+          const current = profiles.find((item) => item.kind === VERIFICATION_MACHINE_KINDS.SSH
+            && item.target === entry.id && item.scope === scope);
+          return (
+            <button
+              type="button"
+              key={entry.id}
+              disabled={busyTarget === entry.id || (scope === VERIFICATION_MACHINE_SCOPES.PROJECT && !projectKey)}
+              onClick={() => { void saveAlias(entry); }}
+            >
+              {current
+                ? t('controlled_nodes.verification.update_alias', { name: entry.name })
+                : t('controlled_nodes.verification.authorize_alias', { name: entry.name })}
+            </button>
+          );
+        })}
         {machines.filter((machine) => machine.nodeId).map((machine) => {
           const current = profiles.find((item) => item.kind === VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE
             && item.target === machine.nodeId && item.scope === scope);
@@ -205,14 +228,7 @@ export function VerificationMachinesSection({
             </button>
           );
         })}
-      </div>
-      <form class="verification-machine-ssh-form" onSubmit={(event) => { void addSsh(event); }}>
-        <input value={alias} onInput={(event) => setAlias((event.target as HTMLInputElement).value)} placeholder={t('controlled_nodes.verification.alias')} />
-        <input value={sshHost} onInput={(event) => setSshHost((event.target as HTMLInputElement).value)} placeholder={t('controlled_nodes.verification.ssh_host')} />
-        <button type="submit" disabled={!alias.trim() || !sshHost.trim() || busyTarget !== null || (scope === VERIFICATION_MACHINE_SCOPES.PROJECT && !projectKey)}>
-          {t('controlled_nodes.verification.add_ssh')}
-        </button>
-      </form>
+      </div>}
     </section>
   );
 }

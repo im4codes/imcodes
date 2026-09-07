@@ -488,13 +488,13 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET]: {
     name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
-    description: 'Create or update a user/project verification-machine authorization. Controlled nodes bind their canonical nodeId; SSH stores only an SSH config Host token and never uploads credentials. Supply id to rename/update an existing record.',
+    description: 'Create or update a user/project verification-machine authorization. Controlled nodes bind their canonical nodeId; SSH binds an existing stable aliasId and never uploads credentials. Supply id to rename/update an existing record.',
     inputSchema: objectSchema({
       id: stringSchema('Stable 32-hex verificationMachineId. Omit only when creating.'),
       verificationScope: { type: 'string', enum: [...VERIFICATION_MACHINE_SCOPE_LIST] },
       alias: stringSchema('Mutable human-readable alias.'),
       kind: { type: 'string', enum: [...VERIFICATION_MACHINE_KIND_LIST] },
-      target: stringSchema('Canonical controlled-node nodeId or local SSH config Host token.'),
+      target: stringSchema('Canonical controlled-node nodeId or stable aliasId.'),
       enabled: { type: 'boolean' },
       expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
     }, ['verificationScope', 'alias', 'kind', 'target']),
@@ -511,7 +511,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]: {
     name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
-    description: 'Non-destructively verify one authorized machine by stable ID. Controlled nodes recheck current access, online state and exec permission. SSH runs BatchMode ssh using the daemon user\'s existing config/agent/keys.',
+    description: 'Non-destructively verify one authorized machine by stable ID. Controlled nodes recheck current access, online state and exec permission. SSH rechecks that the associated aliasId still exists; it does not test connectivity.',
     inputSchema: objectSchema({ id: stringSchema('Stable 32-hex verificationMachineId.') }, ['id']),
     outputSchema: statusSchema,
   },
