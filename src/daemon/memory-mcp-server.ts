@@ -35,7 +35,11 @@ import {
 import { registerMcpToolDiscovery } from './mcp-tool-discovery.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
-import { MEMORY_MCP_SEND_DELIVERY_MODES, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
+  MEMORY_MCP_TOOL_NAMES,
+} from '../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { parseMcpToolCatalogMode, type McpToolCatalogMode } from '../../shared/mcp-tool-discovery.js';
 import { MemoryMcpResourceGuard } from './memory-mcp-resource-guard.js';
@@ -481,6 +485,17 @@ export function mergeDefaultToolDeps(
         caller.sessionName,
         DELEGATION_REPLY_HOOK_TIMEOUT_MS,
       );
+    }),
+    restartSession: toolDeps.restartSession ?? (async (target, restartOptions) => {
+      const port = await resolveLiveHookPort();
+      if (!port) throw new Error('daemon session restart control is unavailable');
+      if (!caller.sessionName) throw new Error('session_restart requires a scoped caller');
+      const response = await postHookSend(port, {
+        from: caller.sessionName,
+        to: target.name,
+        reset: restartOptions.reset,
+      }, MEMORY_MCP_SESSION_RESTART_HOOK_PATH, caller.sessionName);
+      return response.accepted === true;
     }),
     // FULL-node machine tools relay through the daemon's own bound credential.
     // An injected override (tests) wins; otherwise the daemon default is used.

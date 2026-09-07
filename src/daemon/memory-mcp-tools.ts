@@ -323,6 +323,14 @@ export interface MemoryMcpToolDeps {
     prompt: string | undefined,
     options?: { refresh?: boolean },
   ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /**
+   * Daemon-owned exact-session restart. The stdio MCP child must delegate this
+   * operation instead of trying to mutate the daemon's runtime maps itself.
+   */
+  restartSession?: (
+    target: SessionRecord,
+    options: { reset: boolean },
+  ) => Promise<boolean> | boolean;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   delegationReply?: (envelope: AgentDelegationReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
@@ -1280,6 +1288,32 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     return { status: 'ok', target };
   };
 
+  const resolveRestartTarget = async (rawTarget: string | undefined): Promise<
+    { status: 'ok'; target: SessionRecord } | { status: 'error'; result: ToolResult }
+  > => {
+    const targetName = rawTarget?.trim();
+    if (!targetName) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'target is required') };
+    }
+    const sessions = await sendSessions();
+    const callerRecord = caller.sessionName
+      ? sessions.find((session) => session.name === caller.sessionName)
+      : undefined;
+    if (!callerRecord) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'current session identity is unavailable') };
+    }
+    const target = sessions.find((session) => session.name === targetName);
+    if (!target) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, `target "${targetName}" not found`) };
+    }
+    const callerProject = resolveEffectiveProjectName(callerRecord, sessions);
+    const targetProject = resolveEffectiveProjectName(target, sessions);
+    if (!callerProject || targetProject !== callerProject) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'target is outside the caller project') };
+    }
+    return { status: 'ok', target };
+  };
+
   const identityScopeKey = (scope: SessionIdentityScope, target: SessionRecord): string => {
     if (scope === SESSION_IDENTITY_SCOPES.USER) return '';
     if (scope === SESSION_IDENTITY_SCOPES.PROJECT) {
@@ -1702,6 +1736,24 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         codexThreadResumePending: target.agentType === 'codex-sdk',
         applied: refreshed.applied,
       };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target', 'reset']);
+      const resolved = await resolveRestartTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      if (!deps.restartSession) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'daemon session restart control is unavailable');
+      }
+      const reset = boolArg(args, 'reset') === true;
+      try {
+        const scheduled = await deps.restartSession(resolved.target, { reset });
+        if (!scheduled) {
+          return error(MCP_ERROR_REASONS.TARGET_UNAVAILABLE, 'session restart was not accepted');
+        }
+        return { status: 'ok', target: resolved.target.name, reset, scheduled: true };
+      } catch (restartError) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(restartError));
+      }
     },
     [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['includeDisabled']);
@@ -2649,6 +2701,10 @@ const schemas = {
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: z.object({
     target: z.string().optional().describe('Exact session name; defaults to the current session.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: z.object({
+    target: z.string().trim().min(1).describe('Exact session name.'),
+    reset: z.boolean().optional().describe('False/omitted: resume. True: start over.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: z.object({
     includeDisabled: z.boolean().optional(),

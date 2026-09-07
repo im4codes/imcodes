@@ -1218,6 +1218,7 @@ function describeTransportSendError(err: unknown): string {
 }
 
 const pendingSessionRelaunches = new Map<string, Promise<void>>();
+const pendingMcpSessionRestarts = new Map<string, { reset: boolean; result: Promise<boolean> }>();
 const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
 const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
 const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
@@ -2485,6 +2486,46 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     emitSessionInlineError(brain.name, message);
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
   }
+}
+
+/**
+ * Daemon-authoritative MCP restart entry point. `reset` maps to the existing
+ * `fresh` relaunch contract; omission/default is an ordinary continuity-
+ * preserving restart. The exact-name lookup guarantees this can never create
+ * a previously unknown main or sub-session.
+ */
+export async function restartSessionNow(
+  sessionName: string,
+  options: { reset: boolean } = { reset: false },
+): Promise<boolean> {
+  const currentMcpRestart = pendingMcpSessionRestarts.get(sessionName);
+  if (currentMcpRestart) {
+    if (currentMcpRestart.reset === options.reset) return currentMcpRestart.result;
+    await currentMcpRestart.result;
+    return restartSessionNow(sessionName, options);
+  }
+
+  const result = (async () => {
+    // A browser/settings relaunch may already own the shared per-session lane.
+    // Wait for it rather than letting runExclusive coalesce a semantically
+    // different reset into that restart and then falsely reporting success.
+    await pendingSessionRelaunches.get(sessionName);
+    const existing = getSession(sessionName);
+    if (!existing) return false;
+    await runExclusiveSessionRelaunch(sessionName, async () => {
+      const latest = getSession(sessionName) ?? existing;
+      await relaunchSessionWithSettings(latest, { fresh: options.reset });
+    });
+    logger.info({ sessionName, reset: options.reset }, 'Session relaunched through MCP control');
+    return true;
+  });
+  const tracked = result().finally(() => {
+    if (pendingMcpSessionRestarts.get(sessionName)?.result === tracked) {
+      pendingMcpSessionRestarts.delete(sessionName);
+    }
+  });
+  pendingMcpSessionRestarts.set(sessionName, { reset: options.reset, result: tracked });
+  return tracked;
 }
 
 async function handleStop(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

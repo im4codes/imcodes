@@ -40,6 +40,7 @@ import { getAuthenticatedCapabilityOwner } from '../capability/capability-author
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import {
+  MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
@@ -639,6 +640,8 @@ export interface HookServerOptions {
   ) => Promise<Record<string, unknown>>;
   /** Exact ServerLink identity injected by the daemon, never by the MCP child. */
   memoryMcpServerId?: string;
+  /** Test seam; production schedules the command-handler's exclusive relaunch. */
+  restartSession?: (sessionName: string, options: { reset: boolean }) => Promise<boolean> | boolean;
 }
 
 async function invokeDaemonMemoryMcpTool(
@@ -920,6 +923,66 @@ export async function startHookServer(
           res.writeHead(400);
           res.end(JSON.stringify({ ok: false, error: 'bad request' }));
         }
+      }
+      return;
+    }
+
+    if (url === MEMORY_MCP_SESSION_RESTART_HOOK_PATH) {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        const to = typeof body.to === 'string' ? body.to.trim() : '';
+        if (!from || !to || authenticatedSender !== from || typeof body.reset !== 'boolean') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid exact-session restart request' }));
+          return;
+        }
+        const callerRecord = getSession(from);
+        const targetRecord = getSession(to);
+        if (!callerRecord || callerRecord.state === 'stopped') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'session restart caller identity is unavailable' }));
+          return;
+        }
+        if (!targetRecord || targetRecord.projectName !== callerRecord.projectName) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'session restart target is unavailable' }));
+          return;
+        }
+        if (!checkRateLimit(from)) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded' }));
+          return;
+        }
+        recordSend(from);
+        const reset = body.reset;
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, accepted: true, target: targetRecord.name, reset }), () => {
+          setImmediate(() => {
+            void (async () => {
+              const restart = options.restartSession ?? (async (sessionName: string, restartOptions: { reset: boolean }) => {
+                const { restartSessionNow } = await import('./command-handler.js');
+                return restartSessionNow(sessionName, restartOptions);
+              });
+              const accepted = await restart(targetRecord.name, { reset });
+              if (!accepted) logger.warn({ sessionName: targetRecord.name, reset }, 'MCP session restart was not accepted');
+            })().catch((err) => {
+              logger.error({ err, sessionName: targetRecord.name, reset }, 'MCP session restart failed after acceptance');
+            });
+          });
+        });
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
       }
       return;
     }

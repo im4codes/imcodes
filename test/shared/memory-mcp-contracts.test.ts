@@ -89,6 +89,7 @@ describe('memory MCP shared contracts', () => {
       'delegation_reply',
       'send_list_targets',
       'session_runtime_identity_get',
+      'session_restart',
       'send_message',
       'supervision_task_start',
       'supervision_task_update',

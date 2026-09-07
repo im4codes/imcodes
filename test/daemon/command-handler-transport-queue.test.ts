@@ -369,6 +369,7 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
 
 import {
   handleWebCommand,
+  restartSessionNow,
   __invalidateTransportListModelsCacheForTests,
   __resetTransportListModelsCacheForTests,
   __resolveTransportListModelsCacheTtlMsForTests,
@@ -5423,6 +5424,46 @@ describe('handleWebCommand transport queue behavior', () => {
     resolveRestart?.();
     await flushAsync();
     await flushAsync();
+  });
+
+  it('maps MCP restart to resume by default and reset to fresh without creating an unknown session', async () => {
+    relaunchSessionWithSettingsMock.mockResolvedValue(undefined);
+
+    await expect(restartSessionNow('deck_transport_brain')).resolves.toBe(true);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'deck_transport_brain' }),
+      { fresh: false },
+    );
+
+    await expect(restartSessionNow('deck_transport_brain', { reset: true })).resolves.toBe(true);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'deck_transport_brain' }),
+      { fresh: true },
+    );
+
+    getSessionMock.mockReturnValueOnce(undefined);
+    await expect(restartSessionNow('deck_missing_brain')).resolves.toBe(false);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('deduplicates equal MCP restarts but serializes a reset so start-over is never swallowed', async () => {
+    let releaseFirst: (() => void) | undefined;
+    relaunchSessionWithSettingsMock
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { releaseFirst = resolve; }))
+      .mockResolvedValueOnce(undefined);
+
+    const first = restartSessionNow('deck_transport_brain');
+    const duplicate = restartSessionNow('deck_transport_brain');
+    const reset = restartSessionNow('deck_transport_brain', { reset: true });
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    releaseFirst?.();
+    await expect(Promise.all([first, duplicate, reset])).resolves.toEqual([true, true, true]);
+    expect(relaunchSessionWithSettingsMock.mock.calls.map(([, options]) => options)).toEqual([
+      { fresh: false },
+      { fresh: true },
+    ]);
   });
 
   it('skips terminal subscribe and snapshot requests for transport sessions', async () => {

@@ -53,7 +53,8 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
     summary: 'Delegate work, report audits, and operate the supervised task lifecycle.',
     tools: Object.freeze([
       MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE, MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-      MEMORY_MCP_TOOL_NAMES.SEND_STOP, MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
+      MEMORY_MCP_TOOL_NAMES.SEND_STOP, MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
+      MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
       MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY, MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
       MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE, MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
       MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
@@ -148,6 +149,10 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+  // Session recovery is a core control-plane action. It must be callable from
+  // the first tools/list generation, including when the target session is too
+  // unhealthy to participate in a discovery round-trip.
+  MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
   MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
   // supervision task registry

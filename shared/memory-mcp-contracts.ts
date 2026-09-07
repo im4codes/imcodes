@@ -99,6 +99,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   DELEGATION_REPLY: 'delegation_reply',
   SEND_LIST_TARGETS: 'send_list_targets',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
+  SESSION_RESTART: 'session_restart',
   SEND_MESSAGE: 'send_message',
   SUPERVISION_TASK_START: 'supervision_task_start',
   SUPERVISION_TASK_UPDATE: 'supervision_task_update',
@@ -148,6 +149,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
@@ -227,6 +229,9 @@ export const MEMORY_MCP_CAPS = {
   CRON_EXPIRES_AT_MAX_DAYS: 90,
   CRON_LIST_MAX_LIMIT: 100,
 } as const;
+
+/** Local daemon ingress used by the stdio MCP child for exact-session restart. */
+export const MEMORY_MCP_SESSION_RESTART_HOOK_PATH = '/session/restart' as const;
 
 export const MEMORY_MCP_DISABLED_FLAGS = {
   MEMORY_SURFACE: MCP_FEATURE_FLAGS_BY_NAME.memorySurface,
@@ -611,6 +616,20 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     description: 'Return only the bound caller runtime identity; model metadata is evidence, not authority.',
     inputSchema: objectSchema({}),
     outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
+    description: 'Restart an exact existing current-project session; never creates one. Default resumes prior conversation. reset=true keeps the session but starts over.',
+    inputSchema: objectSchema({
+      target: stringSchema('Canonical session name; no label, wildcard, or broadcast.'),
+      reset: booleanSchema('Omit/false to restart and resume; true to reset and start over.'),
+    }, ['target']),
+    outputSchema: objectSchema({
+      status: stringSchema('Result status.'),
+      target: stringSchema('Accepted session name.'),
+      reset: booleanSchema('True for start-over.'),
+      scheduled: booleanSchema('True when accepted.'),
+    }, ['status', 'target', 'reset', 'scheduled']),
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
