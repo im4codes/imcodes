@@ -157,11 +157,20 @@ describe('supervision auto provisioning', () => {
 
     expect(first).toMatchObject({
       ok: true,
-      target: { agentType: 'claude-code-sdk', identityPrompt: 'You are the release engineer.' },
+      target: {
+        name: expect.stringMatching(/^deck_sub_/u),
+        parentSession: brain.name,
+        projectDir: brain.projectDir,
+        role: 'w1',
+        agentType: 'claude-code-sdk',
+        identityPrompt: 'You are the release engineer.',
+      },
       evidence: { selectedConfig: { ...ANTHROPIC, model: 'opus[1M]' }, origin: 'spawned' },
     });
     expect(h.start).toHaveBeenCalledWith(expect.objectContaining({
       type: 'claude-code-sdk',
+      cwd: brain.projectDir,
+      parentSession: brain.name,
       requestedModel: 'opus[1M]',
       identityPrompt: 'You are the release engineer.',
     }));

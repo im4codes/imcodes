@@ -11,11 +11,15 @@ export const MEMORY_MCP_DAEMON_RPC_PATH = '/memory-mcp/tool';
 export const MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES = 512 * 1024;
 
 /**
- * Tools whose implementation owns local context-store or embedding work.
- * Stdio MCP processes proxy this exact set to the daemon so all sessions share
- * the daemon's single context-store worker and embedding worker.
+ * Tools whose implementation requires daemon-owned state. Stdio MCP processes
+ * proxy this exact set to the daemon so all sessions share the daemon's single
+ * context/embedding workers and session/provisioning runtime directory.
  */
 export const MEMORY_MCP_DAEMON_TOOL_NAMES = [
+  // Provisioning and delivery must run in the daemon. A stdio MCP child has a
+  // private session map/provider registry; launching there creates a target
+  // that the daemon and server cannot observe or retain.
+  MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
   MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
   MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,

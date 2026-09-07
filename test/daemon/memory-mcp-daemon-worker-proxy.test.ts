@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   MEMORY_MCP_DAEMON_TOOL_NAMES,
 } from '../../shared/memory-mcp-daemon-rpc.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 
@@ -53,6 +54,9 @@ describe('memory MCP daemon worker proxy', () => {
 
     expect(invokeDaemonMemoryTool).toHaveBeenCalledTimes(MEMORY_MCP_DAEMON_TOOL_NAMES.length);
     expect(invokeDaemonMemoryTool.mock.calls.map(([name]) => name)).toEqual(MEMORY_MCP_DAEMON_TOOL_NAMES);
+    expect(invokeDaemonMemoryTool).toHaveBeenCalledWith(MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE, {
+      marker: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+    });
     expect(localContextStoreClient).not.toHaveBeenCalled();
     expect(localSemanticSearch).not.toHaveBeenCalled();
     expect(localSummaryList).not.toHaveBeenCalled();

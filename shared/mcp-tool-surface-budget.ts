@@ -27,8 +27,15 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // The synchronized identity surface adds four bounded CRUD/refresh contracts.
 // Keep explicit headroom over the measured full catalog rather than
 // silently dropping these tools from STATIC_FULL hosts.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 44_000;
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 50_000;
+// Full identity, verification-machine, and explicit execution-configuration
+// contracts currently measure 44,359 authored bytes. Retain their complete
+// validation guidance with a sub-1 KiB reviewable ceiling instead of truncating
+// fields required for safe MCP calls.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 45_000;
+// MCP SDK framing currently measures 50,283 bytes for the full catalog while
+// the independently enforced authored payload remains below 44 KiB. Keep less
+// than 1 KiB of explicit protocol-only headroom rather than failing at 50,000.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 51_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

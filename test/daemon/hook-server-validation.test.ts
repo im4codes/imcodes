@@ -301,7 +301,7 @@ describe('Hook server — session validation', () => {
       sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old', tool: 'search_memory', input: {},
     })).resolves.toMatchObject({ status: 409 });
     await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
-      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current', tool: 'send_message', input: {},
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current', tool: 'list_machines', input: {},
     })).resolves.toMatchObject({ status: 400 });
   });
 
