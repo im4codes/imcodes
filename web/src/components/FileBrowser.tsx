@@ -161,7 +161,9 @@ export interface FileBrowserProps {
   onCurrentPathChange?: (path: string) => void;
   /** Embedded hosts may provide their own primary action outside the browser. */
   hideBreadcrumbConfirm?: boolean;
-  onConfirm: (paths: string[]) => void;
+  /** The second argument exposes the already-loaded single-file preview so a
+   * host can consume explicitly selected text without issuing a duplicate read. */
+  onConfirm: (paths: string[], preview?: FileBrowserPreviewState) => void;
   onClose?: () => void;
   /** Called after a new directory is successfully created. */
   onDirectoryCreated?: (path: string) => void;
@@ -1667,7 +1669,7 @@ export function FileBrowser({
       if (mode === 'dir-only') onConfirm([currentLabel]);
       return;
     }
-    onConfirm([...selectedPaths]);
+    onConfirm([...selectedPaths], preview);
   };
 
   const copyCurrentPath = useCallback(() => {

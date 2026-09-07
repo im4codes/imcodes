@@ -116,7 +116,7 @@ export function isPeerAuditPhase(v: unknown): v is PeerAuditPhase {
 // ── Exact v1 limits (all UTF-8 bytes unless a *_COUNT) ────────────────────────
 
 export const PEER_AUDIT_DEADLINE_MS = 15 * 60_000;
-export const PEER_AUDIT_BRIEF_TOTAL_BYTES = 32 * 1024;
+export const PEER_AUDIT_BRIEF_TOTAL_BYTES = 64 * 1024;
 export const PEER_AUDIT_BRIEF_REQUEST_BYTES = 8 * 1024;
 export const PEER_AUDIT_BRIEF_RESULT_BYTES = 8 * 1024;
 export const PEER_AUDIT_PATH_COUNT = 128;
@@ -126,7 +126,8 @@ export const PEER_AUDIT_VALIDATION_ITEM_BYTES = 512;
 export const PEER_AUDIT_REPLY_TOTAL_BYTES = 24 * 1024;
 export const PEER_AUDIT_FINDINGS_BYTES = 16 * 1024;
 export const PEER_AUDIT_TIMELINE_PREVIEW_BYTES = 4 * 1024;
-export const PEER_AUDIT_REWORK_INPUT_BYTES = 8 * 1024;
+/** Preserve the auditor's complete bounded findings in repair/re-audit turns. */
+export const PEER_AUDIT_REWORK_INPUT_BYTES = PEER_AUDIT_FINDINGS_BYTES;
 export const PEER_AUDIT_TOMBSTONE_CAPACITY = 1024;
 export const PEER_AUDIT_TOMBSTONE_TTL_MS = 30 * 60_000;
 

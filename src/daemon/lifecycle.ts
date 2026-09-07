@@ -95,6 +95,7 @@ import {
   type CgroupValidationProbeController,
 } from './cgroup-validation-probes.js';
 import { runOrderedDaemonShutdown } from './ordered-shutdown.js';
+import { startSessionIdentitySync, stopSessionIdentitySync } from './session-identity-sync.js';
 
 export { acquireInstanceLock, releaseInstanceLock } from './instance-lock.js';
 
@@ -1415,6 +1416,11 @@ export async function startup(): Promise<DaemonContext> {
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
   startUsageSyncWorker(workerUrl, serverId, token);
+  if (creds) {
+    startSessionIdentitySync({ endpoint: { workerUrl: creds.workerUrl, serverId: creds.serverId, token: creds.token } }, (message) => {
+      logger.warn({ reason: message }, 'session identity synchronization failed');
+    });
+  }
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
   startEventLoopDelayMonitor();
@@ -1784,6 +1790,7 @@ async function performShutdown(exitCode: number): Promise<void> {
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     usageSyncWorker?.stop();
+    stopSessionIdentitySync();
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);

@@ -603,7 +603,7 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
 
 function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<string> {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks: Buffer[] = [];
     let size = 0;
     let rejected = false;
     req.on('data', (chunk: Buffer) => {
@@ -615,10 +615,12 @@ function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<
         req.resume(); // drain remaining data without storing
         return;
       }
-      body += chunk.toString();
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
     req.on('end', () => {
-      if (!rejected) resolve(body);
+      // Decode once after framing is complete. Per-chunk toString() corrupts a
+      // valid multi-byte UTF-8 scalar whenever TCP splits inside that scalar.
+      if (!rejected) resolve(Buffer.concat(chunks, size).toString('utf8'));
     });
     req.on('error', (err) => {
       if (!rejected) reject(err);

@@ -315,6 +315,8 @@ export interface SessionConfig {
   description?: string;
   /** Runtime/system prompt injection that should not be surfaced as user-facing description. */
   systemPrompt?: string;
+  /** Resolved user/project/session Agent identity contract; stable and prefix-cacheable. */
+  identityPrompt?: string;
   /** Resolved shared-context namespace for the live send path. */
   contextNamespace?: ProviderContextPayload['authority']['namespace'];
   /** Diagnostics describing how the runtime namespace was derived. */
@@ -567,6 +569,13 @@ export interface TransportProvider {
    * this never changes the machine's defaults.
    */
   setServiceTier?(sessionId: string, tier: string): Promise<void>;
+
+  /**
+   * Invalidate the provider's cached stable system text without replacing its
+   * durable conversation. Codex implements this by resuming the same thread
+   * with new baseInstructions before the next turn.
+   */
+  refreshSessionSystemText?(sessionId: string): void;
 
   // ── Core methods — all providers must implement ──────────────────────────
 

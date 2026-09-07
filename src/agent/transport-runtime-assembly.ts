@@ -36,6 +36,8 @@ export interface TransportRuntimeAssemblyInput {
   /** Stable logical delivery identity retained across recoverable dispatch retries. */
   deliveryId?: string;
   description?: string;
+  /** Resolved deterministic user/project/session Agent identity contract. */
+  identityPrompt?: string;
   systemPrompt?: string;
   suppressMcpMemorySearchGuidance?: boolean;
   suppressAgentProgressGuidance?: boolean;
@@ -399,6 +401,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     mcpToolRefreshGuidance,
     input.description?.trim(),
     input.systemPrompt?.trim(),
+    input.identityPrompt?.trim(),
     identityPart,
     filePathReportingGuidance,
     memorySearchGuidance,

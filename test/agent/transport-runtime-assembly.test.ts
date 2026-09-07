@@ -102,6 +102,19 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('not a bare filename or relative path');
   });
 
+  it('keeps the synchronized identity contract intact in stable session system text', () => {
+    const identityPrompt = '<imcodes-agent-identity>\n<user>account rule</user>\n<project>project rule</project>\n<session>session rule</session>\n</imcodes-agent-identity>';
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      identityPrompt,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+
+    expect(payload.sessionSystemText).toContain(identityPrompt);
+    expect(payload.turnSystemText).toBeUndefined();
+    expect(payload.userMessage).not.toContain(identityPrompt);
+  });
+
   // A Brain's delegation duty does not depend on supervision being enabled, and
   // it must survive restart/resume and compaction. Field incident: the contract
   // last appeared far earlier in the rollout, was never re-injected after
@@ -233,6 +246,7 @@ describe('buildProviderContextPayload', () => {
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
         userMessage: 'What did we decide about memory recall last week?',
         namespace: { scope: 'personal', projectId: 'repo-1' },
+        identityPrompt: '<imcodes-agent-identity>cross-sdk identity sentinel</imcodes-agent-identity>',
       });
 
       expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
@@ -246,6 +260,7 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
       expect(payload.systemText).toContain('skip routine narration and repeated summaries');
       expect(payload.systemText).toContain('full absolute filesystem path');
+      expect(payload.sessionSystemText).toContain('cross-sdk identity sentinel');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }
   });
@@ -705,6 +720,8 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('imcodes send');
       expect(systemText).toContain('full absolute filesystem path');
       expect(systemText).toContain(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
+      expect(systemText).toContain('the user\'s latest explicit instruction is authoritative');
+      expect(systemText).toContain('This does not override platform system/developer instructions');
       expect(systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     });
 
@@ -752,7 +769,7 @@ describe('buildProviderContextPayload', () => {
       // Order matters for prefix-cache friendliness: stable session-level
       // blocks should appear in a deterministic order so the model's
       // prompt cache hits across turns. The assembly order is:
-      //   highest-priority capability tools -> description -> systemPrompt -> identity -> memory-search
+      //   user authority -> capability tools -> description -> systemPrompt -> identity -> memory-search
       //   guidance -> agent progress guidance.
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
@@ -765,10 +782,12 @@ describe('buildProviderContextPayload', () => {
       const descIdx = systemText.indexOf('desc-here');
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
+      const userAuthorityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes USER-AUTHORITY POLICY');
       const capabilityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
       const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
-      expect(capabilityIdx).toBe(0);
+      expect(userAuthorityIdx).toBe(0);
+      expect(capabilityIdx).toBeGreaterThan(userAuthorityIdx);
       expect(systemText).toContain('Never rewrite, replace, narrow, or override any third-party provider or SDK tool definition');
       expect(descIdx).toBeGreaterThan(capabilityIdx);
       expect(spIdx).toBeGreaterThan(descIdx);

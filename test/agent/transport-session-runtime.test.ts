@@ -6,6 +6,7 @@ import type { MemorySearchResult } from '../../src/context/memory-search.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
@@ -83,6 +84,46 @@ describe('TransportSessionRuntime memory provenance', () => {
   afterEach(() => {
     resetTransportQueueStoreForTests();
     resetContextStoreClientForTests();
+  });
+
+  it('invalidates provider-stable system text after a compact completion', async () => {
+    let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
+    const provider = makeProvider();
+    provider.refreshSessionSystemText = vi.fn();
+    provider.onComplete = (callback) => {
+      complete = callback;
+      return () => undefined;
+    };
+    const runtime = new TransportSessionRuntime(provider, 'deck_compact_identity');
+    await runtime.initialize({
+      sessionKey: 'deck_compact_identity',
+      identityPrompt: 'session identity must return after compact',
+    });
+
+    runtime.send('/compact', 'compact-1');
+    await waitForProviderSend(provider);
+    expect((provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.sessionSystemText).toBeUndefined();
+    complete?.('provider-session-1', {
+      id: 'compact-done',
+      sessionId: 'provider-session-1',
+      kind: 'text',
+      role: 'assistant',
+      content: 'compacted',
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
+    });
+
+    expect(provider.refreshSessionSystemText).toHaveBeenCalledOnce();
+    expect(provider.refreshSessionSystemText).toHaveBeenCalledWith('provider-session-1');
+
+    runtime.send('continue', 'after-compact-1');
+    const send = provider.send as ReturnType<typeof vi.fn>;
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && send.mock.calls.length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(send.mock.calls[1]?.[1]?.sessionSystemText).toContain('session identity must return after compact');
   });
 
   it('registers a dynamic cron system contract once per provider thread', async () => {

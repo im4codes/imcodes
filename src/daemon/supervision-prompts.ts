@@ -31,6 +31,7 @@ import {
   PEER_AUDIT_BRIEF_REQUEST_BYTES,
   PEER_AUDIT_BRIEF_RESULT_BYTES,
   PEER_AUDIT_BRIEF_TOTAL_BYTES,
+  PEER_AUDIT_FINDINGS_BYTES,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
   PEER_AUDIT_PATH_COUNT,
   PEER_AUDIT_PATH_ITEM_BYTES,
@@ -956,7 +957,7 @@ const PEER_AUDIT_ACCEPTANCE_TOTAL_BYTES = 4 * 1024;
 const PEER_AUDIT_PATHS_TOTAL_BYTES = 3 * 1024;
 const PEER_AUDIT_VALIDATIONS_TOTAL_BYTES = 4 * 1024;
 const PEER_AUDIT_RATIONALE_BYTES = 1024;
-const PEER_AUDIT_PRIOR_FINDINGS_BYTES = 3 * 1024;
+const PEER_AUDIT_PRIOR_FINDINGS_BYTES = PEER_AUDIT_FINDINGS_BYTES;
 const SUPERVISION_RECENT_EVIDENCE_ITEM_BYTES = 2 * 1024;
 const SUPERVISION_RECENT_EVIDENCE_TOTAL_BYTES = 12 * 1024;
 const SUPERVISION_RECENT_EVIDENCE_COUNT = 12;
@@ -1089,6 +1090,8 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Treat `git status` as a signal, not proof of a content change. Before classifying an unexpected EOL-only path as task contamination, compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash (`git hash-object --path`). If raw bytes equal HEAD but the clean hash differs, report one repository-normalization defect; do not include that unrelated path in the candidate diff/archive, and do not hide it with reset, clean, or assume-unchanged. If raw bytes differ from HEAD, keep the normal fail-closed contamination rule. An explicit normalization task may include the path.',
     'Report exact commands/tools/devices/environments and observed outcomes. Explain unavailable checks; never invent a result.',
+    'VERDICT BOUNDARY: use REWORK only for a concrete defect in the audited bytes or behavior that materially violates an explicit acceptance criterion, creates a regression, or breaches a relevant safety/security invariant. Name the exact failing behavior and the smallest required fix.',
+    'Do NOT use REWORK merely because an optional check was unavailable or not personally rerun, evidence packaging/control-plane/receipt delivery failed, style or future hardening could improve, or a non-blocking observation exists. Record those separately as unavailable checks, infrastructure blockers, or follow-up observations; they do not block PASS when the implementation evidence is otherwise sufficient.',
     '',
     'Task request:',
     taskRequest || '(empty)',
@@ -1109,6 +1112,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
       'THIS IS A RE-AUDIT. The previous round returned REWORK with the findings below.',
       'Spend your effort on: (1) whether each of these is now actually closed, and (2) what the new changes introduced.',
       'Do NOT re-derive areas the previous round already cleared unless the new changes touch them — repeat audits are supposed to converge, and re-litigating settled ground buries the items that still block.',
+      'Restrict this verdict to the previous blocking findings and regressions introduced by the repair delta. Do not expand scope with unrelated improvements; record newly noticed non-blocking items as follow-ups.',
       'If a listed item is still open, say so explicitly rather than replacing it with a newly-noticed unrelated one.',
       'Previous REWORK findings:',
       priorFindings] : []),
@@ -1121,7 +1125,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
       'If that MCP tool is unavailable, write findings and validations JSON to disposable local files, then invoke:',
       `imcodes audit-reply --task-id ${input.taskId} --assignment-id ${input.assignmentId} --attempt-id ${input.attemptId} --revision ${input.revision} --receipt-kind final --verdict PASS --findings-file <path> --validations-file <path>`,
     ] : []),
-    'Use --verdict REWORK when concrete fixes are required. Do not use ordinary send, send --reply, legacy verdict markers, or terminal key injection for this reply.',
+    'Use --verdict REWORK only when the concrete implementation fixes defined by VERDICT BOUNDARY are required. Do not use ordinary send, send --reply, legacy verdict markers, or terminal key injection for this reply.',
   ].join('\n');
 
   // Static budgeting above normally leaves several KiB of headroom. Keep a
@@ -1250,7 +1254,10 @@ const SUPERVISION_CONTINUE_CONTEXT_RESULT_BYTES = 1024;
 const SUPERVISION_CUSTOM_INSTRUCTIONS_BYTES = 4 * 1024;
 // REWORK already carries the canonical contracts. Keep the contextual copies
 // tighter so a verbose task or verdict cannot recreate contract-token bloat.
-const SUPERVISION_REWORK_FINDINGS_BYTES = 1024;
+// Keep the repair handoff as wide as the complete bounded peer-audit finding.
+// A narrower handoff silently dropped later findings, causing serial
+// rediscovery and unnecessary N-round REWORK loops.
+const SUPERVISION_REWORK_FINDINGS_BYTES = PEER_AUDIT_FINDINGS_BYTES;
 const SUPERVISION_REWORK_TASK_BYTES = 256;
 
 function buildCompactContinueRulesSection(

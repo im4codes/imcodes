@@ -17,6 +17,9 @@ const patchSubSessionMock = vi.fn();
 const fetchSupervisorDefaultsMock = vi.fn();
 const fetchExecutionPoolCatalogMock = vi.fn();
 const saveSupervisorDefaultsMock = vi.fn();
+const fetchSessionIdentityProfileMock = vi.fn();
+const saveSessionIdentityProfileMock = vi.fn();
+const clearSessionIdentityProfileMock = vi.fn();
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -44,6 +47,21 @@ vi.mock('../../src/api.js', () => ({
   getUserPref: () => fetchSupervisorDefaultsMock(),
   saveUserPref: (_key: string, value: unknown) => saveSupervisorDefaultsMock(value),
   onUserPrefChanged: () => () => undefined,
+  fetchSessionIdentityProfile: (...args: unknown[]) => fetchSessionIdentityProfileMock(...args),
+  saveSessionIdentityProfile: (...args: unknown[]) => saveSessionIdentityProfileMock(...args),
+  clearSessionIdentityProfile: (...args: unknown[]) => clearSessionIdentityProfileMock(...args),
+}));
+
+vi.mock('../../src/components/file-browser-lazy.js', () => ({
+  FileBrowser: ({ onConfirm }: { onConfirm: (paths: string[], preview: unknown) => void }) => (
+    <button
+      type="button"
+      onClick={() => onConfirm(
+        ['/home/k/identities/release-agent.md'],
+        { status: 'ok', path: '/home/k/identities/release-agent.md', content: 'Identity loaded outside the project.' },
+      )}
+    >confirm-external-identity-file</button>
+  ),
 }));
 
 import {
@@ -106,10 +124,85 @@ describe('SessionSettingsDialog supervision', () => {
     fetchSupervisorDefaultsMock.mockRejectedValue(new Error('no defaults'));
     fetchExecutionPoolCatalogMock.mockResolvedValue([]);
     saveSupervisorDefaultsMock.mockResolvedValue(undefined);
+    fetchSessionIdentityProfileMock.mockResolvedValue(null);
+    saveSessionIdentityProfileMock.mockImplementation(async (input: Record<string, unknown>) => ({
+      ...input,
+      contentHash: 'hash',
+      revision: 1,
+      updatedAt: 1,
+      source: 'web',
+    }));
+    clearSessionIdentityProfileMock.mockResolvedValue(true);
   });
 
   afterEach(() => {
     cleanup();
+  });
+
+  it('saves a manually entered exact-session identity online and requests an immediate runtime refresh', async () => {
+    const send = vi.fn();
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description=""
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        ws={{ connected: true, send, onMessage: () => () => undefined } as any}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const identity = await screen.findByLabelText('session-identity-content') as HTMLTextAreaElement;
+    await waitFor(() => expect(identity.disabled).toBe(false));
+    fireEvent.input(identity, { target: { value: 'You are the release engineer.' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith({
+      scope: 'session',
+      scopeKey: 'srv-1:deck_proj_brain',
+      content: 'You are the release engineer.',
+      expectedRevision: 0,
+    }));
+    expect(send).toHaveBeenCalledWith({
+      type: 'session.identity.refresh',
+      sessionName: 'deck_proj_brain',
+    });
+    expect(patchSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('reuses the host file browser and uploads content from outside the project, not its path', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description=""
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        ws={{ connected: true, send: vi.fn(), onMessage: () => () => undefined } as any}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const identity = await screen.findByLabelText('session-identity-content') as HTMLTextAreaElement;
+    await waitFor(() => expect(identity.disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'identityChooseFile' }));
+    fireEvent.click(screen.getByRole('button', { name: 'confirm-external-identity-file' }));
+    expect(identity.value).toBe('Identity loaded outside the project.');
+    expect(screen.getByText('identitySelectedFile')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
+      scopeKey: 'srv-1:deck_proj_brain',
+      content: 'Identity loaded outside the project.',
+    })));
+    expect(JSON.stringify(saveSessionIdentityProfileMock.mock.calls[0])).not.toContain('/home/k/identities');
   });
 
   it('renders authoritative supervision read-only without forcing it off', () => {

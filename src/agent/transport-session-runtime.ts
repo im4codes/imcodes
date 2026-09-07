@@ -498,6 +498,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _lastProviderOutputAt = 0;
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
+  private _identityPrompt: string | undefined;
   /**
    * Session-stable IM.codes identity (exact session name + display label).
    * Injected at assembly-time into `sessionSystemText`, peer-level with
@@ -739,6 +740,13 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
           this._lastInjectedSupervisionContractSignature = null;
+          // A provider compaction may replace the conversation prefix with a
+          // summary. Invalidate any adapter-side "already injected" marker so
+          // the next ordinary turn re-establishes the complete stable system
+          // text (including the merged user/project/session identity). Codex
+          // handles this by resuming the SAME thread with fresh
+          // baseInstructions; message-side adapters clear their own cache.
+          this.provider.refreshSessionSystemText?.(this._providerSessionId);
           // Compaction discards the registered contract body, so the next turn
           // must register it again rather than reference text that is gone.
           this._brainContractRegistered = false;
@@ -991,6 +999,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
   setDescription(desc: string): void { this._description = clampUserSessionText(desc); }
   setSystemPrompt(prompt: string): void { this._systemPrompt = clampUserSessionText(prompt); }
+  setIdentityPrompt(prompt: string | undefined): void {
+    this._identityPrompt = prompt?.trim() || undefined;
+  }
+  refreshIdentityPrompt(): void {
+    if (this._providerSessionId) this.provider.refreshSessionSystemText?.(this._providerSessionId);
+  }
   /**
    * Update the session-stable IM.codes identity injected into every
    * transport turn's `sessionSystemText`. Daemon-injected and NOT subject
@@ -1964,6 +1978,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     // every model call. See `shared/user-session-text-caps.ts`.
     this._description = clampUserSessionText(config.description);
     this._systemPrompt = clampUserSessionText(config.systemPrompt);
+    this._identityPrompt = config.identityPrompt?.trim() || undefined;
     // Capture identity for assembly-time injection. Daemon-injected and
     // NOT subject to the user-authored cap — see p2p audit 37bfbb85-430 N-A.
     if (config.sessionName) {
@@ -3332,17 +3347,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
-      // Daemon-injected identity is stable session metadata — same on
-      // every turn, NOT user-authored — so we always pass it through.
-      // Slash control commands still get it: it is cheap, reinforces the
-      // model's identity for control replies, and skipping it on `/foo`
-      // would leak the exact session name out of the model's awareness
-      // on follow-up turns when the cached system text is rebuilt from
-      // a slash-only tail. The 300-char user-authored cap stays in
-      // force on `description` / `systemPrompt`; identity is peer-level.
-      // Shared runtime guidance (memory/progress/file-path) is suppressed
-      // for raw slash controls so the provider receives the control text
-      // exactly, without unrelated system context.
+      // Daemon-injected identity is stable session metadata — same on every
+      // ordinary turn and NOT subject to the 300-char user-authored cap.
+      // Provider-native slash controls remain byte-clean; after `/compact`,
+      // the completion path invalidates provider-side stable-text state and
+      // the next ordinary turn reasserts the identity.
       // Generated Image Reporting is now appended in Codex SDK's own
       // `baseInstructions` tail (Codex-only, once per thread/start) —
       // it does NOT ride the per-turn payload at all.
@@ -3355,6 +3364,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         messagePreamble,
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
+        // Provider-native slash controls must remain byte-clean. The stable
+        // identity is deliberately reasserted on the next ordinary turn after
+        // /compact rather than being prepended to the control itself.
+        identityPrompt: isSlashControl ? undefined : this._identityPrompt,
         suppressMcpMemorySearchGuidance: isSlashControl,
         suppressAgentProgressGuidance: isSlashControl,
         suppressFilePathReportingGuidance: isSlashControl,
@@ -4335,16 +4348,17 @@ function normalizeStableContextSignature(blocks: readonly string[]): string {
 
 function isTransportCompactionCompletion(message: AgentMessage): boolean {
   const metadata = message.metadata;
+  const command = typeof metadata === 'object' && metadata !== null
+    ? (metadata as Record<string, unknown>)[SESSION_CONTROL_METADATA_COMMAND_FIELD]
+    : undefined;
   const event = typeof metadata === 'object' && metadata !== null
     ? (metadata as Record<string, unknown>).event
     : undefined;
+  // Slash-command adapters such as Qoder/Kimi can only annotate their normal
+  // assistant completion. The daemon-authored command metadata is sufficient
+  // proof even when the provider cannot emit a synthetic system message.
+  if (command === 'compact') return true;
   return message.kind === 'system'
     && message.role === 'system'
-    && (
-      (typeof metadata === 'object'
-        && metadata !== null
-        && (metadata as Record<string, unknown>)[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact')
-      || event === 'thread/compacted'
-      || event === 'session.history.compact'
-    );
+    && (event === 'thread/compacted' || event === 'session.history.compact');
 }

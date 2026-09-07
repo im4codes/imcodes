@@ -76,6 +76,17 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
     ]),
   }),
   Object.freeze({
+    id: 'session-identity',
+    aliases: Object.freeze(['agent identity', 'session identity', 'refresh identity']),
+    summary: 'Read, set, clear, and refresh synchronized Agent identity contracts.',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,
+      MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
+      MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
+      MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
+    ]),
+  }),
+  Object.freeze({
     id: 'scheduling',
     summary: 'Create, inspect, update, and cancel self-wake or targeted scheduled work.',
     tools: Object.freeze([
@@ -152,6 +163,10 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
   MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+  // Refresh is a normal live-session operation and stays callable from a
+  // cached bootstrap catalog. CRUD is discoverable as group:session-identity
+  // so its schemas do not tax every unrelated turn.
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
   // Scheduling must work from cached tool lists and before a discovery turn.
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,

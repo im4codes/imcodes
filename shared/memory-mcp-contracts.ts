@@ -60,6 +60,11 @@ import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
 } from './session-send-delivery.js';
+import {
+  SESSION_IDENTITY_MCP_TOOLS,
+  SESSION_IDENTITY_SCOPE_LIST,
+  SESSION_IDENTITY_MAX_UTF8_BYTES,
+} from './session-identity.js';
 export {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
@@ -76,6 +81,10 @@ export const MEMORY_MCP_TOOL_NAMES = {
   MEMORY_FEEDBACK: 'memory_feedback',
   SAVE_OBSERVATION: 'save_observation',
   SAVE_PREFERENCE: 'save_preference',
+  SESSION_IDENTITY_GET: SESSION_IDENTITY_MCP_TOOLS.GET,
+  SESSION_IDENTITY_SET: SESSION_IDENTITY_MCP_TOOLS.SET,
+  SESSION_IDENTITY_CLEAR: SESSION_IDENTITY_MCP_TOOLS.CLEAR,
+  SESSION_IDENTITY_REFRESH: SESSION_IDENTITY_MCP_TOOLS.REFRESH,
   PEER_AUDIT_REPLY: 'peer_audit_reply',
   DELEGATION_REPLY: 'delegation_reply',
   SEND_LIST_TARGETS: 'send_list_targets',
@@ -117,6 +126,10 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
   MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
   MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
@@ -408,6 +421,44 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       text: stringSchema(`Required preference text, up to ${MEMORY_MCP_CAPS.PREFERENCE_MAX_BYTES} UTF-8 bytes.`),
       idempotencyKey: stringSchema('Optional caller-stable key for safe retries of the same preference.'),
     }, ['text']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,
+    description: 'Read the effective user/project/session identity contract for the current or an exact same-project session. Identity is deterministic server-stored configuration, not fuzzy memory.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact session name. Omit for the current session.'),
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
+    description: 'Set a deterministic Agent identity contract at user, project, or exact-session scope. Project/user writes require the project Brain. Supply exactly one of content or filePath; session-scoped files may be absolute paths explicitly selected on the daemon host, while user/project files remain project-confined. Only content is synchronized online.',
+    inputSchema: objectSchema({
+      identityScope: { type: 'string', enum: [...SESSION_IDENTITY_SCOPE_LIST], description: 'user, project, or session.' },
+      target: stringSchema('Exact session name. Omit for the current session.'),
+      content: stringSchema(`Inline identity contract, at most ${SESSION_IDENTITY_MAX_UTF8_BYTES} UTF-8 bytes.`),
+      filePath: stringSchema('Identity document path. User/project scope requires a project-relative path; session scope also accepts an absolute daemon-host path. The daemon uploads content, never the local path.'),
+      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+    }, ['identityScope']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
+    description: 'Clear one deterministic Agent identity scope. Project/user writes require the project Brain.',
+    inputSchema: objectSchema({
+      identityScope: { type: 'string', enum: [...SESSION_IDENTITY_SCOPE_LIST], description: 'user, project, or session.' },
+      target: stringSchema('Exact session name. Omit for the current session.'),
+      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+    }, ['identityScope']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
+    description: 'Refresh the effective identity for the current or an exact same-project session from online storage. Codex resumes the existing thread with refreshed baseInstructions on its next turn so the new identity remains prefix-cacheable.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact session name. Omit for the current session.'),
+    }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: {

@@ -48,6 +48,8 @@ import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
+import { sessionIdentityRoutes } from './routes/session-identities.js';
+import { SESSION_IDENTITY_API_PATH } from '../../shared/session-identity.js';
 import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
@@ -271,6 +273,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   // User-level alias store: flat, pod-independent (no serverId). Mounted under
   // /api/* so it inherits the global CORS + CSRF middleware.
   app.route(ALIAS_API_PATH, aliasRoutes);
+  app.route(SESSION_IDENTITY_API_PATH, sessionIdentityRoutes);
   app.route('/api/embedding', embeddingRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
   app.route('/api/auth/remote-desktop', remoteDesktopAccountAuthRoutes);

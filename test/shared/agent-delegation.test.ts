@@ -362,9 +362,10 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: REWORK -->');
     expect(prompt).toContain('REWORK is not a stopping response');
     expect(prompt).toContain('do not merely output REWORK and wait');
-    expect(prompt).toContain('Apply the findings, run the relevant validation');
-    expect(prompt).toContain('prepare the next audit brief yourself');
+    expect(prompt).toContain('apply the complete findings, run the relevant validation');
+    expect(prompt).toContain('prepare the next audit brief itself');
     expect(prompt).toContain('send one fresh reply-enabled audit to the same Target ID');
+    expect(prompt).toContain('do not wait for another user message or manual kick');
     expect(prompt).toContain('Repeat repair -> re-audit autonomously until PASS');
     expect(prompt).toContain('Only when an exact blocker or safety limit prevents another cycle');
     expect(prompt).toContain('Never finalize the repository or delivery from a REWORK verdict.');

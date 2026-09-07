@@ -3,8 +3,12 @@ import { MEMORY_MCP_TOOL_NAMES, type MemoryMcpToolName } from './memory-mcp-cont
 /** Local daemon ingress used by stdio MCP adapters for memory operations. */
 export const MEMORY_MCP_DAEMON_RPC_PATH = '/memory-mcp/tool';
 
-/** Memory writes are capped at 16 KiB; leave bounded room for identity/envelope data. */
-export const MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES = 64 * 1024;
+/**
+ * Identity documents may contain 30k four-byte Unicode scalars plus JSON
+ * escaping. Keep the local authenticated envelope bounded without truncating
+ * a protocol-valid identity update.
+ */
+export const MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES = 512 * 1024;
 
 /**
  * Tools whose implementation owns local context-store or embedding work.
@@ -22,6 +26,12 @@ export const MEMORY_MCP_DAEMON_TOOL_NAMES = [
   MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  // Identity refresh must execute in the daemon process: only it owns the
+  // live transport runtime and can invalidate Codex's loaded thread state.
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
+  MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
 ] as const satisfies readonly MemoryMcpToolName[];
 
 export type MemoryMcpDaemonToolName = typeof MEMORY_MCP_DAEMON_TOOL_NAMES[number];

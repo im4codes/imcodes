@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { KimiSdkProvider } from '../../src/agent/providers/kimi-sdk.js';
 import { normalizeTransportCwd } from '../../src/agent/transport-paths.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import type { AgentMessage } from '../../shared/agent-message.js';
 
 // Regression lock for the cross-message streaming text-bleed bug class.
 //
@@ -52,6 +54,28 @@ function driveChunk(provider: KimiSdkProvider, acpSessionId: string, messageId: 
 }
 
 describe('KimiSdkProvider cross-message streaming', () => {
+  it('marks a successful native compact and invalidates the stable identity for the next turn', () => {
+    const provider = new KimiSdkProvider();
+    const { state } = attachRoute(provider, 'kimi-compact-identity');
+    state.sessionSystemTextInjected = 'identity v1';
+    state.currentText = 'compacted';
+    const completed: AgentMessage[] = [];
+    provider.onComplete((_sessionId, message) => completed.push(message));
+
+    (provider as any).settleTurn(
+      'kimi-compact-identity',
+      state,
+      1,
+      'end_turn',
+      undefined,
+      true,
+    );
+
+    expect(state.sessionSystemTextInjected).toBeUndefined();
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.metadata?.[SESSION_CONTROL_METADATA_COMMAND_FIELD]).toBe('compact');
+  });
+
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', () => {
     const provider = new KimiSdkProvider();
     const { acpSessionId } = attachRoute(provider);

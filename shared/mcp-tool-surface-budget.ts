@@ -24,8 +24,11 @@ export const MCP_INJECTED_SCHEMA_DIALECT = 'http://json-schema.org/draft-07/sche
 /** Injected per-tool by the MCP SDK. `forbidden` is already the protocol default. */
 export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbidden' });
 
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 40_000;
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 46_000;
+// The synchronized identity surface adds four bounded CRUD/refresh contracts.
+// Keep explicit headroom over the measured full catalog rather than
+// silently dropping these tools from STATIC_FULL hosts.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 44_000;
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 50_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

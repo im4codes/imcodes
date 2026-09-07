@@ -4401,6 +4401,55 @@ describe('CodexSdkProvider', () => {
     expect(thirdTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Third rule');
   });
 
+  it('refreshes identity by resuming the same Codex thread with new prefix-cacheable baseInstructions', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-identity-refresh', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const payload = (identity: string): ProviderContextPayload => ({
+      userMessage: 'continue',
+      assembledMessage: 'continue',
+      sessionSystemText: identity,
+      systemText: identity,
+      attachments: [],
+      context: {
+        sessionSystemText: identity,
+        systemText: identity,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-identity-refresh' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('route-identity-refresh', payload('identity v1'));
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    provider.refreshSessionSystemText('route-identity-refresh');
+    await provider.send('route-identity-refresh', payload('identity v2'));
+
+    const resume = child.requests.filter((req) => req.method === 'thread/resume').at(-1);
+    expect(resume?.params?.threadId).toBe('thread-1');
+    expect(resume?.params?.baseInstructions).toContain('identity v2');
+    expect(resume?.params?.baseInstructions).not.toContain('identity v1');
+    const secondTurn = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(secondTurn?.params?.input?.[0]?.text).not.toContain('runtime instructions updated');
+    expect(secondTurn?.params?.input?.[0]?.text).not.toContain('identity v2');
+  });
+
   it('re-sends a changed split stable context when the Codex update turn fails before completion', async () => {
     const provider = createCodexProvider();
     const errors: string[] = [];
@@ -4595,6 +4644,52 @@ describe('CodexSdkProvider', () => {
         }),
       }),
     ]);
+  });
+
+  it('resumes the same Codex thread with identity-bearing baseInstructions after compaction', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-identity', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+    const payload: ProviderContextPayload = {
+      userMessage: 'hello',
+      assembledMessage: 'hello',
+      sessionSystemText: 'stable identity after compact',
+      systemText: 'stable identity after compact',
+      attachments: [],
+      context: {
+        sessionSystemText: 'stable identity after compact',
+        systemText: 'stable identity after compact',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-compact-identity' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-compact-identity', payload);
+    const child = childProcessMock.children[0]!;
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-compact-identity', '/compact');
+    child.emits({ method: 'thread/compacted', params: { threadId: 'thread-1', turnId: 'compact-turn' } });
+    await flush();
+    await provider.send('route-compact-identity', payload);
+
+    const resume = child.requests.filter((req) => req.method === 'thread/resume').at(-1);
+    expect(resume?.params?.threadId).toBe('thread-1');
+    expect(resume?.params?.baseInstructions).toContain('stable identity after compact');
   });
 
   it('recognizes snake_case thread compact notifications and clears compact busy state', async () => {

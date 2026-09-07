@@ -142,7 +142,10 @@ const CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT = 1;
 const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
-const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
+// A synchronized identity contract alone may be 30k characters. Leave room
+// for Codex's stable IM.codes guidance and image-reporting tail so a valid
+// identity is never silently truncated out of prefix-cacheable instructions.
+const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 64_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
@@ -2672,6 +2675,17 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) return;
     state.effort = effort;
     this.emitSessionInfo(sessionId, { effort });
+  }
+
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    // Preserve the exact durable thread id/history. The next turn crosses
+    // ensureThreadLoaded and issues thread/resume with freshly assembled
+    // baseInstructions, restoring prefix-cacheable identity immediately.
+    state.loaded = false;
+    state.lastInjectedSessionSystemText = undefined;
+    this.clearPendingSessionSystemTextUpdate(state);
   }
 
   async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
@@ -5817,6 +5831,11 @@ export class CodexSdkProvider implements TransportProvider {
     for (const itemId of state.activeCompactionItemIds) state.activeItemIds.delete(itemId);
     state.activeCompactionItemIds.clear();
 
+    // Native compaction may replace the stored prefix with a summary. Force
+    // the next turn through thread/resume on the SAME durable thread so its
+    // cacheable baseInstructions (including merged identity) are reasserted.
+    this.refreshSessionSystemText(sessionId);
+
     // Auto-compaction is an item INSIDE the current model turn, not a transport
     // turn completion. Keep all parent turn identity/text/tool ownership intact
     // and re-arm terminal authority now that the inline compact phase is over.
@@ -5850,6 +5869,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
+    this.refreshSessionSystemText(sessionId);
     const completed: AgentMessage = {
       id: turnId ? `${turnId}:context-compaction` : `${sessionId}:context-compaction:${Date.now()}`,
       sessionId,

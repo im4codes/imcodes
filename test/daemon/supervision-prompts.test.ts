@@ -485,8 +485,45 @@ describe('supervision prompts', () => {
       `Verdict: REWORK\n${'缺陷'.repeat(5_000)}`,
     );
     expect(prompt).toContain('[truncated]');
-    expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThan(7 * 1024);
+    expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThan(23 * 1024);
     expect(prompt).not.toContain('old result');
+  });
+
+  it('preserves later blocking findings across the repair handoff', () => {
+    const prompt = buildReworkBriefPrompt(
+      'deck_supervision_brain',
+      'Implement the requested behavior',
+      'Implementation ready',
+      `F1 ${'x'.repeat(10_000)}\nF2-late-blocker must also be fixed`,
+    );
+
+    // The next peer brief accepts the complete 16 KiB findings payload. The repair prompt
+    // must not truncate earlier and make the auditor rediscover F2 next round.
+    expect(prompt).toContain('F2-late-blocker must also be fixed');
+  });
+
+  it('reserves REWORK for material implementation defects, not audit infrastructure or optional checks', () => {
+    const prompt = buildPeerAuditBriefV1({
+      taskId: 'tsk_boundary',
+      assignmentId: 'asg_boundary',
+      attemptId: 'attempt_boundary',
+      revision: 'revision-boundary',
+      taskRequest: 'Implement the requested behavior',
+      completedResult: 'Implementation and focused validation complete',
+      acceptanceCriteria: ['Requested behavior works without regression'],
+      validations: [{
+        kind: 'test',
+        label: 'focused suite',
+        outcome: 'passed',
+        summary: '12/12 passed',
+      }],
+    });
+
+    expect(prompt).toContain('VERDICT BOUNDARY');
+    expect(prompt).toContain('materially violates an explicit acceptance criterion');
+    expect(prompt).toContain('Do NOT use REWORK merely because an optional check was unavailable');
+    expect(prompt).toContain('evidence packaging/control-plane/receipt delivery failed');
+    expect(prompt).toContain('they do not block PASS');
   });
 
   it('does NOT include IM.codes workflow background in the continue prompt', () => {
@@ -568,6 +605,20 @@ describe('supervision prompts', () => {
     // The auditor is told to converge, not to re-open settled ground.
     expect(prompt).toContain('converge');
     expect(prompt).toContain('still open');
+    expect(prompt).toContain('Do not expand scope with unrelated improvements');
+  });
+
+  it('carries the complete bounded findings into the next audit round', () => {
+    const prompt = buildPeerAuditBriefV1({
+      attemptId: 'attempt_complete_findings',
+      taskRequest: 'Implement the requested behavior',
+      completedResult: 'All listed findings were addressed',
+      acceptanceCriteria: ['Every prior blocker is closed'],
+      priorReworkFindings: `F1 ${'x'.repeat(10_000)}\nF2-late-blocker`,
+    });
+
+    expect(prompt).toContain('F2-late-blocker');
+    expect(peerAuditByteLength(prompt)).toBeLessThanOrEqual(PEER_AUDIT_BRIEF_TOTAL_BYTES);
   });
 
   it('omits the re-audit section entirely on a first-round brief', () => {

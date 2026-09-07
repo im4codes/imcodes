@@ -972,6 +972,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     }
     const initParts: string[] = [];
     if (record.description) initParts.push(record.description);
+    if (record.identityPrompt) initParts.push(record.identityPrompt);
     if (record.ccPreset && record.agentType === 'claude-code') {
       const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
       const preset = await getPreset(record.ccPreset);
@@ -1020,6 +1021,8 @@ export interface LaunchOpts {
   transportConfig?: Record<string, unknown>;
   /** Session description for transport sessions (persona/system prompt injection). */
   description?: string;
+  /** Effective synchronized user/project/session identity contract. */
+  identityPrompt?: string;
   /** CC env preset name — resolved to env vars at launch, persisted for respawn. */
   ccPreset?: string;
   /** Bind to an existing remote session key instead of creating a new one. */
@@ -1038,6 +1041,7 @@ export interface SessionRelaunchOverrides {
   projectDir?: string;
   label?: string | null;
   description?: string | null;
+  identityPrompt?: string | null;
   requestedModel?: string | null;
   effort?: TransportEffortLevel | null;
   transportConfig?: Record<string, unknown> | null;
@@ -1094,6 +1098,7 @@ export async function relaunchSessionWithSettings(
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
+  const targetIdentityPrompt = overrides.identityPrompt !== undefined ? overrides.identityPrompt : (record.identityPrompt ?? null);
   const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel : (record.requestedModel ?? null);
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
@@ -1122,6 +1127,7 @@ export async function relaunchSessionWithSettings(
     projectDir: targetProjectDir,
     label: targetLabel ?? undefined,
     description: targetDescription ?? undefined,
+    identityPrompt: targetIdentityPrompt ?? undefined,
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
@@ -2116,6 +2122,25 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
   return transportRuntimes.get(name);
 }
 
+/** Persist and apply one fully-resolved identity contract without replacing history. */
+export function applyEffectiveSessionIdentity(
+  sessionName: string,
+  identityPrompt: string | undefined,
+  options: { refresh?: boolean } = {},
+): { applied: boolean; runtimeType?: 'process' | 'transport'; refreshPending?: boolean } {
+  const record = getSession(sessionName);
+  if (!record) return { applied: false };
+  const normalized = identityPrompt?.trim() || undefined;
+  upsertSession({ ...record, identityPrompt: normalized, updatedAt: Date.now() });
+  const runtime = transportRuntimes.get(sessionName);
+  if (!runtime) {
+    return { applied: true, runtimeType: 'process', refreshPending: true };
+  }
+  runtime.setIdentityPrompt(normalized);
+  if (options.refresh !== false) runtime.refreshIdentityPrompt();
+  return { applied: true, runtimeType: 'transport', refreshPending: false };
+}
+
 type RestoreOpenToolCall = {
   id: string;
   tool?: string;
@@ -2748,6 +2773,7 @@ export async function restoreTransportSessions(
         cwd: providerRestoreDirectory ?? s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
+        identityPrompt: s.identityPrompt,
         // User-authored systemPrompt only; the IM.codes identity block and
         // Generated Image Reporting protocol are injected at the assembly
         // layer (peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`) via
@@ -2977,7 +3003,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 }
 
 async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
-  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, label, description, identityPrompt, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
   const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
   const resourceRuntimeEpoch = randomUUID();
@@ -3235,6 +3261,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     cwd: projectDir,
     label: label || name,
     description,
+    identityPrompt,
     // User-authored only. Identity + image-reporting are injected at
     // the assembly layer via `SessionConfig.sessionName` / `label` ->
     // `runtime.setSessionIdentity`, peer-level with
@@ -3312,6 +3339,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(sdkDisplay ?? {}),
         ...(opts.effort ? { effort: opts.effort } : {}),
         description,
+        identityPrompt,
         ...(effectiveCcPreset ? { ccPreset: effectiveCcPreset } : {}),
         ...(presetContextWindow ? { presetContextWindow } : {}),
         label,

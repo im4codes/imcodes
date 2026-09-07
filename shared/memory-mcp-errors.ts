@@ -6,6 +6,7 @@ export const MCP_ERROR_REASONS = {
   SCOPE_FORBIDDEN: 'scope_forbidden',
   PROJECTION_UNAVAILABLE: 'projection_unavailable',
   VALIDATION_FAILED: 'validation_failed',
+  REVISION_CONFLICT: 'revision_conflict',
   RATE_LIMITED: 'rate_limited',
   INTERNAL_ERROR: 'internal_error',
   // Machine remote-exec tool surface (list_machines / exec_remote). A typed

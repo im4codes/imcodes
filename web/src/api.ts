@@ -30,6 +30,11 @@ import {
 } from '@shared/supervision-config.js';
 import { normalizeSupervisionExecutionConfig } from '@shared/supervision-execution-pool.js';
 import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
+import {
+  SESSION_IDENTITY_API_PATH,
+  type SessionIdentityProfile,
+  type SessionIdentityScope,
+} from '@shared/session-identity.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -440,6 +445,46 @@ export async function closeLocalWebPreview(serverId: string, previewId: string):
   return apiFetch(`/api/server/${encodeURIComponent(serverId)}/local-web-preview/${encodeURIComponent(previewId)}`, {
     method: 'DELETE',
   });
+}
+
+function sessionIdentityQuery(scope: SessionIdentityScope, scopeKey: string): string {
+  return `${SESSION_IDENTITY_API_PATH}?scope=${encodeURIComponent(scope)}&scopeKey=${encodeURIComponent(scopeKey)}`;
+}
+
+export async function fetchSessionIdentityProfile(
+  scope: SessionIdentityScope,
+  scopeKey: string,
+): Promise<SessionIdentityProfile | null> {
+  const response = await apiFetch<{ profile: SessionIdentityProfile | null }>(
+    sessionIdentityQuery(scope, scopeKey),
+  );
+  return response.profile;
+}
+
+export async function saveSessionIdentityProfile(input: {
+  scope: SessionIdentityScope;
+  scopeKey: string;
+  content: string;
+  expectedRevision?: number;
+}): Promise<SessionIdentityProfile> {
+  const response = await apiFetch<{ profile: SessionIdentityProfile }>(SESSION_IDENTITY_API_PATH, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  return response.profile;
+}
+
+export async function clearSessionIdentityProfile(
+  scope: SessionIdentityScope,
+  scopeKey: string,
+  expectedRevision?: number,
+): Promise<boolean> {
+  const suffix = expectedRevision === undefined ? '' : `&expectedRevision=${expectedRevision}`;
+  const response = await apiFetch<{ deleted: boolean }>(`${sessionIdentityQuery(scope, scopeKey)}${suffix}`, {
+    method: 'DELETE',
+  });
+  return response.deleted;
 }
 
 export async function apiFetch<T = unknown>(

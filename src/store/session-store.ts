@@ -142,6 +142,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerResumeId?: string;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
+  /** Effective synchronized user/project/session identity contract. */
+  identityPrompt?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */
   ccPreset?: string;
   /** Context window override carried by a provider preset (for example MiniMax-M3 1M). */

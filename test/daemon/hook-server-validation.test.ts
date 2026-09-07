@@ -229,6 +229,34 @@ describe('Hook server — session validation', () => {
     }), 'search_memory', { query: 'worker sharing' });
   });
 
+  it('routes identity refresh through the live daemon and accepts a protocol-max identity document', async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const invokeMemoryMcpTool = vi.fn(async () => ({ status: 'ok', applied: true }));
+    const restarted = await startHookServer(hookCallback, { invokeMemoryMcpTool });
+    server = restarted.server;
+    port = restarted.port;
+    expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
+    getSessionMock.mockReturnValue({
+      name: 'deck_current_brain', state: 'idle', agentType: 'codex-sdk', providerId: 'codex-sdk',
+      projectName: 'current', projectDir: '/tmp/current', role: 'brain',
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
+      contextNamespace: { scope: 'user_private', userId: 'owner-1', projectId: 'repo-1' },
+    });
+
+    const response = await postMemoryMcpDaemonTool(port, 'deck_current_brain', {
+      sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1', serverId: 'server-1',
+      tool: 'session_identity_set',
+      input: { identityScope: 'session', content: '界'.repeat(30_000) },
+    });
+
+    expect(response).toMatchObject({ status: 200, body: { ok: true, result: { status: 'ok', applied: true } } });
+    const [forwardedCaller, forwardedTool, forwardedInput] = invokeMemoryMcpTool.mock.calls[0]!;
+    expect(forwardedCaller).toMatchObject({ sessionName: 'deck_current_brain', serverId: 'server-1' });
+    expect(forwardedTool).toBe('session_identity_set');
+    expect(forwardedInput).toMatchObject({ identityScope: 'session' });
+    expect((forwardedInput as { content: string }).content).toBe('界'.repeat(30_000));
+  });
+
   it('accepts a legacy daemon-local namespace only for the daemon-bound server', async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     const invokeMemoryMcpTool = vi.fn(async () => ({ status: 'ok', items: [] }));

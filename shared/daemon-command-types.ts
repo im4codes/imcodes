@@ -4,6 +4,8 @@ export const DAEMON_COMMAND_TYPES = {
   SESSION_CANCEL: 'session.cancel',
   SESSION_EXECUTION_CLONES: 'session.execution_clones',
   SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
+  /** Browser/server → daemon: fetch online identity profiles and refresh live runtimes. */
+  SESSION_IDENTITY_REFRESH: 'session.identity.refresh',
   SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
   /** Server → controlled node: run a one-shot command locally (RemoteExecRequest). */
   MACHINE_EXEC: 'machine.exec',

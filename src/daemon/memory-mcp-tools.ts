@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { lstat, readFile, realpath } from 'node:fs/promises';
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
@@ -165,6 +167,23 @@ import {
   aliasMcpDelete,
   type AliasMcpClientOptions,
 } from './alias-mcp-client.js';
+import {
+  SESSION_IDENTITY_MAX_UTF8_BYTES,
+  SESSION_IDENTITY_SCOPE_LIST,
+  SESSION_IDENTITY_SCOPES,
+  isSessionIdentityScope,
+  normalizeSessionIdentityContent,
+  renderSessionIdentityProfiles,
+  sessionIdentityContentError,
+  type SessionIdentityScope,
+} from '../../shared/session-identity.js';
+import {
+  clearSessionIdentityProfile,
+  getEffectiveSessionIdentityProfiles,
+  getSessionIdentityProfile,
+  setSessionIdentityProfile,
+  type SessionIdentityClientOptions,
+} from './session-identity-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
 
@@ -269,6 +288,16 @@ export interface MemoryMcpToolDeps {
   orchestratorDeps?: OrchestratorDeps;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
+  identityClientOptions?: SessionIdentityClientOptions;
+  getIdentityProfile?: typeof getSessionIdentityProfile;
+  getEffectiveIdentityProfiles?: typeof getEffectiveSessionIdentityProfiles;
+  setIdentityProfile?: typeof setSessionIdentityProfile;
+  clearIdentityProfile?: typeof clearSessionIdentityProfile;
+  applyEffectiveIdentity?: (
+    sessionName: string,
+    prompt: string | undefined,
+    options?: { refresh?: boolean },
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   delegationReply?: (envelope: AgentDelegationReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
@@ -989,6 +1018,31 @@ function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'
   return projectId || undefined;
 }
 
+async function readIdentityFile(
+  filePath: string,
+  projectRoot: string,
+  allowOutsideProject: boolean,
+): Promise<string> {
+  const requested = filePath.trim();
+  if (!requested || (!isAbsolute(requested) && requested.split(/[\\/]+/u).includes('..'))) {
+    throw new Error('identity_file_path_invalid');
+  }
+  const root = await realpath(projectRoot);
+  const candidate = isAbsolute(requested) ? requested : resolve(root, requested);
+  const rel = relative(root, candidate);
+  const insideProject = !!rel && !rel.startsWith('..') && !isAbsolute(rel);
+  if (!insideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  const stat = await lstat(candidate);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > SESSION_IDENTITY_MAX_UTF8_BYTES) {
+    throw new Error('identity_file_invalid');
+  }
+  const exact = await realpath(candidate);
+  const exactRel = relative(root, exact);
+  const exactInsideProject = !!exactRel && !exactRel.startsWith('..') && !isAbsolute(exactRel);
+  if (!exactInsideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  return readFile(exact, 'utf8');
+}
+
 function canManageProjectionNamespace(projectionNamespace: ContextNamespace, callerNamespace: ContextNamespace, callerUserId: string): boolean {
   if (serializeContextNamespace(projectionNamespace) === serializeContextNamespace(callerNamespace)) return true;
   if (projectionNamespace.scope !== 'personal' || callerNamespace.scope !== 'personal') return false;
@@ -1102,6 +1156,67 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const cronList = deps.cronList ?? cronMcpList;
 
   const memoryCaller = () => deriveMemoryToolCaller(scopedCallerForDeps(caller, deps));
+
+  const identityOptions = deps.identityClientOptions ?? {};
+  const identityGet = deps.getIdentityProfile ?? getSessionIdentityProfile;
+  const identityGetEffective = deps.getEffectiveIdentityProfiles ?? getEffectiveSessionIdentityProfiles;
+  const identitySet = deps.setIdentityProfile ?? setSessionIdentityProfile;
+  const identityClear = deps.clearIdentityProfile ?? clearSessionIdentityProfile;
+  const identityApply = deps.applyEffectiveIdentity ?? (async (sessionName, prompt, options) => {
+    const { applyEffectiveSessionIdentity } = await import('../agent/session-manager.js');
+    return applyEffectiveSessionIdentity(sessionName, prompt, options);
+  });
+
+  const resolveIdentityTarget = async (rawTarget: string | undefined): Promise<
+    { status: 'ok'; target: SessionRecord } | { status: 'error'; result: ToolResult }
+  > => {
+    const sessions = await sendSessions();
+    const callerRecord = caller.sessionName
+      ? sessions.find((session) => session.name === caller.sessionName)
+      : undefined;
+    if (!callerRecord) return { status: 'error', result: error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'current session identity is unavailable') };
+    const targetName = rawTarget?.trim() || callerRecord.name;
+    const target = sessions.find((session) => session.name === targetName && session.state !== 'stopped');
+    if (!target) return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, `target "${targetName}" not found`) };
+    if (target.projectName !== callerRecord.projectName) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'target is outside the caller project') };
+    }
+    if (target.name !== callerRecord.name && callerRecord.role !== 'brain') {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may change a sibling identity') };
+    }
+    return { status: 'ok', target };
+  };
+
+  const identityScopeKey = (scope: SessionIdentityScope, target: SessionRecord): string => {
+    if (scope === SESSION_IDENTITY_SCOPES.USER) return '';
+    if (scope === SESSION_IDENTITY_SCOPES.PROJECT) {
+      return target.contextNamespace?.projectId?.trim() || target.projectName;
+    }
+    return `${caller.serverId ?? 'local'}:${target.name}`;
+  };
+
+  const refreshIdentityTarget = async (target: SessionRecord) => {
+    const effective = await identityGetEffective({
+      projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
+      sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+    }, identityOptions);
+    if (effective.status !== 'ok') return effective;
+    const prompt = renderSessionIdentityProfiles(effective.profiles);
+    const applied = await identityApply(target.name, prompt, { refresh: true });
+    return { status: 'ok' as const, target: target.name, profiles: effective.profiles, prompt, applied };
+  };
+
+  const refreshAffectedIdentities = async (scope: SessionIdentityScope, target: SessionRecord) => {
+    const sessions = await sendSessions();
+    const affected = scope === SESSION_IDENTITY_SCOPES.USER
+      ? sessions.filter((session) => session.state !== 'stopped')
+      : scope === SESSION_IDENTITY_SCOPES.PROJECT
+        ? sessions.filter((session) => session.state !== 'stopped' && session.projectName === target.projectName)
+        : [target];
+    const results = [];
+    for (const session of affected) results.push(await refreshIdentityTarget(session));
+    return results;
+  };
 
 
   const supervisionTaskIdentity = async (): Promise<PersistedSupervisionTaskAssignmentIdentity | undefined> => {
@@ -1386,6 +1501,116 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.preferences, MEMORY_MCP_DISABLED_FLAGS.PREFERENCES);
       if (gate) return gate;
       return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target']);
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const result = await identityGetEffective({
+        projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
+        sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+      }, identityOptions);
+      if (result.status !== 'ok') return result;
+      const prompt = renderSessionIdentityProfiles(result.profiles);
+      return {
+        status: 'ok',
+        target: target.name,
+        projectName: target.projectName,
+        profiles: result.profiles,
+        effectiveIdentity: prompt ?? null,
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'content', 'filePath', 'expectedRevision']);
+      const scopeValue = stringArg(args, 'identityScope');
+      if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const callerRecord = (await sendSessions()).find((session) => session.name === caller.sessionName);
+      if ((scopeValue === SESSION_IDENTITY_SCOPES.USER || scopeValue === SESSION_IDENTITY_SCOPES.PROJECT)
+        && callerRecord?.role !== 'brain') {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may change user/project identity defaults');
+      }
+      const inline = stringArg(args, 'content');
+      const filePath = stringArg(args, 'filePath');
+      if (Boolean(inline) === Boolean(filePath)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'provide exactly one of content or filePath');
+      }
+      let content: string;
+      try {
+        content = filePath
+          ? await readIdentityFile(
+            filePath,
+            target.projectDir,
+            scopeValue === SESSION_IDENTITY_SCOPES.SESSION,
+          )
+          : inline ?? '';
+      } catch (err) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'identity_file_invalid');
+      }
+      const contentReason = sessionIdentityContentError(content);
+      if (contentReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, contentReason);
+      const expectedRevision = numberArg(args, 'expectedRevision');
+      const saved = await identitySet({
+        scope: scopeValue,
+        scopeKey: identityScopeKey(scopeValue, target),
+        content: normalizeSessionIdentityContent(content),
+        ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+      }, identityOptions);
+      if (saved.status !== 'ok') return saved;
+      const refreshed = await refreshAffectedIdentities(scopeValue, target);
+      return {
+        status: 'ok',
+        saved: true,
+        target: target.name,
+        profile: { ...saved.profile, content: undefined },
+        refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'expectedRevision']);
+      const scopeValue = stringArg(args, 'identityScope');
+      if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const callerRecord = (await sendSessions()).find((session) => session.name === caller.sessionName);
+      if ((scopeValue === SESSION_IDENTITY_SCOPES.USER || scopeValue === SESSION_IDENTITY_SCOPES.PROJECT)
+        && callerRecord?.role !== 'brain') {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may clear user/project identity defaults');
+      }
+      const expectedRevision = numberArg(args, 'expectedRevision');
+      const cleared = await identityClear(
+        scopeValue,
+        identityScopeKey(scopeValue, target),
+        expectedRevision,
+        identityOptions,
+      );
+      if (cleared.status !== 'ok') return cleared;
+      const refreshed = await refreshAffectedIdentities(scopeValue, target);
+      return {
+        status: 'ok',
+        deleted: cleared.deleted,
+        target: target.name,
+        refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target']);
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const refreshed = await refreshIdentityTarget(target);
+      if (refreshed.status !== 'ok') return refreshed;
+      return {
+        status: 'ok',
+        target: target.name,
+        runtimeType: target.runtimeType ?? 'process',
+        codexThreadResumePending: target.agentType === 'codex-sdk',
+        applied: refreshed.applied,
+      };
     },
     [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: async (input) => {
       if (!deps.peerAuditReply) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit reply ingress is unavailable');
@@ -2182,6 +2407,28 @@ const schemas = {
     text: z.string().describe('Stable preference text.'),
     idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: z.object({
+    target: z.string().optional().describe('Exact session name; defaults to the current session.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: z.object({
+    identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
+    target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
+    content: z.string().optional().describe('Inline identity contract.'),
+    filePath: z.string().optional().describe('UTF-8 identity file. User/project scope is project-relative; session scope also accepts an absolute daemon-host path.'),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict().superRefine((value, context) => {
+    if (Boolean(value.content) === Boolean(value.filePath)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide exactly one of content or filePath' });
+    }
+  }),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: z.object({
+    identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
+    target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: z.object({
+    target: z.string().optional().describe('Exact session name; defaults to the current session.'),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: z.object({
     taskId: z.string(),
     assignmentId: z.string(),

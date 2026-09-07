@@ -236,7 +236,7 @@ describe('memory MCP stdio server', () => {
       // shrunken allowlist and a leaked non-core tool both fail here.
       const bootstrapNames = bootstrap.tools.map((tool) => tool.name).sort();
       expect(bootstrapNames).toEqual([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE].sort());
-      expect(bootstrap.tools).toHaveLength(29);
+      expect(bootstrap.tools).toHaveLength(30);
       expect(new Set(bootstrapNames).size).toBe(bootstrapNames.length);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);

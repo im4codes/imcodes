@@ -71,6 +71,10 @@ import {
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { filterAcpJsonLines } from './acp-json-filter.js';
 import { acpPlanEntriesToInput } from './acp-plan.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionControlCommandText,
+} from '../../../shared/session-control-commands.js';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -585,6 +589,12 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
+  }
+
   async send(
     sessionId: string,
     payloadOrMessage: string | ProviderContextPayload,
@@ -976,6 +986,7 @@ export class KimiSdkProvider implements TransportProvider {
       state.currentMessageId = null;
       const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
       const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+      const compactControl = isSessionControlCommandText(payload.userMessage, 'compact');
       const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
 
       // Long-lived call — invoking it submits A; its Promise resolves only
@@ -994,6 +1005,7 @@ export class KimiSdkProvider implements TransportProvider {
           generation,
           result.stopReason,
           includeSessionSystemText ? sessionSystemText : undefined,
+          compactControl,
         );
       }).catch((err: unknown) => {
         this.failTurn(sessionId, state, generation, err);
@@ -1283,6 +1295,7 @@ export class KimiSdkProvider implements TransportProvider {
     generation: number,
     stopReason: StopReason,
     sessionSystemTextToCommit?: string,
+    compactControl = false,
   ): void {
     if (state.settledGeneration === generation) return;
     state.settledGeneration = generation;
@@ -1343,6 +1356,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
 
     // stopReason === 'end_turn' (happy path).
+    if (compactControl) state.sessionSystemTextInjected = undefined;
     const msg: AgentMessage = {
       id: messageId,
       sessionId,
@@ -1352,6 +1366,7 @@ export class KimiSdkProvider implements TransportProvider {
       timestamp: Date.now(),
       status: 'complete',
       metadata: {
+        ...(compactControl ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
         ...(state.model ? { model: state.model } : {}),
         ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
         ...(turnUsage ? { usage: turnUsage } : {}),

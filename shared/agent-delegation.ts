@@ -527,7 +527,7 @@ const AGENT_DELEGATION_ORCHESTRATION_COPY: Record<AgentDelegationUiLocale, {
     send: (target) => `Send it exactly once with send_message(target=${JSON.stringify(target)}, reply=true). Do not call send_list_targets. If send_message is unavailable, use:`,
     fallback: 'Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done',
     wait: 'After sending, do not poll session state, logs, or transcripts; wait for reply notifications. Do not perform the delegated work unless needed only to prepare or verify the brief.',
-    auditCycle: ['Quick Audit cycle after each delegated reply:', '- Outcome markers (emit neither before the reply): {PASS} or {REWORK}.', '- PASS: report the evidence, end with {PASS}, then continue any remaining delivery/finalization requested by the task.', '- REWORK is not a stopping response: do not merely output REWORK and wait. Apply the findings, run the relevant validation, prepare the next audit brief yourself, then send one fresh reply-enabled audit to the same Target ID.', '- Repeat repair -> re-audit autonomously until PASS. Only when an exact blocker or safety limit prevents another cycle, report it and end with the REWORK marker.', '- Never finalize the repository or delivery from a REWORK verdict.'],
+    auditCycle: ['Quick Audit cycle after each delegated reply:', '- Outcome markers (emit neither before the reply): {PASS} or {REWORK}.', '- PASS: report the evidence, end with {PASS}, then continue any remaining delivery/finalization requested by the task.', '- REWORK is not a stopping response: do not merely output REWORK and wait. The same active orchestration must immediately apply the complete findings, run the relevant validation, prepare the next audit brief itself, and send one fresh reply-enabled audit to the same Target ID; do not wait for another user message or manual kick.', '- Repeat repair -> re-audit autonomously until PASS. Only when an exact blocker or safety limit prevents another cycle, report it and end with the REWORK marker.', '- Never finalize the repository or delivery from a REWORK verdict.'],
   },
   'zh-CN': {
     orchestrator: '你是当前会话的代理委派编排者。', targetLabel: '目标显示名',
@@ -536,7 +536,7 @@ const AGENT_DELEGATION_ORCHESTRATION_COPY: Record<AgentDelegationUiLocale, {
     send: (target) => `只发送一次：send_message(target=${JSON.stringify(target)}, reply=true)。不要调用 send_list_targets。若 send_message 不可用，则使用：`,
     fallback: '任务：<自包含说明>\n上下文：<当前会话事实>\n验收标准：<如何验证>\n回执：完成后把结果发回本会话',
     wait: '发送后不要轮询会话状态、日志或记录；等待回执通知。除准备或核对说明外，不要代替受委派者执行审计。',
-    auditCycle: ['每次委派回执后的快审循环：', '- 回执前不要输出结果标记；回执后只选 {PASS} 或 {REWORK}。', '- PASS：汇报证据，以 {PASS} 结束，再继续任务明确要求的剩余交付。', '- REWORK 不是停止：立即修复、验证，再向同一目标 ID 发送一次新的可回执复审。', '- 自主循环“修复→复审”直至 PASS；只有明确阻断或安全上限才可用 REWORK 停止。', '- REWORK 时绝不能做仓库或交付收尾。'],
+    auditCycle: ['每次委派回执后的快审循环：', '- 回执前不要输出结果标记；回执后只选 {PASS} 或 {REWORK}。', '- PASS：汇报证据，以 {PASS} 结束，再继续任务明确要求的剩余交付。', '- REWORK 不是停止：同一个活动编排必须立即接收完整发现、修复并验证，再自行向同一目标 ID 发送一次新的可回执复审；不得等待下一条用户消息或人工再次触发。', '- 自主循环“修复→复审”直至 PASS；只有明确阻断或安全上限才可用 REWORK 停止。', '- REWORK 时绝不能做仓库或交付收尾。'],
   },
   'zh-TW': {
     orchestrator: '你是目前工作階段的代理委派編排者。', targetLabel: '目標顯示名',
@@ -545,7 +545,7 @@ const AGENT_DELEGATION_ORCHESTRATION_COPY: Record<AgentDelegationUiLocale, {
     send: (target) => `只傳送一次：send_message(target=${JSON.stringify(target)}, reply=true)。不要呼叫 send_list_targets。若 send_message 不可用，則使用：`,
     fallback: '任務：<自包含說明>\n脈絡：<目前工作階段事實>\n驗收標準：<如何驗證>\n回覆：完成後把結果傳回本工作階段',
     wait: '傳送後不要輪詢工作階段狀態、日誌或記錄；等待回覆通知。除準備或核對說明外，不要代替受委派者執行審計。',
-    auditCycle: ['每次委派回覆後的快審循環：', '- 回覆前不要輸出結果標記；回覆後只選 {PASS} 或 {REWORK}。', '- PASS：回報證據，以 {PASS} 結束，再繼續任務明確要求的剩餘交付。', '- REWORK 不是停止：立即修復、驗證，再向同一目標 ID 傳送一次新的可回覆複審。', '- 自主循環「修復→複審」直到 PASS；只有明確阻斷或安全上限才可用 REWORK 停止。', '- REWORK 時絕不能做儲存庫或交付收尾。'],
+    auditCycle: ['每次委派回覆後的快審循環：', '- 回覆前不要輸出結果標記；回覆後只選 {PASS} 或 {REWORK}。', '- PASS：回報證據，以 {PASS} 結束，再繼續任務明確要求的剩餘交付。', '- REWORK 不是停止：同一個活動編排必須立即接收完整發現、修復並驗證，再自行向同一目標 ID 傳送一次新的可回覆複審；不得等待下一則使用者訊息或人工再次觸發。', '- 自主循環「修復→複審」直到 PASS；只有明確阻斷或安全上限才可用 REWORK 停止。', '- REWORK 時絕不能做儲存庫或交付收尾。'],
   },
   es: {
     orchestrator: 'Eres el orquestador de delegación de la sesión actual.', targetLabel: 'Etiqueta del destino',
