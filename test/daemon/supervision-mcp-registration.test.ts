@@ -813,6 +813,84 @@ describe('administrative recover', () => {
     expect(rebindTaskAssignmentRevision).toHaveBeenCalledTimes(1);
   });
 
+  it('immediately refreezes and dispatches an already-validated pre-persisted successor', async () => {
+    const assignmentId = 'validated-successor-assignment';
+    const state: any = {
+      taskId: 'validated-successor-task', projectName: 'codedeck',
+      status: 'ready_for_audit', currentRevision: 'revision-r2', validationState: 'passed',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditRevision: 'revision-r2', validationState: 'passed',
+        identity: testIdentity('deck_validated_successor_worker'),
+      }],
+    };
+    const convergeValidatedAssignment = vi.fn().mockResolvedValue([{
+      taskId: state.taskId, assignmentId, action: 'project_validated_handoff',
+    }]);
+    const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'accepted' });
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      rebindTaskAssignmentRevision: vi.fn(() => ({ ok: true as const })),
+      convergeValidatedAssignment,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true,
+      resolveSessionIdentity: testResolveSessionIdentity, dispatchReadyAudit,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId,
+      fromRevision: 'revision-r1', toRevision: 'revision-r2',
+      leaseAction: 'preserve', idempotencyKey: 'recover-validated-successor-r2',
+      reason: 'clear the exact stale predecessor bundle and converge R2',
+    })).resolves.toMatchObject({
+      status: 'ok', taskId: state.taskId, assignmentId, toRevision: 'revision-r2',
+    });
+    expect(convergeValidatedAssignment).toHaveBeenCalledOnce();
+    expect(convergeValidatedAssignment).toHaveBeenCalledWith({ taskId: state.taskId, assignmentId });
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).toHaveBeenCalledWith(state.taskId);
+  });
+
+  it('does not dispatch when the recovered successor bundle cannot be refrozen', async () => {
+    const assignmentId = 'unfrozen-successor-assignment';
+    const state: any = {
+      taskId: 'unfrozen-successor-task', projectName: 'codedeck',
+      status: 'ready_for_audit', currentRevision: 'revision-r2', validationState: 'passed',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditRevision: 'revision-r2', validationState: 'passed',
+        identity: testIdentity('deck_unfrozen_successor_worker'),
+      }],
+    };
+    const convergeValidatedAssignment = vi.fn().mockResolvedValue({
+      ok: false as const, reason: 'manifest_mismatch',
+    });
+    const dispatchReadyAudit = vi.fn();
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      rebindTaskAssignmentRevision: vi.fn(() => ({ ok: true as const })),
+      convergeValidatedAssignment,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true,
+      resolveSessionIdentity: testResolveSessionIdentity, dispatchReadyAudit,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId,
+      fromRevision: 'revision-r1', toRevision: 'revision-r2',
+      leaseAction: 'preserve', idempotencyKey: 'recover-unfrozen-successor-r2',
+      reason: 'fail closed until the exact R2 bundle can be refrozen',
+    })).resolves.toMatchObject({
+      status: 'ok', toRevision: 'revision-r2', pendingConvergence: 'manifest_mismatch',
+    });
+    expect(convergeValidatedAssignment).toHaveBeenCalledOnce();
+    expect(dispatchReadyAudit).not.toHaveBeenCalled();
+  });
+
   it('fails closed when a successful revision rebind does not satisfy authoritative postconditions', async () => {
     const assignmentId = 'false-success-assignment';
     const state = {

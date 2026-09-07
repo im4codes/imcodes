@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -39,6 +40,30 @@ function snapshot() {
   };
 }
 
+function integrationBundle(taskId: string, assignmentId: string, revision: string) {
+  const files = FILES.map((path, index) => ({
+    path, sha256: String(index + 1).repeat(64), mode: 0o644 as const,
+  }));
+  const manifest = {
+    version: 1 as const,
+    taskId,
+    sourceAssignmentId: assignmentId,
+    revision,
+    headSha: 'a'.repeat(40),
+    files,
+  };
+  const manifestSha256 = createHash('sha256')
+    .update(`${JSON.stringify(manifest)}\n`)
+    .digest('hex');
+  const bundleRoot = '/tmp/imcodes-successor-recovery-bundles';
+  return {
+    ...manifest,
+    manifestSha256,
+    bundleRoot,
+    bundlePath: join(bundleRoot, manifestSha256.slice(0, 2), manifestSha256),
+  };
+}
+
 function rewriteStatus(
   database: DatabaseSync,
   table: 'supervision_tasks' | 'supervision_task_assignments',
@@ -56,6 +81,7 @@ function r1ReworkThenBoundR2(
   database: DatabaseSync,
   taskId: string,
   staleTaskStatus: 'implementing' | 'rework' = 'rework',
+  bindStaleBundle = false,
 ) {
   const implementerIdentity = identity(`${taskId}-implementer`);
   const auditorIdentity = identity(`${taskId}-auditor`, 'claude-code-sdk', 'anthropic');
@@ -86,6 +112,15 @@ function r1ReworkThenBoundR2(
       auditAttemptId: R1_ATTEMPT,
       auditRevision: R1,
     }), status).toMatchObject({ ok: true });
+  }
+  if (bindStaleBundle) {
+    expect(registry.bindIntegrationBundle({
+      taskId,
+      assignmentId: implementerId,
+      identity: implementerIdentity,
+      revision: R1,
+      bundle: integrationBundle(taskId, implementerId, R1),
+    })).toMatchObject({ ok: true });
   }
   expect(registry.createAssignment({
     taskId,
@@ -196,6 +231,39 @@ function recoveryRequest(taskId: string, implementerId: string) {
 }
 
 describe('same-object successor finish/recovery convergence', () => {
+  it('clears only the exact predecessor bundle after a successor was pre-persisted', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = r1ReworkThenBoundR2(
+      registry, database, 'prepersisted-successor-stale-bundle', 'rework', true,
+    );
+    expect(registry.getTaskRecord(shape.taskId)?.integrationBundle?.revision).toBe(R1);
+
+    expect(registry.rebindTaskAssignmentRevision(recoveryRequest(shape.taskId, shape.implementerId)))
+      .toMatchObject({ ok: true, value: { currentRevision: R2 } });
+    expect(registry.getTaskRecord(shape.taskId)).not.toHaveProperty('integrationBundle');
+    registry.close();
+    database.close();
+  });
+
+  it('refuses to clear an unrelated bundle during successor recovery', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = r1ReworkThenBoundR2(
+      registry, database, 'prepersisted-successor-foreign-bundle', 'rework', true,
+    );
+    const task = registry.getTaskRecord(shape.taskId)!;
+    const unrelated = integrationBundle(shape.taskId, shape.implementerId, 'unrelated-r0');
+    database.prepare('UPDATE supervision_tasks SET payload_json = ? WHERE task_id = ?')
+      .run(JSON.stringify({ ...task, integrationBundle: unrelated }), shape.taskId);
+
+    expect(registry.rebindTaskAssignmentRevision(recoveryRequest(shape.taskId, shape.implementerId)))
+      .toEqual({ ok: false, reason: 'conflicting_replay' });
+    expect(registry.getTaskRecord(shape.taskId)?.integrationBundle).toEqual(unrelated);
+    registry.close();
+    database.close();
+  });
+
   it('clears a stale blocker when Brain resumes the same assignment', () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });

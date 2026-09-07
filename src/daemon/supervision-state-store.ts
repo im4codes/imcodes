@@ -5824,6 +5824,15 @@ export class SupervisionTaskRegistry {
         const targetAttestation = this.#db.prepare(
           'SELECT 1 AS ok FROM supervision_audit_attestations WHERE task_id = ? AND revision = ? LIMIT 1',
         ).get(taskId, toRevision) as { ok?: number } | undefined;
+        const integrationBundle = task.integrationBundle;
+        const integrationBundleRecoverable = Boolean(
+          !integrationBundle
+          || integrationBundle.revision === toRevision
+          || (fromRevision
+            && integrationBundle.revision === fromRevision
+            && integrationBundle.taskId === taskId
+            && integrationBundle.sourceAssignmentId === assignmentId),
+        );
         const exactScope = sameStringArray([...targetScopeFiles].sort(), [...assignment.scopeFiles].sort());
         const worktreeWithinScope = worktreePaths.every((path) => targetScopeFiles.includes(path));
         const adoptable = Boolean(
@@ -5842,6 +5851,7 @@ export class SupervisionTaskRegistry {
           && worktreeWithinScope
           && targetReceipts.length === 0
           && targetAttestation?.ok !== 1
+          && integrationBundleRecoverable
           && !task.finalization
           && !task.commitSha
           && !task.pushRemoteRef
@@ -5876,7 +5886,18 @@ export class SupervisionTaskRegistry {
           generation: input.leaseAction === 'renew' ? assignment.generation + 1 : assignment.generation,
           updatedAt: now,
         };
-        const adoptedTask = { ...task, updatedAt: now };
+        // The interrupted successor edge can leave the predecessor immutable
+        // bundle attached after both revision columns already moved forward.
+        // That bundle is historical evidence, not authority for the successor.
+        // Clear only the exact predecessor binding; an unrelated bundle keeps
+        // the recovery fail-closed through integrationBundleRecoverable above.
+        const adoptedTask = {
+          ...task,
+          ...(integrationBundle?.revision === fromRevision
+            ? { integrationBundle: undefined }
+            : {}),
+          updatedAt: now,
+        };
         this.#writeAssignment(adoptedAssignment, 'recovered', payload);
         this.#writeTask(adoptedTask, 'recovered', { ...payload, assignmentId });
         this.#db.exec('COMMIT');

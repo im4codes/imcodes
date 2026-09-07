@@ -81,6 +81,7 @@ export interface SupervisionVisibilityItem {
     auditAttemptId?: string;
     auditRevision?: string;
     verdict?: string;
+    validationState?: string;
     generation?: number;
     executionBinding?: SupervisionExecutionBinding;
     identity?: {
@@ -1027,7 +1028,34 @@ export function createSupervisionMcpToolHandlers(
             'revision recovery postcondition failed: authoritative successor state is not bound',
           );
         }
-        return ok({ taskId, assignmentId, ...(fromRevision ? { fromRevision } : {}), toRevision, replay: rebound.replay === true });
+        let convergenceOutcome: string | undefined;
+        const validatedSuccessor = reboundTask?.validationState === 'passed'
+          && reboundAssignment?.validationState === 'passed'
+          && ['validated', 'ready_for_audit'].includes(reboundTask.status ?? '')
+          && ['validated', 'ready_for_audit'].includes(reboundAssignment.status ?? '');
+        if (validatedSuccessor) {
+          try {
+            const convergence = await reg.convergeValidatedAssignment?.({ taskId, assignmentId });
+            if (convergence && !Array.isArray(convergence) && convergence.ok === false) {
+              convergenceOutcome = convergence.reason;
+            }
+          } catch (error) {
+            convergenceOutcome = error instanceof Error ? error.message : String(error);
+          }
+          if (!convergenceOutcome) {
+            try {
+              await deps.dispatchReadyAudit?.(taskId);
+            } catch {
+              // The same-object successor recovery and immutable freeze are
+              // authoritative. The deterministic dispatcher can replay them.
+            }
+          }
+        }
+        return ok({
+          taskId, assignmentId, ...(fromRevision ? { fromRevision } : {}),
+          toRevision, replay: rebound.replay === true,
+          ...(convergenceOutcome ? { pendingConvergence: convergenceOutcome } : {}),
+        });
       }
       const coordinationOverrideRequested = Boolean(
         taskStatus || assignmentStatus || scopeFiles.length > 0 || leaseAction || idempotencyKey,
