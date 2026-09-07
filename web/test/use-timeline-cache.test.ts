@@ -568,6 +568,54 @@ describe('useTimeline global cache bounds', () => {
     expect((opts as { maxDeletions: number }).maxDeletions).toBeLessThanOrEqual(2_000);
   });
 
+  it('drains legacy last-value signals out of the conversation store, before trimming it', async () => {
+    // The v2 split routes NEW signals to their own store but rewrites no
+    // existing row, so everything recorded before the upgrade stays in
+    // `events`. `session.state` alone is ~67% of recorded events and the
+    // last-value group ~84%, which is enough to fill the bounded window the
+    // first paint reads and open the pane with no messages in it.
+    //
+    // Retention cannot fix that on its own: `pruneOldEvents` keeps the newest
+    // N by timestamp with no idea what a row IS, so it will happily retain
+    // 1000 unrenderable signals. The drain has to run, and has to run first.
+    vi.useFakeTimers();
+    __resetLocalHistoryPruneStateForTests();
+    const sessionName = `deck_drain_${Date.now()}`;
+    const serverId = `srv-drain-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockResolvedValue([makeStoredEvent(sessionName, 'restored')]);
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
+    const drainSpy = vi.spyOn(TimelineDB.prototype, 'drainLegacySignals')
+      .mockResolvedValue({ deleted: 0, done: true });
+    const pruneSpy = vi.spyOn(TimelineDB.prototype, 'pruneOldEvents')
+      .mockResolvedValue({ deleted: 0, done: true });
+
+    await renderRestoredProbe(sessionName, serverId, 'drain-probe');
+
+    // Same deadline rule as the trim: reclaiming space must never precede a paint.
+    expect(drainSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+      await flushMicrotasks();
+    });
+
+    expect(drainSpy).toHaveBeenCalledWith(
+      `${serverId}:${sessionName}`,
+      expect.objectContaining({ maxDeletions: expect.any(Number) }),
+    );
+    // Bounded, for the same reason the trim is: one shared connection.
+    const [, drainOpts] = drainSpy.mock.calls[0]!;
+    expect((drainOpts as { maxDeletions: number }).maxDeletions).toBeLessThanOrEqual(2_000);
+    // Order matters — trimming a window that is still 84% signals just retains
+    // the signals and leaves the pane blank.
+    expect(drainSpy.mock.invocationCallOrder[0]!)
+      .toBeLessThan(pruneSpy.mock.invocationCallOrder[0]!);
+  });
+
   it('never deletes local history while the store is degraded to memory-only', async () => {
     // A memory-only DB cannot report what is actually on disk, so a delete
     // issued against it is a delete issued blind. This file has destroyed local

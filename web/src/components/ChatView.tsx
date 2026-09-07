@@ -1,3 +1,4 @@
+import { isNeverRenderedTimelineEventType, normalizeAssistantTextForDisplay } from '../../../src/shared/timeline/types.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -30,6 +31,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
 } from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
@@ -838,6 +840,25 @@ const TOOL_LIKE_EVENT_TYPES = new Set<string>([
   'assistant.thinking',
 ]);
 
+/**
+ * Types that reach `ChatEvent` and always come back as `null`:
+ * `assistant.thinking` returns null outright, and the `transport.queue.*`
+ * family has no case at all and falls through to `default`.
+ *
+ * They must not become ViewItems. A ViewItem that draws nothing still counts
+ * towards `viewItems.length`, which gates BOTH the "load earlier messages"
+ * button and the suppression of the empty-state placeholder — so a window made
+ * only of these rendered as a button floating above an empty scroller, with no
+ * spinner and no "no messages" text.
+ *
+ * They are deliberately NOT removed by `isVisibleChatTimelineEvent`: they still
+ * have to flow through `buildViewItems`, where `assistant.thinking` is a
+ * grouping boundary that flushes pending text and tool runs. Filtering them out
+ * earlier would silently merge assistant blocks that are currently separate.
+ * Only the item PUSH is suppressed; every grouping side effect still happens.
+ */
+
+
 function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean): boolean {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
@@ -1248,7 +1269,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     }
     pendingTools = [];
     // Flush any session.state events that were deferred to avoid breaking the group
-    for (const ev of deferredEvents) items.push({ key: ev.eventId, type: 'event', event: ev });
+    for (const ev of deferredEvents) {
+      if (isNeverRenderedTimelineEventType(ev.type)) continue;
+      items.push({ key: ev.eventId, type: 'event', event: ev });
+    }
     deferredEvents = [];
   };
 
@@ -1259,7 +1283,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const text = String(event.payload.text ?? '').trim().replace(/\n{3,}/g, '\n\n');
+      const text = normalizeAssistantTextForDisplay(event.payload.text);
       if (!text) continue;
       const assistantAutomation = event.payload.automation === true;
       if (pendingText.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
@@ -1290,6 +1314,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     } else {
       flushPending();
       if (showToolCalls || event.type === 'user.message') flushTools();
+      // Flushing above is the grouping contract and still runs; only the
+      // unrenderable item itself is withheld.
+      if (isNeverRenderedTimelineEventType(event.type)) continue;
       items.push({
         key: event.eventId,
         type: 'event',
@@ -5400,3 +5427,10 @@ function splitPathsAndUrls(
 
   return parts.length ? parts : [<span>{text}</span>];
 }
+
+/**
+ * Test seam: the renderer itself, so a contract test can measure what a type
+ * ACTUALLY draws instead of trusting the classification it is meant to check.
+ * Same convention as `__buildViewItemsForTests` above.
+ */
+export const __ChatEventForTests = ChatEvent;

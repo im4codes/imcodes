@@ -1,4 +1,4 @@
-import { isLastValueTimelineEventType } from '../../../src/shared/timeline/types.js';
+import { isGuaranteedVisibleTimelineEvent, isLastValueTimelineEventType } from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import {
@@ -76,7 +76,7 @@ function localizedDelegationAckError(error: unknown): string | undefined {
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
-import { TimelineDB } from '../timeline-db.js';
+import { TimelineDB, type DrainCursor } from '../timeline-db.js';
 import {
   TIMELINE_DETAIL_FIELD_PATHS,
   mergeTimelineEvents,
@@ -530,8 +530,103 @@ const localPruneDoneThisPageSession = new Set<string>();
 /** One sweep at a time across ALL sessions — they share a single connection. */
 let localPruneChain: Promise<void> = Promise.resolve();
 
+/**
+ * Re-read the authoritative window for the mount that is on screen RIGHT NOW.
+ *
+ * The bootstrap read already happened — that is what returned a window with
+ * nothing renderable in it — and nothing re-reads on its own. Without this the
+ * drain only helps the NEXT time the session is opened, which for an offline
+ * client (or one whose daemon/HTTP backfill returns nothing) means the pane the
+ * user is staring at stays blank until they reload.
+ */
+async function refreshCachedWindowAfterDrain(
+  cacheKey: string,
+  deletedIds: readonly string[],
+): Promise<boolean> {
+  const refreshed = await sharedDb
+    .getRecentEvents(cacheKey, { limit: MAX_MEMORY_EVENTS })
+    .catch(() => [] as TimelineEvent[]);
+
+  const existing = getCachedEvents(cacheKey) ?? [];
+  // Drop exactly the rows the drain deleted — nothing else.
+  //
+  // `mergeTimelineEvents` is additive: it replaces or appends by eventId and
+  // never removes an `existing` row the incoming set omits. Each drained legacy
+  // signal has its own eventId, so a plain merge keeps all of them — and they
+  // are precisely the rows whose `ts` is NEWER than the buried conversation, so
+  // the newest-N trim then evicts the very messages the re-read went to fetch.
+  // The pane stayed blank after a successful drain AND a successful re-read.
+  //
+  // Evicting by "absent from the refreshed window" instead would over-delete:
+  // `getRecentEvents` deliberately returns conversation with an EMPTY signal set
+  // when the signals sub-read fails, and a live signal can arrive between that
+  // read and this merge. Both would silently wipe current state from the UI.
+  // The drain's own deletion list has neither failure mode.
+  const drained = new Set(deletedIds);
+  const survivors = drained.size === 0
+    ? existing
+    : existing.filter((event) => !drained.has(event.eventId));
+  // Evict first, merge second. A read that comes back empty is still a reason
+  // to drop the rows we know were deleted — returning early would leave them
+  // in the cache indefinitely.
+  const merged = refreshed.length > 0
+    ? mergeTimelineEvents(survivors, refreshed, retainedTimelineMergeLimit(survivors, refreshed))
+    : survivors;
+  if (merged !== existing) setCachedEvents(cacheKey, merged);
+
+  return merged.some((event) => isGuaranteedVisibleTimelineEvent(event));
+}
+
 function runLocalHistoryPrune(cacheKey: string): void {
   localPruneChain = localPruneChain.then(async () => {
+    // Drain first. Retention alone cannot fix a window full of last-value rows:
+    // `pruneOldEvents` keeps the newest N by timestamp with no idea what a row
+    // IS, so on a session whose newest rows are ~84% signals it happily retains
+    // 1000 unrenderable rows and the pane still opens with nothing in it.
+    // Draining the legacy signals is what returns the read window to
+    // conversation; the size trim below then applies to real history.
+    let paneHasRenderableContent = false;
+    let before: DrainCursor | undefined;
+    for (let chunk = 0; chunk < LOCAL_PRUNE_MAX_CHUNKS; chunk += 1) {
+      if (sharedDb.memoryOnly) return;
+      const drained = await sharedDb
+        .drainLegacySignals(cacheKey, {
+          maxDeletions: LOCAL_PRUNE_DELETIONS_PER_SWEEP,
+          ...(before !== undefined ? { before } : {}),
+        })
+        .catch(() => null);
+      if (!drained) break;
+      // Refresh after EVERY productive pass until the pane has content, not
+      // once after the whole loop and not once overall.
+      //
+      // Once-after-the-loop made an "immediate" repair wait out the full
+      // LOCAL_PRUNE_MAX_CHUNKS * LOCAL_PRUNE_CHUNK_GAP_MS (~30s). Once overall
+      // was just as wrong in the other direction: a backlog larger than one
+      // deletion budget leaves the first refreshed window still full of the
+      // NEXT layer of signals, and IndexedDB deletions do not notify anyone, so
+      // every later pass freed the window with nobody looking.
+      //
+      // Stopping as soon as something renderable appears keeps healthy sessions
+      // from paying for a window read per chunk.
+      if (drained.deleted > 0 && !paneHasRenderableContent) {
+        paneHasRenderableContent = await refreshCachedWindowAfterDrain(
+          cacheKey,
+          drained.deletedIds ?? [],
+        );
+      }
+      if (drained.done) break;
+      // Advance strictly downward. Without this a pass whose scan budget is
+      // consumed by conversation returns {deleted: 0, done: false} and the next
+      // pass re-scans the identical prefix — no progress, for every chunk.
+      if (drained.nextBefore === undefined
+        || (before !== undefined
+          && drained.nextBefore.ts === before.ts
+          && drained.nextBefore.eventId === before.eventId)) break;
+      before = drained.nextBefore;
+      await new Promise<void>((resolve) => { setTimeout(resolve, LOCAL_PRUNE_CHUNK_GAP_MS); });
+    }
+
+
     for (let chunk = 0; chunk < LOCAL_PRUNE_MAX_CHUNKS; chunk += 1) {
       if (sharedDb.memoryOnly) return;
       const result = await sharedDb
@@ -557,7 +652,12 @@ function runLocalHistoryPrune(cacheKey: string): void {
  * blind — and this file has already destroyed local history once by deleting
  * against an assumption (see migrateRawToScoped).
  */
-function scheduleLocalHistoryPrune(cacheKey: string, writtenEvents: number, force = false): void {
+function scheduleLocalHistoryPrune(
+  cacheKey: string,
+  writtenEvents: number,
+  force = false,
+  immediate = false,
+): void {
   if (!cacheKey || sharedDb.memoryOnly) return;
   if (force) {
     if (localPruneDoneThisPageSession.has(cacheKey)) return;
@@ -572,7 +672,14 @@ function scheduleLocalHistoryPrune(cacheKey: string, writtenEvents: number, forc
   }
   // Deliberately delayed and never awaited: reclaiming space must never sit in
   // front of a paint, and there is no deadline on it.
-  const timer = setTimeout(() => runLocalHistoryPrune(cacheKey), LOCAL_PRUNE_START_DELAY_MS);
+  //
+  // `immediate` is the one exception, and it is still deferred by a turn rather
+  // than run inline: the pane it is repairing is currently showing nothing, so
+  // the work has a deadline the ordinary space-reclaim does not.
+  const timer = setTimeout(
+    () => runLocalHistoryPrune(cacheKey),
+    immediate ? 0 : LOCAL_PRUNE_START_DELAY_MS,
+  );
   timer.unref?.();
 }
 
@@ -2275,7 +2382,17 @@ export function useTimeline(
         // The restore proves this key's store opened and is readable, which is
         // the only safe moment to trim it. Fire-and-forget: it must never sit
         // in front of the paint we just did.
-        scheduleLocalHistoryPrune(cacheKey!, 0, true);
+        //
+        // A restore that is ENTIRELY last-value signals is the blank-pane
+        // signature: the bounded window held nothing the chat can render. That
+        // pane is already wrong on screen, so the drain that fixes it should
+        // not wait out the usual idle delay.
+        // "Nothing the user can see", not merely "all last-value": a window of
+        // 299 signals plus one assistant.thinking or transport.queue row also
+        // renders empty, and would otherwise have waited out the idle delay.
+        const restoreIsAllSignals = restored.length > 0
+          && !restored.some((event) => isGuaranteedVisibleTimelineEvent(event));
+        scheduleLocalHistoryPrune(cacheKey!, 0, true, restoreIsAllSignals);
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the last
         // WS event; reopening after a mid-chat close may leave a gap. A

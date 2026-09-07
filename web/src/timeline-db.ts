@@ -23,7 +23,7 @@
  */
 
 import type { TimelineEvent } from './ws-client.js';
-import { preferTimelineEvent } from '../../src/shared/timeline/merge.js';
+import { preferLastValueSignal, preferTimelineEvent } from '../../src/shared/timeline/merge.js';
 import { isLastValueTimelineEventType } from '../../src/shared/timeline/types.js';
 
 const DB_NAME = 'imcodes-timeline';
@@ -50,6 +50,23 @@ const SIGNAL_STORE_NAME = 'signals';
 const OPEN_RETRY_BACKOFF_MS = 3_000;
 /** Reject a permanently-`blocked` open after this long so callers can retry. */
 const OPEN_BLOCKED_TIMEOUT_MS = 1_500;
+/** Rows deleted per drain pass when the caller does not specify a budget. */
+const DRAIN_DEFAULT_DELETION_BUDGET = 500;
+/**
+ * How many rows one drain pass may examine per row it is allowed to delete.
+ * Bounds the pass on a store whose newest rows are mostly conversation, where
+ * scanning for signals could otherwise walk the entire session.
+ */
+const DRAIN_SCAN_MULTIPLIER = 4;
+
+/**
+ * A position inside the `session_ts` index. The primary key is required because
+ * that index is NOT unique — many events can share one millisecond.
+ */
+export interface DrainCursor {
+  ts: number;
+  eventId: string;
+}
 
 export class TimelineDB {
   private db: IDBDatabase | null = null;
@@ -162,7 +179,7 @@ export class TimelineDB {
         // v2. Additive only: no existing row is read, rewritten or deleted, so
         // the upgrade is O(1) rather than a full-store migration on a phone.
         // Signals already sitting in `events` are drained later, in the
-        // background, by pruneSessionHistory.
+        // background, by drainLegacySignals().
         if (!db.objectStoreNames.contains(SIGNAL_STORE_NAME)) {
           db.createObjectStore(SIGNAL_STORE_NAME, { keyPath: ['sessionId', 'type'] });
         }
@@ -195,11 +212,19 @@ export class TimelineDB {
         const db = req.result;
         // If another tab upgrades the schema later we want to drop our
         // connection so the upgrade isn't blocked indefinitely. Going back
-        // to memory until the next ensureOpen() is the safest fallback;
-        // production has DB_VERSION=1 today so this is dormant defense.
+        // to memory until the next ensureOpen() is the safest fallback.
+        //
+        // `openPromise` MUST be cleared alongside `db`: ensureOpen() returns the
+        // cached promise when `db` is null, so leaving it set handed every later
+        // caller the CLOSED connection. Each transaction then threw
+        // InvalidStateError, every read silently fell back to an empty
+        // in-memory store, and because `_memoryOnly` was never set the
+        // resetAndReopen() recovery hook stayed disabled — a permanently blank
+        // pane until a full page reload.
         db.onversionchange = () => {
           try { db.close(); } catch { /* ignore */ }
           this.db = null;
+          this.openPromise = null;
         };
         finishSuccess(db);
       };
@@ -488,6 +513,143 @@ export class TimelineDB {
     }
   }
 
+  /**
+   * Drain last-value signals that v1 wrote into the conversation store.
+   *
+   * The v2 upgrade is deliberately additive — it creates the `signals` store and
+   * touches no existing row — so every signal an install recorded before the
+   * upgrade stays in `events` forever. That matters because the first paint
+   * reads a BOUNDED newest-first window out of `events`, and by this repo's own
+   * measurement `session.state` alone is ~67% of recorded events and the whole
+   * last-value group ~84%. On a busy session those rows fill the entire window
+   * and the pane renders with no messages in it.
+   *
+   * Nothing is lost: the newest value of each type is copied into `signals`
+   * first (newest-wins), which is exactly where `getRecentEvents` now reads it
+   * back from, and only then are the `events` copies deleted.
+   *
+   * Bounded per call for the same reason as `pruneOldEvents`: every timeline
+   * shares one connection, so an unbounded delete parks every other session's
+   * read behind it.
+   */
+  async drainLegacySignals(
+    sessionId: string,
+    opts?: { maxDeletions?: number; maxScan?: number; before?: DrainCursor },
+  ): Promise<{ deleted: number; done: boolean; nextBefore?: DrainCursor; deletedIds?: string[] } | null> {
+    const db = await this.ensureOpen();
+    if (!db) return null;
+
+    const budget = Math.max(1, opts?.maxDeletions ?? DRAIN_DEFAULT_DELETION_BUDGET);
+    const scanBudget = Math.max(budget, opts?.maxScan ?? budget * DRAIN_SCAN_MULTIPLIER);
+
+    try {
+      // Walk NEWEST-first and stop at a budget.
+      //
+      // Two properties this has to have, both learned the hard way:
+      //
+      //  - Bounded MATERIALISATION, not just a bounded delete. A full-range
+      //    `getAll` structured-clones every remaining row on every chunk, so a
+      //    capped sweep over a large store re-read the whole session up to 40
+      //    times — the exact unbounded cost the bounded read path exists to
+      //    avoid, on the one connection every timeline shares.
+      //  - Newest-first. The first paint reads the NEWEST window, so that is
+      //    the window that has to be unblocked. Draining oldest-first can spend
+      //    an entire page session's budget without freeing a single row the
+      //    user would have seen.
+      const { batch, scannedToEnd, resumeFrom } = await new Promise<{
+        batch: TimelineEvent[];
+        scannedToEnd: boolean;
+        resumeFrom: DrainCursor | undefined;
+      }>((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const index = store.index('session_ts');
+        const resume = opts?.before;
+        // Upper bound is INCLUSIVE of the boundary timestamp: `session_ts` is
+        // not unique, so an exclusive ts bound would skip every unvisited
+        // sibling in that millisecond and then report `done`, silently
+        // abandoning them. The already-consumed part of that bucket is skipped
+        // by primary key below instead.
+        //
+        // `continuePrimaryKey` would express this directly but cannot be used:
+        // the row a token points at is usually one this pass just DELETED, and
+        // resuming onto a deleted primary key never fires another cursor event
+        // — the pass hangs forever.
+        const range = resume === undefined
+          ? IDBKeyRange.bound([sessionId, 0], [sessionId, Infinity])
+          : IDBKeyRange.bound([sessionId, 0], [sessionId, resume.ts]);
+        const req = index.openCursor(range, 'prev');
+        const collected: TimelineEvent[] = [];
+        let scanned = 0;
+        let last: DrainCursor | undefined;
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) { resolve({ batch: collected, scannedToEnd: true, resumeFrom: last }); return; }
+          const pending = cursor.value as TimelineEvent;
+          // Within one timestamp a 'prev' cursor descends by primary key, so
+          // everything already consumed compares >= the token. Skipping by
+          // value rather than by cursor position is what makes the resume
+          // survive the deletion of the token row itself.
+          if (resume !== undefined && pending.ts === resume.ts && pending.eventId >= resume.eventId) {
+            cursor.continue();
+            return;
+          }
+          scanned += 1;
+          const event = pending;
+          last = { ts: event.ts, eventId: event.eventId };
+          if (isLastValueTimelineEventType(event.type)) collected.push(event);
+          if (collected.length >= budget || scanned >= scanBudget) {
+            resolve({ batch: collected, scannedToEnd: false, resumeFrom: last });
+            return;
+          }
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error);
+      });
+
+      if (batch.length === 0) {
+        return {
+          deleted: 0,
+          done: scannedToEnd,
+          deletedIds: [],
+          ...(resumeFrom !== undefined ? { nextBefore: resumeFrom } : {}),
+        };
+      }
+
+      // Preserve the newest value per type BEFORE deleting anything, so a crash
+      // between the two steps can only leave a duplicate, never a hole.
+      //
+      // Ordering is `preferTimelineEvent`, not a bare `ts` comparison: signals
+      // recorded in the same millisecond are distinguished only by epoch/seq,
+      // and comparing `ts` alone let a stale epoch=1 legacy row overwrite the
+      // live epoch=2 value in `signals` — after which the `events` copy was
+      // deleted and the newer value was gone for good.
+      const newestByType = new Map<string, TimelineEvent>();
+      for (const event of batch) {
+        const existing = newestByType.get(event.type);
+        newestByType.set(event.type, existing ? preferLastValueSignal(existing, event) : event);
+      }
+      await txPutSignals(db, [...newestByType.values()]);
+
+      await txWrite(db, STORE_NAME, (store) => {
+        for (const event of batch) store.delete(event.eventId);
+      });
+
+      return {
+        deleted: batch.length,
+        done: scannedToEnd,
+        // The caller evicts exactly these from its cache. Inferring "absent from
+        // the refreshed window means deleted" is not safe: the signals sub-read
+        // can fail independently and return an empty signal set, and a live
+        // signal can land between the read and the merge.
+        deletedIds: batch.map((event) => event.eventId),
+        ...(resumeFrom !== undefined ? { nextBefore: resumeFrom } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async pruneOldEvents(
     sessionId: string,
     keepCount: number,
@@ -617,8 +779,13 @@ function txPutEventsPreservingCompleteness(
  * Upsert last-value signals, newest wins.
  *
  * The key is `[sessionId, type]`, so a plain put would let a late or replayed
- * older event clobber a newer state. Compare timestamps first: a signal only
- * moves forward.
+ * older event clobber a newer state.
+ *
+ * Ordering is the shared `preferTimelineEvent`, NOT a bare `ts` comparison.
+ * Signals recorded in the same millisecond are distinguished only by
+ * epoch/seq, and `ts`-only with a `>=` tiebreak accepted the incoming row on
+ * every tie — so replaying a stale legacy row overwrote the live value. The
+ * drain deletes the row it just replayed, which made that loss permanent.
  */
 function txPutSignals(db: IDBDatabase, events: TimelineEvent[]): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -628,7 +795,8 @@ function txPutSignals(db: IDBDatabase, events: TimelineEvent[]): Promise<void> {
       const getReq = store.get([event.sessionId, event.type]);
       getReq.onsuccess = () => {
         const existing = getReq.result as TimelineEvent | undefined;
-        if (!existing || (event.ts ?? 0) >= (existing.ts ?? 0)) store.put(event);
+        const winner = existing ? preferLastValueSignal(existing, event) : event;
+        if (!existing || winner !== existing) store.put(winner);
       };
       getReq.onerror = () => reject(getReq.error);
     }

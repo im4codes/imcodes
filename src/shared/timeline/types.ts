@@ -87,6 +87,106 @@ export const TIMELINE_LAST_VALUE_TYPES = [
   'command.ack',
 ] as const satisfies readonly TimelineEventType[];
 
+/**
+ * Timeline events the chat can actually draw.
+ *
+ * This is an ALLOWLIST on purpose. The first version was a denylist of "types
+ * that render as null", and it drifted immediately: `peer_audit.status` returns
+ * null explicitly, while `ask.question`, `memory.compression` and
+ * `execution_clone.terminal` have no case at all and fall through to
+ * `default: return null`. None were listed, so each of them still produced a
+ * ViewItem that drew nothing — which is what makes the pane show a "load
+ * earlier messages" button above an empty scroller, and what makes the cache
+ * layer believe the pane has content when it does not.
+ *
+ * An allowlist fails in the safe direction: a NEW event type added without a
+ * renderer is treated as not-renderable, which is exactly what it is. Adding a
+ * renderer means adding it here, next to the switch it mirrors.
+ *
+ * Mirrors the `ChatEvent` switch in `web/src/components/ChatView.tsx`, plus
+ * `assistant.text`, which is rendered through the assistant-block path rather
+ * than that switch. `ChatView.render-contract.test.tsx` fails if the two drift.
+ */
+export const TIMELINE_CHAT_RENDERABLE_TYPES: readonly string[] = [
+  'user.message',
+  'assistant.text',
+  'peer_audit.result',
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  'tool.call',
+  'tool.result',
+  'mode.state',
+  'session.state',
+  'memory.context',
+  'terminal.snapshot',
+  TIMELINE_EVENT_FILE_CHANGE,
+];
+
+/**
+ * Types the chat draws only when the tool-detail preference is on.
+ * Mirrors `TOOL_LIKE_EVENT_TYPES` in ChatView.
+ */
+export const TIMELINE_PREFERENCE_DEPENDENT_TYPES: readonly string[] = [
+  'tool.call',
+  'tool.result',
+  'file.change',
+  'memory.context',
+  'assistant.thinking',
+];
+
+/**
+ * Is THIS event guaranteed to put something on screen?
+ *
+ * Type alone cannot answer that, which is what the previous version got wrong.
+ * A deleted message is re-emitted as `hidden: true` and persisted, so it can sit
+ * at the top of a restored window looking like a perfectly renderable
+ * `assistant.text` — while ChatView discards it before anything else
+ * (`!event.hidden` is the first clause of its filter). A cache layer that
+ * believes the pane has content then stops repairing it, and the pane stays
+ * blank.
+ *
+ * Deliberately CONSERVATIVE — "guaranteed", not "possibly":
+ *  - last-value signals are shown only in certain states (a plain running/idle
+ *    `session.state` is filtered out),
+ *  - tool-like rows depend on a user preference this layer does not know.
+ * Both are treated as "cannot be counted on", so the worst case is an extra
+ * window read rather than a pane left blank.
+ */
+/**
+ * The exact text an `assistant.text` row contributes to the chat.
+ *
+ * `buildViewItems` trims and collapses runs of blank lines, then SKIPS the row
+ * when nothing is left. Providers really do emit empty completions (Cursor
+ * headless, Kimi and Gemini all forward accumulated text with no non-empty
+ * guard), and those rows are persisted — so a blank assistant row can sit at
+ * the top of a restored window looking like content.
+ *
+ * Defined once here so the view and the cache cannot disagree about what
+ * "blank" means.
+ */
+export function normalizeAssistantTextForDisplay(text: unknown): string {
+  return String(text ?? '').trim().replace(/\n{3,}/g, '\n\n');
+}
+
+export function isGuaranteedVisibleTimelineEvent(
+  event: { type: string; hidden?: boolean; payload?: Record<string, unknown> },
+): boolean {
+  if (event.hidden) return false;
+  if (isLastValueTimelineEventType(event.type)) return false;
+  if (TIMELINE_PREFERENCE_DEPENDENT_TYPES.includes(event.type)) return false;
+  if (!TIMELINE_CHAT_RENDERABLE_TYPES.includes(event.type)) return false;
+  // Payload granularity, not just type: a whitespace-only assistant row is
+  // dropped by buildViewItems, so counting it as content stops the repair loop
+  // while the pane shows nothing.
+  if (event.type === 'assistant.text') {
+    return normalizeAssistantTextForDisplay(event.payload?.text).length > 0;
+  }
+  return true;
+}
+
+export function isNeverRenderedTimelineEventType(type: string): boolean {
+  return !TIMELINE_CHAT_RENDERABLE_TYPES.includes(type);
+}
+
 export function isLastValueTimelineEventType(type: string): boolean {
   return (TIMELINE_LAST_VALUE_TYPES as readonly string[]).includes(type);
 }
