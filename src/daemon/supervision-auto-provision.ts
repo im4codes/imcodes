@@ -27,6 +27,7 @@ import { getSession, listSessions } from '../store/session-store.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { delegationTargetInputs } from './delegation-admission.js';
 import { startSubSession, type SubSessionRecord } from './subsession-manager.js';
+import logger from '../util/logger.js';
 import {
   SESSION_IDENTITY_SCOPES,
   renderSessionIdentityProfileSection,
@@ -318,7 +319,16 @@ async function provisionConfig(
           fresh: true,
           label: `Auto ${selectedPool}`,
         });
-      } catch {
+      } catch (error) {
+        logger.warn({
+          err: error,
+          parentSessionName: parent.name,
+          createdSessionName: identity.sessionName,
+          agentType: config.agentType,
+          providerFamily: config.providerFamily,
+          runtimeType: config.runtimeType,
+          model: config.model,
+        }, 'Supervision target auto-provision launch failed');
         cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
         return {
           ok: false,
