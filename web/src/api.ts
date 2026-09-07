@@ -457,6 +457,7 @@ export async function fetchSessionIdentityProfile(
 ): Promise<SessionIdentityProfile | null> {
   const response = await apiFetch<{ profile: SessionIdentityProfile | null }>(
     sessionIdentityQuery(scope, scopeKey),
+    { cache: 'no-store' },
   );
   return response.profile;
 }
