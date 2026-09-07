@@ -656,6 +656,14 @@ const activeAttempts = new Map<string, ActiveDirectTransfer>();
 const recentOperations = new Map<string, LedgerRecord>();
 const retiredNativeResources: unknown[] = [];
 let nativeRecycleTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * Hard per-process ceiling for wrappers that cannot safely enter native close.
+ * Reaching it fences new work and recycles the whole child address space. The
+ * parent keeps the capability advertised and applies its normal retryable,
+ * capped-backoff generation recovery.
+ */
+export const DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES = 16;
+let nativeRetirementRecycleRequested = false;
 
 /**
  * Never call node-datachannel close() in the shipped child process.
@@ -675,7 +683,22 @@ function closeOrRetireNative(resource: { close(): void } | null | undefined): vo
     try { resource.close(); } catch { /* already closed */ }
     return;
   }
+  // Production requestHardRecycle() sends SIGKILL to this exact child. Once
+  // fenced, no later request is admitted and this stack reference remains live
+  // until the kernel tears the process down; never grow a second overflow list.
+  if (nativeRetirementRecycleRequested) return;
   retiredNativeResources.push(resource);
+  if (retiredNativeResources.length >= DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES) {
+    nativeRetirementRecycleRequested = true;
+    if (nativeRecycleTimer) clearTimeout(nativeRecycleTimer);
+    nativeRecycleTimer = null;
+    directFileMetric('native_retirement_budget_reached', {
+      retiredResources: retiredNativeResources.length,
+      activeAttempts: activeAttempts.size,
+    });
+    requestHardRecycle?.();
+    return;
+  }
   scheduleNativeRecycleWhenIdle();
 }
 
@@ -1746,6 +1769,10 @@ function attachLeasePeer(lease: DirectLease): void {
 
 async function prepareLease(command: DirectFileTransferLeasePrepare, sender: WorkerControlSender): Promise<void> {
   if (!rtc) return;
+  if (nativeRetirementRecycleRequested) {
+    sendLeaseSignalFailure(sender, command.requestId);
+    return;
+  }
   const key = leaseKey(command.leaseId, command.leaseGeneration);
   const existing = leases.get(key);
   if (existing) {
@@ -1867,6 +1894,10 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Wo
     refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
     return;
   }
+  if (nativeRetirementRecycleRequested) {
+    refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true);
+    return;
+  }
   if (Date.now() >= authority.authorityExpiresAt) {
     refuseOperation(authority, sender, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, false);
     return;
@@ -1971,7 +2002,7 @@ function findLeaseForSignal(command: DirectFileTransferLeaseOffer | DirectFileTr
  * accepting it; never do this while a file channel is active.
  */
 function replaceInactiveLeasePeer(lease: DirectLease): boolean {
-  if (!rtc || lease.closing || lease.activeAttempts.size > 0) return false;
+  if (!rtc || nativeRetirementRecycleRequested || lease.closing || lease.activeAttempts.size > 0) return false;
   let peer: PeerConnection;
   try {
     peer = new rtc.PeerConnection(`imcodes-file-lease-${lease.binding.leaseId}`, {
@@ -2434,6 +2465,109 @@ export async function __retireNativeChannelUnderLiveLeaseForTests(
   await closeTransferResources(transfer, false);
 }
 
+/**
+ * Exercise the production peer-replacement path while an unrelated transfer
+ * remains active. Each replacement retires one real native PeerConnection;
+ * the hard budget must recycle this child instead of waiting for global idle.
+ */
+export function __replaceNativePeersUnderConcurrentActiveTransferForTests(
+  blockingPeer: PeerConnection,
+  blockingChannel: DataChannel,
+): void {
+  if (process.env.NODE_ENV !== 'test' || !childProcessPost || !requestHardRecycle || !rtc) {
+    throw new Error('test-only isolated native retirement budget seam');
+  }
+  const id = `native-retirement-budget-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const binding = {
+    serverId: 'native-retirement-budget-server',
+    browserTabId: 'native-retirement-budget-tab',
+    leaseId: `${id}-blocking`,
+    leaseGeneration: 1,
+    daemonGeneration: 1,
+    requestId: `${id}-blocking-request`,
+    expiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+  };
+  const blockingLease = {
+    binding,
+    sender: { send: () => {} },
+    peer: blockingPeer,
+    activeAttempts: new Set<string>(),
+    pendingOperationChannels: new Map(),
+    idleTimer: null,
+    iceServers: [],
+    controlEpoch: 0,
+    terminalGrace: new Map(),
+    callbackGeneration: 1,
+    closePromise: null,
+    closing: false,
+  } as unknown as DirectLease;
+  const blockingAttemptId = `${id}-blocking-attempt`;
+  const blockingTransfer = {
+    lease: blockingLease,
+    settled: false,
+    channel: blockingChannel,
+    authority: {
+      ...binding,
+      attemptId: blockingAttemptId,
+      attempt: 1,
+      operationId: `${id}-blocking-operation`,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      previewHandle: 'native-retirement-budget-preview',
+      channelLabel: blockingChannel.getLabel(),
+    },
+  } as unknown as ActiveDirectTransfer;
+  blockingLease.activeAttempts.add(blockingAttemptId);
+  leases.set(leaseKey(binding.leaseId, binding.leaseGeneration), blockingLease);
+  activeAttempts.set(blockingAttemptId, blockingTransfer);
+
+  const rotatingBinding = {
+    ...binding,
+    leaseId: `${id}-rotating`,
+    requestId: `${id}-rotating-request`,
+  };
+  const rotatingLease = {
+    binding: rotatingBinding,
+    sender: { send: () => {} },
+    peer: new rtc.PeerConnection(`imcodes-file-lease-${rotatingBinding.leaseId}`, {
+      iceServers: [],
+      maxMessageSize: DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
+    }),
+    activeAttempts: new Set<string>(),
+    pendingOperationChannels: new Map(),
+    idleTimer: null,
+    iceServers: [],
+    controlEpoch: 0,
+    terminalGrace: new Map(),
+    callbackGeneration: 1,
+    closePromise: null,
+    closing: false,
+    remoteDescriptionSet: false,
+    pendingRemoteCandidates: [],
+    negotiationRequestId: null,
+  } as unknown as DirectLease;
+  leases.set(leaseKey(rotatingBinding.leaseId, rotatingBinding.leaseGeneration), rotatingLease);
+  attachLeasePeer(rotatingLease);
+  for (let i = 0; i < DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES; i += 1) {
+    if (!replaceInactiveLeasePeer(rotatingLease)) {
+      throw new Error(`native_peer_replacement_stopped_before_budget:${i}`);
+    }
+  }
+}
+
+export function __nativeRetirementBudgetForTests(): { retired: number; limit: number; fenced: boolean } {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test-only native retirement budget seam');
+  return {
+    retired: retiredNativeResources.length,
+    limit: DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES,
+    fenced: nativeRetirementRecycleRequested,
+  };
+}
+
+export function __setNativeRetirementBackpressureForTests(value: boolean): void {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test-only native retirement backpressure seam');
+  nativeRetirementRecycleRequested = value;
+}
+
 /** Whether new peers/leases are refused because the addon was quiesced. */
 export function isDirectTransferNativeQuiesced(): boolean {
   return nativeAdmissionClosed;
@@ -2569,6 +2703,8 @@ export async function startDirectFileTransferChildRuntime(
   activeWorkerGeneration = transport.generation;
   childProcessPost = transport.send;
   requestHardRecycle = transport.requestHardRecycle;
+  retiredNativeResources.length = 0;
+  nativeRetirementRecycleRequested = false;
   let dispatchTail = Promise.resolve();
   transport.subscribe((raw: unknown) => {
     const envelope = validateDirectFileTransferWorkerEnvelope(raw);

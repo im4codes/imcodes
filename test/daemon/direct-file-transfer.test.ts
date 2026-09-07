@@ -289,6 +289,44 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('applies retryable admission backpressure while a retirement-budget recycle is pending', async () => {
+    const { direct, sent, sender } = await readyLease();
+    direct.__setNativeRetirementBackpressureForTests(true);
+    sent.length = 0;
+
+    await direct.handleDirectFileTransferCommand(leasePrepare({
+      leaseId: 'backpressured-lease',
+      requestId: 'backpressured-lease-request',
+    }), sender);
+    await direct.handleDirectFileTransferCommand(uploadPrepare({
+      requestId: 'backpressured-operation-request',
+    }), sender);
+
+    expect(sent).toEqual([
+      expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+        requestId: 'backpressured-lease-request',
+        error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+        retryable: true,
+      }),
+      expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION,
+        requestId: 'backpressured-operation-request',
+        error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+        retryable: true,
+      }),
+    ]);
+    expect(sent).not.toContainEqual(expect.objectContaining({
+      error: DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE,
+    }));
+    expect(sent).not.toContainEqual(expect.objectContaining({ retryable: false }));
+
+    direct.__setNativeRetirementBackpressureForTests(false);
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('reports an offer for an already-evicted lease instead of silently timing out', async () => {
     const direct = await import('../../src/daemon/direct-file-transfer-worker.js');
     const sent: Array<Record<string, unknown>> = [];

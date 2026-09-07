@@ -14,9 +14,21 @@ let dispatch = () => {};
 await direct.startDirectFileTransferChildRuntime({
   kind: DIRECT_FILE_TRANSFER_WORKER_KIND,
   generation: Number.parseInt(process.env.IMCODES_DIRECT_FILE_TRANSFER_GENERATION ?? '1', 10),
-  send() {},
+  send(envelope) { if (process.connected) process.send(envelope); },
   subscribe(handler) { dispatch = handler; },
-  requestHardRecycle() { process.kill(process.pid, 'SIGKILL'); },
+  requestHardRecycle() {
+    const budget = direct.__nativeRetirementBudgetForTests();
+    if (!process.connected) {
+      process.kill(process.pid, 'SIGKILL');
+      return;
+    }
+    process.send({
+        type: 'fixture.native-retirement-budget',
+        pid: process.pid,
+        generation: Number.parseInt(process.env.IMCODES_DIRECT_FILE_TRANSFER_GENERATION ?? '1', 10),
+        ...budget,
+      }, () => process.kill(process.pid, 'SIGKILL'));
+  },
 });
 void dispatch;
 
@@ -74,11 +86,9 @@ await new Promise((resolve, reject) => {
   });
 });
 await received;
-if (process.connected) process.send({ type: 'fixture.native-peer-negotiated', pid: process.pid });
 
-// Real callbacks may still be queued here. Complete the operation while its
-// renewed lease remains live: production must still retire the channel without
-// native close and hard-recycle this OS child, rather than retaining wrappers
-// forever behind a warm lease.
-await direct.__retireNativeChannelUnderLiveLeaseForTests(left, channel);
+// Keep this negotiated transfer live while repeatedly replacing a different
+// real peer. The generation must hit its hard retirement budget and recycle
+// even though global activeAttempts never reaches zero.
+direct.__replaceNativePeersUnderConcurrentActiveTransferForTests(left, channel);
 setTimeout(() => process.exit(91), 5_000).unref();
