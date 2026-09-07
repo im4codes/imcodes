@@ -4120,10 +4120,33 @@ export class SupervisionTaskRegistry {
       && (this.listAuditReceipts(existing.taskId).every((receipt) => receipt.assignmentId !== assignment.assignmentId)
         || assignment.status === 'finalized')
     ));
+    const activeRequiredImplementers = assignments.filter((assignment) => (
+      assignment.role === 'implementer'
+      && assignment.required
+      && !isTerminalSupervisionTaskStatus(assignment.status)
+      && !this.#assignmentConsumedByFinalization(task, assignment)
+    ));
+    // A process can crash after durable validation + the exact successor
+    // revision are stored but before the lifecycle columns advance. Those
+    // facts are sufficient for the ordinary implementation handoff; requiring
+    // record_validation again strands the SAME object forever.
+    const durableValidatedSuccessorHandoff = task.classification !== 'integration_slice'
+      && existing.role === 'implementer'
+      && existing.required
+      && (existing.status === 'implementing' || existing.status === 'rework')
+      && existing.validationState === 'passed'
+      && task.validationState === 'passed'
+      && Boolean(requestedRevision ?? taskRevision)
+      && existing.auditRevision === (requestedRevision ?? taskRevision)
+      && taskRevision === (requestedRevision ?? taskRevision)
+      && activeRequiredImplementers.length === 1
+      && activeRequiredImplementers[0]?.assignmentId === existing.assignmentId
+      && !this.#revisionHasAcceptedAudit(existing.taskId, requestedRevision ?? taskRevision!);
     const validatedTopLevelHandoff = task.classification !== 'integration_slice'
       && existing.role === 'implementer'
       && (existing.status === 'validated'
-        || (existing.status === 'ready_for_audit' && !completedMatchingPass));
+        || (existing.status === 'ready_for_audit' && !completedMatchingPass)
+        || durableValidatedSuccessorHandoff);
     const implementationHandoff = validatedSliceHandoff || validatedTopLevelHandoff;
     if (existing.role === 'auditor') {
       const receipts = this.listAuditReceipts(existing.taskId)
@@ -4392,7 +4415,8 @@ export class SupervisionTaskRegistry {
       if (validatedTopLevelHandoff) {
         const currentTask = this.getTaskRecord(task.taskId) ?? task;
         if (currentTask.status !== 'ready_for_audit') {
-          if (!canTransitionSupervisionTaskStatus(currentTask.status, 'ready_for_audit')) {
+          if (!canTransitionSupervisionTaskStatus(currentTask.status, 'ready_for_audit')
+            && !durableValidatedSuccessorHandoff) {
             this.#db.exec('ROLLBACK');
             return { ok: false, reason: 'invalid_transition' };
           }
@@ -5750,11 +5774,114 @@ export class SupervisionTaskRegistry {
           )
           && sameWorktreeManifest(event.payload?.worktreeManifest, worktreeFiles)
         ));
-        this.#db.exec('ROLLBACK');
-        return priorEvents.length === 0 ? { ok: false, reason: 'conflicting_replay' }
-          : prior
-          ? { ok: true, value: task, replay: true }
-          : { ok: false, reason: 'conflicting_replay' };
+        if (priorEvents.length > 0) {
+          this.#db.exec('ROLLBACK');
+          return prior
+            ? { ok: true, value: task, replay: true }
+            : { ok: false, reason: 'conflicting_replay' };
+        }
+
+        // Interrupted SAME-object successor bind. Older writers could commit
+        // task.currentRevision + assignment.auditRevision before appending the
+        // recovery event. Adopt only the evidence-unique shape; this is not a
+        // general "current values win" replay rule.
+        const assignments = this.listAssignments(taskId);
+        const activeImplementers = assignments.filter((candidate) => (
+          candidate.required
+          && candidate.role === 'implementer'
+          && !isTerminalSupervisionTaskStatus(candidate.status)
+          && !this.#assignmentConsumedByFinalization(task, candidate)
+        ));
+        const activeAuditors = assignments.filter((candidate) => (
+          candidate.role === 'auditor'
+          && !isTerminalSupervisionTaskStatus(candidate.status)
+        ));
+        const sourceFinals = this.listAuditReceipts(taskId).filter((receipt) => (
+          receipt.receiptKind === 'final'
+          && receipt.revision === fromRevision
+          && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
+        ));
+        const sourceReceipt = sourceFinals.length === 1 ? sourceFinals[0] : undefined;
+        const sourceAuditor = sourceReceipt ? this.getAssignment(sourceReceipt.assignmentId) : undefined;
+        const sourceImplementerEvidence = sourceReceipt && this.listEvents(taskId).some((event) => (
+          event.assignmentId === assignmentId
+          && event.payload?.auditAttemptId === sourceReceipt.attemptId
+          && event.payload?.revision === fromRevision
+        ));
+        const sourceAuthorityExact = Boolean(
+          sourceReceipt
+          && sourceAuditor
+          && sourceImplementerEvidence
+          && sourceAuditor.role === 'auditor'
+          && isTerminalSupervisionTaskStatus(sourceAuditor.status)
+          && !sourceAuditor.leaseId
+          && sourceAuditor.auditAttemptId === sourceReceipt.attemptId
+          && sourceAuditor.auditRevision === fromRevision
+          && sourceAuditor.verdict?.trim().toUpperCase() === sourceReceipt.verdict,
+        );
+        const targetReceipts = this.listAuditReceipts(taskId).filter((receipt) => (
+          receipt.receiptKind === 'final' && receipt.revision === toRevision
+        ));
+        const targetAttestation = this.#db.prepare(
+          'SELECT 1 AS ok FROM supervision_audit_attestations WHERE task_id = ? AND revision = ? LIMIT 1',
+        ).get(taskId, toRevision) as { ok?: number } | undefined;
+        const exactScope = sameStringArray([...targetScopeFiles].sort(), [...assignment.scopeFiles].sort());
+        const worktreeWithinScope = worktreePaths.every((path) => targetScopeFiles.includes(path));
+        const adoptable = Boolean(
+          fromRevision
+          && sourceAuthorityExact
+          && activeImplementers.length === 1
+          && activeImplementers[0]?.assignmentId === assignmentId
+          && activeAuditors.length === 0
+          && assignment.role === 'implementer'
+          && assignment.required
+          && ['implementing', 'rework', 'validated', 'ready_for_audit'].includes(assignment.status)
+          && ['implementing', 'rework', 'validated', 'ready_for_audit'].includes(task.status)
+          && assignment.validationState === 'passed'
+          && task.validationState === 'passed'
+          && exactScope
+          && worktreeWithinScope
+          && targetReceipts.length === 0
+          && targetAttestation?.ok !== 1
+          && !task.finalization
+          && !task.commitSha
+          && !task.pushRemoteRef
+          && !task.archivedAt,
+        );
+        if (!adoptable) {
+          this.#db.exec('ROLLBACK');
+          return activeImplementers.length > 1
+            ? { ok: false, reason: 'ambiguous_assignment' }
+            : { ok: false, reason: 'conflicting_replay' };
+        }
+        const payload = {
+          source: 'brain_authorized_revision_rebind',
+          idempotencyKey,
+          reason,
+          fromRevision,
+          toRevision,
+          ownedFiles,
+          scopeFiles: targetScopeFiles,
+          worktreeHeadSha: worktree.headSha,
+          worktreePaths,
+          worktreeManifest: worktreeFiles,
+          leaseAction: input.leaseAction,
+          adoptedPersistedSuccessor: true,
+          sourceReceiptId: sourceReceipt!.receiptId,
+          ...(evidenceManifestSha256 ? { evidenceManifestSha256 } : {}),
+        };
+        const adoptedAssignment = {
+          ...assignment,
+          scopeFiles: targetScopeFiles,
+          leaseId: input.leaseAction === 'renew' ? this.#mintLeaseId() : assignment.leaseId,
+          generation: input.leaseAction === 'renew' ? assignment.generation + 1 : assignment.generation,
+          updatedAt: now,
+        };
+        const adoptedTask = { ...task, updatedAt: now };
+        this.#writeAssignment(adoptedAssignment, 'recovered', payload);
+        this.#writeTask(adoptedTask, 'recovered', { ...payload, assignmentId });
+        this.#db.exec('COMMIT');
+        return { ok: true, value: adoptedTask };
       }
 
       const assignments = this.listAssignments(taskId);
@@ -8206,7 +8333,9 @@ export class SupervisionTaskRegistry {
       && assignment.role !== 'coordinator'
       && assignment.validationState === 'passed'
       && assignment.status !== 'ready_for_audit'
-      && canTransitionSupervisionTaskStatus(assignment.status, 'ready_for_audit')
+      && (canTransitionSupervisionTaskStatus(assignment.status, 'ready_for_audit')
+        || assignment.status === 'implementing'
+        || assignment.status === 'rework')
     ));
     if (!target) return undefined;
     // Passed validation is the durable fact; waiting for a separate open_audit
