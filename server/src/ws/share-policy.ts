@@ -168,6 +168,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.ACK, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
+  { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'allow-covered-read', requireTarget: true } },

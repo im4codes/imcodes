@@ -1,3 +1,5 @@
+import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
+
 export const SHARE_ROLES = ['viewer', 'participant'] as const;
 export type ShareRole = (typeof SHARE_ROLES)[number];
 
@@ -147,6 +149,7 @@ export const SHARE_BROWSER_COMMANDS = {
   SESSION_MODEL_LIST: 'session.model_list',
   SESSION_PRESET_LIST: 'session.preset_list',
   SESSION_SUPERVISION: 'session.supervision',
+  SESSION_IDENTITY_REFRESH: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH,
   /** Read-only live task projection for one shared MAIN coordinator tab. */
   SUPERVISION_TASK_CONSOLE_READ: 'supervision.task_console.read',
   SESSION_CANCEL: 'session.cancel',
@@ -221,6 +224,7 @@ export const SHARE_SCOPED_COMMAND_POLICY = {
   [SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ]: allow('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_CANCEL]: {
     ...allowParticipant('concrete-tab'),
@@ -311,6 +315,9 @@ export const SHARE_HTTP_ROUTE_POLICY_INVENTORY = [
   { id: 'session-supervision', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/supervision', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
   { id: 'session-supervision-defaults-read', method: 'GET', pattern: '/api/server/:id/sessions/:name/supervision/defaults', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
   { id: 'session-supervision-defaults-write', method: 'PUT', pattern: '/api/server/:id/sessions/:name/supervision/defaults', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
+  { id: 'session-identity-read', method: 'GET', pattern: '/api/server/:id/sessions/:name/identity', command: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, disposition: 'share-aware' },
+  { id: 'session-identity-write', method: 'PUT', pattern: '/api/server/:id/sessions/:name/identity', command: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, disposition: 'share-aware' },
+  { id: 'session-identity-delete', method: 'DELETE', pattern: '/api/server/:id/sessions/:name/identity', command: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, disposition: 'share-aware' },
   { id: 'session-relabel', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/label', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
   { id: 'session-rename', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/rename', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
   { id: 'session-delete', method: 'DELETE', pattern: '/api/server/:id/sessions/:name', command: SHARE_BROWSER_COMMANDS.SESSION_STOP, disposition: 'share-denied', reason: 'share-direct-surface-denied' },

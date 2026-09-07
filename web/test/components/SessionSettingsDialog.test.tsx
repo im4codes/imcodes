@@ -186,7 +186,7 @@ describe('SessionSettingsDialog supervision', () => {
       scope: 'session',
       scopeKey: 'srv-1:deck_proj_brain',
       content: 'You are the release engineer.',
-    }));
+    }, { serverId: 'srv-1', sessionName: 'deck_proj_brain' }));
     expect(ws.send).toHaveBeenCalledWith({
       type: 'session.identity.refresh',
       sessionName: 'deck_proj_brain',
@@ -221,7 +221,7 @@ describe('SessionSettingsDialog supervision', () => {
     await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledOnce());
     expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith({
       scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'My explicit update',
-    });
+    }, { serverId: 'srv-1', sessionName: 'deck_proj_brain' });
   });
 
   it('reuses the host file browser, uploads its content, and records the selected source path', async () => {
@@ -251,10 +251,10 @@ describe('SessionSettingsDialog supervision', () => {
     await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
       scopeKey: 'srv-1:deck_proj_brain',
       content: 'Identity loaded outside the project.',
-    })));
+    }), { serverId: 'srv-1', sessionName: 'deck_proj_brain' }));
     expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
       sourceFile: '/home/k/identities/release-agent.md',
-    }));
+    }), { serverId: 'srv-1', sessionName: 'deck_proj_brain' });
   });
 
   it('edits synchronized user and project identities from the three-tab settings surface', async () => {
@@ -282,7 +282,7 @@ describe('SessionSettingsDialog supervision', () => {
     fireEvent.click(screen.getByRole('button', { name: 'identityApply' }));
     await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
       scope: 'user', scopeKey: '', content: 'Shared across my machines.',
-    })));
+    }), { serverId: 'srv-1', sessionName: 'deck_proj_brain' }));
 
     fireEvent.click(screen.getByRole('tab', { name: 'identityScope_project' }));
     const projectIdentity = screen.getByLabelText('session-identity-content') as HTMLTextAreaElement;
@@ -291,7 +291,7 @@ describe('SessionSettingsDialog supervision', () => {
     fireEvent.click(screen.getByRole('button', { name: 'identityApply' }));
     await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
       scope: 'project', scopeKey: 'repo-stable-id', content: 'Use this project role.',
-    })));
+    }), { serverId: 'srv-1', sessionName: 'deck_proj_brain' }));
   });
 
   it('renders authoritative supervision read-only without forcing it off', () => {

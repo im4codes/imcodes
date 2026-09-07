@@ -447,16 +447,32 @@ export async function closeLocalWebPreview(serverId: string, previewId: string):
   });
 }
 
-function sessionIdentityQuery(scope: SessionIdentityScope, scopeKey: string): string {
-  return `${SESSION_IDENTITY_API_PATH}?scope=${encodeURIComponent(scope)}&scopeKey=${encodeURIComponent(scopeKey)}`;
+export interface SessionIdentityAccessContext {
+  serverId: string;
+  sessionName: string;
+}
+
+function sessionIdentityApiPath(context?: SessionIdentityAccessContext): string {
+  return context
+    ? `/api/server/${encodeURIComponent(context.serverId)}/sessions/${encodeURIComponent(context.sessionName)}/identity`
+    : SESSION_IDENTITY_API_PATH;
+}
+
+function sessionIdentityQuery(
+  scope: SessionIdentityScope,
+  scopeKey: string,
+  context?: SessionIdentityAccessContext,
+): string {
+  return `${sessionIdentityApiPath(context)}?scope=${encodeURIComponent(scope)}&scopeKey=${encodeURIComponent(scopeKey)}`;
 }
 
 export async function fetchSessionIdentityProfile(
   scope: SessionIdentityScope,
   scopeKey: string,
+  context?: SessionIdentityAccessContext,
 ): Promise<SessionIdentityProfile | null> {
   const response = await apiFetch<{ profile: SessionIdentityProfile | null }>(
-    sessionIdentityQuery(scope, scopeKey),
+    sessionIdentityQuery(scope, scopeKey, context),
     { cache: 'no-store' },
   );
   return response.profile;
@@ -467,8 +483,8 @@ export async function saveSessionIdentityProfile(input: {
   scopeKey: string;
   content: string;
   sourceFile?: string;
-}): Promise<SessionIdentityProfile> {
-  const response = await apiFetch<{ profile: SessionIdentityProfile }>(SESSION_IDENTITY_API_PATH, {
+}, context?: SessionIdentityAccessContext): Promise<SessionIdentityProfile> {
+  const response = await apiFetch<{ profile: SessionIdentityProfile }>(sessionIdentityApiPath(context), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
@@ -479,8 +495,9 @@ export async function saveSessionIdentityProfile(input: {
 export async function clearSessionIdentityProfile(
   scope: SessionIdentityScope,
   scopeKey: string,
+  context?: SessionIdentityAccessContext,
 ): Promise<boolean> {
-  const response = await apiFetch<{ deleted: boolean }>(sessionIdentityQuery(scope, scopeKey), {
+  const response = await apiFetch<{ deleted: boolean }>(sessionIdentityQuery(scope, scopeKey, context), {
     method: 'DELETE',
   });
   return response.deleted;

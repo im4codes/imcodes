@@ -149,6 +149,13 @@ describe('shared tab sharing contract', () => {
     });
     expect(isShareCommandAllowed(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, 'viewer')).toBe(false);
     expect(isShareCommandAllowed(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, 'participant')).toBe(true);
+    expect(getShareScopedCommandPolicy(SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH)).toMatchObject({
+      disposition: 'allow',
+      minRole: 'participant',
+      scope: 'concrete-tab',
+    });
+    expect(isShareCommandAllowed(SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, 'viewer')).toBe(false);
+    expect(isShareCommandAllowed(SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, 'participant')).toBe(true);
   });
 
   it('allows scoped file reads for viewers and requires participant for file mutations', () => {

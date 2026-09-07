@@ -72,6 +72,11 @@ import {
   type SessionSupervisionSnapshot,
   evaluateAutomaticSupervisionEnablement,
 } from '../../../shared/supervision-config.js';
+import {
+  handleSessionIdentityDelete,
+  handleSessionIdentityGet,
+  handleSessionIdentityPut,
+} from './session-identity-http.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -494,6 +499,29 @@ sessionMgmtRoutes.put('/:id/sessions/:name/supervision/defaults', async (c) => {
     JSON.stringify(defaults),
   );
   return c.json({ ok: true, defaults });
+});
+
+/**
+ * A participant edits the covered machine owner's identity profiles. Reading
+ * or writing the participant account's same-named profile would acknowledge a
+ * save that the owner's daemon can never observe.
+ */
+sessionMgmtRoutes.get('/:id/sessions/:name/identity', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityGet(c, resolved.ownerUserId);
+});
+
+sessionMgmtRoutes.put('/:id/sessions/:name/identity', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityPut(c, resolved.ownerUserId);
+});
+
+sessionMgmtRoutes.delete('/:id/sessions/:name/identity', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityDelete(c, resolved.ownerUserId);
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */

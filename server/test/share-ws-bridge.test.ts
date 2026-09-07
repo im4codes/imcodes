@@ -34,6 +34,7 @@ import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js'
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { CC_PRESET_MSG } from '../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -597,6 +598,54 @@ describe('WsBridge share-scoped sockets', () => {
       }),
     ]));
     expect(daemon.sentJson.some((msg) => msg.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES)).toBe(false);
+  });
+
+  it('forwards identity refresh for a covered participant and rejects a viewer', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const db = makeDb();
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'shared-user', db, {
+      ticketId: 'share-ticket-identity-participant',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    participant.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH,
+      commandId: 'identity-refresh-participant',
+      sessionName: 'deck_proj_brain',
+    }));
+    await flushAsync();
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH,
+        commandId: 'identity-refresh-participant',
+        sessionName: 'deck_proj_brain',
+      }),
+    ]));
+
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', db, {
+      ticketId: 'share-ticket-identity-viewer',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    daemon.sent.length = 0;
+    viewer.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH,
+      commandId: 'identity-refresh-viewer',
+      sessionName: 'deck_proj_brain',
+    }));
+    await flushAsync();
+    expect(daemon.sentJson.some((message) => message.type === DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH)).toBe(false);
   });
 
   it('denies unknown commands and participant-only controls to viewers before daemon forwarding', async () => {

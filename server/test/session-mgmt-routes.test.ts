@@ -1056,6 +1056,56 @@ describe('session-mgmt persistence routes', () => {
     }));
   });
 
+  it('reads, overwrites, and clears the machine owner identity for a covered participant', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'participant',
+        },
+      },
+    });
+    const profileRow = {
+      scope: 'project', scope_key: 'repo-stable-id', content: 'Owner identity',
+      content_hash: 'owner-hash', revision: 4, updated_at: 10, source: 'web', source_file: null,
+    };
+    mockDbQueryOne.mockResolvedValue(profileRow);
+    const app = await buildApp();
+
+    const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=repo-stable-id');
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toEqual({
+      profile: expect.objectContaining({ scope: 'project', scopeKey: 'repo-stable-id', content: 'Owner identity' }),
+    });
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
+      'owner-user', 'project', 'repo-stable-id',
+    ]);
+
+    mockDbQueryOne.mockResolvedValueOnce({ ...profileRow, content: 'Participant overwrite', revision: 5 });
+    const write = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'project', scopeKey: 'repo-stable-id', content: 'Participant overwrite' }),
+    });
+    expect(write.status).toBe(200);
+    await expect(write.json()).resolves.toEqual({
+      profile: expect.objectContaining({ content: 'Participant overwrite', revision: 5 }),
+    });
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('INSERT INTO session_identity_profiles'),
+      expect.arrayContaining(['owner-user', 'project', 'repo-stable-id', 'Participant overwrite']));
+
+    const clear = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=repo-stable-id', {
+      method: 'DELETE',
+    });
+    expect(clear.status).toBe(200);
+    await expect(clear.json()).resolves.toEqual({ deleted: true });
+    expect(mockDbExecute).toHaveBeenLastCalledWith(expect.stringContaining('DELETE FROM session_identity_profiles'), [
+      'owner-user', 'project', 'repo-stable-id', null,
+    ]);
+  });
+
   it('projects every valid owner-group execution candidate to a participant even when both pools are empty', async () => {
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       actor: {
@@ -1140,6 +1190,21 @@ describe('session-mgmt persistence routes', () => {
     expect(mockGetUserPref).not.toHaveBeenCalled();
     expect(mockSetUserPref).not.toHaveBeenCalled();
     expect(mockGetSubSessionsByServer).not.toHaveBeenCalled();
+  });
+
+  it('keeps the machine owner identity read-only for shared viewers', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'viewer' },
+    });
+    const app = await buildApp();
+    const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=user&scopeKey=');
+    const write = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'user', scopeKey: '', content: 'Forbidden' }),
+    });
+    expect(read.status).toBe(403);
+    expect(write.status).toBe(403);
+    expect(mockDbQueryOne).not.toHaveBeenCalled();
   });
 
   it('fails the owner execution catalog closed for inactive shares and malformed sub-session targets', async () => {

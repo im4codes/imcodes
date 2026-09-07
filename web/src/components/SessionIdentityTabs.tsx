@@ -53,6 +53,7 @@ export function SessionIdentityTabs({
     project: projectKey?.trim() ?? '',
     session: sessionName ? `${serverId}:${sessionName}` : '',
   }), [projectKey, serverId, sessionName]);
+  const accessContext = useMemo(() => sessionName ? { serverId, sessionName } : undefined, [serverId, sessionName]);
 
   useEffect(() => {
     let live = true;
@@ -64,7 +65,7 @@ export function SessionIdentityTabs({
           initial: '', revision: 0, sourceFile: '', loaded: true,
         }] as const;
       }
-      const profile = await fetchSessionIdentityProfile(scope, key);
+      const profile = await fetchSessionIdentityProfile(scope, key, accessContext);
       return [scope, {
         content: profile?.content ?? '', initial: profile?.content ?? '', revision: profile?.revision ?? 0,
         sourceFile: profile?.sourceFile ?? '', loaded: true,
@@ -77,7 +78,7 @@ export function SessionIdentityTabs({
       if (live) setError(reason instanceof Error ? reason.message : String(reason));
     });
     return () => { live = false; };
-  }, [scopeKey, sessionName]);
+  }, [accessContext, scopeKey, sessionName]);
 
   const draft = drafts[activeScope];
   const validationError = draft.content.trim() ? sessionIdentityContentError(draft.content, activeScope) : null;
@@ -104,9 +105,9 @@ export function SessionIdentityTabs({
           scopeKey: scopeKey[activeScope],
           content,
           ...(draft.sourceFile ? { sourceFile: draft.sourceFile } : {}),
-        });
+        }, accessContext);
       } else if (!content && contentChanged && draft.revision > 0) {
-        await clearSessionIdentityProfile(activeScope, scopeKey[activeScope]);
+        await clearSessionIdentityProfile(activeScope, scopeKey[activeScope], accessContext);
       }
       if (contentChanged) {
         setDrafts((current) => ({
