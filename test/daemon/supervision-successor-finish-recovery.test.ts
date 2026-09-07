@@ -196,6 +196,63 @@ function recoveryRequest(taskId: string, implementerId: string) {
 }
 
 describe('same-object successor finish/recovery convergence', () => {
+  it('clears a stale blocker when Brain resumes the same assignment', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'same-object-heartbeat-blocker-resume';
+    const assignmentId = `${taskId}-implementer`;
+    const implementerIdentity = identity(assignmentId);
+    expect(registry.createOrGet({
+      taskId,
+      projectName: 'alpha',
+      classification: 'independent_top_level',
+      objective: 'resume the exact implementation after a watchdog escalation',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId,
+      assignmentId,
+      role: 'implementer',
+      identity: implementerIdentity,
+      scopeFiles: FILES,
+    })).toMatchObject({ ok: true });
+    expect(registry.coordinateTaskAssignment({
+      taskId,
+      assignmentId,
+      taskStatus: 'blocked',
+      assignmentStatus: 'blocked',
+      leaseAction: 'clear',
+      idempotencyKey: `${taskId}-blocked`,
+      reason: 'heartbeat completed without durable progress',
+    })).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(taskId)?.blocker).toBe('heartbeat completed without durable progress');
+    expect(registry.getAssignment(assignmentId)?.blocker).toBe('heartbeat completed without durable progress');
+
+    expect(registry.coordinateTaskAssignment({
+      taskId,
+      assignmentId,
+      taskStatus: 'implementing',
+      assignmentStatus: 'implementing',
+      leaseAction: 'renew',
+      idempotencyKey: `${taskId}-resume`,
+      reason: 'Brain-authorized same-object repair',
+    })).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(taskId)).toMatchObject({ status: 'implementing' });
+    expect(registry.getTaskRecord(taskId)).not.toHaveProperty('blocker');
+    expect(registry.getAssignment(assignmentId)).toMatchObject({
+      status: 'implementing',
+      leaseId: expect.stringMatching(/^lse_/),
+    });
+    expect(registry.getAssignment(assignmentId)).not.toHaveProperty('blocker');
+    expect(registry.listEvents(taskId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventType: 'recovered',
+        payload: expect.objectContaining({ reason: 'Brain-authorized same-object repair' }),
+      }),
+    ]));
+    registry.close();
+    database.close();
+  });
+
   it('finishes the exact validated R2 directly when only lifecycle projection lagged', () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });

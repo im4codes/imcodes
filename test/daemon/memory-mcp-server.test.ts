@@ -255,6 +255,7 @@ describe('memory MCP stdio server', () => {
         MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
       ]));
       expect(bootstrapNames).toContain(MEMORY_MCP_TOOL_NAMES.SESSION_RESTART);
+      expect(bootstrapNames).toContain(MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY);
       expect(bootstrapNames).toEqual(expect.arrayContaining(Object.values(ALIAS_MCP_TOOLS)));
       expect(bootstrapNames).toEqual(expect.arrayContaining([
         MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,

@@ -6310,7 +6310,16 @@ export class SupervisionTaskRegistry {
           auditRoutingReason: undefined,
           auditDegradedReason: undefined,
         } : {}),
-        blocker: repairsControlState ? reason : assignment.blocker,
+        // `reason` is durable audit provenance for every recovery, but it is
+        // not automatically a live blocker. Reopening/resuming an assignment
+        // must clear the blocker that caused the Brain repair; otherwise the
+        // watchdog immediately reports the SAME implementing assignment as
+        // stuck again. REWORK/blocked/cancelled retain the reason because they
+        // are deliberate non-forward states. Lease/scope/identity-only repairs
+        // preserve the existing blocker unless a lifecycle status is explicit.
+        blocker: assignmentStatus === undefined
+          ? assignment.blocker
+          : (['blocked', 'rework', 'cancelled'].includes(nextAssignmentStatus) ? reason : undefined),
         updatedAt: now,
       };
       // A Brain reopen is ONE complete transition, not a half of one.
@@ -6381,11 +6390,14 @@ export class SupervisionTaskRegistry {
           };
         }
       }
+      const nextTaskStatus = taskStatus ?? task.status;
       const nextTask: PersistedSupervisionTaskRecord = {
         ...task,
-        status: taskStatus ?? task.status,
+        status: nextTaskStatus,
         ...(retiredPredecessorOwner ? { integrationOwnerAssignmentId: undefined } : {}),
-        blocker: repairsControlState ? reason : task.blocker,
+        blocker: taskStatus === undefined
+          ? task.blocker
+          : (['blocked', 'rework', 'cancelled'].includes(nextTaskStatus) ? reason : undefined),
         updatedAt: repairsControlState ? now : task.updatedAt,
       };
       const payload = {
