@@ -35,6 +35,8 @@ import {
 } from '../../shared/turn-service.js';
 import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
+import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
+import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');
@@ -683,6 +685,7 @@ function installSystemdService(): void {
   const unit = `[Unit]
 Description=IM.codes Daemon
 After=network.target
+${renderSystemdStartLimitBlock()}
 
 [Service]
 Type=simple
@@ -690,6 +693,7 @@ ExecStart=${renderSystemdExecStart(target)}
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
+${renderSystemdTerminalDiagnostics()}
 TimeoutStopSec=45s
 SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
@@ -720,6 +724,11 @@ WantedBy=default.target
   } catch {
     console.log('  Could not start systemd service automatically. Run: systemctl --user start imcodes');
   }
+
+  // External recovery trigger, installed as its own timer/oneshot pair so it can
+  // still act when imcodes.service itself is wedged falsely-active. Idempotent:
+  // a re-run rewrites nothing and reloads nothing when the units already match.
+  installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
 
   const linger = enableSystemdUserLinger();
   if (linger.ok) {

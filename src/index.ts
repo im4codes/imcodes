@@ -93,7 +93,7 @@ import {
 import { PROJECT_ROOT } from './util/project-root.js';
 import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.js';
 import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
-import { isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
+import { daemonProcessAppearsRunning, isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
@@ -471,27 +471,23 @@ program
       const storedPid = readFileSync(pidFile, 'utf8').trim();
       if (storedPid) {
         daemonPid = storedPid;
-        // Check if process is actually running
-        try {
-          process.kill(parseInt(storedPid, 10), 0);
-          daemonRunning = true;
-        } catch (err: any) {
-          // On Windows, EPERM means the process IS alive but was spawned in
-          // a different security context (e.g. VBS/watchdog detached launch).
-          // Treating EPERM as "dead" causes `imcodes status` to show "stopped"
-          // when the daemon is actually running fine.
-          if (err?.code === 'EPERM') {
-            daemonRunning = true;
-          }
-          // ESRCH = no such process = actually dead
-        }
+        // `kill(pid, 0)` succeeds for a zombie, so it reported a reaped daemon as
+        // running. The shared probe only reports `reclaimable` on positive proof
+        // (absent, or a Z/X/x state), and `unknown` still displays as running so
+        // the Windows cross-security-context case keeps its previous behaviour.
+        daemonRunning = daemonProcessAppearsRunning(Number.parseInt(storedPid, 10));
       }
     } catch { /* no PID file */ }
     // Fallback: systemd (Linux only)
     if (!daemonRunning && process.platform === 'linux') {
       try {
         const out = execSync('systemctl --user show imcodes --property=MainPID --value 2>/dev/null', { encoding: 'utf8' }).trim();
-        if (out && out !== '0') { daemonPid = out; daemonRunning = true; }
+        // systemd keeps reporting a non-zero MainPID while the unit is falsely
+        // active with a zombie main process, so the PID alone proves nothing.
+        if (out && out !== '0' && daemonProcessAppearsRunning(Number.parseInt(out, 10))) {
+          daemonPid = out;
+          daemonRunning = true;
+        }
       } catch { /* not using systemd */ }
     }
     const daemonPidNumber = daemonPid ? parseInt(daemonPid, 10) : NaN;
@@ -1272,6 +1268,17 @@ program
     } else {
       console.log('Watchdog files regenerated. Daemon will start on next login (Startup shortcut).');
     }
+  });
+
+program
+  .command('recover-service')
+  .description('One bounded check for a falsely-active daemon unit (run by imcodes-recovery.timer)')
+  .action(async () => {
+    // Executed by the shipped oneshot unit, outside imcodes.service's cgroup,
+    // because a zombie main process cannot run its own recovery.
+    const { runShippedServiceRecovery } = await import('./daemon/service-recovery-runner.js');
+    const outcome = await runShippedServiceRecovery();
+    console.log(JSON.stringify(outcome));
   });
 
 // ── Memory search CLI ────────────────────────────────────────────────────────

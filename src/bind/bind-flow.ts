@@ -8,6 +8,8 @@ import { BACKEND } from '../agent/tmux.js';
 import { restartWindowsDaemon } from '../util/windows-daemon.js';
 import { resolveDaemonLaunchTarget, renderSystemdExecStart, renderPlistProgramArguments } from '../util/launch-target.js';
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
+import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
+import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');
@@ -322,12 +324,14 @@ async function installSystemdService(): Promise<void> {
   const unit = `[Unit]
 Description=IM.codes Daemon
 After=network.target
+${renderSystemdStartLimitBlock()}
 
 [Service]
 ExecStart=${renderSystemdExecStart(target)}
 Restart=always
 RestartSec=5
 KillMode=control-group
+${renderSystemdTerminalDiagnostics()}
 TimeoutStopSec=45s
 SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
@@ -364,6 +368,13 @@ WantedBy=default.target
 
   execSync('systemctl --user daemon-reload', { stdio: 'inherit' });
   execSync('systemctl --user enable --now imcodes', { stdio: 'inherit' });
+
+  // External recovery trigger. Installed as its own timer/oneshot pair so it can
+  // still act when imcodes.service itself is wedged falsely-active.
+  const recovery = installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
+  if (recovery.serviceWritten || recovery.timerWritten) {
+    console.log('Installed daemon recovery timer (imcodes-recovery.timer).');
+  }
 
   const linger = enableSystemdUserLinger();
   if (linger.ok) {
