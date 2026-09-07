@@ -5113,7 +5113,12 @@ describe('SupervisionTaskRegistry', () => {
         identity: worker, scopeFiles: ['src/no-progress.ts'], now: 2_000,
       });
       if (!assignment.ok) throw new Error(assignment.reason);
-      const progressClock = assignment.value.updatedAt;
+      expect(registry.updateTask({ taskId: 'no-progress-task', status: 'implementing', now: 3_000 }))
+        .toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: assignment.value.assignmentId, identity: worker, status: 'implementing', now: 3_000,
+      })).toMatchObject({ ok: true });
+      const progressClock = registry.getAssignment(assignment.value.assignmentId)!.updatedAt;
       expect(registry.recordImplementationNoProgressBlocker({
         assignmentId: assignment.value.assignmentId, blocker,
         blockerFingerprint: fingerprint, now: 10_000,
@@ -5134,6 +5139,26 @@ describe('SupervisionTaskRegistry', () => {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('atomically rejects a no-progress blocker while implementation is still delegated', () => {
+    const registry = makeRegistry();
+    expect(registry.createOrGet({
+      taskId: 'delegated-no-progress-task', projectName: 'alpha',
+      classification: 'independent_top_level', objective: 'do not fabricate started work', now: 1_000,
+    })).toMatchObject({ ok: true });
+    const assignment = registry.createAssignment({
+      taskId: 'delegated-no-progress-task', assignmentId: 'delegated-no-progress-assignment',
+      role: 'implementer', identity: identity('deck_alpha_delegated_worker'), now: 2_000,
+    });
+    if (!assignment.ok) throw new Error(assignment.reason);
+    expect(registry.recordImplementationNoProgressBlocker({
+      assignmentId: assignment.value.assignmentId,
+      blocker: JSON.stringify({ blockerFingerprint: 'delegated-must-not-block' }),
+      blockerFingerprint: 'delegated-must-not-block',
+      now: 10_000,
+    })).toMatchObject({ ok: false, reason: 'invalid_transition' });
+    expect(registry.getAssignment(assignment.value.assignmentId)?.blocker).toBeUndefined();
   });
 
   it('admits exactly one active overall auditor and makes REWORK belong to the combined revision', () => {

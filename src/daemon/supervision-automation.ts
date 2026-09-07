@@ -1301,21 +1301,33 @@ class SupervisionAutomation {
         // reminder noise. Leave the single blocker standing instead.
         if (normalizeBlockerText(assignment.blocker)) continue;
         const assignmentEvents = events.filter((event) => event.assignmentId === assignment.assignmentId);
-        const progressAt = Math.max(
-          assignment.updatedAt,
-          ...assignmentEvents
-            .filter((event) => event.eventType !== 'implementation_heartbeat')
-            .map((event) => event.createdAt),
-        );
+        // While work is only delegated, runtime identity repair is
+        // observational rather than substantive implementation progress. Use
+        // the immutable creation edge and all delegated watchdog events so an
+        // epoch rebind cannot erase the one durable wake-up. The first real
+        // delegated -> implementing transition updates the assignment and
+        // restores the normal progress-reset semantics below.
+        const progressAt = assignment.status === 'delegated'
+          ? assignment.createdAt
+          : Math.max(
+              assignment.updatedAt,
+              ...assignmentEvents
+                .filter((event) => event.eventType !== 'implementation_heartbeat')
+                .map((event) => event.createdAt),
+            );
         const reminders = assignmentEvents.filter((event) => (
           event.eventType === 'implementation_heartbeat'
           && event.payload?.source === 'implementation_watchdog'
-          && event.createdAt > progressAt
+          && (assignment.status === 'delegated'
+            ? event.status === 'delegated'
+            : event.createdAt > progressAt)
         ));
         const runtimeRetries = assignmentEvents.filter((event) => (
           event.eventType === 'implementation_heartbeat'
           && event.payload?.source === 'implementation_watchdog_runtime_unavailable'
-          && event.createdAt > progressAt
+          && (assignment.status === 'delegated'
+            ? event.status === 'delegated'
+            : event.createdAt > progressAt)
         ));
         const attempts = [...reminders, ...runtimeRetries].sort((left, right) => left.createdAt - right.createdAt);
         const latestAttempt = attempts.at(-1);
@@ -1341,6 +1353,16 @@ class SupervisionAutomation {
             targetSessionName: assignment.identity.sessionName,
             now,
           });
+          // A delegated assignment has not started implementation yet. Its
+          // original task delivery is durable and the first reminder is a
+          // bounded wake-up for a queued/busy target; silence after that is not
+          // evidence that implementation ran without progress. The authority
+          // call may still converge an observational runtime-identity rotation,
+          // but stop before runtime-outage accounting so it cannot turn an
+          // already-woken delegated assignment into a false blocker. The real
+          // delegated -> implementing transition resets progress and re-enables
+          // the started-work watchdog below.
+          if (reminders.length > 0 && assignment.status === 'delegated') continue;
           if (authority.status === 'transient_unavailable') {
             const retryNumber = runtimeRetries.length + 1;
             if (retryNumber >= IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT) {

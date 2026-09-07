@@ -3064,8 +3064,7 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid_transition' };
       }
-      if (assignment.role !== 'implementer'
-        || (assignment.status !== 'delegated' && assignment.status !== 'implementing')) {
+      if (assignment.role !== 'implementer' || assignment.status !== 'implementing') {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid_transition' };
       }

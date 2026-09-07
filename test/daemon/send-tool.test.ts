@@ -523,6 +523,15 @@ describe('send-tool', () => {
         agentType: worker.agentType, providerFamily: 'openai',
       },
     })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId,
+      identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+      status: 'implementing',
+    })).toMatchObject({ ok: true });
     const dispatchMessage = vi.fn().mockResolvedValue('delivered');
     const deps = {
       listSessions: () => [brain, worker], dispatchMessage,
@@ -548,6 +557,34 @@ describe('send-tool', () => {
     }
   });
 
+  it('refuses to fabricate an implementation no-progress blocker before a delegated assignment starts', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'delegated-is-not-implementation-no-progress';
+    const assignmentId = 'delegated-implementer';
+    const worker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1' });
+    const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Project Brain' });
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'wait for initial delivery',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn();
+    try {
+      await expect(reportImplementationNoProgressBlocker({ taskId, assignmentId }, {
+        listSessions: () => [brain, worker], dispatchMessage,
+      })).resolves.toEqual({ status: 'ignored', reason: 'implementation_not_started' });
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
   it('uses NEEDS_INPUT only when no unique same-project Brain can resolve the blocker', async () => {
     resetSupervisionTaskRegistryForTests();
     const registry = getSupervisionTaskRegistry();
@@ -562,6 +599,15 @@ describe('send-tool', () => {
         sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
         agentType: worker.agentType, providerFamily: 'openai',
       },
+    })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId,
+      identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+      status: 'implementing',
     })).toMatchObject({ ok: true });
     const dispatchMessage = vi.fn();
     try {

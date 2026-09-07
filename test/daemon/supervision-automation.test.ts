@@ -6026,6 +6026,42 @@ describe('SupervisionAutomation', () => {
       expect(registry.listEvents(taskId)).toContainEqual(expect.objectContaining({
         assignmentId, eventType: 'implementation_heartbeat', status: 'delegated',
       }));
+
+      mockTransportRuntime.pendingEntries.length = 0;
+      // Once the sole delegated wake is durable, a later runtime outage must
+      // not start the unavailable retry budget or park a blocker, even across
+      // every retry-limit window that would otherwise exhaust it.
+      removeSession(identity.sessionName);
+      const eventsBeforeOutage = registry.listEvents(taskId).length;
+      for (const minutes of [20, 40, 80, 160, 320, 640, 1_280]) {
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + minutes * 60_000);
+      }
+      expect(registry.listEvents(taskId)).toHaveLength(eventsBeforeOutage);
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+
+      // Restoring the durable session under a new runtime identity may repair
+      // observational fencing metadata, but still cannot mint another wake.
+      const reboundIdentity = liveWorkerIdentity(identity.sessionName);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 1_290 * 60_000);
+      await sleep(25);
+      expect(mockTransportRuntime.send, 'a queued assignment gets one wake-up, not a false implementation blocker')
+        .toHaveBeenCalledOnce();
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        status: 'delegated',
+        identity: {
+          sessionInstanceId: reboundIdentity.sessionInstanceId,
+          runtimeEpoch: reboundIdentity.runtimeEpoch,
+        },
+      });
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_heartbeat'
+        && event.payload?.source === 'implementation_watchdog'
+      ))).toHaveLength(1);
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_heartbeat'
+        && event.payload?.source === 'implementation_watchdog_runtime_unavailable'
+      ))).toHaveLength(0);
     });
 
     it('escalates one structured blocker instead of sending a second no-progress heartbeat', async () => {
@@ -6046,10 +6082,14 @@ describe('SupervisionAutomation', () => {
       expect(registry.createAssignment({
         assignmentId, taskId, role: 'implementer', identity, scopeFiles: ['src/noop.ts'], now: 2_000,
       })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing', now: 3_000 })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId, identity, status: 'implementing', now: 3_000,
+      })).toMatchObject({ ok: true });
       mockTransportRuntime.send.mockClear();
       mockTransportRuntimeWorking = false;
 
-      const firstDue = 2_000 + 10 * 60_000;
+      const firstDue = 3_000 + 10 * 60_000;
       await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       mockTransportRuntime.pendingEntries.length = 0;

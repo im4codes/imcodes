@@ -2540,6 +2540,13 @@ export async function reportImplementationNoProgressBlocker(
   if (isTerminalSupervisionTaskStatus(task.status) || isTerminalSupervisionTaskStatus(assignment.status)) {
     return { status: 'ignored', reason: 'terminal' };
   }
+  // No-progress escalation describes work that actually started. A delegated
+  // assignment may merely be waiting behind the original durable FIFO
+  // delivery, so treating it as failed implementation fabricates progress and
+  // blocks the same object before the worker can claim it.
+  if (assignment.status !== 'implementing') {
+    return { status: 'ignored', reason: 'implementation_not_started' };
+  }
 
   const sessions = (deps.listSessions ?? listSessions)();
   const reporter = sessions.find((session) => (
