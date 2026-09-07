@@ -231,17 +231,267 @@ function recoveryRequest(taskId: string, implementerId: string) {
 }
 
 describe('same-object successor finish/recovery convergence', () => {
+  it('finishes a successor audit after its implementer retained the predecessor attempt projection', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = r1ReworkThenBoundR2(
+      registry, database, 'successor-audit-stale-predecessor-attempt', 'rework', false,
+    );
+    const task = registry.getTaskRecord(shape.taskId)!;
+    const implementer = registry.getAssignment(shape.implementerId)!;
+    database.prepare('UPDATE supervision_tasks SET status = ?, payload_json = ? WHERE task_id = ?')
+      .run('ready_for_audit', JSON.stringify({
+        ...task,
+        status: 'ready_for_audit',
+        integrationBundle: integrationBundle(shape.taskId, shape.implementerId, R2),
+      }), shape.taskId);
+    database.prepare(
+      'UPDATE supervision_task_assignments SET status = ?, payload_json = ? WHERE assignment_id = ?',
+    ).run('ready_for_audit', JSON.stringify({
+      ...implementer,
+      status: 'ready_for_audit',
+      auditAttemptId: R1_ATTEMPT,
+      verdict: 'REWORK',
+      blocker: 'bounded recovery trigger is missing',
+    }), shape.implementerId);
+    expect(registry.getAssignment(shape.implementerId)).toMatchObject({
+      auditAttemptId: R1_ATTEMPT,
+      auditRevision: R2,
+      verdict: 'REWORK',
+      validationState: 'passed',
+    });
+
+    const attemptId = 'successor-audit-r2-attempt';
+    const auditorIdentity = identity('successor-audit-r2-auditor', 'claude-code-sdk', 'anthropic');
+    const auditor = registry.createAssignment({
+      taskId: shape.taskId,
+      assignmentId: 'successor-audit-r2-auditor',
+      role: 'auditor',
+      required: false,
+      identity: auditorIdentity,
+      auditAttemptId: attemptId,
+      auditRevision: R2,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditorIdentity,
+      status: 'auditing',
+      auditAttemptId: attemptId,
+      auditRevision: R2,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId: shape.taskId,
+      auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity,
+      auditorSessionName: auditorIdentity.sessionName,
+      attemptId,
+      revision: R2,
+      receiptKind: 'final',
+      verdict: 'PASS',
+      findings: 'successor closes predecessor rework',
+      validations: [],
+    })).toMatchObject({ ok: true });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditorIdentity,
+      revision: R2,
+    })).toMatchObject({ ok: true, value: { status: 'finalized', verdict: 'PASS' } });
+    expect(registry.getTaskRecord(shape.taskId)?.status).toBe('ready_for_integration');
+    expect(registry.getAssignment(shape.implementerId)).toMatchObject({
+      status: 'ready_for_integration',
+      auditAttemptId: attemptId,
+      auditRevision: R2,
+      verdict: 'PASS',
+      crossVendorAuditPassed: true,
+    });
+    registry.close();
+    database.close();
+  });
+
+  it('does not finish when a successor implementer carries an unproven stale attempt', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = r1ReworkThenBoundR2(
+      registry, database, 'successor-audit-unproven-stale-attempt', 'rework', false,
+    );
+    const task = registry.getTaskRecord(shape.taskId)!;
+    const implementer = registry.getAssignment(shape.implementerId)!;
+    database.prepare('UPDATE supervision_tasks SET status = ?, payload_json = ? WHERE task_id = ?')
+      .run('ready_for_audit', JSON.stringify({
+        ...task,
+        status: 'ready_for_audit',
+        integrationBundle: integrationBundle(shape.taskId, shape.implementerId, R2),
+      }), shape.taskId);
+    database.prepare(
+      'UPDATE supervision_task_assignments SET status = ?, payload_json = ? WHERE assignment_id = ?',
+    ).run('ready_for_audit', JSON.stringify({
+      ...implementer,
+      status: 'ready_for_audit',
+      auditAttemptId: R1_ATTEMPT,
+      verdict: 'REWORK',
+    }), shape.implementerId);
+    database.prepare(
+      `DELETE FROM supervision_task_events
+       WHERE task_id = ? AND assignment_id = ? AND payload_json LIKE ?`,
+    ).run(shape.taskId, shape.implementerId, `%${R1_ATTEMPT}%`);
+    const attemptId = 'successor-audit-unproven-r2-attempt';
+    const auditorIdentity = identity('successor-audit-unproven-r2-auditor', 'claude-code-sdk', 'anthropic');
+    const auditor = registry.createAssignment({
+      taskId: shape.taskId,
+      assignmentId: 'successor-audit-unproven-r2-auditor',
+      role: 'auditor',
+      required: false,
+      identity: auditorIdentity,
+      auditAttemptId: attemptId,
+      auditRevision: R2,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.appendMatchingAuditReceipt({
+      taskId: shape.taskId,
+      auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity,
+      auditorSessionName: auditorIdentity.sessionName,
+      attemptId,
+      revision: R2,
+      receiptKind: 'final',
+      verdict: 'PASS',
+      findings: 'must remain blocked',
+      validations: [],
+    })).toMatchObject({ ok: true });
+    const before = registry.get(shape.taskId);
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditorIdentity,
+      revision: R2,
+    })).toEqual({ ok: false, reason: 'old_audit_attempt' });
+    expect(registry.get(shape.taskId)).toEqual(before);
+    registry.close();
+    database.close();
+  });
+
+  it('does not finish a successor audit against a foreign-task integration bundle', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = r1ReworkThenBoundR2(
+      registry, database, 'successor-audit-foreign-task-bundle', 'rework', false,
+    );
+    const task = registry.getTaskRecord(shape.taskId)!;
+    const implementer = registry.getAssignment(shape.implementerId)!;
+    database.prepare('UPDATE supervision_tasks SET status = ?, payload_json = ? WHERE task_id = ?')
+      .run('ready_for_audit', JSON.stringify({
+        ...task,
+        status: 'ready_for_audit',
+        integrationBundle: {
+          ...integrationBundle(shape.taskId, shape.implementerId, R2),
+          taskId: 'foreign-task',
+        },
+      }), shape.taskId);
+    database.prepare(
+      'UPDATE supervision_task_assignments SET status = ?, payload_json = ? WHERE assignment_id = ?',
+    ).run('ready_for_audit', JSON.stringify({
+      ...implementer,
+      status: 'ready_for_audit',
+      auditAttemptId: R1_ATTEMPT,
+      verdict: 'REWORK',
+      blocker: 'bounded recovery trigger is missing',
+    }), shape.implementerId);
+
+    const attemptId = 'successor-audit-foreign-task-r2-attempt';
+    const auditorIdentity = identity(
+      'successor-audit-foreign-task-r2-auditor', 'claude-code-sdk', 'anthropic',
+    );
+    const auditor = registry.createAssignment({
+      taskId: shape.taskId,
+      assignmentId: 'successor-audit-foreign-task-r2-auditor',
+      role: 'auditor',
+      required: false,
+      identity: auditorIdentity,
+      auditAttemptId: attemptId,
+      auditRevision: R2,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.appendMatchingAuditReceipt({
+      taskId: shape.taskId,
+      auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity,
+      auditorSessionName: auditorIdentity.sessionName,
+      attemptId,
+      revision: R2,
+      receiptKind: 'final',
+      verdict: 'PASS',
+      findings: 'must not authorize a foreign-task bundle',
+      validations: [],
+    })).toMatchObject({ ok: true });
+    const taskBefore = registry.getTaskRecord(shape.taskId);
+    const assignmentsBefore = registry.listAssignments(shape.taskId);
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditorIdentity,
+      revision: R2,
+    })).toEqual({ ok: false, reason: 'old_audit_attempt' });
+    expect(registry.getTaskRecord(shape.taskId)).toEqual(taskBefore);
+    expect(registry.listAssignments(shape.taskId)).toEqual(assignmentsBefore);
+    registry.close();
+    database.close();
+  });
+
   it('clears only the exact predecessor bundle after a successor was pre-persisted', () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const shape = r1ReworkThenBoundR2(
       registry, database, 'prepersisted-successor-stale-bundle', 'rework', true,
     );
+    const implementer = registry.getAssignment(shape.implementerId)!;
+    database.prepare(
+      'UPDATE supervision_task_assignments SET payload_json = ? WHERE assignment_id = ?',
+    ).run(JSON.stringify({
+      ...implementer,
+      auditAttemptId: R1_ATTEMPT,
+      verdict: 'REWORK',
+      blocker: 'bounded recovery trigger is missing',
+    }), shape.implementerId);
     expect(registry.getTaskRecord(shape.taskId)?.integrationBundle?.revision).toBe(R1);
+    expect(registry.getAssignment(shape.implementerId)).toMatchObject({
+      auditAttemptId: R1_ATTEMPT,
+      auditRevision: R2,
+      verdict: 'REWORK',
+      blocker: 'bounded recovery trigger is missing',
+    });
 
     expect(registry.rebindTaskAssignmentRevision(recoveryRequest(shape.taskId, shape.implementerId)))
       .toMatchObject({ ok: true, value: { currentRevision: R2 } });
     expect(registry.getTaskRecord(shape.taskId)).not.toHaveProperty('integrationBundle');
+    const recovered = registry.getAssignment(shape.implementerId)!;
+    expect(recovered.auditRevision).toBe(R2);
+    expect(recovered).not.toHaveProperty('auditAttemptId');
+    expect(recovered).not.toHaveProperty('verdict');
+    expect(recovered).not.toHaveProperty('blocker');
+    registry.close();
+    database.close();
+  });
+
+  it('refuses to erase unrelated audit evidence from a pre-persisted successor', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = r1ReworkThenBoundR2(
+      registry, database, 'prepersisted-successor-foreign-audit', 'rework', true,
+    );
+    const assignment = registry.getAssignment(shape.implementerId)!;
+    database.prepare(
+      'UPDATE supervision_task_assignments SET payload_json = ? WHERE assignment_id = ?',
+    ).run(JSON.stringify({
+      ...assignment,
+      auditAttemptId: 'unrelated-target-attempt',
+      verdict: 'PASS',
+    }), shape.implementerId);
+
+    expect(registry.rebindTaskAssignmentRevision(recoveryRequest(shape.taskId, shape.implementerId)))
+      .toEqual({ ok: false, reason: 'conflicting_replay' });
+    expect(registry.getAssignment(shape.implementerId)).toMatchObject({
+      auditAttemptId: 'unrelated-target-attempt',
+      verdict: 'PASS',
+    });
     registry.close();
     database.close();
   });
@@ -260,6 +510,41 @@ describe('same-object successor finish/recovery convergence', () => {
     expect(registry.rebindTaskAssignmentRevision(recoveryRequest(shape.taskId, shape.implementerId)))
       .toEqual({ ok: false, reason: 'conflicting_replay' });
     expect(registry.getTaskRecord(shape.taskId)?.integrationBundle).toEqual(unrelated);
+    registry.close();
+    database.close();
+  });
+
+  it.each([
+    ['foreign task', 'foreign-task', undefined],
+    ['foreign source', undefined, 'foreign-implementer'],
+  ] as const)('refuses a same-revision bundle with %s authority', (
+    _label, foreignTaskId, foreignSourceAssignmentId,
+  ) => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const shape = r1ReworkThenBoundR2(
+      registry, database, `prepersisted-successor-${_label.replace(' ', '-')}`, 'rework', false,
+    );
+    const task = registry.getTaskRecord(shape.taskId)!;
+    const foreign = integrationBundle(shape.taskId, shape.implementerId, R2);
+    database.prepare('UPDATE supervision_tasks SET payload_json = ? WHERE task_id = ?')
+      .run(JSON.stringify({
+        ...task,
+        integrationBundle: {
+          ...foreign,
+          ...(foreignTaskId ? { taskId: foreignTaskId } : {}),
+          ...(foreignSourceAssignmentId
+            ? { sourceAssignmentId: foreignSourceAssignmentId } : {}),
+        },
+      }), shape.taskId);
+
+    expect(registry.rebindTaskAssignmentRevision(recoveryRequest(shape.taskId, shape.implementerId)))
+      .toEqual({ ok: false, reason: 'conflicting_replay' });
+    expect(registry.getTaskRecord(shape.taskId)?.integrationBundle).toMatchObject({
+      revision: R2,
+      taskId: foreignTaskId ?? shape.taskId,
+      sourceAssignmentId: foreignSourceAssignmentId ?? shape.implementerId,
+    });
     registry.close();
     database.close();
   });

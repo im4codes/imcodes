@@ -4237,6 +4237,7 @@ export class SupervisionTaskRegistry {
       }
       authenticatedAuditVerdict = verdict;
       if (receipts.length > 0) {
+        const allReceipts = this.listAuditReceipts(existing.taskId);
         const exact = assignments.filter((assignment) => assignment.role === 'implementer'
           && assignment.auditAttemptId === existing.auditAttemptId
           && assignment.auditRevision === existing.auditRevision);
@@ -4244,6 +4245,41 @@ export class SupervisionTaskRegistry {
           assignment.role === 'implementer'
           && AUDIT_RECEIPT_PENDING_TARGET_STATUSES.has(assignment.status)
         ));
+        const stalePredecessorProjection = pendingImplementers.filter((candidate) => {
+          if (!candidate.auditAttemptId
+            || candidate.auditAttemptId === existing.auditAttemptId
+            || candidate.auditRevision !== existing.auditRevision
+            || candidate.verdict?.trim().toUpperCase() !== 'REWORK'
+            || task.currentRevision !== existing.auditRevision
+            || task.validationState !== 'passed'
+            || candidate.validationState !== 'passed'
+            || task.integrationBundle?.taskId !== existing.taskId
+            || task.integrationBundle?.revision !== existing.auditRevision
+            || task.integrationBundle?.sourceAssignmentId !== candidate.assignmentId) return false;
+          const predecessorFinals = allReceipts.filter((receipt) => (
+            receipt.receiptKind === 'final'
+            && receipt.attemptId === candidate.auditAttemptId
+            && receipt.revision !== existing.auditRevision
+            && receipt.verdict === 'REWORK'
+          ));
+          if (predecessorFinals.length !== 1) return false;
+          const predecessor = predecessorFinals[0]!;
+          const predecessorAuditors = assignments.filter((assignment) => (
+            assignment.role === 'auditor'
+            && assignment.status === 'finalized'
+            && !assignment.leaseId
+            && assignment.assignmentId === predecessor.assignmentId
+            && assignment.auditAttemptId === predecessor.attemptId
+            && assignment.auditRevision === predecessor.revision
+            && assignment.verdict?.trim().toUpperCase() === 'REWORK'
+          ));
+          const implementerEvidence = this.listEvents(existing.taskId).some((event) => (
+            event.assignmentId === candidate.assignmentId
+            && event.payload?.auditAttemptId === predecessor.attemptId
+            && event.payload?.revision === predecessor.revision
+          ));
+          return predecessorAuditors.length === 1 && implementerEvidence;
+        });
         if (exact.length === 0) {
           const boundFallbacks = pendingImplementers.filter((assignment) => (
             assignment.auditAttemptId !== undefined || assignment.auditRevision !== undefined
@@ -4251,6 +4287,9 @@ export class SupervisionTaskRegistry {
           if (boundFallbacks.some((assignment) => (
             assignment.auditAttemptId !== undefined
             && assignment.auditAttemptId !== existing.auditAttemptId
+            && !stalePredecessorProjection.some((candidate) => (
+              candidate.assignmentId === assignment.assignmentId
+            ))
           ))) {
             return { ok: false, reason: 'old_audit_attempt' };
           }
@@ -4273,7 +4312,10 @@ export class SupervisionTaskRegistry {
           ? exact
           : revisionOnly.length > 0
             ? (pendingImplementers.length === 1 ? revisionOnly : pendingImplementers)
-            : unbound;
+            : stalePredecessorProjection.length > 0
+              ? (pendingImplementers.length === 1
+                ? stalePredecessorProjection : pendingImplementers)
+              : unbound;
         if (candidates.length !== 1) return { ok: false, reason: 'ambiguous_assignment' };
         authenticatedAuditTarget = candidates[0];
       }
@@ -5818,6 +5860,13 @@ export class SupervisionTaskRegistry {
           && sourceAuditor.auditRevision === fromRevision
           && sourceAuditor.verdict?.trim().toUpperCase() === sourceReceipt.verdict,
         );
+        const successorCarriesOnlySourceAuditProjection = Boolean(
+          sourceReceipt
+          && (!assignment.auditAttemptId
+            || assignment.auditAttemptId === sourceReceipt.attemptId)
+          && (!assignment.verdict
+            || assignment.verdict.trim().toUpperCase() === sourceReceipt.verdict),
+        );
         const targetReceipts = this.listAuditReceipts(taskId).filter((receipt) => (
           receipt.receiptKind === 'final' && receipt.revision === toRevision
         ));
@@ -5827,17 +5876,17 @@ export class SupervisionTaskRegistry {
         const integrationBundle = task.integrationBundle;
         const integrationBundleRecoverable = Boolean(
           !integrationBundle
-          || integrationBundle.revision === toRevision
-          || (fromRevision
-            && integrationBundle.revision === fromRevision
-            && integrationBundle.taskId === taskId
-            && integrationBundle.sourceAssignmentId === assignmentId),
+          || (integrationBundle.taskId === taskId
+            && integrationBundle.sourceAssignmentId === assignmentId
+            && (integrationBundle.revision === toRevision
+              || (fromRevision && integrationBundle.revision === fromRevision))),
         );
         const exactScope = sameStringArray([...targetScopeFiles].sort(), [...assignment.scopeFiles].sort());
         const worktreeWithinScope = worktreePaths.every((path) => targetScopeFiles.includes(path));
         const adoptable = Boolean(
           fromRevision
           && sourceAuthorityExact
+          && successorCarriesOnlySourceAuditProjection
           && activeImplementers.length === 1
           && activeImplementers[0]?.assignmentId === assignmentId
           && activeAuditors.length === 0
@@ -5884,6 +5933,19 @@ export class SupervisionTaskRegistry {
           scopeFiles: targetScopeFiles,
           leaseId: input.leaseAction === 'renew' ? this.#mintLeaseId() : assignment.leaseId,
           generation: input.leaseAction === 'renew' ? assignment.generation + 1 : assignment.generation,
+          // The successor revision columns may be committed before the
+          // predecessor audit projection is retired. Keeping that attempt or
+          // verdict makes the MCP postcondition reject an otherwise exact
+          // recovery and prevents the successor bundle from being refrozen.
+          // Clear only the source receipt proven above; unrelated audit
+          // evidence is rejected by successorCarriesOnlySourceAuditProjection.
+          auditAttemptId: undefined,
+          verdict: undefined,
+          blocker: undefined,
+          primaryReviewPassed: undefined,
+          crossVendorAuditPassed: undefined,
+          auditRoutingReason: undefined,
+          auditDegradedReason: undefined,
           updatedAt: now,
         };
         // The interrupted successor edge can leave the predecessor immutable
