@@ -1,7 +1,6 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { SessionRecord } from '../store/session-store.js';
-import { getPaneId, getPanePids } from '../agent/tmux.js';
 import {
   SESSION_RESOURCE_DEFAULTS,
   SESSION_RESOURCE_HANDLE_TYPE,
@@ -259,6 +258,14 @@ export async function initializeSessionResourceLifecycle(
   for (const record of records) {
     if (record.runtimeType === 'transport') continue;
     try {
+      // Imported lazily. `tmux.ts` resolves its terminal backend in a
+      // module-level initializer that THROWS when none is available — on
+      // Windows it requires `node-pty`. The controlled node reaches this file
+      // through computer-use-ipc and bundles no terminal backend, so a static
+      // import killed `imcodes-node.exe` at startup with
+      // "node-pty not found. Reinstall imcodes." before it could run at all.
+      // Nothing here needs a terminal until these calls actually happen.
+      const { getPaneId } = await import('../agent/tmux.js');
       const paneId = await getPaneId(record.name);
       if (!paneId) throw new Error('session_resource_tmux_identity_unavailable');
       await registerTmuxSessionResource({ ...record, paneId });
@@ -321,6 +328,7 @@ async function processMemoryRows(): Promise<ProcessMemoryRow[] | null> {
 
 export async function measureSessionProcessTreeRssBytes(record: SessionRecord): Promise<number | null> {
   if (record.runtimeType === 'transport') return 0;
+  const { getPanePids } = await import('../agent/tmux.js');
   const roots = new Set((await getPanePids(record.name)).map(Number).filter(Number.isSafeInteger));
   if (roots.size === 0) return null;
   const rows = await processMemoryRows();

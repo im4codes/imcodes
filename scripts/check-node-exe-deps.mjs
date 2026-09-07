@@ -6,6 +6,10 @@
 // Bundle the production entry with esbuild and fail on any reachable native
 // module instead.
 import { build } from 'esbuild';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const THIN_ENTRY = 'src/node/index.ts';
 // `ws` lazily requires these optional native accelerators inside try/catch; they
@@ -39,4 +43,51 @@ if (violations.length > 0) {
   for (const v of violations) console.error('   -', v);
   process.exit(1);
 }
-console.log(`✅ thin controlled-node dependency graph is native-free (${inputs.length} modules, node-pty and node-datachannel excluded).`);
+
+// Bundle membership was never the whole property, and checking only that let a
+// fleet-wide outage through. `src/agent/tmux.ts` never imports `node-pty`; it
+// calls `createRequire(...).resolve('node-pty')` from a module-level
+// initializer that THROWS when the addon is absent. esbuild therefore saw no
+// forbidden input, this guard printed a green line, and `imcodes-node.exe`
+// still died at startup on every Windows node with
+// "node-pty not found. Reinstall imcodes." — no process, so every self-upgrade
+// failed its post-restart health check and rolled back.
+//
+// Judge the built artifact by RUNNING it, not by reading the graph. Two earlier
+// attempts to infer this statically were both wrong: the metafile reports such
+// an edge with an unresolved specifier AND `external: true`, and an unused
+// static import is tree-shaken away entirely, so source-level reachability
+// reports violations that do not exist in the artifact.
+//
+// `IMCODES_MUX=conpty` makes that same module-level initializer throw on any
+// non-Windows host, so this reproduces the production failure mode portably:
+// if tmux is initialized eagerly the process dies before `--version` can run.
+const probeDir = mkdtempSync(join(tmpdir(), 'imcodes-node-eager-init-'));
+const probePath = join(probeDir, 'thin-entry.cjs');
+try {
+  await build({
+    entryPoints: [THIN_ENTRY],
+    bundle: true, platform: 'node', format: 'cjs', outfile: probePath,
+    external: OPTIONAL_NATIVE, logLevel: 'silent',
+    define: { 'process.env.WS_NO_BUFFER_UTIL': '"1"', 'process.env.WS_NO_UTF_8_VALIDATE': '"1"' },
+  });
+  const probe = spawnSync(process.execPath, [probePath, '--version'], {
+    encoding: 'utf8',
+    timeout: 60_000,
+    env: { ...process.env, IMCODES_MUX: 'conpty', IMCODES_TEST: '' },
+  });
+  if (probe.status !== 0) {
+    console.error('❌ thin controlled-node entry fails during module initialization:');
+    for (const line of (probe.stderr || '(no stderr)').split('\n').slice(0, 6)) {
+      console.error('   ' + line);
+    }
+    console.error('   A module reached by a STATIC import threw while loading. Import it');
+    console.error('   lazily at the call site (`await import(...)`) so startup cannot depend on it.');
+    process.exit(1);
+  }
+} finally {
+  rmSync(probeDir, { recursive: true, force: true });
+}
+
+console.log(`✅ thin controlled-node dependency graph is native-free (${inputs.length} modules, node-pty and node-datachannel excluded)`
+  + ', and its bundle completes module initialization with no terminal backend available.');
