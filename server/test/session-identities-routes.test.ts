@@ -106,27 +106,24 @@ describe('/api/session-identities', () => {
     expect(await other.json()).toEqual({ profiles: [] });
   });
 
-  it('enforces optimistic revision on update and delete', async () => {
+  it('uses explicit last-write-wins semantics for update and delete', async () => {
     const body = { scope: 'project', scopeKey: 'repo-1', content: 'Project identity' };
     await app.request('/api/session-identities', {
       method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
-    const stale = await app.request('/api/session-identities', {
+    const overwritten = await app.request('/api/session-identities', {
       method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, content: 'stale', expectedRevision: 0 }),
     });
-    expect(stale.status).toBe(409);
+    expect(overwritten.status).toBe(200);
+    expect(await overwritten.json()).toMatchObject({ profile: { revision: 2, content: 'stale' } });
     const updated = await app.request('/api/session-identities', {
       method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, content: 'v2', expectedRevision: 1 }),
     });
-    expect(await updated.json()).toMatchObject({ profile: { revision: 2, content: 'v2' } });
+    expect(await updated.json()).toMatchObject({ profile: { revision: 3, content: 'v2' } });
 
-    const badDelete = await app.request('/api/session-identities?scope=project&scopeKey=repo-1&expectedRevision=1', {
-      method: 'DELETE', headers: { Authorization: bearer() },
-    });
-    expect(badDelete.status).toBe(409);
-    const deleted = await app.request('/api/session-identities?scope=project&scopeKey=repo-1&expectedRevision=2', {
+    const deleted = await app.request('/api/session-identities?scope=project&scopeKey=repo-1&expectedRevision=1', {
       method: 'DELETE', headers: { Authorization: bearer() },
     });
     expect(await deleted.json()).toEqual({ deleted: true });

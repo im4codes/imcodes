@@ -1581,13 +1581,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const contentReason = sessionIdentityContentError(content, scopeValue);
       if (contentReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, contentReason);
-      const expectedRevision = numberArg(args, 'expectedRevision');
       const saved = await identitySet({
         scope: scopeValue,
         scopeKey: identityScopeKey(scopeValue, target),
         content: normalizeSessionIdentityContent(content),
         ...(filePath ? { sourceFile: filePath } : {}),
-        ...(expectedRevision !== undefined ? { expectedRevision } : {}),
       }, identityOptions);
       if (saved.status !== 'ok') return saved;
       const refreshed = await refreshAffectedIdentities(scopeValue, target);
@@ -1611,11 +1609,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         && callerRecord?.role !== 'brain') {
         return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may clear user/project identity defaults');
       }
-      const expectedRevision = numberArg(args, 'expectedRevision');
       const cleared = await identityClear(
         scopeValue,
         identityScopeKey(scopeValue, target),
-        expectedRevision,
+        undefined,
         identityOptions,
       );
       if (cleared.status !== 'ok') return cleared;

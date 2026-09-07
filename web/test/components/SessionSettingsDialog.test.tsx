@@ -186,7 +186,6 @@ describe('SessionSettingsDialog supervision', () => {
       scope: 'session',
       scopeKey: 'srv-1:deck_proj_brain',
       content: 'You are the release engineer.',
-      expectedRevision: 0,
     }));
     expect(ws.send).toHaveBeenCalledWith({
       type: 'session.identity.refresh',
@@ -196,26 +195,15 @@ describe('SessionSettingsDialog supervision', () => {
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
-  it('rebases one explicit identity update when another client advanced the revision', async () => {
-    let sessionFetches = 0;
+  it('directly overwrites an existing identity without optimistic revision coupling', async () => {
     fetchSessionIdentityProfileMock.mockImplementation(async (scope: string) => {
       if (scope !== 'session') return null;
-      sessionFetches += 1;
       return {
         scope: 'session', scopeKey: 'srv-1:deck_proj_brain',
-        content: sessionFetches === 1 ? 'Old identity' : 'Changed elsewhere',
-        contentHash: 'hash', revision: sessionFetches === 1 ? 4 : 5,
-        updatedAt: sessionFetches, source: 'web',
+        content: 'Old identity', contentHash: 'hash', revision: 4,
+        updatedAt: 1, source: 'web',
       };
     });
-    saveSessionIdentityProfileMock
-      .mockRejectedValueOnce(Object.assign(new Error('API 409: revision_conflict'), {
-        status: 409, code: 'revision_conflict',
-      }))
-      .mockResolvedValueOnce({
-        scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'My explicit update',
-        contentHash: 'hash', revision: 6, updatedAt: 3, source: 'web',
-      });
 
     render(
       <SessionSettingsDialog
@@ -230,9 +218,10 @@ describe('SessionSettingsDialog supervision', () => {
     fireEvent.input(identity, { target: { value: 'My explicit update' } });
     fireEvent.click(screen.getByRole('button', { name: 'identityApply' }));
 
-    await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledTimes(2));
-    expect(saveSessionIdentityProfileMock.mock.calls.map(([input]) => input.expectedRevision)).toEqual([4, 5]);
-    expect(screen.queryByText(/revision_conflict/)).toBeNull();
+    await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledOnce());
+    expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith({
+      scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'My explicit update',
+    });
   });
 
   it('reuses the host file browser, uploads its content, and records the selected source path', async () => {

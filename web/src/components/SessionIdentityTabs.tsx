@@ -21,12 +21,6 @@ import { FileBrowser, type FileBrowserPreviewState } from './file-browser-lazy.j
 type Draft = { content: string; initial: string; revision: number; sourceFile: string; loaded: boolean };
 const emptyDraft = (): Draft => ({ content: '', initial: '', revision: 0, sourceFile: '', loaded: false });
 
-function isRevisionConflict(reason: unknown): boolean {
-  if (!reason || typeof reason !== 'object') return false;
-  const candidate = reason as { status?: unknown; code?: unknown };
-  return candidate.status === 409 && candidate.code === 'revision_conflict';
-}
-
 export function SessionIdentityTabs({
   serverId,
   sessionName,
@@ -105,35 +99,14 @@ export function SessionIdentityTabs({
       let profile: SessionIdentityProfile | null = null;
       const contentChanged = content !== draft.initial;
       if (content && contentChanged) {
-        const persist = (expectedRevision: number) => saveSessionIdentityProfile({
+        profile = await saveSessionIdentityProfile({
           scope: activeScope,
           scopeKey: scopeKey[activeScope],
           content,
-          expectedRevision,
           ...(draft.sourceFile ? { sourceFile: draft.sourceFile } : {}),
         });
-        try {
-          profile = await persist(draft.revision);
-        } catch (reason) {
-          if (!isRevisionConflict(reason)) throw reason;
-          // The same identity can be edited from another browser, machine, or
-          // MCP call. An explicit Apply is a last-writer decision, so rebase it
-          // once on the authoritative row instead of surfacing a raw 409. The
-          // bounded retry preserves CAS protection if another writer races us
-          // again while the retry is in flight.
-          const current = await fetchSessionIdentityProfile(activeScope, scopeKey[activeScope]);
-          profile = current?.content === content && (current.sourceFile ?? '') === draft.sourceFile
-            ? current
-            : await persist(current?.revision ?? 0);
-        }
       } else if (!content && contentChanged && draft.revision > 0) {
-        try {
-          await clearSessionIdentityProfile(activeScope, scopeKey[activeScope], draft.revision);
-        } catch (reason) {
-          if (!isRevisionConflict(reason)) throw reason;
-          const current = await fetchSessionIdentityProfile(activeScope, scopeKey[activeScope]);
-          if (current) await clearSessionIdentityProfile(activeScope, scopeKey[activeScope], current.revision);
-        }
+        await clearSessionIdentityProfile(activeScope, scopeKey[activeScope]);
       }
       if (contentChanged) {
         setDrafts((current) => ({

@@ -466,7 +466,6 @@ export async function saveSessionIdentityProfile(input: {
   scope: SessionIdentityScope;
   scopeKey: string;
   content: string;
-  expectedRevision?: number;
   sourceFile?: string;
 }): Promise<SessionIdentityProfile> {
   const response = await apiFetch<{ profile: SessionIdentityProfile }>(SESSION_IDENTITY_API_PATH, {
@@ -480,10 +479,8 @@ export async function saveSessionIdentityProfile(input: {
 export async function clearSessionIdentityProfile(
   scope: SessionIdentityScope,
   scopeKey: string,
-  expectedRevision?: number,
 ): Promise<boolean> {
-  const suffix = expectedRevision === undefined ? '' : `&expectedRevision=${expectedRevision}`;
-  const response = await apiFetch<{ deleted: boolean }>(`${sessionIdentityQuery(scope, scopeKey)}${suffix}`, {
+  const response = await apiFetch<{ deleted: boolean }>(sessionIdentityQuery(scope, scopeKey), {
     method: 'DELETE',
   });
   return response.deleted;

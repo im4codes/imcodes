@@ -456,7 +456,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       target: stringSchema('Exact session name. Omit for the current session.'),
       content: stringSchema(`Inline identity contract: user scope up to 10,000 characters, project up to 20,000, session up to 30,000; all scopes also enforce ${SESSION_IDENTITY_MAX_UTF8_BYTES} UTF-8 bytes.`),
       filePath: stringSchema('Identity document path. User/project scope requires a project-relative path; session scope also accepts an absolute daemon-host path. The daemon uploads content, never the local path.'),
-      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+      expectedRevision: numberSchema('Deprecated compatibility field; ignored because identity saves are explicit last-write-wins operations.', { minimum: 0 }),
     }, ['identityScope']),
     outputSchema: statusSchema,
   },
@@ -466,7 +466,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     inputSchema: objectSchema({
       identityScope: { type: 'string', enum: [...SESSION_IDENTITY_SCOPE_LIST], description: 'user, project, or session.' },
       target: stringSchema('Exact session name. Omit for the current session.'),
-      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+      expectedRevision: numberSchema('Deprecated compatibility field; ignored because identity clears are explicit last-write-wins operations.', { minimum: 0 }),
     }, ['identityScope']),
     outputSchema: statusSchema,
   },

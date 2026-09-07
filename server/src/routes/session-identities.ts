@@ -61,11 +61,6 @@ sessionIdentityRoutes.put('/', async (c) => {
   const contentReason = sessionIdentityContentError(body.content, scope);
   if (contentReason) return c.json({ error: contentReason }, 400);
   const content = normalizeSessionIdentityContent(String(body.content));
-  const expectedRevision = typeof body.expectedRevision === 'number'
-    && Number.isSafeInteger(body.expectedRevision)
-    && body.expectedRevision >= 0
-    ? body.expectedRevision
-    : undefined;
   const sourceFile = typeof body.sourceFile === 'string' ? body.sourceFile.trim() : '';
   if (Array.from(sourceFile).length > SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS || sourceFile.includes('\0')) {
     return c.json({ error: 'identity_source_file_invalid' }, 400);
@@ -77,10 +72,8 @@ sessionIdentityRoutes.put('/', async (c) => {
     content,
     contentHash: createHash('sha256').update(content).digest('hex'),
     source: c.req.header('X-Server-Id') ? 'mcp' : 'web',
-    expectedRevision,
     sourceFile: sourceFile || undefined,
   });
-  if (result === 'revision_conflict') return c.json({ error: result }, 409);
   return c.json({ profile: result });
 });
 
@@ -89,15 +82,11 @@ sessionIdentityRoutes.delete('/', async (c) => {
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
   const scopeKey = normalizedScopeKey(scope, c.req.query('scopeKey'));
   if (scopeKey === null) return c.json({ error: 'identity_scope_key_invalid' }, 400);
-  const revisionText = c.req.query('expectedRevision');
-  const expectedRevision = revisionText && /^\d+$/.test(revisionText) ? Number(revisionText) : undefined;
   const result = await deleteSessionIdentityProfile(
     c.env.DB,
     c.get('userId' as never) as string,
     scope,
     scopeKey,
-    expectedRevision,
   );
-  if (result === 'revision_conflict') return c.json({ error: result }, 409);
   return c.json({ deleted: result === 'deleted' });
 });

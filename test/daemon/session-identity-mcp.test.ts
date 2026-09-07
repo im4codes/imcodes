@@ -97,7 +97,6 @@ describe('session identity MCP tools', () => {
       scope: 'session',
       scopeKey: 'srv-1:deck_proj_cc1',
       content: 'You are the release engineer.',
-      expectedRevision: 0,
     }, {});
     expect(applyEffectiveIdentity).toHaveBeenCalledTimes(1);
   });

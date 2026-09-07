@@ -170,9 +170,10 @@ export async function setSessionIdentityProfile(
   input: { scope: SessionIdentityScope; scopeKey: string; content: string; expectedRevision?: number; sourceFile?: string },
   options: SessionIdentityClientOptions = {},
 ): Promise<IdentityWriteResult> {
+  const { expectedRevision: _ignoredExpectedRevision, ...lastWriteWinsInput } = input;
   const result = await request(options, input.scope, input.scopeKey, {
     method: 'PUT',
-    body: JSON.stringify(input),
+    body: JSON.stringify(lastWriteWinsInput),
   });
   if (result.status !== 'ok') return result;
   const profile = profileFrom(result.body.profile);
@@ -182,12 +183,10 @@ export async function setSessionIdentityProfile(
 export async function clearSessionIdentityProfile(
   scope: SessionIdentityScope,
   scopeKey: string,
-  expectedRevision: number | undefined,
+  _expectedRevision: number | undefined,
   options: SessionIdentityClientOptions = {},
 ): Promise<IdentityDeleteResult> {
-  const query = new URLSearchParams();
-  if (expectedRevision !== undefined) query.set('expectedRevision', String(expectedRevision));
-  const result = await request(options, scope, scopeKey, { method: 'DELETE' }, query);
+  const result = await request(options, scope, scopeKey, { method: 'DELETE' });
   if (result.status !== 'ok') return result;
   return { status: 'ok', deleted: result.body.deleted === true };
 }

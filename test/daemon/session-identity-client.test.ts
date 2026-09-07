@@ -23,30 +23,32 @@ describe('session identity online client', () => {
     }));
   });
 
-  it('sends optimistic revisions and maps a conflict without leaking credentials', async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse({ error: 'revision_conflict' }, 409));
+  it('ignores legacy optimistic revisions and sends a last-write-wins update', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ profile: {
+      scope: 'session', scopeKey: 'srv-1:deck_proj_cc1', content: 'identity',
+      contentHash: 'hash', revision: 5, updatedAt: 1, source: 'mcp',
+    } }));
     const result = await setSessionIdentityProfile({
       scope: 'session',
       scopeKey: 'srv-1:deck_proj_cc1',
       content: 'identity',
       expectedRevision: 4,
     }, { endpoint, fetchImpl });
-    expect(result).toMatchObject({ status: 'error', reason: 'revision_conflict' });
+    expect(result).toMatchObject({ status: 'ok', profile: { revision: 5 } });
     const [url, init] = fetchImpl.mock.calls[0]!;
     expect(String(url)).toContain('scope=session');
     expect(String(url)).toContain('scopeKey=srv-1%3Adeck_proj_cc1');
     expect(JSON.parse(String(init.body))).toEqual({
-      scope: 'session', scopeKey: 'srv-1:deck_proj_cc1', content: 'identity', expectedRevision: 4,
+      scope: 'session', scopeKey: 'srv-1:deck_proj_cc1', content: 'identity',
     });
-    expect(JSON.stringify(result)).not.toContain('secret-token');
   });
 
-  it('passes the expected revision when clearing one scope', async () => {
+  it('ignores the legacy expected revision when clearing one scope', async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ deleted: true }));
     await expect(clearSessionIdentityProfile('project', 'repo-1', 7, { endpoint, fetchImpl }))
       .resolves.toEqual({ status: 'ok', deleted: true });
     const [url, init] = fetchImpl.mock.calls[0]!;
-    expect(String(url)).toContain('expectedRevision=7');
+    expect(String(url)).not.toContain('expectedRevision');
     expect(init.method).toBe('DELETE');
   });
 });
