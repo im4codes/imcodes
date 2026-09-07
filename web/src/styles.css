@@ -8206,6 +8206,44 @@ html.native-ios-mac .chat-dl-btn {
 .qp-machine-status.is-unverified { color: #94a3b8; }
 .qp-machine-status.is-unreachable { color: #fbbf24; }
 .qp-machine-status.is-unauthorized { color: #f87171; }
+.qp-verification-authorize {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(125, 211, 252, 0.14);
+}
+.qp-verification-authorize-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #cbd5e1;
+  font-size: 11px;
+}
+.qp-verification-authorize-header select {
+  min-height: 30px;
+  border: 1px solid rgba(71, 85, 105, 0.65);
+  border-radius: 6px;
+  color: #dbeafe;
+  background: rgba(15, 23, 42, 0.82);
+  padding: 4px 8px;
+}
+.qp-verification-source-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.qp-verification-source-list button {
+  min-height: 32px;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 7px;
+  color: #bae6fd;
+  background: rgba(8, 145, 178, 0.09);
+  cursor: pointer;
+}
+.qp-verification-source-list button:hover:not(:disabled) { background: rgba(8, 145, 178, 0.18); }
+.qp-verification-source-list button:disabled { cursor: wait; opacity: 0.55; }
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }

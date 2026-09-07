@@ -904,9 +904,12 @@
     "confirm_delete": "Delete this item?",
     "tab_verification": "Verification",
     "verification_hint": "Authorized long-lived targets for real-device testing. Select one to reference it in the message.",
-    "verification_empty": "No authorized verification machines. Add one from Controlled Nodes.",
+    "verification_empty": "No authorized verification machines yet. Choose an alias or controlled node below.",
     "verification_error": "Could not load verification machines.",
-    "verification_reference": "Use authorized verification machine \"{{alias}}\" (verificationMachineId: {{id}}, target: {{target}}) for real-device testing."
+    "verification_reference": "Use authorized verification machine \"{{alias}}\" (verificationMachineId: {{id}}, target: {{target}}) for real-device testing.",
+    "verification_add": "Authorize from an existing source",
+    "verification_authorize_alias": "Alias: {{name}}",
+    "verification_authorize_node": "Node: {{name}}"
   },
   "file_browser": {
     "title_dir": "Select Directory",

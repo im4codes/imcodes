@@ -904,9 +904,12 @@
     "confirm_delete": "Удалить этот элемент?",
     "tab_verification": "Проверка",
     "verification_hint": "Постоянно разрешённые цели для тестирования на реальных устройствах. Выберите цель, чтобы добавить ссылку.",
-    "verification_empty": "Нет разрешённых машин проверки. Добавьте машину в разделе управляемых узлов.",
+    "verification_empty": "Авторизованных проверочных машин пока нет. Выберите ниже псевдоним или управляемый узел.",
     "verification_error": "Не удалось загрузить машины проверки.",
-    "verification_reference": "Используйте разрешённую машину проверки «{{alias}}» (verificationMachineId: {{id}}, цель: {{target}}) для тестирования на реальном устройстве."
+    "verification_reference": "Используйте разрешённую машину проверки «{{alias}}» (verificationMachineId: {{id}}, цель: {{target}}) для тестирования на реальном устройстве.",
+    "verification_add": "Авторизовать из существующего источника",
+    "verification_authorize_alias": "Псевдоним: {{name}}",
+    "verification_authorize_node": "Управляемый узел: {{name}}"
   },
   "file_browser": {
     "title_dir": "Выбрать директорию",

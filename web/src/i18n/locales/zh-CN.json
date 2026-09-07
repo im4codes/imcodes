@@ -904,9 +904,12 @@
     "confirm_delete": "确认删除？",
     "tab_verification": "验证设备",
     "verification_hint": "已授权用于真机测试的长期设备。选择后会把稳定引用加入消息。",
-    "verification_empty": "暂无授权验证设备，请在“受控节点”中添加。",
+    "verification_empty": "尚无已授权验证设备，请在下方选择别名或受控节点。",
     "verification_error": "无法加载验证设备。",
-    "verification_reference": "使用已授权验证设备“{{alias}}”（verificationMachineId：{{id}}，目标：{{target}}）进行真机测试。"
+    "verification_reference": "使用已授权验证设备“{{alias}}”（verificationMachineId：{{id}}，目标：{{target}}）进行真机测试。",
+    "verification_add": "从已有来源授权",
+    "verification_authorize_alias": "别名：{{name}}",
+    "verification_authorize_node": "受控节点：{{name}}"
   },
   "file_browser": {
     "title_dir": "选择目录",

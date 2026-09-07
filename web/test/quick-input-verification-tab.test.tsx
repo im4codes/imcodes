@@ -11,6 +11,8 @@ import type { VerificationMachineProfile } from '../../shared/verification-machi
 
 const mocks = vi.hoisted(() => ({
   listVerificationMachines: vi.fn(),
+  setVerificationMachine: vi.fn(),
+  aliases: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock('react-i18next', () => ({
@@ -19,12 +21,13 @@ vi.mock('react-i18next', () => ({
 vi.mock('../src/components/file-browser-lazy.js', () => ({ FileBrowser: () => null }));
 vi.mock('../src/hooks/useAliases.js', () => ({
   useAliases: () => ({
-    aliases: [], filtered: [], loaded: true, loading: false, error: null,
+    aliases: mocks.aliases, filtered: mocks.aliases, loaded: true, loading: false, error: null,
     refetch: vi.fn(), create: vi.fn(), remove: vi.fn(),
   }),
 }));
 vi.mock('../src/api/verification-machines.js', () => ({
   listVerificationMachines: mocks.listVerificationMachines,
+  setVerificationMachine: mocks.setVerificationMachine,
 }));
 
 import { QuickInputPanel } from '../src/components/QuickInputPanel.js';
@@ -65,6 +68,7 @@ function props(over: Record<string, unknown> = {}) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  mocks.aliases = [];
 });
 
 describe('QuickInputPanel verification-machine tab', () => {
@@ -104,5 +108,57 @@ describe('QuickInputPanel verification-machine tab', () => {
     await waitFor(() => expect(mocks.listVerificationMachines).toHaveBeenCalledOnce());
     await waitFor(() => expect(document.body.textContent).toContain('quick_input.verification_empty'));
     expect(document.body.textContent).not.toContain('Windows Lab');
+  });
+
+  it('authorizes a clicked SSH alias or controlled node without retyping its target', async () => {
+    mocks.aliases = [{
+      name: '211-gitlab',
+      value: 'ssh k@172.16.253.211',
+      tags: [],
+      createdAt: '',
+      updatedAt: '',
+      source: 'web',
+    }];
+    mocks.listVerificationMachines.mockResolvedValue([]);
+    mocks.setVerificationMachine.mockResolvedValue(profile);
+    render(<QuickInputPanel {...props({
+      projectKey: 'repo-1',
+      onInsertVerificationMachine: vi.fn(),
+      machines: [{
+        serverId: 'node-server',
+        nodeId: '1000000001',
+        displayName: 'Windows Lab',
+        online: true,
+        execEnabled: true,
+      }],
+    })} />);
+
+    const tab = Array.from(document.body.querySelectorAll('button'))
+      .find((button) => button.textContent?.includes('quick_input.tab_verification'))!;
+    fireEvent.click(tab);
+    await waitFor(() => expect(mocks.listVerificationMachines).toHaveBeenCalledOnce());
+
+    const aliasButton = Array.from(document.body.querySelectorAll('button'))
+      .find((button) => button.textContent?.includes('quick_input.verification_authorize_alias'))!;
+    fireEvent.click(aliasButton);
+    await waitFor(() => expect(mocks.setVerificationMachine).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'project',
+      scopeKey: 'repo-1',
+      alias: '211-gitlab',
+      kind: 'ssh',
+      target: 'k@172.16.253.211',
+    })));
+
+    const nodeButton = Array.from(document.body.querySelectorAll('button'))
+      .find((button) => button.textContent?.includes('quick_input.verification_authorize_node'))!;
+    await waitFor(() => expect(nodeButton.disabled).toBe(false));
+    fireEvent.click(nodeButton);
+    await waitFor(() => expect(mocks.setVerificationMachine).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'project',
+      scopeKey: 'repo-1',
+      alias: 'Windows Lab',
+      kind: 'controlled_node',
+      target: '1000000001',
+    })));
   });
 });

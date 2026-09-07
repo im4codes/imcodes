@@ -19,8 +19,14 @@ import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
 import { DEFAULT_QUICK_PHRASES, getDefaultQuickCommands } from '../quick-commands.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
-import type { VerificationMachineProfile } from '@shared/verification-machine.js';
-import { listVerificationMachines } from '../api/verification-machines.js';
+import {
+  VERIFICATION_MACHINE_KINDS,
+  VERIFICATION_MACHINE_SCOPES,
+  verificationMachineTargetError,
+  type VerificationMachineProfile,
+  type VerificationMachineScope,
+} from '@shared/verification-machine.js';
+import { listVerificationMachines, setVerificationMachine } from '../api/verification-machines.js';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -434,6 +440,16 @@ function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
   return text.slice(0, half) + '...' + text.slice(-half);
 }
 
+/** Accept a plain SSH Host token or the common alias value `ssh <host>`. */
+export function verificationTargetFromAliasValue(value: string): string | null {
+  const trimmed = value.trim();
+  const commandMatch = /^ssh\s+([^\s]+)$/u.exec(trimmed);
+  const target = commandMatch?.[1] ?? trimmed;
+  return verificationMachineTargetError(VERIFICATION_MACHINE_KINDS.SSH, target) === null
+    ? target
+    : null;
+}
+
 function formatPreviewText(text: string, max = TRUNCATE_THRESHOLD): string {
   return truncateMiddle(text.replace(/\r\n?/g, '\n').replace(/\n/g, ' ↵ '), max);
 }
@@ -462,6 +478,14 @@ export function QuickInputPanel({
   const [verificationMachines, setVerificationMachines] = useState<VerificationMachineProfile[]>([]);
   const [verificationLoading, setVerificationLoading] = useState(false);
   const [verificationError, setVerificationError] = useState(false);
+  const [verificationBusyTarget, setVerificationBusyTarget] = useState<string | null>(null);
+  const [verificationScope, setVerificationScope] = useState<VerificationMachineScope>(
+    projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER,
+  );
+  const enabledVerificationMachines = useMemo(
+    () => verificationMachines.filter((profile) => profile.enabled),
+    [verificationMachines],
+  );
 
   // ── Alias tab state ──
   // Server-authoritative alias data (create/remove invalidate the shared
@@ -486,8 +510,12 @@ export function QuickInputPanel({
   // opens on it), so aliases created elsewhere — e.g. by an agent via the
   // save_alias MCP tool, or on another device — show up without a manual reload.
   useEffect(() => {
-    if (open && activeTab === 'alias') refetchAliases();
+    if (open && (activeTab === 'alias' || activeTab === 'verification')) refetchAliases();
   }, [open, activeTab, refetchAliases]);
+
+  useEffect(() => {
+    setVerificationScope(projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER);
+  }, [projectKey]);
 
   useEffect(() => {
     if (!open || activeTab !== 'verification') return;
@@ -495,7 +523,7 @@ export function QuickInputPanel({
     setVerificationLoading(true);
     setVerificationError(false);
     void listVerificationMachines(projectKey).then((profiles) => {
-      if (live) setVerificationMachines(profiles.filter((profile) => profile.enabled));
+      if (live) setVerificationMachines(profiles);
     }).catch(() => {
       if (live) setVerificationError(true);
     }).finally(() => {
@@ -503,6 +531,36 @@ export function QuickInputPanel({
     });
     return () => { live = false; };
   }, [activeTab, open, projectKey]);
+
+  const authorizeVerificationTarget = async (input: {
+    alias: string;
+    kind: VerificationMachineProfile['kind'];
+    target: string;
+  }) => {
+    const existing = verificationMachines.find((profile) => (
+      profile.scope === verificationScope
+      && profile.kind === input.kind
+      && profile.target === input.target
+    ));
+    setVerificationBusyTarget(`${input.kind}:${input.target}`);
+    setVerificationError(false);
+    try {
+      await setVerificationMachine({
+        ...(existing ? { id: existing.id, expectedRevision: existing.revision } : {}),
+        scope: verificationScope,
+        scopeKey: verificationScope === VERIFICATION_MACHINE_SCOPES.PROJECT ? projectKey ?? '' : '',
+        alias: input.alias,
+        kind: input.kind,
+        target: input.target,
+        enabled: true,
+      });
+      setVerificationMachines(await listVerificationMachines(projectKey));
+    } catch {
+      setVerificationError(true);
+    } finally {
+      setVerificationBusyTarget(null);
+    }
+  };
 
   // A removed/revoked last machine must not strand the panel on a hidden tab.
   useEffect(() => {
@@ -792,10 +850,10 @@ export function QuickInputPanel({
             <div class="qp-alias-hint">{t('quick_input.verification_hint')}</div>
             {verificationLoading && <div class="qp-history-empty">{t('quick_input.loading')}</div>}
             {verificationError && <div class="qp-alias-error" role="alert">{t('quick_input.verification_error')}</div>}
-            {!verificationLoading && !verificationError && verificationMachines.length === 0 && (
+            {!verificationLoading && !verificationError && enabledVerificationMachines.length === 0 && (
               <div class="qp-history-empty">{t('quick_input.verification_empty')}</div>
             )}
-            {!verificationLoading && verificationMachines.map((machine) => (
+            {!verificationLoading && enabledVerificationMachines.map((machine) => (
               <button
                 key={machine.id}
                 type="button"
@@ -817,6 +875,67 @@ export function QuickInputPanel({
                 </span>
               </button>
             ))}
+            <div class="qp-verification-authorize">
+              <div class="qp-verification-authorize-header">
+                <strong>{t('quick_input.verification_add')}</strong>
+                <select
+                  aria-label={t('controlled_nodes.verification.scope')}
+                  value={verificationScope}
+                  onChange={(event) => setVerificationScope(
+                    (event.target as HTMLSelectElement).value as VerificationMachineScope,
+                  )}
+                >
+                  {projectKey && (
+                    <option value={VERIFICATION_MACHINE_SCOPES.PROJECT}>
+                      {t('controlled_nodes.verification.project_scope')}
+                    </option>
+                  )}
+                  <option value={VERIFICATION_MACHINE_SCOPES.USER}>
+                    {t('controlled_nodes.verification.user_scope')}
+                  </option>
+                </select>
+              </div>
+              <div class="qp-verification-source-list">
+                {allAliases.map((entry) => {
+                  const target = verificationTargetFromAliasValue(entry.value);
+                  if (!target) return null;
+                  const busyKey = `${VERIFICATION_MACHINE_KINDS.SSH}:${target}`;
+                  return (
+                    <button
+                      type="button"
+                      key={`alias:${entry.name}`}
+                      disabled={verificationBusyTarget !== null}
+                      onClick={() => { void authorizeVerificationTarget({
+                        alias: entry.name,
+                        kind: VERIFICATION_MACHINE_KINDS.SSH,
+                        target,
+                      }); }}
+                    >
+                      🔖 {t('quick_input.verification_authorize_alias', { name: entry.name })}
+                      {verificationBusyTarget === busyKey ? '…' : ''}
+                    </button>
+                  );
+                })}
+                {machines.filter((machine) => machine.nodeId).map((machine) => {
+                  const busyKey = `${VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE}:${machine.nodeId}`;
+                  return (
+                    <button
+                      type="button"
+                      key={`node:${machine.nodeId}`}
+                      disabled={verificationBusyTarget !== null}
+                      onClick={() => { void authorizeVerificationTarget({
+                        alias: machine.displayName,
+                        kind: VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE,
+                        target: machine.nodeId!,
+                      }); }}
+                    >
+                      🖥 {t('quick_input.verification_authorize_node', { name: machine.displayName })}
+                      {verificationBusyTarget === busyKey ? '…' : ''}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         )}
 

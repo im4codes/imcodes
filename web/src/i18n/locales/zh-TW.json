@@ -904,9 +904,12 @@
     "confirm_delete": "確認刪除？",
     "tab_verification": "驗證裝置",
     "verification_hint": "已授權用於真機測試的長期裝置。選取後會把穩定參照加入訊息。",
-    "verification_empty": "暫無授權驗證裝置，請在「受控節點」中新增。",
+    "verification_empty": "尚無已授權驗證設備，請在下方選擇別名或受控節點。",
     "verification_error": "無法載入驗證裝置。",
-    "verification_reference": "使用已授權驗證裝置「{{alias}}」（verificationMachineId：{{id}}，目標：{{target}}）進行真機測試。"
+    "verification_reference": "使用已授權驗證裝置「{{alias}}」（verificationMachineId：{{id}}，目標：{{target}}）進行真機測試。",
+    "verification_add": "從現有來源授權",
+    "verification_authorize_alias": "別名：{{name}}",
+    "verification_authorize_node": "受控節點：{{name}}"
   },
   "file_browser": {
     "title_dir": "選擇目錄",
