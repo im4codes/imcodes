@@ -10,6 +10,7 @@ import {
 } from '../db/session-identity-queries.js';
 import {
   SESSION_IDENTITY_SCOPES,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS,
   isSessionIdentityScope,
   normalizeSessionIdentityContent,
   sessionIdentityContentError,
@@ -65,6 +66,10 @@ sessionIdentityRoutes.put('/', async (c) => {
     && body.expectedRevision >= 0
     ? body.expectedRevision
     : undefined;
+  const sourceFile = typeof body.sourceFile === 'string' ? body.sourceFile.trim() : '';
+  if (Array.from(sourceFile).length > SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS || sourceFile.includes('\0')) {
+    return c.json({ error: 'identity_source_file_invalid' }, 400);
+  }
   const result = await upsertSessionIdentityProfile(c.env.DB, {
     userId: c.get('userId' as never) as string,
     scope,
@@ -73,6 +78,7 @@ sessionIdentityRoutes.put('/', async (c) => {
     contentHash: createHash('sha256').update(content).digest('hex'),
     source: c.req.header('X-Server-Id') ? 'mcp' : 'web',
     expectedRevision,
+    sourceFile: sourceFile || undefined,
   });
   if (result === 'revision_conflict') return c.json({ error: result }, 409);
   return c.json({ profile: result });

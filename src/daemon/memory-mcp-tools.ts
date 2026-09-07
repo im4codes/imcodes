@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { execFile } from 'node:child_process';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -184,6 +185,25 @@ import {
   setSessionIdentityProfile,
   type SessionIdentityClientOptions,
 } from './session-identity-mcp-client.js';
+import {
+  VERIFICATION_MACHINE_KIND_LIST,
+  VERIFICATION_MACHINE_KINDS,
+  VERIFICATION_MACHINE_SCOPE_LIST,
+  VERIFICATION_MACHINE_SCOPES,
+  VERIFICATION_MACHINE_STATUSES,
+  isVerificationMachineId,
+  normalizeVerificationMachineAlias,
+  normalizeVerificationMachineTarget,
+  verificationMachineAliasError,
+  verificationMachineTargetError,
+  type VerificationMachineStatus,
+} from '../../shared/verification-machine.js';
+import {
+  listVerificationMachineProfiles,
+  recordVerificationMachineProfileStatus,
+  removeVerificationMachineProfile,
+  setVerificationMachineProfile,
+} from './verification-machine-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
 
@@ -293,6 +313,11 @@ export interface MemoryMcpToolDeps {
   getEffectiveIdentityProfiles?: typeof getEffectiveSessionIdentityProfiles;
   setIdentityProfile?: typeof setSessionIdentityProfile;
   clearIdentityProfile?: typeof clearSessionIdentityProfile;
+  listVerificationMachines?: typeof listVerificationMachineProfiles;
+  setVerificationMachine?: typeof setVerificationMachineProfile;
+  removeVerificationMachine?: typeof removeVerificationMachineProfile;
+  recordVerificationMachineStatus?: typeof recordVerificationMachineProfileStatus;
+  verifySshHost?: (host: string) => Promise<boolean>;
   applyEffectiveIdentity?: (
     sessionName: string,
     prompt: string | undefined,
@@ -1162,6 +1187,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const identityGetEffective = deps.getEffectiveIdentityProfiles ?? getEffectiveSessionIdentityProfiles;
   const identitySet = deps.setIdentityProfile ?? setSessionIdentityProfile;
   const identityClear = deps.clearIdentityProfile ?? clearSessionIdentityProfile;
+  const verificationList = deps.listVerificationMachines ?? listVerificationMachineProfiles;
+  const verificationSet = deps.setVerificationMachine ?? setVerificationMachineProfile;
+  const verificationRemove = deps.removeVerificationMachine ?? removeVerificationMachineProfile;
+  const verificationRecordStatus = deps.recordVerificationMachineStatus ?? recordVerificationMachineProfileStatus;
+  const verifySshHost = deps.verifySshHost ?? ((host: string) => new Promise<boolean>((resolveResult) => {
+    execFile('ssh', [
+      '-o', 'BatchMode=yes',
+      '-o', 'ConnectTimeout=5',
+      '-o', 'ConnectionAttempts=1',
+      host,
+      'true',
+    ], { timeout: 8_000, windowsHide: true }, (err) => resolveResult(!err));
+  }));
   const identityApply = deps.applyEffectiveIdentity ?? (async (sessionName, prompt, options) => {
     const { applyEffectiveSessionIdentity } = await import('../agent/session-manager.js');
     return applyEffectiveSessionIdentity(sessionName, prompt, options);
@@ -1557,6 +1595,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         scope: scopeValue,
         scopeKey: identityScopeKey(scopeValue, target),
         content: normalizeSessionIdentityContent(content),
+        ...(filePath ? { sourceFile: filePath } : {}),
         ...(expectedRevision !== undefined ? { expectedRevision } : {}),
       }, identityOptions);
       if (saved.status !== 'ok') return saved;
@@ -1611,6 +1650,111 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         codexThreadResumePending: target.agentType === 'codex-sdk',
         applied: refreshed.applied,
       };
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['includeDisabled']);
+      const scoped = scopedCallerForDeps(caller, deps);
+      const projectKey = scoped.namespace.projectId?.trim() || scoped.projectName?.trim() || undefined;
+      const result = await verificationList(projectKey);
+      if (result.status !== 'ok') return result;
+      const includeDisabled = boolArg(args, 'includeDisabled') === true;
+      return {
+        status: 'ok',
+        projectKey: projectKey ?? null,
+        machines: result.profiles
+          .filter((profile) => includeDisabled || profile.enabled)
+          .map((profile) => ({ ...profile })),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET]: async (input) => {
+      const args = pickAllowedMcpArgs(input, [
+        'id', 'verificationScope', 'alias', 'kind', 'target', 'enabled', 'expectedRevision',
+      ]);
+      const scope = stringArg(args, 'verificationScope');
+      const kind = stringArg(args, 'kind');
+      const alias = stringArg(args, 'alias');
+      const target = stringArg(args, 'target');
+      if (!(VERIFICATION_MACHINE_SCOPE_LIST as readonly string[]).includes(scope ?? '')) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verificationScope is invalid');
+      }
+      if (!(VERIFICATION_MACHINE_KIND_LIST as readonly string[]).includes(kind ?? '')) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind is invalid');
+      }
+      const typedKind = kind as (typeof VERIFICATION_MACHINE_KIND_LIST)[number];
+      const aliasReason = verificationMachineAliasError(alias);
+      if (aliasReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, aliasReason);
+      const targetReason = verificationMachineTargetError(typedKind, target);
+      if (targetReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, targetReason);
+      const id = stringArg(args, 'id');
+      if (id !== undefined && !isVerificationMachineId(id)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine id is invalid');
+      }
+      const scoped = scopedCallerForDeps(caller, deps);
+      const projectKey = scoped.namespace.projectId?.trim() || scoped.projectName?.trim();
+      if (scope === VERIFICATION_MACHINE_SCOPES.PROJECT && !projectKey) {
+        return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'current project identity is unavailable');
+      }
+      return await verificationSet({
+        ...(id ? { id } : {}),
+        scope: scope as (typeof VERIFICATION_MACHINE_SCOPE_LIST)[number],
+        scopeKey: scope === VERIFICATION_MACHINE_SCOPES.USER ? '' : projectKey!,
+        alias: normalizeVerificationMachineAlias(alias!),
+        kind: typedKind,
+        target: normalizeVerificationMachineTarget(target!),
+        enabled: boolArg(args, 'enabled') ?? true,
+        ...(numberArg(args, 'expectedRevision') === undefined ? {} : { expectedRevision: numberArg(args, 'expectedRevision') }),
+      });
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id', 'expectedRevision']);
+      const id = stringArg(args, 'id');
+      if (!isVerificationMachineId(id)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine id is invalid');
+      return await verificationRemove(id, numberArg(args, 'expectedRevision'));
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!isVerificationMachineId(id)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine id is invalid');
+      const scoped = scopedCallerForDeps(caller, deps);
+      const projectKey = scoped.namespace.projectId?.trim() || scoped.projectName?.trim() || undefined;
+      const listed = await verificationList(projectKey);
+      if (listed.status !== 'ok') return listed;
+      const profile = listed.profiles.find((item) => item.id === id);
+      if (!profile) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine not found in the current scope');
+      let status: VerificationMachineStatus;
+      if (!profile.enabled) {
+        status = VERIFICATION_MACHINE_STATUSES.UNAUTHORIZED;
+      } else if (profile.kind === VERIFICATION_MACHINE_KINDS.SSH) {
+        status = await verifySshHost(profile.target)
+          ? VERIFICATION_MACHINE_STATUSES.VERIFIED
+          : VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+      } else if (!deps.machineDeps) {
+        status = VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+      } else {
+        try {
+          const machines = await deps.machineDeps.listMachines({ includeOffline: true });
+          const target = machines.find((machine) => machine.name === profile.target);
+          if (!target) {
+            status = VERIFICATION_MACHINE_STATUSES.UNAUTHORIZED;
+          } else if (!target.online || !target.execEnabled) {
+            status = VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+          } else {
+            const probe = await deps.machineDeps.execRemote({
+              machine: profile.target,
+              command: 'echo imcodes-verification',
+              timeoutMs: 10_000,
+            });
+            status = probe.outcome === REMOTE_EXEC_OUTCOMES[2] && probe.exitCode === 0
+              ? VERIFICATION_MACHINE_STATUSES.VERIFIED
+              : VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+          }
+        } catch {
+          status = VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+        }
+      }
+      const recorded = await verificationRecordStatus(id, status);
+      if (recorded.status !== 'ok') return recorded;
+      return { status: 'ok', verificationMachineId: id, verificationStatus: status, profile: recorded.profile };
     },
     [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: async (input) => {
       if (!deps.peerAuditReply) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit reply ingress is unavailable');
@@ -2428,6 +2572,25 @@ const schemas = {
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: z.object({
     target: z.string().optional().describe('Exact session name; defaults to the current session.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: z.object({
+    includeDisabled: z.boolean().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET]: z.object({
+    id: z.string().regex(/^[a-f0-9]{32}$/u).optional(),
+    verificationScope: z.enum(VERIFICATION_MACHINE_SCOPE_LIST),
+    alias: z.string(),
+    kind: z.enum(VERIFICATION_MACHINE_KIND_LIST),
+    target: z.string(),
+    enabled: z.boolean().optional(),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE]: z.object({
+    id: z.string().regex(/^[a-f0-9]{32}$/u),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]: z.object({
+    id: z.string().regex(/^[a-f0-9]{32}$/u),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: z.object({
     taskId: z.string(),

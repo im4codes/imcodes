@@ -101,6 +101,41 @@ html { position: fixed; }
   .supervision-task-console-transition { animation: none; }
   .supervision-task-console-progress > span { transition: none; }
 }
+
+.session-identity-tab-list {
+  display: flex;
+  gap: 6px;
+  margin: 7px 0 10px;
+}
+.session-identity-tab-list button {
+  min-height: 34px;
+  padding: 5px 14px;
+  border: 1px solid rgba(71, 85, 105, .65);
+  border-radius: 8px;
+  color: #94a3b8;
+  background: rgba(15, 23, 42, .72);
+}
+.session-identity-tab-list button.active {
+  color: #67e8f9;
+  border-color: rgba(34, 211, 238, .75);
+  background: rgba(8, 145, 178, .13);
+}
+.verification-machine-node-actions,
+.verification-machine-ssh-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.verification-machine-ssh-form input,
+.verification-machines-section select {
+  min-height: 36px;
+  border: 1px solid rgba(71, 85, 105, .65);
+  border-radius: 7px;
+  color: #dbeafe;
+  background: rgba(15, 23, 42, .82);
+  padding: 6px 10px;
+}
 /* Global: all fixed full-screen overlays respect iOS safe area (status bar/notch) */
 .dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay { padding-top: var(--sat); }
 @media (max-width: 640px) { .fb-body-split .fb-preview { padding-top: var(--sat); } }
@@ -3887,7 +3922,8 @@ html.native-ios-mac .chat-dl-btn {
   line-height: 1.5;
 }
 .controlled-nodes-muted,
-.controlled-nodes-error {
+.controlled-nodes-error,
+.verification-machines-error {
   margin: 9px 0;
   padding: 9px 11px;
   border-radius: 7px;
@@ -3899,7 +3935,8 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(15, 23, 42, 0.5);
   color: #64748b;
 }
-.controlled-nodes-error {
+.controlled-nodes-error,
+.verification-machines-error {
   border: 1px solid rgba(248, 113, 113, 0.24);
   background: rgba(127, 29, 29, 0.13);
   color: #fca5a5;

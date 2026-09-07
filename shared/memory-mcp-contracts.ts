@@ -65,6 +65,11 @@ import {
   SESSION_IDENTITY_SCOPE_LIST,
   SESSION_IDENTITY_MAX_UTF8_BYTES,
 } from './session-identity.js';
+import {
+  VERIFICATION_MACHINE_KIND_LIST,
+  VERIFICATION_MACHINE_MCP_TOOLS,
+  VERIFICATION_MACHINE_SCOPE_LIST,
+} from './verification-machine.js';
 export {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
@@ -85,6 +90,10 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SESSION_IDENTITY_SET: SESSION_IDENTITY_MCP_TOOLS.SET,
   SESSION_IDENTITY_CLEAR: SESSION_IDENTITY_MCP_TOOLS.CLEAR,
   SESSION_IDENTITY_REFRESH: SESSION_IDENTITY_MCP_TOOLS.REFRESH,
+  VERIFICATION_MACHINE_LIST: VERIFICATION_MACHINE_MCP_TOOLS.LIST,
+  VERIFICATION_MACHINE_SET: VERIFICATION_MACHINE_MCP_TOOLS.SET,
+  VERIFICATION_MACHINE_REMOVE: VERIFICATION_MACHINE_MCP_TOOLS.REMOVE,
+  VERIFICATION_MACHINE_VERIFY: VERIFICATION_MACHINE_MCP_TOOLS.VERIFY,
   PEER_AUDIT_REPLY: 'peer_audit_reply',
   DELEGATION_REPLY: 'delegation_reply',
   SEND_LIST_TARGETS: 'send_list_targets',
@@ -130,6 +139,10 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
   MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
   MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
@@ -173,6 +186,10 @@ export const SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS = [
  * here is the shared role check the spec requires (10.12).
  */
 export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
   MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
   MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
   MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
@@ -459,6 +476,43 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     inputSchema: objectSchema({
       target: stringSchema('Exact session name. Omit for the current session.'),
     }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+    description: 'List long-lived verification machines authorized for the current user and project. Records use stable IDs; aliases may be renamed without breaking references.',
+    inputSchema: objectSchema({
+      includeDisabled: { type: 'boolean', description: 'Include disabled records.' },
+    }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+    description: 'Create or update a user/project verification-machine authorization. Controlled nodes bind their canonical nodeId; SSH stores only an SSH config Host token and never uploads credentials. Supply id to rename/update an existing record.',
+    inputSchema: objectSchema({
+      id: stringSchema('Stable 32-hex verificationMachineId. Omit only when creating.'),
+      verificationScope: { type: 'string', enum: [...VERIFICATION_MACHINE_SCOPE_LIST] },
+      alias: stringSchema('Mutable human-readable alias.'),
+      kind: { type: 'string', enum: [...VERIFICATION_MACHINE_KIND_LIST] },
+      target: stringSchema('Canonical controlled-node nodeId or local SSH config Host token.'),
+      enabled: { type: 'boolean' },
+      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+    }, ['verificationScope', 'alias', 'kind', 'target']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+    description: 'Remove a verification-machine authorization by stable verificationMachineId.',
+    inputSchema: objectSchema({
+      id: stringSchema('Stable 32-hex verificationMachineId.'),
+      expectedRevision: numberSchema('Optional optimistic-concurrency revision.', { minimum: 0 }),
+    }, ['id']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]: {
+    name: MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
+    description: 'Non-destructively verify one authorized machine by stable ID. Controlled nodes recheck current access, online state and exec permission. SSH runs BatchMode ssh using the daemon user\'s existing config/agent/keys.',
+    inputSchema: objectSchema({ id: stringSchema('Stable 32-hex verificationMachineId.') }, ['id']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: {

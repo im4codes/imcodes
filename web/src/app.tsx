@@ -7238,6 +7238,7 @@ export function App() {
           <ControlledNodesPanel
             onOpenRemoteDesktop={openRemoteDesktop}
             onOpenRemoteDesktopWall={openRemoteDesktopWall}
+            projectKey={activeSessionInfo?.contextNamespace?.projectId || activeSessionInfo?.project}
           />
         </FloatingPanel>
       )}
@@ -7412,6 +7413,7 @@ export function App() {
       {showNewSession && (
         <NewSessionDialog
           ws={wsRef.current}
+          serverId={selectedServerId ?? ''}
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
           isProviderConnected={isProviderConnected}
@@ -7604,6 +7606,8 @@ export function App() {
           activeModel={settingsTarget.activeModel}
           requestedModel={settingsTarget.requestedModel}
           providerId={settingsTarget.providerId}
+          projectKey={sessions.find((session) => session.name === settingsTarget.sessionName)?.contextNamespace?.projectId
+            || sessions.find((session) => session.name === settingsTarget.sessionName)?.project}
           peerAuditSessions={peerAuditSettingsSessions}
           poolSessionDialogOpen={poolAddTarget != null}
           onAddPoolSession={canCreateSubSession ? (pool) => {

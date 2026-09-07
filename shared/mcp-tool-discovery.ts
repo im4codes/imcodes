@@ -138,9 +138,10 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
  * The stable bootstrap is deliberately limited to the tools needed to discover
  * peers, report delegated/audit work, operate the supervision state machine, and
  * perform basic memory recall/recording/source expansion. Scheduling and exact
- * aliases are also core because agents rely on them across ordinary turns and
- * cached tool lists. Pins, machines, file transfer, computer use, capability
- * management and memory administration remain explicit-on-demand.
+ * aliases and verification-machine management are also core because agents
+ * rely on them across ordinary turns and cached tool lists. Pins, general
+ * machine control, file transfer, computer use, capability management and
+ * memory administration remain explicit-on-demand.
  */
 export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freeze([
   // delegation + audit receipts
@@ -167,6 +168,13 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   // cached bootstrap catalog. CRUD is discoverable as group:session-identity
   // so its schemas do not tax every unrelated turn.
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH,
+  // Verification targets must remain callable from the initial catalog. They
+  // are intentionally not lazy-loaded: an agent must be able to register or
+  // validate an authorized real-device target before deciding how to test.
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+  MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
   // Scheduling must work from cached tool lists and before a discovery turn.
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,

@@ -50,6 +50,8 @@ import { aliasRoutes } from './routes/aliases.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
 import { sessionIdentityRoutes } from './routes/session-identities.js';
 import { SESSION_IDENTITY_API_PATH } from '../../shared/session-identity.js';
+import { verificationMachineRoutes } from './routes/verification-machines.js';
+import { VERIFICATION_MACHINE_API_PATH } from '../../shared/verification-machine.js';
 import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
@@ -274,6 +276,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   // /api/* so it inherits the global CORS + CSRF middleware.
   app.route(ALIAS_API_PATH, aliasRoutes);
   app.route(SESSION_IDENTITY_API_PATH, sessionIdentityRoutes);
+  app.route(VERIFICATION_MACHINE_API_PATH, verificationMachineRoutes);
   app.route('/api/embedding', embeddingRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
   app.route('/api/auth/remote-desktop', remoteDesktopAccountAuthRoutes);

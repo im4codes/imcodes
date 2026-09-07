@@ -33,6 +33,7 @@ import { ShareSessionDialog } from './ShareSessionDialog.js';
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
+import { VerificationMachinesSection } from './VerificationMachinesSection.js';
 
 /**
  * Auto unlock exists only where the remote-desktop worker does: it is that
@@ -112,6 +113,7 @@ const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: str
 export interface ControlledNodesPanelProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
   onOpenRemoteDesktopWall?(): void;
+  projectKey?: string;
 }
 
 const CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH = 640;
@@ -119,6 +121,7 @@ const CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH = 640;
 export function ControlledNodesPanel({
   onOpenRemoteDesktop,
   onOpenRemoteDesktopWall,
+  projectKey,
 }: ControlledNodesPanelProps) {
   const { t, i18n } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
@@ -824,9 +827,11 @@ export function ControlledNodesPanel({
         </ul>
       </section>
 
+      <VerificationMachinesSection machines={machines} projectKey={projectKey} />
+
       <section class="controlled-nodes-section controlled-nodes-download-section">
         <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">02</span>
+          <span class="controlled-nodes-section-index">03</span>
           <h3>{t('controlled_nodes.add_title')}</h3>
         </div>
         {availLoading && <p class="controlled-nodes-muted">{t('controlled_nodes.loading_availability')}</p>}
@@ -937,7 +942,7 @@ export function ControlledNodesPanel({
 
       <section class="controlled-nodes-section controlled-nodes-usage-section">
         <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">03</span>
+          <span class="controlled-nodes-section-index">04</span>
           <h3>{t('controlled_nodes.usage_title')}</h3>
         </div>
         <ol class="controlled-nodes-usage">

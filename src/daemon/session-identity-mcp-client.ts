@@ -111,6 +111,7 @@ function profileFrom(value: unknown): SessionIdentityProfile | null {
     revision: row.revision,
     updatedAt: row.updatedAt,
     source: row.source === 'web' ? 'web' : 'mcp',
+    ...(typeof row.sourceFile === 'string' && row.sourceFile ? { sourceFile: row.sourceFile } : {}),
   };
 }
 
@@ -166,7 +167,7 @@ export async function listSessionIdentityProfiles(
 }
 
 export async function setSessionIdentityProfile(
-  input: { scope: SessionIdentityScope; scopeKey: string; content: string; expectedRevision?: number },
+  input: { scope: SessionIdentityScope; scopeKey: string; content: string; expectedRevision?: number; sourceFile?: string },
   options: SessionIdentityClientOptions = {},
 ): Promise<IdentityWriteResult> {
   const result = await request(options, input.scope, input.scopeKey, {

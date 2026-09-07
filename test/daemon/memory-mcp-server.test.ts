@@ -236,12 +236,18 @@ describe('memory MCP stdio server', () => {
       // shrunken allowlist and a leaked non-core tool both fail here.
       const bootstrapNames = bootstrap.tools.map((tool) => tool.name).sort();
       expect(bootstrapNames).toEqual([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE].sort());
-      expect(bootstrap.tools).toHaveLength(30);
+      expect(bootstrap.tools).toHaveLength(34);
       expect(new Set(bootstrapNames).size).toBe(bootstrapNames.length);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
       expect(bootstrapNames).toContain(MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES);
+      expect(bootstrapNames).toEqual(expect.arrayContaining([
+        MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST,
+        MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET,
+        MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE,
+        MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY,
+      ]));
       expect(bootstrapNames).toEqual(expect.arrayContaining([
         MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
         MEMORY_MCP_TOOL_NAMES.CRON_LIST,

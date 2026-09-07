@@ -25,6 +25,7 @@ export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentit
 });
 export const SESSION_IDENTITY_MAX_UTF8_BYTES = 120_000;
 export const SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS = 512;
+export const SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS = 1_024;
 export const SESSION_IDENTITY_API_PATH = '/api/session-identities';
 
 export const SESSION_IDENTITY_MCP_TOOLS = {
@@ -45,6 +46,8 @@ export interface SessionIdentityProfile {
   revision: number;
   updatedAt: number;
   source: 'web' | 'mcp';
+  /** Informational origin only. File bytes are uploaded; this path is never dereferenced remotely. */
+  sourceFile?: string;
 }
 
 export function isSessionIdentityScope(value: unknown): value is SessionIdentityScope {

@@ -159,7 +159,7 @@ describe('SessionSettingsDialog supervision', () => {
     const identity = await screen.findByLabelText('session-identity-content') as HTMLTextAreaElement;
     await waitFor(() => expect(identity.disabled).toBe(false));
     fireEvent.input(identity, { target: { value: 'You are the release engineer.' } });
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'identityApply' }));
 
     await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith({
       scope: 'session',
@@ -174,7 +174,7 @@ describe('SessionSettingsDialog supervision', () => {
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
-  it('reuses the host file browser and uploads content from outside the project, not its path', async () => {
+  it('reuses the host file browser, uploads its content, and records the selected source path', async () => {
     render(
       <SessionSettingsDialog
         serverId="srv-1"
@@ -197,12 +197,51 @@ describe('SessionSettingsDialog supervision', () => {
     expect(identity.value).toBe('Identity loaded outside the project.');
     expect(screen.getByText('identitySelectedFile')).toBeDefined();
 
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'identityApply' }));
     await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
       scopeKey: 'srv-1:deck_proj_brain',
       content: 'Identity loaded outside the project.',
     })));
-    expect(JSON.stringify(saveSessionIdentityProfileMock.mock.calls[0])).not.toContain('/home/k/identities');
+    expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
+      sourceFile: '/home/k/identities/release-agent.md',
+    }));
+  });
+
+  it('edits synchronized user and project identities from the three-tab settings surface', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        projectKey="repo-stable-id"
+        label="Brain"
+        description=""
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        ws={{ connected: true, send: vi.fn(), onMessage: () => () => undefined } as any}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findAllByRole('tab')).toHaveLength(3);
+    fireEvent.click(screen.getByRole('tab', { name: 'identityScope_user' }));
+    const userIdentity = screen.getByLabelText('session-identity-content') as HTMLTextAreaElement;
+    await waitFor(() => expect(userIdentity.disabled).toBe(false));
+    fireEvent.input(userIdentity, { target: { value: 'Shared across my machines.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'identityApply' }));
+    await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'user', scopeKey: '', content: 'Shared across my machines.',
+    })));
+
+    fireEvent.click(screen.getByRole('tab', { name: 'identityScope_project' }));
+    const projectIdentity = screen.getByLabelText('session-identity-content') as HTMLTextAreaElement;
+    await waitFor(() => expect(projectIdentity.disabled).toBe(false));
+    fireEvent.input(projectIdentity, { target: { value: 'Use this project role.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'identityApply' }));
+    await waitFor(() => expect(saveSessionIdentityProfileMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'project', scopeKey: 'repo-stable-id', content: 'Use this project role.',
+    })));
   });
 
   it('renders authoritative supervision read-only without forcing it off', () => {

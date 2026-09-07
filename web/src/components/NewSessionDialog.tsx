@@ -54,6 +54,10 @@ import {
   isCodeBuddyProviderId,
 } from "@shared/codebuddy.js";
 import { HERMES_AGENT_PROVIDER_ID } from "@shared/hermes-agent.js";
+import { SESSION_IDENTITY_SCOPES, normalizeSessionIdentityContent } from '@shared/session-identity.js';
+import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { saveSessionIdentityProfile } from '../api.js';
+import { SessionIdentityTabs } from './SessionIdentityTabs.js';
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
@@ -76,6 +80,7 @@ const responsiveDialogStyle = {
 
 interface Props {
   ws: WsClient | null;
+  serverId: string;
   onClose: () => void;
   onSessionStarted: (sessionName: string) => void;
   isProviderConnected: (id: string) => boolean;
@@ -106,6 +111,7 @@ function canUseGitRemoteClone(ws: WsClient | null): boolean {
 
 export function NewSessionDialog({
   ws,
+  serverId,
   onClose,
   onSessionStarted,
   isProviderConnected: _isProviderConnected,
@@ -122,6 +128,8 @@ export function NewSessionDialog({
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
+  const [pendingSessionIdentity, setPendingSessionIdentity] = useState('');
+  const [pendingSessionIdentitySourceFile, setPendingSessionIdentitySourceFile] = useState('');
   const [thinking, setThinking] = useState<TransportEffortLevel>("high");
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>("");
@@ -332,8 +340,23 @@ export function NewSessionDialog({
       pendingStartRef.current = null;
       setError("");
       setStarting(false);
-      onSessionStarted(sessionName);
-      onClose();
+      void (async () => {
+        if (pendingSessionIdentity.trim()) {
+          try {
+            await saveSessionIdentityProfile({
+              scope: SESSION_IDENTITY_SCOPES.SESSION,
+              scopeKey: `${serverId}:${sessionName}`,
+              content: normalizeSessionIdentityContent(pendingSessionIdentity),
+              ...(pendingSessionIdentitySourceFile ? { sourceFile: pendingSessionIdentitySourceFile } : {}),
+            });
+            ws.send({ type: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH, sessionName });
+          } catch {
+            onToast?.(t('session.identityCreateSaveFailed'));
+          }
+        }
+        onSessionStarted(sessionName);
+        onClose();
+      })();
     };
     const matchesPendingSession = (name: string, pending: PendingStart) =>
       name === pending.sessionName;
@@ -378,7 +401,7 @@ export function NewSessionDialog({
     });
 
     return unsub;
-  }, [ws, onClose, onSessionStarted]);
+  }, [onClose, onSessionStarted, onToast, pendingSessionIdentity, pendingSessionIdentitySourceFile, serverId, t, ws]);
 
   useEffect(() => {
     if (!ws || !starting) return;
@@ -709,6 +732,18 @@ export function NewSessionDialog({
             onClose={() => setShowDirBrowser(false)}
           />
         )}
+
+        <SessionIdentityTabs
+          serverId={serverId}
+          projectKey={project.trim() ? sanitizeProjectName(project.trim()) : undefined}
+          ws={ws}
+          pendingSessionIdentity={pendingSessionIdentity}
+          onPendingSessionIdentityChange={(content, sourceFile) => {
+            setPendingSessionIdentity(content);
+            setPendingSessionIdentitySourceFile(sourceFile);
+          }}
+          disabled={starting}
+        />
 
         <div class="form-group">
           <label>{t("new_session.git_remote_url")}</label>
@@ -1664,6 +1699,18 @@ export function NewSessionDialog({
             </div>
           </>
         )}
+
+        <SessionIdentityTabs
+          serverId={serverId}
+          projectKey={sanitizeProjectName(project.trim()) || undefined}
+          ws={ws}
+          pendingSessionIdentity={pendingSessionIdentity}
+          onPendingSessionIdentityChange={(content, sourceFile) => {
+            setPendingSessionIdentity(content);
+            setPendingSessionIdentitySourceFile(sourceFile);
+          }}
+          disabled={starting}
+        />
 
         <div class="form-group">
           <label>Default shell (for terminal sub-session)</label>

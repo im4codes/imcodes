@@ -4,18 +4,11 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import {
-  clearSessionIdentityProfile,
-  fetchSessionIdentityProfile,
-  patchSession,
-  patchSubSession,
-  saveSessionIdentityProfile,
-} from '../api.js';
+import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
-import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
@@ -79,13 +72,7 @@ import {
   type RuntimeModelPresetEntry,
 } from './RuntimeModelPresetSelector.js';
 import { mergeModelSuggestions } from '../../../src/shared/models/options.js';
-import {
-  SESSION_IDENTITY_MAX_CHARS,
-  SESSION_IDENTITY_SCOPES,
-  normalizeSessionIdentityContent,
-  sessionIdentityContentError,
-} from '@shared/session-identity.js';
-import { FileBrowser, type FileBrowserPreviewState } from './file-browser-lazy.js';
+import { SessionIdentityTabs } from './SessionIdentityTabs.js';
 
 interface Props {
   serverId: string;
@@ -109,6 +96,7 @@ interface Props {
   activeModel?: string | null;
   requestedModel?: string | null;
   providerId?: string | null;
+  projectKey?: string;
   /**
    * Ordinary sub-sessions already loaded by the App's HTTP session APIs and
    * enriched by live session sync. Settings must render this list directly;
@@ -798,6 +786,7 @@ export function SessionSettingsDialog({
   supervisionMode,
   activeModel,
   requestedModel,
+  projectKey,
   peerAuditSessions = [],
   onAddPoolSession,
   poolSessionDialogOpen = false,
@@ -838,13 +827,6 @@ export function SessionSettingsDialog({
 
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
-  const [sessionIdentity, setSessionIdentity] = useState('');
-  const [initialSessionIdentity, setInitialSessionIdentity] = useState('');
-  const [sessionIdentityRevision, setSessionIdentityRevision] = useState(0);
-  const [sessionIdentityLoaded, setSessionIdentityLoaded] = useState(false);
-  const [sessionIdentitySourcePath, setSessionIdentitySourcePath] = useState('');
-  const [sessionIdentityError, setSessionIdentityError] = useState('');
-  const [showSessionIdentityFileBrowser, setShowSessionIdentityFileBrowser] = useState(false);
   const [agentType, setAgentType] = useState(type);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -874,28 +856,6 @@ export function SessionSettingsDialog({
     setSupervision(initialSupervision);
     setPeerAuditTargetName(initialSupervision.auditTargetSessionName ?? null);
   }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
-
-  useEffect(() => {
-    let active = true;
-    const scopeKey = `${serverId}:${sessionName}`;
-    setSessionIdentityLoaded(false);
-    setSessionIdentityError('');
-    setSessionIdentitySourcePath('');
-    void fetchSessionIdentityProfile(SESSION_IDENTITY_SCOPES.SESSION, scopeKey)
-      .then((profile) => {
-        if (!active) return;
-        const content = profile?.content ?? '';
-        setSessionIdentity(content);
-        setInitialSessionIdentity(content);
-        setSessionIdentityRevision(profile?.revision ?? 0);
-        setSessionIdentityLoaded(true);
-      })
-      .catch((err) => {
-        if (!active) return;
-        setSessionIdentityError(err instanceof Error ? err.message : String(err));
-      });
-    return () => { active = false; };
-  }, [serverId, sessionName]);
 
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
@@ -1246,12 +1206,6 @@ export function SessionSettingsDialog({
     type,
   ]);
 
-  const hasSessionIdentityChanges = sessionIdentityLoaded
-    && sessionIdentity !== initialSessionIdentity;
-  const sessionIdentityValidationError = sessionIdentity.trim()
-    ? sessionIdentityContentError(sessionIdentity)
-    : null;
-
   const hasGlobalDefaultsChanges = useMemo(() => JSON.stringify({
     ...supervisorDefaults,
     executionPools: supervisorDefaultsExecutionPools,
@@ -1261,7 +1215,7 @@ export function SessionSettingsDialog({
     supervisorDefaultsExecutionPools,
   ]);
 
-  const hasChanges = hasSessionChanges || hasGlobalDefaultsChanges || hasSessionIdentityChanges;
+  const hasChanges = hasSessionChanges || hasGlobalDefaultsChanges;
 
   const renderTypeLabel = (value: string): string => {
     switch (value) {
@@ -1396,33 +1350,6 @@ export function SessionSettingsDialog({
               : {}),
           } : {}),
           executionPools: supervisorDefaultsExecutionPools,
-        });
-      }
-
-      if (hasSessionIdentityChanges) {
-        const scopeKey = `${serverId}:${sessionName}`;
-        const normalized = sessionIdentity.trim()
-          ? normalizeSessionIdentityContent(sessionIdentity)
-          : '';
-        if (normalized) {
-          await saveSessionIdentityProfile({
-            scope: SESSION_IDENTITY_SCOPES.SESSION,
-            scopeKey,
-            content: normalized,
-            expectedRevision: sessionIdentityRevision,
-          });
-        } else if (sessionIdentityRevision > 0) {
-          await clearSessionIdentityProfile(
-            SESSION_IDENTITY_SCOPES.SESSION,
-            scopeKey,
-            sessionIdentityRevision,
-          );
-        }
-        // Pull the just-written online value immediately. Codex keeps its
-        // thread/history and rebuilds cacheable baseInstructions on resume.
-        ws?.send({
-          type: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH,
-          sessionName,
         });
       }
 
@@ -1965,97 +1892,13 @@ export function SessionSettingsDialog({
             />
           </div>
 
-          {/* Exact-session Agent identity. Content is synchronized online;
-              a selected host file is read once and only its text is uploaded. */}
-          <div class="session-settings-field">
-            <div class="session-settings-label">{t('session.identityTitle')}</div>
-            <div style={{ color: '#94a3b8', fontSize: 12, lineHeight: 1.4, marginBottom: 8 }}>
-              {t('session.identityHelp')}
-            </div>
-            <textarea
-              class="input"
-              aria-label="session-identity-content"
-              value={sessionIdentity}
-              onInput={(e) => {
-                setSessionIdentity((e.target as HTMLTextAreaElement).value);
-                setSessionIdentitySourcePath('');
-                setSessionIdentityError('');
-              }}
-              rows={6}
-              style={{ width: '100%', resize: 'vertical' }}
-              disabled={saving || !sessionIdentityLoaded}
-              placeholder={t('session.identityPlaceholder')}
-            />
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-              {ws && (
-                <button
-                  type="button"
-                  class="btn btn-secondary"
-                  disabled={saving || !sessionIdentityLoaded}
-                  onClick={() => setShowSessionIdentityFileBrowser(true)}
-                >
-                  {t('session.identityChooseFile')}
-                </button>
-              )}
-              <button
-                type="button"
-                class="btn btn-secondary"
-                disabled={saving || !sessionIdentityLoaded || !sessionIdentity}
-                onClick={() => {
-                  setSessionIdentity('');
-                  setSessionIdentitySourcePath('');
-                  setSessionIdentityError('');
-                }}
-              >
-                {t('session.identityClear')}
-              </button>
-              <span style={{ color: '#64748b', fontSize: 12 }}>
-                {t('session.identityCharacterCount', {
-                  count: Array.from(sessionIdentity).length,
-                  limit: SESSION_IDENTITY_MAX_CHARS,
-                })}
-              </span>
-            </div>
-            {sessionIdentitySourcePath && (
-              <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 6, overflowWrap: 'anywhere' }}>
-                {t('session.identitySelectedFile', { path: sessionIdentitySourcePath })}
-              </div>
-            )}
-            {sessionIdentityValidationError && (
-              <div class="session-settings-error">{t('session.identityTooLarge')}</div>
-            )}
-            {sessionIdentityError && <div class="session-settings-error">{sessionIdentityError}</div>}
-          </div>
-
-          {showSessionIdentityFileBrowser && ws && (
-            <FileBrowser
-              ws={ws}
-              mode="file-single"
-              layout="modal"
-              initialPath="~"
-              serverId={serverId}
-              sessionName={sessionName}
-              scopeToSessionRoot={false}
-              readOnly
-              onConfirm={(paths, preview?: FileBrowserPreviewState) => {
-                const selectedPath = paths[0];
-                if (!selectedPath || preview?.status !== 'ok' || preview.path !== selectedPath) {
-                  setSessionIdentityError(t('session.identityPreviewRequired'));
-                  return;
-                }
-                const reason = sessionIdentityContentError(preview.content);
-                if (reason) {
-                  setSessionIdentityError(t('session.identityTooLarge'));
-                  return;
-                }
-                setSessionIdentity(preview.content);
-                setSessionIdentitySourcePath(selectedPath);
-                setSessionIdentityError('');
-                setShowSessionIdentityFileBrowser(false);
-              }}
-              onClose={() => setShowSessionIdentityFileBrowser(false)}
-            />
-          )}
+          <SessionIdentityTabs
+            serverId={serverId}
+            sessionName={sessionName}
+            projectKey={projectKey}
+            ws={ws}
+            disabled={saving}
+          />
 
           {/* Working directory */}
           <div class="session-settings-field">
@@ -2080,7 +1923,7 @@ export function SessionSettingsDialog({
 
         <div class="dialog-footer session-settings-footer">
           <button type="button" class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
-          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid || !globalDefaultsValid || !!sessionIdentityValidationError}>
+          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid || !globalDefaultsValid}>
             {saving ? t('common.loading') : t('common.save')}
           </button>
         </div>

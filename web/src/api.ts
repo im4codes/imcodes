@@ -466,6 +466,7 @@ export async function saveSessionIdentityProfile(input: {
   scopeKey: string;
   content: string;
   expectedRevision?: number;
+  sourceFile?: string;
 }): Promise<SessionIdentityProfile> {
   const response = await apiFetch<{ profile: SessionIdentityProfile }>(SESSION_IDENTITY_API_PATH, {
     method: 'PUT',

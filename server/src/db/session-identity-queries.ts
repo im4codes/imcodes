@@ -9,6 +9,7 @@ interface IdentityProfileRow {
   revision: number;
   updated_at: number;
   source: 'web' | 'mcp';
+  source_file: string | null;
 }
 
 function mapRow(row: IdentityProfileRow): SessionIdentityProfile {
@@ -20,6 +21,7 @@ function mapRow(row: IdentityProfileRow): SessionIdentityProfile {
     revision: Number(row.revision),
     updatedAt: Number(row.updated_at),
     source: row.source,
+    ...(row.source_file ? { sourceFile: row.source_file } : {}),
   };
 }
 
@@ -30,7 +32,7 @@ export async function getSessionIdentityProfile(
   scopeKey: string,
 ): Promise<SessionIdentityProfile | null> {
   const row = await db.queryOne<IdentityProfileRow>(
-    `SELECT scope, scope_key, content, content_hash, revision, updated_at, source
+    `SELECT scope, scope_key, content, content_hash, revision, updated_at, source, source_file
        FROM session_identity_profiles
       WHERE user_id = $1 AND scope = $2 AND scope_key = $3`,
     [userId, scope, scopeKey],
@@ -43,7 +45,7 @@ export async function listSessionIdentityProfiles(
   userId: string,
 ): Promise<SessionIdentityProfile[]> {
   const rows = await db.query<IdentityProfileRow>(
-    `SELECT scope, scope_key, content, content_hash, revision, updated_at, source
+    `SELECT scope, scope_key, content, content_hash, revision, updated_at, source, source_file
        FROM session_identity_profiles
       WHERE user_id = $1
       ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END,
@@ -63,6 +65,7 @@ export async function upsertSessionIdentityProfile(
     contentHash: string;
     source: 'web' | 'mcp';
     expectedRevision?: number;
+    sourceFile?: string;
   },
 ): Promise<SessionIdentityProfile | 'revision_conflict'> {
   const now = Date.now();
@@ -75,20 +78,22 @@ export async function upsertSessionIdentityProfile(
     input.source,
     now,
     input.expectedRevision ?? null,
+    input.sourceFile ?? null,
   ];
   const row = await db.queryOne<IdentityProfileRow>(
     `INSERT INTO session_identity_profiles
-       (user_id, scope, scope_key, content, content_hash, source, revision, updated_at)
-     SELECT $1, $2, $3, $4, $5, $6, 1, $7
+       (user_id, scope, scope_key, content, content_hash, source, revision, updated_at, source_file)
+     SELECT $1, $2, $3, $4, $5, $6, 1, $7, $9
       WHERE $8::bigint IS NULL OR $8::bigint = 0
      ON CONFLICT (user_id, scope, scope_key) DO UPDATE SET
        content = excluded.content,
        content_hash = excluded.content_hash,
        source = excluded.source,
+       source_file = excluded.source_file,
        revision = session_identity_profiles.revision + 1,
        updated_at = excluded.updated_at
       WHERE $8::bigint IS NULL OR session_identity_profiles.revision = $8::bigint
-     RETURNING scope, scope_key, content, content_hash, revision, updated_at, source`,
+     RETURNING scope, scope_key, content, content_hash, revision, updated_at, source, source_file`,
     values,
   );
   return row ? mapRow(row) : 'revision_conflict';
