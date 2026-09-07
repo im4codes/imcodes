@@ -6382,6 +6382,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onInsertAlias={insertAliasMarker}
             machines={machineAll}
             onInsertMachine={insertMachineMarker}
+            projectKey={activeSession?.contextNamespace?.projectId || activeSession?.project}
+            onInsertVerificationMachine={(machine) => appendToInput([
+              t('quick_input.verification_reference', {
+                alias: machine.alias,
+                id: machine.id,
+                target: machine.target,
+              }),
+            ])}
             anchorRef={quickWrapRef}
           />
         </div>

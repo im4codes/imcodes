@@ -19,6 +19,8 @@ import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
 import { DEFAULT_QUICK_PHRASES, getDefaultQuickCommands } from '../quick-commands.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import type { VerificationMachineProfile } from '@shared/verification-machine.js';
+import { listVerificationMachines } from '../api/verification-machines.js';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -412,6 +414,10 @@ interface Props {
   machines?: readonly MachineListItem[];
   /** Insert a canonical nodeId marker plus its human-readable display note. */
   onInsertMachine?: (nodeId: string, displayName: string) => void;
+  /** Stable project identity used to include project-scoped verification machines. */
+  projectKey?: string;
+  /** Insert one long-lived verification-machine reference into the composer. */
+  onInsertVerificationMachine?: (machine: VerificationMachineProfile) => void;
   anchorRef?: RefObject<HTMLElement>;
 }
 
@@ -419,7 +425,7 @@ const HISTORY_PAGE_SIZE = 10;
 const TRUNCATE_THRESHOLD = 40;
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
-type QpTab = 'quick' | 'files' | 'alias' | 'machines';
+type QpTab = 'quick' | 'files' | 'alias' | 'machines' | 'verification';
 
 /** Truncate long text: "start of text...end of text" */
 function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
@@ -437,7 +443,8 @@ export function QuickInputPanel({
   data, loaded,
   onAddCommand, onAddPhrase, onRemoveCommand, onRemovePhrase,
   onRemoveHistory, onRemoveSessionHistory, onClearHistory, onClearSessionHistory,
-  ws, sessionCwd, onAppendPaths, onInsertAlias, machines = [], onInsertMachine, anchorRef,
+  ws, sessionCwd, onAppendPaths, onInsertAlias, machines = [], onInsertMachine,
+  projectKey, onInsertVerificationMachine, anchorRef,
 }: Props) {
   const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -452,6 +459,9 @@ export function QuickInputPanel({
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
   const [insertedPaths, setInsertedPaths] = useState<string[]>([]);
   const [layoutTick, setLayoutTick] = useState(0);
+  const [verificationMachines, setVerificationMachines] = useState<VerificationMachineProfile[]>([]);
+  const [verificationLoading, setVerificationLoading] = useState(false);
+  const [verificationError, setVerificationError] = useState(false);
 
   // ── Alias tab state ──
   // Server-authoritative alias data (create/remove invalidate the shared
@@ -478,6 +488,21 @@ export function QuickInputPanel({
   useEffect(() => {
     if (open && activeTab === 'alias') refetchAliases();
   }, [open, activeTab, refetchAliases]);
+
+  useEffect(() => {
+    if (!open || activeTab !== 'verification') return;
+    let live = true;
+    setVerificationLoading(true);
+    setVerificationError(false);
+    void listVerificationMachines(projectKey).then((profiles) => {
+      if (live) setVerificationMachines(profiles.filter((profile) => profile.enabled));
+    }).catch(() => {
+      if (live) setVerificationError(true);
+    }).finally(() => {
+      if (live) setVerificationLoading(false);
+    });
+    return () => { live = false; };
+  }, [activeTab, open, projectKey]);
 
   // A removed/revoked last machine must not strand the panel on a hidden tab.
   useEffect(() => {
@@ -722,6 +747,9 @@ export function QuickInputPanel({
           <button class={`qp-tab${activeTab === 'alias' ? ' active' : ''}`} onClick={() => setActiveTab('alias')}>
             🔖 {t('alias.tab')}
           </button>
+          <button class={`qp-tab${activeTab === 'verification' ? ' active' : ''}`} onClick={() => setActiveTab('verification')}>
+            🧪 {t('quick_input.tab_verification')}
+          </button>
           {machines.length > 0 && (
             <button class={`qp-tab${activeTab === 'machines' ? ' active' : ''}`} onClick={() => setActiveTab('machines')}>
               🖥 {t('quick_input.tab_machines')}
@@ -753,6 +781,39 @@ export function QuickInputPanel({
                 </span>
                 <span class={`qp-machine-status ${machine.online ? 'is-online' : 'is-offline'}`}>
                   {machine.online ? t('machine.online') : t('machine.offline')}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {activeTab === 'verification' && (
+          <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_verification')}>
+            <div class="qp-alias-hint">{t('quick_input.verification_hint')}</div>
+            {verificationLoading && <div class="qp-history-empty">{t('quick_input.loading')}</div>}
+            {verificationError && <div class="qp-alias-error" role="alert">{t('quick_input.verification_error')}</div>}
+            {!verificationLoading && !verificationError && verificationMachines.length === 0 && (
+              <div class="qp-history-empty">{t('quick_input.verification_empty')}</div>
+            )}
+            {!verificationLoading && verificationMachines.map((machine) => (
+              <button
+                key={machine.id}
+                type="button"
+                class="qp-machine-item"
+                title={machine.target}
+                disabled={!onInsertVerificationMachine}
+                onClick={() => {
+                  if (!onInsertVerificationMachine) return;
+                  onInsertVerificationMachine(machine);
+                  onClose();
+                }}
+              >
+                <span class="qp-machine-item-main">
+                  <strong>{machine.alias}</strong>
+                  <code>{machine.target}</code>
+                </span>
+                <span class={`qp-machine-status is-${machine.lastVerificationStatus}`}>
+                  {t(`controlled_nodes.verification.status_${machine.lastVerificationStatus}`)}
                 </span>
               </button>
             ))}

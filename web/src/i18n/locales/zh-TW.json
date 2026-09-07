@@ -901,7 +901,12 @@
     "tab_quick": "快捷",
     "tab_files": "檔案",
     "tab_machines": "AI Desk",
-    "confirm_delete": "確認刪除？"
+    "confirm_delete": "確認刪除？",
+    "tab_verification": "驗證裝置",
+    "verification_hint": "已授權用於真機測試的長期裝置。選取後會把穩定參照加入訊息。",
+    "verification_empty": "暫無授權驗證裝置，請在「受控節點」中新增。",
+    "verification_error": "無法載入驗證裝置。",
+    "verification_reference": "使用已授權驗證裝置「{{alias}}」（verificationMachineId：{{id}}，目標：{{target}}）進行真機測試。"
   },
   "file_browser": {
     "title_dir": "選擇目錄",

@@ -901,7 +901,12 @@
     "tab_quick": "クイック",
     "tab_files": "ファイル",
     "tab_machines": "AI Desk",
-    "confirm_delete": "この項目を削除しますか？"
+    "confirm_delete": "この項目を削除しますか？",
+    "tab_verification": "検証端末",
+    "verification_hint": "実機テスト用に承認された永続的な端末です。選択すると安定した参照をメッセージへ追加します。",
+    "verification_empty": "承認済み検証端末はありません。［制御対象ノード］で追加してください。",
+    "verification_error": "検証端末を読み込めませんでした。",
+    "verification_reference": "承認済み検証端末「{{alias}}」（verificationMachineId: {{id}}、対象: {{target}}）で実機テストを行ってください。"
   },
   "file_browser": {
     "title_dir": "ディレクトリを選択",

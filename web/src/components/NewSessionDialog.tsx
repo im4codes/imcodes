@@ -1700,18 +1700,6 @@ export function NewSessionDialog({
           </>
         )}
 
-        <SessionIdentityTabs
-          serverId={serverId}
-          projectKey={sanitizeProjectName(project.trim()) || undefined}
-          ws={ws}
-          pendingSessionIdentity={pendingSessionIdentity}
-          onPendingSessionIdentityChange={(content, sourceFile) => {
-            setPendingSessionIdentity(content);
-            setPendingSessionIdentitySourceFile(sourceFile);
-          }}
-          disabled={starting}
-        />
-
         <div class="form-group">
           <label>Default shell (for terminal sub-session)</label>
           {shells.length > 0 ? (

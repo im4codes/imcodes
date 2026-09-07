@@ -901,7 +901,12 @@
     "tab_quick": "빠른",
     "tab_files": "파일",
     "tab_machines": "AI Desk",
-    "confirm_delete": "이 항목을 삭제하시겠습니까?"
+    "confirm_delete": "이 항목을 삭제하시겠습니까?",
+    "tab_verification": "검증 장치",
+    "verification_hint": "실기기 테스트용으로 승인된 장기 대상입니다. 선택하면 안정적인 참조를 메시지에 추가합니다.",
+    "verification_empty": "승인된 검증 장치가 없습니다. 제어 노드에서 추가하세요.",
+    "verification_error": "검증 장치를 불러오지 못했습니다.",
+    "verification_reference": "승인된 검증 장치 \"{{alias}}\"(verificationMachineId: {{id}}, 대상: {{target}})로 실기기 테스트를 수행하세요."
   },
   "file_browser": {
     "title_dir": "디렉토리 선택",

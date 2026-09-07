@@ -93,6 +93,15 @@ describe('NewSessionDialog', () => {
     expect(screen.getByPlaceholderText('~/projects/my-project')).toBeDefined();
   });
 
+  it('renders one user/project/session identity editor while creating a session', async () => {
+    render(<NewSessionDialog serverId="srv-1" ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    expect(await screen.findAllByRole('tab')).toHaveLength(3);
+    expect(screen.getByRole('tab', { name: 'identityScope_user' })).toBeDefined();
+    expect(screen.getByRole('tab', { name: 'identityScope_project' })).toBeDefined();
+    expect(screen.getByRole('tab', { name: 'identityScope_session' })).toBeDefined();
+    expect(screen.getAllByLabelText('session-identity-content')).toHaveLength(1);
+  });
+
   it('uses a newly created folder from the directory picker as the working directory', async () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 

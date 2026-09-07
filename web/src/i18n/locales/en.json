@@ -901,7 +901,12 @@
     "tab_quick": "Quick",
     "tab_files": "Files",
     "tab_machines": "AI Desk",
-    "confirm_delete": "Delete this item?"
+    "confirm_delete": "Delete this item?",
+    "tab_verification": "Verification",
+    "verification_hint": "Authorized long-lived targets for real-device testing. Select one to reference it in the message.",
+    "verification_empty": "No authorized verification machines. Add one from Controlled Nodes.",
+    "verification_error": "Could not load verification machines.",
+    "verification_reference": "Use authorized verification machine \"{{alias}}\" (verificationMachineId: {{id}}, target: {{target}}) for real-device testing."
   },
   "file_browser": {
     "title_dir": "Select Directory",

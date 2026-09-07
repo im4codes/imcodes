@@ -8202,6 +8202,10 @@ html.native-ios-mac .chat-dl-btn {
 }
 .qp-machine-status.is-online { color: #5eead4; }
 .qp-machine-status.is-offline { color: #94a3b8; }
+.qp-machine-status.is-verified { color: #5eead4; }
+.qp-machine-status.is-unverified { color: #94a3b8; }
+.qp-machine-status.is-unreachable { color: #fbbf24; }
+.qp-machine-status.is-unauthorized { color: #f87171; }
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }

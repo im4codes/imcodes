@@ -901,7 +901,12 @@
     "tab_quick": "Rápido",
     "tab_files": "Archivos",
     "tab_machines": "AI Desk",
-    "confirm_delete": "¿Eliminar este elemento?"
+    "confirm_delete": "¿Eliminar este elemento?",
+    "tab_verification": "Verificación",
+    "verification_hint": "Destinos autorizados y persistentes para pruebas en dispositivos reales. Selecciona uno para referenciarlo.",
+    "verification_empty": "No hay máquinas de verificación autorizadas. Añade una en Nodos controlados.",
+    "verification_error": "No se pudieron cargar las máquinas de verificación.",
+    "verification_reference": "Usa la máquina de verificación autorizada «{{alias}}» (verificationMachineId: {{id}}, destino: {{target}}) para pruebas reales."
   },
   "file_browser": {
     "title_dir": "Seleccionar directorio",
