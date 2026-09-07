@@ -1106,6 +1106,17 @@ async function parseSendIdentityArg(
   };
 }
 
+function sendIdentityProjectRoot(
+  caller: McpRuntimeCaller,
+  sessions: SessionRecord[],
+): string | null {
+  const injectedRoot = caller.projectRoot?.trim();
+  if (injectedRoot) return injectedRoot;
+  if (!caller.sessionName) return null;
+  const sessionRoot = sessions.find((session) => session.name === caller.sessionName)?.projectDir?.trim();
+  return sessionRoot || null;
+}
+
 function canManageProjectionNamespace(projectionNamespace: ContextNamespace, callerNamespace: ContextNamespace, callerUserId: string): boolean {
   if (serializeContextNamespace(projectionNamespace) === serializeContextNamespace(callerNamespace)) return true;
   if (projectionNamespace.scope !== 'personal' || callerNamespace.scope !== 'personal') return false;
@@ -1886,7 +1897,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
       const task = parseTaskArg(args.task);
       if (task === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task metadata is invalid');
-      const identity = await parseSendIdentityArg(args.identity, caller.projectRoot);
+      // A session's working project directory is authoritative even when the
+      // directory is not a Git checkout. Older/restored MCP registrations can
+      // omit PROJECT_ROOT, so recover it from the live session record before
+      // resolving a relative identity document.
+      const identity = await parseSendIdentityArg(args.identity, sendIdentityProjectRoot(caller, sessions));
       if (identity === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'identity is invalid');
       const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
       if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');

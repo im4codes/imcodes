@@ -981,7 +981,8 @@ describe('memory MCP tool schema firewall', () => {
 
   it('resolves an Agent identity file and carries the complete explicit config through MCP auto-provisioning', async () => {
     const root = mkdtempSync(join(tmpdir(), 'imc-agent-identity-'));
-    const identityPath = join(root, 'release-engineer.md');
+    const identityFile = 'release-engineer.md';
+    const identityPath = join(root, identityFile);
     writeFileSync(identityPath, '  You are the release engineer.  \n', 'utf8');
     const requestedBase = {
       agentType: 'claude-code-sdk',
@@ -1063,7 +1064,7 @@ describe('memory MCP tool schema firewall', () => {
         arguments: {
           message: 'ship the release',
           idempotencyKey: 'identity-file-auto-provision-1',
-          identity: { filePath: identityPath },
+          identity: { filePath: identityFile },
           task: {
             objective: 'ship the release',
             autoProvision: true,
@@ -1082,7 +1083,7 @@ describe('memory MCP tool schema firewall', () => {
         scope: 'session',
         scopeKey: `srv-1:${target.name}`,
         content: 'You are the release engineer.',
-        sourceFile: identityPath,
+        sourceFile: identityFile,
       }), expect.any(Object));
       expect(applyEffectiveIdentity).toHaveBeenCalledWith(
         target.name,
