@@ -481,6 +481,12 @@ describe('remote desktop worker artifact and IPC host', () => {
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-',
     ]);
     expect(script).toContain('CreateEnvironmentBlock(out env, primary, false)');
+    expect(script).toContain('const uint CREATE_NO_WINDOW = 0x08000000;');
+    expect(script).toContain('si.dwFlags = STARTF_USESHOWWINDOW;');
+    expect(script).toContain('si.wShowWindow = SW_HIDE;');
+    expect(script).toContain('uint creationFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;');
+    expect(script).toContain('CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, creationFlags');
+    expect(script).toContain('CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, cmd, creationFlags');
     expect(script).toContain('WTSGetActiveConsoleSessionId');
     expect(script).toContain('s.State == WTSDisconnected');
     expect(script).toContain('s.SessionID <= 0 || !HasUserToken(s.SessionID)');

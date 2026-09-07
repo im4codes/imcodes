@@ -104,6 +104,9 @@ public static class ImcodesUserProc {
   const int TokenElevationTypeLimited = 3;
   const int TokenSessionId = 12;
   const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+  const uint CREATE_NO_WINDOW = 0x08000000;
+  const int STARTF_USESHOWWINDOW = 0x00000001;
+  const short SW_HIDE = 0;
   const uint LOGON_WITH_PROFILE = 0x00000001;
   const int ERROR_PRIVILEGE_NOT_HELD = 1314;
   static bool HasUserToken(int sessionId) {
@@ -198,12 +201,21 @@ public static class ImcodesUserProc {
     IntPtr env;
     if (!CreateEnvironmentBlock(out env, primary, false)) env = IntPtr.Zero;
     try {
-      STARTUPINFO si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO)); si.lpDesktop = desktop;
+      STARTUPINFO si = new STARTUPINFO();
+      si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+      si.lpDesktop = desktop;
+      // Every process launched through this helper is an IM.codes background
+      // worker. CreateProcessAsUser otherwise allocates a visible console for
+      // console-subsystem executables such as cmd.exe/imcodes-node.exe, which
+      // made every remote Computer Use probe pop up a blank terminal window.
+      si.dwFlags = STARTF_USESHOWWINDOW;
+      si.wShowWindow = SW_HIDE;
       PROCESS_INFORMATION pi;
       string cmd = "\"" + exe + "\" " + argsLine;
-      if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) {
+      uint creationFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+      if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, creationFlags, env, null, ref si, out pi)) {
         int error = Marshal.GetLastWin32Error();
-        if (!allowTokenFallback || error != ERROR_PRIVILEGE_NOT_HELD || !CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, cmd, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) {
+        if (!allowTokenFallback || error != ERROR_PRIVILEGE_NOT_HELD || !CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, cmd, creationFlags, env, null, ref si, out pi)) {
           if (allowTokenFallback && error == ERROR_PRIVILEGE_NOT_HELD) error = Marshal.GetLastWin32Error();
           throw new System.ComponentModel.Win32Exception(error);
         }

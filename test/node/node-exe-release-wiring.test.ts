@@ -404,7 +404,7 @@ describe('controlled-node executable release wiring', () => {
     const copyScript = readFileSync('scripts/copy-computer-use-helper.mjs', 'utf8');
     const workflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
 
-    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.2.0');
+    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.3.3');
     expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
     expect(copyScript).toContain('Open Computer Use.app');
     expect(copyScript).toContain('open-computer-use.app.zip');

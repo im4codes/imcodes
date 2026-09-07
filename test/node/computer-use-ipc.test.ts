@@ -14,6 +14,7 @@ import {
   computerUseIpcPipePath,
   quoteWinArg,
   runComputerUseIpcHelper,
+  windowsComputerUseHelperLaunchSpecForTest,
   windowsPipeClientAclCommand,
 } from '../../src/node/computer-use-ipc.js';
 import { allowWindowsNamedPipeClients } from '../../src/node/windows-user-session.js';
@@ -37,6 +38,27 @@ describe('computer use IPC Windows argv quoting', () => {
 
   it('doubles trailing backslashes before the closing quote', () => {
     expect(quoteWinArg('C:\\Temp\\')).toBe('"C:\\Temp\\\\"');
+  });
+
+  it('launches the interactive helper directly instead of opening a cmd console', () => {
+    expect(windowsComputerUseHelperLaunchSpecForTest(
+      'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      '\\\\.\\pipe\\imcodes-computer-use-123',
+      undefined,
+    )).toEqual({
+      executable: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      argsLine: '"--computer-use-helper" "--pipe" "\\\\.\\pipe\\imcodes-computer-use-123"',
+    });
+  });
+
+  it('retains the JavaScript entry only when the runtime executable is node.exe', () => {
+    expect(windowsComputerUseHelperLaunchSpecForTest(
+      'C:\\Program Files\\nodejs\\node.exe',
+      '\\\\.\\pipe\\imcodes-computer-use-123',
+      'C:\\imcodes\\dist\\src\\node\\index.js',
+    ).argsLine).toBe(
+      '"C:\\imcodes\\dist\\src\\node\\index.js" "--computer-use-helper" "--pipe" "\\\\.\\pipe\\imcodes-computer-use-123"',
+    );
   });
 });
 

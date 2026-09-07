@@ -87,9 +87,12 @@ function pipePath(): string {
 
 export const quoteWinArg = quoteWindowsArgument;
 
-function helperArgv(pipe: string): string[] {
-  const entry = process.argv[1];
-  const isNodeRuntime = /(?:^|[/\\])node(?:\.exe)?$/i.test(process.execPath);
+function helperArgv(
+  pipe: string,
+  runtimeExecutable = process.execPath,
+  entry = process.argv[1],
+): string[] {
+  const isNodeRuntime = /(?:^|[/\\])node(?:\.exe)?$/i.test(runtimeExecutable);
   return isNodeRuntime && entry
     ? [entry, '--computer-use-helper', '--pipe', pipe]
     : ['--computer-use-helper', '--pipe', pipe];
@@ -104,19 +107,23 @@ function allowWindowsComputerUseHelperFiles(): void {
   applyWindowsAclCommands(windowsComputerUseHelperAclCommands(WINDOWS_DEFAULT_OCU_DIR));
 }
 
-function windowsCommandShellPath(): string {
-  return process.env.ComSpec?.trim() || 'C:\\Windows\\System32\\cmd.exe';
-}
-
-function windowsHelperCommandLine(exe: string, pipe: string): { shellExe: string; argsLine: string } {
-  const helperArgs = helperArgv(pipe).map(quoteWinArg).join(' ');
-  const helperCommand = `${quoteWinArg(exe)} ${helperArgs}`;
-  return { shellExe: windowsCommandShellPath(), argsLine: `/d /s /c "${helperCommand}"` };
+export function windowsComputerUseHelperLaunchSpecForTest(
+  exe: string,
+  pipe: string,
+  entry = process.argv[1],
+): { executable: string; argsLine: string } {
+  return {
+    executable: exe,
+    argsLine: helperArgv(pipe, exe, entry).map(quoteWinArg).join(' '),
+  };
 }
 
 function launchWindowsUserSessionHelper(exe: string, pipe: string): void {
-  const { shellExe, argsLine } = windowsHelperCommandLine(exe, pipe);
-  launchWindowsActiveUserCommand(shellExe, argsLine);
+  const { executable, argsLine } = windowsComputerUseHelperLaunchSpecForTest(exe, pipe);
+  // Launch the helper directly. Routing it through cmd.exe created an extra
+  // console-subsystem process on every GUI machine and made a blank console
+  // flash/persist whenever the OCU IPC helper was started.
+  launchWindowsActiveUserCommand(executable, argsLine);
 }
 
 function launchSameSessionHelper(exe: string, pipe: string): void {
