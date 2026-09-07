@@ -27,6 +27,7 @@ export function VerificationMachinesSection({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [sourceTab, setSourceTab] = useState<'alias' | 'controlled_node'>('alias');
   const [scope, setScope] = useState<VerificationMachineScope>(
     projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER,
   );
@@ -196,7 +197,28 @@ export function VerificationMachinesSection({
         {t('quick_input.verification_add')}
       </button>
       {pickerOpen && <div class="verification-machine-node-actions">
-        {aliases.filter((entry) => isAliasId(entry.id)).map((entry) => {
+        <div class="qp-verification-source-tabs" role="tablist" aria-label={t('quick_input.verification_source')}>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sourceTab === 'alias'}
+            class={sourceTab === 'alias' ? 'active' : ''}
+            onClick={() => setSourceTab('alias')}
+          >
+            🔖 {t('alias.tab')}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sourceTab === 'controlled_node'}
+            class={sourceTab === 'controlled_node' ? 'active' : ''}
+            onClick={() => setSourceTab('controlled_node')}
+          >
+            🖥 {t('quick_input.tab_machines')}
+          </button>
+        </div>
+        <div class="qp-verification-source-list">
+        {sourceTab === 'alias' && aliases.filter((entry) => isAliasId(entry.id)).map((entry) => {
           const current = profiles.find((item) => item.kind === VERIFICATION_MACHINE_KINDS.SSH
             && item.target === entry.id && item.scope === scope);
           return (
@@ -212,7 +234,7 @@ export function VerificationMachinesSection({
             </button>
           );
         })}
-        {machines.filter((machine) => machine.nodeId).map((machine) => {
+        {sourceTab === 'controlled_node' && machines.filter((machine) => machine.nodeId).map((machine) => {
           const current = profiles.find((item) => item.kind === VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE
             && item.target === machine.nodeId && item.scope === scope);
           return (
@@ -228,6 +250,7 @@ export function VerificationMachinesSection({
             </button>
           );
         })}
+        </div>
       </div>}
     </section>
   );

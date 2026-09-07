@@ -77,6 +77,7 @@ describe('VerificationMachinesSection', () => {
       displayName: 'Windows 11',
     } as any]} projectKey="repo-1" />);
     fireEvent.click(await screen.findByRole('button', { name: 'quick_input.verification_add' }));
+    fireEvent.click(await screen.findByRole('tab', { name: /quick_input.tab_machines/ }));
     fireEvent.click(await screen.findByRole('button', {
       name: 'controlled_nodes.verification.authorize_node:Windows 11',
     }));
@@ -92,6 +93,8 @@ describe('VerificationMachinesSection', () => {
   it('authorizes an existing alias by its stable id instead of accepting an SSH host field', async () => {
     render(<VerificationMachinesSection machines={[]} projectKey="repo-1" />);
     fireEvent.click(await screen.findByRole('button', { name: 'quick_input.verification_add' }));
+    expect(screen.getByRole('tab', { name: /alias.tab/ }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.queryByRole('button', { name: /controlled_nodes.verification.authorize_node/ })).toBeNull();
     expect(screen.queryByPlaceholderText('controlled_nodes.verification.ssh_host')).toBeNull();
     fireEvent.click(await screen.findByRole('button', {
       name: 'controlled_nodes.verification.authorize_alias:211-gitlab',

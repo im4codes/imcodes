@@ -432,6 +432,7 @@ const TRUNCATE_THRESHOLD = 40;
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
 type QpTab = 'quick' | 'files' | 'alias' | 'machines' | 'verification';
+type VerificationSourceTab = 'alias' | 'controlled_node';
 
 /** Truncate long text: "start of text...end of text" */
 function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
@@ -470,6 +471,7 @@ export function QuickInputPanel({
   const [verificationError, setVerificationError] = useState(false);
   const [verificationBusyTarget, setVerificationBusyTarget] = useState<string | null>(null);
   const [verificationPickerOpen, setVerificationPickerOpen] = useState(false);
+  const [verificationSourceTab, setVerificationSourceTab] = useState<VerificationSourceTab>('alias');
   const [verificationScope, setVerificationScope] = useState<VerificationMachineScope>(
     projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER,
   );
@@ -546,6 +548,7 @@ export function QuickInputPanel({
         enabled: true,
       });
       setVerificationMachines(await listVerificationMachines(projectKey));
+      setVerificationPickerOpen(false);
     } catch {
       setVerificationError(true);
     } finally {
@@ -901,8 +904,28 @@ export function QuickInputPanel({
                   </option>
                 </select>
               </div>
+              <div class="qp-verification-source-tabs" role="tablist" aria-label={t('quick_input.verification_source')}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={verificationSourceTab === 'alias'}
+                  class={verificationSourceTab === 'alias' ? 'active' : ''}
+                  onClick={() => setVerificationSourceTab('alias')}
+                >
+                  🔖 {t('alias.tab')}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={verificationSourceTab === 'controlled_node'}
+                  class={verificationSourceTab === 'controlled_node' ? 'active' : ''}
+                  onClick={() => setVerificationSourceTab('controlled_node')}
+                >
+                  🖥 {t('quick_input.tab_machines')}
+                </button>
+              </div>
               <div class="qp-verification-source-list">
-                {allAliases.map((entry) => {
+                {verificationSourceTab === 'alias' && allAliases.map((entry) => {
                   if (!isAliasId(entry.id)) return null;
                   const aliasId = entry.id;
                   const busyKey = `${VERIFICATION_MACHINE_KINDS.SSH}:${aliasId}`;
@@ -922,7 +945,7 @@ export function QuickInputPanel({
                     </button>
                   );
                 })}
-                {machines.filter((machine) => machine.nodeId).map((machine) => {
+                {verificationSourceTab === 'controlled_node' && machines.filter((machine) => machine.nodeId).map((machine) => {
                   const busyKey = `${VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE}:${machine.nodeId}`;
                   return (
                     <button

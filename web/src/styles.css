@@ -127,6 +127,10 @@ html { position: fixed; }
   gap: 8px;
   margin-top: 12px;
 }
+.verification-machine-node-actions {
+  flex-direction: column;
+  align-items: stretch;
+}
 .verification-machine-ssh-form input,
 .verification-machines-section select {
   min-height: 36px;
@@ -8233,6 +8237,26 @@ html.native-ios-mac .chat-dl-btn {
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
+}
+.qp-verification-source-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.qp-verification-source-tabs > button {
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid rgba(71, 85, 105, 0.65);
+  border-radius: 7px;
+  color: #94a3b8;
+  background: rgba(15, 23, 42, 0.72);
+  font: inherit;
+  cursor: pointer;
+}
+.qp-verification-source-tabs > button.active {
+  color: #67e8f9;
+  border-color: rgba(34, 211, 238, 0.7);
+  background: rgba(8, 145, 178, 0.14);
 }
 .qp-verification-source-list button {
   min-height: 32px;

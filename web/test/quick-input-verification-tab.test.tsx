@@ -153,6 +153,13 @@ describe('QuickInputPanel verification-machine tab', () => {
     expect(addButton).toBeDefined();
     fireEvent.click(addButton);
 
+    const sourceTabs = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+    const aliasSourceTab = sourceTabs.find((button) => button.textContent?.includes('alias.tab'))!;
+    const nodeSourceTab = sourceTabs.find((button) => button.textContent?.includes('quick_input.tab_machines'))!;
+    expect(aliasSourceTab.getAttribute('aria-selected')).toBe('true');
+    expect(nodeSourceTab.getAttribute('aria-selected')).toBe('false');
+    expect(document.body.textContent).not.toContain('quick_input.verification_authorize_node');
+
     const aliasButton = Array.from(document.body.querySelectorAll('button'))
       .find((button) => button.textContent?.includes('quick_input.verification_authorize_alias'))!;
     fireEvent.click(aliasButton);
@@ -164,6 +171,14 @@ describe('QuickInputPanel verification-machine tab', () => {
       target: 'b'.repeat(32),
     })));
 
+    // A successful authorization closes the picker. Reopen it, then switch the
+    // source tab: candidates from the inactive source must not be rendered.
+    fireEvent.click(addButton);
+    const reopenedNodeSourceTab = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+      .find((button) => button.textContent?.includes('quick_input.tab_machines'))!;
+    fireEvent.click(reopenedNodeSourceTab);
+    expect(reopenedNodeSourceTab.getAttribute('aria-selected')).toBe('true');
+    expect(document.body.textContent).not.toContain('quick_input.verification_authorize_alias');
     const nodeButton = Array.from(document.body.querySelectorAll('button'))
       .find((button) => button.textContent?.includes('quick_input.verification_authorize_node'))!;
     await waitFor(() => expect(nodeButton.disabled).toBe(false));
