@@ -79,6 +79,7 @@ export function containsProhibitedQueueProjectionField(value: unknown): boolean 
     'rawSessionHistory',
     'rawSharedActorEnvelope',
     'sharedActorEnvelope',
+    'sharedMachineAuthority',
     'fullChildTranscript',
     'timelineCommitted',
     'historyCommitted',

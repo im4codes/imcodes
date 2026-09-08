@@ -3,7 +3,7 @@ import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
 import {
   canOperateControlledMachine,
-  resolveRemoteDesktopHostAccess,
+  resolveRemoteDesktopHostOperatorAccess,
   type ControlledMachineAccessRow,
 } from '../share/machine-access.js';
 import {
@@ -1091,7 +1091,7 @@ export class RemoteDesktopRouter {
     const queryStartedAt = this.now();
     let access: ControlledMachineAccessRow | null;
     try {
-      access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(
+      access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess)(
         db,
         userId,
         this.hooks.serverId(),
@@ -1666,7 +1666,7 @@ export class RemoteDesktopRouter {
     if (route.actor.source === REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT) {
       let access: ControlledMachineAccessRow | null = null;
       try {
-        access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(
+        access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess)(
           db,
           route.actor.userId,
           this.hooks.serverId(),

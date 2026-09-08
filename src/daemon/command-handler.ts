@@ -3368,6 +3368,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const sharedActor = cmd.sharedActor && typeof cmd.sharedActor === 'object'
     ? cmd.sharedActor as SharedActorEnvelope
     : undefined;
+  const sharedMachineAuthority = typeof cmd.sharedMachineAuthority === 'string' && cmd.sharedMachineAuthority.trim()
+    ? cmd.sharedMachineAuthority.trim()
+    : undefined;
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
     : undefined;
@@ -3929,6 +3932,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+  const { bindProcessSharedMachineAuthority } = await import('./shared-machine-authority-context.js');
+  bindProcessSharedMachineAuthority(
+    sessionName,
+    record?.sessionInstanceId && record.runtimeEpoch
+      ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
+      : null,
+    sharedMachineAuthority,
+    sharedActor?.effectiveActorRole === 'participant',
+  );
 
   // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
   //
@@ -4139,6 +4151,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
+      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -4231,6 +4244,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
+      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -4651,9 +4665,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // `aliasAudit` must ride the metadata, not just the immediate emit: a
       // queued/resent message emits its user.message later from session-manager,
       // which can only anchor what the entry carries.
-      const sendMetadata = (sharedActor || aliasProviderText || aliasAudit || requestedDeliveryMode)
+      const sendMetadata = (sharedActor || sharedMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
+            ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
             ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),

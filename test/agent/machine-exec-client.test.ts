@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execRemote, listMachines, MachineControlPlaneError } from '../../src/daemon/machine-exec-client.js';
 import {
   encodeMachineExecHttpEnvelope,
@@ -196,6 +196,14 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
   });
   it('includes all when includeOffline is set', async () => {
     expect((await listMachines({ ...opts, includeOffline: true, fetchImpl: list200(items) })).length).toBe(3);
+  });
+  it('forwards the private shared-turn authority during discovery', async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get('x-imcodes-shared-machine-authority')).toBe('signed-turn');
+      return new Response(JSON.stringify({ machines: items }), { status: 200 });
+    });
+    await listMachines({ ...opts, sharedMachineAuthority: 'signed-turn', fetchImpl: fetchImpl as typeof fetch });
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
   it('accepts a mixed legacy + post-migration list where empty refName means no deprecated alias', async () => {
     const mixed = [

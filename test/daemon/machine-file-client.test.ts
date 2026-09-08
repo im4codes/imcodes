@@ -49,7 +49,11 @@ describe('machine file client', () => {
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       expect(init?.method).toBe('POST');
       expect(init?.body).toBeInstanceOf(FormData);
-      expect(init?.headers).toMatchObject({ 'X-Server-Id': 'full-1', authorization: 'Bearer token' });
+      expect(init?.headers).toMatchObject({
+        'X-Server-Id': 'full-1',
+        authorization: 'Bearer token',
+        'x-imcodes-shared-machine-authority': 'signed-turn',
+      });
       return new Response(JSON.stringify({ ok: true, attachment: attachment('a'.repeat(32), '/staging/a.txt') }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -60,6 +64,7 @@ describe('machine file client', () => {
       serverUrl: 'https://relay.example',
       sourceServerId: 'full-1',
       sourceToken: 'token',
+      sharedMachineAuthority: 'signed-turn',
       targetServerId: 'controlled-1',
       sourcePath,
       fetchImpl: fetchImpl as typeof fetch,

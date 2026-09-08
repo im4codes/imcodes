@@ -29,6 +29,10 @@ export interface ControlledMachineAccessRow {
   remote_desktop_host_id: string | null;
 }
 
+export type ControlledMachineOperatorAccessRow = ControlledMachineAccessRow & {
+  access_role: Extract<MachineAccessRole, 'owner' | 'participant'>;
+};
+
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.node_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
@@ -71,6 +75,28 @@ export async function resolveControlledMachineAccess(
 }
 
 /**
+ * The single operational authority boundary for a controlled device.
+ *
+ * Every device capability must enter through this helper rather than spelling
+ * an owner-only predicate in its own route.  The share row is read on every
+ * action, so revocation, expiry, and a Participant -> Viewer downgrade take
+ * effect without copying an owner credential into the participant's daemon.
+ * Sharing-management routes deliberately do not use this helper: they remain
+ * owner-only.
+ */
+export async function resolveControlledMachineOperatorAccess(
+  db: Database,
+  userId: string,
+  serverId: string,
+  now: number,
+): Promise<ControlledMachineOperatorAccessRow | null> {
+  const access = await resolveControlledMachineAccess(db, userId, serverId, now);
+  return access && canOperateControlledMachine(access.access_role)
+    ? access as ControlledMachineOperatorAccessRow
+    : null;
+}
+
+/**
  * Resolve current DB-authoritative access to a remote-desktop host, which may
  * be a controlled node OR a normal (FULL) daemon: on Windows a daemon serves
  * remote control with the same native worker. Node role is returned rather than
@@ -91,6 +117,19 @@ export async function resolveRemoteDesktopHostAccess(
       LIMIT 1`,
     [userId, now, serverId],
   );
+}
+
+/** Owner/active-Participant authority for the remote-control capability. */
+export async function resolveRemoteDesktopHostOperatorAccess(
+  db: Database,
+  userId: string,
+  serverId: string,
+  now: number,
+): Promise<ControlledMachineOperatorAccessRow | null> {
+  const access = await resolveRemoteDesktopHostAccess(db, userId, serverId, now);
+  return access && canOperateControlledMachine(access.access_role)
+    ? access as ControlledMachineOperatorAccessRow
+    : null;
 }
 
 /** One bounded query for owned + actively shared controlled-node discovery. */

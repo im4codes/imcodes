@@ -11,9 +11,9 @@ import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, type NodeRole, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import {
-  canOperateControlledMachine,
-  resolveControlledMachineAccess,
+  resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
+import { SHARED_MACHINE_AUTHORITY_TYPE } from '../../../shared/shared-machine-authority.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
@@ -37,7 +37,8 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket' && payload.type !== 'share-ws-ticket') {
+    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket'
+      && payload.type !== 'share-ws-ticket' && payload.type !== SHARED_MACHINE_AUTHORITY_TYPE) {
       return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
     }
   }
@@ -99,7 +100,8 @@ export async function resolveBearerAuth(
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
   if (!payload) return null;
   if (typeof payload.sub !== 'string') return null;
-  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket') return null; // reject special-purpose WebSocket tickets
+  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket'
+    || payload.type === SHARED_MACHINE_AUTHORITY_TYPE) return null; // reject special-purpose capability tickets
   return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
 }
 
@@ -310,11 +312,9 @@ export async function resolveServerWebSocketAccess(
   );
   if (!target) return null;
   if (target.node_role === NODE_ROLE.CONTROLLED) {
-    const controlled = await resolveControlledMachineAccess(db, userId, serverId, now);
+    const controlled = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
     if (!controlled) return null;
-    return canOperateControlledMachine(controlled.access_role)
-      ? { kind: 'controlled', role: controlled.access_role }
-      : null;
+    return { kind: 'controlled', role: controlled.access_role };
   }
   const role = await resolveServerRole(db, serverId, userId);
   return role === 'none' ? null : { kind: 'standard', role };

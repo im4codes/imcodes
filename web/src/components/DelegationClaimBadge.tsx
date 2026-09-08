@@ -135,6 +135,13 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
             class="delegation-claim-dispatch"
             data-delegation-dispatch={dispatch.dispatchId}
           >
+            {dispatch.kind === 'machine-control' && dispatch.tool && dispatch.machine ? (
+              <span class="delegation-claim-execution" data-delegation-field="machineControl">
+                {t('delegation.claim.execution', 'Runs on')}
+                {': '}
+                <code>{dispatch.tool} · {dispatch.machine}</code>
+              </span>
+            ) : null}
             {execution ? (
               <span class="delegation-claim-execution" data-delegation-field="execution">
                 {t('delegation.claim.execution', 'Runs on')}

@@ -72,6 +72,7 @@ export const COMPUTER_USE_HTTP_REASON = {
   SCOPED_AUTH: 'scoped_auth',
   TARGET_FORBIDDEN: 'target_forbidden',
   EXEC_DISABLED: 'exec_disabled',
+  TARGET_UNAVAILABLE: 'target_unavailable',
   RELAY_DEADLINE: 'relay_deadline',
   INVALID_RESULT: 'invalid_result',
 } as const;
@@ -274,6 +275,8 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
       return [
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
+        'A request that names a CLI, executable, script, terminal command, or shell operation is not a GUI request. Route it through exec_remote for session-0/SYSTEM, or through shell_session1 only when it genuinely requires the active signed-in user session; never select OCU merely because the target is a Windows machine.',
+        'An OCU/helper error proves that the GUI route failed, not that the machine is unauthorized or uncontrollable. If the original intent is a shell command and exec_remote is authorized, use that correct route rather than reporting an authorization refusal.',
         'Target controlled machines use their canonical 10-digit nodeId or complete ^^(nodeId) marker. A deprecated noncanonical legacy ref_name remains accepted only for migration compatibility. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
         'When the user asks to use a browser on the daemon host, call computer_use_call with machine=local and the built-in CDP-backed browser_* tools; do not probe for or install a separate Playwright runtime through a shell.',
         'Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path; browser_* is IM.codes\' separate CDP implementation and should be preferred over coordinate GUI control for web pages.',
@@ -282,11 +285,12 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
       return [
         'Recommended workflow:',
         '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, pass its canonical 10-digit nodeId or complete ^^(nodeId) marker directly; a deprecated noncanonical legacy ref_name is compatibility-only. Call list_machines only when no exact target is available or the user asks for status.',
-        '2. computer_use_docs for the relevant topic/tool details only.',
-        '3. computer_use_call tool=list_apps to discover app ids.',
-        '4. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
-        '5. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
-        '6. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
+        '2. Classify intent before selecting a tool: executable/CLI/script/terminal work uses exec_remote (SYSTEM/session 0), or shell_session1 only for required active-user semantics. Use OCU only for actual GUI interaction.',
+        '3. computer_use_docs for the relevant topic/tool details only.',
+        '4. computer_use_call tool=list_apps to discover app ids.',
+        '5. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
+        '6. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
+        '7. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
       ].join('\n');
     case 'tools':
       return [

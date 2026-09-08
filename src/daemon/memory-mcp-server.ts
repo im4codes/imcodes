@@ -18,6 +18,7 @@ import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './messag
 import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supervision-mcp-tools.js';
 import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
+import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
 import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
@@ -504,7 +505,24 @@ export function mergeDefaultToolDeps(
     // An injected override (tests) wins; otherwise the daemon default is used.
     // This stdio MCP server only runs on FULL nodes, so the tools are advertised
     // (a controlled node never starts it — see registerMemoryMcpTools gate).
-    machineDeps: toolDeps.machineDeps ?? createDaemonMachineToolDeps({ resourceOwner }),
+    machineDeps: toolDeps.machineDeps ?? createDaemonMachineToolDeps({
+      resourceOwner,
+      loadSharedMachineAuthority: resourceOwner && caller.sessionName
+        ? async () => {
+            const port = await resolveLiveHookPort();
+            if (!port) throw new Error('shared_machine_authority_hook_unavailable');
+            const response = await postHookSend(port, {
+              sessionInstanceId: resourceOwner.sessionInstanceId,
+              runtimeEpoch: resourceOwner.runtimeEpoch,
+            }, SHARED_MACHINE_AUTHORITY_HOOK_PATH, caller.sessionName!, 2_000);
+            if (response.authority == null) return null;
+            if (typeof response.authority !== 'string' || !response.authority) {
+              throw new Error('shared_machine_authority_invalid_response');
+            }
+            return response.authority;
+          }
+        : async () => null,
+    }),
     sendDeps: {
       ...toolDeps.sendDeps,
       // The stdio MCP runs in a child process, so its local transport/tmux

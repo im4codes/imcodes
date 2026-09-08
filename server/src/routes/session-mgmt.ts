@@ -57,6 +57,8 @@ import {
 } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import {
   buildTransportConfigWithSupervision,
   canSessionRoleOwnAutomaticSupervision,
@@ -1014,18 +1016,31 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
       }
       await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'accepted', actionId, now });
-      const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope, ...rest } = body;
+      const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...rest } = body;
       void _ignoredType;
       void _ignoredSharedActor;
       void _ignoredShareScope;
+      void _ignoredMachineAuthority;
+      const sharedActor = await buildHttpSharedActor(c.env.DB, {
+        userId,
+        coverage: access.actor.coverage,
+        actionId,
+        now,
+      });
+      const sharedMachineAuthority = await issueSharedMachineAuthorityForSession(c.env.DB, {
+        actorUserId: userId,
+        sourceServerId: serverId,
+        sessionName: targetSessionName!,
+        shareTarget: access.actor.coverage.target,
+        actionId,
+        signingKey: c.env.JWT_SIGNING_KEY,
+      });
+      if (!sharedMachineAuthority) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
       return relayToDaemon(c, 'session.send', {
         ...rest,
-        sharedActor: await buildHttpSharedActor(c.env.DB, {
-          userId,
-          coverage: access.actor.coverage,
-          actionId,
-          now,
-        }),
+        sharedActor,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: sharedMachineAuthority,
       });
     }
     if (access.actor.kind === 'none') {
@@ -1071,10 +1086,12 @@ function actionIdFromBody(body: Record<string, unknown>): string {
 }
 
 function stripBrowserShareFields(body: Record<string, unknown>): Record<string, unknown> {
-  const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope, ...safeBody } = body;
+  const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
+    [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...safeBody } = body;
   void _ignoredType;
   void _ignoredSharedActor;
   void _ignoredShareScope;
+  void _ignoredMachineAuthority;
   return safeBody;
 }
 

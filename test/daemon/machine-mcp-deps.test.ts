@@ -8,6 +8,153 @@ type ClientMachine = { serverId: string; nodeId: string; name: string; refName: 
 const m = (over: Partial<ClientMachine>): ClientMachine => ({ serverId: 'x', nodeId: CONTROLLED_NODE_ID_MIN, name: 'x', refName: 'x', displayName: 'X', online: true, nodeRole: 'controlled', execEnabled: true, ...over });
 
 describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', () => {
+  it('loads and forwards the active shared-turn authority once for exec and computer use', async () => {
+    const loadAuthority = vi.fn(async () => 'signed-shared-turn');
+    const list = vi.fn(async () => [m({ serverId: 'target' })]);
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const computerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: loadAuthority,
+      listMachines: list,
+      execRemote: exec,
+      computerUseCall: computerUse as never,
+    });
+    await deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'whoami' });
+    expect(exec).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(loadAuthority).toHaveBeenCalledTimes(1);
+    await deps.computerUseCall?.({ machine: CONTROLLED_NODE_ID_MIN, tool: 'list_apps' });
+    expect(computerUse).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(loadAuthority).toHaveBeenCalledTimes(2);
+  });
+
+  it('applies the same active shared-turn authority to discovery and both file capability families', async () => {
+    const list = vi.fn(async () => [m({ serverId: 'target' })]);
+    const sendFile = vi.fn(async () => ({ size: 1, attachmentId: 'a'.repeat(32), transport: 'relay' as const }));
+    const fetchFile = vi.fn(async (input: { destinationPath: string }) => ({
+      size: 1, attachmentId: 'b'.repeat(32), transport: 'relay' as const, destinationPath: input.destinationPath,
+    }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => 'signed-shared-turn',
+      listMachines: list,
+      sendFileToMachine: sendFile as never,
+      fetchFileFromMachine: fetchFile as never,
+    });
+
+    await deps.listMachines({ includeOffline: true });
+    await deps.sendFileToMachine?.({ machine: CONTROLLED_NODE_ID_MIN, sourcePath: '/tmp/a' });
+    await deps.fetchFileFromMachine?.({ machine: CONTROLLED_NODE_ID_MIN, sourcePath: 'C:\\a', destinationPath: '/tmp/a' });
+
+    expect(list).toHaveBeenCalledTimes(3);
+    for (const call of list.mock.calls) {
+      expect(call[0]).toEqual(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    }
+    expect(sendFile).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(fetchFile).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+  });
+
+  it('never dispatches if active shared-turn authority cannot be proved', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => { throw new Error('shared_machine_authority_unavailable'); },
+      listMachines: async () => [m({ serverId: 'target' })],
+      execRemote: exec,
+    });
+    await expect(deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'must-not-run' }))
+      .rejects.toThrow('shared_machine_authority_unavailable');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.each(['local', 'localhost', 'self', 'this', creds.serverId])(
+    'loads required shared authority before local Computer Use for %s',
+    async (machine) => {
+      const localComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+      const listMachines = vi.fn(async () => [m({ serverId: 'target' })]);
+      const deps = createDaemonMachineToolDeps({
+        loadCredential: async () => creds,
+        loadSharedMachineAuthority: async () => { throw new Error('shared_machine_authority_unavailable'); },
+        listMachines,
+        localComputerUseCall: localComputerUse as never,
+      });
+
+      await expect(deps.computerUseCall?.({ machine, tool: 'list_apps' }))
+        .rejects.toThrow('shared_machine_authority_unavailable');
+      expect(listMachines).not.toHaveBeenCalled();
+      expect(localComputerUse).not.toHaveBeenCalled();
+    },
+  );
+
+  it('snapshots the exact fail-closed result when the required authority loader throws', async () => {
+    const localComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => { throw new Error('shared_machine_authority_unavailable'); },
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    let rejection: unknown;
+    try {
+      await deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' });
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toMatchInlineSnapshot('[Error: shared_machine_authority_unavailable]');
+    expect(localComputerUse).not.toHaveBeenCalled();
+  });
+
+  it('live-revalidates a participant turn before dispatching local Computer Use', async () => {
+    const order: string[] = [];
+    const listMachines = vi.fn(async (input: { sharedMachineAuthority?: string }) => {
+      order.push(`revalidate:${input.sharedMachineAuthority ?? 'owner'}`);
+      return [m({ serverId: 'target' })];
+    });
+    const localComputerUse = vi.fn(async () => {
+      order.push('local-dispatch');
+      return { outcome: 'completed' as const };
+    });
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => 'signed-shared-turn',
+      listMachines: listMachines as never,
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    await expect(deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' }))
+      .resolves.toMatchObject({ outcome: 'completed' });
+    expect(order).toEqual(['revalidate:signed-shared-turn', 'local-dispatch']);
+    expect(listMachines).toHaveBeenCalledWith(expect.objectContaining({
+      sourceServerId: creds.serverId,
+      sourceToken: creds.token,
+      sharedMachineAuthority: 'signed-shared-turn',
+      includeOffline: true,
+    }));
+  });
+
+  it('denies a stale delegated turn before local Computer Use when live revalidation rejects it', async () => {
+    const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
+    const localComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => 'stale-shared-turn',
+      listMachines: async () => { throw new MachineControlPlaneError('http_status', 'machines API returned http_403'); },
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    await expect(deps.computerUseCall?.({ machine: 'self', tool: 'get_app_state' }))
+      .resolves.toMatchInlineSnapshot(`
+        {
+          "error": "machine control plane: http_status",
+          "outcome": "not_dispatched",
+          "reason": "control_plane_unavailable",
+        }
+      `);
+    expect(localComputerUse).not.toHaveBeenCalled();
+  });
+
   it('unbound daemon: exec → FEATURE_DISABLED, list throws an unbound-kind control-plane error (not an empty list)', async () => {
     const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => null });

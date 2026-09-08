@@ -154,6 +154,46 @@ describe('DelegationClaimBadge', () => {
     expect(text).toMatch(/1/);
   });
 
+  it('shows the canonical controlled-device call as an authorized dispatch', () => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'mcp-machine-1',
+          kind: 'machine-control',
+          tool: 'computer_use_call',
+          machine: '1472527657',
+          deliveries: [{ target: '1472527657', status: 'delivered' }],
+        }],
+      }),
+    }));
+
+    expect(container.querySelector('[data-delegation-claim="substantiated"]')).not.toBeNull();
+    expect(container.querySelector('[data-delegation-field="machineControl"]')?.textContent)
+      .toContain('computer_use_call · 1472527657');
+    expect(container.textContent).not.toMatch(/no authorized dispatch/i);
+  });
+
+  it('shows an authority-validated local Computer Use call as an authorized dispatch', () => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'mcp-local-1',
+          kind: 'machine-control',
+          tool: 'computer_use_call',
+          machine: 'local',
+          deliveries: [{ target: 'local', status: 'delivered' }],
+        }],
+      }),
+    }));
+
+    expect(container.querySelector('[data-delegation-claim="substantiated"]')).not.toBeNull();
+    expect(container.querySelector('[data-delegation-field="machineControl"]')?.textContent)
+      .toContain('computer_use_call · local');
+    expect(container.textContent).not.toMatch(/no authorized dispatch/i);
+  });
+
   it('names the executor on one line so an id row is readable without a lookup', () => {
     const { container } = render(h(DelegationClaimBadge, {
       metadata: withClaim({

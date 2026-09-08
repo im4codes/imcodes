@@ -19,10 +19,8 @@ import {
 } from '../../../shared/computer-use.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
-import {
-  canOperateControlledMachine,
-  resolveControlledMachineAccess,
-} from '../share/machine-access.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
 
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
 const ALLOWED_BODY_KEYS = new Set(['tool', 'arguments', 'timeoutMs', 'resourceOwner']);
@@ -89,10 +87,17 @@ export function createMachineComputerUseRoutes(dispatcher: ComputerUseDispatcher
     const v = validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, ...(body ?? {}), correlationId });
     if (!v.ok) return c.json(pre(COMPUTER_USE_HTTP_REASON.INVALID_REQUEST), 400);
 
-    const target = await resolveControlledMachineAccess(c.env.DB, auth.userId, targetId, Date.now());
-    if (!target || !canOperateControlledMachine(target.access_role)) {
-      return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
-    }
+    const now = Date.now();
+    const operational = await resolveMachineOperationalAccess(c.env.DB, {
+      token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+      signingKey: c.env.JWT_SIGNING_KEY,
+      authenticatedSourceServerId: sourceServerId,
+      sourceOwnerUserId: auth.userId,
+      targetServerId: targetId,
+      now,
+    });
+    if (!operational) return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
+    const target = operational.target;
     if (!target.exec_enabled) return c.json(pre(COMPUTER_USE_HTTP_REASON.EXEC_DISABLED), 403);
 
     let dispatch: { online: boolean; result?: ComputerUseResult };
@@ -106,7 +111,12 @@ export function createMachineComputerUseRoutes(dispatcher: ComputerUseDispatcher
       const normalized = validateComputerUseResultFrame({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...dispatch.result });
       if (!normalized.ok) return c.json(encodeComputerUseHttpEnvelope('dispatched_no_result', undefined, COMPUTER_USE_HTTP_REASON.INVALID_RESULT));
     }
-    return c.json(encodeComputerUseHttpEnvelope(outcomeFor(dispatch), dispatch.result));
+    const outcome = outcomeFor(dispatch);
+    return c.json(encodeComputerUseHttpEnvelope(
+      outcome,
+      dispatch.result,
+      outcome === 'not_dispatched' ? COMPUTER_USE_HTTP_REASON.TARGET_UNAVAILABLE : undefined,
+    ));
   });
 
   return routes;

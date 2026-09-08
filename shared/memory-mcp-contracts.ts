@@ -950,7 +950,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
     description:
-      'Run one command on a controlled node. Pass its canonical 10-digit nodeId or complete ^^(nodeId) marker without list_machines. A deprecated noncanonical legacy ref_name remains accepted only for migration compatibility. not_dispatched is retry-safe; dispatched_no_result may have run, so never auto-retry non-idempotent work. FULL nodes only.',
+      'Run one shell/CLI command or executable on a controlled node in session 0/SYSTEM. Requests that name a command-line program (for example ipmitool.exe), script, terminal command, or shell operation MUST use exec_remote, never GUI Computer Use. Use computer_use_call with shell_session1 only when the command specifically requires the active signed-in user session. Pass the canonical 10-digit nodeId or complete ^^(nodeId) marker without list_machines. not_dispatched is retry-safe; dispatched_no_result may have run, so never auto-retry non-idempotent work. FULL nodes only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
@@ -1018,7 +1018,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'GUI/browser control on this host (machine=local) or a controlled machine. Prefer machine=local with browser_open/browser_snapshot over installing Playwright; includeImage=true only when you must see it. Pass a canonical 10-digit nodeId or ^^(nodeId) without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. exec_remote is SYSTEM, shell_session1 is active-user. GUI/browser max 120000, shell_session1 max 900000. FULL nodes only.',
+    description: 'GUI/browser control on this host (machine=local) or a controlled machine. Do not use GUI OCU for a shell/CLI/executable request: use exec_remote for session-0/SYSTEM, or shell_session1 only when active-user semantics are required. An OCU/helper failure does not mean the machine is unauthorized or uncontrollable; if the requested operation is semantically a shell command and exec_remote is authorized, use that correct route rather than reporting an authorization failure. Prefer machine=local with browser_open/browser_snapshot over installing Playwright; includeImage=true only when you must see it. Pass a canonical 10-digit nodeId or ^^(nodeId) without list_machines. GUI/browser max 120000, shell_session1 max 900000. FULL nodes only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId, complete ^^(nodeId) marker, deprecated noncanonical legacy ref_name, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),

@@ -1,9 +1,8 @@
 import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, win32 as pathWin32 } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
@@ -216,10 +215,11 @@ export async function resolveOpenComputerUseBinaryForCurrentProcessForTest(optio
   Parameters<typeof resolveOpenComputerUseBinaryForTest>[0],
   'moduleFilePath'
 >): Promise<string> {
-  return resolveOpenComputerUseBinaryForTest({
-    ...options,
-    moduleFilePath: fileURLToPath(import.meta.url),
-  });
+  // The controlled-node executable is an esbuild CJS/SEA bundle. In that
+  // format `import.meta.url` is undefined. Resolve from the running entry and
+  // cwd candidates instead; both ESM daemon builds and SEA executables put the
+  // helper beside that entry, and neither route can throw ERR_INVALID_ARG_TYPE.
+  return resolveOpenComputerUseBinaryForTest(options);
 }
 
 export async function selectOpenComputerUseBinaryForTest(
@@ -517,6 +517,7 @@ class OpenComputerUseMcpClient {
 
 let mcpClient: OpenComputerUseMcpClient | null = null;
 let mcpClientBinary = '';
+let mcpClientBinaryIdentity = '';
 let mcpClientOwnerKey = '';
 let stopComputerUseExpirySweep: (() => void) | null = null;
 
@@ -528,13 +529,32 @@ function ensureComputerUseExpirySweep(): void {
   stopComputerUseExpirySweep ??= startSessionResourceExpirySweep();
 }
 
+export function openComputerUseBinaryIdentityForTest(
+  binary: string,
+  metadata: { size: number; mtimeMs: number; ino: number } | null,
+): string {
+  return metadata
+    ? JSON.stringify([binary, metadata.size, metadata.mtimeMs, metadata.ino])
+    : binary;
+}
+
+async function openComputerUseBinaryIdentity(binary: string): Promise<string> {
+  const metadata = await stat(binary).catch(() => null);
+  return openComputerUseBinaryIdentityForTest(binary, metadata);
+}
+
 async function openComputerUseMcpClient(owner: SessionResourceOwner | null): Promise<OpenComputerUseMcpClient> {
   const bin = await resolveOpenComputerUseBinary();
+  const binaryIdentity = await openComputerUseBinaryIdentity(bin);
   const ownerKey = computerUseOwnerKey(owner);
-  if (!mcpClient || mcpClientBinary !== bin || mcpClientOwnerKey !== ownerKey) {
+  if (!mcpClient
+    || mcpClientBinary !== bin
+    || mcpClientBinaryIdentity !== binaryIdentity
+    || mcpClientOwnerKey !== ownerKey) {
     await mcpClient?.close();
     mcpClient = new OpenComputerUseMcpClient(bin, owner);
     mcpClientBinary = bin;
+    mcpClientBinaryIdentity = binaryIdentity;
     mcpClientOwnerKey = ownerKey;
   }
   return mcpClient;
@@ -1846,6 +1866,7 @@ export async function closeComputerUseRuntimeForProcessExit(): Promise<void> {
   await mcpClient?.close();
   mcpClient = null;
   mcpClientBinary = '';
+  mcpClientBinaryIdentity = '';
   mcpClientOwnerKey = '';
   fastPointerClient?.close();
   fastPointerClient = null;

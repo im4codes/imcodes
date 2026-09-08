@@ -1,16 +1,19 @@
 import {
   COMPUTER_USE_HTTP_RESPONSE_MAX_BYTES,
   decodeComputerUseHttpEnvelope,
+  type ComputerUseHttpReason,
   type ComputerUseOutcome,
   type ComputerUseResult,
   type ComputerUseToolName,
 } from '../../shared/computer-use.js';
 import type { SessionResourceOwnerIdentity } from '../../shared/session-resource-lifecycle.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
 export interface ComputerUseRemoteOptions {
   serverUrl: string;
   sourceServerId: string;
   sourceToken: string;
+  sharedMachineAuthority?: string;
   targetServerId: string;
   tool: ComputerUseToolName;
   arguments?: Record<string, unknown>;
@@ -23,11 +26,16 @@ export interface ComputerUseRemoteOptions {
 export interface ComputerUseRemoteResult {
   outcome: ComputerUseOutcome;
   result?: ComputerUseResult;
+  reason?: ComputerUseHttpReason;
   error?: string;
 }
 
-function authHeaders(sourceServerId: string, sourceToken: string): Record<string, string> {
-  return { 'X-Server-Id': sourceServerId, authorization: `Bearer ${sourceToken}` };
+function authHeaders(sourceServerId: string, sourceToken: string, sharedMachineAuthority?: string): Record<string, string> {
+  return {
+    'X-Server-Id': sourceServerId,
+    authorization: `Bearer ${sourceToken}`,
+    ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
+  };
 }
 
 async function readBoundedText(res: Response, maxBytes: number): Promise<string | null> {
@@ -60,7 +68,7 @@ export async function computerUseCall(opts: ComputerUseRemoteOptions): Promise<C
   try {
     res = await doFetch(`${base}/api/machine/computer-use?serverId=${encodeURIComponent(opts.targetServerId)}`, {
       method: 'POST',
-      headers: { ...authHeaders(opts.sourceServerId, opts.sourceToken), 'content-type': 'application/json' },
+      headers: { ...authHeaders(opts.sourceServerId, opts.sourceToken, opts.sharedMachineAuthority), 'content-type': 'application/json' },
       body: JSON.stringify({
         tool: opts.tool,
         ...(opts.arguments ? { arguments: opts.arguments } : {}),
@@ -78,5 +86,9 @@ export async function computerUseCall(opts: ComputerUseRemoteOptions): Promise<C
   try { parsed = JSON.parse(text); } catch { return { outcome: 'dispatched_no_result' }; }
   const decoded = decodeComputerUseHttpEnvelope(parsed);
   if (!decoded.ok) return { outcome: 'dispatched_no_result' };
-  return { outcome: decoded.value.outcome, ...(decoded.value.result ? { result: decoded.value.result } : {}) };
+  return {
+    outcome: decoded.value.outcome,
+    ...(decoded.value.result ? { result: decoded.value.result } : {}),
+    ...(decoded.value.reason ? { reason: decoded.value.reason } : {}),
+  };
 }
