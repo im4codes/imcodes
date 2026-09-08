@@ -456,6 +456,7 @@ describe('controlled-node self-upgrade', () => {
       installId: 'install-1',
       nodeTokenHash: 'a'.repeat(64),
       sourceExePath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      sourceArtifact: { sha256: 'a'.repeat(64), size: 2048 },
       stagedExePath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
       stagedReceipt: {
         path: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',

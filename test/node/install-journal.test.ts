@@ -20,10 +20,12 @@ let path: string;
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'deck-journal-')); path = join(dir, 'install.json'); });
 afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 
+const ARTIFACT = { sha256: 'd'.repeat(64), size: 8192 };
 const IDENTITY = {
   installId: 'inst-1',
   nodeTokenHash: 'a'.repeat(64),
   sourceExePath: '/tmp/download/imcodes-node',
+  sourceArtifact: ARTIFACT,
 };
 
 async function advanceToCredentialPrepared() {
@@ -95,6 +97,252 @@ describe('install journal persistence + resume (10.10)', () => {
     expect(j.phase).toBe('credential_prepared');
     expect(j.installId).toBe('inst-1');
     expect(j.updatedAt).toBe(1000);
+  });
+
+  describe('legacy v1 journal without sourceArtifact (already on disk)', () => {
+    // The users in the incident screenshot already have a journal written by a
+    // build that predates `sourceArtifact`. It sits at credential_prepared or
+    // files_staged with installId/nodeTokenHash/sourceExePath and nothing else.
+    // If loading such a journal is refused, the upgrade dies before the new
+    // download is ever inspected — strictly worse than the original bug.
+    const LEGACY_A = 'C:\\Users\\k\\Downloads\\imcodes-node.exe';
+    const LEGACY_B = 'C:\\Users\\k\\Downloads\\imcodes-node (1).exe';
+
+    async function writeLegacyJournal(phase: string, extra: Record<string, unknown> = {}) {
+      await writeFile(path, JSON.stringify({
+        version: 1,
+        phase,
+        updatedAt: 1,
+        installId: 'inst-legacy',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: LEGACY_A,
+        ...extra,
+      }));
+    }
+
+    it('loads a legacy credential_prepared journal instead of refusing it', async () => {
+      await writeLegacyJournal('credential_prepared');
+      const journal = await loadInstallJournal(path);
+      expect(journal.phase).toBe('credential_prepared');
+      expect(journal.installId).toBe('inst-legacy');
+      expect(journal.sourceArtifact).toBeUndefined();
+    });
+
+    it('loads a legacy files_staged journal instead of refusing it', async () => {
+      await writeLegacyJournal('files_staged', { stagedExePath: 'C:\\Program Files\\imcodes-node\\bin.exe' });
+      const journal = await loadInstallJournal(path);
+      expect(journal.phase).toBe('files_staged');
+      expect(journal.sourceArtifact).toBeUndefined();
+    });
+
+    it('adopts the verified artifact and the new download path in one atomic write', async () => {
+      await writeLegacyJournal('credential_prepared');
+      const legacy = await loadInstallJournal(path);
+      const adopted = await writeInstallPhase(path, 'credential_prepared', {
+        now: 2,
+        previous: legacy,
+        installId: 'inst-legacy',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: LEGACY_B,
+        sourceArtifact: ARTIFACT,
+      });
+      expect(adopted.sourceExePath).toBe(LEGACY_B);
+      expect(adopted.sourceArtifact).toEqual(ARTIFACT);
+      // Persisted, not just returned.
+      const reread = await loadInstallJournal(path);
+      expect(reread.sourceArtifact).toEqual(ARTIFACT);
+      expect(reread.sourceExePath).toBe(LEGACY_B);
+    });
+
+    it('refuses adoption when the durable token differs', async () => {
+      await writeLegacyJournal('credential_prepared');
+      const legacy = await loadInstallJournal(path);
+      await expect(writeInstallPhase(path, 'credential_prepared', {
+        now: 2,
+        previous: legacy,
+        nodeTokenHash: 'b'.repeat(64),
+        sourceExePath: LEGACY_B,
+        sourceArtifact: ARTIFACT,
+      })).rejects.toThrow(/immutable field changed: nodeTokenHash/);
+    });
+
+    it('refuses adoption after the install is enrolled', async () => {
+      await writeLegacyJournal('enrolled', {
+        stagedExePath: 'C:\\Program Files\\imcodes-node\\bin.exe',
+        serverId: 'srv-1',
+      });
+      const legacy = await loadInstallJournal(path);
+      await expect(writeInstallPhase(path, 'enrolled', {
+        now: 2,
+        previous: legacy,
+        sourceExePath: LEGACY_B,
+        sourceArtifact: ARTIFACT,
+      })).rejects.toThrow(/may not change after files_staged/);
+    });
+
+    it('refuses adoption that also mutates the staged target', async () => {
+      const receipt = {
+        path: 'C:\\Program Files\\imcodes-node\\bin.exe',
+        size: 4096,
+        sha256: '1'.repeat(64),
+        sourceIdentity: { dev: 1, ino: 2, size: 4096, mtimeMs: 1, ctimeMs: 1 },
+        stagedIdentity: { dev: 1, ino: 3, size: 4096, mtimeMs: 2, ctimeMs: 2 },
+      };
+      await writeLegacyJournal('files_staged', { stagedExePath: receipt.path, stagedReceipt: receipt });
+      const legacy = await loadInstallJournal(path);
+      await expect(writeInstallPhase(path, 'files_staged', {
+        now: 2,
+        previous: legacy,
+        sourceExePath: LEGACY_B,
+        sourceArtifact: ARTIFACT,
+        stagedReceipt: { ...receipt, path: 'C:\\Temp\\evil.exe' },
+      })).rejects.toThrow(/staged receipt must describe the pinned staged target/);
+    });
+
+    it('pins the adopted artifact: a later different package is refused', async () => {
+      await writeLegacyJournal('credential_prepared');
+      const legacy = await loadInstallJournal(path);
+      const adopted = await writeInstallPhase(path, 'credential_prepared', {
+        now: 2, previous: legacy, sourceExePath: LEGACY_B, sourceArtifact: ARTIFACT,
+      });
+      await expect(writeInstallPhase(path, 'credential_prepared', {
+        now: 3, previous: adopted, sourceArtifact: { sha256: 'e'.repeat(64), size: ARTIFACT.size },
+      })).rejects.toThrow(/immutable field changed: sourceArtifact/);
+    });
+  });
+
+  describe('source path drift vs tamper resistance', () => {
+    // The download LOCATION moves on a legitimate retry; the BYTES do not.
+    // `sourceArtifact` is therefore the invariant, and the path may migrate
+    // only inside the interrupted-install retry window and only when the new
+    // download is byte-for-byte the artifact this install already committed to.
+    const DOWNLOAD_A = 'C:\\Users\\k\\Downloads\\imcodes-node.exe';
+    const DOWNLOAD_B = 'C:\\Users\\k\\Downloads\\imcodes-node (1).exe';
+
+    async function preparedAt(sourceExePath = DOWNLOAD_A) {
+      const elevated = await writeInstallPhase(path, 'elevated', { now: 1 });
+      return writeInstallPhase(path, 'credential_prepared', {
+        now: 2, previous: elevated, ...IDENTITY, sourceExePath,
+      });
+    }
+
+    it('fresh install records both the path and the artifact identity', async () => {
+      const prepared = await preparedAt();
+      expect(prepared.sourceExePath).toBe(DOWNLOAD_A);
+      expect(prepared.sourceArtifact).toEqual(ARTIFACT);
+    });
+
+    it('same-token retry from the SAME path is accepted', async () => {
+      const prepared = await preparedAt();
+      const retry = await writeInstallPhase(path, 'credential_prepared', {
+        now: 3, previous: prepared, ...IDENTITY, sourceExePath: DOWNLOAD_A,
+      });
+      expect(retry.sourceExePath).toBe(DOWNLOAD_A);
+    });
+
+    it('adopts a " (1).exe" re-download of the identical artifact inside the retry window', async () => {
+      const prepared = await preparedAt();
+      const retry = await writeInstallPhase(path, 'credential_prepared', {
+        now: 3, previous: prepared, ...IDENTITY, sourceExePath: DOWNLOAD_B,
+      });
+      expect(retry.sourceExePath).toBe(DOWNLOAD_B);
+      expect(retry.sourceArtifact).toEqual(ARTIFACT);
+      expect(retry.installId).toBe(IDENTITY.installId);
+    });
+
+    it('survives a crash between phases and still adopts the re-download on resume', async () => {
+      await preparedAt();
+      // Simulated crash: nothing in memory, the journal is re-read from disk.
+      const resumed = await loadInstallJournal(path);
+      expect(resumed.sourceExePath).toBe(DOWNLOAD_A);
+      const retry = await writeInstallPhase(path, 'credential_prepared', {
+        now: 4, previous: resumed, ...IDENTITY, sourceExePath: DOWNLOAD_B,
+      });
+      expect(retry.sourceExePath).toBe(DOWNLOAD_B);
+    });
+
+    it('refuses a path change once the install is enrolled (late malicious source)', async () => {
+      const prepared = await preparedAt();
+      const staged = await writeInstallPhase(path, 'files_staged', {
+        now: 3, previous: prepared, stagedExePath: 'C:\\Program Files\\imcodes-node\\bin.exe',
+      });
+      const enrolled = await writeInstallPhase(path, 'enrolled', {
+        now: 4, previous: staged, serverId: 'srv-1',
+      });
+      await expect(writeInstallPhase(path, 'enrolled', {
+        now: 5, previous: enrolled, ...IDENTITY, sourceExePath: DOWNLOAD_B,
+      })).rejects.toThrow(/may not change after files_staged/);
+    });
+
+    it('refuses a re-download whose bytes differ (package/publisher/hash mutation)', async () => {
+      const prepared = await preparedAt();
+      await expect(writeInstallPhase(path, 'credential_prepared', {
+        now: 3,
+        previous: prepared,
+        ...IDENTITY,
+        sourceExePath: DOWNLOAD_B,
+        sourceArtifact: { sha256: 'e'.repeat(64), size: 8192 },
+      })).rejects.toThrow(/immutable field changed: sourceArtifact/);
+    });
+
+    it('refuses a same-size re-download with a different digest', async () => {
+      const prepared = await preparedAt();
+      await expect(writeInstallPhase(path, 'credential_prepared', {
+        now: 3,
+        previous: prepared,
+        sourceArtifact: { sha256: 'f'.repeat(64), size: ARTIFACT.size },
+      })).rejects.toThrow(/immutable field changed: sourceArtifact/);
+    });
+
+    it('refuses a path change that arrives without any artifact evidence', async () => {
+      const prepared = await preparedAt();
+      await expect(writeInstallPhase(path, 'credential_prepared', {
+        now: 3, previous: prepared, sourceExePath: DOWNLOAD_B,
+      })).rejects.toThrow(/requires an identical verified source artifact/);
+    });
+
+    it('refuses a staged-target mutation (swapped service copy)', async () => {
+      const prepared = await preparedAt();
+      const receipt = {
+        path: 'C:\\Program Files\\imcodes-node\\bin.exe',
+        size: 4096,
+        sha256: '1'.repeat(64),
+        sourceIdentity: { dev: 1, ino: 2, size: 4096, mtimeMs: 1, ctimeMs: 1 },
+        stagedIdentity: { dev: 1, ino: 3, size: 4096, mtimeMs: 2, ctimeMs: 2 },
+      };
+      const staged = await writeInstallPhase(path, 'files_staged', {
+        now: 3,
+        previous: prepared,
+        stagedExePath: receipt.path,
+        stagedReceipt: receipt,
+      });
+      // Refreshing the bytes AT the pinned target is a legitimate re-stage.
+      const restaged = await writeInstallPhase(path, 'files_staged', {
+        now: 4,
+        previous: staged,
+        stagedReceipt: { ...receipt, sha256: '2'.repeat(64) },
+      });
+      expect(restaged.stagedReceipt!.sha256).toBe('2'.repeat(64));
+      // Redirecting the service somewhere else is not.
+      await expect(writeInstallPhase(path, 'files_staged', {
+        now: 5,
+        previous: restaged,
+        stagedReceipt: { ...receipt, path: 'C:\\Temp\\evil.exe' },
+      })).rejects.toThrow(/staged receipt must describe the pinned staged target/);
+    });
+
+    it('keeps installId and nodeTokenHash immutable through a legitimate migration', async () => {
+      const prepared = await preparedAt();
+      const migrated = await writeInstallPhase(path, 'credential_prepared', {
+        now: 3, previous: prepared, ...IDENTITY, sourceExePath: DOWNLOAD_B,
+      });
+      await expect(writeInstallPhase(path, 'credential_prepared', {
+        now: 4, previous: migrated, installId: 'inst-2',
+      })).rejects.toBeInstanceOf(InstallJournalTransitionError);
+      await expect(writeInstallPhase(path, 'credential_prepared', {
+        now: 5, previous: migrated, nodeTokenHash: 'b'.repeat(64),
+      })).rejects.toBeInstanceOf(InstallJournalTransitionError);
+    });
   });
 
   it('merges immutable metadata across phase transitions', async () => {

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { mkdtempSync } from 'node:fs';
 import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +11,7 @@ import {
   journalPathFor,
   type ControlledNodeBootstrapDeps,
 } from '../../src/node/bootstrap.js';
+import { INSTALL_JOURNAL_VERSION, writeInstallPhase as realWriteInstallPhase } from '../../src/node/install-journal.js';
 import type { InstallJournal, InstallPhase, ServiceReceipt } from '../../src/node/install-journal.js';
 import type {
   ControlledNodeCredential,
@@ -73,7 +75,13 @@ function makeSource(over: Partial<VerifiedEnrollmentSource> = {}): VerifiedEnrol
 
 function makeDeps(over: Partial<ControlledNodeBootstrapDeps> = {}): ControlledNodeBootstrapDeps & { phases: InstallPhase[]; journal: InstallJournal } {
   const phases: InstallPhase[] = [];
-  let journal: InstallJournal = { phase: 'uninstalled', updatedAt: 0 };
+  let journal: InstallJournal = { version: INSTALL_JOURNAL_VERSION, phase: 'uninstalled', updatedAt: 0 };
+  // Every deps set gets its own on-disk journal so the real writer's transition
+  // and immutability rules apply exactly as they do in production.
+  const journalFilePath = join(
+    mkdtempSync(join(tmpdir(), 'deck-bootstrap-')),
+    'install.json',
+  );
   const source = makeSource();
   const deps = {
     loadCredential: vi.fn(async () => null),
@@ -105,15 +113,24 @@ function makeDeps(over: Partial<ControlledNodeBootstrapDeps> = {}): ControlledNo
     isStableRuntime: vi.fn(async () => false),
     assertElevated: vi.fn(async () => {}),
     ensureReleasePublisherTrust: vi.fn(async () => {}),
+    // Content identity of the launched installer. Real installs read it from
+    // the verified inspection; the fixture pins it so path drift can be tested
+    // without a real executable on disk.
+    inspectSourceArtifact: vi.fn(async () => ({ sha256: 'c'.repeat(64), size: 4096 })),
     prepareCredentialDir: vi.fn(async () => {}),
     loadInstallJournal: vi.fn(async () => journal),
+    // The REAL writer, not a merge-only stand-in.
+    //
+    // The previous fake reproduced the merge and skipped `assertImmutableMetadata`
+    // entirely, so every bootstrap test ran with the tamper guards switched off
+    // and would have passed even if those guards did not exist. It writes to a
+    // per-test temp journal so the transition rules are exercised for real.
     writeInstallPhase: vi.fn(async (_p: string, phase: InstallPhase, extra: Partial<InstallJournal> & { previous?: InstallJournal | null; now: number }) => {
       phases.push(phase);
-      const { previous: _previous, now, ...patch } = extra;
-      journal = { ...(extra.previous ?? journal), ...patch, phase, updatedAt: now };
+      journal = await realWriteInstallPhase(journalFilePath, phase, { ...extra, previous: extra.previous ?? journal });
       return journal;
     }),
-    journalPath: '/tmp/j.json',
+    journalPath: journalFilePath,
     credentialPath: '/tmp/credential.json',
     stagedExecutablePath: '/tmp/staged/imcodes-node',
     sourceExecutablePath: '/tmp/download/imcodes-node',
@@ -121,6 +138,19 @@ function makeDeps(over: Partial<ControlledNodeBootstrapDeps> = {}): ControlledNo
     warn: vi.fn(),
     ...over,
   } as ControlledNodeBootstrapDeps & { phases: InstallPhase[]; journal: InstallJournal };
+  // Seed the real journal file from whatever the fixture reports as loaded, so
+  // the on-disk state the real writer validates against matches the scenario
+  // under test. Without this the writer compares a synthetic in-memory journal
+  // against an empty file and reports a stale transition.
+  const loadFixture = deps.loadInstallJournal;
+  deps.loadInstallJournal = vi.fn(async (...args: Parameters<typeof loadFixture>) => {
+    const loaded = await loadFixture(...args);
+    journal = loaded;
+    if (loaded && loaded.phase !== 'uninstalled') {
+      await writeFile(journalFilePath, JSON.stringify(loaded));
+    }
+    return loaded;
+  }) as typeof loadFixture;
   deps.phases = phases;
   deps.journal = journal;
   return deps;
@@ -132,6 +162,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       loadCredential: vi.fn(async () => CRED),
       isStableRuntime: vi.fn(async () => true),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_start_requested' as InstallPhase,
         updatedAt: 5,
         stagedExePath: STAGED_RECEIPT.path,
@@ -158,6 +193,12 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       isStableRuntime: vi.fn(async () => true),
       ensureReleasePublisherTrust: vi.fn(async () => { throw trustFailure; }),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        updatedAt: 1,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_start_requested' as InstallPhase,
         stagedExePath: '/tmp/staged/imcodes-node',
         stagedReceipt: STAGED_RECEIPT,
@@ -183,6 +224,12 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       loadCredential: vi.fn(async () => CRED),
       ensureReleasePublisherTrust: vi.fn(async () => { throw new Error('publisher trust invalid'); }),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        updatedAt: 1,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_registered' as InstallPhase,
         stagedExePath: '/tmp/staged/imcodes-node',
         stagedReceipt: STAGED_RECEIPT,
@@ -203,6 +250,12 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        updatedAt: 1,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_registered' as InstallPhase,
         stagedExePath: '/tmp/staged/imcodes-node',
         stagedReceipt: STAGED_RECEIPT,
@@ -225,6 +278,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       installDefinition: vi.fn(async () => MAC_SERVICE_RECEIPT),
       inspectServiceState,
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_start_requested' as InstallPhase,
         updatedAt: 5,
         stagedExePath: STAGED_RECEIPT.path,
@@ -256,6 +314,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       installDefinition: vi.fn(async () => MAC_SERVICE_RECEIPT),
       inspectServiceState,
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_start_requested' as InstallPhase,
         updatedAt: 5,
         stagedExePath: STAGED_RECEIPT.path,
@@ -283,6 +346,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       isStableRuntime: vi.fn(async () => true),
       inspectServiceState,
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_start_requested' as InstallPhase,
         updatedAt: 5,
         stagedExePath: STAGED_RECEIPT.path,
@@ -309,6 +377,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       loadCredential: vi.fn(async () => CRED),
       isStableRuntime: vi.fn(async () => true),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_registered' as InstallPhase,
         updatedAt: 5,
         stagedExePath: '/tmp/staged/imcodes-node',
@@ -329,6 +402,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'enrolled' as InstallPhase,
         updatedAt: 5,
         stagedExePath: '/tmp/staged/imcodes-node',
@@ -362,6 +440,9 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       isStableRuntime: vi.fn(async () => false),
       loadInstallIdentity: vi.fn(async () => IDENTITY),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        sourceExePath: '/tmp/download/imcodes-node',
+        healthyAt: 2,
         phase: 'service_healthy' as InstallPhase,
         updatedAt: 5,
         installId: IDENTITY.installId,
@@ -390,6 +471,80 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(result.credential).toEqual(CRED);
   });
 
+  it('refuses a different package delivered at the SAME source path', async () => {
+    // The worst shape of the attack: do not move the file at all, just replace
+    // its bytes at the path the journal already trusts. Checking only when the
+    // path changed meant nobody ever looked.
+    const deps = makeDeps({
+      loadInstallIdentity: vi.fn(async () => IDENTITY),
+      inspectSourceArtifact: vi.fn(async () => ({ sha256: 'f'.repeat(64), size: 9999 })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'credential_prepared' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        // Same path the installer is running from — only the bytes differ.
+        sourceExePath: '/tmp/download/imcodes-node',
+        sourceArtifact: { sha256: 'c'.repeat(64), size: 4096 },
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps))
+      .rejects.toThrow(/source executable does not match the journal source artifact/);
+  });
+
+  it('converges a torn journal/identity pair on the next boot without regressing the path', async () => {
+    // Crash injection at the persistence boundary: the journal was written and
+    // fsynced with the new download path, then the process died before the
+    // durable identity cache was updated. The journal is the authority, so the
+    // next boot must pull the identity forward — never push the journal back.
+    const persisted: PendingInstallIdentity[] = [];
+    const torn = { ...IDENTITY, sourceExePath: 'C:\\Users\\k\\Downloads\\imcodes-node.exe' };
+    const deps = makeDeps({
+      loadInstallIdentity: vi.fn(async () => torn),
+      persistInstallIdentity: vi.fn(async (identity: PendingInstallIdentity) => { persisted.push({ ...identity }); }),
+      inspectSourceArtifact: vi.fn(async () => ({ sha256: 'c'.repeat(64), size: 4096 })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'credential_prepared' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        // Already advanced by the crashed run.
+        sourceExePath: '/tmp/download/imcodes-node',
+        sourceArtifact: { sha256: 'c'.repeat(64), size: 4096 },
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+
+    expect(result.journal.sourceExePath, 'the journal must never regress').toBe('/tmp/download/imcodes-node');
+    expect(persisted.at(-1)?.sourceExePath, 'the identity cache must converge onto the journal')
+      .toBe('/tmp/download/imcodes-node');
+  });
+
+  it('is idempotent: a converged pair rewrites nothing', async () => {
+    const persisted: PendingInstallIdentity[] = [];
+    const deps = makeDeps({
+      loadInstallIdentity: vi.fn(async () => ({ ...IDENTITY, sourceExePath: '/tmp/download/imcodes-node' })),
+      persistInstallIdentity: vi.fn(async (identity: PendingInstallIdentity) => { persisted.push({ ...identity }); }),
+      inspectSourceArtifact: vi.fn(async () => ({ sha256: 'c'.repeat(64), size: 4096 })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'credential_prepared' as InstallPhase,
+        updatedAt: 5,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: '/tmp/download/imcodes-node',
+        sourceArtifact: { sha256: 'c'.repeat(64), size: 4096 },
+      })),
+    });
+
+    await bootstrapControlledNodeWithDisposition(deps);
+    expect(persisted, 'an already-converged pair must not be rewritten').toHaveLength(0);
+  });
+
   it('re-stages when the staged copy drifted from its receipt instead of refusing the install', async () => {
     // Field failure (Windows, 2026-09): a node whose stable image had been
     // replaced since its install could never be re-installed. Every run failed
@@ -401,6 +556,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       loadCredential: vi.fn(async () => null),
       loadInstallIdentity: vi.fn(async () => IDENTITY),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        sourceExePath: '/tmp/download/imcodes-node',
+        serverId: 'srv-1',
+        serviceName: 'imcodes-node',
+        healthyAt: 2,
         phase: 'service_healthy' as InstallPhase,
         updatedAt: 5,
         installId: IDENTITY.installId,
@@ -417,7 +577,12 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const result = await bootstrapControlledNodeWithDisposition(deps);
 
     expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith('/tmp/staged/imcodes-node', TRAILER.trailerStart, undefined);
-    expect(deps.phases).toContain('files_staged');
+    // The repair records the refreshed receipt WITHOUT rewinding the label: a
+    // healthy machine stays healthy. Stamping `files_staged` here would be a
+    // backward transition the journal refuses, which is what used to leave
+    // drifted machines with no way back.
+    expect(deps.phases).not.toContain('files_staged');
+    expect(deps.phases.every((phase) => phase === 'service_healthy')).toBe(true);
     expect(result.journal.stagedReceipt).toEqual(STAGED_RECEIPT);
   });
 
@@ -495,6 +660,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const retry = makeDeps({
       loadInstallIdentity: vi.fn(async () => IDENTITY),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
         phase: 'enrolled' as InstallPhase,
         updatedAt: 5,
         installId: 'inst-1',
@@ -517,6 +683,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       loadCredential: vi.fn(async () => null),
       loadInstallIdentity: vi.fn(async () => IDENTITY),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
         phase: 'enrolled' as InstallPhase,
         updatedAt: 5,
         installId: 'inst-1',
@@ -538,7 +705,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
       loadInstallJournal: vi.fn(async () => ({
-        version: 1,
+        version: INSTALL_JOURNAL_VERSION,
         phase: 'files_staged' as InstallPhase,
         updatedAt: 5,
         installId: IDENTITY.installId,
@@ -586,6 +753,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       openVerifiedEnrollmentSource: vi.fn(async () => source),
       loadCredential: vi.fn(async () => CRED),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
         phase: 'files_staged' as InstallPhase,
         updatedAt: 5,
         installId: IDENTITY.installId,
@@ -605,6 +773,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
       loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        serverId: 'srv-1',
+        installId: 'inst-1',
+        nodeTokenHash: 'a'.repeat(64),
+        sourceExePath: '/tmp/download/imcodes-node',
         phase: 'service_registered' as InstallPhase,
         updatedAt: 5,
         stagedExePath: '/tmp/staged/imcodes-node',
