@@ -382,6 +382,9 @@ const MAX_PENDING_INPUT_BYTES = 32 * 1024;
  *  every ~10s) is never probed by ordinary interaction — only a genuinely
  *  stalled one is. */
 const INTERACTION_PROBE_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
+const OWNED_DATA_REQUEST_TTL_MS = 20_000;
+const OWNED_DATA_REQUEST_RATE_WINDOW_MS = 10_000;
+const OWNED_DATA_REQUEST_RATE_LIMIT = 64;
 
 function createP2pWorkflowRequestId(): string {
   const requestId = globalThis.crypto?.randomUUID?.()
@@ -525,6 +528,13 @@ export class WsClient {
   private postConnectNonCriticalUntil = 0;
   private postConnectNonCriticalSlots = 0;
   private nonCriticalSendTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** Browser-owner single-flight for daemon reads that can return large
+   * payloads. Multiple mounted panels asking for the same snapshot share one
+   * requestId/response instead of multiplying daemon work and retained WS
+   * payloads. */
+  private ownedDataRequests = new Map<string, { requestId: string; expiresAt: number }>();
+  private ownedDataRequestKeyById = new Map<string, string>();
+  private ownedDataRequestStarts: number[] = [];
 
   /** Per-session stream reset recovery state.
    *  - lastSnapshotAt: rate-limits snapshot requests to avoid hammering the
@@ -1613,19 +1623,66 @@ export class WsClient {
     }
   }
 
+  private settleOwnedDataRequest(msg: ServerMessage): void {
+    const requestId = typeof (msg as { requestId?: unknown }).requestId === 'string'
+      ? (msg as { requestId: string }).requestId
+      : undefined;
+    if (!requestId) return;
+    const key = this.ownedDataRequestKeyById.get(requestId);
+    if (!key) return;
+    this.ownedDataRequestKeyById.delete(requestId);
+    const current = this.ownedDataRequests.get(key);
+    if (current?.requestId === requestId) this.ownedDataRequests.delete(key);
+  }
+
+  private beginOwnedDataRequest(
+    key: string,
+    buildRequest: (requestId: string) => Record<string, unknown>,
+    buildOverloadResponse: (requestId: string) => ServerMessage,
+  ): string {
+    const now = Date.now();
+    for (const [pendingKey, pending] of this.ownedDataRequests) {
+      if (pending.expiresAt > now) continue;
+      this.ownedDataRequests.delete(pendingKey);
+      this.ownedDataRequestKeyById.delete(pending.requestId);
+    }
+    const existing = this.ownedDataRequests.get(key);
+    if (existing) return existing.requestId;
+
+    const requestId = crypto.randomUUID();
+    this.ownedDataRequestStarts = this.ownedDataRequestStarts.filter(
+      (startedAt) => now - startedAt < OWNED_DATA_REQUEST_RATE_WINDOW_MS,
+    );
+    if (this.ownedDataRequestStarts.length >= OWNED_DATA_REQUEST_RATE_LIMIT) {
+      queueMicrotask(() => this.dispatch(buildOverloadResponse(requestId)));
+      return requestId;
+    }
+    this.ownedDataRequestStarts.push(now);
+    this.ownedDataRequests.set(key, { requestId, expiresAt: now + OWNED_DATA_REQUEST_TTL_MS });
+    this.ownedDataRequestKeyById.set(requestId, key);
+    this.send(buildRequest(requestId));
+    return requestId;
+  }
+
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
   fsListDir(path: string, includeFiles = false, includeMetadata = false, options?: FsListDirOptions): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: 'fs.ls',
-      path,
-      requestId,
-      includeFiles,
-      includeMetadata,
-      ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
-      ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
-    });
-    return requestId;
+    const key = JSON.stringify(['fs.ls', path, includeFiles, includeMetadata, options?.includeOpenSpecTaskStats === true, options?.sessionName ?? '']);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: 'fs.ls',
+        path,
+        requestId,
+        includeFiles,
+        includeMetadata,
+        ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+        ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
+      }),
+      (requestId) => ({
+        type: 'fs.ls_response', requestId, path, status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL, recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request a file's content from the daemon. Returns the requestId for matching the response. */
@@ -1680,15 +1737,21 @@ export class WsClient {
 
   /** Request git status for a directory. Returns requestId. */
   fsGitStatus(path: string, opts?: { includeStats?: boolean; sessionName?: string }): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: 'fs.git_status',
-      path,
-      requestId,
-      ...(opts?.includeStats ? { includeStats: true } : {}),
-      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
-    });
-    return requestId;
+    const key = JSON.stringify(['fs.git_status', path, opts?.includeStats === true, opts?.sessionName ?? '']);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: 'fs.git_status',
+        path,
+        requestId,
+        ...(opts?.includeStats ? { includeStats: true } : {}),
+        ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+      }),
+      (requestId) => ({
+        type: 'fs.git_status_response', requestId, path, status: 'error', files: [],
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL, recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request git diff for a file. Returns requestId. */
@@ -1787,21 +1850,72 @@ export class WsClient {
    *  afterTs: client's latest known event timestamp — server returns only newer events.
    *  beforeTs: for backward pagination — server returns only older events. */
   sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
-      sessionName,
-      requestId,
-      limit,
-      ...(afterTs !== undefined ? { afterTs } : {}),
-      ...(beforeTs !== undefined ? { beforeTs } : {}),
-    });
+    const key = JSON.stringify([TIMELINE_MESSAGES.HISTORY_REQUEST, sessionName, limit, afterTs ?? null, beforeTs ?? null]);
+    const requestId = this.beginOwnedDataRequest(
+      key,
+      (nextRequestId) => ({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName,
+        requestId: nextRequestId,
+        limit,
+        ...(afterTs !== undefined ? { afterTs } : {}),
+        ...(beforeTs !== undefined ? { beforeTs } : {}),
+      }),
+      (nextRequestId) => ({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: nextRequestId,
+        status: 'error',
+        source: 'error',
+        errorReason: 'queue_full',
+        events: [],
+        payloadTruncated: false,
+        hasMore: false,
+        recoverable: true,
+      } as unknown as ServerMessage),
+    );
     // Probe AFTER sending (not before): the send must run while the socket is
     // still logically connected. If the socket turned out to be a zombie, the
     // send is silently lost, but this kicks recovery so the window's foreground
     // auto-sync refetch lands on a healthy socket instead of waiting ~36s.
     this.maybeProbeForInteraction();
     return requestId;
+  }
+
+  requestTransportModels(options: {
+    agentType: string;
+    sessionName?: string;
+    ccPreset?: string;
+    force?: boolean;
+  }): string {
+    const key = JSON.stringify([
+      TRANSPORT_MSG.LIST_MODELS,
+      options.agentType,
+      options.sessionName ?? '',
+      options.ccPreset?.trim().toLowerCase() ?? '',
+      options.force === true,
+    ]);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: TRANSPORT_MSG.LIST_MODELS,
+        agentType: options.agentType,
+        requestId,
+        ...(options.sessionName ? { sessionName: options.sessionName } : {}),
+        ...(options.ccPreset ? { ccPreset: options.ccPreset } : {}),
+        ...(options.force ? { force: true } : {}),
+      }),
+      (requestId) => ({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        agentType: options.agentType,
+        requestId,
+        ...(options.sessionName ? { sessionName: options.sessionName } : {}),
+        ...(options.ccPreset ? { ccPreset: options.ccPreset } : {}),
+        models: [],
+        error: 'queue_full',
+        recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request a bounded explicit timeline page. */
@@ -2303,6 +2417,7 @@ export class WsClient {
   }
 
   private dispatch(msg: ServerMessage): void {
+    this.settleOwnedDataRequest(msg);
     this.settleP2pWorkflowRequest(msg);
     // Daemon lifecycle generations are independent from the browser↔Server
     // WebSocket.  During an in-place daemon upgrade that browser socket stays

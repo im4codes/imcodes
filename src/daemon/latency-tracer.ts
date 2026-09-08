@@ -49,6 +49,7 @@ interface RecentServerSend {
   wsSendMs: number;
   plane: ServerSendPlane;
   outboundQueueDepth?: number;
+  outboundQueueBytes?: number;
   outboundQueueAgeMs?: number;
   sendBacklogAgeMs?: number;
 }
@@ -566,6 +567,7 @@ export function recordServerSend(input: {
   bufferedAmountAfter?: number;
   sendBacklogAgeMs?: number;
   outboundQueueDepth?: number;
+  outboundQueueBytes?: number;
   outboundQueueAgeMs?: number;
   recipientCount?: number;
   success: boolean;
@@ -606,6 +608,7 @@ export function recordServerSend(input: {
       wsSendMs: roundMs(input.wsSendMs),
       plane,
       ...(input.outboundQueueDepth !== undefined ? { outboundQueueDepth: input.outboundQueueDepth } : {}),
+      ...(input.outboundQueueBytes !== undefined ? { outboundQueueBytes: input.outboundQueueBytes } : {}),
       ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
       ...(input.sendBacklogAgeMs !== undefined ? { sendBacklogAgeMs: roundMs(input.sendBacklogAgeMs) } : {}),
     });
@@ -628,6 +631,7 @@ export function recordServerSend(input: {
     ...(input.bufferedAmountAfter !== undefined ? { bufferedAmountAfter: input.bufferedAmountAfter } : {}),
     ...(input.sendBacklogAgeMs !== undefined ? { sendBacklogAgeMs: roundMs(input.sendBacklogAgeMs) } : {}),
     ...(input.outboundQueueDepth !== undefined ? { outboundQueueDepth: input.outboundQueueDepth } : {}),
+    ...(input.outboundQueueBytes !== undefined ? { outboundQueueBytes: input.outboundQueueBytes } : {}),
     ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
     ...(input.recipientCount !== undefined ? { recipientCount: input.recipientCount } : {}),
     success: input.success,

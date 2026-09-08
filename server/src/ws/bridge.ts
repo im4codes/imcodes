@@ -94,6 +94,7 @@ import {
   isDirectConnectivityRuntimeStatus,
 } from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import {
   FILE_TRANSFER_MSG,
@@ -527,6 +528,17 @@ const SESSION_GROUP_CLONE_CONTEXT_TTL_MS = 10 * 60 * 1000;
  * the limiter back on, flip the flag — no other changes required.
  */
 const BROWSER_RATE_LIMIT_ENABLED = false;
+// Dedicated read-plane limiter stays enabled even while the legacy global
+// limiter is disabled. It cannot block session.send/STOP/control traffic and
+// bounds old browsers that predate owner-side single-flight.
+const BROWSER_DATA_READ_RATE_LIMIT = 64;
+const BROWSER_DATA_READ_RATE_WINDOW_MS = 10_000;
+const BROWSER_DATA_READ_TYPES: ReadonlySet<string> = new Set([
+  'fs.ls',
+  'fs.git_status',
+  TRANSPORT_MSG.LIST_MODELS,
+  TIMELINE_MESSAGES.HISTORY_REQUEST,
+]);
 // 4MB per (session, browser). Heavy output (build logs, large `cat`, log tail)
 // can burst tens of KB per frame; at 1MB the queue overflowed within a few
 // frames during heavy output and triggered stream_reset cascades, which the
@@ -1624,6 +1636,7 @@ export class WsBridge {
   private upgradeBlockedSyncCompleteGeneration: number | null = null;
   private seenUpgradeBlockedFailures = new Map<string, number>();
   private browserRateLimiter = new MemoryRateLimiter();
+  private browserDataReadRateLimiter = new MemoryRateLimiter();
 
   /** browser socket → session name → raw-enabled flag */
   private browserSubscriptions = new Map<WebSocket, Map<string, boolean>>();
@@ -3268,6 +3281,49 @@ export class WsBridge {
     safeSend(ws, JSON.stringify(withBridgeActualPayloadBytes(
       timelineDataPlaneErrorResponse(msg, responseType, errorReason),
     )));
+  }
+
+  private rejectBrowserDataReadOverload(ws: WebSocket, msg: Record<string, unknown>): void {
+    const type = optionalString(msg.type);
+    if (type === TIMELINE_MESSAGES.HISTORY_REQUEST) {
+      this.sendTimelineRequestError(ws, msg, TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL);
+      return;
+    }
+    if (type === 'fs.ls') {
+      safeSend(ws, JSON.stringify({
+        type: 'fs.ls_response',
+        requestId: msg.requestId,
+        path: optionalString(msg.path) ?? '',
+        status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      return;
+    }
+    if (type === 'fs.git_status') {
+      safeSend(ws, JSON.stringify({
+        type: 'fs.git_status_response',
+        requestId: msg.requestId,
+        path: optionalString(msg.path) ?? '',
+        status: 'error',
+        files: [],
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      return;
+    }
+    if (type === TRANSPORT_MSG.LIST_MODELS) {
+      safeSend(ws, JSON.stringify({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        requestId: msg.requestId,
+        agentType: optionalString(msg.agentType) ?? '',
+        ...(optionalString(msg.sessionName) ? { sessionName: optionalString(msg.sessionName) } : {}),
+        ...(optionalString(msg.ccPreset) ? { ccPreset: optionalString(msg.ccPreset) } : {}),
+        models: [],
+        error: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+        recoverable: true,
+      }));
+    }
   }
 
   private async verifyTimelineBrowserRequest(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
@@ -5287,6 +5343,20 @@ export class WsBridge {
       const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
       if (!browserMessageType) {
         return;
+      }
+
+      if (BROWSER_DATA_READ_TYPES.has(browserMessageType)) {
+        const browserId = this.getBrowserId(ws);
+        if (!this.browserDataReadRateLimiter.check(
+          `data-read:${browserId}`,
+          BROWSER_DATA_READ_RATE_LIMIT,
+          BROWSER_DATA_READ_RATE_WINDOW_MS,
+        )) {
+          incrementCounter('ws_bridge_browser_data_read_rate_limited', { type: browserMessageType });
+          logger.warn({ serverId: this.serverId, type: browserMessageType }, 'Browser data read rate limit exceeded');
+          this.rejectBrowserDataReadOverload(ws, msg);
+          return;
+        }
       }
 
       if (this.directFileTransferRouter.handleBrowser(ws, userId, msg)) {
@@ -10788,6 +10858,7 @@ export class WsBridge {
       && this.pendingPreviewWsUpgrades.size === 0
     ) {
       this.browserRateLimiter.stop();
+      this.browserDataReadRateLimiter.stop();
       if (this.shareExpirySweepTimer) {
         clearInterval(this.shareExpirySweepTimer);
         this.shareExpirySweepTimer = null;

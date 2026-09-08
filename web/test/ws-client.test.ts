@@ -1687,6 +1687,36 @@ describe('WsClient', () => {
       client.disconnect();
     });
 
+    it('single-flights identical owner reads until the matching response settles', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const first = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      const duplicate = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      expect(duplicate).toBe(first);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(lastWs!.send.mock.calls
+        .map(([raw]) => JSON.parse(String(raw)))
+        .filter((message) => message.type === 'fs.ls')).toHaveLength(1);
+
+      lastWs!.emit('message', { data: JSON.stringify({
+        type: 'fs.ls_response', requestId: first, path: '/home/user/shared', status: 'ok', entries: [],
+      }) });
+      const afterSettle = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      expect(afterSettle).not.toBe(first);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(lastWs!.send.mock.calls
+        .map(([raw]) => JSON.parse(String(raw)))
+        .filter((message) => message.type === 'fs.ls')).toHaveLength(2);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('fs.ls_response is dispatched to onMessage handlers', async () => {
       const client = await connectClient();
       const handler = vi.fn();
@@ -1704,6 +1734,57 @@ describe('WsClient', () => {
       expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'fs.ls_response', requestId }));
       client.disconnect();
     });
+  });
+
+  it('single-flights timeline history, git status and model catalogue reads by semantic owner key', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    lastWs!.send.mockClear();
+
+    expect(client.sendTimelineHistoryRequest('deck_owner', 500))
+      .toBe(client.sendTimelineHistoryRequest('deck_owner', 500));
+    expect(client.fsGitStatus('/repo', { includeStats: true, sessionName: 'deck_owner' }))
+      .toBe(client.fsGitStatus('/repo', { includeStats: true, sessionName: 'deck_owner' }));
+    expect(client.requestTransportModels({ agentType: 'codex-sdk', sessionName: 'deck_owner' }))
+      .toBe(client.requestTransportModels({ agentType: 'codex-sdk', sessionName: 'deck_owner' }));
+
+    await vi.advanceTimersByTimeAsync(500);
+    const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string });
+    expect(sent.filter((message) => message.type === TIMELINE_MESSAGES.HISTORY_REQUEST)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === 'fs.git_status')).toHaveLength(1);
+    expect(sent.filter((message) => message.type === TRANSPORT_MSG.LIST_MODELS)).toHaveLength(1);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('rate-limits unique owner data reads without blocking control traffic and emits a recoverable result', async () => {
+    const client = await connectClient();
+    const handler = vi.fn();
+    client.onMessage(handler);
+    lastWs!.send.mockClear();
+
+    let rejectedRequestId = '';
+    for (let index = 0; index < 65; index += 1) {
+      rejectedRequestId = client.sendTimelineHistoryRequest(`deck_owner_${index}`, 500);
+    }
+    client.send({ type: 'session.send', sessionName: 'deck_owner_0', text: 'still-live', commandId: 'cmd-live' });
+    await Promise.resolve();
+
+    const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string });
+    expect(sent.filter((message) => message.type === TIMELINE_MESSAGES.HISTORY_REQUEST)).toHaveLength(64);
+    expect(sent).toContainEqual(expect.objectContaining({ type: 'session.send', commandId: 'cmd-live' }));
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: rejectedRequestId,
+      status: 'error',
+      errorReason: 'queue_full',
+      recoverable: true,
+    }));
+    client.disconnect();
   });
 
   describe('fs rename/delete', () => {

@@ -387,6 +387,180 @@ describe('ServerLink', () => {
     expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
   });
 
+  it('bounds retained data-plane payload bytes while the server link is unavailable', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      softCap: 1,
+      hardCap: 100,
+      maxBytes: 32 * 1024,
+      staleMs: 60_000,
+    });
+    mockWsInstance.readyState = 3; // CLOSED
+
+    for (let index = 0; index < 20; index += 1) {
+      link.send({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: `hist-${index}`,
+        sessionName: 'deck_test_brain',
+        events: [{ text: `${index}:`.padEnd(16 * 1024, 'x') }],
+      });
+    }
+
+    const stats = link.dataPlaneQueueStatsForTests();
+    expect(stats.bytes).toBeLessThanOrEqual(32 * 1024);
+    expect(stats.depth).toBeLessThanOrEqual(20);
+
+    mockWsInstance.readyState = 1;
+    link.connect();
+    link.flushDataPlaneAfterReconnect();
+    for (let index = 0; index < stats.depth + 1; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const sentHistory = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type === TIMELINE_MESSAGES.HISTORY);
+    expect(sentHistory).toHaveLength(stats.depth);
+    expect(sentHistory.filter((message) => message.errorReason === 'queue_full').length).toBeGreaterThan(0);
+  });
+
+  it('returns a compact recoverable response instead of retaining a timeline payload beyond the byte cap', () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      softCap: 1,
+      hardCap: 100,
+      maxBytes: 20 * 1024,
+      overloadReserveBytes: 1024,
+      staleMs: 60_000,
+    });
+    link.connect();
+
+    link.send({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-kept',
+      sessionName: 'deck_test_brain',
+      events: [{ text: 'x'.repeat(16 * 1024) }],
+    });
+    link.send({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-rejected',
+      sessionName: 'deck_test_brain',
+      events: [{ text: 'y'.repeat(16 * 1024) }],
+    });
+
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 2 });
+  });
+
+  it('never bypasses a stuck WebSocket watermark with queue-full data responses', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      softCap: 1,
+      hardCap: 32,
+      maxBytes: 32 * 1024,
+      overloadReserveBytes: 8 * 1024,
+      overloadReserveItems: 8,
+      wsHighWaterBytes: 1024,
+      wsLowWaterBytes: 256,
+      staleMs: 60_000,
+    });
+    mockWsInstance.bufferedAmount = 2048;
+    link.connect();
+
+    for (let index = 0; index < 64; index += 1) {
+      link.send({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: `hist-overload-${index}`,
+        sessionName: 'deck_test_brain',
+        events: [{ text: `${index}`.padEnd(16 * 1024, 'x') }],
+      });
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests().bytes).toBeLessThanOrEqual(32 * 1024);
+    expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+    expect(mockWsInstance.close).toHaveBeenCalledWith(1013, 'data_plane_backpressure');
+
+    mockWsInstance.bufferedAmount = 0;
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+    for (let index = 0; index < 40; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const sent = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-overload-1',
+      sessionName: 'deck_test_brain',
+      status: 'error',
+      source: 'error',
+      errorReason: 'queue_full',
+      events: [],
+      recoverable: true,
+    }));
+  });
+
+  it('holds bulk sends above WebSocket high-water, keeps ACKs live, then drains in order below low-water', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      maxBytes: 1024 * 1024,
+      wsHighWaterBytes: 1024,
+      wsLowWaterBytes: 256,
+      staleMs: 60_000,
+    });
+    mockWsInstance.bufferedAmount = 2048;
+    link.connect();
+    link.send({ type: 'fs.ls_response', requestId: 'ls-1', path: '/a', status: 'ok', entries: [] });
+    link.send({ type: 'fs.git_status_response', requestId: 'git-2', path: '/a', status: 'ok', files: [] });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 2, socketBackpressured: true });
+
+    link.send({ type: 'command.ack', commandId: 'ack-while-bulk-paused' });
+    expect(JSON.parse(String(mockWsInstance.send.mock.calls[0][0]))).toMatchObject({
+      type: 'command.ack',
+      commandId: 'ack-while-bulk-paused',
+    });
+
+    mockWsInstance.bufferedAmount = 256;
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const sentData = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type !== 'command.ack');
+    expect(sentData.map((message) => message.requestId)).toEqual(['ls-1', 'git-2']);
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 0, bytes: 0, socketBackpressured: false });
+  });
+
+  it('keeps a mixed one-megabyte flood under the configured retained-byte ceiling', () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      maxBytes: 128 * 1024,
+      wsHighWaterBytes: 64 * 1024,
+      wsLowWaterBytes: 16 * 1024,
+      staleMs: 60_000,
+    });
+    mockWsInstance.readyState = 3;
+    const types = [TIMELINE_MESSAGES.HISTORY, 'fs.ls_response', 'fs.git_status_response', 'transport.models_response'];
+    for (let index = 0; index < 256; index += 1) {
+      const type = types[index % types.length];
+      link.send({
+        type,
+        requestId: `mixed-${index}`,
+        sessionName: 'deck_test_brain',
+        path: '/repo',
+        status: 'ok',
+        events: [{ text: `${index}`.padEnd(4096, 'x') }],
+        entries: [{ name: `${index}`.padEnd(4096, 'x') }],
+        files: [{ path: `${index}`.padEnd(4096, 'x') }],
+        models: [{ id: `${index}`.padEnd(4096, 'x') }],
+      });
+    }
+    expect(link.dataPlaneQueueStatsForTests().bytes).toBeLessThanOrEqual(128 * 1024);
+  });
+
   it('drain leaves the queued data-plane item intact when the socket is not OPEN and resends it after reconnect', async () => {
     // Section-10 (post-deploy audit fix for commit f25f72e7) anchor:
     // before the fix, the drain loop ran `shift()` and then `trySend()`

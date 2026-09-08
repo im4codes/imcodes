@@ -28,6 +28,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import {
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
@@ -3632,6 +3633,39 @@ describe('WsBridge', () => {
         session: 'sessStorm',
         raw: true,
       })]);
+    });
+
+    it('bounds legacy browser bulk-read storms without rate-limiting control commands', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+      browserWs.sent.length = 0;
+
+      for (let index = 0; index < 65; index += 1) {
+        browserWs.emit('message', JSON.stringify({
+          type: 'fs.ls',
+          requestId: `bulk-${index}`,
+          path: `/tmp/${index}`,
+        }));
+      }
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.send', session: 'sessStorm', text: 'control survives', commandId: 'cmd-survives',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      expect(forwarded.filter((message) => message.type === 'fs.ls')).toHaveLength(64);
+      expect(forwarded).toContainEqual(expect.objectContaining({ type: 'session.send', commandId: 'cmd-survives' }));
+      expect(browserWs.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({
+        type: 'fs.ls_response',
+        requestId: 'bulk-64',
+        status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      expect(getCounter('ws_bridge_browser_data_read_rate_limited', { type: 'fs.ls' })).toBe(1);
     });
 
     it('rapid replace without auth does not crash or leak', async () => {

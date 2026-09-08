@@ -59,21 +59,10 @@ export function useTransportModels(
         setState({ models: [], loading: false });
         return;
       }
-      const requestId = `models-${Math.random().toString(36).slice(2)}-${Date.now()}`;
-      pendingRequestId.current = requestId;
-      // Clear only when the picker actually changes provider. Reconnects and
-      // repeated refreshes for the same provider keep the last good catalog
-      // visible until its replacement arrives.
-      const providerChanged = currentCatalogIdentity.current !== catalogIdentity;
-      currentCatalogIdentity.current = catalogIdentity;
-      setState((prev) => providerChanged
-        ? { models: [], loading: true }
-        : { ...prev, loading: true, error: undefined });
+      let requestId: string;
       try {
-        ws.send({
-          type: TRANSPORT_MSG.LIST_MODELS,
+        requestId = ws.requestTransportModels({
           agentType,
-          requestId,
           ...(sessionName?.trim() ? { sessionName: sessionName.trim() } : {}),
           ...(ccPreset?.trim() ? { ccPreset: ccPreset.trim() } : {}),
           ...(force ? { force: true } : {}),
@@ -84,7 +73,17 @@ export function useTransportModels(
           loading: false,
           error: err instanceof Error ? err.message : String(err),
         });
+        return;
       }
+      pendingRequestId.current = requestId;
+      // Clear only when the picker actually changes provider. Reconnects and
+      // repeated refreshes for the same provider keep the last good catalog
+      // visible until its replacement arrives.
+      const providerChanged = currentCatalogIdentity.current !== catalogIdentity;
+      currentCatalogIdentity.current = catalogIdentity;
+      setState((prev) => providerChanged
+        ? { models: [], loading: true }
+        : { ...prev, loading: true, error: undefined });
     },
     [ws, wsConnected, agentType, ccPreset, sessionName, catalogIdentity],
   );
