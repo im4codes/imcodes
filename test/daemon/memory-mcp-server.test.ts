@@ -1570,6 +1570,30 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       resetTransportQueueStoreForTests();
     }
   });
+
+  it('preserves upstream shared machine authority in durable private resend material', () => {
+    resetTransportQueueStoreForTests();
+    const recipient = { sessionInstanceId: 'authority-instance', runtimeEpoch: 'authority-epoch' };
+    try {
+      expect(enqueueResend('deck_sub_authority', {
+        recipient,
+        text: 'authorized work',
+        commandId: 'authority-command',
+        clientMessageId: 'authority-message',
+        sharedMachineAuthority: 'server-signed-authority',
+        queuedAt: Date.now(),
+      }).accepted).toBe(true);
+      expect(JSON.parse(getTransportQueueStore().readPrivateDispatchMaterial(
+        'deck_sub_authority',
+        'authority-message',
+        recipient,
+      ) ?? '{}')).toMatchObject({
+        sharedMachineAuthority: 'server-signed-authority',
+      });
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
+  });
 });
 
 describe('createMemoryMcpServerFromEnv supervision wiring', () => {
