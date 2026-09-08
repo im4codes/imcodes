@@ -6925,6 +6925,88 @@ describe('CodexSdkProvider', () => {
       });
     });
 
+    it('marks a canonical controlled-device helper timeout as dispatched, not unauthorized', async () => {
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-claim-machine', cwd: '/tmp/project' });
+      await provider.send('route-claim-machine', 'control the shared machine');
+      const child = childProcessMock.children.at(-1)!;
+
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: {
+            id: 'mcp-machine-1', type: 'mcpToolCall', status: 'completed',
+            server: 'imcodes-memory', tool: 'computer_use_call',
+            arguments: { machine: '1472527657', tool: 'list_apps' },
+            result: {
+              structuredContent: {
+                status: 'ok', outcome: 'tool_error',
+                result: {
+                  correlationId: 'correlation-1', ok: false, tool: 'list_apps', content: [],
+                  durationMs: 1, error: 'computer_use_helper_connect_timeout',
+                },
+              },
+            },
+          },
+        },
+      });
+      completeTurn(child, 'The device helper timed out.');
+      await waitForCondition(() => completions.length > 0);
+
+      expect(readDelegationClaim(completions.at(-1)?.metadata)).toMatchObject({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'mcp-machine-1', kind: 'machine-control',
+          tool: 'computer_use_call', machine: '1472527657',
+        }],
+      });
+    });
+
+    it('projects an authority-validated local Computer Use result into the completed turn', async () => {
+      const provider = createCodexProvider();
+      const completions: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completions.push(message));
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-claim-local-machine', cwd: '/tmp/project' });
+      await provider.send('route-claim-local-machine', 'control the shared owner host');
+      const child = childProcessMock.children.at(-1)!;
+
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: {
+            id: 'mcp-local-machine-1', type: 'mcpToolCall', status: 'completed',
+            server: 'imcodes-memory', tool: 'computer_use_call',
+            arguments: { machine: 'self', tool: 'list_apps' },
+            result: {
+              structuredContent: {
+                status: 'ok', outcome: 'completed',
+                result: {
+                  correlationId: 'local-correlation-1', ok: true, tool: 'list_apps',
+                  content: [{ type: 'text', text: 'local-ok' }], durationMs: 1,
+                },
+              },
+            },
+          },
+        },
+      });
+      completeTurn(child, 'The local device operation completed.');
+      await waitForCondition(() => completions.length > 0);
+
+      expect(readDelegationClaim(completions.at(-1)?.metadata)).toMatchObject({
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'mcp-local-machine-1', kind: 'machine-control',
+          tool: 'computer_use_call', machine: 'local',
+        }],
+      });
+    });
+
     it('does not let a native collaboration send_message substantiate a claim', async () => {
       // Native collab shares the short name but carries no IM.codes authority.
       const provider = createCodexProvider();

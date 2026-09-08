@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   readDelegationDispatchFact,
+  readMachineControlDispatchFact,
   projectDelegationClaim,
   DELEGATION_CLAIM_METADATA_FIELD,
   type DelegationDispatchFact,
@@ -4720,6 +4721,12 @@ export class CodexSdkProvider implements TransportProvider {
           item.tool,
           item.arguments,
           item.result?.structuredContent ?? item.result?.content,
+        ) ?? readMachineControlDispatchFact(
+          item.server,
+          item.tool,
+          item.arguments,
+          item.result?.structuredContent ?? item.result?.content,
+          item.id,
         );
         if (dispatchFact) {
           (state.turnDelegationDispatches ??= []).push(dispatchFact);

@@ -12,6 +12,7 @@ import {
   normalizeComputerUseErrorForTest,
   normalizeOpenComputerUseParsedResult,
   openComputerUseCallArgs,
+  openComputerUseBinaryIdentityForTest,
   openComputerUseCandidateBinariesForTest,
   openComputerUseEnv,
   resolveOpenComputerUseBinaryForCurrentProcessForTest,
@@ -21,6 +22,14 @@ import {
 } from '../../src/node/computer-use-runner.js';
 
 describe('computer use runner open-computer-use CLI', () => {
+  it('invalidates the long-lived MCP helper when the sidecar bytes are replaced in place', () => {
+    const path = 'C:\\ProgramData\\imcodes-node\\computer-use-helper\\open-computer-use.exe';
+    const before = openComputerUseBinaryIdentityForTest(path, { size: 10, mtimeMs: 100, ino: 1 });
+    const after = openComputerUseBinaryIdentityForTest(path, { size: 11, mtimeMs: 101, ino: 1 });
+    expect(after).not.toBe(before);
+    expect(openComputerUseBinaryIdentityForTest(path, null)).toBe(path);
+  });
+
   it('uses the supported JSON argument form without unsupported timeout flags', () => {
     expect(openComputerUseCallArgs('list_apps', '{}')).toEqual(['call', 'list_apps', '--args', '{}']);
   });
@@ -122,7 +131,7 @@ describe('computer use runner open-computer-use CLI', () => {
     expect(verify).toHaveBeenCalledWith(packaged);
   });
 
-  it('wires the running module location into production resolution instead of relying on cwd or PATH', async () => {
+  it('wires the running entry location into production resolution instead of relying on cwd or PATH', async () => {
     const packaged = resolve('dist/computer-use-helper/darwin-arm64/Open Computer Use.app/Contents/MacOS/OpenComputerUse');
     const exists = vi.fn(async (candidate: string) => candidate === packaged);
     const verify = vi.fn(async (candidate: string) => exists(candidate));
@@ -130,11 +139,25 @@ describe('computer use runner open-computer-use CLI', () => {
     const selected = await resolveOpenComputerUseBinaryForCurrentProcessForTest({
       platform: 'darwin',
       arch: 'arm64',
-      entryFilePath: '/tmp/unrelated/imcodes',
+      entryFilePath: resolve('dist/src/index.js'),
       env: { PATH: '/usr/bin:/bin' },
       cwd: '/tmp/unrelated',
       fileExists: exists,
       verifyTrustedArtifact: verify,
+    });
+    expect(selected).toBe(packaged);
+  });
+
+  it('resolves the signed Windows sidecar in a CJS/SEA build where import.meta.url is unavailable', async () => {
+    const packaged = 'C:\\ProgramData\\imcodes-node\\computer-use-helper\\open-computer-use.exe';
+    const selected = await resolveOpenComputerUseBinaryForCurrentProcessForTest({
+      platform: 'win32',
+      arch: 'x64',
+      entryFilePath: 'C:\\Program Files\\imcodes-node\\imcodes-node.exe',
+      env: { PATH: 'C:\\Windows\\System32' },
+      cwd: 'C:\\Program Files\\imcodes-node',
+      fileExists: async (candidate) => candidate === packaged,
+      verifyTrustedArtifact: async (candidate) => candidate === packaged,
     });
     expect(selected).toBe(packaged);
   });

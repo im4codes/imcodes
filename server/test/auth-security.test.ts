@@ -188,6 +188,26 @@ describe('share ticket auth boundary', () => {
     expect(bearerAuth).toBeNull();
     expect(cookieAuth).toBeNull();
   });
+
+  it('does not accept shared machine authority as ordinary API auth', async () => {
+    const env = makeEnv();
+    const { resolveAuth } = await import('../src/security/authorization.js');
+    const { signJwt } = await import('../src/security/crypto.js');
+    const token = signJwt({
+      type: 'shared-session-machine-authority', sub: 'participant-1', sourceServerId: 'srv-1',
+      sessionName: 'deck_a', projectName: 'project-a',
+      shareTarget: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_a' }, actionId: 'action-1',
+    }, env.JWT_SIGNING_KEY, 60);
+    for (const headers of [
+      { authorization: `Bearer ${token}` },
+      { cookie: `${COOKIE_SESSION}=${encodeURIComponent(token)}` },
+    ]) {
+      await expect(resolveAuth({
+        env,
+        req: { header: (name: string) => headers[name.toLowerCase() as keyof typeof headers] },
+      } as never)).resolves.toBeNull();
+    }
+  });
 });
 
 describe('browser identity expectation boundary', () => {

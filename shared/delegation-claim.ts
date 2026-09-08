@@ -19,6 +19,8 @@ import {
   readSupervisionExecutionSummary,
   type SupervisionExecutionSummary,
 } from './supervision-execution-summary.js';
+import { isControlledNodeId } from './controlled-node-identity.js';
+import { isLocalComputerUseAlias } from './machine-reference.js';
 
 export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
 
@@ -29,6 +31,10 @@ export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
  * alone.
  */
 export const DELEGATION_DISPATCH_TOOLS = ['send_message'] as const;
+export const MACHINE_CONTROL_DISPATCH_TOOLS = [
+  'exec_remote',
+  'computer_use_call',
+] as const;
 
 /** Metadata field carrying the projection on a completed assistant message. */
 export const DELEGATION_CLAIM_METADATA_FIELD = 'delegationClaim';
@@ -57,9 +63,14 @@ export interface DelegationDeliveryFact {
 /** One authorized dispatch, bound to its exact authority ids. */
 export interface DelegationDispatchFact {
   dispatchId: string;
+  /** Absent on legacy supervision receipts. */
+  kind?: 'machine-control';
   /** Required: without both ids the dispatch cannot be checked against the registry. */
-  taskId: string;
-  assignmentId: string;
+  taskId?: string;
+  assignmentId?: string;
+  /** Present for an authenticated controlled-device dispatch. */
+  tool?: (typeof MACHINE_CONTROL_DISPATCH_TOOLS)[number];
+  machine?: string;
   deliveries: DelegationDeliveryFact[];
 }
 
@@ -141,6 +152,53 @@ export const readDelegationDispatchFact = (
   // must not substantiate an assigned/queued/recovered claim.
   if (!taskId || !assignmentId) return null;
   return { dispatchId, taskId, assignmentId, deliveries };
+};
+
+/**
+ * Read a definitively dispatched controlled-device call from one completed MCP
+ * item.  Pre-dispatch refusals and indeterminate outcomes are deliberately not
+ * counted.  In particular, a `computer_use_helper_connect_timeout` is a
+ * `tool_error` returned by the target after dispatch, whereas authorization,
+ * expiry, Viewer, offline, and routing failures never reach this function's
+ * positive outcome set.
+ */
+export const readMachineControlDispatchFact = (
+  server: unknown,
+  tool: unknown,
+  toolArguments: unknown,
+  structuredOutput: unknown,
+  toolCallId: unknown,
+): DelegationDispatchFact | null => {
+  if (asMeaningfulString(server) !== DELEGATION_AUTHORITY_MCP_SERVER) return null;
+  const toolName = asMeaningfulString(tool);
+  if (!toolName || !(MACHINE_CONTROL_DISPATCH_TOOLS as readonly string[]).includes(toolName)) return null;
+  const callId = asMeaningfulString(toolCallId);
+  const args = asRecord(toolArguments);
+  const machineInput = asMeaningfulString(args?.machine);
+  const markedNodeId = machineInput?.match(/^\^\^\(([1-9][0-9]{9})\)$/)?.[1];
+  const nodeId = isControlledNodeId(machineInput)
+    ? machineInput
+    : isControlledNodeId(markedNodeId) ? markedNodeId : null;
+  const machine = nodeId
+    ?? (toolName === 'computer_use_call' && isLocalComputerUseAlias(machineInput) ? 'local' : null);
+  // Only a canonical controlled-node identity or the shared local-host alias
+  // can substantiate this UI fact. Deprecated arbitrary aliases remain
+  // intentionally untrusted at this projection boundary.
+  if (!callId || !machine) return null;
+  const output = asRecord(structuredOutput);
+  if (!output || asMeaningfulString(output.status) !== 'ok') return null;
+  const outcome = asMeaningfulString(output.outcome);
+  const dispatched = toolName === 'exec_remote'
+    ? outcome === 'completed' || outcome === 'node_timeout' || outcome === 'spawn_error'
+    : (outcome === 'completed' || outcome === 'tool_error') && asRecord(output.result) !== null;
+  if (!dispatched) return null;
+  return {
+    dispatchId: callId,
+    kind: 'machine-control',
+    tool: toolName as (typeof MACHINE_CONTROL_DISPATCH_TOOLS)[number],
+    machine,
+    deliveries: [{ target: machine, status: 'delivered' }],
+  };
 };
 
 /**

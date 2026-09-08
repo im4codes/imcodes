@@ -19,6 +19,8 @@ import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
+import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import type {
@@ -5685,6 +5687,29 @@ export class WsBridge {
       runtimeType,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
     });
+    if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
+      const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
+      const signingKey = this.directFileTransferTicketSigningKey;
+      const token = actor && signingKey && this.db
+        ? await issueSharedMachineAuthorityForSession(this.db, {
+            actorUserId: actor.actorUserId,
+            sourceServerId: this.serverId,
+            sessionName,
+            shareTarget: actor.snapshot.target,
+            actionId: actor.actionId,
+            signingKey,
+          })
+        : null;
+      if (!token) {
+        const denied: ShareCommandDecision = { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
+        await this.auditShareScopedBrowserCommand(current, msg, denied);
+        return denied;
+      }
+      decision.stampedMessage = {
+        ...decision.stampedMessage,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: token,
+      };
+    }
     if (decision.allowed && sessionName) {
       const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, sessionName, shareClockNow());
       if (rateLimitReason) {

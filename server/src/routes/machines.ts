@@ -18,7 +18,10 @@ import {
   MACHINE_REASONS,
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
-import { listAccessibleControlledMachines } from '../share/machine-access.js';
+import {
+  listAccessibleControlledMachines,
+  resolveControlledMachineOperatorAccess,
+} from '../share/machine-access.js';
 import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
 import {
   isImcodesVersionOutdated,
@@ -43,6 +46,8 @@ import {
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
 import { backfillCanonicalHosts } from '../services/remote-desktop-host-identity.js';
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -145,7 +150,7 @@ export async function listControlledMachines(
 
 // GET /api/machines — owned + actively shared controlled machines with DB-backed presence.
 machinesRoutes.get('/', requireAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  let userId = c.get('userId' as never) as string;
   const now = Date.now();
   // Browser discovery is also the bounded, resumable provisioning seam for an
   // Owner whose remote-desktop node predates canonical host identity. This is
@@ -153,6 +158,18 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   // the additive identity field.
   const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
     && typeof c.get('authServerId') === 'string';
+  if (authenticatedDaemon) {
+    const sourceServerId = c.get('authServerId') as string;
+    const operational = await resolveMachineOperationalUser(c.env.DB, {
+      token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+      signingKey: c.env.JWT_SIGNING_KEY,
+      authenticatedSourceServerId: sourceServerId,
+      sourceOwnerUserId: userId,
+      now,
+    });
+    if (!operational) return c.json({ error: 'forbidden' }, 403);
+    userId = operational.userId;
+  }
   if (!authenticatedDaemon) {
     await backfillCanonicalHosts({
       db: c.env.DB,
@@ -182,7 +199,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   return c.json({ machines: responseMachines });
 });
 
-// POST /api/machines/:serverId/display-name — owner-controlled render name.
+// POST /api/machines/:serverId/display-name — operator-controlled render name.
 // A deprecated legacy `ref_name` remains immutable so historical markers stay valid.
 machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -193,13 +210,15 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const displayName = normalizeMachineDisplayName(parsed.data.displayName);
   if (!displayName) return c.json({ error: MACHINE_REASONS.INVALID_DISPLAY_NAME }, 400);
+  const access = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  if (!access) return c.json({ error: 'not_found' }, 404);
 
   const row = await c.env.DB.queryOne<{ previous_name: string | null }>(
-    `UPDATE servers SET display_name = $3
+    `UPDATE servers SET display_name = $2
        FROM (SELECT display_name AS previous_name FROM servers WHERE id = $1) prev
-      WHERE servers.id = $1 AND servers.user_id = $2 AND servers.node_role = $4 AND servers.revoked_at IS NULL
+      WHERE servers.id = $1 AND servers.node_role = $3 AND servers.revoked_at IS NULL
       RETURNING prev.previous_name`,
-    [serverId, userId, displayName, NODE_ROLE.CONTROLLED],
+    [serverId, displayName, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
@@ -212,17 +231,19 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   return c.json({ ok: true, displayName });
 });
 
-// POST /api/machines/:serverId/revoke — owner kill-switch (10.3).
+// POST /api/machines/:serverId/revoke — operator kill-switch (10.3).
 machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const now = Date.now();
+  const access = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, now);
+  if (!access) return c.json({ error: 'not_found' }, 404);
   const row = await c.env.DB.queryOne<{ id: string }>(
-    `UPDATE servers SET revoked_at = $3
-      WHERE id = $1 AND user_id = $2 AND node_role = $4 AND revoked_at IS NULL
+    `UPDATE servers SET revoked_at = $2
+      WHERE id = $1 AND node_role = $3 AND revoked_at IS NULL
       RETURNING id`,
-    [serverId, userId, now, NODE_ROLE.CONTROLLED],
+    [serverId, now, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
   // Drop the live connection immediately (the `:serverId` path is ingress
@@ -241,7 +262,7 @@ machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   return c.json({ ok: true });
 });
 
-// POST /api/machines/:serverId/exec-enabled — owner toggles D-E exec gate.
+// POST /api/machines/:serverId/exec-enabled — operator toggles D-E exec gate.
 machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
@@ -249,14 +270,16 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ enabled: z.boolean() }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const access = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  if (!access) return c.json({ error: 'not_found' }, 404);
   // Capture the prior value so the audit records from → to (enabling exec is a
   // high-privilege action that gates SYSTEM/root RCE and MUST be attributable).
   const row = await c.env.DB.queryOne<{ was: boolean }>(
-    `UPDATE servers SET exec_enabled = $3
+    `UPDATE servers SET exec_enabled = $2
        FROM (SELECT exec_enabled AS was FROM servers WHERE id = $1) prev
-      WHERE servers.id = $1 AND servers.user_id = $2 AND servers.node_role = $4 AND servers.revoked_at IS NULL
+      WHERE servers.id = $1 AND servers.node_role = $3 AND servers.revoked_at IS NULL
       RETURNING prev.was`,
-    [serverId, userId, parsed.data.enabled, NODE_ROLE.CONTROLLED],
+    [serverId, parsed.data.enabled, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
   if (!parsed.data.enabled) {
@@ -281,7 +304,8 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
  * The secret is relayed and never retained: it is not written to the database,
  * not placed in an audit detail, not logged, and not readable back through any
  * route. Only the boolean outcome the node reports is persisted, so the list
- * page can mark the node. Owner-only, like every other node mutation here.
+ * page can mark the node. Owner and active Participant use the same
+ * centralized device-operation authority.
  */
 machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -296,11 +320,7 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const owned = await c.env.DB.queryOne<{ id: string; controlled_capabilities: unknown }>(
-    `SELECT id, controlled_capabilities FROM servers
-      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
-    [serverId, userId, NODE_ROLE.CONTROLLED],
-  );
+  const owned = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   // A node that never advertised auto unlock cannot answer this command; it
   // would simply not reply, and the caller would wait out the whole timeout
@@ -336,9 +356,9 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   if (!result) return c.json({ error: 'node_timeout' }, 504);
 
   await c.env.DB.execute(
-    `UPDATE servers SET auto_unlock_configured = $3
-      WHERE id = $1 AND user_id = $2`,
-    [serverId, userId, result.configured],
+    `UPDATE servers SET auto_unlock_configured = $2
+      WHERE id = $1`,
+    [serverId, result.configured],
   );
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({
@@ -354,23 +374,12 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   return c.json({ ok: true, autoUnlockConfigured: result.configured });
 });
 
-// POST /api/machines/:serverId/remote-desktop-worker — owner-only quick repair.
+// POST /api/machines/:serverId/remote-desktop-worker — operator quick repair.
 machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
-  const owned = await c.env.DB.queryOne<{
-    id: string;
-    os: string | null;
-    status: string | null;
-    last_heartbeat_at: number | null;
-    daemon_version: string | null;
-    controlled_capabilities: unknown;
-  }>(
-    `SELECT id, os, status, last_heartbeat_at, daemon_version, controlled_capabilities FROM servers
-      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
-    [serverId, userId, NODE_ROLE.CONTROLLED],
-  );
+  const owned = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
   if (canonicalMachineOs(owned.os) !== 'win'

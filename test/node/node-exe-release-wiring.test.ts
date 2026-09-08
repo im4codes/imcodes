@@ -402,10 +402,23 @@ describe('controlled-node executable release wiring', () => {
   it('self-hosts the Computer Use helper from a pinned npm package during CI builds', () => {
     const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as { devDependencies?: Record<string, string> };
     const copyScript = readFileSync('scripts/copy-computer-use-helper.mjs', 'utf8');
+    const runner = readFileSync('src/node/computer-use-runner.ts', 'utf8');
     const workflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
 
-    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.2.0');
+    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.3.3');
+    const packageLock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as {
+      packages?: Record<string, { version?: string; integrity?: string }>;
+    };
+    expect(packageLock.packages?.['node_modules/open-computer-use']).toMatchObject({
+      version: '0.3.3',
+      integrity: 'sha512-A4xCoXgu+Mwi2OdhL15FHY/VcnhhxIJwRgSmC2LwX9mTya85VO2NZN8PNholvgQeTeOlPpej+eEucHXtPhhVrA==',
+    });
     expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
+    expect(copyScript).toContain('open-computer-use must use an exact semver pin');
+    expect(copyScript).toContain('npm package manifest must be a regular non-symlink file');
+    expect(copyScript).toContain('manifest.version !== pinnedOpenComputerUseVersion');
+    expect(runner).not.toContain('fileURLToPath(import.meta.url)');
+    expect(runner).toContain('entryFilePath = options.entryFilePath === undefined ? process.argv[1]');
     expect(copyScript).toContain('Open Computer Use.app');
     expect(copyScript).toContain('open-computer-use.app.zip');
     expect(copyScript).toContain("['--verify', '--deep', '--strict', appPath]");

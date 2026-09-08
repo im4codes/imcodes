@@ -4642,7 +4642,10 @@ ${PREFERENCE_CONTEXT_END}`;
   it('preserves shared actor metadata on queued entries and drain callbacks without injecting it into provider text', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
-    runtime.send('shared queued', 'cmd-shared', undefined, undefined, { sharedActor: sharedActorFixture });
+    runtime.send('shared queued', 'cmd-shared', undefined, undefined, {
+      sharedActor: sharedActorFixture,
+      sharedMachineAuthority: 'SIGNED_PRIVATE_AUTHORITY',
+    });
     expect(runtime.pendingEntries).toEqual([
       expect.objectContaining({
         clientMessageId: 'cmd-shared',
@@ -4650,6 +4653,7 @@ ${PREFERENCE_CONTEXT_END}`;
         sharedActor: sharedActorFixture,
       }),
     ]);
+    expect(runtime.pendingEntries[0]).not.toHaveProperty('sharedMachineAuthority');
 
     let received: PendingTransportMessage[] = [];
     runtime.onDrain = (messages) => {
@@ -4666,6 +4670,9 @@ ${PREFERENCE_CONTEXT_END}`;
         sharedActor: sharedActorFixture,
       }),
     ]);
+    expect(received[0]).not.toHaveProperty('sharedMachineAuthority');
+    expect(runtime.getActiveSharedMachineAuthority()).toBe('SIGNED_PRIVATE_AUTHORITY');
+    expect(runtime.requiresSharedMachineAuthority()).toBe(true);
     const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
     expect(resentPayload.userMessage).toBe('shared queued');
     expect(resentPayload).not.toHaveProperty('sharedActor');

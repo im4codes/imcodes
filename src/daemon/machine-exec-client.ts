@@ -31,15 +31,18 @@ import {
   type RemoteExecOutputChunk,
   type RemoteExecShell,
   type MachineExecHttpEnvelope,
+  type MachineExecHttpReason,
   type MachineSummary,
 } from '../../shared/remote-exec.js';
 import { isValidMachineName } from '../../shared/machine-reference.js';
 import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
 export interface ExecRemoteOptions {
   serverUrl: string;
   sourceServerId: string;
   sourceToken: string;
+  sharedMachineAuthority?: string;
   targetServerId: string;
   command: string;
   shell?: RemoteExecShell;
@@ -51,6 +54,7 @@ export interface ExecRemoteOptions {
 
 export interface ExecRemoteResult {
   outcome: RemoteExecOutcome;
+  reason?: MachineExecHttpReason;
   ok?: boolean;
   exitCode?: number | null;
   stdout?: string;
@@ -75,8 +79,12 @@ export class MachineControlPlaneError extends Error {
 /** List responses are small JSON; bound independently of the exec output envelope. */
 const MAX_LIST_RESPONSE_BYTES = 1_000_000;
 
-function authHeaders(sourceServerId: string, sourceToken: string): Record<string, string> {
-  return { 'X-Server-Id': sourceServerId, authorization: `Bearer ${sourceToken}` };
+function authHeaders(sourceServerId: string, sourceToken: string, sharedMachineAuthority?: string): Record<string, string> {
+  return {
+    'X-Server-Id': sourceServerId,
+    authorization: `Bearer ${sourceToken}`,
+    ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
+  };
 }
 
 /**
@@ -123,6 +131,7 @@ async function readBoundedText(res: Response, maxBytes: number): Promise<string 
 function resultFromEnvelope(e: MachineExecHttpEnvelope): ExecRemoteResult {
   return {
     outcome: e.outcome,
+    reason: e.reason,
     ...(e.ok !== undefined ? { ok: e.ok } : {}),
     ...(e.exitCode !== undefined ? { exitCode: e.exitCode } : {}),
     ...(e.stdout !== undefined ? { stdout: e.stdout } : {}),
@@ -210,7 +219,7 @@ export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteRes
     res = await doFetch(url, {
       method: 'POST',
       headers: {
-        ...authHeaders(opts.sourceServerId, opts.sourceToken),
+        ...authHeaders(opts.sourceServerId, opts.sourceToken, opts.sharedMachineAuthority),
         'content-type': 'application/json',
         ...(opts.onOutput ? { accept: MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE } : {}),
       },
@@ -274,13 +283,15 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
  * only a valid, bounded `{machines:[...]}` is a real (possibly empty) list.
  */
 export async function listMachines(opts: {
-  serverUrl: string; sourceServerId: string; sourceToken: string; includeOffline?: boolean; fetchImpl?: typeof fetch;
+  serverUrl: string; sourceServerId: string; sourceToken: string; sharedMachineAuthority?: string; includeOffline?: boolean; fetchImpl?: typeof fetch;
 }): Promise<MachineListItem[]> {
   const doFetch = opts.fetchImpl ?? fetch;
   const base = opts.serverUrl.replace(/\/+$/, '');
   let res: Response;
   try {
-    res = await doFetch(`${base}/api/machines`, { headers: authHeaders(opts.sourceServerId, opts.sourceToken) });
+    res = await doFetch(`${base}/api/machines`, {
+      headers: authHeaders(opts.sourceServerId, opts.sourceToken, opts.sharedMachineAuthority),
+    });
   } catch (err) {
     throw new MachineControlPlaneError('transport', `machines API unreachable: ${(err as Error).message}`);
   }

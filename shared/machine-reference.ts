@@ -27,6 +27,14 @@ export const MACHINE_DISPLAY_NAME_MAX = 120;
 /** Bounded render fallback for endpoints that have no public node identity. */
 export const MACHINE_IDENTITY_UNAVAILABLE = '—';
 
+/** Stable aliases for Computer Use on the FULL daemon host itself. */
+export const LOCAL_COMPUTER_USE_TARGETS = ['local', 'localhost', 'self', 'this'] as const;
+
+export function isLocalComputerUseAlias(value: unknown): boolean {
+  return typeof value === 'string'
+    && (LOCAL_COMPUTER_USE_TARGETS as readonly string[]).includes(value.trim().toLowerCase());
+}
+
 /** Owner-scoped controllable-machine list endpoint (DB-backed presence, F1). */
 export const MACHINE_API_PATH = '/api/machines';
 

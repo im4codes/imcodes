@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   readDelegationDispatchFact,
+  readMachineControlDispatchFact,
   projectDelegationClaim,
   readDelegationClaim,
   isDelegationDispatchTool,
@@ -66,6 +67,87 @@ describe('delegation dispatch facts', () => {
       { ...ACCEPTED_OUTPUT, deliveries: [{ target: 'deck_cd_brain' }, { status: 'queued' }] },
     );
     expect(fact, 'no complete delivery leg means no substantiation').toBeNull();
+  });
+});
+
+describe('controlled-device dispatch facts', () => {
+  const nodeId = '1472527657';
+
+  it('substantiates exec completion and a Computer Use helper timeout only after target dispatch', () => {
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'exec_remote',
+      { machine: nodeId, command: 'whoami' },
+      { status: 'ok', outcome: 'completed', ok: true, exitCode: 0 },
+      'mcp-exec-1',
+    )).toMatchObject({
+      dispatchId: 'mcp-exec-1', kind: 'machine-control', tool: 'exec_remote', machine: nodeId,
+    });
+
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'computer_use_call',
+      { machine: nodeId, tool: 'list_apps' },
+      {
+        status: 'ok', outcome: 'tool_error',
+        result: { ok: false, tool: 'list_apps', error: 'computer_use_helper_connect_timeout' },
+      },
+      'mcp-cu-1',
+    )).toMatchObject({
+      dispatchId: 'mcp-cu-1', kind: 'machine-control', tool: 'computer_use_call', machine: nodeId,
+    });
+  });
+
+  it.each(['local', 'localhost', 'self', 'this', ' LOCAL '])(
+    'normalizes an authorized local Computer Use dispatch from %s',
+    (machine) => {
+      expect(readMachineControlDispatchFact(
+        DELEGATION_AUTHORITY_MCP_SERVER,
+        'computer_use_call',
+        { machine, tool: 'list_apps' },
+        { status: 'ok', outcome: 'completed', result: { ok: true, tool: 'list_apps', content: [] } },
+        'mcp-local-1',
+      )).toEqual({
+        dispatchId: 'mcp-local-1',
+        kind: 'machine-control',
+        tool: 'computer_use_call',
+        machine: 'local',
+        deliveries: [{ target: 'local', status: 'delivered' }],
+      });
+    },
+  );
+
+  it('does not treat local as a valid exec_remote target or trust arbitrary machine aliases', () => {
+    const output = { status: 'ok', outcome: 'completed', result: { ok: true } };
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'exec_remote', { machine: 'local' }, output, 'exec-local',
+    )).toBeNull();
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'computer_use_call', { machine: 'workstation' }, output, 'cu-alias',
+    )).toBeNull();
+  });
+
+  it.each([
+    [{ status: 'error', reason: 'scope_forbidden' }, 'authorization refusal'],
+    [{ status: 'error', reason: 'exec_offline' }, 'offline refusal'],
+    [{ status: 'ok', outcome: 'not_dispatched' }, 'pre-dispatch outcome'],
+    [{ status: 'ok', outcome: 'dispatched_no_result' }, 'indeterminate outcome'],
+  ])('does not claim an authorized dispatch for %s (%s)', (output) => {
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'computer_use_call',
+      { machine: nodeId, tool: 'list_apps' },
+      output,
+      'mcp-negative',
+    )).toBeNull();
+  });
+
+  it('rejects native/provider-name collisions and missing exact call identity', () => {
+    const output = { status: 'ok', outcome: 'completed', result: { ok: true } };
+    expect(readMachineControlDispatchFact('codex-native', 'computer_use_call', { machine: nodeId }, output, 'call'))
+      .toBeNull();
+    expect(readMachineControlDispatchFact(DELEGATION_AUTHORITY_MCP_SERVER, 'computer_use_call', { machine: nodeId }, output, ''))
+      .toBeNull();
   });
 });
 

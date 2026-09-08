@@ -64,6 +64,8 @@ export interface ResendEntry {
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
   sharedActor?: SharedActorEnvelope;
+  /** Opaque server-signed device authority; private queue material only. */
+  sharedMachineAuthority?: string;
   /** Preserve the trusted MCP delivery policy across runtime restore windows. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** @internal: this logical user event has already been written to the timeline. */
@@ -137,6 +139,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
         ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
         ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
         ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
+        ...(normalizedEntry.sharedMachineAuthority ? { sharedMachineAuthority: normalizedEntry.sharedMachineAuthority } : {}),
         ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
         ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
         ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),

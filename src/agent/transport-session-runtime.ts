@@ -134,6 +134,8 @@ export interface PendingTransportMessage {
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
   sharedActor?: SharedActorEnvelope;
+  /** @internal: opaque server-signed device authority; never exposed in public projections/prompts. */
+  sharedMachineAuthority?: string;
   /** @internal: this logical user event has already been written to the timeline. */
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
@@ -201,6 +203,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // full material for internal resend preservation only.
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
+  delete publicEntry.sharedMachineAuthority;
   // `aliasAudit` deliberately survives: it holds only referenced names and a
   // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
@@ -211,6 +214,8 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
 
 export interface TransportSendMetadata {
   sharedActor?: SharedActorEnvelope;
+  /** @internal: opaque server-signed device authority for this exact shared turn. */
+  sharedMachineAuthority?: string;
   /**
    * Agent-bound text after alias expansion (A′). When present the provider (and
    * runtime history) receive this text while the timeline keeps the ORIGINAL
@@ -1078,6 +1083,18 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Snapshot of active entries for internal resend preservation, including idempotency markers. */
   get activeDispatchEntriesForResend(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
 
+  /** Opaque authority for the active turn only; ambiguity fails closed. */
+  getActiveSharedMachineAuthority(): string | null {
+    if (this._activeDispatchEntries.length === 0
+      || this._activeDispatchEntries.some((entry) => !entry.sharedMachineAuthority)) return null;
+    const tokens = new Set(this._activeDispatchEntries.map((entry) => entry.sharedMachineAuthority!));
+    return tokens.size === 1 ? [...tokens][0]! : null;
+  }
+
+  requiresSharedMachineAuthority(): boolean {
+    return this._activeDispatchEntries.some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+  }
+
   getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
     let providerDiagnostics: Record<string, unknown> | null | undefined;
     if (this._providerSessionId) {
@@ -1358,6 +1375,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             messagePreamble?: unknown;
             attachmentRefs?: unknown;
             sharedActorEnvelope?: unknown;
+            sharedMachineAuthority?: unknown;
             timelineCommitted?: unknown;
             historyCommitted?: unknown;
             deliveryMode?: unknown;
@@ -1374,6 +1392,9 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
               ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
+              ...(typeof material.sharedMachineAuthority === 'string' && material.sharedMachineAuthority
+                ? { sharedMachineAuthority: material.sharedMachineAuthority }
+                : {}),
               ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
               ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
               ...(material.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
@@ -2062,6 +2083,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
+      ...(metadata?.sharedMachineAuthority ? { sharedMachineAuthority: metadata.sharedMachineAuthority } : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
@@ -2098,6 +2120,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
             ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
             ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
+            ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
             ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
             ...(entry.historyCommitted ? { historyCommitted: true } : {}),
             ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),

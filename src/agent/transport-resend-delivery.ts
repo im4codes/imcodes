@@ -18,6 +18,7 @@ type ResendDeliveryRuntime = Pick<
 function buildResendMetadata(entry: ResendEntry): TransportSendMetadata {
   return {
     ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+    ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
     ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
     ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
     ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
@@ -32,6 +33,7 @@ function canUseNativeAppend(entry: ResendEntry): boolean {
   return entry.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
     && !entry.messagePreamble
     && !entry.registeredSystemContract
+    && !entry.sharedMachineAuthority
     && !entry.historyCommitted
     && (entry.attachments?.length ?? 0) === 0;
 }

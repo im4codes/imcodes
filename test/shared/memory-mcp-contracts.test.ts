@@ -154,6 +154,15 @@ describe('memory MCP shared contracts', () => {
     expect(timeout?.description).toContain('900000');
   });
 
+  it('directs shell and executable intent to exec_remote instead of GUI OCU', () => {
+    const exec = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE].description;
+    const ocu = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL].description;
+    expect(exec).toContain('ipmitool.exe');
+    expect(exec).toContain('MUST use exec_remote');
+    expect(ocu).toContain('Do not use GUI OCU for a shell/CLI/executable request');
+    expect(ocu).toContain('does not mean the machine is unauthorized or uncontrollable');
+  });
+
   it('documents scoped send target discovery and self-target rejection', () => {
     const sendList = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS];
     const sendMessage = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];

@@ -55,6 +55,8 @@ import {
 } from '../../shared/memory-mcp-daemon-rpc.js';
 import { normalizeDaemonLocalMemoryNamespace, LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
+import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
+import { readProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -771,6 +773,43 @@ export async function startHookServer(
           return;
         }
         throw new Error('invalid_task_admission_request');
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'malformed' }));
+      }
+      return;
+    }
+
+    if (url === SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const session = senderSessionName ? getSession(senderSessionName) : null;
+        if (!session || session.state === 'stopped'
+          || typeof session.sessionInstanceId !== 'string' || !session.sessionInstanceId
+          || typeof session.runtimeEpoch !== 'string' || !session.runtimeEpoch
+          || body.sessionInstanceId !== session.sessionInstanceId
+          || body.runtimeEpoch !== session.runtimeEpoch) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_stale_runtime' }));
+          return;
+        }
+        const { getTransportRuntime } = await import('../agent/session-manager.js');
+        const runtime = getTransportRuntime(session.name);
+        const processContext = readProcessSharedMachineAuthority(session.name, {
+          sessionInstanceId: session.sessionInstanceId,
+          runtimeEpoch: session.runtimeEpoch,
+        });
+        const required = runtime?.requiresSharedMachineAuthority() ?? processContext.required;
+        const authority = runtime?.getActiveSharedMachineAuthority() ?? processContext.authority;
+        if (required && !authority) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_unavailable' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, required, authority }));
       } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'malformed' }));
