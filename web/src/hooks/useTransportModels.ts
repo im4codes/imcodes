@@ -61,12 +61,26 @@ export function useTransportModels(
       }
       let requestId: string;
       try {
-        requestId = ws.requestTransportModels({
+        const request = {
           agentType,
           ...(sessionName?.trim() ? { sessionName: sessionName.trim() } : {}),
           ...(ccPreset?.trim() ? { ccPreset: ccPreset.trim() } : {}),
           ...(force ? { force: true } : {}),
-        });
+        };
+        // Component hosts and embedded clients may expose the narrower legacy
+        // WsClient surface while they are upgraded independently. Keep model
+        // discovery functional there, while the current WsClient owns the
+        // production single-flight/rate-limit path.
+        if (typeof ws.requestTransportModels === 'function') {
+          requestId = ws.requestTransportModels(request);
+        } else {
+          requestId = `models-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+          ws.send({
+            type: TRANSPORT_MSG.LIST_MODELS,
+            requestId,
+            ...request,
+          });
+        }
       } catch (err) {
         setState({
           models: [],
