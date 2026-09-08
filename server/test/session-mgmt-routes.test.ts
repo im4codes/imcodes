@@ -52,7 +52,8 @@ vi.mock('../src/db/queries.js', () => ({
   updateSubSession: (...args: unknown[]) => mockUpdateSubSession(...args),
 }));
 
-vi.mock('../src/security/crypto.js', () => ({
+vi.mock('../src/security/crypto.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/security/crypto.js')>(),
   randomHex: vi.fn(() => 'sid-test'),
 }));
 
@@ -105,7 +106,10 @@ describe('session-mgmt persistence routes', () => {
     const { sessionMgmtRoutes } = await import('../src/routes/session-mgmt.js');
     const app = new Hono();
     app.use('*', async (c, next) => {
-      (c as unknown as { env: { DB: object } }).env = { DB: mockDb };
+      (c as unknown as { env: { DB: object; JWT_SIGNING_KEY: string } }).env = {
+        DB: mockDb,
+        JWT_SIGNING_KEY: 'session-mgmt-test-signing-key',
+      };
       await next();
     });
     app.route('/api/server', sessionMgmtRoutes);
@@ -1248,7 +1252,7 @@ describe('session-mgmt persistence routes', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toMatchObject({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
       text: 'hello',

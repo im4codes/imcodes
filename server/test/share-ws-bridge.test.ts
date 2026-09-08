@@ -101,6 +101,12 @@ function makeDb(
       if (sql.includes('runtime_type')) return { runtime_type: runtimeType };
       if (sql.includes('SELECT 1 FROM sessions')) return { exists: 1 };
       if (sql.includes('SELECT 1 FROM sub_sessions')) return { exists: 1 };
+      if (sql.includes('SELECT project_name FROM sessions')) return { project_name: 'proj' };
+      if (sql.includes('FROM sub_sessions ss') && sql.includes('JOIN sessions')) {
+        const id = String(params?.[1] ?? '');
+        const row = (options.subSessions ?? []).find((candidate) => candidate.id === id);
+        return row ? { project_name: 'proj', parent_session: row.parent_session } : null;
+      }
       if (sql.includes('FROM users')) return { id: 'shared-user', display_name: 'Shared User', username: 'shared-user' };
       if (sql.includes('SELECT * FROM discussion_comments')) return discussionComments.get(String(params?.[0] ?? '')) ?? null;
       return null;
@@ -270,7 +276,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
 
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.emit('message', JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId: 'qwen', connected: true }));
@@ -372,7 +378,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.setShareCoverageResolverForTests(async ({ target }) => coverage(target, 'viewer', now));
     const daemon = new MockWs();
     const db = makeDb();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -450,7 +456,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
     const db = makeDb(null, auditRows);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -532,7 +538,7 @@ describe('WsBridge share-scoped sockets', () => {
     });
 
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.emit('message', JSON.stringify({ type: 'unlisted.daemon.message', secret: true }));
@@ -547,7 +553,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -606,7 +612,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const db = makeDb();
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -653,7 +659,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -682,7 +688,7 @@ describe('WsBridge share-scoped sockets', () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -793,7 +799,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -839,7 +845,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -889,7 +895,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -969,7 +975,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1000,7 +1006,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1078,7 +1084,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1125,7 +1131,7 @@ describe('WsBridge share-scoped sockets', () => {
       now,
     ));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1312,7 +1318,7 @@ describe('WsBridge share-scoped sockets', () => {
       subSessions: [{ id: 'child_1', parent_session: 'deck_proj_brain' }],
     });
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1425,7 +1431,7 @@ describe('WsBridge share-scoped sockets', () => {
     const tabTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async ({ target: requested }) => coverage(requested, 'participant', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1534,7 +1540,7 @@ describe('WsBridge share-scoped sockets', () => {
     ));
     const db = makeDb(null, auditRows);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1630,7 +1636,7 @@ describe('WsBridge share-scoped sockets', () => {
       subSessions: [{ id: 'child_1', parent_session: 'deck_proj_brain' }],
     });
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1752,7 +1758,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
     const db = makeDb(null, auditRows);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1828,7 +1834,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const db = makeDb(null, auditRows);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -1888,7 +1894,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const db = makeDb('transport', auditRows);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.emit('message', JSON.stringify({
@@ -1953,7 +1959,7 @@ describe('WsBridge share-scoped sockets', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.emit('message', JSON.stringify({
@@ -2023,7 +2029,7 @@ describe('WsBridge share-scoped sockets', () => {
     let liveCoverage: EffectiveCoverage | null = coverage(target, 'participant', now);
     bridge.setShareCoverageResolverForTests(async () => liveCoverage);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb('transport'), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb('transport'), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -2052,7 +2058,7 @@ describe('WsBridge share-scoped sockets', () => {
     let liveCoverage = coverage(target, 'participant', now);
     bridge.setShareCoverageResolverForTests(async () => liveCoverage);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb('transport'), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb('transport'), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -2145,7 +2151,7 @@ describe('WsBridge share-scoped sockets', () => {
     let liveCoverage: EffectiveCoverage | null = coverage(target, 'viewer', now, now + 30_000);
     bridge.setShareCoverageResolverForTests(async () => liveCoverage);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;
@@ -2188,7 +2194,7 @@ describe('WsBridge share-scoped sockets', () => {
   it('does not apply share direct-surface denials to ordinary member sockets', async () => {
     const bridge = WsBridge.get(serverId);
     const daemon = new MockWs();
-    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
     daemon.sent.length = 0;

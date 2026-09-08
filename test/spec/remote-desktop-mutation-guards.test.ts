@@ -116,7 +116,7 @@ const contracts: Contract[] = [
     guards: [
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess',
+        needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess',
         minimum: 2,
       },
       {
@@ -485,7 +485,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),',
+        needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),\n        g_input_desktop_ready.load()',
       },
       {
         // The secret reaches the worker through stdin, never argv.
@@ -495,7 +495,7 @@ const contracts: Contract[] = [
       {
         // The Server relays and records a boolean, never the value.
         path: 'server/src/routes/machines.ts',
-        needle: 'auto_unlock_configured = $3',
+        needle: 'auto_unlock_configured = $2',
       },
     ],
   },
@@ -1233,7 +1233,7 @@ const mutations: Mutation[] = [
     name: 'let the stored secret be typed without a watching controller',
     contract: 'auto unlock stays write-only and operator-gated',
     path: 'native/windows-remote-desktop/worker_main.cc',
-    needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),',
+    needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),\n        g_input_desktop_ready.load()',
   },
   {
     name: 'put the sign-in secret on the worker command line',
@@ -1317,7 +1317,7 @@ const mutations: Mutation[] = [
     name: 'remove access revalidation',
     contract: 'continuous access revalidation',
     path: 'server/src/ws/remote-desktop-router.ts',
-    needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess',
+    needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess',
   },
   {
     name: 'remove requester socket binding',

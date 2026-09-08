@@ -77,7 +77,7 @@ function machineDispatchFailureReason(
   if (reason === 'exec_disabled') return MCP_ERROR_REASONS.EXEC_DISABLED;
   if (reason === 'target_forbidden') return MCP_ERROR_REASONS.SCOPE_FORBIDDEN;
   if (reason === 'scoped_auth') return MCP_ERROR_REASONS.IDENTITY_REJECTED;
-  if (reason === 'invalid_request') return MCP_ERROR_REASONS.VALIDATION_FAILED;
+  if (reason === FS_GENERIC_ERROR_CODES.INVALID_REQUEST) return MCP_ERROR_REASONS.VALIDATION_FAILED;
   return MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
 }
 

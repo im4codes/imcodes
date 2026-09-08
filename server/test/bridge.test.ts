@@ -1437,7 +1437,9 @@ describe('WsBridge', () => {
 
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();
-      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {
+        JWT_SIGNING_KEY: 'bridge-test-signing-key',
+      } as never);
 
       const target = { kind: 'main', serverId, sessionName: 'deck_slow_auth_brain' } as const;
       const liveCoverage = {
@@ -1918,7 +1920,9 @@ describe('WsBridge', () => {
     it('does not replay an inflight command through a replacement while stale auth revalidation settles', async () => {
       const bridge = WsBridge.get(serverId);
       const firstWs = new MockWs();
-      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {} as never);
+      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {
+        JWT_SIGNING_KEY: 'bridge-test-signing-key',
+      } as never);
 
       const target = { kind: 'main', serverId, sessionName: 'deck_stale_auth_replay_brain' } as const;
       const liveCoverage = {

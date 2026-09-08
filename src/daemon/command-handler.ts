@@ -16,6 +16,7 @@ import { routeMessage, type InboundMessage, type RouterContext } from '../router
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { bindProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 import { emitTransportUserMessage as emitTransportUserMessageEvent } from './transport-relay.js';
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
 import { hasAssistantFileReadGrant } from './session-file-read-grants.js';
@@ -3932,7 +3933,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
-  const { bindProcessSharedMachineAuthority } = await import('./shared-machine-authority-context.js');
   bindProcessSharedMachineAuthority(
     sessionName,
     record?.sessionInstanceId && record.runtimeEpoch
