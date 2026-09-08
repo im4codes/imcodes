@@ -950,7 +950,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
     description:
-      'Run a shell/CLI command or executable (for example ipmitool.exe) on a controlled node in session 0/SYSTEM; such requests MUST use exec_remote, not GUI OCU. Use shell_session1 only for active-user semantics. Pass a canonical 10-digit nodeId or complete ^^(nodeId); deprecated noncanonical legacy ref_name is migration-only. not_dispatched is retry-safe; dispatched_no_result may have run. FULL nodes only.',
+      'Run a shell/CLI command or executable (for example ipmitool.exe) on a controlled node in session 0/SYSTEM; such requests MUST use exec_remote, not GUI OCU. Use shell_session1 only for active-user semantics. Pass a canonical 10-digit nodeId or complete ^^(nodeId) without calling list_machines first; deprecated noncanonical legacy ref_name is migration-only. not_dispatched is retry-safe; dispatched_no_result may have run. FULL nodes only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
@@ -1018,7 +1018,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'GUI/browser control locally or remotely. Do not use GUI OCU for a shell/CLI/executable request. A helper failure does not mean the machine is unauthorized or uncontrollable. Use shell_session1 only for active-user semantics. Prefer browser_open/browser_snapshot. Pass a canonical nodeId or ^^(nodeId); deprecated noncanonical legacy ref_name is compatibility-only. GUI max 120000, shell_session1 max 900000. FULL nodes only.',
+    description: 'GUI/browser control locally or remotely. Do not use GUI OCU for a shell/CLI/executable request. A helper failure does not mean the machine is unauthorized or uncontrollable. Use shell_session1 only for active-user semantics. Prefer browser_open/browser_snapshot. Pass a canonical 10-digit nodeId or complete ^^(nodeId) marker without calling list_machines first; deprecated noncanonical legacy ref_name is compatibility-only. GUI max 120000, shell_session1 max 900000. FULL nodes only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId, complete ^^(nodeId) marker, deprecated noncanonical legacy ref_name, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
