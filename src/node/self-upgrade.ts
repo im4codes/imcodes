@@ -1048,14 +1048,26 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + journalVariables
     + `$recoveryFailures = [System.Collections.Generic.List[string]]::new()\r\n`
     + `$runRecovery = { param([string]$label,[scriptblock]$action) try { & $action } catch { $recoveryFailure = ('{0}: {1}' -f $label, [string]$_.Exception.Message); if ($recoveryFailure.Length -gt 240) { $recoveryFailure = $recoveryFailure.Substring(0, 240) }; [void]$recoveryFailures.Add($recoveryFailure) } }\r\n`
+    + `$waitForNodeExecutableRelease = { param([int]$timeoutMs = 30000)\r\n`
+    + `  $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $timeoutMs\r\n`
+    + `  do {\r\n`
+    + `    $matchingProcesses = @(Get-CimInstance Win32_Process -Filter 'name="imcodes-node.exe"' -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $dst, [StringComparison]::OrdinalIgnoreCase) })\r\n`
+    + `    foreach ($matchingProcess in $matchingProcesses) { Stop-Process -Id $matchingProcess.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
+    + `    $exclusiveHandle = $null\r\n`
+    + `    try {\r\n`
+    + `      if (Test-Path -LiteralPath $dst) { $exclusiveHandle = [IO.File]::Open($dst, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }\r\n`
+    + `      if ($matchingProcesses.Count -eq 0) { return }\r\n`
+    + `    } catch [IO.IOException] { } finally { if ($exclusiveHandle) { $exclusiveHandle.Dispose() } }\r\n`
+    + `    [Threading.Thread]::Sleep(250)\r\n`
+    + `  } while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline)\r\n`
+    + `  throw 'controlled node executable remained locked after stop'\r\n`
+    + `}\r\n`
     + releasePreflightGuard
     + `$upgradePhase = 'install'\r\n`
     + `try {\r\n`
     + `@{ version = 1; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeMarker -Encoding utf8\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
-    + `Start-Sleep -Seconds 2\r\n`
-    + `Get-CimInstance Win32_Process -Filter 'name="imcodes-node.exe"' | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $dst, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
-    + `Start-Sleep -Seconds 1\r\n`
+    + `& $waitForNodeExecutableRelease\r\n`
     + `Remove-Item -Force $backupDst,$backupManifest -ErrorAction SilentlyContinue\r\n`
     + `if (Test-Path $dst) { Copy-Item -Force $dst $backupDst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node backup hash mismatch' }; $mainBackedUp = $true }\r\n`
     + `if (Test-Path $dstManifest) { Copy-Item -Force $dstManifest $backupManifest; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node manifest backup hash mismatch' }; $manifestBackedUp = $true }\r\n`
@@ -1106,7 +1118,8 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `if ($failureMessage.Length -gt 240) { $failureMessage = $failureMessage.Substring(0, 240) }\r\n`
     + `$upgradeResultPersisted = $false\r\n`
     + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = 'rollback_started'; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recordedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback_started' }\r\n`
-    + `& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter 'name="imcodes-node.exe"' | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $dst, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep -Seconds 1 }\r\n`
+    + `$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })\r\n`
+    + `if ($rollbackExecutableReleased) {\r\n`
     + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node rollback source hash mismatch' }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node restored hash mismatch' } } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
     + `& $runRecovery 'restore_manifest' { if ($manifestBackedUp -and (Test-Path $backupManifest)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node manifest rollback source hash mismatch' }; Copy-Item -Force $backupManifest $dstManifest; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node restored manifest hash mismatch' } } elseif ($manifestPublished) { Remove-Item -Force $dstManifest -ErrorAction Stop } }\r\n`
     + (helperRollback ? `& $runRecovery 'restore_helper' { ${helperRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
@@ -1116,6 +1129,9 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
         + `& $runRecovery 'restore_driver' { if ($remoteDesktopBackedUp -and (Test-Path -LiteralPath $dstRemoteDesktop)) { & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner; $rollbackVirtualDisplayInf = Join-Path (Join-Path (Join-Path $dstRemoteDesktop 'win32-x64') 'virtual-display') 'imcodes-virtual-display.inf'; & (Join-Path $env:WINDIR 'System32\\pnputil.exe') /add-driver $rollbackVirtualDisplayInf /install | Out-Null; $driverRollbackExitCode = $LASTEXITCODE; if ($driverRollbackExitCode -ne 0 -and $driverRollbackExitCode -ne 3010) { throw 'virtual display driver rollback installation failed' } } }\r\n`
       : '')
     + (journalRollback ? `& $runRecovery 'restore_journal' { ${journalRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
+    + `} else {\r\n`
+    + `[void]$recoveryFailures.Add('restore_artifacts: skipped because the controlled node executable release fence failed')\r\n`
+    + `}\r\n`
     + `$rollbackStatus = if ($recoveryFailures.Count -eq 0) { 'rolled_back' } else { 'rollback_failed' }\r\n`
     + `$upgradeResultPersisted = $false\r\n`
     + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = $rollbackStatus; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recoveryFailures = @($recoveryFailures); completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback' }\r\n`

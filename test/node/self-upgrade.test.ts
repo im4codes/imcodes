@@ -2,7 +2,8 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, w
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
@@ -52,6 +53,39 @@ const credential = {
   token: 'secret-token',
   nodeRole: NODE_ROLE.CONTROLLED,
 } as const;
+
+async function holdWindowsFileLock(
+  filePath: string,
+  directory: string,
+  durationMs: number,
+): Promise<ReturnType<typeof spawn>> {
+  const scriptPath = join(directory, `hold-lock-${durationMs}.ps1`);
+  const readyPath = join(directory, `lock-ready-${durationMs}`);
+  const quotedFile = filePath.replaceAll("'", "''");
+  const quotedReady = readyPath.replaceAll("'", "''");
+  await writeFile(scriptPath, [
+    "$ErrorActionPreference = 'Stop'",
+    `$handle = [IO.File]::Open('${quotedFile}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)`,
+    'try {',
+    `  Set-Content -LiteralPath '${quotedReady}' -Value 'ready' -Encoding ascii`,
+    `  [Threading.Thread]::Sleep(${durationMs})`,
+    '} finally {',
+    '  $handle.Dispose()',
+    '}',
+  ].join('\r\n'));
+  const child = spawn('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,
+  ], { stdio: 'ignore', windowsHide: true });
+  const readyDeadline = Date.now() + 5_000;
+  while (!(await readFile(readyPath).then(() => true, () => false))) {
+    if (Date.now() >= readyDeadline) {
+      if (child.exitCode === null) child.kill();
+      throw new Error('Windows replacement lock holder did not become ready');
+    }
+    await new Promise((resolveReady) => setTimeout(resolveReady, 25));
+  }
+  return child;
+}
 
 function createWindowsUpgradeFetch(version = '2026.7.1'): typeof fetch {
   const main = Buffer.from('signed controlled node');
@@ -533,6 +567,18 @@ describe('controlled-node self-upgrade', () => {
       .toBeLessThan(script.indexOf('Get-AuthenticodeSignature -LiteralPath $src'));
     expect(script).toContain('Stop-ScheduledTask');
     expect(script).toContain('Start-ScheduledTask');
+    expect(script).toContain('$waitForNodeExecutableRelease = { param([int]$timeoutMs = 30000)');
+    expect(script).toContain("[IO.FileShare]::None");
+    expect(script).toContain("throw 'controlled node executable remained locked after stop'");
+    expect(script.indexOf('& $waitForNodeExecutableRelease'))
+      .toBeLessThan(script.indexOf('Copy-Item -Force $src $dst'));
+    expect(script).toContain("$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })");
+    const rollbackReleaseGuard = script.indexOf('if ($rollbackExecutableReleased) {');
+    const rollbackMainRestore = script.indexOf("& $runRecovery 'restore_main'");
+    const rollbackSkip = script.indexOf('restore_artifacts: skipped because the controlled node executable release fence failed');
+    expect(rollbackReleaseGuard).toBeGreaterThan(script.indexOf('$rollbackExecutableReleased = [bool]'));
+    expect(rollbackMainRestore).toBeGreaterThan(rollbackReleaseGuard);
+    expect(rollbackSkip).toBeGreaterThan(rollbackMainRestore);
     expect(script).toContain("$upgradeMarker = Join-Path (Split-Path -Parent $dst) 'upgrade-in-progress.json'");
     expect(script).not.toContain('Disable-ScheduledTask -TaskName $watchdogTask');
     expect(script).not.toContain('Stop-ScheduledTask -TaskName $watchdogTask');
@@ -1313,7 +1359,13 @@ describe('controlled-node self-upgrade', () => {
         'function Get-CimInstance { param($ClassName, $Filter); @() }',
         generated,
       ].join('\r\n'));
-      await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', harnessPath], { timeout: 30_000 });
+      const lockHolder = await holdWindowsFileLock(destinationPath, dir, 1500);
+      try {
+        await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', harnessPath], { timeout: 30_000 });
+        if (lockHolder.exitCode === null) await once(lockHolder, 'exit');
+      } finally {
+        if (lockHolder.exitCode === null) lockHolder.kill();
+      }
     } else {
       const binDir = join(dir, 'bin');
       await mkdir(binDir);
@@ -1354,5 +1406,103 @@ describe('controlled-node self-upgrade', () => {
       expect(serviceLog).toContain('stop');
       expect(serviceLog).toContain('start');
     }
+  });
+
+  it.runIf(process.platform === 'win32')('restores after a transient rollback lock and preserves bytes after a permanent lock timeout', async () => {
+    const runRollbackLockCase = async (name: string, releaseTimeoutMs: number, lockDurationMs: number) => {
+      const dir = await mkdtemp(join(tmpdir(), `imcodes-native-upgrade-rollback-${name}-`));
+      dirs.push(dir);
+      const destinationPath = join(dir, 'imcodes-node.exe');
+      const destinationManifestPath = `${destinationPath}.manifest.json`;
+      const backupPath = `${destinationPath}.upgrade-old`;
+      const backupManifestPath = `${destinationManifestPath}.upgrade-old`;
+      const stagedArtifactPath = join(dir, 'staged-node.exe');
+      const stagedManifestPath = `${stagedArtifactPath}.manifest.json`;
+      const outcomePath = join(dir, 'outcome.json');
+      await writeFile(destinationPath, 'new-native-artifact');
+      await writeFile(destinationManifestPath, 'new-native-manifest');
+      await writeFile(backupPath, 'old-native-artifact');
+      await writeFile(backupManifestPath, 'old-native-manifest');
+
+      const generated = buildWindowsControlledNodeUpgradeScript({
+        stagedArtifactPath,
+        stagedManifestPath,
+        destinationPath,
+        destinationManifestPath,
+      });
+      const supportStart = generated.indexOf('$recoveryFailures =');
+      const supportSentinel = "  throw 'controlled node executable remained locked after stop'\r\n}\r\n";
+      const supportEnd = generated.indexOf(supportSentinel, supportStart) + supportSentinel.length;
+      const rollbackStart = generated.indexOf('$rollbackExecutableReleased = [bool]');
+      const rollbackEnd = generated.indexOf('$rollbackStatus =', rollbackStart);
+      expect(supportStart).toBeGreaterThanOrEqual(0);
+      expect(supportEnd).toBeGreaterThan(supportStart);
+      expect(rollbackStart).toBeGreaterThan(supportEnd);
+      expect(rollbackEnd).toBeGreaterThan(rollbackStart);
+      const support = generated.slice(supportStart, supportEnd)
+        .replace('param([int]$timeoutMs = 30000)', `param([int]$timeoutMs = ${releaseTimeoutMs})`);
+      const rollback = generated.slice(rollbackStart, rollbackEnd);
+      const oldHash = createHash('sha256').update('old-native-artifact').digest('hex');
+      const oldManifestHash = createHash('sha256').update('old-native-manifest').digest('hex');
+      const quote = (value: string): string => value.replaceAll("'", "''");
+      const harnessPath = join(dir, 'rollback-lock-harness.ps1');
+      await writeFile(harnessPath, [
+        "$ErrorActionPreference = 'Stop'",
+        `$task = 'imcodes-node'`,
+        `$dst = '${quote(destinationPath)}'`,
+        `$dstManifest = '${quote(destinationManifestPath)}'`,
+        `$backupDst = '${quote(backupPath)}'`,
+        `$backupManifest = '${quote(backupManifestPath)}'`,
+        `$currentMainHash = '${oldHash}'`,
+        `$currentManifestHash = '${oldManifestHash}'`,
+        '$mainBackedUp = $true',
+        '$mainPublished = $true',
+        '$manifestBackedUp = $true',
+        '$manifestPublished = $true',
+        'function Stop-ScheduledTask { param($TaskName, $ErrorAction) }',
+        'function Get-CimInstance { param($ClassName, $Filter, $ErrorAction); @() }',
+        support,
+        rollback,
+        `[pscustomobject]@{ released = $rollbackExecutableReleased; failures = @($recoveryFailures) } | ConvertTo-Json -Compress | Set-Content -LiteralPath '${quote(outcomePath)}' -Encoding utf8`,
+      ].join('\r\n'));
+
+      const lockHolder = await holdWindowsFileLock(destinationPath, dir, lockDurationMs);
+      try {
+        await execFileAsync('powershell.exe', [
+          '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harnessPath,
+        ], { timeout: 10_000 });
+      } finally {
+        if (lockHolder.exitCode === null) lockHolder.kill();
+      }
+      const outcome = JSON.parse((await readFile(outcomePath, 'utf8')).replace(/^\uFEFF/, '')) as {
+        released: boolean;
+        failures: string[];
+      };
+      return {
+        outcome,
+        executable: await readFile(destinationPath, 'utf8'),
+        manifest: await readFile(destinationManifestPath, 'utf8'),
+      };
+    };
+
+    const transient = await runRollbackLockCase('transient', 3000, 500);
+    expect(transient).toEqual({
+      outcome: { released: true, failures: [] },
+      executable: 'old-native-artifact',
+      manifest: 'old-native-manifest',
+    });
+
+    const permanent = await runRollbackLockCase('permanent', 250, 1500);
+    expect(permanent).toEqual({
+      outcome: {
+        released: false,
+        failures: [
+          'stop_new_node: controlled node executable remained locked after stop',
+          'restore_artifacts: skipped because the controlled node executable release fence failed',
+        ],
+      },
+      executable: 'new-native-artifact',
+      manifest: 'new-native-manifest',
+    });
   });
 });
