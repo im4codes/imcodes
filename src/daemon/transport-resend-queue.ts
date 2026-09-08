@@ -101,7 +101,7 @@ export function recipientFromSessionRecord(
   return sessionInstanceId && runtimeEpoch ? { sessionInstanceId, runtimeEpoch } : undefined;
 }
 
-export function enqueueResend(sessionName: string, entry: ResendEntry): {
+export type EnqueueResendResult = {
   accepted: true;
   droppedOldest: boolean;
   pendingVersion: number;
@@ -111,8 +111,26 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
   accepted: false;
   droppedOldest: false;
   pendingVersion: number;
-  reason: 'sqlite_enqueue_failed' | 'cancelled';
-} {
+  reason: 'sqlite_enqueue_failed' | 'cancelled' | 'idempotency_conflict' | 'capacity_exhausted';
+};
+
+export function enqueueResend(sessionName: string, entry: ResendEntry): EnqueueResendResult {
+  return enqueueResendInternal(sessionName, entry, true);
+}
+
+/**
+ * Persist work from a non-daemon process without creating a second in-memory
+ * queue owner. The daemon later rehydrates the row and owns its only drain.
+ */
+export function enqueueDurableResend(sessionName: string, entry: ResendEntry): EnqueueResendResult {
+  return enqueueResendInternal(sessionName, entry, false);
+}
+
+function enqueueResendInternal(
+  sessionName: string,
+  entry: ResendEntry,
+  retainInMemory: boolean,
+): EnqueueResendResult {
   const list = queues.get(sessionName) ?? [];
   const clientMessageId = entry.clientMessageId?.trim() || randomUUID();
   let droppedOldest = false;
@@ -120,6 +138,81 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
     ...entry,
     clientMessageId,
   };
+  const privateMaterialJson = JSON.stringify({
+    clientMessageId: normalizedEntry.clientMessageId,
+    text: normalizedEntry.text,
+    ...(normalizedEntry.providerText != null ? { providerText: normalizedEntry.providerText } : {}),
+    ...(normalizedEntry.aliasAudit ? { aliasAudit: normalizedEntry.aliasAudit } : {}),
+    ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
+    ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
+    ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
+    ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
+    ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
+    ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
+    ...(normalizedEntry.registeredSystemContract
+      ? { registeredSystemContract: normalizedEntry.registeredSystemContract }
+      : {}),
+  });
+  // Stable message ids are replay authority. An exact retry is accepted once;
+  // the same id carrying different bytes or recipient context is rejected
+  // rather than acknowledged as work that will never be delivered.
+  try {
+    const existingSnapshot = getTransportQueueStore().readSnapshot(sessionName);
+    const existing = existingSnapshot.pendingMessageEntries.find(
+      (candidate) => candidate.clientMessageId === clientMessageId,
+    );
+    if (existing) {
+      const existingPrivateMaterial = getTransportQueueStore().readPrivateDispatchMaterial(
+        sessionName,
+        clientMessageId,
+        normalizedEntry.recipient ?? null,
+      );
+      const local = retainInMemory
+        ? list.find((candidate) => candidate.clientMessageId === clientMessageId)
+        : undefined;
+      const localMatches = !local || JSON.stringify({ ...local, queuedAt: normalizedEntry.queuedAt })
+        === JSON.stringify(normalizedEntry);
+      const privateMaterialMatches = existingPrivateMaterial === privateMaterialJson
+        // Legacy SQLite-only producers may not have written a private row.
+        // Preserve the prior hydration behavior only for identity-less legacy
+        // entries; recipient-bound work must match its private authority row.
+        || (existingPrivateMaterial === undefined && !normalizedEntry.recipient);
+      const exactReplay = existing.text === normalizedEntry.text
+        && existing.commandId === normalizedEntry.commandId
+        && privateMaterialMatches
+        && localMatches;
+      if (!exactReplay) {
+        return {
+          accepted: false,
+          droppedOldest: false,
+          pendingVersion: existingSnapshot.pendingMessageVersion,
+          reason: 'idempotency_conflict',
+        };
+      }
+      if (retainInMemory && !local) {
+        list.push(normalizedEntry);
+        queues.set(sessionName, list);
+      }
+      return {
+        accepted: true,
+        droppedOldest: false,
+        pendingVersion: existingSnapshot.pendingMessageVersion,
+        queueSnapshot: existingSnapshot,
+      };
+    }
+    if (!retainInMemory && existingSnapshot.pendingMessageEntries.length >= MAX_RESEND_ENTRIES) {
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: existingSnapshot.pendingMessageVersion,
+        reason: 'capacity_exhausted',
+      };
+    }
+  } catch {
+    // The transactional enqueue below remains authoritative. This read is only
+    // an idempotency fast path and must not turn a store read fault into an
+    // acknowledgement.
+  }
   const evicted = list.length >= MAX_RESEND_ENTRIES ? list[0] : undefined;
   let queueSnapshot: QueueSnapshot;
   let dropSnapshot: QueueSnapshot | undefined;
@@ -131,22 +224,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
       commandId: normalizedEntry.commandId,
       text: normalizedEntry.text,
       now: normalizedEntry.queuedAt,
-      privateMaterialJson: JSON.stringify({
-        clientMessageId: normalizedEntry.clientMessageId,
-        text: normalizedEntry.text,
-        ...(normalizedEntry.providerText != null ? { providerText: normalizedEntry.providerText } : {}),
-        ...(normalizedEntry.aliasAudit ? { aliasAudit: normalizedEntry.aliasAudit } : {}),
-        ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
-        ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
-        ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
-        ...(normalizedEntry.sharedMachineAuthority ? { sharedMachineAuthority: normalizedEntry.sharedMachineAuthority } : {}),
-        ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
-        ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
-        ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
-        ...(normalizedEntry.registeredSystemContract
-          ? { registeredSystemContract: normalizedEntry.registeredSystemContract }
-          : {}),
-      }),
+      privateMaterialJson,
       ...(normalizedEntry.supervisionReference ? { supervisionReference: normalizedEntry.supervisionReference } : {}),
     }, evicted?.clientMessageId);
     queueSnapshot = result.queueSnapshot;
@@ -167,15 +245,38 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
         return null;
       }
     })();
-    const alreadyAuthoritative = existingSnapshot?.pendingMessageEntries.some(
-      (candidate) => candidate.clientMessageId === normalizedEntry.clientMessageId,
-    ) === true;
-    if (alreadyAuthoritative && existingSnapshot) {
+    const existing = existingSnapshot?.pendingMessageEntries.find(
+      (candidate) => candidate.clientMessageId === clientMessageId,
+    );
+    const existingPrivateMaterial = existingSnapshot
+      ? getTransportQueueStore().readPrivateDispatchMaterial(
+          sessionName,
+          clientMessageId,
+          normalizedEntry.recipient ?? null,
+        )
+      : undefined;
+    const exactConcurrentReplay = Boolean(
+      existing
+      && existing.text === normalizedEntry.text
+      && existing.commandId === normalizedEntry.commandId
+      && (
+        existingPrivateMaterial === privateMaterialJson
+        || (existingPrivateMaterial === undefined && !normalizedEntry.recipient)
+      ),
+    );
+    if (exactConcurrentReplay && existingSnapshot) {
       queueSnapshot = existingSnapshot;
       logger.warn(
         { err, sessionName, commandId: entry.commandId, clientMessageId: normalizedEntry.clientMessageId },
         'transport queue sqlite enqueue found existing live entry; preserving resend memory handoff',
       );
+    } else if (existing) {
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: existingSnapshot?.pendingMessageVersion ?? bumpTransportQueueRevision(sessionName),
+        reason: 'idempotency_conflict',
+      };
     } else {
       logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite enqueue failed for resend entry; resend enqueue rejected');
       return {
@@ -185,6 +286,15 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
         reason: 'sqlite_enqueue_failed',
       };
     }
+  }
+  if (!retainInMemory) {
+    return {
+      accepted: true,
+      droppedOldest: false,
+      pendingVersion: queueSnapshot.pendingMessageVersion,
+      queueSnapshot,
+      ...(dropSnapshot ? { dropSnapshot } : {}),
+    };
   }
   if (list.length >= MAX_RESEND_ENTRIES) {
     const removed = list.shift();

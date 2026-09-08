@@ -61,6 +61,9 @@ import {
   MEMORY_MCP_DAEMON_RPC_PATH,
   type MemoryMcpDaemonToolName,
 } from '../../shared/memory-mcp-daemon-rpc.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import { enqueueDurableResend, recipientFromSessionRecord } from './transport-resend-queue.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -76,6 +79,13 @@ export interface MemoryMcpServerCatalogOptions {
   resourceGuard?: MemoryMcpResourceGuard;
   daemonAdmissionEnabled?: boolean;
   daemonAdmissionOwner?: SessionResourceOwner | null;
+}
+
+/** Narrow daemon-bridge seams used to make transient hook outages deterministic in tests. */
+export interface MemoryMcpDaemonBridgeDeps {
+  resolveHookPort?: typeof resolveLiveHookPort;
+  enqueueTransportResend?: typeof enqueueDurableResend;
+  now?: () => number;
 }
 
 const MEMORY_MCP_DEFAULT_MAX_CONCURRENT = 8;
@@ -426,7 +436,11 @@ export function mergeDefaultToolDeps(
   caller: McpRuntimeCaller,
   toolDeps: MemoryMcpToolDeps,
   resourceOwner: SessionResourceOwner | null = sessionResourceOwnerFromEnv(),
+  bridgeDeps: MemoryMcpDaemonBridgeDeps = {},
 ): MemoryMcpToolDeps {
+  const resolveHookPort = bridgeDeps.resolveHookPort ?? resolveLiveHookPort;
+  const enqueueTransportResend = bridgeDeps.enqueueTransportResend ?? enqueueDurableResend;
+  const now = bridgeDeps.now ?? Date.now;
   const usesDefaultCapabilityService = !toolDeps.capabilityService && Boolean(caller.serverId);
   const resolveCapabilityIdentity = toolDeps.resolveCapabilityIdentity
     ?? (usesDefaultCapabilityService ? resolveDaemonCapabilityIdentity : undefined);
@@ -473,13 +487,13 @@ export function mergeDefaultToolDeps(
       }) : undefined),
     ...(resolveCapabilityIdentity ? { resolveCapabilityIdentity } : {}),
     peerAuditReply: toolDeps.peerAuditReply ?? (async (envelope) => {
-      const port = await resolveLiveHookPort();
+      const port = await resolveHookPort();
       if (!port) throw new Error('daemon peer audit ingress is unavailable');
       if (!caller.sessionName) throw new Error('peer_audit_reply requires a scoped caller');
       return postHookSend(port, envelope as unknown as Record<string, unknown>, '/audit-reply', caller.sessionName);
     }),
     delegationReply: toolDeps.delegationReply ?? (async (envelope) => {
-      const port = await resolveLiveHookPort();
+      const port = await resolveHookPort();
       if (!port) throw new Error('daemon delegation reply ingress is unavailable');
       if (!caller.sessionName) throw new Error('delegation_reply requires a scoped caller');
       return postHookSend(
@@ -491,7 +505,7 @@ export function mergeDefaultToolDeps(
       );
     }),
     restartSession: toolDeps.restartSession ?? (async (target, restartOptions) => {
-      const port = await resolveLiveHookPort();
+      const port = await resolveHookPort();
       if (!port) throw new Error('daemon session restart control is unavailable');
       if (!caller.sessionName) throw new Error('session_restart requires a scoped caller');
       const response = await postHookSend(port, {
@@ -532,7 +546,7 @@ export function mergeDefaultToolDeps(
       isSessionAuthoritativelyActive:
         toolDeps.sendDeps?.isSessionAuthoritativelyActive
         ?? (async (candidate: SessionRecord) => {
-          const port = await resolveLiveHookPort();
+          const port = await resolveHookPort();
           if (!port) return false;
           try {
             const response = await postHookSend(port, {}, '/sessions/live', caller.sessionName ?? undefined, 2_000);
@@ -569,9 +583,48 @@ export function mergeDefaultToolDeps(
       dispatchMessage:
         toolDeps.sendDeps?.dispatchMessage
         ?? (async (target: SessionRecord, message: string, options) => {
-          const port = await resolveLiveHookPort();
-          if (!port) throw new Error('daemon hook server is unavailable');
           if (!caller.sessionName) throw new Error('send_message requires a scoped caller');
+          const port = await resolveHookPort();
+          if (!port) {
+            const recipient = recipientFromSessionRecord(target);
+            const transportTarget = (
+              target.runtimeType ?? getSessionRuntimeType(target.agentType)
+            ) === 'transport';
+            // Only the append-only supervised continuation path has enough
+            // durable identity to survive a transient hook outage. Process
+            // sends and other control operations remain fail-closed because a
+            // child MCP process cannot safely emulate daemon ownership.
+            if (
+              !transportTarget
+              || options.deliveryMode !== MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+              || !options.supervision
+              || !recipient
+            ) {
+              throw new Error('daemon hook server is unavailable');
+            }
+            const durableStore = getTransportQueueStore();
+            if (
+              durableStore.queueBelongsTo(target.name, recipient)
+              && durableStore.hasDeliveryTombstone(target.name, options.messageId)
+            ) {
+              // This is not optimistic acknowledgement: daemon-owned drain
+              // already committed exact delivery in the current queue epoch.
+              return 'sent';
+            }
+            const queued = enqueueTransportResend(target.name, {
+              recipient,
+              text: message,
+              commandId: options.messageId,
+              clientMessageId: options.messageId,
+              ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+              deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+              queuedAt: now(),
+            });
+            if (!queued.accepted) {
+              throw new Error(`daemon hook server is unavailable; durable queue rejected: ${queued.reason}`);
+            }
+            return 'queued';
+          }
           const response = await postHookSend(port, {
             from: caller.sessionName,
             to: target.name,
@@ -591,7 +644,7 @@ export function mergeDefaultToolDeps(
       cancelSession:
         toolDeps.sendDeps?.cancelSession
         ?? (async (target: SessionRecord) => {
-          const port = await resolveLiveHookPort();
+          const port = await resolveHookPort();
           if (!port) throw new Error('daemon hook server is unavailable');
           if (!caller.sessionName) throw new Error('send_stop requires a scoped caller');
           const res = await postHookSend(port, {

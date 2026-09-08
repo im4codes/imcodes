@@ -46,6 +46,12 @@ import {
   MEMORY_MCP_WATCHDOG,
   SESSION_RESOURCE_OWNER_ENV,
 } from '../../shared/session-resource-lifecycle.js';
+import { deterministicSendMessageId, createSendDispatchId } from '../../shared/send-message-id.js';
+import {
+  getTransportQueueStore,
+  resetTransportQueueStoreForTests,
+} from '../../src/daemon/transport-queue-store.js';
+import { drainResend, enqueueResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 
 // Hoisted mock: prove the production run-authoritative limit resolver is wired
 // into the composed deps WITHOUT a manual inject. A tight cap=1 (distinct from
@@ -1408,6 +1414,161 @@ describe('mergeDefaultToolDeps per-field composition', () => {
 
     const standalone = mergeDefaultToolDeps(caller, {}, null);
     expect(standalone.invokeDaemonMemoryTool).toBeUndefined();
+  });
+
+  it('durably queues an exact recipient-bound transport continuation while the hook is absent', async () => {
+    resetTransportQueueStoreForTests();
+    const messageId = deterministicSendMessageId('hook-outage-supervision-continuation');
+    const target = {
+      name: 'deck_sub_peer',
+      projectName: 'proj',
+      role: 'w1' as const,
+      agentType: 'claude-code-sdk' as const,
+      runtimeType: 'transport' as const,
+      projectDir: '/tmp/proj',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      sessionInstanceId: 'peer-instance',
+      runtimeEpoch: 'peer-epoch',
+    };
+    const resolveHookPort = vi.fn(async () => null);
+    const merged = mergeDefaultToolDeps(caller, {}, null, { resolveHookPort });
+    const options = {
+      dispatchId: createSendDispatchId(),
+      messageId,
+      deliveryMode: 'append' as const,
+      supervision: { taskId: 'tsk_exact', assignmentId: 'asg_exact' },
+    };
+
+    try {
+      await expect(merged.sendDeps?.dispatchMessage?.(target, 'continue exact work', options))
+        .resolves.toBe('queued');
+      // An unknown-result replay carrying the same authoritative message id is
+      // idempotent in SQLite and cannot create a second eventual dispatch.
+      await expect(merged.sendDeps?.dispatchMessage?.(target, 'continue exact work', options))
+        .resolves.toBe('queued');
+      await expect(merged.sendDeps?.dispatchMessage?.(target, 'different bytes', options))
+        .rejects.toThrow('idempotency_conflict');
+      await expect(merged.sendDeps?.dispatchMessage?.({
+        ...target,
+        runtimeEpoch: 'replacement-epoch',
+      }, 'continue exact work', options)).rejects.toThrow('idempotency_conflict');
+
+      const snapshot = getTransportQueueStore().readSnapshot(target.name);
+      expect(snapshot.pendingMessageEntries).toEqual([
+        expect.objectContaining({
+          clientMessageId: messageId,
+          commandId: messageId,
+          status: 'queued',
+        }),
+      ]);
+      expect(getTransportQueueStore().queueBelongsTo(target.name, {
+        sessionInstanceId: target.sessionInstanceId,
+        runtimeEpoch: target.runtimeEpoch,
+      })).toBe(true);
+      expect(getResendEntries(target.name)).toEqual([]);
+      // The stdio process is never an in-memory queue owner. This exact replay
+      // models the daemon's later SQLite rehydration before its owned drain.
+      expect(enqueueResend(target.name, {
+        recipient: {
+          sessionInstanceId: target.sessionInstanceId,
+          runtimeEpoch: target.runtimeEpoch,
+        },
+        text: 'continue exact work',
+        commandId: messageId,
+        clientMessageId: messageId,
+        deliveryMode: 'append',
+        queuedAt: Date.now(),
+      }).accepted).toBe(true);
+      const delivered = vi.fn(async () => undefined);
+      await expect(drainResend(target.name, delivered, undefined, undefined, undefined, {
+        sessionInstanceId: target.sessionInstanceId,
+        runtimeEpoch: target.runtimeEpoch,
+      })).resolves.toBe(1);
+      expect(delivered).toHaveBeenCalledTimes(1);
+      expect(getResendEntries(target.name)).toEqual([]);
+      // A retry after daemon-owned finalization uses the exact recipient-bound
+      // delivery tombstone and must neither requeue nor redeliver the write.
+      await expect(merged.sendDeps?.dispatchMessage?.(target, 'continue exact work', options))
+        .resolves.toBe('sent');
+      expect(getTransportQueueStore().readSnapshot(target.name).pendingMessageEntries).toEqual([]);
+      expect(delivered).toHaveBeenCalledTimes(1);
+      expect(resolveHookPort).toHaveBeenCalledTimes(5);
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
+  });
+
+  it('keeps non-append, unbound, and process sends fail-closed while the hook is absent', async () => {
+    resetTransportQueueStoreForTests();
+    const merged = mergeDefaultToolDeps(caller, {}, null, {
+      resolveHookPort: async () => null,
+    });
+    const target = {
+      name: 'deck_sub_process', projectName: 'proj', role: 'w1' as const,
+      agentType: 'claude-code' as const, runtimeType: 'process' as const,
+      projectDir: '/tmp/proj', state: 'idle' as const, restarts: 0,
+      restartTimestamps: [], createdAt: 1, updatedAt: 1,
+      sessionInstanceId: 'process-instance', runtimeEpoch: 'process-epoch',
+    };
+    const base = {
+      dispatchId: createSendDispatchId(),
+      messageId: deterministicSendMessageId('hook-outage-rejected'),
+    };
+    try {
+      await expect(merged.sendDeps?.dispatchMessage?.(target, 'process send', {
+        ...base,
+        deliveryMode: 'append',
+        supervision: { taskId: 'tsk_exact', assignmentId: 'asg_exact' },
+      })).rejects.toThrow('daemon hook server is unavailable');
+      await expect(merged.sendDeps?.dispatchMessage?.({
+        ...target,
+        name: 'deck_sub_transport',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+      }, 'ordinary send', base)).rejects.toThrow('daemon hook server is unavailable');
+      expect(getTransportQueueStore().readSnapshot(target.name).pendingMessageEntries).toEqual([]);
+      expect(getTransportQueueStore().readSnapshot('deck_sub_transport').pendingMessageEntries).toEqual([]);
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
+  });
+
+  it('fails recoverably instead of growing the cross-process durable fallback past its hard cap', async () => {
+    resetTransportQueueStoreForTests();
+    const merged = mergeDefaultToolDeps(caller, {}, null, {
+      resolveHookPort: async () => null,
+    });
+    const target = {
+      name: 'deck_sub_bounded', projectName: 'proj', role: 'w1' as const,
+      agentType: 'codex-sdk' as const, runtimeType: 'transport' as const,
+      projectDir: '/tmp/proj', state: 'idle' as const, restarts: 0,
+      restartTimestamps: [], createdAt: 1, updatedAt: 1,
+      sessionInstanceId: 'bounded-instance', runtimeEpoch: 'bounded-epoch',
+    };
+    try {
+      for (let index = 0; index < 10; index += 1) {
+        await expect(merged.sendDeps?.dispatchMessage?.(target, `message-${index}`, {
+          dispatchId: createSendDispatchId(),
+          messageId: deterministicSendMessageId(`hook-outage-cap-${index}`),
+          deliveryMode: 'append',
+          supervision: { taskId: 'tsk_exact', assignmentId: 'asg_exact' },
+        })).resolves.toBe('queued');
+      }
+      await expect(merged.sendDeps?.dispatchMessage?.(target, 'overflow', {
+        dispatchId: createSendDispatchId(),
+        messageId: deterministicSendMessageId('hook-outage-cap-overflow'),
+        deliveryMode: 'append',
+        supervision: { taskId: 'tsk_exact', assignmentId: 'asg_exact' },
+      })).rejects.toThrow('capacity_exhausted');
+      expect(getTransportQueueStore().readSnapshot(target.name).pendingMessageEntries).toHaveLength(10);
+      expect(getResendEntries(target.name)).toEqual([]);
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
   });
 });
 

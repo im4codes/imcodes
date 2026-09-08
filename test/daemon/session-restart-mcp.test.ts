@@ -81,4 +81,22 @@ describe('session_restart MCP tool', () => {
     await expect(handler({ target: '*' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
     expect(restartSession).not.toHaveBeenCalled();
   });
+
+  it('reports transient restart-control loss as explicit recoverable failure without emulation', async () => {
+    const self = session();
+    const restartSession = vi.fn(async () => {
+      throw new Error('daemon session restart control is unavailable');
+    });
+    const handler = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => [self] },
+      restartSession,
+    })[MEMORY_MCP_TOOL_NAMES.SESSION_RESTART];
+
+    await expect(handler({ target: self.name, reset: false })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'control_plane_unavailable',
+      recoverable: true,
+    });
+    expect(restartSession).toHaveBeenCalledTimes(1);
+  });
 });
