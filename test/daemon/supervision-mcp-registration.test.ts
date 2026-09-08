@@ -692,6 +692,89 @@ describe('list/get visibility guards', () => {
   });
 });
 
+describe('coordinator-authorized implementer handoff', () => {
+  // Reproduces the exact production call. The authoritative Brain asked to
+  // rebind the SAME active implementer (tsk_hn8/asg_hn9) onto a live CC session
+  // and was answered `owner_mismatch`, so the coordinator-authorized handoff
+  // was pushed back onto the owner it was meant to replace.
+  const ccTarget = {
+    sessionName: 'deck_sub_3l6z4l39', sessionInstanceId: 'instance-cc', runtimeEpoch: 'epoch-cc',
+    agentType: 'claude-code-sdk', providerFamily: 'anthropic', projectName: 'codedeck',
+  };
+  const request = {
+    taskId: 'tsk_a',
+    assignmentId: 'tsk_a-assignment-0',
+    rebindSessionName: ccTarget.sessionName,
+    expectedRevision: 'c558e38a18a93efe65ebbbed39367039b7197f90',
+    ownedFiles: ['src/one.ts', 'src/two.ts'],
+    evidenceManifestSha256: 'ac5e9d0eeaab9975641efda5803f9858ea11ad128927e8ebb9ebd757edffbba8',
+    reason: 'coordinator-authorized handoff of the active implementer',
+  } as const;
+
+  it('routes the Brain call through coordinator recovery, not the implementer owner check', async () => {
+    const reg = new FakeRegistry();
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: reg as never, isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => (name === ccTarget.sessionName ? ccTarget : undefined),
+    });
+
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toMatchObject({
+      status: 'ok', taskId: request.taskId, assignmentId: request.assignmentId, replay: false,
+    });
+
+    // It must reach the coordinator transaction carrying the authority this
+    // branch established — the owner check is never what decides this call.
+    expect(reg.implementerRebound).toHaveLength(1);
+    expect(reg.implementerRebound[0]).toMatchObject({
+      taskId: request.taskId,
+      assignmentId: request.assignmentId,
+      expectedRevision: request.expectedRevision,
+      ownedFiles: request.ownedFiles,
+      evidenceManifestSha256: request.evidenceManifestSha256,
+      identity: { sessionName: ccTarget.sessionName },
+      coordinatorAuthorization: {
+        targetProjectName: 'codedeck',
+        coordinatorSessionName: CALLER.sessionName,
+      },
+    });
+  });
+
+  it('refuses a non-coordinator caller, a foreign-project target and a dead target', async () => {
+    const participant = createSupervisionMcpToolHandlers(CALLER, {
+      registry: new FakeRegistry() as never,
+      resolveSessionIdentity: (name) => (name === ccTarget.sessionName ? ccTarget : undefined),
+    });
+    expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER](request))
+      .toMatchObject({ status: 'error', reason: 'forbidden' });
+
+    // The implementer branch computed the task project but never compared it,
+    // so a coordinator could name a target belonging to another project.
+    const foreignReg = new FakeRegistry();
+    const foreignTargetBrain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: foreignReg as never, isProjectBrain: () => true,
+      // Only the TARGET is foreign. Returning it for the caller's own session
+      // too would fail the call for the unrelated reason that the coordinator
+      // itself looked cross-project.
+      resolveSessionIdentity: (name) => (name === ccTarget.sessionName
+        ? { ...ccTarget, projectName: 'other-project' }
+        : testResolveSessionIdentity(name)),
+    });
+    expect(await foreignTargetBrain[SUPERVISION_MCP_TOOLS.RECOVER](request))
+      .toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(foreignReg.implementerRebound, 'nothing is written before every check passes').toEqual([]);
+
+    const deadReg = new FakeRegistry();
+    const deadTargetBrain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: deadReg as never, isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => (name === ccTarget.sessionName
+        ? undefined : testResolveSessionIdentity(name)),
+    });
+    expect(await deadTargetBrain[SUPERVISION_MCP_TOOLS.RECOVER](request))
+      .toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(deadReg.implementerRebound).toEqual([]);
+  });
+});
+
 describe('administrative recover', () => {
   it('lets only the authoritative same-project Brain atomically repair coordination state, scope, lease, and live identity', async () => {
     const liveIdentity = {
@@ -811,6 +894,96 @@ describe('administrative recover', () => {
     });
     expect(convergeExactReworkAssignment).not.toHaveBeenCalled();
     expect(rebindTaskAssignmentRevision).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes a Brain revision recovery that also PINS the current revision to the revision lane', async () => {
+    // Production shape: a careful Brain adds `expectedRevision` for optimistic
+    // concurrency on top of a revision recovery. `expectedRevision` was treated
+    // as the implementer branch's exclusive signal, so this call was claimed by
+    // a branch sitting ABOVE the revision lane and rejected with an
+    // implementer-shaped `validation_failed` naming rebindSessionName/ownedFiles/
+    // evidenceManifestSha256 -- fields this request never had any reason to send.
+    // The more precisely the Brain pinned its request, the more certainly it was
+    // misrouted, which is why this looked like a schema error rather than a
+    // dispatcher defect.
+    const assignmentId = 'pinned-successor-assignment';
+    const state: any = {
+      taskId: 'tsk_pinned', projectName: 'codedeck', status: 'rework',
+      currentRevision: 'revision-r1', classification: 'independent_top_level',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'rework', required: true,
+        auditRevision: 'revision-r1', leaseId: 'lease-r1', generation: 1,
+        identity: testIdentity('deck_successor_worker'),
+      }],
+    };
+    const rebindTaskAssignmentRevision = vi.fn(() => ({ ok: true as const }));
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      convergeExactReworkAssignment: vi.fn(() => ({ ok: true as const })),
+      rebindTaskAssignmentRevision,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    const response = await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId,
+      fromRevision: 'revision-r1', toRevision: 'revision-r2',
+      expectedRevision: 'revision-r1',
+      leaseAction: 'renew', idempotencyKey: 'pinned-successor-r2',
+      reason: 'bind the successor revision while pinning the observed current one',
+    });
+    expect(
+      JSON.stringify(response),
+      'the pinned revision recovery must not be answered with the implementer schema',
+    ).not.toContain('implementer identity recovery requires');
+    expect(rebindTaskAssignmentRevision, 'it reaches the revision lane').toHaveBeenCalledTimes(1);
+  });
+
+  it('routes pinned completion-evidence and auditor-shaped recoveries away from the implementer schema', async () => {
+    // Same defect class as the pinned revision recovery: `expectedRevision` is
+    // shared optimistic-concurrency metadata, so every OTHER recovery shape that
+    // pinned it was answered with the implementer branch's schema error.
+    const state: any = {
+      taskId: 'tsk_pinned_other', projectName: 'codedeck', status: 'rework',
+      currentRevision: 'revision-r1', classification: 'independent_top_level',
+      assignments: [{
+        assignmentId: 'pinned-other-assignment', role: 'implementer', status: 'rework',
+        required: true, auditRevision: 'revision-r1', leaseId: 'lease-r1', generation: 1,
+        identity: testIdentity('deck_successor_worker'),
+      }],
+    };
+    const resolveCompletionEvidence = vi.fn(() => ({ ok: true as const }));
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      resolveCompletionEvidence,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    const completion = await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, evidenceId: 'evidence-1',
+      targetAssignmentId: 'pinned-other-assignment',
+      completionEvidenceDecision: 'adopt', expectedRevision: 'revision-r1',
+      reason: 'adopt the completion evidence while pinning the observed revision',
+    });
+    expect(JSON.stringify(completion), 'completion evidence keeps its own schema')
+      .not.toContain('implementer identity recovery requires');
+    expect(resolveCompletionEvidence, 'it reaches the completion-evidence lane').toHaveBeenCalledTimes(1);
+
+    // An auditor-shaped call that misses one of the orphaned-auditor branch's
+    // required fields must be answered in AUDIT terms, not told to supply
+    // implementer evidence it has no business producing.
+    const auditor = await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId: 'pinned-other-assignment',
+      auditAttemptId: 'attempt-1', expectedRevision: 'revision-r1',
+      reason: 'recover the delegated auditor',
+    });
+    expect(JSON.stringify(auditor), 'auditor recovery is never answered with the implementer schema')
+      .not.toContain('implementer identity recovery requires');
   });
 
   it('immediately refreezes and dispatches an already-validated pre-persisted successor', async () => {
@@ -1266,7 +1439,7 @@ describe('administrative recover', () => {
       registry,
       isProjectBrain: () => true,
       resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
-      resolveAuditorRecoveryBinding: (name) => name === replacement.sessionName ? replacementBinding : undefined,
+      resolveRecoveryExecutionBinding: (name) => name === replacement.sessionName ? replacementBinding : undefined,
       dispatchReadyAudit,
       retireSupersededAuditDelivery,
     });
@@ -1356,7 +1529,26 @@ describe('administrative recover', () => {
   it('rebinds a validated required implementer through the live same-session identity and frozen evidence', async () => {
     const liveIdentity = {
       sessionName: 'deck_cd_brain', sessionInstanceId: 'instance-restarted', runtimeEpoch: 'epoch-restarted',
-      agentType: 'codex-sdk', providerFamily: 'openai',
+      // Production identities always carry the project (the type requires it,
+      // and the auditor branch has always compared it). The fixture omitted it
+      // only because the implementer branch never looked.
+      agentType: 'codex-sdk', providerFamily: 'openai', projectName: 'codedeck',
+    };
+    const successorBinding = {
+      pool: 'primary' as const,
+      requested: {
+        capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+        runtimeType: 'transport' as const, model: 'gpt-5.6',
+      },
+      actual: {
+        sessionName: liveIdentity.sessionName,
+        sessionInstanceId: liveIdentity.sessionInstanceId,
+        runtimeEpoch: liveIdentity.runtimeEpoch,
+        agentType: 'codex-sdk', providerFamily: 'openai',
+        runtimeType: 'transport' as const, model: 'gpt-5.6',
+      },
+      origin: 'reused' as const,
     };
     const request = {
       taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
@@ -1378,18 +1570,36 @@ describe('administrative recover', () => {
       registry,
       isProjectBrain: () => true,
       resolveSessionIdentity: (name) => name === liveIdentity.sessionName ? liveIdentity : undefined,
+      // The successor's OWN selected binding, resolved from the live pool. The
+      // incumbent's describes the runtime being replaced, so it can never stand
+      // in for it.
+      resolveRecoveryExecutionBinding: (name) => (
+        name === liveIdentity.sessionName ? successorBinding : undefined
+      ),
     });
     expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({ ...request, rebindSessionName: 'missing' }))
       .toMatchObject({ status: 'error', reason: 'identity_rejected' });
     expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toEqual({
       status: 'ok', taskId: request.taskId, assignmentId: request.assignmentId,
       rebindSessionName: liveIdentity.sessionName, expectedRevision: request.expectedRevision,
-      replay: false,
+      leaseAction: 'preserve', replay: false,
     });
     expect(registry.implementerRebound).toEqual([{
       taskId: request.taskId, assignmentId: request.assignmentId, identity: liveIdentity,
       expectedRevision: request.expectedRevision, ownedFiles: request.ownedFiles,
       evidenceManifestSha256: request.evidenceManifestSha256, reason: request.reason,
+      // Absent from the request, so the transaction is told the default
+      // explicitly rather than left to infer it.
+      leaseAction: 'preserve',
+      // The authority this branch established is now handed to the transaction
+      // so it can re-derive the project instead of trusting the caller. A
+      // same-session recovery carries it too and is unaffected by it.
+      coordinatorAuthorization: {
+        targetProjectName: 'codedeck', coordinatorSessionName: CALLER.sessionName,
+      },
+      // Forwarded so the transaction can persist the complete canonical tuple
+      // instead of blending the incumbent's capability into the successor's row.
+      executionBinding: successorBinding,
     }]);
 
     registry.implementerRebound = [];
