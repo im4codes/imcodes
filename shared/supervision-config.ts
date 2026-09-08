@@ -899,11 +899,18 @@ export function canTransitionSupervisionTaskStatus(
 }
 
 export const SUPERVISION_EXECUTION_STATUS_MARKERS = {
-  ADVANCE: '<!-- IMCODES_EXEC: ADVANCE -->',
-  AUDIT_READY: '<!-- IMCODES_EXEC: AUDIT_READY -->',
   NEEDS_INPUT: '<!-- IMCODES_EXEC: NEEDS_INPUT -->',
   WAITING: '<!-- IMCODES_EXEC: WAITING -->',
 } as const;
+
+/**
+ * Historical completion marker retained only so runtime automation can
+ * explicitly quarantine old transcripts. It is not an active protocol token:
+ * prompts must not emit it and parsers must never translate it into lifecycle
+ * authority.
+ */
+export const RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER = '<!-- IMCODES_EXEC: AUDIT_READY -->';
+export const RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER = '<!-- IMCODES_EXEC: ADVANCE -->';
 
 export type SupervisionMode = typeof SUPERVISION_MODE[keyof typeof SUPERVISION_MODE];
 export const SUPERVISION_TASK_AUDIT_POLICIES = [
@@ -975,8 +982,6 @@ export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>p
 export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
 export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';
 export type SupervisionExecutionState =
-  | 'advance'
-  | 'audit_ready'
   | 'needs_input'
   | 'waiting';
 export type SessionSupervisionSnapshotIssue =
@@ -1635,20 +1640,19 @@ export interface ParsedSupervisionExecutionState {
   markerCount: number;
 }
 
-const SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(ADVANCE|AUDIT_READY|NEEDS_INPUT|WAITING)\s*-->[ \t]*$/;
+const SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(NEEDS_INPUT|WAITING)\s*-->[ \t]*$/;
+const RETIRED_SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(?:ADVANCE|AUDIT_READY)\s*-->[ \t]*$/;
 const MARKDOWN_FENCE_OPEN_RE = /^[ \t]{0,3}(`{3,}|~{3,})/;
 
-/**
- * Parse only assistant-authored marker lines. Host dispatch metadata is carried
- * beside `assistant.text.payload.text`, never concatenated into this input.
- * Markdown quotations, fenced examples, inline prose and indented code are not
- * protocol authority. When a model corrects itself in one response, the last
- * valid marker is authoritative and the caller still performs one transition.
- */
-export function parseSupervisionExecutionStateDetailsFromText(text: string): ParsedSupervisionExecutionState {
-  const matches: string[] = [];
+function scanAssistantAuthoredExecutionLines(text: string): {
+  matches: Array<{ marker: string; lineIndex: number }>;
+  retiredExecutionMarker: boolean;
+} {
+  const matches: Array<{ marker: string; lineIndex: number }> = [];
+  let retiredExecutionMarker = false;
   let fence: { delimiter: '`' | '~'; length: number } | undefined;
-  for (const line of text.split(/\r?\n/u)) {
+  const lines = text.split(/\r?\n/u);
+  for (const [lineIndex, line] of lines.entries()) {
     const fenceMatch = line.match(MARKDOWN_FENCE_OPEN_RE)?.[1];
     if (fence) {
       if (fenceMatch?.[0] === fence.delimiter && fenceMatch.length >= fence.length) fence = undefined;
@@ -1659,14 +1663,26 @@ export function parseSupervisionExecutionStateDetailsFromText(text: string): Par
       continue;
     }
     const marker = line.match(SUPERVISION_EXECUTION_MARKER_LINE_RE)?.[1];
-    if (marker) matches.push(marker);
+    if (marker) matches.push({ marker, lineIndex });
+    else if (RETIRED_SUPERVISION_EXECUTION_MARKER_LINE_RE.test(line)) retiredExecutionMarker = true;
   }
-  const state = matches[matches.length - 1];
+  return { matches, retiredExecutionMarker };
+}
+
+/**
+ * Parse only assistant-authored marker lines. Host dispatch metadata is carried
+ * beside `assistant.text.payload.text`, never concatenated into this input.
+ * Markdown quotations, fenced examples, inline prose and indented code are not
+ * protocol authority. Prompts require one final active marker, but the parser
+ * preserves compatibility and liveness by selecting the last valid authored
+ * WAITING/NEEDS_INPUT marker when a response self-corrects or adds trailing
+ * prose. Historical ADVANCE and AUDIT_READY lines are observed separately and
+ * never become authority.
+ */
+export function parseSupervisionExecutionStateDetailsFromText(text: string): ParsedSupervisionExecutionState {
+  const { matches } = scanAssistantAuthoredExecutionLines(text);
+  const state = matches[matches.length - 1]?.marker;
   switch (state) {
-    case 'ADVANCE':
-      return { state: 'advance', markerCount: matches.length };
-    case 'AUDIT_READY':
-      return { state: 'audit_ready', markerCount: matches.length };
     case 'NEEDS_INPUT':
       return { state: 'needs_input', markerCount: matches.length };
     case 'WAITING':
@@ -1678,6 +1694,11 @@ export function parseSupervisionExecutionStateDetailsFromText(text: string): Par
 
 export function parseSupervisionExecutionStateFromText(text: string): SupervisionExecutionState | null {
   return parseSupervisionExecutionStateDetailsFromText(text).state;
+}
+
+/** True only for an assistant-authored, non-quoted, non-fenced retired marker. */
+export function hasRetiredSupervisionExecutionMarker(text: string): boolean {
+  return scanAssistantAuthoredExecutionLines(text).retiredExecutionMarker;
 }
 
 export function parseTaskRunTerminalStateDetailsFromText(text: string): ParsedTaskRunTerminalState {

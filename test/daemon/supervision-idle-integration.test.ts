@@ -20,6 +20,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   SUPERVISION_EXECUTION_STATUS_MARKERS,
+  RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
+  RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_MODE,
   normalizeSessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
@@ -220,15 +222,15 @@ describe('supervision → idle → broker integration', () => {
       'implement the feature',
       'cmd-int-1',
       undefined,
-      expect.stringContaining('"localWork":"perform_now_no_marker"'),
+      expect.stringContaining('"waiting":"all_nonterminal"'),
     );
     const executionPreamble = String(transportSend.mock.calls[0]?.[3]);
     expect(executionPreamble.match(/<!-- IMCODES_EXEC: [A-Z_]+ -->/g)).toEqual([
-      SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY,
-      SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
       SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+      SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
     ]);
-    expect(executionPreamble).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+    expect(executionPreamble).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
+    expect(executionPreamble).not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
     expect(supervisionAutomation.getActiveRun(SESSION)).toBeTruthy();
 
     // Now simulate the transport runtime's status flow: streaming → idle.

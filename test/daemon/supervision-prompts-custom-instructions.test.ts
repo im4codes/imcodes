@@ -8,6 +8,8 @@ import {
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
+  RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
+  RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS,
   SUPERVISION_MODE,
   SUPERVISION_SUPPORTED_UI_LOCALES,
@@ -180,10 +182,11 @@ describe('supervision prompt custom-instructions merge', () => {
         delegateRemainingIsAdvance: false,
         sentAndNoIndependentSafeWork: SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
       });
-      expect(prompt).toContain('\"delegateWorkIsLocal\":false');
+      expect(prompt).toContain('"waiting":"all_nonterminal"');
       // ADVANCE is deprecated for emission: safe local work is performed, not announced.
-      expect(prompt).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
-      expect(prompt).toContain('"localWork":"perform_now_no_marker"');
+      expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
+      expect(prompt).toContain('"exactlyOne":true');
+      expect(prompt).toContain('"end":true');
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
     }
   });
@@ -422,9 +425,9 @@ describe('Brain work-delegation contract placement and budget', () => {
 
   it('does not disturb status, no-safe-work or waiting-heartbeat semantics', () => {
     const execution = buildSupervisionExecutionPreamble('en');
-    expect(execution).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+    expect(execution).not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
     expect(execution).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
-    expect(execution).toContain('"delegateWorkIsLocal":false');
+    expect(execution).toContain('"waiting":"all_nonterminal"');
     const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract('en'));
     expect(contract.status.sentAndNoIndependentSafeWork)
       .toBe(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
@@ -512,24 +515,25 @@ describe('ADVANCE marker deprecation and waiting semantics', () => {
     // it. Only the announcement is removed; the other markers are untouched.
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       const prompt = buildSupervisionExecutionPreamble(locale);
-      expect(prompt).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+      expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
     }
   });
 
-  it('still offers WAITING, AUDIT_READY and NEEDS_INPUT in every locale', () => {
+  it('offers only the two non-terminal execution markers in every locale', () => {
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       const prompt = buildSupervisionExecutionPreamble(locale);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
-      expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
+      expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
+      expect(prompt).toContain('"completion":"registry_intent_only"');
+      expect(prompt).toContain('"waiting":"all_nonterminal"');
     }
   });
 
   it('keeps delegated work non-local so pending delegates resolve to WAITING', () => {
-    // delegatedWorkIsLocal=false is what makes "my delegates are still busy"
-    // mean WAITING rather than local work. It must survive this change.
+    // Delegated work remains external and therefore converges on WAITING.
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
-      expect(buildSupervisionExecutionPreamble(locale)).toContain('"delegateWorkIsLocal":false');
+      expect(buildSupervisionExecutionPreamble(locale)).toContain('"waiting":"all_nonterminal"');
     }
   });
 
@@ -542,13 +546,13 @@ describe('ADVANCE marker deprecation and waiting semantics', () => {
   it('keeps the audit preamble free of ADVANCE too', () => {
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       expect(buildSupervisedAuditExecutionPreamble(locale))
-        .not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+        .not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
     }
   });
 
   it('still parses a legacy ADVANCE reply so old transcripts stay readable', () => {
     // Deprecating emission must not break detection of historical replies.
-    expect(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE)
+    expect(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER)
       .toBe('<!-- IMCODES_EXEC: ADVANCE -->');
   });
 

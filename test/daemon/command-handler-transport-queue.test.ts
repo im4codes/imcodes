@@ -43,6 +43,7 @@ import {
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER } from '../../shared/supervision-config.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -2333,7 +2334,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'also cover automatic audit',
       'cmd-composer-append-supervised',
       undefined,
-      expect.stringContaining('<!-- IMCODES_EXEC: AUDIT_READY -->'),
+      expect.stringContaining('"completion":"registry_intent_only"'),
       { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
     );
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
@@ -4540,9 +4541,11 @@ describe('handleWebCommand transport queue behavior', () => {
     );
     const preamble = String(transportSend.mock.calls[0]?.[3]);
     expect(preamble).toContain('"exactlyOne":true');
+    expect(preamble).toContain('"end":true');
     expect(preamble).toContain('"actBeforeMarker":true');
-    expect(preamble).toContain('"done":"<!-- IMCODES_EXEC: AUDIT_READY -->"');
-    expect(preamble).toContain('"delegateWorkIsLocal":false');
+    expect(preamble).toContain('"completion":"registry_intent_only"');
+    expect(preamble).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
+    expect(preamble).toContain('"waiting":"all_nonterminal"');
     expect(registerTaskIntentMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'cmd-heavy',
@@ -4606,8 +4609,9 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(preamble).toContain('"contractId":"supervision_orchestrator_context_v1"');
     expect(preamble).toContain('"fabricateOrInfer":false');
     expect(preamble).toContain('"contractId":"task_run_status_v1"');
-    expect(preamble).toContain('"done":"<!-- IMCODES_EXEC: AUDIT_READY -->"');
-    expect(preamble).toContain('"delegateWorkIsLocal":false');
+    expect(preamble).toContain('"completion":"registry_intent_only"');
+    expect(preamble).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
+    expect(preamble).toContain('"waiting":"all_nonterminal"');
     expect(preamble).not.toContain('PASS 前不得');
   });
 

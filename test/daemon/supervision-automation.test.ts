@@ -10,6 +10,8 @@ import {
   SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
+  RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
+  RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND,
@@ -22,6 +24,7 @@ import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_PURPOSES,
+  SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
   buildAgentDelegationReplyInstruction,
 } from '../../shared/agent-delegation.js';
 import { createSendDispatchId, createSendMessageId } from '../../shared/send-message-id.js';
@@ -133,6 +136,7 @@ process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = path.join(
 const {
   supervisionAutomation,
   enrichSnapshotWithGlobalDefaults,
+  executionMarkerForStructuredSupervisionBlocker,
 } = await import('../../src/daemon/supervision-automation.js');
 const { peerAuditService: mockedPeerAuditService } = await import('../../src/daemon/peer-audit-service.js');
 const {
@@ -502,53 +506,48 @@ describe('SupervisionAutomation', () => {
     expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenCalledTimes(2);
   });
 
-  it('fast-paths ADVANCE without calling the supervisor model', async () => {
+  it('quarantines retired ADVANCE without calling the supervisor model', async () => {
     const snapshot = await seedSession('supervised_audit', false, 2, { uiLocale: 'zh-CN' });
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-advance', 'implement the feature', snapshot);
     beginRun('cmd-marker-advance', 'implement the feature');
 
-    completeTurn(`More safe work remains.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}`);
-    await waitForTransportSendCount(1);
+    completeTurn(`More safe work remains.\n${RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
-    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(prompt).toContain('执行模式：advance_safe_work');
-    expect(prompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
-    expect(prompt).not.toContain('Continue the same task.');
-    expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
-    expect(prompt).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY);
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
-  it('fast-paths AUDIT_READY into peer audit without calling the supervisor model', async () => {
+  it('keeps a legacy AUDIT_READY transcript inert instead of auditing or finalizing', async () => {
     const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-audit', 'implement the feature', snapshot);
     beginRun('cmd-marker-audit', 'implement the feature');
 
-    completeTurn(`Implementation and validation are complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
-    await waitForTransportSendCount(1);
+    completeTurn(`Implementation and validation are complete.\n${RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('send exactly one reply-enabled audit request');
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
-  it('fast-paths AUDIT_READY into explicit finalization for ordinary supervision', async () => {
+  it('does not let legacy AUDIT_READY authorize explicit repository finalization', async () => {
     const snapshot = await seedSession('supervised', false, 2, {
       globalCustomInstructions: 'Always commit and push after implementation and tests are complete.',
     });
     supervisionAutomation.init();
-    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-finalize', 'implement the feature', snapshot);
-    beginRun('cmd-marker-finalize', 'implement the feature');
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-retired-finalize', 'implement the feature', snapshot);
+    beginRun('cmd-retired-finalize', 'implement the feature');
 
-    completeTurn(`Implementation and validation are complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
-    await waitForTransportSendCount(1);
+    completeTurn(`Implementation and validation are complete.\n${RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
-    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(prompt).toContain('Perform only the repository or delivery finalization explicitly requested');
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
@@ -563,29 +562,151 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
 
     const waitingSnapshot = await seedSession('supervised');
-    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-waiting', 'wait for the reply', waitingSnapshot);
-    beginRun('cmd-marker-waiting', 'wait for the reply');
-    completeTurn(`The reply-enabled request was sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-waiting', 'wait for the delegated result', waitingSnapshot);
+    beginRun('cmd-marker-waiting', 'wait for the delegated result');
+    completeTurn(`The delegated result is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
     await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' }));
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
   });
 
-  it('uses only the last authored execution marker and cannot double-advance', async () => {
+  it.each([
+    [
+      'WAITING followed by trailing explanation',
+      `The delegated result is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}\nAdditional diagnostic context follows.`,
+    ],
+    [
+      'multiple active markers with a WAITING self-correction',
+      `${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}\nCorrection: no human input is required.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+    ],
+  ])('keeps %s alive and arms the bounded heartbeat instead of silently quarantining it', async (_caseName, response) => {
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-active-marker-liveness',
+        'wait for the delegated result',
+        snapshot,
+      );
+      beginRun('cmd-active-marker-liveness', 'wait for the delegated result');
+      completeTurn(response);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(mockSupervisionDecide).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockTransportRuntime.send.mock.calls
+        .map((call) => String(call[0]))
+        .filter((prompt) => prompt.includes('[Contract: supervision_waiting_heartbeat_v1]')))
+        .toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        commandId: 'cmd-active-marker-liveness',
+        phase: 'execution',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['safe local execution', 'Completed this slice and am continuing the remaining safe local implementation.'],
+    ['delegated dispatch', 'Dispatched the remaining work and am waiting for its bound reply.'],
+  ])('requires %s to end with exactly one WAITING marker', async (caseName, body) => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    const commandId = `cmd-nonterminal-${caseName.replaceAll(' ', '-')}`;
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', commandId, 'implement the feature', snapshot);
+    beginRun(commandId, 'implement the feature');
+    const response = `${body}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`;
+
+    expect(response.match(/<!-- IMCODES_EXEC: [A-Z_]+ -->/gu)).toEqual([
+      SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+    ]);
+    expect(response.endsWith(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING)).toBe(true);
+    completeTurn(response);
+
+    await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain'))
+      .toMatchObject({ phase: 'execution' }));
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['genuine human approval', 'Please approve the required release policy.'],
+    ['no actionable task', 'No actionable task was provided; please provide one.'],
+  ])('reserves exactly one final NEEDS_INPUT marker for %s', async (caseName, body) => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    const commandId = `cmd-needs-input-${caseName.replaceAll(' ', '-')}`;
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', commandId, 'continue the task', snapshot);
+    beginRun(commandId, 'continue the task');
+    const response = `${body}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}`;
+
+    expect(response.match(/<!-- IMCODES_EXEC: [A-Z_]+ -->/gu)).toEqual([
+      SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+    ]);
+    expect(response.endsWith(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT)).toBe(true);
+    completeTurn(response);
+
+    await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined());
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['release approval', 'Peer audit dispatch is blocked because the required user release-policy approval is missing.'],
+    ['credential', 'Audit transport is unavailable because the user credential is missing.'],
+  ])('preserves NEEDS_INPUT authority for a genuine human %s blocker', async (caseName, response) => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', `cmd-human-audit-${caseName}`, 'finish the formal audit lifecycle', snapshot);
+    beginRun(`cmd-human-audit-${caseName}`, 'finish the formal audit lifecycle');
+
+    completeTurn(`${response}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}`);
+    await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined());
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+  });
+
+  it('uses only structured blocker disposition for internal recovery, independent of multilingual prose', () => {
+    const exactErrors = [
+      'Peer audit dispatch is blocked because the required user release-policy approval is missing.',
+      'Audit transport is unavailable because the user credential is missing.',
+      '代码已由 Cx2 技术审计 PASS，但正式审计回执/控制面物化失败。不得绕过审计、提交或部署；已升级给 Brain。',
+      'Cx2 technically audited PASS, but formal receipt/control-plane materialization failed. Do not waive audit, commit, or deploy; escalated to Brain.',
+    ];
+    for (const exactError of exactErrors) {
+      expect(executionMarkerForStructuredSupervisionBlocker({
+        exactError,
+        disposition: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN,
+      })).toBe(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
+      expect(executionMarkerForStructuredSupervisionBlocker({
+        exactError,
+        disposition: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.NEEDS_INPUT,
+      })).toBe(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
+    }
+  });
+
+  it('keeps combined retired ADVANCE/AUDIT_READY text inert', async () => {
     const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-conflict', 'finish the task', snapshot);
     beginRun('cmd-marker-conflict', 'finish the task');
     completeTurn([
-      SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE,
-      SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY,
+      RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
+      RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
     ].join('\n'));
 
-    await waitForTransportSendCount(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
-    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('send exactly one reply-enabled audit request');
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
   it('ignores quoted markers and preserves the assistant/host-dispatch metadata boundary', async () => {
@@ -595,11 +716,11 @@ describe('SupervisionAutomation', () => {
     beginRun('cmd-marker-inline', 'finish and audit the status protocol');
     timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
       text: [
-        `> ${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}`,
+        `> ${RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER}`,
         '```md',
         SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
         '```',
-        SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY,
+        RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
         'Assistant-authored text may continue after the marker.',
       ].join('\n'),
       streaming: false,
@@ -607,11 +728,10 @@ describe('SupervisionAutomation', () => {
     });
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
 
-    await waitForTransportSendCount(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
-    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(prompt).toContain('send exactly one reply-enabled audit request');
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
   beforeEach(async () => {
@@ -5210,7 +5330,7 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.init();
       supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-audit-restart-state', 'implement and audit', snapshot);
       beginRun('cmd-audit-restart-state', 'implement and audit');
-      completeTurn(`Implementation and validation complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
+      completeTurn('Implementation and validation complete.');
       await waitForRunPhase('auditing');
       const before = supervisionAutomation.getActiveRun('deck_supervision_brain');
       expect(before?.auditAttemptId).toBeTruthy();
@@ -5243,7 +5363,7 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.init();
       supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-auditor-recreated', 'implement and audit', snapshot);
       beginRun('cmd-auditor-recreated', 'implement and audit');
-      completeTurn(`Implementation and validation complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
+      completeTurn('Implementation and validation complete.');
       await waitForRunPhase('auditing');
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       const priorAuditorIdentity = getSession('deck_sub_reviewer')?.sessionInstanceId;
@@ -5623,7 +5743,7 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(true);
     });
 
-    it('routes audit-ready work only through the bounded Brain continue channel', async () => {
+    it('does not let prose-classified completion route an audit or finish the run', async () => {
       const previousNodeEnv = process.env.NODE_ENV;
       process.env.NODE_ENV = 'production';
       supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(true);
@@ -5640,7 +5760,7 @@ describe('SupervisionAutomation', () => {
       );
       beginRun('cmd-brain-owned-audit', 'implement the feature');
 
-      completeTurn(`Implementation and validation complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
+      completeTurn('Implementation and validation complete.');
       await waitForTransportSendCount(2);
 
       expect(mockedPeerAuditService.applyAutomaticConfiguration).toHaveBeenLastCalledWith(
@@ -5653,12 +5773,8 @@ describe('SupervisionAutomation', () => {
       const modePrompts = sentPrompts.filter((prompt) => prompt.includes('[Contract: supervision_auto_audit_mode_control_v1]'));
       expect(continuePrompts).toHaveLength(1);
       expect(modePrompts).toHaveLength(1);
-      expect(continuePrompts[0]).toContain(
-        'For integration_slice, validate/freeze/handoff without audit',
-      );
-      expect(continuePrompts[0]).toContain(
-        'only then dispatch one audit for the exact combined revision',
-      );
+      expect(continuePrompts[0]).toContain('Assistant prose and supervisor classification are not completion authority');
+      expect(continuePrompts[0]).toContain('structured supervision task intent/finish path');
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
         phase: 'execution',
         continueLoops: 1,
@@ -5672,6 +5788,38 @@ describe('SupervisionAutomation', () => {
       expect(emitted.some((event) => event.type === 'assistant.text'
         && /peer audit|peer-audit|auditor|reviewer|elapsed|cancelled|审核者|耗时|已取消|已发送/iu
           .test(String(event.payload.text ?? '')))).toBe(false);
+    });
+
+    it('does not let standalone prose PASS suppress an authenticated audit or finish', async () => {
+      const snapshot = await seedSession('supervised_audit');
+      mockSupervisionDecide.mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'No authenticated receipt exists, so dispatch an independent audit.',
+        confidence: 0.95,
+        requiresAudit: true,
+        nextAction: 'Construct and send a reply-enabled independent audit brief to the configured auditor.',
+      });
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-prose-pass-not-authority',
+        'implement and audit the feature',
+        snapshot,
+      );
+      beginRun('cmd-prose-pass-not-authority', 'implement and audit the feature');
+
+      completeTurn('审计 PASS；实现和验证已完成。');
+      await waitForTransportSendCount(1);
+
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'execution',
+        continueLoops: 1,
+      });
+      expect(lastStatusPayload()).not.toMatchObject({ status: 'supervision_complete' });
+      expect(mockTransportRuntime.send.mock.calls
+        .map((call) => String(call[0]))
+        .some((prompt) => prompt.includes('[Contract: supervision_continue_v1]'))).toBe(true);
     });
 
     it('does not adopt, cancel, or recover an explicitly Brain-dispatched manual audit', async () => {

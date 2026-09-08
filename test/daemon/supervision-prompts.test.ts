@@ -5,6 +5,8 @@ import {
   SUPERVISION_CONTRACT_PREAMBLE_START,
   SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
+  RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
+  RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_MODE,
   SUPERVISION_SUPPORTED_UI_LOCALES,
 } from '../../shared/supervision-config.js';
@@ -121,7 +123,8 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('"auditMode":true');
     expect(prompt).toContain('"beforePass":"no_delivery_finalization"');
     expect(prompt).toContain('"rerun":"minimal_on_concrete_gap"');
-    expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY);
+    expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
+    expect(prompt).toContain('"completion":"registry_intent_only"');
     expect(prompt).toContain('Authoritative auto-audit mode: enabled');
     expect(prompt).toContain('Brain coordinates and integrates');
     expect(prompt).not.toContain('同伴审计模式');
@@ -130,12 +133,12 @@ describe('supervision prompts', () => {
   it('encodes status-marker priority without prose expansion', () => {
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       const prompt = buildSupervisionExecutionPreamble(locale);
+      expect(prompt).toContain('"exactlyOne":true');
+      expect(prompt).toContain('"end":true');
       expect(prompt).toContain('"actBeforeMarker":true');
-      expect(prompt).toContain('"priority":["human","external","done"]');
-      expect(prompt).toContain('"delegateWorkIsLocal":false');
-      // Local work has no marker: Brain performs it instead of announcing it.
-      expect(prompt).toContain('"localWork":"perform_now_no_marker"');
-      expect(prompt).not.toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+      expect(prompt).toContain('"needsInput":"no_task_or_user_blocker_only"');
+      expect(prompt).toContain('"waiting":"all_nonterminal"');
+      expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
       expect(prompt).toContain('Authoritative auto-audit mode: disabled');
     }
@@ -177,7 +180,7 @@ describe('supervision prompts', () => {
     expect(heartbeat).toContain('有安全工作就继续推进');
     expect(heartbeat).toContain('等待回执则保持等待并在下次心跳继续检查');
     expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
-    expect(Buffer.byteLength(heartbeat, 'utf8')).toBeLessThanOrEqual(420);
+    expect(Buffer.byteLength(heartbeat, 'utf8')).toBeLessThanOrEqual(2_200);
     for (const forbidden of [
       SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
       SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,

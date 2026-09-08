@@ -42,11 +42,13 @@ import {
   SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
   isAutomaticSupervisionEnabled,
+  hasRetiredSupervisionExecutionMarker,
   normalizeSessionSupervisionSnapshot,
   parseSupervisionExecutionStateDetailsFromText,
   resolveSupervisionCustomInstructionsDetail,
@@ -81,9 +83,11 @@ import {
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
   buildAgentDelegationReplyInstruction,
   buildAgentDelegationOrchestrationPrompt,
   extractAgentDelegationReplyAuthorityFromInstruction,
+  type SupervisionBlockerEscalationReport,
 } from '../../shared/agent-delegation.js';
 import {
   PEER_AUDIT_DEADLINE_MS,
@@ -159,11 +163,21 @@ const SUPERVISION_CONTINUE_LABEL = 'Supervised: sent a continue prompt.';
 const SUPERVISION_FINALIZING_LABEL = 'Supervised: audit passed; running post-audit finalization.';
 const SUPERVISION_NEEDS_INPUT_LABEL = 'Supervised: returned control to you.';
 
+/** Only daemon-authenticated structured disposition selects blocker status. */
+export function executionMarkerForStructuredSupervisionBlocker(
+  report: Pick<SupervisionBlockerEscalationReport, 'disposition' | 'exactError'>,
+): typeof SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING | typeof SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT {
+  return report.disposition === SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
+    ? SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING
+    : SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+}
+
 /** Trimmed blocker text, or undefined when the assignment has no live blocker. */
 function normalizeBlockerText(value: string | null | undefined): string | undefined {
   const trimmed = typeof value === 'string' ? value.trim() : '';
   return trimmed ? trimmed : undefined;
 }
+
 const SUPERVISION_AUDIT_PASS_LABEL = 'Supervised: audit passed.';
 const SUPERVISION_REWORK_LABEL = 'Supervised: audit requested rework; brief sent.';
 const SUPERVISION_BLOCKED_LABEL = 'Supervised: stopped because the session is blocked.';
@@ -1415,7 +1429,8 @@ class SupervisionAutomation {
             .then((result) => {
               if (result.status === 'ignored') return;
               const actor = `${result.report.reporter.label} (${result.report.reporter.sessionName})`;
-              if (result.status === 'waiting') {
+              const marker = executionMarkerForStructuredSupervisionBlocker(result.report);
+              if (marker === SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING) {
                 this.emitStatus(rebound.identity.sessionName, 'supervision_waiting_for_brain',
                   `${actor}: waiting for authoritative Brain repair on the same object.`);
               } else {
@@ -3321,14 +3336,24 @@ class SupervisionAutomation {
     // silently discard the very verdict it was waiting for.
     this.clearWaitingTimers(current, { preserveWindow: true });
 
-    // Normal execution turns carry one exact, prefixed status marker. Trusting
-    // that small protocol avoids a supervisor-model call on every step; absent
-    // or conflicting markers deliberately fall through to the broker.
+    // Normal execution turns carry one exact, prefixed status marker. The
+    // parser accepts the last active marker for compatibility/liveness when a
+    // response self-corrects or appends prose; only retired markers quarantine
+    // a transcript from completion/audit authority.
     const executionStatus = parseSupervisionExecutionStateDetailsFromText(current.lastAssistantText ?? '');
     if (executionStatus.state) {
       current.evaluating = false;
       this.clearStatus(run.sessionName);
       await this.handleExecutionStatus(current, executionStatus.state);
+      return;
+    }
+    if (hasRetiredSupervisionExecutionMarker(current.lastAssistantText ?? '')) {
+      // Retired completion tokens are not broker input. Old transcript bytes
+      // must remain inert:
+      // do not infer completion, route an audit, finalize, or finish the run.
+      // Only a structured registry intent may advance that lifecycle.
+      current.evaluating = false;
+      this.clearStatus(run.sessionName);
       return;
     }
 
@@ -3355,12 +3380,17 @@ class SupervisionAutomation {
     // A new evaluation means the park (if any) is over; the branch below
     // re-arms it when the decision is still `waiting`.
     this.clearWaitingTimers(latest, { preserveWindow: true });
-    const reportedAuditPass = !latest.freshAuditRequiredAfterRework
+    // This compatibility seam exists only for the retired in-process audit
+    // harness and cannot be enabled outside NODE_ENV=test. Production never
+    // treats standalone assistant prose as an authenticated audit receipt.
+    const reportedAuditPass = this.automaticPeerAuditCompatibilityForTests
+      && !latest.freshAuditRequiredAfterRework
       && parseExplicitAuditVerdict(latest.lastAssistantText ?? '') === 'PASS';
     const deterministicAuditRequired = latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
       && turnHasDeterministicAuditEvidence(latest.userText, latest.lastAssistantText);
     latest.requiresAudit = latest.freshAuditRequiredAfterRework
-      || (!reportedAuditPass && (brokerDecision.requiresAudit !== false || deterministicAuditRequired));
+      || brokerDecision.requiresAudit !== false
+      || deterministicAuditRequired;
     // A rework round re-opens the full surface: the previous verdict already
     // said the narrow read was not enough.
     latest.auditDepth = latest.freshAuditRequiredAfterRework ? 'standard' : brokerDecision.auditDepth ?? 'standard';
@@ -3368,13 +3398,20 @@ class SupervisionAutomation {
       && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
       && PENDING_PRE_AUDIT_WORK_RE.test(latest.lastAssistantText ?? '');
 
-    const decision: SupervisionDecision = brokerDecision.decision === 'complete' && assistantReportsPendingPreAuditWork
+    const decision: SupervisionDecision = brokerDecision.decision === 'complete'
+      && (!this.automaticPeerAuditCompatibilityForTests || assistantReportsPendingPreAuditWork)
       ? {
         ...brokerDecision,
         decision: 'continue',
-        reason: 'The latest result explicitly identifies unfinished task work; the supervisor completion judgment may be stale.',
-        gap: 'Reconcile the unfinished work from the current session context before peer audit.',
-        nextAction: PRE_AUDIT_SELF_RECONCILIATION_ACTION,
+        reason: assistantReportsPendingPreAuditWork
+          ? 'The latest result explicitly identifies unfinished task work; the supervisor completion judgment may be stale.'
+          : 'Assistant prose and supervisor classification are not completion authority; only structured task-registry intent may advance the lifecycle.',
+        gap: assistantReportsPendingPreAuditWork
+          ? 'Reconcile the unfinished work from the current session context before peer audit.'
+          : 'Record the exact validation and lifecycle result through the authoritative task registry.',
+        nextAction: assistantReportsPendingPreAuditWork
+          ? PRE_AUDIT_SELF_RECONCILIATION_ACTION
+          : 'Advance the SAME task through the structured supervision task intent/finish path; do not infer completion, audit readiness, or PASS from prose.',
         requiresAudit: true,
       }
       : brokerDecision;
@@ -3390,6 +3427,9 @@ class SupervisionAutomation {
 
     switch (decision.decision) {
       case 'complete': {
+        // Production `complete` decisions are normalized to `continue` above.
+        // This branch is reachable only through the NODE_ENV=test-locked
+        // compatibility harness for the retired in-process audit pipeline.
         latest.terminalState = 'complete';
         if (latest.phase === 'finalizing') {
           this.emitAutomationNote(run.sessionName, 'Auto: peer audit passed and post-audit finalization completed.', 'supervision-post-audit-complete');
@@ -3405,12 +3445,10 @@ class SupervisionAutomation {
             && !latest.requiresAudit;
           this.emitAutomationNote(
             run.sessionName,
-            this.automaticPeerAuditCompatibilityForTests && auditSkipped
+            auditSkipped
               ? 'Auto: task looks complete; the supervisor determined that no new peer audit is needed.'
               : 'Auto: task looks complete.',
-            this.automaticPeerAuditCompatibilityForTests && auditSkipped
-              ? 'supervision-audit-skipped'
-              : 'supervision-complete',
+            auditSkipped ? 'supervision-audit-skipped' : 'supervision-complete',
           );
           this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
           this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
@@ -3436,20 +3474,15 @@ class SupervisionAutomation {
           await this.continueBrainOwnedLifecycle(latest);
           return;
         }
-        // A completed turn can already contain a clearly stated independent
-        // audit PASS (for example an agent-native subagent review followed by
-        // commit/push). If the supervisor then asks only to dispatch that same
-        // audit again, deterministically close the duplicate loop. This does
-        // not bypass a REWORK gate and does not suppress concrete remaining
-        // implementation/validation work.
+        // Retained solely for the retired in-process peer-audit test harness.
+        // Production cannot enable this seam, so prose never substitutes for
+        // an authenticated structured audit receipt.
         if (reportedAuditPass && requestsOnlyRedundantAudit(decision)) {
-          if (this.automaticPeerAuditCompatibilityForTests) {
-            this.emitAutomationNote(
-              run.sessionName,
-              'Auto: the completed turn already reports an independent audit PASS; skipped the duplicate audit request.',
-              'supervision-audit-already-passed',
-            );
-          }
+          this.emitAutomationNote(
+            run.sessionName,
+            'Auto: the completed turn already reports an independent audit PASS; skipped the duplicate audit request.',
+            'supervision-audit-already-passed',
+          );
           this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
           this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
           return;
@@ -3592,41 +3625,6 @@ class SupervisionAutomation {
     if (!current || current.generation !== run.generation) return;
 
     switch (state) {
-      case 'advance':
-        await this.dispatchContinueWithinLimits(current, {
-          reason: 'The execution status reports safe unfinished work.',
-          nextAction: current.phase === 'finalizing'
-            ? POST_AUDIT_REPOSITORY_FINALIZATION_ACTION
-            : 'Advance the safest unfinished task-owned work from current context now.',
-        });
-        return;
-      case 'audit_ready':
-        current.terminalState = 'complete';
-        if (current.phase === 'finalizing') {
-          this.emitAutomationNote(current.sessionName, 'Auto: audited finalization completed.', 'supervision-post-audit-complete');
-          this.emitTerminalStatus(current.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
-          this.finishRun(current.sessionName, 'complete', { preserveStatus: true });
-        } else if (current.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
-          current.requiresAudit = true;
-          current.auditDepth = current.freshAuditRequiredAfterRework ? 'standard' : current.auditDepth ?? 'standard';
-          await this.continueBrainOwnedLifecycle(current);
-        } else if (hasExplicitRepositoryFinalizationRequirement([
-          current.userText,
-          resolveSupervisionCustomInstructionsDetail(
-            enrichSnapshotWithGlobalDefaults(current.snapshot),
-          ).text,
-        ].filter(Boolean).join('\n'))) {
-          current.terminalState = undefined;
-          await this.dispatchContinueWithinLimits(current, {
-            reason: 'Implementation and validation are complete; explicit delivery work remains.',
-            nextAction: SUPERVISED_REPOSITORY_FINALIZATION_ACTION,
-          });
-        } else {
-          this.emitAutomationNote(current.sessionName, 'Auto: task reported implementation and validation complete.', 'supervision-complete');
-          this.emitTerminalStatus(current.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
-          this.finishRun(current.sessionName, 'complete', { preserveStatus: true });
-        }
-        return;
       case 'needs_input':
         this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
         this.emitWarning(current.sessionName, 'Automation returned control because the executing session reported a human-input blocker.');

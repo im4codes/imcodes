@@ -23,6 +23,8 @@ import {
   SUPERVISION_MIN_TIMEOUT_MS,
   SUPERVISION_MODE,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
+  RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
+  RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   TASK_RUN_STATUS_MARKERS,
   embedSessionSupervisionSnapshot,
@@ -441,11 +443,11 @@ describe('supervision config helpers', () => {
     expect(parseTaskRunTerminalStateFromText(`${TASK_RUN_STATUS_MARKERS.NEEDS_INPUT}\n${TASK_RUN_STATUS_MARKERS.BLOCKED}`)).toBeNull();
   });
 
-  it('accepts exactly one fully-prefixed execution marker and ignores bare status words', () => {
+  it('accepts active WAITING/NEEDS_INPUT markers and ignores retired or bare status words', () => {
     expect(parseSupervisionExecutionStateFromText(
-      `still working\n${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}`,
-    )).toBe('advance');
-    expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY)).toBe('audit_ready');
+      `still working\n${RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER}`,
+    )).toBeNull();
+    expect(parseSupervisionExecutionStateFromText(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER)).toBeNull();
     expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT)).toBe('needs_input');
     expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING)).toBe('waiting');
 
@@ -454,25 +456,34 @@ describe('supervision config helpers', () => {
     }
   });
 
-  it('selects the last assistant-authored execution marker exactly once', () => {
+  it('uses the last active marker and tolerates trailing prose while retired markers stay inert', () => {
     expect(parseSupervisionExecutionStateDetailsFromText(
-      `${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`,
-    )).toEqual({ state: 'audit_ready', markerCount: 2 });
+      `${RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER}\n${RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER}`,
+    )).toEqual({ state: null, markerCount: 0 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+    )).toEqual({ state: 'waiting', markerCount: 2 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}\ntrailing prose`,
+    )).toEqual({ state: 'waiting', markerCount: 1 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `still running\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}\n\n`,
+    )).toEqual({ state: 'waiting', markerCount: 1 });
   });
 
-  it('does not require the marker to be the final bytes of assistant content', () => {
-    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY;
+  it('keeps the retired completion marker inert outside quotes and fences', () => {
+    const marker = RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER;
     expect(parseSupervisionExecutionStateDetailsFromText(`${marker}\nmore text`))
-      .toEqual({ state: 'audit_ready', markerCount: 1 });
+      .toEqual({ state: null, markerCount: 0 });
     expect(parseSupervisionExecutionStateDetailsFromText(
       `${marker}\n已授权派发：1\n执行于: deck_sub_reviewer · claude-opus-5 · primary`,
-    )).toEqual({ state: 'audit_ready', markerCount: 1 });
-    expect(parseSupervisionExecutionStateFromText(`done\n  ${marker}\n`)).toBe('audit_ready');
+    )).toEqual({ state: null, markerCount: 0 });
+    expect(parseSupervisionExecutionStateFromText(`done\n  ${marker}\n`)).toBeNull();
   });
 
   it('ignores quoted and fenced marker examples before selecting the last authored marker', () => {
-    const advance = SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE;
-    const ready = SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY;
+    const advance = RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER;
+    const ready = RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER;
     expect(parseSupervisionExecutionStateDetailsFromText([
       `> ${advance}`,
       '```md',
@@ -480,7 +491,8 @@ describe('supervision config helpers', () => {
       '```',
       `The prompt said \`${advance}\`.`,
       ready,
-    ].join('\n'))).toEqual({ state: 'audit_ready', markerCount: 1 });
+      SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+    ].join('\n'))).toEqual({ state: 'waiting', markerCount: 1 });
     expect(parseSupervisionExecutionStateDetailsFromText(`> ${advance}\n\`\`\`\n${ready}\n\`\`\``))
       .toEqual({ state: null, markerCount: 0 });
   });

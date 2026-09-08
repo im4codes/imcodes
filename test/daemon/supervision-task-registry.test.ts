@@ -950,6 +950,46 @@ beforeEach(() => {
 
 describe('SupervisionTaskRegistry', () => {
 
+  it('advances validated implementation through structured registry intent without transcript authority', () => {
+    const registry = makeRegistry();
+    const taskId = 'structured-only-audit-readiness';
+    const revision = 'structured-only-r1';
+    const workerIdentity = identity('deck_structured_only_worker');
+    expect(registry.createOrGet({
+      taskId,
+      projectName: 'alpha',
+      classification: 'independent_top_level',
+      objective: 'prove structured lifecycle authority',
+      currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      assignmentId: 'structured-only-worker',
+      taskId,
+      role: 'implementer',
+      identity: workerIdentity,
+      scopeFiles: ['src/a.ts'],
+      auditRevision: revision,
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
+      identity: workerIdentity,
+    })).toMatchObject({ ok: true, value: { status: 'implementing' } });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'record_validation',
+      validationState: 'passed', toStatus: 'validated', identity: workerIdentity,
+    })).toMatchObject({ ok: true, value: { status: 'validated' } });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: worker.value.assignmentId, intent: 'open_audit',
+      toStatus: 'ready_for_audit', identity: workerIdentity,
+    })).toMatchObject({ ok: true, value: { status: 'ready_for_audit' } });
+    expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({
+      status: 'ready_for_audit', validationState: 'passed', auditRevision: revision,
+    });
+    registry.close();
+  });
+
   it('durably persists every record_validation outcome on BOTH task and assignment', () => {
     // The R1 audit caught two real defects here:
     //  * supervision_tasks had no validation_state column in its upsert, so the

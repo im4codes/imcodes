@@ -87,15 +87,9 @@ type ExecutionPromptCopy = {
   gapHint: string;
   reasonHint: string;
   ownContext: string;
-  noSafeWork: (markers: typeof SUPERVISION_EXECUTION_STATUS_MARKERS) => string;
   userRules: string;
   taskContext: string;
   lastResult: string;
-  statusContract: (markers: typeof SUPERVISION_EXECUTION_STATUS_MARKERS) => string;
-  waitingHeartbeat: (
-    waitedMinutes: number,
-    markers: typeof SUPERVISION_EXECUTION_STATUS_MARKERS,
-  ) => string;
 };
 
 const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = {
@@ -105,10 +99,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     reworkLoop: 'On REWORK, fix and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
     continueTask: 'Continue the same task.', executionMode: 'Execution mode', actionHint: 'Supervisor hint (verify first)', gapHint: 'Reported gap (advisory)', reasonHint: 'Rationale (advisory)',
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
-    noSafeWork: (m) => `If none is safe, report the exact human blocker unless an already-sent external/delegated reply is required next; then use ${m.WAITING}. Do not guess. Uncommitted files alone are not completion.`,
     userRules: 'User supervision rules', taskContext: 'Task context', lastResult: 'Last result',
-    statusContract: (m) => `Do all safe work possible in this turn; never use a marker instead of acting. If this session has safe work, perform it now and do not announce future work. Include exactly one status marker: ${m.AUDIT_READY} implementation+validation done; ${m.NEEDS_INPUT} human input required; ${m.WAITING} no safe main-window work remains and delegated/external work is pending or running. Priority: when all known next work is assigned to other sessions, use ${m.WAITING}; finding issues, sending tasks, or a delegate's remaining work is never local work.`,
-    waitingHeartbeat: (minutes, m) => `Waiting check after ${minutes} minutes: check the external/delegated request. If its reply arrived, continue. If still pending but this session has independent safe work, do it now without announcing it. A delegate still working is not local work; otherwise report what is pending and use ${m.WAITING}. Use ${m.AUDIT_READY} if done and ${m.NEEDS_INPUT} only for an exact human blocker. Include exactly one status marker.`,
   },
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
@@ -116,10 +107,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     reworkLoop: '收到 REWORK 后立即修复并验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
     continueTask: '继续同一任务。', executionMode: '执行模式', actionHint: '监督提示（先核对）', gapHint: '监督报告缺口（仅供参考）', reasonHint: '监督理由（仅供参考）',
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
-    noSafeWork: (m) => `若无可安全推进项，报告确切人工阻断；但若已发外部/委派请求且下一步需其回执，则改用 ${m.WAITING}。不要猜测。仅有未提交文件不代表已完成。`,
     userRules: '用户监督规则', taskContext: '任务上下文', lastResult: '最近结果',
-    statusContract: (m) => `本轮先尽量完成所有安全工作，不得用状态标记代替执行。当前会话有安全工作就立即执行，不要预告下一轮工作。回复中只用一个状态标记：${m.AUDIT_READY} 实现验证完成；${m.NEEDS_INPUT} 必须人工输入；${m.WAITING} 主窗口已无安全工作，且委派/外部工作待办或进行中。优先规则：全部已知后续工作已派给其他会话时必须用 ${m.WAITING}；发现问题、派出任务或对方仍有工作都不算本地工作。`,
-    waitingHeartbeat: (minutes, m) => `等待状态检查（已等待 ${minutes} 分钟）：核对外部/委派请求。回执已到就继续；仍未到但当前会话有独立安全工作就现在执行，不要预告。对方仍在工作不算本地工作；否则汇报等待对象并用 ${m.WAITING}。完成则用 ${m.AUDIT_READY}；只有确需人工时才用 ${m.NEEDS_INPUT}。只用一个状态标记。`,
   },
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
@@ -127,10 +115,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     reworkLoop: '收到 REWORK 後立即修復並驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
     continueTask: '繼續同一任務。', executionMode: '執行模式', actionHint: '監督提示（先核對）', gapHint: '監督回報缺口（僅供參考）', reasonHint: '監督理由（僅供參考）',
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
-    noSafeWork: (m) => `若無可安全推進項，回報確切人工阻斷；但若已發外部/委派請求且下一步需其回執，則改用 ${m.WAITING}。不要猜測。僅有未提交檔案不代表已完成。`,
     userRules: '使用者監督規則', taskContext: '任務上下文', lastResult: '最近結果',
-    statusContract: (m) => `本輪先盡量完成所有安全工作，不得用狀態標記代替執行。目前會話有安全工作就立即執行，不要預告下一輪工作。回覆中只用一個狀態標記：${m.AUDIT_READY} 實作驗證完成；${m.NEEDS_INPUT} 必須人工輸入；${m.WAITING} 主視窗已無安全工作，且委派/外部工作待辦或進行中。優先規則：全部已知後續工作已派給其他會話時必須用 ${m.WAITING}；發現問題、派出任務或對方仍有工作都不算本地工作。`,
-    waitingHeartbeat: (minutes, m) => `等待狀態檢查（已等待 ${minutes} 分鐘）：核對外部/委派請求。回執已到就繼續；仍未到但目前會話有獨立安全工作就現在執行，不要預告。對方仍在工作不算本地工作；否則回報等待對象並用 ${m.WAITING}。完成則用 ${m.AUDIT_READY}；只有確需人工時才用 ${m.NEEDS_INPUT}。只用一個狀態標記。`,
   },
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
@@ -138,10 +123,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     reworkLoop: 'Tras REWORK, corrige y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
     continueTask: 'Continúa la misma tarea.', executionMode: 'Modo de ejecución', actionHint: 'Sugerencia del supervisor (verifica primero)', gapHint: 'Falta informada (orientativa)', reasonHint: 'Motivo (orientativo)',
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
-    noSafeWork: (m) => `Si nada es seguro, informa el bloqueo humano exacto, salvo que la siguiente acción requiera una respuesta externa/delegada ya solicitada; entonces usa ${m.WAITING}. No adivines. Archivos sin confirmar no implican finalización.`,
     userRules: 'Reglas de supervisión del usuario', taskContext: 'Contexto de la tarea', lastResult: 'Último resultado',
-    statusContract: (m) => `Primero completa todo el trabajo seguro posible en este turno; no uses un marcador en vez de actuar. Si esta sesión tiene trabajo seguro, hazlo ahora y no anuncies trabajo futuro. Incluye un solo marcador de estado: ${m.AUDIT_READY} implementación+validación listas; ${m.NEEDS_INPUT} intervención humana obligatoria; ${m.WAITING} no queda trabajo seguro en la ventana principal y hay trabajo delegado/externo pendiente o en curso. Prioridad: si todo el trabajo siguiente conocido se asignó a otras sesiones, usa ${m.WAITING}; encontrar problemas, enviar tareas o el trabajo pendiente del delegado nunca es trabajo local.`,
-    waitingHeartbeat: (minutes, m) => `Comprobación tras ${minutes} minutos: revisa la solicitud externa/delegada. Si llegó la respuesta, continúa. Si sigue pendiente pero esta sesión tiene trabajo seguro independiente, hazlo ahora sin anunciarlo. Que el delegado siga trabajando no es trabajo local; si no, informa qué esperas y usa ${m.WAITING}. Usa ${m.AUDIT_READY} si terminaste y ${m.NEEDS_INPUT} solo ante un bloqueo humano concreto. Incluye un solo marcador.`,
   },
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
@@ -149,10 +131,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     reworkLoop: 'После REWORK сразу исправьте и проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
     continueTask: 'Продолжайте ту же задачу.', executionMode: 'Режим выполнения', actionHint: 'Подсказка надзора (сначала проверьте)', gapHint: 'Указанный пробел (справочно)', reasonHint: 'Причина (справочно)',
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
-    noSafeWork: (m) => `Если безопасных действий нет, укажите точную человеческую блокировку, кроме случая, когда следующий шаг требует ответа на уже отправленный внешний/делегированный запрос; тогда используйте ${m.WAITING}. Не угадывайте. Незакоммиченные файлы не означают завершение.`,
     userRules: 'Правила надзора пользователя', taskContext: 'Контекст задачи', lastResult: 'Последний результат',
-    statusContract: (m) => `Сначала выполните всю безопасную работу, возможную в этом ходе; не заменяйте действие маркером. Если у сеанса есть безопасная работа, выполните её сейчас и не анонсируйте будущую. Используйте ровно один маркер статуса: ${m.AUDIT_READY} реализация+проверка готовы; ${m.NEEDS_INPUT} обязателен ввод человека; ${m.WAITING} безопасной работы в главном окне нет, а делегированная/внешняя работа ожидает или выполняется. Приоритет: если вся известная следующая работа назначена другим сеансам, используйте ${m.WAITING}; найденные проблемы, отправка задач и оставшаяся работа исполнителя не являются локальной работой.`,
-    waitingHeartbeat: (minutes, m) => `Проверка ожидания через ${minutes} мин.: проверьте внешний/делегированный запрос. Если ответ получен, продолжайте. Если ответа нет, но у этого сеанса есть независимая безопасная работа, выполните её сейчас без анонса. Работающий исполнитель — не локальная работа; иначе укажите, чего ждёте, и используйте ${m.WAITING}. ${m.AUDIT_READY} — если всё готово; ${m.NEEDS_INPUT} — только для точной человеческой блокировки. Используйте один маркер.`,
   },
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
@@ -160,10 +139,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     reworkLoop: 'REWORK 後は直ちに修正・検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
     continueTask: '同じタスクを続行してください。', executionMode: '実行モード', actionHint: '監督ヒント（先に確認）', gapHint: '報告された不足（参考）', reasonHint: '理由（参考）',
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
-    noSafeWork: (m) => `安全に進められない場合は必要な人手の障害を明示してください。ただし次の手順が送信済みの外部/委任リクエストの返信を必要とするなら ${m.WAITING} を使います。推測しないでください。未コミットファイルだけでは完了を意味しません。`,
     userRules: 'ユーザーの監督ルール', taskContext: 'タスク文脈', lastResult: '直近の結果',
-    statusContract: (m) => `このターンで可能な安全な作業を先にすべて進め、マーカーを実行の代わりにしないでください。安全な作業があれば今実行し、次の作業を予告しないでください。状態マーカーは1つだけ：${m.AUDIT_READY} 実装検証完了；${m.NEEDS_INPUT} 人手の入力が必須；${m.WAITING} メインウィンドウに安全な作業が残っておらず、委任/外部の作業が保留中または進行中。優先規則：既知の次作業をすべて他セッションに委任した場合は ${m.WAITING}。問題の発見、タスク送信、委任先に残る作業はローカル作業ではありません。`,
-    waitingHeartbeat: (minutes, m) => `待機開始から ${minutes} 分の確認です。外部/委任リクエストを確認してください。返信済みなら続行します。未返信でもこのセッションに独立した安全な作業があれば予告せず今実行します。委任先が作業中でもローカル作業ではありません。なければ待機対象を報告して ${m.WAITING}。完了なら ${m.AUDIT_READY}、人手が必須の場合だけ ${m.NEEDS_INPUT}。マーカーは1つだけです。`,
   },
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
@@ -171,10 +147,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     reworkLoop: 'REWORK 후 즉시 수정·검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
     continueTask: '같은 작업을 계속하세요.', executionMode: '실행 모드', actionHint: '감독 힌트(먼저 확인)', gapHint: '보고된 누락(참고)', reasonHint: '이유(참고)',
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
-    noSafeWork: (m) => `안전하게 진행할 수 없으면 정확한 사람 개입 사유를 보고하세요. 단, 다음 단계에 이미 보낸 외부/위임 요청의 회신이 필요하면 ${m.WAITING}을 사용하세요. 추측하지 마세요. 미커밋 파일만으로 완료된 것은 아닙니다.`,
     userRules: '사용자 감독 규칙', taskContext: '작업 문맥', lastResult: '최근 결과',
-    statusContract: (m) => `이번 턴에 가능한 안전한 작업을 먼저 모두 수행하고, 상태 마커를 실행 대신 사용하지 마세요. 안전한 작업이 있으면 지금 수행하고 다음 작업을 예고하지 마세요. 상태 마커는 하나만 사용: ${m.AUDIT_READY} 구현·검증 완료; ${m.NEEDS_INPUT} 사람 입력 필수; ${m.WAITING} 메인 창에 안전한 작업이 없고 위임/외부 작업이 대기 중이거나 진행 중. 우선 규칙: 알려진 후속 작업을 모두 다른 세션에 맡겼다면 ${m.WAITING}; 문제 발견, 작업 전송 또는 위임 대상에 남은 작업은 로컬 작업이 아닙니다.`,
-    waitingHeartbeat: (minutes, m) => `대기 확인(${minutes}분 경과): 외부/위임 요청을 확인하세요. 회신이 도착했으면 계속합니다. 아직이지만 이 세션에 독립적인 안전한 작업이 있으면 예고 없이 지금 수행하세요. 위임 대상이 작업 중인 것은 로컬 작업이 아닙니다. 그렇지 않으면 대기 대상을 보고하고 ${m.WAITING}. 완료면 ${m.AUDIT_READY}, 정확한 사람 차단일 때만 ${m.NEEDS_INPUT}. 상태 마커는 하나만 포함하세요.`,
   },
 };
 
@@ -188,15 +161,14 @@ function buildExecutionStatusContract(_locale?: SupervisionUiLocale): string {
     contractId: SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS,
     v: 1,
     exactlyOne: true,
+    end: true,
     actBeforeMarker: true,
-    // No local marker: if safe main-window work exists Brain performs it now
-    // rather than announcing it, so ADVANCE is deprecated for emission. It
-    // stays in SUPERVISION_EXECUTION_STATUS_MARKERS only so historical replies
-    // remain parseable.
-    markers: { done: m.AUDIT_READY, human: m.NEEDS_INPUT, external: m.WAITING },
-    localWork: 'perform_now_no_marker',
-    priority: ['human', 'external', 'done'],
-    delegateWorkIsLocal: false,
+    // Completion is registry-owned. Every other outcome stays visibly active
+    // with WAITING; historical completion/advance text grants no authority.
+    markers: { waiting: m.WAITING, human: m.NEEDS_INPUT },
+    waiting: 'all_nonterminal',
+    completion: 'registry_intent_only',
+    needsInput: 'no_task_or_user_blocker_only',
   });
 }
 
