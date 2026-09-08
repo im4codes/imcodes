@@ -15,7 +15,11 @@ describe('memory MCP resource budget', () => {
     await first;
     rss = 21;
     expect(guard.memoryLimitExceeded()).toBe(true);
-    await expect(guard.run('rss', async () => 'no')).rejects.toThrow('memory_mcp_memory_limit');
+    const callback = vi.fn(async () => 'no');
+    await expect(guard.run('rss', callback)).rejects.toThrow('memory_mcp_memory_limit');
+    expect(callback).not.toHaveBeenCalled();
+    rss = 19;
+    await expect(guard.run('recovered-rss', async () => 'ok')).resolves.toBe('ok');
   });
 
   it('times out a request without releasing its concurrency slot until underlying work settles', async () => {
@@ -47,5 +51,29 @@ describe('memory MCP resource budget', () => {
     expect(evaluateDaemonTaskAdmission({ daemonRssBytes: 101, daemonMaxRssBytes: 100, sessionReservedBytes: 0, sessionMaxBytes: 50, systemFreeBytes: 1_000, systemMinFreeBytes: 10 })).toBe('reject');
     expect(evaluateDaemonTaskAdmission({ daemonRssBytes: 85, daemonMaxRssBytes: 100, sessionReservedBytes: 45, sessionMaxBytes: 50, systemFreeBytes: 20, systemMinFreeBytes: 10 })).toBe('queue');
     expect(evaluateDaemonTaskAdmission({ daemonRssBytes: 20, daemonMaxRssBytes: 100, sessionReservedBytes: 10, sessionMaxBytes: 50, systemFreeBytes: 1_000, systemMinFreeBytes: 10 })).toBe('accept');
+  });
+
+  it('rejects callbacks with a typed CPU overload error and recovers after a healthy window', async () => {
+    const alarm = vi.fn();
+    const guard = new MemoryMcpResourceGuard({
+      maxConcurrent: 1,
+      maxRssBytes: 100,
+      requestTimeoutMs: 50,
+      memoryUsage: () => ({ rss: 1 }),
+      cpuStrikeLimit: 2,
+      onSustainedCpu: alarm,
+    });
+    guard.observeCpuWindow(950_000, 1_000);
+    guard.observeCpuWindow(960_000, 1_000);
+    const callback = vi.fn(async () => 'must-not-run');
+    await expect(guard.run('non-idempotent-write', callback)).rejects.toThrow('memory_mcp_cpu_overload');
+    expect(callback).not.toHaveBeenCalled();
+    expect(alarm).toHaveBeenCalledOnce();
+
+    guard.observeCpuWindow(10_000, 1_000);
+    await expect(guard.run('first-healthy-window', callback)).rejects.toThrow('memory_mcp_cpu_overload');
+    expect(callback).not.toHaveBeenCalled();
+    guard.observeCpuWindow(10_000, 1_000);
+    await expect(guard.run('after-healthy-window', async () => 'ok')).resolves.toBe('ok');
   });
 });

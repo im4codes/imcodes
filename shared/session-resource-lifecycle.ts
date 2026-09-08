@@ -54,6 +54,7 @@ export const SESSION_RESOURCE_OWNER_ENV = {
 
 export const MEMORY_MCP_RESOURCE_ERROR = {
   CONCURRENCY_LIMIT: 'memory_mcp_concurrency_limit',
+  CPU_OVERLOAD: 'memory_mcp_cpu_overload',
   MEMORY_LIMIT: 'memory_mcp_memory_limit',
   REQUEST_TIMEOUT: 'memory_mcp_request_timeout',
 } as const;
@@ -62,6 +63,7 @@ export const MEMORY_MCP_WATCHDOG = {
   SAMPLE_INTERVAL_MS: 10_000,
   CPU_RATIO_THRESHOLD: 0.9,
   CPU_STRIKE_LIMIT: 6,
+  CPU_RECOVERY_WINDOW_LIMIT: 2,
 } as const;
 
 export const TASK_ADMISSION = {

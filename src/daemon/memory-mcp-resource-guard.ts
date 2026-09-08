@@ -11,8 +11,10 @@ export interface MemoryMcpResourceGuardOptions {
   requestTimeoutMs: number;
   memoryUsage?: () => { rss: number };
   cpuStrikeLimit?: number;
+  cpuRecoveryWindowLimit?: number;
   cpuRatioThreshold?: number;
   onSustainedCpu?: (details: { cpuRatio: number; strikes: number }) => void;
+  onCpuRecovered?: () => void;
 }
 
 export interface DaemonTaskAdmissionSnapshot {
@@ -32,9 +34,10 @@ function positiveFinite(value: number, name: string): number {
 export class MemoryMcpResourceGuard {
   private active = 0;
   private cpuStrikes = 0;
-  private cpuAlarmRaised = false;
-  private readonly options: Required<Omit<MemoryMcpResourceGuardOptions, 'onSustainedCpu'>>
-    & Pick<MemoryMcpResourceGuardOptions, 'onSustainedCpu'>;
+  private cpuHealthyWindows = 0;
+  private cpuOverloaded = false;
+  private readonly options: Required<Omit<MemoryMcpResourceGuardOptions, 'onSustainedCpu' | 'onCpuRecovered'>>
+    & Pick<MemoryMcpResourceGuardOptions, 'onSustainedCpu' | 'onCpuRecovered'>;
 
   constructor(options: MemoryMcpResourceGuardOptions) {
     this.options = {
@@ -43,13 +46,16 @@ export class MemoryMcpResourceGuard {
       requestTimeoutMs: positiveFinite(options.requestTimeoutMs, 'request_timeout_ms'),
       memoryUsage: options.memoryUsage ?? process.memoryUsage,
       cpuStrikeLimit: positiveFinite(options.cpuStrikeLimit ?? 3, 'cpu_strike_limit'),
+      cpuRecoveryWindowLimit: positiveFinite(options.cpuRecoveryWindowLimit ?? 2, 'cpu_recovery_window_limit'),
       cpuRatioThreshold: positiveFinite(options.cpuRatioThreshold ?? 0.9, 'cpu_ratio_threshold'),
       onSustainedCpu: options.onSustainedCpu,
+      onCpuRecovered: options.onCpuRecovered,
     };
   }
 
   async run<T>(operationName: string, operation: () => Promise<T> | T): Promise<T> {
     if (!operationName) throw new Error('invalid_memory_mcp_operation');
+    if (this.cpuOverloaded) throw new Error(MEMORY_MCP_RESOURCE_ERROR.CPU_OVERLOAD);
     if (this.active >= this.options.maxConcurrent) throw new Error(MEMORY_MCP_RESOURCE_ERROR.CONCURRENCY_LIMIT);
     if (this.options.memoryUsage().rss > this.options.maxRssBytes) throw new Error(MEMORY_MCP_RESOURCE_ERROR.MEMORY_LIMIT);
     this.active += 1;
@@ -73,15 +79,22 @@ export class MemoryMcpResourceGuard {
     if (!Number.isFinite(cpuMicros) || cpuMicros < 0 || !Number.isFinite(wallMs) || wallMs <= 0) return;
     const cpuRatio = cpuMicros / (wallMs * 1_000);
     if (cpuRatio >= this.options.cpuRatioThreshold) {
-      this.cpuStrikes += 1;
-      if (!this.cpuAlarmRaised && this.cpuStrikes >= this.options.cpuStrikeLimit) {
-        this.cpuAlarmRaised = true;
+      this.cpuHealthyWindows = 0;
+      this.cpuStrikes = Math.min(this.cpuStrikes + 1, this.options.cpuStrikeLimit);
+      if (!this.cpuOverloaded && this.cpuStrikes >= this.options.cpuStrikeLimit) {
+        this.cpuOverloaded = true;
         this.options.onSustainedCpu?.({ cpuRatio, strikes: this.cpuStrikes });
       }
       return;
     }
     this.cpuStrikes = 0;
-    this.cpuAlarmRaised = false;
+    if (!this.cpuOverloaded) return;
+    this.cpuHealthyWindows += 1;
+    if (this.cpuHealthyWindows >= this.options.cpuRecoveryWindowLimit) {
+      this.cpuOverloaded = false;
+      this.cpuHealthyWindows = 0;
+      this.options.onCpuRecovered?.();
+    }
   }
 
   memoryLimitExceeded(): boolean {

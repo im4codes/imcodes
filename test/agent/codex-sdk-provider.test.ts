@@ -116,6 +116,9 @@ const childProcessMock = vi.hoisted(() => {
               childRecord.emits({ id: msg.id, result: next });
             }
           }
+          if (msg.method === 'config/mcpServer/reload' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: {} });
+          }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
             const turnStartError = turnStartErrors.shift();
             if (turnStartError) {
@@ -2299,7 +2302,7 @@ describe('CodexSdkProvider', () => {
     expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
   });
 
-  it('restarts and rehydrates the same Brain session once when authoritative IM delegation recovers', async () => {
+  it('reloads and rehydrates the same Brain session once when authoritative IM delegation recovers', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'c1-rehydrate-im', cwd: '/tmp/project' });
@@ -2310,28 +2313,52 @@ describe('CodexSdkProvider', () => {
 
     await provider.send('c1-rehydrate-im', brainPayload('c1-rehydrate-im'));
 
-    expect(childProcessMock.children).toHaveLength(2);
-    expect(childProcessMock.children[0]!.requests.map((request) => request.method))
-      .not.toContain('turn/start');
-    expect(childProcessMock.children[1]!.requests.map((request) => request.method)
-      .filter((method) => method === 'turn/start')).toHaveLength(1);
+    expect(childProcessMock.children).toHaveLength(1);
+    const methods = childProcessMock.children[0]!.requests.map((request) => request.method);
+    expect(methods.filter((method) => method === 'config/mcpServer/reload')).toHaveLength(1);
+    expect(methods.filter((method) => method === 'turn/start')).toHaveLength(1);
   });
 
-  it('does not consult the delegation inventory for a non-Brain session', async () => {
-    // Control: the gate is scoped to Brains, so a worker turn must not pay for
-    // it -- and this proves the assertions above are about the role.
+  it('rehydrates a worker MCP generation after a healthy transport closes without replaying the unknown-outcome turn', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'c1-worker', cwd: '/tmp/project' });
+    await provider.createSession({ sessionKey: 'c1-worker-reconnect', cwd: '/tmp/project' });
     mcpStatusPages = [connectedPage];
 
-    const payload = { ...brainPayload('c1-worker'), sessionRole: 'w1' as const };
-    await provider.send('c1-worker', payload);
+    const payload = { ...brainPayload('c1-worker-reconnect'), sessionRole: 'w1' as const };
+    await provider.send('c1-worker-reconnect', payload);
+    const firstChild = childProcessMock.children[0];
+    mcpStatusPages = [{
+      data: [{ name: 'unrelated-mcp', runtimeStatus: 'connected', tools: {} }],
+      nextCursor: 'page-2',
+    }, connectedPage];
+    firstChild.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: {
+          id: 'mcp-closed', type: 'mcpToolCall', status: 'failed',
+          server: 'imcodes-memory', tool: 'delegation_reply',
+          arguments: { delegationId: 'delegation-1', result: 'done' },
+          error: { message: 'Transport closed' },
+        },
+      },
+    });
+    firstChild.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'failed', error: { message: 'Transport closed' } } },
+    });
+    await flush();
+    expect(firstChild.requests.map((request) => request.method)).not.toContain('config/mcpServer/reload');
+    await provider.send('c1-worker-reconnect', { ...payload, userMessage: 'continue', assembledMessage: 'continue' });
 
-    const child = childProcessMock.children[0];
-    const methods = child.requests.map((req) => req.method);
-    expect(methods, 'a non-Brain turn must not consult the inventory').not.toContain('mcpServerStatus/list');
-    expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
+    expect(childProcessMock.children).toHaveLength(1);
+    const methods = firstChild.requests.map((request) => request.method);
+    expect(methods.filter((method) => method === 'config/mcpServer/reload')).toHaveLength(1);
+    expect(methods.filter((method) => method === 'mcpServerStatus/list')).toHaveLength(2);
+    expect(methods.filter((method) => method === 'turn/start')).toHaveLength(2);
+    expect(firstChild.requests.filter((request) => request.method === 'turn/start')[0]?.params?.input)
+      .not.toEqual(firstChild.requests.filter((request) => request.method === 'turn/start')[1]?.params?.input);
   });
 
   // E: model-agnostic matrix.

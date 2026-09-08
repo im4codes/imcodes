@@ -21,7 +21,12 @@ import {
 const registry = new SessionResourceRegistry();
 const execFile = promisify(execFileCallback);
 let stopExpirySweep: (() => void) | null = null;
-const mcpCpuSamples = new Map<string, { cpuMs: number; sampledAt: number; strikes: number }>();
+const mcpCpuSamples = new Map<string, {
+  cpuMs: number;
+  sampledAt: number;
+  strikes: number;
+  pressureReported: boolean;
+}>();
 
 function usable(value: string | null | undefined): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -175,6 +180,7 @@ interface MemoryMcpWatchdogDependencies {
   sampleCpuMillis: (pid: number) => Promise<number | null>;
   pidHandleIsCurrent: typeof sessionResourcePidHandleIsCurrent;
   releaseResource: typeof releaseSessionResource;
+  reportSustainedCpu?: (record: SessionResourceRecord, cpuRatio: number) => void;
 }
 
 const memoryMcpWatchdogDependencies: MemoryMcpWatchdogDependencies = {
@@ -182,6 +188,11 @@ const memoryMcpWatchdogDependencies: MemoryMcpWatchdogDependencies = {
   sampleCpuMillis: sampleProcessCpuMillis,
   pidHandleIsCurrent: sessionResourcePidHandleIsCurrent,
   releaseResource: releaseSessionResource,
+  reportSustainedCpu: (record, cpuRatio) => {
+    process.stderr.write(
+      `[memory-mcp] sustained CPU for ${record.resourceId}: ratio=${cpuRatio.toFixed(2)}; preserving live stdio generation\n`,
+    );
+  },
 };
 
 export async function sweepMemoryMcpCpu(
@@ -217,20 +228,27 @@ export async function sweepMemoryMcpCpu(
     }
     const previous = mcpCpuSamples.get(record.resourceId);
     if (!previous) {
-      mcpCpuSamples.set(record.resourceId, { cpuMs, sampledAt: now, strikes: 0 });
+      mcpCpuSamples.set(record.resourceId, {
+        cpuMs, sampledAt: now, strikes: 0, pressureReported: false,
+      });
       continue;
     }
     const wallMs = now - previous.sampledAt;
     const cpuRatio = wallMs > 0 ? Math.max(0, cpuMs - previous.cpuMs) / wallMs : 0;
-    const strikes = cpuRatio >= MEMORY_MCP_WATCHDOG.CPU_RATIO_THRESHOLD ? previous.strikes + 1 : 0;
-    mcpCpuSamples.set(record.resourceId, { cpuMs, sampledAt: now, strikes });
-    if (strikes >= MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT) {
-      await dependencies.releaseResource(
-        record.resourceId,
-        record.owner,
-        SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
-      );
-      mcpCpuSamples.delete(record.resourceId);
+    const overThreshold = cpuRatio >= MEMORY_MCP_WATCHDOG.CPU_RATIO_THRESHOLD;
+    const strikes = overThreshold
+      ? Math.min(previous.strikes + 1, MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT)
+      : 0;
+    const pressureReported = overThreshold
+      && (previous.pressureReported || strikes >= MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT);
+    mcpCpuSamples.set(record.resourceId, {
+      cpuMs, sampledAt: now, strikes, pressureReported,
+    });
+    if (pressureReported && !previous.pressureReported) {
+      // A live stdio MCP generation is owned by its host. Releasing this PID
+      // resource terminates the child but cannot reconnect the living host,
+      // permanently stranding that thread on a closed transport/catalog.
+      dependencies.reportSustainedCpu?.(record, cpuRatio);
     }
   }
   for (const resourceId of mcpCpuSamples.keys()) {

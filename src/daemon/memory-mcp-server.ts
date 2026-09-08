@@ -114,13 +114,16 @@ export function resolveMemoryMcpMaxRssBytes(
 function createDefaultMemoryMcpResourceGuard(
   env: Record<string, string | undefined> = process.env,
   onSustainedCpu?: (details: { cpuRatio: number; strikes: number }) => void,
+  onCpuRecovered?: () => void,
 ): MemoryMcpResourceGuard {
   return new MemoryMcpResourceGuard({
     maxConcurrent: positiveEnvNumber(env.IMCODES_MEMORY_MCP_MAX_CONCURRENT, MEMORY_MCP_DEFAULT_MAX_CONCURRENT),
     maxRssBytes: resolveMemoryMcpMaxRssBytes(env),
     requestTimeoutMs: positiveEnvNumber(env.IMCODES_MEMORY_MCP_REQUEST_TIMEOUT_MS, MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS),
     cpuStrikeLimit: MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT,
+    cpuRecoveryWindowLimit: MEMORY_MCP_WATCHDOG.CPU_RECOVERY_WINDOW_LIMIT,
     onSustainedCpu,
+    onCpuRecovered,
   });
 }
 
@@ -610,15 +613,13 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
   try {
     await loadStore();
     const env = options.env ?? process.env;
-    let cpuShutdownStarted = false;
-    let server: McpServer;
+    let rssPressureReported = false;
     const guard = createDefaultMemoryMcpResourceGuard(env, ({ cpuRatio, strikes }) => {
-      process.stderr.write(`[memory-mcp] sustained single-core CPU: ratio=${cpuRatio.toFixed(2)} strikes=${strikes}; restarting\n`);
-      if (cpuShutdownStarted) return;
-      cpuShutdownStarted = true;
-      void server.close().finally(() => process.exit(70));
+      process.stderr.write(`[memory-mcp] sustained single-core CPU: ratio=${cpuRatio.toFixed(2)} strikes=${strikes}; rejecting calls until a healthy CPU window (stdio preserved)\n`);
+    }, () => {
+      process.stderr.write('[memory-mcp] CPU pressure recovered; accepting calls\n');
     });
-    server = createMemoryMcpServerFromEnv({ ...options, resourceGuard: guard });
+    const server = createMemoryMcpServerFromEnv({ ...options, resourceGuard: guard });
     const owner = sessionResourceOwnerFromEnv(env as NodeJS.ProcessEnv);
     const resourceId = owner ? await registerMcpProcessResource(owner) : null;
     let previousCpu = process.cpuUsage();
@@ -627,10 +628,13 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
       const now = Date.now();
       const usage = process.cpuUsage(previousCpu);
       guard.observeCpuWindow(usage.user + usage.system, now - previousWall);
-      if (guard.memoryLimitExceeded() && !cpuShutdownStarted) {
-        cpuShutdownStarted = true;
-        process.stderr.write('[memory-mcp] process RSS budget exceeded; restarting\n');
-        void server.close().finally(() => process.exit(71));
+      const memoryLimitExceeded = guard.memoryLimitExceeded();
+      if (memoryLimitExceeded && !rssPressureReported) {
+        rssPressureReported = true;
+        process.stderr.write('[memory-mcp] process RSS budget exceeded; rejecting calls until RSS recovers (stdio preserved)\n');
+      } else if (!memoryLimitExceeded && rssPressureReported) {
+        rssPressureReported = false;
+        process.stderr.write('[memory-mcp] RSS pressure recovered; accepting calls\n');
       }
       previousCpu = process.cpuUsage();
       previousWall = now;

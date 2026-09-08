@@ -41,6 +41,11 @@ import {
   postHookSend,
 } from '../../src/daemon/memory-mcp-server.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+import { MemoryMcpResourceGuard } from '../../src/daemon/memory-mcp-resource-guard.js';
+import {
+  MEMORY_MCP_WATCHDOG,
+  SESSION_RESOURCE_OWNER_ENV,
+} from '../../shared/session-resource-lifecycle.js';
 
 // Hoisted mock: prove the production run-authoritative limit resolver is wired
 // into the composed deps WITHOUT a manual inject. A tight cap=1 (distinct from
@@ -196,6 +201,99 @@ describe('memory MCP stdio server', () => {
       expect(names).toContain(SUPERVISION_MCP_TOOLS.RECOVER);
     } finally {
       await client.close();
+    }
+  });
+
+  it('preserves one stdio generation and its full catalog across recoverable CPU and RSS overload', async () => {
+    let rss = 1;
+    const guard = new MemoryMcpResourceGuard({
+      maxConcurrent: 2,
+      maxRssBytes: 100,
+      requestTimeoutMs: 1_000,
+      memoryUsage: () => ({ rss }),
+      cpuStrikeLimit: 2,
+      cpuRecoveryWindowLimit: 2,
+    });
+    const listMachines = vi.fn(async () => [{
+      name: '1472527657', online: true, execEnabled: true, role: 'controlled' as const,
+    }]);
+    const sendFileToMachine = vi.fn(async () => ({
+      ok: true as const,
+      remotePath: 'C:\\tmp\\payload.bin',
+      attachmentId: 'attachment-1',
+      size: 7,
+      transport: 'relay' as const,
+    }));
+    const caller: McpRuntimeCaller = {
+      transport: 'stdio',
+      userId: 'user-1',
+      namespace,
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+      projectRoot: '/tmp/proj',
+      serverId: 'srv-1',
+      providerId: 'codex-sdk',
+    };
+    const server = createMemoryMcpServer(caller, {
+      machineDeps: {
+        listMachines,
+        execRemote: vi.fn(async () => ({ outcome: 'not_dispatched' as const })),
+        sendFileToMachine,
+      },
+    }, {}, {}, { resourceGuard: guard, toolCatalogMode: 'static_full' });
+    const client = new Client({ name: 'memory-mcp-overload-recovery-test', version: '0.1.0' }, {});
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      const initialCatalog = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(initialCatalog).toEqual(expect.arrayContaining([
+        SUPERVISION_MCP_TOOLS.GET,
+        MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+        MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      ]));
+
+      guard.observeCpuWindow(950_000, 1_000);
+      guard.observeCpuWindow(960_000, 1_000);
+      const cpuRejected = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+        arguments: {},
+      });
+      expect(cpuRejected.isError).toBe(true);
+      expect(JSON.stringify(cpuRejected.content)).toContain('memory_mcp_cpu_overload');
+      expect(listMachines).not.toHaveBeenCalled();
+
+      guard.observeCpuWindow(10_000, 1_000);
+      guard.observeCpuWindow(10_000, 1_000);
+      await expect(client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+        arguments: {},
+      })).resolves.toMatchObject({
+        isError: false,
+        structuredContent: { status: 'ok' },
+      });
+
+      rss = 101;
+      const rssRejected = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+        arguments: { machine: '1472527657', sourcePath: '/tmp/payload.bin' },
+      });
+      expect(rssRejected.isError).toBe(true);
+      expect(JSON.stringify(rssRejected.content)).toContain('memory_mcp_memory_limit');
+      expect(sendFileToMachine).not.toHaveBeenCalled();
+
+      rss = 1;
+      await expect(client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+        arguments: { machine: '1472527657', sourcePath: '/tmp/payload.bin' },
+      })).resolves.toMatchObject({
+        isError: false,
+        structuredContent: { status: 'ok', machine: '1472527657' },
+      });
+      expect(sendFileToMachine).toHaveBeenCalledOnce();
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(initialCatalog);
+    } finally {
+      await client.close();
+      await server.close();
     }
   });
 
@@ -399,6 +497,48 @@ describe('memory MCP stdio server', () => {
 
     expect(readFileSync(serverConfigPath, 'utf8')).not.toContain('userId');
   });
+
+  it('keeps the real stdio child and initial catalog alive after the RSS watchdog samples overload', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-mcp-rss-overload-'));
+    const serverConfigPath = join(dir, 'server.json');
+    await writeFile(serverConfigPath, JSON.stringify({ serverId: 'srv-local' }), 'utf8');
+    const env = buildMemoryMcpServerEnv({
+      [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
+      [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify(namespace),
+      [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_proj_brain',
+      [MEMORY_MCP_ENV_KEYS.PROJECT_NAME]: 'proj',
+      [MEMORY_MCP_ENV_KEYS.PROJECT_ROOT]: dir,
+      [MEMORY_MCP_ENV_KEYS.SERVER_ID]: 'srv-1',
+    }, {
+      PATH: process.env.PATH,
+      HOME: dir,
+      IMCODES_SERVER_CONFIG_PATH: serverConfigPath,
+      IMCODES_MEMORY_MCP_MAX_RSS_BYTES: '1',
+      [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-rss-watchdog',
+      [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-rss-watchdog',
+    });
+    const client = new Client({ name: 'memory-mcp-rss-watchdog-test', version: '0.1.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'],
+      cwd: process.cwd(),
+      env: env as Record<string, string>,
+      stderr: 'pipe',
+    });
+    try {
+      await client.connect(transport);
+      const initialPid = transport.pid;
+      expect(initialPid).toEqual(expect.any(Number));
+      const initialCatalog = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(initialCatalog).toContain(MCP_TOOL_DISCOVERY_NAME);
+      await new Promise((resolve) => setTimeout(resolve, MEMORY_MCP_WATCHDOG.SAMPLE_INTERVAL_MS + 250));
+      expect(transport.pid).toBe(initialPid);
+      expect(() => process.kill(initialPid!, 0)).not.toThrow();
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(initialCatalog);
+    } finally {
+      await client.close();
+    }
+  }, MEMORY_MCP_WATCHDOG.SAMPLE_INTERVAL_MS + 10_000);
 
   it('lists tools over stdio without identity env', async () => {
     const client = new Client({ name: 'memory-mcp-local-default-test', version: '0.1.0' });

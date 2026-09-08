@@ -69,26 +69,26 @@ describe('memory MCP watchdog process identity', () => {
 
   });
 
-  it('isolates sustained CPU to the live MCP without an owner restart path', async () => {
+  it('records sustained CPU without releasing the live MCP stdio generation', async () => {
     const record = mcpRecord('mcp:sustained-cpu');
     let cpuMs = 0;
+    const reportSustainedCpu = vi.fn();
     const deps = {
       ...dependencies(record, true),
       sampleCpuMillis: vi.fn().mockImplementation(async () => {
         cpuMs += 1_000;
         return cpuMs;
       }),
+      reportSustainedCpu,
     };
 
     for (let sample = 0; sample <= MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT; sample += 1) {
       await sweepMemoryMcpCpu(sample * 1_000, deps);
     }
 
-    expect(deps.releaseResource).toHaveBeenCalledWith(
-      record.resourceId,
-      owner,
-      SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
-    );
+    expect(reportSustainedCpu).toHaveBeenCalledOnce();
+    expect(reportSustainedCpu).toHaveBeenCalledWith(record, 1);
+    expect(deps.releaseResource).not.toHaveBeenCalled();
     expect('restartOwner' in deps).toBe(false);
   });
 });

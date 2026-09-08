@@ -139,6 +139,7 @@ const CODEX_TURN_HEARTBEAT_PROVIDER_CAP = 2;
 const CODEX_TURN_HEARTBEAT_MAX_TURNS = 100;
 const CODEX_AUTH_RECOVERY_RETRY_LIMIT = 1;
 const CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_IM_MCP_RECOVERY_BACKOFF_MS = [0, 50, 100, 250, 500, 1_000, 2_000] as const;
 const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
@@ -208,10 +209,16 @@ const CODEX_NATIVE_COLLAB_FUNCTION_NAMES = new Set([
 const CODEX_NATIVE_COLLAB_DURABILITY = 'non_durable';
 
 /** Exact IM MCP server and the tools a Brain needs to delegate authoritatively. */
-const IMCODES_DELEGATION_MCP_SERVER = 'imcodes-memory';
+const IMCODES_DELEGATION_MCP_SERVER = IMCODES_MEMORY_MCP_SERVER_NAME;
 const IMCODES_DELEGATION_REQUIRED_TOOLS = ['send_list_targets', 'send_message'] as const;
 /** Bounded pagination: this is one authoritative snapshot per turn, not polling. */
 const MCP_STATUS_PAGE_LIMIT = 20;
+const CODEX_MCP_RPC_METHOD = {
+  RELOAD: 'config/mcpServer/reload',
+  STATUS_LIST: 'mcpServerStatus/list',
+  STATUS_UPDATED: 'mcpServer/startupStatus/updated',
+} as const;
+const CODEX_MCP_TERMINAL_STARTUP_STATUS = new Set(['failed', 'cancelled']);
 
 export class ImcodesDelegationUnavailableError extends Error {
   constructor() {
@@ -856,6 +863,9 @@ interface CodexSdkSessionState {
   cwd: string;
   env?: Record<string, string>;
   mcpConfig?: Record<string, unknown>;
+  /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
+  imcodesMcpRecoveryRequired: boolean;
+  imcodesMcpRecoveryPromise?: Promise<void>;
   model?: string;
   effort?: TransportEffortLevel;
   /**
@@ -1177,6 +1187,15 @@ function meaningfulString(value: unknown): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   return trimmed.length <= CODEX_COLLAB_MAX_ID_CHARS ? trimmed : trimmed.slice(0, CODEX_COLLAB_MAX_ID_CHARS);
+}
+
+function isImcodesMcpTransportClosedItem(item: Record<string, any>): boolean {
+  if (item.type !== 'mcpToolCall'
+    || meaningfulString(item.server) !== IMCODES_DELEGATION_MCP_SERVER
+    || meaningfulString(item.status) !== 'failed') return false;
+  const message = meaningfulString(item.error?.message) ?? meaningfulString(item.error) ?? '';
+  return /(?:^|\b)(?:transport|connection|stdio) (?:is )?closed(?:\b|$)/i.test(message)
+    || /MCP client is not connected/i.test(message);
 }
 
 function meaningfulStringArray(value: unknown): { values: string[]; malformed: boolean } {
@@ -2392,6 +2411,7 @@ export class CodexSdkProvider implements TransportProvider {
   private pendingRequests = new Map<number, PendingRequest>();
   private appServerAuthFingerprint: string | null = null;
   private appServerRestart: Promise<void> | null = null;
+  private imcodesMcpReload: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
   private rawNativeCollabCalls = new Map<string, { sessionId: string; name: string }>();
   private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
@@ -2537,6 +2557,8 @@ export class CodexSdkProvider implements TransportProvider {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
       mcpConfig: buildCodexMcpThreadConfig(config) ?? existing?.mcpConfig,
+      imcodesMcpRecoveryRequired: false,
+      imcodesMcpRecoveryPromise: undefined,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,
@@ -2732,6 +2754,10 @@ export class CodexSdkProvider implements TransportProvider {
     state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
     state.authRecoveryReplayUnsafe = false;
     let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
+    if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
+    if (state.imcodesMcpRecoveryRequired && state.threadId) {
+      await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
+    }
     for (;;) {
       try {
         await this.startTurn(
@@ -2741,6 +2767,7 @@ export class CodexSdkProvider implements TransportProvider {
           turnDispatchGeneration,
           CODEX_AUTH_RECOVERY_RETRY_LIMIT,
         );
+        state.imcodesMcpRecoveryRequired = false;
         break;
       } catch (error) {
         if (!(error instanceof ImcodesDelegationUnavailableError)
@@ -2751,10 +2778,10 @@ export class CodexSdkProvider implements TransportProvider {
         delegationRecoveryRetriesRemaining -= 1;
         // The readiness failure happens before turn/start, provider output, or
         // any tool side effect. Restarting is therefore replay-safe. Preserve
-        // the SAME durable session/thread identity, rehydrate it on the fresh
-        // app-server, and retry exactly once; persistent outages still surface
-        // to the durable caller instead of polling forever.
-        await this.restartAppServerPreservingSessions('im-delegation-unavailable', sessionId);
+        // the SAME durable session/thread identity, reload only the stale MCP
+        // client/catalog, and retry exactly once; no model turn or MCP tool call
+        // has started, so this boundary is replay-safe.
+        await this.reloadImcodesMcpClient('im-delegation-unavailable');
       }
     }
   }
@@ -3021,7 +3048,7 @@ export class CodexSdkProvider implements TransportProvider {
     for (let page = 0; page < MCP_STATUS_PAGE_LIMIT; page++) {
       let result: Record<string, unknown> | undefined;
       try {
-        result = await this.request('mcpServerStatus/list', {
+        result = await this.request(CODEX_MCP_RPC_METHOD.STATUS_LIST, {
           threadId,
           detail: 'toolsAndAuthOnly',
           ...(cursor ? { cursor } : {}),
@@ -3051,6 +3078,55 @@ export class CodexSdkProvider implements TransportProvider {
     for (const tool of IMCODES_DELEGATION_REQUIRED_TOOLS) {
       if (!(tool in tools)) throw new ImcodesDelegationUnavailableError();
     }
+  }
+
+  private async reloadImcodesMcpClient(reason: string): Promise<void> {
+    if (this.imcodesMcpReload) return this.imcodesMcpReload;
+    const child = this.child;
+    if (!child) throw new ImcodesDelegationUnavailableError();
+    this.imcodesMcpReload = this.request(CODEX_MCP_RPC_METHOD.RELOAD, {})
+      .then(() => {
+        if (this.child !== child) throw new ImcodesDelegationUnavailableError();
+        logger.info({ provider: this.id, reason }, 'Codex IM.codes MCP client/catalog reloaded');
+      })
+      .finally(() => { this.imcodesMcpReload = null; });
+    return this.imcodesMcpReload;
+  }
+
+  private async waitForImcodesMcpHydration(threadId: string): Promise<void> {
+    let lastError: unknown = new ImcodesDelegationUnavailableError();
+    for (const delayMs of CODEX_IM_MCP_RECOVERY_BACKOFF_MS) {
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      try {
+        await this.assertImcodesDelegationReady(threadId);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  private recoverImcodesMcpAfterObservedClosure(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    reason: string,
+  ): Promise<void> {
+    state.imcodesMcpRecoveryRequired = true;
+    if (state.imcodesMcpRecoveryPromise) return state.imcodesMcpRecoveryPromise;
+    const threadId = state.threadId;
+    if (!threadId) return Promise.reject(new ImcodesDelegationUnavailableError());
+    const recovery = (async () => {
+      await this.reloadImcodesMcpClient(reason);
+      await this.waitForImcodesMcpHydration(threadId);
+      if (this.sessions.get(sessionId) === state && state.threadId === threadId) {
+        state.imcodesMcpRecoveryRequired = false;
+      }
+    })().finally(() => {
+      if (state.imcodesMcpRecoveryPromise === recovery) state.imcodesMcpRecoveryPromise = undefined;
+    });
+    state.imcodesMcpRecoveryPromise = recovery;
+    return recovery;
   }
 
   private async startAppServer(
@@ -4448,6 +4524,23 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
+    if (method === CODEX_MCP_RPC_METHOD.STATUS_UPDATED) {
+      if (meaningfulString(params.name) !== IMCODES_DELEGATION_MCP_SERVER
+        || !CODEX_MCP_TERMINAL_STARTUP_STATUS.has(meaningfulString(params.status) ?? '')) return;
+      const threadId = meaningfulString(params.threadId);
+      const targets = threadId
+        ? [...this.sessions.entries()].filter(([, state]) => state.threadId === threadId)
+        : [...this.sessions.entries()];
+      for (const [, state] of targets) {
+        // Never reload underneath an in-flight model turn. The startup event
+        // only invalidates this thread's MCP generation; the next explicit
+        // send performs the bounded reload + complete catalog hydration before
+        // dispatching any new model/tool work.
+        state.imcodesMcpRecoveryRequired = true;
+      }
+      return;
+    }
+
     if (method === 'thread/started') {
       const threadId = params.thread?.id;
       if (!threadId) return;
@@ -4658,6 +4751,12 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      if (method === 'item/completed' && isImcodesMcpTransportClosedItem(item)) {
+        // The failed MCP write has unknown outcome. Mark the generation stale,
+        // but neither replay the call nor reload beneath the current turn. A
+        // later explicit send crosses the pre-turn recovery boundary.
+        state.imcodesMcpRecoveryRequired = true;
+      }
       if (closedTurn && item.type !== 'agentMessage') return;
       // NEVER drop a real provider item. If our turn bookkeeping lags the
       // app-server (turn/start's result carried no turn id, or this event's
