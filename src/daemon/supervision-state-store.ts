@@ -5470,36 +5470,6 @@ export class SupervisionTaskRegistry {
     ownedFiles: readonly string[];
     evidenceManifestSha256: string;
     reason: string;
-    /**
-     * Present only for a coordinator-authorized HANDOFF to another session.
-     *
-     * Carries the facts the caller claims to have verified so this transaction
-     * can re-check them itself rather than trust that it was called correctly:
-     * the project the live rebind target actually belongs to, and the
-     * coordinator that authorized it. Absent, a cross-session rebind stays
-     * refused, which is what keeps ordinary self-recovery fail-closed.
-     */
-    coordinatorAuthorization?: {
-      targetProjectName: string;
-      coordinatorSessionName: string;
-    };
-    /**
-     * Whether the successor keeps the incumbent's lease or gets a fresh one.
-     * `clear` is deliberately not accepted: this recovery hands work to a LIVE
-     * successor, and an assignment with no lease is not an owned assignment.
-     * Defaults to `preserve`, the pre-existing behaviour.
-     */
-    leaseAction?: 'preserve' | 'renew';
-    /**
-     * The successor's COMPLETE authoritative selected binding.
-     *
-     * Required whenever the selected execution changes, which a cross-runtime
-     * handoff always does. Identity fields alone cannot prove capability,
-     * runtimeType, model or preset, so there is no way to derive this from the
-     * incumbent's binding -- only the caller that performed pool selection
-     * knows it.
-     */
-    executionBinding?: SupervisionExecutionBinding;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const taskId = normalizeTaskString(input.taskId);
@@ -5508,7 +5478,6 @@ export class SupervisionTaskRegistry {
     const ownedFiles = normalizeTaskArray(input.ownedFiles);
     const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
     const reason = normalizeTaskString(input.reason);
-    const leaseAction = input.leaseAction ?? 'preserve';
     const targetIdentity: PersistedSupervisionTaskAssignmentIdentity = {
       sessionName: normalizeTaskString(input.identity.sessionName) ?? '',
       sessionInstanceId: normalizeTaskString(input.identity.sessionInstanceId) ?? '',
@@ -5545,29 +5514,13 @@ export class SupervisionTaskRegistry {
           ownedFiles,
         )
       ));
-      // Two DIFFERENT questions are asked of these events, and conflating them
-      // would trade one guarantee for the other:
-      //
-      //  - "has this identity ever been targeted?" protects against re-binding
-      //    an identity a prior recovery already moved through. It must stay as
-      //    broad as it was, or returning to an earlier target under a different
-      //    lease disposition would slip past `conflicting_replay`.
-      //  - "is this the SAME request replayed?" decides idempotency, and must be
-      //    narrow: a replay asking for a different lease disposition is a
-      //    different request and must not be absorbed as a no-op.
-      const targetsRequestedIdentity = (event: typeof recoveryEvents[number]) => {
+      const priorTargetingRequestedIdentity = recoveryEvents.some((event) => {
         const target = event.payload?.targetIdentity as Partial<PersistedSupervisionTaskAssignmentIdentity> | undefined;
         return Boolean(target && runtimeIdentityMetadataMatches(
           target as PersistedSupervisionTaskAssignmentIdentity,
           targetIdentity,
         ));
-      };
-      const priorTargetingRequestedIdentity = recoveryEvents.some(targetsRequestedIdentity);
-      // Events written before `leaseAction` existed carry the default it replaced.
-      const exactRequestAlreadyApplied = recoveryEvents.some((event) => (
-        targetsRequestedIdentity(event)
-        && (event.payload?.leaseAction ?? 'preserve') === leaseAction
-      ));
+      });
       const identityAlreadyCurrent = runtimeIdentityMetadataMatches(assignment.identity, targetIdentity);
 
       const assignments = this.listAssignments(taskId);
@@ -5582,27 +5535,7 @@ export class SupervisionTaskRegistry {
       ));
       const exactLifecycle = (task.status === 'validated' || task.status === 'ready_for_audit')
         && assignment.status === task.status;
-      // Same session returning after a restart. This is the only shape the
-      // recovery originally admitted.
-      const sameSessionRecovery = assignment.identity.sessionName === targetIdentity.sessionName;
-      // Coordinator-authorized handoff to a DIFFERENT live session. Requiring
-      // the target to already BE the incumbent made the coordinator path
-      // unusable for the one thing it exists to do — the authoritative Brain
-      // asked to move an active implementer and was answered `owner_mismatch`,
-      // so the handoff was pushed back onto the owner being replaced.
-      //
-      // The project is re-derived from the task record here rather than taken
-      // on trust, so a caller cannot authorize a rebind into another project by
-      // asserting it. A bare cross-session rebind with no authorization stays
-      // refused exactly as before.
-      const authorization = input.coordinatorAuthorization;
-      const authorizedHandoff = Boolean(
-        authorization
-        && normalizeTaskString(authorization.coordinatorSessionName)
-        && normalizeTaskString(authorization.targetProjectName)
-        && normalizeTaskString(authorization.targetProjectName) === normalizeTaskString(task.projectName),
-      );
-      const exactIdentityFamily = sameSessionRecovery || authorizedHandoff;
+      const exactIdentityFamily = assignment.identity.sessionName === targetIdentity.sessionName;
       const conflictingPassAssignment = assignments.some((candidate) => (
         candidate.auditRevision === expectedRevision
         && candidate.verdict?.trim().toUpperCase() === 'PASS'
@@ -5655,44 +5588,9 @@ export class SupervisionTaskRegistry {
                   ? { ok: false, reason: 'receipt_closed' }
                   : { ok: false, reason: 'invalid_transition' };
       }
-      // A handoff replaces the RUNTIME, and a different selected runtime may
-      // have a different capability, runtimeType, model and preset. Refreshing
-      // only the five identity fields of `actual` -- and carrying `requested`
-      // and `origin` over untouched -- produced a MIXED binding: a row reading
-      // as claude-code-sdk/anthropic while still advertising an OpenAI
-      // capability and a gpt model. The audit rebind lane already refuses that
-      // shape for exactly this reason; this lane now refuses it too.
-      //
-      // The successor's binding is therefore REQUIRED, never inferred, and it
-      // must independently prove it describes this target: identity metadata
-      // has to match, and `requested` vs `actual` has to survive the same
-      // observed-identity validation the pool selector applies.
-      const selectionChanged = Boolean(assignment.executionBinding && (
-        assignment.executionBinding.actual.sessionName !== targetIdentity.sessionName
-        || assignment.executionBinding.actual.agentType !== targetIdentity.agentType
-        || assignment.executionBinding.actual.providerFamily !== targetIdentity.providerFamily
-      ));
-      const suppliedBinding = input.executionBinding;
-      const suppliedBindingIsAuthoritative = !suppliedBinding || Boolean(
-        runtimeIdentityMetadataMatches(suppliedBinding.actual, targetIdentity)
-        && evaluateSupervisionObservedIdentity({
-          config: suppliedBinding.requested,
-          actual: suppliedBinding.actual,
-          pool: suppliedBinding.pool,
-        }).ok,
-      );
-      if (!suppliedBindingIsAuthoritative || (selectionChanged && !suppliedBinding)) {
-        this.#db.exec('ROLLBACK');
-        return { ok: false, reason: 'invalid' };
-      }
-
       if (identityAlreadyCurrent) {
         this.#db.exec('ROLLBACK');
-        // A replay carrying a DIFFERENT binding is not the request that was
-        // already applied, so it must not be absorbed as an idempotent no-op.
-        const bindingUnchanged = !suppliedBinding
-          || JSON.stringify(assignment.executionBinding) === JSON.stringify(suppliedBinding);
-        return exactRequestAlreadyApplied && bindingUnchanged
+        return priorTargetingRequestedIdentity
           ? { ok: true, value: assignment, replay: true }
           : { ok: false, reason: 'invalid_transition' };
       }
@@ -5701,45 +5599,9 @@ export class SupervisionTaskRegistry {
         return { ok: false, reason: 'conflicting_replay' };
       }
 
-      // A handoff replaces the RUNTIME, so every field that names the session
-      // being replaced has to move with the identity. Spreading `...assignment`
-      // alone left the successor wearing the incumbent's execution binding,
-      // provisioning evidence and blocker text -- a projection that reads as
-      // the new session executing under the old one's selected config, and a
-      // stale blocker attributed to an owner that is no longer there.
-      //
-      // A same-session restart is the opposite case: nothing moved, so those
-      // fields still describe this assignment truthfully and are preserved.
-      const handoff = !sameSessionRecovery;
       const rebound: PersistedSupervisionTaskAssignment = {
         ...assignment,
         identity: targetIdentity,
-        // The successor gets the COMPLETE authoritative binding or none at all.
-        // Nothing from the incumbent's binding is ever spread into it, so no
-        // stale capability/model/preset can survive a cross-runtime transfer.
-        // A same-runtime restart changed no selection, so its existing binding
-        // still describes it and is kept unless the caller supplied a better one.
-        executionBinding: suppliedBinding ?? (handoff ? undefined : assignment.executionBinding),
-        ...(handoff ? {
-          provisioning: assignment.provisioning ? {
-            ...assignment.provisioning,
-            // Provisioning evidence must name the same selection the binding
-            // does, or the two records disagree about what is running.
-            ...(suppliedBinding ? {
-              selectedPool: suppliedBinding.pool,
-              selectedConfig: suppliedBinding.requested,
-              origin: suppliedBinding.origin,
-            } : {}),
-            createdSessionName: targetIdentity.sessionName,
-            // These describe provisioning the session being REPLACED. Carrying
-            // them forward would report the successor as degraded/failed for a
-            // failure it never had.
-            failureReason: undefined,
-            degradedReason: undefined,
-          } : undefined,
-          blocker: undefined,
-        } : {}),
-        leaseId: leaseAction === 'renew' ? this.#mintLeaseId() : assignment.leaseId,
         generation: assignment.generation + 1,
         updatedAt: now,
       };
@@ -5751,12 +5613,6 @@ export class SupervisionTaskRegistry {
         revision: expectedRevision,
         ownedFiles,
         evidenceManifestSha256,
-        leaseAction,
-        // Append-only provenance: what the handoff moved, not just that it
-        // happened. `#writeAssignment` never rewrites prior rows.
-        handoff,
-        priorExecutionBinding: assignment.executionBinding,
-        priorBlocker: assignment.blocker,
       });
       this.#db.exec('COMMIT');
       return { ok: true, value: rebound };

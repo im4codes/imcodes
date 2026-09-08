@@ -371,7 +371,7 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         projectName,
       };
     },
-    resolveRecoveryExecutionBinding: (sessionName) => {
+    resolveAuditorRecoveryBinding: (sessionName) => {
       const sessions = listSessions();
       const session = sessions.find((candidate) => candidate.name === sessionName);
       if (!session) return undefined;

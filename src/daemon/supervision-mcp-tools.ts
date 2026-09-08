@@ -273,9 +273,6 @@ export interface SupervisionRegistryPort {
     ownedFiles: string[];
     evidenceManifestSha256: string;
     reason: string;
-    coordinatorAuthorization?: { targetProjectName: string; coordinatorSessionName: string };
-    leaseAction?: 'preserve' | 'renew';
-    executionBinding?: SupervisionExecutionBinding;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   rebindTaskAssignmentRevision?(input: {
     taskId: string;
@@ -336,14 +333,8 @@ export interface SupervisionMcpToolDeps {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
     agentType: string; providerFamily: string; projectName: string;
   } | undefined;
-  /**
-   * Exact project-pool selection for ANY recovery target.
-   *
-   * Resolution is purely a function of the live session and its effective
-   * project, so the auditor and implementer recovery lanes share it rather than
-   * each carrying a private copy that could drift.
-   */
-  resolveRecoveryExecutionBinding?: (sessionName: string) => SupervisionExecutionBinding | undefined;
+  /** Exact project-pool selection for an auditor recovery target. */
+  resolveAuditorRecoveryBinding?: (sessionName: string) => SupervisionExecutionBinding | undefined;
   /** Physical worktree cleanup shares the already-authorized housekeeping ingress. */
   worktreeGc?: (input: {
     mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number;
@@ -827,7 +818,7 @@ export function createSupervisionMcpToolHandlers(
           || identity.providerFamily === implementerProviderFamily) {
           return err('identity_rejected', 'orphaned auditor recovery requires one live same-project cross-vendor transport target');
         }
-        const executionBinding = deps.resolveRecoveryExecutionBinding?.(rebindSessionName);
+        const executionBinding = deps.resolveAuditorRecoveryBinding?.(rebindSessionName);
         if (!executionBinding) {
           return err('identity_rejected', 'orphaned auditor recovery target is not selected in the authoritative execution pool');
         }
@@ -909,34 +900,13 @@ export function createSupervisionMcpToolHandlers(
           ...(auditTrigger !== undefined ? { auditTrigger } : {}),
         });
       }
-      // Route on the shape the caller actually sent, not on one field several
-      // shapes share. `expectedRevision` is optimistic-concurrency metadata that
-      // ANY recovery may pin, so claiming every call carrying it swallowed the
-      // revision-recovery, completion-evidence and orphaned-auditor shapes whose
-      // own branches sit further down this chain. Those callers were then
-      // rejected with an implementer-shaped `validation_failed` naming fields
-      // they never meant to send -- the more precisely a Brain pinned its
-      // request, the more certainly it was misrouted. This branch's own
-      // validation already refused `fromRevision`/`toRevision`, which is the
-      // tell: it was rejecting calls it should never have claimed.
-      const revisionRecoveryShaped = Boolean(fromRevision || toRevision);
-      const completionEvidenceShaped = Boolean(String(input.completionEvidenceDecision ?? '').trim());
-      const orphanedAuditorShaped = Boolean(auditAttemptId);
-      const validatedImplementerRecoveryRequested = !revisionRecoveryShaped
-        && !completionEvidenceShaped
-        && !orphanedAuditorShaped
-        && Boolean(
-          expectedRevision || (rebindSessionName && (ownedFiles.length > 0 || evidenceManifestSha256)),
-        );
+      const validatedImplementerRecoveryRequested = Boolean(
+        expectedRevision || (rebindSessionName && (ownedFiles.length > 0 || evidenceManifestSha256)),
+      );
       if (validatedImplementerRecoveryRequested) {
-        // `clear` is rejected rather than silently downgraded: this recovery
-        // hands the work to a live successor, and an assignment with no lease
-        // is not an owned assignment.
-        const recoveryLeaseAction = leaseAction || 'preserve';
         if (!assignmentId || !rebindSessionName || !expectedRevision || ownedFiles.length === 0
-          || !evidenceManifestSha256 || fromRevision || toRevision || input.toStatus !== undefined
-          || (recoveryLeaseAction !== 'preserve' && recoveryLeaseAction !== 'renew')) {
-          return err('validation_failed', 'implementer identity recovery requires assignmentId, rebindSessionName, expectedRevision, ownedFiles, evidenceManifestSha256, an optional preserve/renew leaseAction and reason only');
+          || !evidenceManifestSha256 || fromRevision || toRevision || input.toStatus !== undefined) {
+          return err('validation_failed', 'implementer identity recovery requires assignmentId, rebindSessionName, expectedRevision, ownedFiles, evidenceManifestSha256 and reason only');
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
@@ -946,35 +916,14 @@ export function createSupervisionMcpToolHandlers(
         }
         const identity = deps.resolveSessionIdentity?.(rebindSessionName);
         if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
-        // `taskProjectName` was computed here but never used, so a coordinator
-        // could name a rebind target belonging to another project. The auditor
-        // branch above has always checked this; the implementer branch did not.
-        if (identity.projectName !== taskProjectName) {
-          return err('identity_rejected', 'implementer identity recovery requires a live same-project target');
-        }
-        // Resolve the SUCCESSOR's own selected binding from the live pool. The
-        // incumbent's binding describes the runtime being replaced, so it can
-        // never stand in for it; when the selection changes the transaction
-        // refuses the rebind outright rather than persist a mixed record.
-        const executionBinding = deps.resolveRecoveryExecutionBinding?.(rebindSessionName);
         const rebound = reg.rebindValidatedImplementerAssignment?.({
           taskId, assignmentId, identity, expectedRevision, ownedFiles,
-          evidenceManifestSha256, reason, leaseAction: recoveryLeaseAction,
-          ...(executionBinding ? { executionBinding } : {}),
-          // The authority this branch just established, handed on as facts the
-          // transaction re-checks for itself. Without it a cross-session rebind
-          // stays refused, so the capability cannot be reached by any other
-          // caller of the registry.
-          coordinatorAuthorization: {
-            targetProjectName: identity.projectName,
-            coordinatorSessionName: caller.sessionName ?? '',
-          },
+          evidenceManifestSha256, reason,
         });
         if (!rebound) return err('unavailable', 'implementer identity recovery is not bound');
         if (!rebound.ok) return err(rebound.reason, `implementer identity recovery rejected: ${rebound.reason}`);
         return ok({
           taskId, assignmentId, rebindSessionName, expectedRevision,
-          leaseAction: recoveryLeaseAction,
           replay: rebound.replay === true,
         });
       }

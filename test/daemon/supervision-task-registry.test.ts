@@ -22,11 +22,7 @@ import {
   SUPERVISION_TASK_REGISTRY_CONTRACT,
   type SupervisionTaskClassification,
 } from '../../shared/supervision-config.js';
-import {
-  buildSupervisionExecutionCapabilityId,
-  evaluateSupervisionObservedIdentity,
-  normalizeSupervisionExecutionModel,
-} from '../../shared/supervision-execution-pool.js';
+import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import { createSupervisionMcpToolHandlers } from '../../src/daemon/supervision-mcp-tools.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
@@ -102,32 +98,8 @@ function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
   };
 }
 
-/**
- * A complete, self-consistent selected binding for one session.
- *
- * The runtime is parameterised so the SAME builder produces both sides of a
- * cross-runtime transfer; a second hand-written literal would be free to drift
- * out of agreement with `normalizeSupervisionExecutionConfig` and quietly stop
- * exercising the validation this fixture exists to exercise. The model is
- * canonicalised before the capability id is built, because the id is derived
- * from the canonical form and a raw one would fail config normalisation.
- */
-function persistedExecutionBinding(
-  name: string,
-  overrides: {
-    agentType?: string;
-    providerFamily?: string;
-    runtimeType?: 'process' | 'transport';
-    model?: string;
-  } = {},
-) {
-  const agentType = overrides.agentType ?? 'codex-sdk';
-  const requested = {
-    agentType,
-    providerFamily: overrides.providerFamily ?? resolvePeerAuditProviderFamily({ agentType }),
-    runtimeType: overrides.runtimeType ?? ('transport' as const),
-    model: normalizeSupervisionExecutionModel(agentType, overrides.model ?? 'gpt-5.6'),
-  };
+function persistedExecutionBinding(name: string) {
+  const requested = { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6' };
   return {
     pool: 'primary' as const,
     requested: { ...requested, capabilityId: buildSupervisionExecutionCapabilityId(requested) },
@@ -215,17 +187,7 @@ const ensureTestAssignmentWorktree = async (input: { assignmentId: string }) => 
 function prepareValidatedStaleImplementerShape(
   registry: SupervisionTaskRegistry,
   taskId: string,
-  options: {
-    readyForAudit?: boolean;
-    addAmbiguousImplementer?: boolean;
-    /**
-     * Give the incumbent the runtime evidence a real stalled implementer
-     * carries: an execution binding naming ITS session, provisioning evidence
-     * that failed for it, and the blocker that stalled it. Without these the
-     * handoff has nothing to move and the migration assertions are vacuous.
-     */
-    withRuntimeEvidence?: boolean;
-  } = {},
+  options: { readyForAudit?: boolean; addAmbiguousImplementer?: boolean } = {},
 ) {
   const revision = `${taskId}-r2`;
   const files = ['src/recovery-a.ts', 'test/recovery-a.test.ts'];
@@ -239,20 +201,9 @@ function prepareValidatedStaleImplementerShape(
     taskId, projectName: 'alpha', classification: 'independent_top_level',
     objective: 'recover one stale validated implementer runtime', currentRevision: revision,
   })).toMatchObject({ ok: true });
-  const staleExecutionBinding = options.withRuntimeEvidence
-    ? persistedExecutionBinding(oldIdentity.sessionName) : undefined;
-  const staleProvisioning = options.withRuntimeEvidence ? {
-    selectedPool: 'primary' as const,
-    provisionAttemptId: `${taskId}-provision`,
-    createdSessionName: oldIdentity.sessionName,
-    failureReason: 'no_selected_config' as const,
-    degradedReason: 'no_independent_session' as const,
-  } : undefined;
   const implementer = registry.createAssignment({
     assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
     identity: oldIdentity, scopeFiles: files, required: true, auditRevision: revision,
-    ...(staleExecutionBinding ? { executionBinding: staleExecutionBinding } : {}),
-    ...(staleProvisioning ? { provisioning: staleProvisioning } : {}),
   });
   if (!implementer.ok) throw new Error(implementer.reason);
   expect(registry.updateTask({ taskId, status: 'implementing', currentRevision: revision }))
@@ -281,15 +232,8 @@ function prepareValidatedStaleImplementerShape(
     });
     if (!duplicate.ok) throw new Error(duplicate.reason);
   }
-  if (options.withRuntimeEvidence) {
-    expect(registry.updateAssignment({
-      assignmentId: implementer.value.assignmentId, identity: oldIdentity,
-      blocker: 'incumbent stalled: no selected execution config',
-    })).toMatchObject({ ok: true });
-  }
   return {
     taskId, revision, files, oldIdentity, currentIdentity,
-    staleExecutionBinding, staleProvisioning,
     evidenceManifestSha256: 'c'.repeat(64), implementer: implementer.value,
   };
 }
@@ -1944,386 +1888,6 @@ describe('SupervisionTaskRegistry', () => {
         assignmentId: shape.implementer.assignmentId, identity: shape.implementerIdentity,
         status: 'ready_for_audit', revision: shape.toRevision, auditRevision: shape.toRevision,
       })).toMatchObject({ ok: true, value: { status: 'ready_for_audit', auditRevision: shape.toRevision } });
-    } finally {
-      registry.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('rebinds a coordinator-authorized implementer handoff to a DIFFERENT live session', () => {
-    // Production RED. The authoritative Brain called supervision_task_recover
-    // for the SAME active implementer (tsk_hn8/asg_hn9) with
-    // rebindSessionName=deck_sub_3l6z4l39 — a different session from the
-    // incumbent owner — carrying the exact current revision, the exact owned
-    // files and the immutable evidence manifest. The handler answered
-    // `owner_mismatch`, and the coordinator-authorized handoff was then wrongly
-    // pushed onto the implementer owner to perform on itself.
-    //
-    // The rejection came from `exactIdentityFamily`, which required the rebind
-    // TARGET to already be the incumbent sessionName. That only ever admitted
-    // "the same session restarted", never a handoff — which is the one thing a
-    // coordinator recovery exists to do.
-    const dir = mkdtempSync(join(tmpdir(), 'imcodes-coordinator-handoff-'));
-    const registry = new SupervisionTaskRegistry({ dbPath: join(dir, 'supervision-state.sqlite') });
-    try {
-      const shape = prepareValidatedStaleImplementerShape(registry, 'coordinator-handoff', {
-        withRuntimeEvidence: true,
-      });
-      // Production shape: the incumbent is a Codex/OpenAI transport runtime and
-      // the successor is a Claude Code / Anthropic one. Nothing about the old
-      // capability, model or origin may survive the transfer.
-      const handoffTarget = identity('coordinator-handoff-cc-target', 'claude-code-sdk');
-      const successorBinding = persistedExecutionBinding(handoffTarget.sessionName, {
-        agentType: 'claude-code-sdk', runtimeType: 'transport', model: 'opus[1M]',
-      });
-      expect(shape.staleExecutionBinding?.requested.providerFamily, 'precondition: incumbent is OpenAI')
-        .toBe('openai');
-      expect(successorBinding.requested.providerFamily, 'and the successor is Anthropic')
-        .toBe('anthropic');
-      expect(
-        handoffTarget.sessionName,
-        'the target must be a different session, otherwise this is the restart case',
-      ).not.toBe(shape.oldIdentity.sessionName);
-
-      const request = {
-        taskId: shape.taskId,
-        assignmentId: shape.implementer.assignmentId,
-        identity: handoffTarget,
-        expectedRevision: shape.revision,
-        ownedFiles: shape.files,
-        evidenceManifestSha256: shape.evidenceManifestSha256,
-        reason: 'coordinator-authorized handoff to a live CC session',
-        coordinatorAuthorization: {
-          targetProjectName: 'alpha',
-          coordinatorSessionName: 'deck_cd_brain',
-        },
-        executionBinding: successorBinding,
-        now: 700,
-      };
-
-      // The same handoff WITHOUT the coordinator authorization must still be
-      // refused, so this capability cannot be reached by an ordinary caller.
-      expect(
-        registry.rebindValidatedImplementerAssignment({
-          ...request, coordinatorAuthorization: undefined, now: 650,
-        }),
-        'an unauthorized cross-session rebind stays fail-closed',
-      ).toEqual({ ok: false, reason: 'owner_mismatch' });
-      // Nor by asserting a project the task does not belong to.
-      expect(
-        registry.rebindValidatedImplementerAssignment({
-          ...request,
-          coordinatorAuthorization: { targetProjectName: 'beta', coordinatorSessionName: 'deck_cd_brain' },
-          now: 660,
-        }),
-        'the target project is re-derived from the task, not taken on trust',
-      ).toEqual({ ok: false, reason: 'owner_mismatch' });
-
-      const rebound = registry.rebindValidatedImplementerAssignment(request);
-      expect(rebound.ok, JSON.stringify(rebound)).toBe(true);
-
-      // Identity, executionBinding and provisioning must move together: every
-      // field that NAMES the replaced session has to follow it, or the
-      // successor is projected as running under the incumbent's runtime.
-      const after = registry.getAssignment(shape.implementer.assignmentId)!;
-      expect(after.identity).toMatchObject(handoffTarget);
-      expect(after.taskId, 'the same object is reused, never replaced').toBe(shape.taskId);
-      expect(after.assignmentId).toBe(shape.implementer.assignmentId);
-      expect(registry.listAssignments(shape.taskId), 'no replacement assignment is created').toHaveLength(1);
-
-      expect(shape.staleExecutionBinding?.actual.sessionName, 'precondition: the binding named the incumbent')
-        .toBe(shape.oldIdentity.sessionName);
-      // The ENTIRE canonical tuple is the successor's, requested included. The
-      // earlier revision refreshed only the five identity fields of `actual` and
-      // carried `requested`/`origin` over, which left the row reading as
-      // claude-code-sdk/anthropic while still advertising an OpenAI capability
-      // and a gpt model.
-      expect(after.executionBinding, 'the whole binding is the successor\'s, never a blend')
-        .toEqual(successorBinding);
-      expect(after.executionBinding?.actual).toMatchObject({
-        sessionName: handoffTarget.sessionName,
-        sessionInstanceId: handoffTarget.sessionInstanceId,
-        runtimeEpoch: handoffTarget.runtimeEpoch,
-        agentType: 'claude-code-sdk',
-        providerFamily: 'anthropic',
-        runtimeType: 'transport',
-      });
-      expect(after.executionBinding?.requested).toMatchObject({
-        agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport',
-      });
-      // Zero-mutation check: no Codex/OpenAI/gpt token may survive anywhere in
-      // the successor's binding or provisioning, in any field, at any depth.
-      const successorRuntimeJson = JSON.stringify({
-        executionBinding: after.executionBinding, provisioning: after.provisioning,
-      }).toLowerCase();
-      for (const stale of ['codex', 'openai', 'gpt']) {
-        expect(successorRuntimeJson, `no stale "${stale}" may survive a Cx -> CC transfer`)
-          .not.toContain(stale);
-      }
-      // Canonical for the SUCCESSOR field by field, not merely "five identity
-      // fields moved". Capability, model, runtimeType and preset are exactly the
-      // values the previous revision could not update and therefore left behind.
-      expect(after.executionBinding?.requested.capabilityId, "the capability is the successor's")
-        .toBe(successorBinding.requested.capabilityId);
-      expect(after.executionBinding?.requested.capabilityId).toContain('claude-code-sdk');
-      expect(after.executionBinding?.requested.model).toBe(successorBinding.requested.model);
-      expect(after.executionBinding?.actual.model, 'the OBSERVED model is the successor\'s')
-        .toBe(successorBinding.actual.model);
-      expect(after.executionBinding?.actual.runtimeType).toBe('transport');
-      expect(after.executionBinding?.actual.ccPresetId).toBe(successorBinding.actual.ccPresetId);
-      // The strongest form: the PERSISTED tuple must itself satisfy the canonical
-      // selected-binding contract. A blended record cannot, which is precisely
-      // how it stranded the newly rebound owner with a second identity rejection.
-      expect(
-        evaluateSupervisionObservedIdentity({
-          config: after.executionBinding!.requested,
-          actual: after.executionBinding!.actual,
-          pool: after.executionBinding!.pool,
-        }),
-        'the persisted binding satisfies the canonical selected-binding contract',
-      ).toEqual({ ok: true });
-
-      expect(after.provisioning?.selectedConfig, 'provisioning names the same selection as the binding')
-        .toEqual(successorBinding.requested);
-      expect(after.provisioning?.selectedPool).toBe(successorBinding.pool);
-      expect(after.provisioning?.origin).toBe(successorBinding.origin);
-      expect(after.provisioning?.createdSessionName, 'provisioning evidence points at the live successor')
-        .toBe(handoffTarget.sessionName);
-      expect(after.provisioning?.failureReason, "the incumbent's provisioning failure is not inherited")
-        .toBeUndefined();
-      expect(after.provisioning?.degradedReason, "nor its degradation").toBeUndefined();
-      expect(after.blocker, "the blocker that stalled the incumbent is not the successor's state")
-        .toBeUndefined();
-      expect(after.generation, 'the runtime generation advances').toBe(shape.implementer.generation + 1);
-      expect(after.leaseId, 'preserve is the default disposition').toBe(shape.implementer.leaseId);
-
-      // Authority must have MOVED, not merely been recorded: the successor can
-      // act on the assignment immediately, and the replaced owner cannot. A
-      // handoff that leaves the old runtime still authorised has not handed
-      // anything off.
-      expect(
-        registry.updateAssignment({
-          assignmentId: shape.implementer.assignmentId, identity: handoffTarget,
-          blocker: 'successor picked the work up', now: 720,
-        }),
-        'the rebound owner can immediately act and receive continuation',
-      ).toMatchObject({ ok: true });
-      expect(
-        registry.updateAssignment({
-          assignmentId: shape.implementer.assignmentId, identity: shape.oldIdentity,
-          blocker: 'replaced owner tries to keep driving', now: 730,
-        }),
-        'the replaced owner no longer holds authority',
-      ).toMatchObject({ ok: false, reason: 'owner_mismatch' });
-
-      // A successful replay of the identical request must be idempotent.
-      const replay = registry.rebindValidatedImplementerAssignment({ ...request, now: 900 });
-      expect(replay, 'replaying the exact authorized handoff must not mutate again')
-        .toMatchObject({ ok: true, replay: true });
-      expect(registry.getAssignment(shape.implementer.assignmentId)!.identity).toMatchObject(handoffTarget);
-    } finally {
-      registry.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('renews the lease on request, preserves runtime evidence on a same-session restart, and fails a changed replay closed', () => {
-    // Three properties the handoff must NOT get for free:
-    //  - `renew` has to actually mint a lease, not report success on the old one;
-    //  - a same-session RESTART moved nothing, so its binding/provisioning/
-    //    blocker still describe it truthfully and must survive;
-    //  - a replay that changes the lease disposition is a different request and
-    //    must not be absorbed as an idempotent no-op.
-    const dir = mkdtempSync(join(tmpdir(), 'imcodes-handoff-lease-'));
-    const registry = new SupervisionTaskRegistry({ dbPath: join(dir, 'supervision-state.sqlite') });
-    try {
-      const renewShape = prepareValidatedStaleImplementerShape(registry, 'handoff-renew', {
-        withRuntimeEvidence: true,
-      });
-      const renewTarget = identity('handoff-renew-cc-target', 'claude-code-sdk');
-      const renewRequest = {
-        taskId: renewShape.taskId,
-        assignmentId: renewShape.implementer.assignmentId,
-        identity: renewTarget,
-        expectedRevision: renewShape.revision,
-        ownedFiles: renewShape.files,
-        evidenceManifestSha256: renewShape.evidenceManifestSha256,
-        reason: 'coordinator-authorized handoff with a fresh lease',
-        coordinatorAuthorization: {
-          targetProjectName: 'alpha', coordinatorSessionName: 'deck_cd_brain',
-        },
-        leaseAction: 'renew' as const,
-        executionBinding: persistedExecutionBinding(renewTarget.sessionName, {
-          agentType: 'claude-code-sdk', runtimeType: 'transport', model: 'opus[1M]',
-        }),
-        now: 700,
-      };
-      const renewed = registry.rebindValidatedImplementerAssignment(renewRequest);
-      expect(renewed.ok, JSON.stringify(renewed)).toBe(true);
-      const afterRenew = registry.getAssignment(renewShape.implementer.assignmentId)!;
-      expect(afterRenew.leaseId, 'renew mints a new lease').not.toBe(renewShape.implementer.leaseId);
-      expect(afterRenew.leaseId, 'and never leaves the assignment unowned').toBeTruthy();
-
-      // Replaying the SAME target with a different lease disposition is not the
-      // request that was already applied.
-      expect(
-        registry.rebindValidatedImplementerAssignment({ ...renewRequest, leaseAction: 'preserve', now: 800 }),
-        'a replay with a changed lease disposition fails closed',
-      ).toEqual({ ok: false, reason: 'invalid_transition' });
-      expect(
-        registry.getAssignment(renewShape.implementer.assignmentId)!.leaseId,
-        'and changes nothing',
-      ).toBe(afterRenew.leaseId);
-      expect(
-        registry.rebindValidatedImplementerAssignment({ ...renewRequest, now: 810 }),
-        'while the identical request stays idempotent',
-      ).toMatchObject({ ok: true, replay: true });
-
-      // Narrowing the idempotency match must NOT narrow the re-targeting guard.
-      // Hand the work onward to a second successor, then try to steer it back to
-      // the first under a different lease disposition: that is a conflicting
-      // replay, and it stays one no matter what lease the caller now asks for.
-      const secondTarget = identity('handoff-renew-second-target', 'codex');
-      expect(
-        registry.rebindValidatedImplementerAssignment({
-          ...renewRequest, identity: secondTarget,
-          executionBinding: persistedExecutionBinding(secondTarget.sessionName, {
-            agentType: 'codex', runtimeType: 'transport', model: 'gpt-5.6',
-          }),
-          reason: 'hand the work onward again', now: 820,
-        }),
-        'a further authorized handoff is allowed',
-      ).toMatchObject({ ok: true });
-      expect(
-        registry.rebindValidatedImplementerAssignment({
-          ...renewRequest, leaseAction: 'preserve',
-          reason: 'steer back to an already-used target', now: 830,
-        }),
-        'returning to an earlier target is still a conflicting replay',
-      ).toEqual({ ok: false, reason: 'conflicting_replay' });
-      expect(
-        registry.getAssignment(renewShape.implementer.assignmentId)!.identity,
-        'and the second successor keeps the assignment',
-      ).toMatchObject(secondTarget);
-
-      // Same session, new instance/epoch: a restart, not a handoff.
-      const restartShape = prepareValidatedStaleImplementerShape(registry, 'handoff-restart', {
-        withRuntimeEvidence: true,
-      });
-      expect(restartShape.currentIdentity.sessionName).toBe(restartShape.oldIdentity.sessionName);
-      const restarted = registry.rebindValidatedImplementerAssignment({
-        taskId: restartShape.taskId,
-        assignmentId: restartShape.implementer.assignmentId,
-        identity: restartShape.currentIdentity,
-        expectedRevision: restartShape.revision,
-        ownedFiles: restartShape.files,
-        evidenceManifestSha256: restartShape.evidenceManifestSha256,
-        reason: 'same session returned after a restart',
-        now: 700,
-      });
-      expect(restarted.ok, JSON.stringify(restarted)).toBe(true);
-      const afterRestart = registry.getAssignment(restartShape.implementer.assignmentId)!;
-      expect(afterRestart.identity).toMatchObject(restartShape.currentIdentity);
-      expect(
-        afterRestart.provisioning,
-        'a restart moved nothing, so its own provisioning evidence is preserved verbatim',
-      ).toEqual(restartShape.staleProvisioning);
-      expect(
-        afterRestart.blocker,
-        'and the blocker it is still working through is not silently cleared',
-      ).toBe('incumbent stalled: no selected execution config');
-      expect(
-        afterRestart.executionBinding?.actual.sessionName,
-        'the binding already named this session',
-      ).toBe(restartShape.oldIdentity.sessionName);
-    } finally {
-      registry.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('refuses a cross-runtime handoff whose successor binding is missing, mismatched or mixed, changing nothing', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'imcodes-handoff-binding-'));
-    const registry = new SupervisionTaskRegistry({ dbPath: join(dir, 'supervision-state.sqlite') });
-    try {
-      const shape = prepareValidatedStaleImplementerShape(registry, 'handoff-binding', {
-        withRuntimeEvidence: true,
-      });
-      const target = identity('handoff-binding-cc-target', 'claude-code-sdk');
-      const goodBinding = persistedExecutionBinding(target.sessionName, {
-        agentType: 'claude-code-sdk', runtimeType: 'transport', model: 'opus[1M]',
-      });
-      const request = {
-        taskId: shape.taskId,
-        assignmentId: shape.implementer.assignmentId,
-        identity: target,
-        expectedRevision: shape.revision,
-        ownedFiles: shape.files,
-        evidenceManifestSha256: shape.evidenceManifestSha256,
-        reason: 'coordinator-authorized cross-runtime handoff',
-        coordinatorAuthorization: {
-          targetProjectName: 'alpha', coordinatorSessionName: 'deck_cd_brain',
-        },
-        executionBinding: goodBinding,
-      };
-      const before = JSON.stringify(registry.get(shape.taskId));
-
-      const rejections: [string, unknown][] = [
-        // Nothing to select FROM: identity fields cannot prove capability,
-        // runtimeType, model or preset, so the rebind cannot proceed at all.
-        ['no successor binding at all', { ...request, executionBinding: undefined, now: 700 }],
-        // A binding describing some other runtime is not this target's.
-        ['a binding whose actual identity is a different session', {
-          ...request,
-          executionBinding: persistedExecutionBinding('handoff-binding-someone-else', {
-            agentType: 'claude-code-sdk', runtimeType: 'transport', model: 'opus[1M]',
-          }),
-          now: 710,
-        }],
-        // Right session, stale incarnation: still not the live target.
-        ['a binding pinned to a stale incarnation', {
-          ...request,
-          executionBinding: {
-            ...goodBinding,
-            actual: { ...goodBinding.actual, runtimeEpoch: 'epoch-from-a-previous-life' },
-          },
-          now: 720,
-        }],
-        // The EXACT record the previous revision used to persist: the successor's
-        // observed identity carrying the incumbent's requested capability. It has
-        // to be unrepresentable, not merely un-produced.
-        ['a mixed binding: successor actual, incumbent requested', {
-          ...request,
-          executionBinding: { ...goodBinding, requested: shape.staleExecutionBinding!.requested },
-          now: 730,
-        }],
-      ];
-      for (const [label, attempt] of rejections) {
-        expect(
-          registry.rebindValidatedImplementerAssignment(attempt as never),
-          label,
-        ).toEqual({ ok: false, reason: 'invalid' });
-        expect(JSON.stringify(registry.get(shape.taskId)), `${label}: nothing is written`).toBe(before);
-      }
-
-      // The authoritative binding is accepted, and only then.
-      expect(registry.rebindValidatedImplementerAssignment({ ...request, now: 740 }))
-        .toMatchObject({ ok: true });
-      const after = JSON.stringify(registry.get(shape.taskId));
-
-      // Replaying the same target under a DIFFERENT binding is a changed
-      // request, not an idempotent one.
-      expect(
-        registry.rebindValidatedImplementerAssignment({
-          ...request,
-          executionBinding: persistedExecutionBinding(target.sessionName, {
-            agentType: 'claude-code-sdk', runtimeType: 'transport', model: 'sonnet',
-          }),
-          now: 750,
-        }),
-        'a replay carrying a changed binding fails closed',
-      ).toEqual({ ok: false, reason: 'invalid_transition' });
-      expect(JSON.stringify(registry.get(shape.taskId)), 'and changes nothing').toBe(after);
     } finally {
       registry.close();
       rmSync(dir, { recursive: true, force: true });
