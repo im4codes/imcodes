@@ -245,6 +245,8 @@ interface DirectLease {
   activeAttempts: Set<string>;
   /** Channels that reached an already-warm peer just before their PREPARE. */
   pendingOperationChannels: Map<string, PendingOperationChannel>;
+  /** The one authority-free bootstrap/health channel negotiated with this peer. */
+  healthChannel: DataChannel | null;
   /** Native callbacks from a replaced peer are fenced by this epoch. */
   callbackGeneration: number;
   /** One serialized teardown owns all native close calls for this lease. */
@@ -704,13 +706,17 @@ function closeOrRetireNative(resource: { close(): void } | null | undefined): vo
 
 function scheduleNativeRecycleWhenIdle(): void {
   if (!requestHardRecycle || nativeAdmissionClosed || nativeRecycleTimer
-    || retiredNativeResources.length === 0 || activeAttempts.size > 0) return;
+    || retiredNativeResources.length === 0 || activeAttempts.size > 0 || leases.size > 0) return;
   // Let the current IPC dispatch finish and flush its terminal/control messages
-  // before killing the child. The parent treats this exactly like any other
-  // isolated-child loss and starts a fresh generation with capped backoff.
+  // before killing the child. A live replacement lease is not idle: recycling
+  // immediately after swapping its old peer kills the new negotiation that
+  // caused the retirement. The hard retirement ceiling above remains the
+  // production backstop while leases stay live. Once the last lease closes,
+  // the parent treats the recycle exactly like any other isolated-child loss
+  // and starts a fresh generation with capped backoff.
   nativeRecycleTimer = setTimeout(() => {
     nativeRecycleTimer = null;
-    if (!requestHardRecycle || nativeAdmissionClosed || activeAttempts.size > 0) return;
+    if (!requestHardRecycle || nativeAdmissionClosed || activeAttempts.size > 0 || leases.size > 0) return;
     requestHardRecycle();
   }, 0);
   nativeRecycleTimer.unref?.();
@@ -1008,6 +1014,9 @@ async function closeLease(lease: DirectLease, cancelActive: boolean): Promise<vo
       closeOrRetireNative(pending.channel);
     }
     lease.pendingOperationChannels.clear();
+    const healthChannel = lease.healthChannel;
+    lease.healthChannel = null;
+    closeOrRetireNative(healthChannel);
     // JS callbacks were fenced synchronously above, but the C++ addon may still
     // be constructing one before JS can observe that fence. In the OS child we
     // therefore retire instead of entering peer.close(); once this was the last
@@ -1216,14 +1225,24 @@ function toCandidateInfo(value: unknown): DirectConnectivityCandidateInfo | null
  * no operation binding, and accepts only a bounded nonce probe.
  */
 function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): void {
+  if (lease.healthChannel && lease.healthChannel !== channel) {
+    closeOrRetireNative(channel);
+    return;
+  }
+  lease.healthChannel = channel;
   const callbackGeneration = lease.callbackGeneration;
+  const retire = () => {
+    if (lease.healthChannel !== channel) return;
+    lease.healthChannel = null;
+    closeOrRetireNative(channel);
+  };
   channel.onMessage((message) => {
-    if (!isCurrentLeaseCallback(lease, callbackGeneration)) {
-      closeOrRetireNative(channel);
+    if (lease.healthChannel !== channel || !isCurrentLeaseCallback(lease, callbackGeneration)) {
+      retire();
       return;
     }
     if (typeof message !== 'string') {
-      closeOrRetireNative(channel);
+      retire();
       return;
     }
     let raw: unknown;
@@ -1235,18 +1254,18 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
       || parsed.value.leaseId !== lease.binding.leaseId
       || parsed.value.leaseGeneration !== lease.binding.leaseGeneration
       || parsed.value.daemonGeneration !== lease.binding.daemonGeneration) {
-      closeOrRetireNative(channel);
+      retire();
       return;
     }
     const selected = lease.peer.getSelectedCandidatePair();
     const localCandidate = toCandidateInfo(selected?.local);
     const remoteCandidate = toCandidateInfo(selected?.remote);
     if (!localCandidate || !remoteCandidate) {
-      closeOrRetireNative(channel);
+      retire();
       return;
     }
     try {
-      channel.sendMessage(JSON.stringify({
+      const sent = channel.sendMessage(JSON.stringify({
         type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG,
         protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
         serverId: lease.binding.serverId,
@@ -1259,10 +1278,13 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
         localCandidate,
         remoteCandidate,
       }));
-    } finally {
-      closeOrRetireNative(channel);
+      if (!sent) retire();
+    } catch {
+      retire();
     }
   });
+  channel.onClosed(retire);
+  channel.onError(retire);
 }
 
 async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset = 0): Promise<void> {
@@ -1831,6 +1853,7 @@ async function prepareLease(command: DirectFileTransferLeasePrepare, sender: Wor
     negotiationRequestId: null,
     activeAttempts: new Set(),
     pendingOperationChannels: new Map(),
+    healthChannel: null,
     callbackGeneration: 1,
     closePromise: null,
     closing: false,
@@ -2013,6 +2036,8 @@ function replaceInactiveLeasePeer(lease: DirectLease): boolean {
     return false;
   }
   const previous = lease.peer;
+  const previousHealthChannel = lease.healthChannel;
+  lease.healthChannel = null;
   for (const pending of lease.pendingOperationChannels.values()) {
     clearTimeout(pending.timer);
     closeOrRetireNative(pending.channel);
@@ -2025,6 +2050,7 @@ function replaceInactiveLeasePeer(lease: DirectLease): boolean {
   lease.remoteDescriptionSet = false;
   lease.negotiationRequestId = null;
   attachLeasePeer(lease);
+  closeOrRetireNative(previousHealthChannel);
   closeOrRetireNative(previous);
   return true;
 }
@@ -2330,6 +2356,7 @@ export function __installBlockedLeaseForTests(): {
     peer: { close: () => { nativeCalls += 1; } },
     activeAttempts: new Set(),
     pendingOperationChannels: new Map(),
+    healthChannel: null,
     idleTimer: null,
     iceServers: [],
     controlEpoch: 0,
@@ -2389,6 +2416,7 @@ export async function __retireNativePeerThroughLeaseForTests(peer: PeerConnectio
     peer,
     activeAttempts: new Set(),
     pendingOperationChannels: new Map(),
+    healthChannel: null,
     idleTimer: null,
     iceServers: [],
     controlEpoch: 0,
@@ -2429,6 +2457,7 @@ export async function __retireNativeChannelUnderLiveLeaseForTests(
     peer,
     activeAttempts: new Set(),
     pendingOperationChannels: new Map(),
+    healthChannel: null,
     idleTimer: null,
     iceServers: [],
     controlEpoch: 0,
@@ -2493,6 +2522,7 @@ export function __replaceNativePeersUnderConcurrentActiveTransferForTests(
     peer: blockingPeer,
     activeAttempts: new Set<string>(),
     pendingOperationChannels: new Map(),
+    healthChannel: null,
     idleTimer: null,
     iceServers: [],
     controlEpoch: 0,
@@ -2534,6 +2564,7 @@ export function __replaceNativePeersUnderConcurrentActiveTransferForTests(
     }),
     activeAttempts: new Set<string>(),
     pendingOperationChannels: new Map(),
+    healthChannel: null,
     idleTimer: null,
     iceServers: [],
     controlEpoch: 0,

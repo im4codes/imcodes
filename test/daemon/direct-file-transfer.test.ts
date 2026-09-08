@@ -285,7 +285,57 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await vi.waitFor(() => expect(health.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG)));
     const pong = JSON.parse(health.sent[0] as string);
     expect(pong).toMatchObject({ nonce: 'probe-nonce-0001', localCandidate: { address: '192.168.1.2' } });
+    health.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
+      nonce: 'probe-nonce-0002',
+    }));
+    await vi.waitFor(() => expect(health.sent).toHaveLength(2));
+    expect(JSON.parse(health.sent[1] as string)).toMatchObject({ nonce: 'probe-nonce-0002' });
+    expect(health.close, 'a successful probe must keep the bounded bootstrap channel alive').not.toHaveBeenCalled();
+    const extraHealth = new FakeDataChannel('imcodes-health-extra');
+    FakePeerConnection.latest!.emitDataChannel(extraHealth);
+    expect(extraHealth.close, 'one lease must never retain a second health channel').toHaveBeenCalledOnce();
     expect(sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED)).toBeUndefined();
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('keeps replacement peers live until the explicit native retirement bound', async () => {
+    vi.useFakeTimers();
+    const { direct, sender } = await readyLease();
+    const requestHardRecycle = vi.fn();
+    await direct.startDirectFileTransferChildRuntime({
+      kind: 'imcodes-direct-file-transfer',
+      generation: 1,
+      send: () => {},
+      subscribe: () => {},
+      requestHardRecycle,
+    });
+
+    const replace = async (index: number) => {
+      await direct.handleDirectFileTransferCommand({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId,
+        browserTabId,
+        leaseId,
+        leaseGeneration: 1,
+        daemonGeneration: 1,
+        requestId: `replacement-browser-offer-${index}`,
+        sdp: `replacement-browser-sdp-${index}`,
+      }, sender);
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    for (let index = 1; index < direct.DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES; index += 1) {
+      await replace(index);
+      expect(requestHardRecycle, `replacement ${index} must not kill its newly-created peer`).not.toHaveBeenCalled();
+    }
+    expect(FakePeerConnection.instances).toHaveLength(direct.DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES);
+
+    await replace(direct.DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES);
+    expect(FakePeerConnection.instances).toHaveLength(direct.DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES + 1);
+    expect(requestHardRecycle).toHaveBeenCalledOnce();
     await direct.shutdownDirectFileTransfers();
   });
 

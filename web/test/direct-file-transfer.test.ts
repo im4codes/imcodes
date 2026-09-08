@@ -158,7 +158,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number; secondOfferAnswerDelayMs?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -314,14 +314,17 @@ function createWs(
         else queueMicrotask(respond);
     } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
         if (++leaseOfferCount === 1 && mode === 'drop_first_lease_answer') return;
-        if (mode === 'lease_signal_failure') {
+        if (mode === 'lease_signal_failure' || (mode === 'runtime_recovering_once' && leaseOfferCount === 1)) {
           queueMicrotask(() => emit({
             type: DIRECT_FILE_TRANSFER_MSG.ERROR,
             protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
             scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
             requestId: message.requestId,
-            error: DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+            error: mode === 'runtime_recovering_once'
+              ? DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED
+              : DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
             retryable: true,
+            ...(mode === 'runtime_recovering_once' ? { detail: 'direct_runtime_child_recovering' } : {}),
           }));
         } else {
           const respond = () => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' });
@@ -1668,6 +1671,44 @@ describe('direct file transfer v2 browser broker', () => {
       expect(message).not.toHaveProperty('previewHandle');
       expect(message).not.toHaveProperty('sessionName');
     }
+  });
+
+  it('reuses one bounded bootstrap health channel across repeated explicit probes', async () => {
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    const peer = FakePeerConnection.instances.at(-1)!;
+    const bootstrap = peer.channels[0]!;
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+
+    expect(peer.connectionState).not.toBe('closed');
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(peer.channels.filter((channel) => channel.label.startsWith('imcodes-health-'))).toEqual([bootstrap]);
+    expect(bootstrap.sent.filter((value) => (
+      typeof value === 'string' && JSON.parse(value).type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE
+    ))).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+  });
+
+  it('reinitializes once the isolated child reports transient recovery during peer replacement', async () => {
+    vi.useFakeTimers();
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'runtime_recovering_once');
+
+    const pending = probeDirectConnectivity(ws, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(Math.ceil(
+      DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[0]
+        * (1 + DIRECT_FILE_TRANSFER_LIMITS.RETRY_MAX_POSITIVE_JITTER_RATIO),
+    ));
+    await expect(pending).resolves.toMatchObject({ route: 'lan_direct' });
+
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(FakePeerConnection.instances[0]?.connectionState).toBe('closed');
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
   });
 
   it('invalidates an unanswered LEASE_INIT on socket loss and immediately starts fresh after reconnect', async () => {

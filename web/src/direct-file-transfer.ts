@@ -2407,7 +2407,14 @@ async function probeLeasePeer(
     throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   }
   reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING, lease);
-  const channel = peer.createDataChannel(`${DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX}${crypto.randomUUID()}`, { ordered: true });
+  // The authority-free bootstrap is the lease's single bounded health
+  // channel. Creating and closing a new native DataChannel for every probe
+  // forced the isolated child to retire native wrappers and recycle its whole
+  // generation after an otherwise successful diagnostic. The browser then
+  // retained a seemingly-connected association to the retired child and the
+  // next offer/ICE exchange could never converge.
+  const channel = lease.bootstrapChannel;
+  if (!channel) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
   await waitForChannelOpen(channel, peer, lease.controlAbort.signal);
   const nonce = crypto.randomUUID();
   const started = performance.now();
@@ -2416,7 +2423,6 @@ async function probeLeasePeer(
     const done = (error?: unknown, value?: DirectConnectivityProbeResult) => {
       clearTimeout(timer);
       channel.removeEventListener('message', onMessage);
-      try { channel.close(); } catch { /* best effort */ }
       if (error) reject(error); else resolve(value!);
     };
     const onMessage = (event: MessageEvent) => {
@@ -2458,29 +2464,49 @@ export async function probeDirectConnectivity(
 ): Promise<DirectConnectivityProbeResult> {
   if (!serverId || !supportsLease(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   const { lease, release } = acquireLease(ws, serverId);
-  const probeControlEpoch = lease.controlEpoch;
   try {
-    await ensureLease(lease, onDiagnostics);
-    const result = await probeLeasePeer(lease, onDiagnostics);
-    reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE, lease);
-    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: result.route });
-    if (result.route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
-      if (lease.active.size === 0) clearLeaseBinding(lease);
-      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
-    } else {
-      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS; attempt += 1) {
+      if (attempt > 1) await wait(retryDelay(attempt - 1));
+      const probeControlEpoch = lease.controlEpoch;
+      try {
+        await ensureLease(lease, onDiagnostics);
+        const result = await probeLeasePeer(lease, onDiagnostics);
+        reportProbeStage(onDiagnostics, DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE, lease);
+        recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: result.route });
+        if (result.route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
+          if (lease.active.size === 0) clearLeaseBinding(lease);
+          setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
+        } else {
+          setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
+        }
+        return result;
+      } catch (error) {
+        lastError = error;
+        const childRecovering = error instanceof DirectFileTransferFailure
+          && error.retryable
+          && error.message === 'direct_runtime_child_recovering';
+        const retryChild = childRecovering && attempt < DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS;
+        // The replacement child owns no state from the retired process. A
+        // retry against the old lease identity can only receive LEASE_EXPIRED;
+        // retire both halves now so the next bounded attempt sends a fresh
+        // LEASE_INIT/PREPARE before emitting another offer.
+        if (retryChild && lease.active.size === 0 && lease.controlEpoch === probeControlEpoch) {
+          clearLeaseBinding(lease);
+          continue;
+        }
+        // A failed explicit probe is itself proof that this idle peer should
+        // not be offered to the next transfer. Drop only the peer (not the
+        // resumable lease), so Refresh or the next upload renegotiates without
+        // requiring an app restart. Active transfers retain their peer.
+        if (error instanceof DirectFileTransferFailure && error.retryable
+          && lease.active.size === 0 && lease.controlEpoch === probeControlEpoch) {
+          closePeer(lease);
+        }
+        throw error;
+      }
     }
-    return result;
-  } catch (error) {
-    // A failed explicit probe is itself proof that this idle peer should not be
-    // offered to the next transfer. Drop only the peer (not the resumable
-    // lease), so Refresh or the next upload renegotiates without requiring an
-    // app restart. Active transfers, if any, retain ownership of their peer.
-    if (error instanceof DirectFileTransferFailure && error.retryable
-      && lease.active.size === 0 && lease.controlEpoch === probeControlEpoch) {
-      closePeer(lease);
-    }
-    throw error;
+    throw lastError;
   } finally {
     release();
   }
