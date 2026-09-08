@@ -3234,7 +3234,12 @@
     "copy_install_command_pending": "Preparing…",
     "copy_install_command_copied": "Command copied",
     "copy_install_command_error": "Could not create the install command. Please try again.",
-    "copy_install_command_clipboard_error": "Could not copy the command. Please check clipboard permissions."
+    "copy_install_command_clipboard_error": "Could not copy the command. Please check clipboard permissions.",
+    "desk_label": "AI Desk",
+    "desk_choose": "Choose a Desk…",
+    "desk_selected": "Will be added to the Desk: {{desk}}",
+    "desk_required": "Choose which AI Desk this machine joins before installing.",
+    "desk_none": "You need an AI Desk before adding a machine. Create or join one first."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

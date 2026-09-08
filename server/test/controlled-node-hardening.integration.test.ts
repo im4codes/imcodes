@@ -50,14 +50,36 @@ function buildApp() {
   return app;
 }
 
+/**
+ * Desk scope: redemption refuses a ticket with no Desk rather than creating an
+ * unbound machine, so a seeded enrollment carries one exactly like a real mint
+ * does. The Desk is derived from the owner id so callers need no extra state.
+ */
+async function seedDesk(userId: string): Promise<string> {
+  const teamId = `desk-${userId}`;
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO teams (id, name, owner_id, plan, created_at)
+     VALUES ($1, 'AI Desk', $2, 'free', $3) ON CONFLICT DO NOTHING`,
+    [teamId, userId, now],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at)
+     VALUES ($1, $2, 'owner', $3) ON CONFLICT DO NOTHING`,
+    [teamId, userId, now],
+  );
+  return teamId;
+}
+
 async function seedV2Enrollment(code: string, userId: string): Promise<void> {
   const now = Date.now();
+  const deskTeamId = await seedDesk(userId);
   await db.execute(
     `INSERT INTO controlled_node_enrollments_v2
        (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
-        encrypted_code, ticket_expires_at, expires_at, created_at)
-     VALUES ($1, $2, $3, 'linux', 'x64', $4, 'test-only', $5, $5, $6)`,
-    [sha256(hex(16)), sha256(code), userId, sha256(hex(32)), now + 60_000, now],
+        encrypted_code, ticket_expires_at, expires_at, created_at, desk_team_id)
+     VALUES ($1, $2, $3, 'linux', 'x64', $4, 'test-only', $5, $5, $6, $7)`,
+    [sha256(hex(16)), sha256(code), userId, sha256(hex(32)), now + 60_000, now, deskTeamId],
   );
 }
 

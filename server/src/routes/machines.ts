@@ -19,6 +19,7 @@ import {
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
 import {
+  controlledDeskManagementFence,
   listAccessibleControlledMachines,
   resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
@@ -229,6 +230,81 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
     details: { serverId, from: row.previous_name, to: displayName },
   }, c.env.DB).catch(() => {});
   return c.json({ ok: true, displayName });
+});
+
+// POST /api/machines/desk-binding?serverId=... — owner binds this machine to
+// one Desk.
+//
+// Deliberately NOT under the `/:serverId/` device-action namespace. Upstream's
+// authority contract defines every route there as a device capability that must
+// admit through resolveControlledMachineOperatorAccess with no owner predicate,
+// and that is right for acting ON a device. Binding is not such an action: it
+// chooses the authorization domain that decides who counts as a Participant at
+// all, so delegating it to a Participant would let a grantee re-point the
+// machine at a Desk they control. Keeping it outside that namespace states the
+// distinction instead of carving an exception into the contract, and matches
+// the repository convention of `?serverId=` for new routes.
+//
+// This is the only way a controlled node acquires a Desk, and it is deliberately
+// explicit. Nothing infers a Desk from the owner's memberships: an owner in
+// exactly one team today may be in two tomorrow, so a "obvious default" would
+// silently decide an authorization boundary. Every ambiguous or unauthorized
+// shape below fails closed and leaves team_id untouched.
+machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.query('serverId')?.trim();
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({ teamId: z.string().trim().min(1) }).safeParse(body);
+  // A missing or blank Desk is rejected rather than defaulted.
+  if (!parsed.success) return c.json({ error: 'invalid_body', reason: 'desk_required' }, 400);
+  const teamId = parsed.data.teamId;
+
+  // Only the machine's own owner may bind it, and only while it is live.
+  const machine = await c.env.DB.queryOne<{ team_id: string | null }>(
+    `SELECT team_id FROM servers
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL
+        -- Live Desk authority: a removed owner manages nothing (R5 audit P0).
+        AND ${controlledDeskManagementFence('servers', '$2')}`,
+    [serverId, userId, NODE_ROLE.CONTROLLED],
+  );
+  if (!machine) return c.json({ error: 'not_found' }, 404);
+
+  // The owner must currently hold a managing role in the target Desk. An
+  // unknown Desk and a Desk the owner merely belongs to as a plain member are
+  // both refused here, and neither is distinguished in the response.
+  const membership = await c.env.DB.queryOne<{ role: string }>(
+    `SELECT tm.role FROM team_members tm
+       JOIN teams t ON t.id = tm.team_id
+      WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
+    [teamId, userId],
+  );
+  if (!membership) return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
+
+  // Rebinding is a move between authorization domains, never a silent update:
+  // it would strand grants made under the previous Desk. Same-Desk repeats stay
+  // idempotent so a retried install does not fail.
+  if (machine.team_id && machine.team_id !== teamId) {
+    return c.json({ error: 'conflict', reason: 'desk_already_bound' }, 409);
+  }
+
+  const bound = await c.env.DB.queryOne<{ id: string }>(
+    `UPDATE servers SET team_id = $3
+      WHERE id = $1 AND user_id = $2 AND node_role = $4 AND revoked_at IS NULL
+        AND (team_id IS NULL OR team_id = $3)
+      RETURNING id`,
+    [serverId, userId, teamId, NODE_ROLE.CONTROLLED],
+  );
+  if (!bound) return c.json({ error: 'conflict', reason: 'desk_already_bound' }, 409);
+
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: 'machine.desk_bind',
+    ip,
+    details: { serverId, teamId, previousTeamId: machine.team_id },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true, teamId });
 });
 
 // POST /api/machines/:serverId/revoke — operator kill-switch (10.3).

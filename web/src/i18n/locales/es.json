@@ -3234,7 +3234,12 @@
     "copy_install_command_pending": "Preparando…",
     "copy_install_command_copied": "Comando copiado",
     "copy_install_command_error": "No se pudo crear el comando de instalación. Inténtalo de nuevo.",
-    "copy_install_command_clipboard_error": "No se pudo copiar el comando. Revisa los permisos del portapapeles."
+    "copy_install_command_clipboard_error": "No se pudo copiar el comando. Revisa los permisos del portapapeles.",
+    "desk_label": "AI Desk",
+    "desk_choose": "Elige un Desk…",
+    "desk_selected": "Se añadirá al Desk: {{desk}}",
+    "desk_required": "Elige a qué AI Desk se une este equipo antes de instalar.",
+    "desk_none": "Necesitas un AI Desk antes de añadir un equipo. Crea uno o únete a uno."
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

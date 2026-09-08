@@ -42,6 +42,9 @@ const ticketResponse = {
   ownerUserId: 'user-rock',
 };
 
+/** Explicit Desk for these mints; the API refuses a mint without one. */
+const TEST_DESK_ID = 'desk-test-1';
+
 describe('buildControlledNodeDownloadTargets', () => {
   it('returns only canonical artifacts with explicit arch', () => {
     const targets = buildControlledNodeDownloadTargets({
@@ -121,11 +124,14 @@ describe('controlled-node desktop download', () => {
     });
 
     const desktopWindow = beginControlledNodeDesktopDownload();
-    await downloadControlledNodeExecutable({ os: 'win', arch: 'x64' }, { desktopWindow });
+    await downloadControlledNodeExecutable({ os: 'win', arch: 'x64' }, TEST_DESK_ID, { desktopWindow });
 
     expect(callOrder).toEqual(['open', 'mint']);
     expect(mockWin.location.href).toBe('https://example.test/api/enroll/v2/bootstrap#ticket=deadbeef');
-    expect(mintControlledNodeExecutableTicket).toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+    // The Desk chosen by the caller must reach the mint, not be dropped by the
+    // download wrapper.
+    expect(mintControlledNodeExecutableTicket)
+      .toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
   });
 
   it('closes the pre-opened window when ticket mint fails', async () => {
@@ -139,7 +145,7 @@ describe('controlled-node desktop download', () => {
 
     const desktopWindow = beginControlledNodeDesktopDownload();
     await expect(
-      downloadControlledNodeExecutable({ os: 'linux', arch: 'x64' }, { desktopWindow }),
+      downloadControlledNodeExecutable({ os: 'linux', arch: 'x64' }, TEST_DESK_ID, { desktopWindow }),
     ).rejects.toThrow('mint_failed');
     expect(mockWin.close).toHaveBeenCalled();
   });

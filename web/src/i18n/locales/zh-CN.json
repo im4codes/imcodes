@@ -3234,7 +3234,12 @@
     "copy_install_command_pending": "准备中…",
     "copy_install_command_copied": "命令已复制",
     "copy_install_command_error": "无法生成安装命令,请重试。",
-    "copy_install_command_clipboard_error": "无法复制命令,请检查剪贴板权限。"
+    "copy_install_command_clipboard_error": "无法复制命令,请检查剪贴板权限。",
+    "desk_label": "AI Desk",
+    "desk_choose": "请选择一个 Desk…",
+    "desk_selected": "将加入这个 Desk：{{desk}}",
+    "desk_required": "安装前请先选择这台电脑要加入哪个 AI Desk。",
+    "desk_none": "你还没有 AI Desk，先创建或加入一个才能添加电脑。"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

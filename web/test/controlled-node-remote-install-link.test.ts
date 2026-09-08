@@ -13,6 +13,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
 import {
   buildControlledNodeBootstrapUrl,
   mintControlledNodeExecutableTicket,
+  mintControlledNodeInstallCommand,
   mintControlledNodeRemoteInstallLink,
   revokeControlledNodeRemoteInstallLink,
 } from '../src/api/machines.js';
@@ -48,13 +49,16 @@ function sentBody(): Record<string, unknown> {
 beforeEach(() => { configureExpectedUserId('user-rock'); });
 afterEach(() => { configureExpectedUserId(null); vi.clearAllMocks(); });
 
+/** The Desk every mint in this file selects; asserted to reach the request body. */
+const TEST_DESK_ID = 'desk-test-1';
+
 describe('controlled-node remote install link', () => {
   it('asks the server for a remote-link ticket and returns a pasteable URL', async () => {
     apiFetch.mockResolvedValueOnce(ticketResponse({
       delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
       expiresAt: null,
     }));
-    const link = await mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' });
+    const link = await mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
 
     expect(sentBody().delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK);
     expect(link.ticketId).toBe('ticket-1');
@@ -66,7 +70,7 @@ describe('controlled-node remote install link', () => {
     apiFetch.mockResolvedValueOnce(ticketResponse({
       delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
     }));
-    const { url } = await mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' });
+    const { url } = await mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
     const parsed = new URL(url);
     // A query string would reach the server, and from there access logs and
     // Referer headers. The fragment never leaves the browser.
@@ -75,36 +79,66 @@ describe('controlled-node remote install link', () => {
     expect(`${parsed.origin}${parsed.pathname}`).not.toContain('raw-ticket-value');
   });
 
+  it('sends the selected Desk on every mint path and refuses to mint without one', async () => {
+    // R4 audit P0: the server made teamId mandatory while this client still
+    // omitted it, so every production mint returned 400. The server tests could
+    // not catch that -- they called the route directly with a Desk. This asserts
+    // the actual client boundary instead.
+    apiFetch.mockResolvedValueOnce(ticketResponse());
+    await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
+    expect(sentBody()).toMatchObject({ teamId: TEST_DESK_ID });
+
+    apiFetch.mockResolvedValueOnce(ticketResponse({
+      delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK, expiresAt: null,
+    }));
+    await mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
+    expect(sentBody()).toMatchObject({ teamId: TEST_DESK_ID });
+
+    apiFetch.mockResolvedValueOnce(ticketResponse({
+      delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+      installCommand: 'curl -fsSL https://example.test/i | sh',
+    }));
+    await mintControlledNodeInstallCommand({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
+    expect(sentBody()).toMatchObject({ teamId: TEST_DESK_ID });
+
+    // A blank Desk is refused before any request is sent, so a caller cannot
+    // fall back to "no Desk" and let the server decide.
+    const callsBefore = apiFetch.mock.calls.length;
+    await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, '   '))
+      .rejects.toThrow('controlled_node_desk_required');
+    expect(apiFetch.mock.calls.length, 'no request may leave the client').toBe(callsBefore);
+  });
+
   it('omits the delivery key entirely for the default, so older servers still mint', async () => {
     // The server body schema is strict; sending `delivery: 'browser'` to a
     // deployment that predates the field would be rejected outright.
     apiFetch.mockResolvedValueOnce(ticketResponse());
-    await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' });
+    await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
     expect(Object.hasOwn(sentBody(), 'delivery')).toBe(false);
   });
 
   it('treats a response with no delivery as the short browser window', async () => {
     apiFetch.mockResolvedValueOnce(ticketResponse());
-    const ticket = await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' });
+    const ticket = await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
     expect(ticket.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.BROWSER);
   });
 
   it('does not let an unrecognized delivery widen the reported lifetime', async () => {
     apiFetch.mockResolvedValueOnce(ticketResponse({ delivery: 'forever' }));
-    const ticket = await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' });
+    const ticket = await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
     expect(ticket.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.BROWSER);
   });
 
   it('accepts a null expiry only for an explicitly stable remote link', async () => {
     apiFetch.mockResolvedValueOnce(ticketResponse({ expiresAt: null }));
-    await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }))
+    await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, TEST_DESK_ID))
       .rejects.toThrow('invalid_ticket_response');
 
     apiFetch.mockResolvedValueOnce(ticketResponse({
       delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
       expiresAt: null,
     }));
-    await expect(mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' }))
+    await expect(mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' }, TEST_DESK_ID))
       .resolves.toMatchObject({ expiresAt: null });
   });
 

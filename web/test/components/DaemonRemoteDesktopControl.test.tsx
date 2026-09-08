@@ -13,6 +13,17 @@ import { h } from 'preact';
 import { render, cleanup, act, fireEvent } from '@testing-library/preact';
 
 const mintTicket = vi.fn(async () => ({ ticket: 'ticket_minted_value' }));
+/**
+ * One mintable Desk, auto-selected. Before R5 this call passed `serverId` where
+ * the Desk now sits; both are strings, so TypeScript could not catch it. The
+ * assertion below therefore pins the exact argument ORDER, not just presence.
+ */
+const TEST_DESK = { id: 'desk-1', name: 'Ops Desk', role: 'owner' as const };
+const listMintableDesks = vi.fn(async () => [TEST_DESK]);
+vi.mock('../../src/api.js', async (importOriginal) => ({
+  ...(await importOriginal() as Record<string, unknown>),
+  listMintableDesks: () => listMintableDesks(),
+}));
 vi.mock('../../src/api/machines.js', async (importOriginal) => ({
   ...(await importOriginal() as Record<string, unknown>),
   mintControlledNodeExecutableTicket: (...args: unknown[]) => mintTicket(...args as []),
@@ -194,13 +205,34 @@ describe('DaemonRemoteDesktopControl', () => {
 
     it('mints a ticket bound to this daemon and hands it over', async () => {
       const { view, sent } = mount(ready);
+      // The Desk list loads asynchronously and the action stays disabled until
+      // it resolves, so settle it before clicking. That disabled window is the
+      // intended fail-closed behaviour, asserted separately below.
+      await act(async () => { await Promise.resolve(); });
       fireEvent.click(view.container.querySelectorAll('button')[1]!);
       await act(async () => { await Promise.resolve(); });
-      expect(mintTicket).toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, 'server_1');
+      // Desk first, daemon second: the Desk is the authorization domain and the
+      // daemon id is only the host binding. Swapping them would enrol the
+      // machine into a Desk named after a server id.
+      expect(mintTicket).toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, TEST_DESK.id, 'server_1');
       expect(sent).toEqual([{
         type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
         ticket: 'ticket_minted_value',
       }]);
+    });
+
+    it('cannot mint before a Desk is known', async () => {
+      // Until the Desk list resolves there is no authorization domain to enrol
+      // into, so the control must not mint. Clicking in that window is a real
+      // user race, not a hypothetical.
+      mintTicket.mockClear();
+      const { view } = mount(ready);
+      const button = view.container.querySelectorAll('button')[1]!;
+      expect(button.hasAttribute('disabled')).toBe(true);
+      fireEvent.click(button);
+      expect(mintTicket).not.toHaveBeenCalled();
+      await act(async () => { await Promise.resolve(); });
+      expect(view.container.querySelectorAll('button')[1]!.hasAttribute('disabled')).toBe(false);
     });
 
     it('reports a dismissed prompt without losing the retry', async () => {

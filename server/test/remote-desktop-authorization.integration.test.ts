@@ -22,15 +22,39 @@ beforeAll(async () => {
 
 afterAll(async () => { await db.close(); });
 
+/**
+ * Desk scope: a controlled node is bound to exactly one Desk, and a share only
+ * grants access to a current member of it. These helpers therefore bind the
+ * machine and enrol the grantee, so the role/expiry/revocation contracts below
+ * are exercised on a realistic machine rather than on a legacy unbound one
+ * (which now admits nobody but its owner).
+ */
+async function seedDesk(ownerId: string): Promise<string> {
+  const teamId = `rd-desk-${ownerId}`;
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO teams (id, name, owner_id, plan, created_at)
+     VALUES ($1, 'AI Desk', $2, 'free', $3) ON CONFLICT DO NOTHING`,
+    [teamId, ownerId, now],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at)
+     VALUES ($1, $2, 'owner', $3) ON CONFLICT DO NOTHING`,
+    [teamId, ownerId, now],
+  );
+  return teamId;
+}
+
 async function createControlledNode(ownerId: string): Promise<string> {
   const serverId = `rd-ctl-${hex(6)}`;
+  const teamId = await seedDesk(ownerId);
   await db.execute(
     `INSERT INTO servers
        (id, user_id, name, token_hash, status, created_at, last_heartbeat_at,
         node_role, exec_enabled, revoked_at, ref_name, display_name, os,
-        controlled_capabilities, node_id)
+        controlled_capabilities, node_id, team_id)
      VALUES ($1,$2,'remote-desktop',$3,'online',$4,$4,$5,true,NULL,$6,
-             'Remote desktop test','win',$7::jsonb,$8)`,
+             'Remote desktop test','win',$7::jsonb,$8,$9)`,
     [
       serverId,
       ownerId,
@@ -40,6 +64,7 @@ async function createControlledNode(ownerId: string): Promise<string> {
       `rd-ref-${hex(4)}`,
       JSON.stringify([REMOTE_DESKTOP_CAPABILITY]),
       generateControlledNodeId(),
+      teamId,
     ],
   );
   await ensureCanonicalHostForServer({ db, serverId, now: Date.now() });
@@ -53,6 +78,19 @@ async function grant(
   role: 'viewer' | 'participant',
   expiresAt: number | null = null,
 ) {
+  // A grant is only effective inside the machine's Desk, so the recipient joins
+  // it here exactly as a real Desk-scoped grant would require.
+  const bound = await db.queryOne<{ team_id: string | null }>(
+    'SELECT team_id FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (bound?.team_id) {
+    await db.execute(
+      `INSERT INTO team_members (team_id, user_id, role, joined_at)
+       VALUES ($1, $2, 'member', $3) ON CONFLICT DO NOTHING`,
+      [bound.team_id, recipientId, Date.now()],
+    );
+  }
   return createOrUpdateShare(db, {
     id: `rd-share-${hex(8)}`,
     target: { kind: 'server', serverId },

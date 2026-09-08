@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
@@ -63,6 +63,14 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
   };
 });
 
+/**
+ * One mintable Desk. The panel auto-selects a single Desk and renders it next
+ * to the actions, so these tests exercise the visible-confirmation path; the
+ * multi-Desk and no-Desk paths get their own cases below.
+ */
+const TEST_DESK = { id: 'desk-1', name: 'Ops Desk', role: 'owner' as const };
+const listMintableDesks = vi.fn(async () => [TEST_DESK]);
+
 const downloadControlledNodeExecutable = vi.fn(async () => ({
   version: 2 as const,
   ticket: 'raw-ticket',
@@ -107,6 +115,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
     revokeControlledNodeRemoteInstallLink: (...a: unknown[]) => revokeControlledNodeRemoteInstallLink(...a),
     createControlledNodeInstallCommand: (...a: unknown[]) => createControlledNodeInstallCommand(...a),
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
+    listMintableDesks: () => listMintableDesks(),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
   };
@@ -138,6 +147,11 @@ function setViewportSize(width: number, height: number): void {
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: height });
   setViewportWidth(width);
 }
+
+// The global afterEach clears every mock, which also drops this one's
+// implementation. Re-establish it before each test so the panel can always
+// resolve a Desk; individual tests override it to exercise the other shapes.
+beforeEach(() => { listMintableDesks.mockResolvedValue([TEST_DESK]); });
 
 afterEach(() => {
   restoreExecCommand?.();
@@ -354,6 +368,7 @@ describe('ControlledNodesPanel (12.3)', () => {
       expect(beginControlledNodeDesktopDownload).toHaveBeenCalled();
       expect(downloadControlledNodeExecutable).toHaveBeenCalledWith(
         { os: 'win', arch: 'x64' },
+        TEST_DESK.id,
         expect.objectContaining({ desktopWindow: expect.anything() }),
       );
     });
@@ -376,7 +391,9 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(btn);
 
     await waitFor(() => {
-      expect(createControlledNodeRemoteInstallLink).toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+      // The selected Desk must reach the API from the real UI action.
+      expect(createControlledNodeRemoteInstallLink)
+        .toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, TEST_DESK.id);
       expect(writeText).toHaveBeenCalledWith(
         'https://im.example.test/api/enroll/v2/bootstrap#ticket=remote-raw-ticket',
       );
@@ -1125,7 +1142,8 @@ describe('ControlledNodesPanel — copy install command', () => {
     fireEvent.click(btn);
 
     await waitFor(() => expect(writeText).toHaveBeenCalled());
-    expect(createControlledNodeInstallCommand).toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+    expect(createControlledNodeInstallCommand)
+      .toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, TEST_DESK.id);
     const copied = String(writeText.mock.calls[0]?.[0] ?? '');
     // Verbatim: the UI must not reformat, wrap or truncate a command that will
     // be executed as root.
@@ -1184,5 +1202,84 @@ describe('ControlledNodesPanel — copy install command', () => {
       expect(alert?.textContent).toContain('controlled_nodes.copy_install_command_error');
     });
     expect(writeText).not.toHaveBeenCalled();
+  });
+});
+
+describe('ControlledNodesPanel Desk selection', () => {
+  const winDownloadButton = async (container: HTMLElement) => waitFor(() => {
+    const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-download-btn');
+    if (!b) throw new Error('win x64 download button not found');
+    return b;
+  });
+
+  it('refuses to mint with no Desk and guides the operator instead', async () => {
+    // Authoritative product decision: zero Desks disables the install entry and
+    // points at creating or joining one. Minting first and binding later is
+    // explicitly not allowed, because it would create a machine with no
+    // authorization domain.
+    listMintableDesks.mockResolvedValue([]);
+    downloadControlledNodeExecutable.mockClear();
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await winDownloadButton(container);
+    await waitFor(() => {
+      expect(container.textContent).toContain('controlled_nodes.desk_none');
+    });
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(container.textContent).toContain('controlled_nodes.desk_none');
+    });
+    expect(downloadControlledNodeExecutable).not.toHaveBeenCalled();
+  });
+
+  it('never defaults when several Desks exist, then uses exactly the chosen one', async () => {
+    // No default: picking an authorization domain on the operator's behalf is
+    // the failure this whole revision exists to prevent.
+    listMintableDesks.mockResolvedValue([
+      { id: 'desk-a', name: 'Desk A', role: 'owner' as const },
+      { id: 'desk-b', name: 'Desk B', role: 'admin' as const },
+    ]);
+    downloadControlledNodeExecutable.mockClear();
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await winDownloadButton(container);
+    const select = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-desk-select"]') as HTMLSelectElement | null;
+      if (!el) throw new Error('desk select not rendered');
+      return el;
+    });
+    expect(select.value, 'must not preselect a Desk').toBe('');
+
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(container.textContent).toContain('controlled_nodes.desk_required');
+    });
+    expect(downloadControlledNodeExecutable).not.toHaveBeenCalled();
+
+    select.value = 'desk-b';
+    fireEvent.input(select);
+    await waitFor(() => {
+      expect((container.querySelector('[data-testid="controlled-nodes-desk-select"]') as HTMLSelectElement).value)
+        .toBe('desk-b');
+    });
+    // Re-query: the panel re-rendered after the refusal and the selection, so the
+    // earlier node reference may no longer be the mounted button.
+    fireEvent.click(await winDownloadButton(container));
+    await waitFor(() => {
+      expect(downloadControlledNodeExecutable).toHaveBeenCalledWith(
+        { os: 'win', arch: 'x64' },
+        'desk-b',
+        expect.objectContaining({ desktopWindow: expect.anything() }),
+      );
+    });
+  });
+
+  it('shows the single Desk it auto-selected rather than choosing silently', async () => {
+    // Exactly one Desk stays one click, but the operator must be able to see
+    // which Desk that is -- visible confirmation, not a hidden default.
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="controlled-nodes-desk-single"]')?.textContent)
+        .toContain('controlled_nodes.desk_selected');
+    });
+    expect(container.querySelector('[data-testid="controlled-nodes-desk-select"]')).toBeNull();
   });
 });

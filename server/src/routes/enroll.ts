@@ -14,7 +14,7 @@ import { requireAuth } from '../security/authorization.js';
 import logger from '../util/logger.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
-import { NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
+import { ENROLLMENT_DESK_NAME_MAX_CHARS, NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
 import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-authenticode-enrollment.js';
 import { classifyMachineTarget, deriveDisplayName } from '../../../shared/machine-reference.js';
@@ -146,6 +146,14 @@ const TICKET_BODY = z
      * browser can tell the two installs are one machine and keep pointing at a
      * single entry.
      */
+    /**
+     * The Desk (team) the installed machine will belong to. Required: a
+     * controlled node is created with an authorization domain or not at all.
+     * There is deliberately no "default Desk" fallback -- an owner in one team
+     * today may be in two tomorrow, so inferring it would silently pick an
+     * authorization boundary on the user's behalf.
+     */
+    teamId: z.string().trim().min(1).max(128),
     hostServerId: z.string().min(1).max(128).optional(),
     /**
      * Omitted means the historical behaviour: a browser standing at the machine,
@@ -192,7 +200,18 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = TICKET_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
-  const { os, arch, hostServerId } = parsed.data;
+  const { os, arch, hostServerId, teamId } = parsed.data;
+  // The minting user must currently hold a managing role in the Desk they are
+  // binding the future machine to. Re-checked inside the redemption
+  // transaction as well, because membership can change between minting an
+  // installer and running it.
+  const deskMembership = await (c.env.DB as Database).queryOne<{ role: string }>(
+    `SELECT tm.role FROM team_members tm
+       JOIN teams t ON t.id = tm.team_id
+      WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
+    [teamId, userId],
+  );
+  if (!deskMembership) return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
   const delivery = parsed.data.delivery && isControlledNodeTicketDelivery(parsed.data.delivery)
     ? parsed.data.delivery
     : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
@@ -259,17 +278,18 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
          (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
           encrypted_code, encrypted_ticket, delivery, consumed_count,
           max_consumes, ticket_expires_at, expires_at, reusable, created_at,
-          host_server_id, install_code_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, NULL, NULL, TRUE, $11, $12, NULL)
+          host_server_id, install_code_hash, desk_team_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, NULL, NULL, TRUE, $11, $12, NULL, $13)
        ON CONFLICT (owner_user_id, os, arch, (COALESCE(host_server_id, '')))
          WHERE delivery = 'remote_link'
            AND revoked_at IS NULL
            AND encrypted_ticket IS NOT NULL
        DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id
+         WHERE controlled_node_enrollments_v2.desk_team_id IS NOT DISTINCT FROM EXCLUDED.desk_team_id
        RETURNING id, ticket_hash, encrypted_ticket`,
       [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
        encryptedCode, encryptedTicket, delivery, maxConsumes, now,
-       hostServerId ?? null],
+       hostServerId ?? null, teamId],
     )
     : await (c.env.DB as Database).queryOne<{
       id: string; ticket_hash: string; encrypted_ticket: string | null;
@@ -278,14 +298,36 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
          (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
           encrypted_code, encrypted_ticket, delivery, consumed_count,
           max_consumes, ticket_expires_at, expires_at, reusable, created_at,
-          host_server_id, install_code_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, 0, $9, $10, NULL, TRUE, $11, $12, $13)
+          host_server_id, install_code_hash, desk_team_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, 0, $9, $10, NULL, TRUE, $11, $12, $13, $14)
        RETURNING id, ticket_hash, encrypted_ticket`,
       [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
        encryptedCode, delivery, maxConsumes, ticketExpiresAt, now,
-       hostServerId ?? null, installCodeHash],
+       hostServerId ?? null, installCodeHash, teamId],
     );
   if (!inserted) {
+    // R4 audit P1: the stable remote-link identity is
+    // (owner_user_id, os, arch, host_server_id) and does NOT include the Desk.
+    // Reusing it for a different Desk used to return the existing ticket with
+    // its ORIGINAL desk_team_id, so the UI reported the new selection while the
+    // install still landed in the old Desk. The conflict guard above now
+    // refuses that update, and the request is rejected rather than answered
+    // with a ticket that binds somewhere else. Rotating silently would be worse:
+    // links already handed out for the first Desk would change meaning.
+    const crossDesk = await (c.env.DB as Database).queryOne<{ desk_team_id: string | null }>(
+      `SELECT desk_team_id FROM controlled_node_enrollments_v2
+        WHERE owner_user_id = $1 AND os = $2 AND arch = $3
+          AND COALESCE(host_server_id, '') = COALESCE($4, '')
+          AND delivery = 'remote_link' AND revoked_at IS NULL AND encrypted_ticket IS NOT NULL`,
+      [userId, os, arch, hostServerId ?? null],
+    ).catch(() => null);
+    if (crossDesk && crossDesk.desk_team_id !== teamId) {
+      return c.json({
+        error: 'conflict',
+        reason: 'desk_conflict',
+        boundTeamId: crossDesk.desk_team_id,
+      }, 409);
+    }
     return c.json({ error: 'ticket_mint_failed' }, 500);
   }
 
@@ -803,9 +845,25 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
 
   const filename = v.descriptor.filename;
   const actualSize = v.descriptor.sizeBytes;
+  // Name the Desk on the consent screen. Read from the ticket's bound Desk
+  // rather than anything the caller supplies, and truncated because the trailer
+  // body has a hard byte ceiling that a long team name could otherwise breach,
+  // which would fail the whole download. Absent/blank degrades to the unnamed
+  // wording rather than blocking the install.
+  const deskRow = await (c.env.DB as Database).queryOne<{ name: string | null }>(
+    `SELECT t.name FROM controlled_node_enrollments_v2 e
+       JOIN teams t ON t.id = e.desk_team_id
+      WHERE e.id = $1`,
+    [reservation.ticketId],
+  ).catch(() => null);
+  const deskName = deskRow?.name?.trim().slice(0, ENROLLMENT_DESK_NAME_MAX_CHARS) || undefined;
   let trailer: Buffer;
   try {
-    trailer = encodeEnrollmentTrailer({ serverUrl, enrollToken: enrollCode });
+    trailer = encodeEnrollmentTrailer({
+      serverUrl,
+      enrollToken: enrollCode,
+      ...(deskName ? { deskName } : {}),
+    });
   } catch {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'enrollment_trailer_failed' }, 500);
@@ -1571,6 +1629,16 @@ const REDEEM_BODY = z
   })
   .strict();
 
+/**
+ * Defence in depth for the one invariant this scope cannot lose: a controlled
+ * node is never created without a Desk. Redemption already denies a Desk-less
+ * ticket before reaching here, so raising this means a new caller bypassed that
+ * check and must fail loudly rather than silently create an unbound machine.
+ */
+class ControlledNodeDeskRequiredError extends Error {
+  constructor() { super('controlled_node_desk_required'); }
+}
+
 async function insertControlledServer(
   tx: Database,
   serverId: string,
@@ -1581,11 +1649,17 @@ async function insertControlledServer(
   arch: string,
   hostServerId: string | null = null,
   secureRandomBytes?: SecureRandomBytes,
+  teamId?: string | null,
 ): Promise<{ nodeId: string; displayName: string }> {
   const displayName = deriveDisplayName(hostname, os);
+  // Redemption without a Desk is refused rather than downgraded to the old
+  // personal/direct-share shape. A ticket minted before Desk scope carries
+  // desk_team_id NULL and simply cannot create a machine any more.
+  if (!teamId?.trim()) throw new ControlledNodeDeskRequiredError();
   const input = {
     serverId,
     userId,
+    teamId,
     tokenHash,
     displayName,
     refName: null,
@@ -1636,10 +1710,11 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         os: string;
         arch: string;
         host_server_id: string | null;
+        desk_team_id: string | null;
       }>(
         `SELECT id, owner_user_id, expires_at, reusable, revoked_at,
                 used_at, redeemed_server_id, host_server_id,
-                install_id, node_token_hash, os, arch
+                install_id, node_token_hash, os, arch, desk_team_id
            FROM controlled_node_enrollments_v2
           WHERE code_hash = $1
           FOR UPDATE`,
@@ -1647,6 +1722,10 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       );
       if (!row) return { kind: 'denied' as const };
       if (row.revoked_at != null) return { kind: 'denied' as const };
+      // Tickets minted before Desk scope carry no Desk. They are denied, not
+      // downgraded: falling back to the personal/direct-share model is exactly
+      // the behaviour this boundary replaces.
+      if (!row.desk_team_id) return { kind: 'denied' as const };
       if (!row.reusable && (row.expires_at == null || Number(row.expires_at) <= now)) {
         return { kind: 'denied' as const };
       }
@@ -1706,11 +1785,29 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       );
       if (reusedToken) return { kind: 'mismatch' as const, ticketId: row.id };
 
+      // R4 audit P0: mint-time authority is not enough. A ticket is a durable
+      // bearer, so between minting and redeeming, the owner may have been
+      // removed from the Desk or downgraded out of a managing role. Without
+      // this re-read a stale installer still enrols a new SYSTEM-capable node
+      // into a Desk its holder no longer administers.
+      //
+      // Deliberately placed AFTER the idempotent branch above: replaying an
+      // install that already produced a node returns that same node and grants
+      // nothing new, so it must keep working. Creating a NEW node is the act
+      // that needs current authority.
+      const deskAuthority = await tx.queryOne<{ role: string }>(
+        `SELECT tm.role FROM team_members tm
+          WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
+        [row.desk_team_id, row.owner_user_id],
+      );
+      if (!deskAuthority) return { kind: 'denied' as const };
+
       const serverId = randomHex(16);
       const { nodeId, displayName } = await insertControlledServer(
         tx, serverId, row.owner_user_id, nodeTokenHash, hostname, os, arch,
         row.host_server_id,
         dependencies.controlledNodeIdRandomBytes,
+        row.desk_team_id,
       );
       await tx.execute(
         `INSERT INTO controlled_node_enrollment_installs

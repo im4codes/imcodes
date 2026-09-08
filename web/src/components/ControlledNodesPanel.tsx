@@ -6,7 +6,9 @@ import {
   createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
+  listMintableDesks,
   revokeControlledNodeRemoteInstallLink,
+  type TeamSummary,
 } from '../api.js';
 import {
   artifactSelectionKey,
@@ -131,6 +133,15 @@ export function ControlledNodesPanel({
   const [availLoading, setAvailLoading] = useState(true);
   const [availError, setAvailError] = useState<string | null>(null);
 
+  // Desk selection for every mint path in this panel.
+  //
+  // A controlled node is created inside exactly one Desk and the server refuses
+  // a mint without one, so the Desk is a decision the operator makes, never a
+  // default this component invents. With no mintable Desk the actions are
+  // disabled outright rather than minting something that could not be bound.
+  const [desks, setDesks] = useState<TeamSummary[]>([]);
+  const [desksLoaded, setDesksLoaded] = useState(false);
+  const [selectedDeskId, setSelectedDeskId] = useState<string>('');
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
@@ -181,6 +192,27 @@ export function ControlledNodesPanel({
   }, [t]);
 
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Guarded the same way and for the same reason as the daemon control: catch
+    // a synchronous failure without delaying the lookup by a tick.
+    try {
+      void listMintableDesks()
+        .then((rows) => {
+          if (cancelled) return;
+          setDesks(rows);
+        // Exactly one Desk auto-selects so the common case stays one click, but
+        // the chosen Desk is always rendered next to the actions, so this is a
+        // visible confirmation rather than a silent guess. More than one never
+        // defaults.
+        setSelectedDeskId(rows.length === 1 ? rows[0]!.id : '');
+        setDesksLoaded(true);
+      })
+        .catch(() => { if (!cancelled) { setDesks([]); setDesksLoaded(true); } });
+    } catch { setDesks([]); setDesksLoaded(true); }
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     const updateMobileActions = (): void => {
@@ -267,10 +299,31 @@ export function ControlledNodesPanel({
     }
   }, [manualPresenceRefresh, refreshPresence]);
 
+  /**
+   * Resolve the Desk for THIS action.
+   *
+   * The id is read once, at the moment the action starts, and passed down
+   * explicitly. Nothing later re-reads component state, so an async Desk-list
+   * refresh landing mid-flight cannot move the install to a different Desk than
+   * the one the operator saw when they clicked.
+   */
+  const takeSelectedDesk = (): string | null => {
+    const deskId = selectedDeskId.trim();
+    if (!deskId || !desks.some((desk) => desk.id === deskId)) {
+      setDownloadError(t(desks.length === 0
+        ? 'controlled_nodes.desk_none'
+        : 'controlled_nodes.desk_required'));
+      return null;
+    }
+    return deskId;
+  };
+
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
-    setDownloadingKey(key);
     setDownloadError(null);
+    const deskId = takeSelectedDesk();
+    if (!deskId) return;
+    setDownloadingKey(key);
     let desktopWindow: Window | null = null;
     if (!isNative()) {
       try {
@@ -282,7 +335,7 @@ export function ControlledNodesPanel({
       }
     }
     try {
-      const ticket = await downloadControlledNodeExecutable(target, { desktopWindow });
+      const ticket = await downloadControlledNodeExecutable(target, deskId, { desktopWindow });
       const expiresAt = ticket.expiresAt;
       if (expiresAt !== null) {
         setTicketExpiryByKey((prev) => ({ ...prev, [key]: expiresAt }));
@@ -320,10 +373,12 @@ export function ControlledNodesPanel({
   const onCopyInstallCommand = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
     if (commandKey) return;
-    setCommandKey(key);
     setDownloadError(null);
+    const deskId = takeSelectedDesk();
+    if (!deskId) return;
+    setCommandKey(key);
     try {
-      const minted = await createControlledNodeInstallCommand(target);
+      const minted = await createControlledNodeInstallCommand(target, deskId);
       const copied = await new Promise<boolean>((resolve) => {
         copyToClipboard(minted.command, () => resolve(true), () => resolve(false));
       });
@@ -350,10 +405,12 @@ export function ControlledNodesPanel({
   const onCopyInstallLink = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
     if (linkingKey) return;
-    setLinkingKey(key);
     setDownloadError(null);
+    const deskId = takeSelectedDesk();
+    if (!deskId) return;
+    setLinkingKey(key);
     try {
-      const link = await createControlledNodeRemoteInstallLink(target);
+      const link = await createControlledNodeRemoteInstallLink(target, deskId);
       const copied = await new Promise<boolean>((resolve) => {
         copyToClipboard(link.url, () => resolve(true), () => resolve(false));
       });
@@ -839,6 +896,31 @@ export function ControlledNodesPanel({
         {showEmptyCatalog && (
           <p class="controlled-nodes-muted">{t('controlled_nodes.no_executables')}</p>
         )}
+        <div class="controlled-nodes-desk-select">
+          {desksLoaded && desks.length === 0 && (
+            <p class="controlled-nodes-error" role="alert">{t('controlled_nodes.desk_none')}</p>
+          )}
+          {desks.length === 1 && (
+            <p class="controlled-nodes-muted" data-testid="controlled-nodes-desk-single">
+              {t('controlled_nodes.desk_selected', { desk: desks[0]!.name })}
+            </p>
+          )}
+          {desks.length > 1 && (
+            <label class="controlled-nodes-desk-label">
+              {t('controlled_nodes.desk_label')}
+              <select
+                data-testid="controlled-nodes-desk-select"
+                value={selectedDeskId}
+                onInput={(event) => setSelectedDeskId(event.currentTarget.value)}
+              >
+                <option value="">{t('controlled_nodes.desk_choose')}</option>
+                {desks.map((desk) => (
+                  <option key={desk.id} value={desk.id}>{desk.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
         <div class="controlled-nodes-downloads">
           {sortedTargets.map((target) => {
             const key = artifactSelectionKey(target);

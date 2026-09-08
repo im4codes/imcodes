@@ -68,6 +68,37 @@ describe('controlled-node nodeId generation', () => {
     expect(queries.every(({ params }) => params[0] === 'internal-high-entropy-id')).toBe(true);
   });
 
+  it('persists the Desk verbatim and never invents one', async () => {
+    // The Desk is an authorization domain, so this helper must store exactly
+    // what the caller decided. A blank or whitespace-only value is normalised to
+    // NULL -- an unbound machine, which admission treats as owner-only -- rather
+    // than being stored as a team id that matches nothing.
+    const captured: unknown[][] = [];
+    const tx = {
+      async queryOne(_sql: string, params: unknown[]) {
+        captured.push(params);
+        return { node_id: params.at(-1) as string };
+      },
+    } as unknown as Database;
+    const base = {
+      serverId: 'srv', userId: 'owner', tokenHash: 'hash', displayName: 'host',
+      refName: null, os: 'linux', arch: 'x64', hostServerId: null, createdAt: 1,
+    };
+    const deskOf = (params: unknown[]) => params.at(-2);
+
+    await insertControlledServerWithNodeId(tx, { ...base, teamId: 'desk-alpha' }, () => fiveBytes(0n));
+    expect(deskOf(captured[0]!)).toBe('desk-alpha');
+
+    for (const teamId of [undefined, null, '', '   ']) {
+      captured.length = 0;
+      await insertControlledServerWithNodeId(tx, { ...base, teamId }, () => fiveBytes(0n));
+      expect(deskOf(captured[0]!), `teamId=${JSON.stringify(teamId)}`).toBeNull();
+    }
+    // node_id stays the final parameter: the collision-retry contract above
+    // identifies the attempted id by position.
+    expect(captured[0]!.at(-1)).toBe('1000000000');
+  });
+
   it('fails closed after the shared bounded collision budget', async () => {
     let calls = 0;
     const tx = { queryOne: async () => null } as unknown as Database;

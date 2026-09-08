@@ -3233,7 +3233,12 @@
     "copy_install_command_pending": "Подготовка…",
     "copy_install_command_copied": "Команда скопирована",
     "copy_install_command_error": "Не удалось создать команду установки. Попробуйте ещё раз.",
-    "copy_install_command_clipboard_error": "Не удалось скопировать команду. Проверьте разрешения буфера обмена."
+    "copy_install_command_clipboard_error": "Не удалось скопировать команду. Проверьте разрешения буфера обмена.",
+    "desk_label": "AI Desk",
+    "desk_choose": "Выберите Desk…",
+    "desk_selected": "Будет добавлен в Desk: {{desk}}",
+    "desk_required": "Перед установкой выберите, к какому AI Desk присоединится этот компьютер.",
+    "desk_none": "Сначала нужен AI Desk. Создайте его или присоединитесь к существующему."
   },
   "peerAuditQuick": {
     "iconLabel": "Пир-аудит",

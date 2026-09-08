@@ -234,10 +234,28 @@ beforeAll(async () => {
   source = { serverId: `full_${hex(5)}`, token: hex(16) };
   target = { serverId: `ctl_${hex(5)}`, token: hex(16), nodeId: generateControlledNodeId() };
   await createServer(db, source.serverId, participantId, 'full', sha256(source.token));
+  // Desk scope: a controlled node is bound to exactly one Desk, and a share only
+  // grants access to a current member of it. The node is therefore created bound
+  // and the participant joined, so the cross-layer contracts below run on a
+  // realistic machine rather than a legacy unbound one (which admits nobody but
+  // its owner). No assertion below changes.
+  const deskId = `cross_desk_${hex(5)}`;
   await db.execute(
-    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, display_name, os, node_id)
-     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,NULL,'node-linux','Linux Node','linux',$6)`,
-    [target.serverId, ownerId, sha256(target.token), Date.now(), NODE_ROLE.CONTROLLED, target.nodeId],
+    `INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES ($1,'AI Desk',$2,'free',$3)`,
+    [deskId, ownerId, Date.now()],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,'owner',$3)`,
+    [deskId, ownerId, Date.now()],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,'member',$3)`,
+    [deskId, participantId, Date.now()],
+  );
+  await db.execute(
+    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, display_name, os, node_id, team_id)
+     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,NULL,'node-linux','Linux Node','linux',$6,$7)`,
+    [target.serverId, ownerId, sha256(target.token), Date.now(), NODE_ROLE.CONTROLLED, target.nodeId, deskId],
   );
   await createOrUpdateShare(db, {
     id: `share_${hex(8)}`,

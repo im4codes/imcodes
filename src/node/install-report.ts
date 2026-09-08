@@ -85,9 +85,19 @@ export function controlledNodeInstallStatus(locale: string): string {
 /** Seconds the warning stays on screen before the install proceeds. */
 export const CONTROLLED_NODE_INSTALL_WARNING_SECONDS = 30;
 
+/** Matches the enrollment trailer bound; a name is a label, never a paragraph. */
+const DESK_NAME_MAX_CHARS = 64;
+
 export interface InstallConsentFacts {
   /** Origin that will control this machine, shown so it can be checked. */
   serverUrl?: string;
+  /**
+   * Name of the AI Desk this installer binds the machine to, when the installer
+   * carries one. Optional on purpose: the consent screen runs before redemption,
+   * so the name may genuinely be unknown, and the block degrades to the
+   * unnamed-Desk wording rather than inventing or guessing one.
+   */
+  deskName?: string;
 }
 
 /**
@@ -111,11 +121,66 @@ export function controlledNodeInstallWarning(
   facts: InstallConsentFacts = {},
 ): string {
   const zh = isChinese(locale);
+  // The destination is an AI Desk, and inside it access follows the permission
+  // granted. Both halves are now what the backend actually enforces.
+  //
+  // A controlled node is bound to exactly one Desk (servers.team_id) at
+  // enrollment, which refuses to create a machine without one. Admission then
+  // requires the caller to be a current member of that Desk before any share
+  // row counts, so a grant to someone outside it -- or one written before the
+  // machine was bound -- is inert, and losing membership revokes access on the
+  // next request. Share creation refuses the same shapes up front rather than
+  // storing a row that could never grant anything.
+  //
+  // Inside the Desk, "authorized" is still not "can control": roles are
+  // owner | viewer | participant, and every control surface gates on
+  // canOperateControlledMachine, true only for owner and participant. A viewer
+  // is authorized and cannot control. Collapsing the two would overstate the
+  // cost of granting view access on the one screen where the reader is deciding
+  // exactly that.
+  //
+  // The Desk name is printed only when the installer carries one. This screen
+  // runs before redemption, so an absent name is normal and must degrade to the
+  // unnamed wording -- naming the wrong Desk here would be worse than naming
+  // none, and the product label alone must never be mistaken for a real binding.
+  // Sanitise even though the trailer decoder already does. This renderer is a
+  // plain function any caller can reach, and the one thing a scam warning can
+  // never afford is an attacker-authored line inside it that reads like the
+  // warning's own voice. Collapse to a single bounded line; control characters
+  // and line separators become spaces rather than new lines.
+  const deskName = facts.deskName
+    // eslint-disable-next-line no-control-regex
+    ?.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .slice(0, DESK_NAME_MAX_CHARS);
+  const desk = zh
+    ? [
+      '',
+      deskName
+        ? `   ▸ 把这台电脑加入 IM.codes AI Desk：${deskName}`
+        : '   ▸ 把这台电脑加入我的 IM.codes AI Desk',
+      '     只有这个 Desk 里获授权的人能访问，',
+      '     只有拿到控制权限的人能远程控制它。',
+      '     权限在 Desk 里管理，随时可以收回。',
+    ]
+    : [
+      '',
+      deskName
+        ? `   ▸ Add this computer to your IM.codes AI Desk: ${deskName}`
+        : '   ▸ Add this computer to my IM.codes AI Desk',
+      '     Only authorized people in that Desk can access it,',
+      '     and only those granted control can control it.',
+      '     Permissions are managed and revoked in the Desk.',
+    ];
   const destination = facts.serverUrl
-    ? zh
-      ? ['', `   ▸ 这台电脑将交给这个服务器的管理员：${facts.serverUrl}`]
-      : ['', `   ▸ This computer will be handed to the administrator of: ${facts.serverUrl}`]
-    : [];
+    ? [
+      ...desk,
+      ...(zh
+        ? [`     服务地址（仅用于连接同步）：${facts.serverUrl}`]
+        : [`     Server address (connection only): ${facts.serverUrl}`]),
+    ]
+    : desk;
   const lines = zh
     ? [
       RULE,

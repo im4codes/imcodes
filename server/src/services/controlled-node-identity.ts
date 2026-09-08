@@ -35,6 +35,18 @@ export function generateControlledNodeId(
 export interface InsertControlledServerInput {
   serverId: string;
   userId: string;
+  /**
+   * The Desk (team) this controlled node belongs to, and never inferred from
+   * the owner's memberships.
+   *
+   * Nullable, but only as an explicit statement of "no Desk". The enrollment
+   * path -- the only way a real installer creates a machine -- refuses a
+   * Desk-less redemption twice before reaching here, so null survives solely
+   * for the legacy administrative seam in db/queries.ts, whose controlled
+   * branch no production route calls. Such a row is unbound, which admission
+   * already treats as owner-only, so it grants nothing to anyone else.
+   */
+  teamId?: string | null;
   tokenHash: string;
   displayName: string;
   refName: string | null;
@@ -56,14 +68,15 @@ export async function insertControlledServerWithNodeId(
     const inserted = await tx.queryOne<{ node_id: string }>(
       `INSERT INTO servers
          (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled,
-          ref_name, display_name, os, arch, host_server_id, bound_with_key_id, node_id)
+          ref_name, display_name, os, arch, host_server_id, bound_with_key_id,
+          team_id, node_id)
        VALUES ($1, $2, $3, $4, 'offline', $5, 'controlled', true,
-               $6, $7, $8, $9, $10, $11, $12)
+               $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (node_id) WHERE node_role = 'controlled' DO NOTHING
        RETURNING node_id`,
       [input.serverId, input.userId, input.displayName, input.tokenHash, input.createdAt,
         input.refName, input.displayName, input.os, input.arch, input.hostServerId,
-        input.boundWithKeyId ?? null, nodeId],
+        input.boundWithKeyId ?? null, input.teamId?.trim() || null, nodeId],
     );
     if (inserted && isControlledNodeId(inserted.node_id)) return inserted.node_id;
   }

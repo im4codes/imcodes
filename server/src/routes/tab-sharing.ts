@@ -2,6 +2,8 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../env.js';
+import type { Database } from '../db/client.js';
+import { holdsControlledDeskAuthority } from '../share/machine-access.js';
 import { randomHex, signJwt } from '../security/crypto.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
@@ -159,7 +161,20 @@ async function requireShareManager(db: Env['DB'], serverId: string, userId: stri
   // Team admins may manage ordinary Tab shares, but a controlled node is a
   // personal root/SYSTEM-capable credential. Only its direct owner may grant,
   // change or revoke access to it.
-  if (server.node_role === NODE_ROLE.CONTROLLED) return server.user_id === userId;
+  // A controlled node is a personal root/SYSTEM-capable credential, so only its
+  // direct owner manages grants -- AND only while they still hold authority in
+  // the Desk it is bound to. R5 audit P0: without the second half, an owner
+  // removed from the Desk could no longer see the machine yet could still
+  // create, change and revoke other people's access to it.
+  if (server.node_role === NODE_ROLE.CONTROLLED) {
+    // Sharing management stays OUTSIDE operator authority: a Participant must
+    // never be able to grant further access. Upstream pins that contract on the
+    // owner-only statement below, which is unchanged. The Desk fence is applied
+    // in addition, never instead: an owner removed from the machine's Desk also
+    // loses the ability to hand out access to it.
+    if (!await holdsControlledDeskAuthority(db as Database, serverId, userId)) return false;
+    return server.user_id === userId;
+  }
   const role = await resolveServerRole(db, serverId, userId);
   return role === 'owner' || role === 'admin';
 }
@@ -375,6 +390,54 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
   if (!targetUser) return c.json({ error: 'invalid_body', reason: 'target_user_unavailable' }, 400);
   const targetUserId = targetUser.id;
   if (targetUserId === userId) return c.json({ error: 'invalid_body', reason: 'self_share_denied' }, 400);
+
+  // Desk scope for controlled nodes. resolveTargetUser above matches ANY user
+  // in the instance by id or username, which is correct for ordinary Tab
+  // sharing but must not be able to hand a personal, SYSTEM-capable machine to
+  // someone outside its Desk. Admission (machine-access.ts) already refuses
+  // such a grant, so without this check the API would cheerfully write a row
+  // that can never grant anything -- an owner would believe they had shared the
+  // machine when they had not. Refusing at write time keeps the stored state
+  // and the effective state the same thing.
+  const controlledTarget = await c.env.DB.queryOne<{ team_id: string | null }>(
+    `SELECT team_id FROM servers WHERE id = $1 AND node_role = $2 AND revoked_at IS NULL`,
+    [serverId, NODE_ROLE.CONTROLLED],
+  );
+  if (controlledTarget) {
+    // An unbound machine has no Desk to share within; bind it first.
+    if (!controlledTarget.team_id) {
+      await auditShareLifecycle(c, {
+        actionType: 'share.create',
+        decision: 'rejected',
+        actorUserId: userId,
+        targetUserId,
+        target: normalizedTarget,
+        // SHARE_DENIAL_REASONS is the canonical cross-surface vocabulary and a
+        // Desk refusal is precisely "this target is not available to that
+        // user"; the exact cause travels in the response below rather than
+        // widening a shared enum from here.
+        reason: 'share-target-unavailable',
+        createdAt: now,
+      });
+      return c.json({ error: 'forbidden', reason: 'desk_unbound' }, 403);
+    }
+    const targetMembership = await c.env.DB.queryOne<{ present: number }>(
+      `SELECT 1 AS present FROM team_members WHERE team_id = $1 AND user_id = $2`,
+      [controlledTarget.team_id, targetUserId],
+    );
+    if (!targetMembership) {
+      await auditShareLifecycle(c, {
+        actionType: 'share.create',
+        decision: 'rejected',
+        actorUserId: userId,
+        targetUserId,
+        target: normalizedTarget,
+        reason: 'share-target-unavailable',
+        createdAt: now,
+      });
+      return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
+    }
+  }
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'invalid_body', reason: 'share-target-unavailable' }, 400);
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import { listMintableDesks, type TeamSummary } from '../api.js';
 import { useTranslation } from 'react-i18next';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import {
@@ -71,6 +72,32 @@ export function DaemonRemoteDesktopControl({
   const [loginScreen, setLoginScreen] = useState<
     { state: RemoteDesktopLoginScreenState; error?: string } | null
   >(null);
+  // Desk selection for the login-screen installer.
+  //
+  // This mint enrols a NEW controlled node, so it needs an explicit Desk just
+  // like the panel flows. Note the shape of the bug this replaces: the call
+  // used to pass `serverId` positionally where `teamId` now sits, and because
+  // both are strings TypeScript accepted it silently. The Desk is therefore
+  // resolved and validated against the fetched list before any mint.
+  const [desks, setDesks] = useState<TeamSummary[]>([]);
+  const [selectedDeskId, setSelectedDeskId] = useState<string>('');
+  useEffect(() => {
+    let cancelled = false;
+    // try/catch, not an extra microtask: a synchronous failure here (module
+    // unavailable in an embedding surface) must not tear down the toolbar, but
+    // deferring the lookup by a tick would open a window where a fast click
+    // finds no Desk yet and is refused for the wrong reason.
+    try {
+      void listMintableDesks()
+        .then((rows) => {
+          if (cancelled) return;
+          setDesks(rows);
+          setSelectedDeskId(rows.length === 1 ? rows[0]!.id : '');
+        })
+        .catch(() => { if (!cancelled) setDesks([]); });
+    } catch { setDesks([]); }
+    return () => { cancelled = true; };
+  }, []);
   const [fetched, setFetched] = useState<readonly MachineListItem[]>([]);
 
   useEffect(() => {
@@ -145,15 +172,26 @@ export function DaemonRemoteDesktopControl({
         <button
           class="view-toggle daemon-remote-desktop-btn"
           style={failed ? { color: '#f87171', borderColor: '#7f1d1d' } : undefined}
-          disabled={installing}
+          data-desk-id={selectedDeskId || undefined}
+          disabled={installing || !selectedDeskId}
           title={failed
             ? t(`remote_desktop.login_screen_error_${loginScreen?.error ?? 'download_failed'}`, {
               defaultValue: t('remote_desktop.login_screen_failed'),
             })
             : t('remote_desktop.login_screen_hint')}
           onClick={() => {
+            // Read the Desk once, here, and validate it against the loaded
+            // list; an async refresh cannot move this install afterwards.
+            const deskId = selectedDeskId.trim();
+            if (!deskId || !desks.some((desk) => desk.id === deskId)) {
+              setLoginScreen({
+                state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+                error: 'download_failed',
+              });
+              return;
+            }
             setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
-            void mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, serverId)
+            void mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, deskId, serverId)
               .then((minted) => {
                 ws?.send({
                   type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,

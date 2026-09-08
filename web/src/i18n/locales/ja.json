@@ -3233,7 +3233,12 @@
     "copy_install_command_pending": "準備中…",
     "copy_install_command_copied": "コマンドをコピーしました",
     "copy_install_command_error": "インストールコマンドを作成できませんでした。もう一度お試しください。",
-    "copy_install_command_clipboard_error": "コマンドをコピーできませんでした。クリップボードの権限を確認してください。"
+    "copy_install_command_clipboard_error": "コマンドをコピーできませんでした。クリップボードの権限を確認してください。",
+    "desk_label": "AI Desk",
+    "desk_choose": "Desk を選択…",
+    "desk_selected": "この Desk に追加されます：{{desk}}",
+    "desk_required": "インストール前に、このコンピューターが参加する AI Desk を選択してください。",
+    "desk_none": "コンピューターを追加するには AI Desk が必要です。作成するか参加してください。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

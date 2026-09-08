@@ -118,12 +118,17 @@ async function warnBeforeInstall(): Promise<boolean> {
   // Read straight off this installer's own trailer: the origin the human is
   // about to hand the machine to is the one fact they can independently check,
   // and a tail read must never be able to fail the install.
-  const serverUrl = await readEnrollmentBlob(process.execPath)
-    .then((blob) => blob?.serverUrl)
-    .catch(() => undefined);
+  const blob = await readEnrollmentBlob(process.execPath).catch(() => null);
+  const serverUrl = blob?.serverUrl;
+  // Naming the exact Desk is strictly better than the product label alone, but
+  // only when the installer actually carries it: an older installer has no name
+  // and the consent block degrades to its unnamed wording rather than implying
+  // a binding it cannot evidence.
+  const deskName = blob?.deskName?.trim() || undefined;
   const locale = installerLocale();
   process.stdout.write(`${controlledNodeInstallWarning(locale, {
     ...(serverUrl ? { serverUrl } : {}),
+    ...(deskName ? { deskName } : {}),
   })}\n`);
 
   const interactive = Boolean(process.stdin.isTTY);

@@ -1937,6 +1937,8 @@ export function controlledNodeDownloadErrorKey(err: unknown): string {
         return 'controlled_nodes.auth_identity_changed';
       case CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED:
         return 'controlled_nodes.auth_identity_expectation_required';
+      case CONTROLLED_NODE_DESK_REQUIRED:
+        return 'controlled_nodes.desk_required';
       default:
         break;
     }
@@ -1951,6 +1953,8 @@ export function controlledNodeDownloadErrorKey(err: unknown): string {
 
 export async function downloadControlledNodeExecutable(
   selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  /** The Desk chosen for THIS action; never read back from shared state. */
+  teamId: string,
   opts: ControlledNodeDownloadOptions = {},
 ): Promise<import('./api/machines.js').ControlledNodeExecutableTicket> {
   const { mintControlledNodeExecutableTicket, buildControlledNodeBootstrapUrl } = await import('./api/machines.js');
@@ -1959,7 +1963,7 @@ export async function downloadControlledNodeExecutable(
   if (!nativeRuntime && !desktopWindow) throw new Error('desktop_window_required');
 
   try {
-    const ticket = await mintControlledNodeExecutableTicket(selection);
+    const ticket = await mintControlledNodeExecutableTicket(selection, teamId);
     const url = buildControlledNodeBootstrapUrl(ticket.ticket);
     if (nativeRuntime) {
       const { Browser } = await import('@capacitor/browser');
@@ -1984,10 +1988,11 @@ export async function downloadControlledNodeExecutable(
  */
 export async function createControlledNodeRemoteInstallLink(
   selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  teamId: string,
   hostServerId?: string,
 ): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
   const { mintControlledNodeRemoteInstallLink } = await import('./api/machines.js');
-  return mintControlledNodeRemoteInstallLink(selection, hostServerId);
+  return mintControlledNodeRemoteInstallLink(selection, teamId, hostServerId);
 }
 
 export async function revokeControlledNodeRemoteInstallLink(
@@ -2000,10 +2005,11 @@ export async function revokeControlledNodeRemoteInstallLink(
 
 export async function createControlledNodeInstallCommand(
   selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  teamId: string,
   hostServerId?: string,
 ): Promise<{ command: string; expiresAt: number; ticketId: string }> {
   const { mintControlledNodeInstallCommand } = await import('./api/machines.js');
-  return mintControlledNodeInstallCommand(selection, hostServerId);
+  return mintControlledNodeInstallCommand(selection, teamId, hostServerId);
 }
 
 export async function previewAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
@@ -2017,6 +2023,16 @@ export async function previewAttachment(serverId: string, attachmentId: string, 
   window.open(url, '_blank');
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
+
+/**
+ * Thrown when a mint is attempted without an explicit Desk.
+ *
+ * Declared HERE, not in api/machines.ts, on purpose: machines.ts already
+ * imports from this module, so defining it there and importing it back would
+ * close a static import cycle and leave these exports undefined during module
+ * initialisation -- which took the whole app shell down, not just this feature.
+ */
+export const CONTROLLED_NODE_DESK_REQUIRED = 'controlled_node_desk_required';
 
 export interface TeamSummary {
   id: string;
@@ -2127,6 +2143,18 @@ export interface SharedContextDiagnosticsView {
 
 export interface SharedContextRuntimeConfigView {
   snapshot: SharedContextRuntimeConfigSnapshot;
+}
+
+/**
+ * The Desks this user can enrol a machine into.
+ *
+ * Minting requires a managing role server-side, so a Desk the user merely
+ * belongs to is filtered out here rather than offered and then rejected with a
+ * 403. Returning fewer choices is the fail-closed direction.
+ */
+export async function listMintableDesks(): Promise<TeamSummary[]> {
+  const teams = await listTeams();
+  return teams.filter((team) => team.role === 'owner' || team.role === 'admin');
 }
 
 export async function listTeams(): Promise<TeamSummary[]> {

@@ -41,6 +41,7 @@ import {
   getApiBaseUrl,
   getExpectedUserId,
   type AttachmentRefResponse,
+  CONTROLLED_NODE_DESK_REQUIRED,
 } from '../api.js';
 
 export type { ControlledNodeArtifactArch, ControlledNodeOs };
@@ -387,6 +388,14 @@ export async function listAvailableExecutableOses(): Promise<string[]> {
 export async function mintControlledNodeExecutableTicket(
   selection: ControlledNodeArtifactSelection,
   /**
+   * The AI Desk this machine will be enrolled into. Required, and required as a
+   * positional argument on purpose: the server rejects a mint without it, and
+   * making it optional here is exactly how R4 shipped a client that 400s on
+   * every production install path. There is deliberately no default -- the Desk
+   * is an authorization domain and must be an explicit choice by the operator.
+   */
+  teamId: string,
+  /**
    * The daemon whose machine this install is for, when enrolling to give that
    * machine login-screen control. Recorded on the enrolment so both installs are
    * known to share a machine and the browser keeps offering one entry.
@@ -405,6 +414,9 @@ export async function mintControlledNodeExecutableTicket(
   if (!expectedOwnerUserId) {
     throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED);
   }
+  // Fail here rather than sending a request the server will reject, and rather
+  // than letting an untyped caller slip through with an empty string.
+  if (!teamId.trim()) throw new Error(CONTROLLED_NODE_DESK_REQUIRED);
   const res = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -412,6 +424,7 @@ export async function mintControlledNodeExecutableTicket(
       version: 2,
       os: selection.os,
       arch: selection.arch,
+      teamId,
       ...(hostServerId ? { hostServerId } : {}),
       // Omitted for the default so an older server, which rejects unknown keys
       // with its strict body schema, keeps working unchanged.
@@ -440,10 +453,11 @@ export function buildControlledNodeBootstrapUrl(ticket: string): string {
  */
 export async function mintControlledNodeInstallCommand(
   selection: ControlledNodeArtifactSelection,
+  teamId: string,
   hostServerId?: string,
 ): Promise<{ command: string; expiresAt: number; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(
-    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+    selection, teamId, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
   );
   if (!minted.installCommand) throw new Error('install_command_unsupported');
   if (minted.expiresAt === null) throw new Error('invalid_ticket_response');
@@ -465,10 +479,11 @@ export async function mintControlledNodeInstallCommand(
  */
 export async function mintControlledNodeRemoteInstallLink(
   selection: ControlledNodeArtifactSelection,
+  teamId: string,
   hostServerId?: string,
 ): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(
-    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+    selection, teamId, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
   );
   return {
     url: buildControlledNodeBootstrapUrl(minted.ticket),
