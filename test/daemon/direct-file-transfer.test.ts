@@ -1154,6 +1154,11 @@ describe('daemon direct file transfer v2 lease broker', () => {
       state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED,
       error: DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
     })));
+    // The terminal control frame is emitted before asynchronous transfer
+    // resource cleanup finishes. Under the full macOS suite the unlink can
+    // therefore complete a few ticks after the terminal becomes observable.
+    // Wait for the cleanup postcondition instead of racing that unlink.
+    await vi.waitFor(() => expect(existsSync(storedPath)).toBe(false));
     await expect(readFile(storedPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await direct.shutdownDirectFileTransfers();
   });
