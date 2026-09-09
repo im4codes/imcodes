@@ -698,6 +698,9 @@ function closeOrRetireNative(resource: { close(): void } | null | undefined): vo
       retiredResources: retiredNativeResources.length,
       activeAttempts: activeAttempts.size,
     });
+    // Declare intent before dying: the parent sees only a SIGKILL otherwise and
+    // would charge this healthy recycle to the crash-backoff counter.
+    post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING });
     requestHardRecycle?.();
     return;
   }
@@ -717,6 +720,7 @@ function scheduleNativeRecycleWhenIdle(): void {
   nativeRecycleTimer = setTimeout(() => {
     nativeRecycleTimer = null;
     if (!requestHardRecycle || nativeAdmissionClosed || activeAttempts.size > 0 || leases.size > 0) return;
+    post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING });
     requestHardRecycle();
   }, 0);
   nativeRecycleTimer.unref?.();
@@ -1001,6 +1005,15 @@ async function closeLease(lease: DirectLease, cancelActive: boolean): Promise<vo
   lease.idleTimer = null;
   const key = leaseKey(lease.binding.leaseId, lease.binding.leaseGeneration);
   if (leases.get(key) === lease) leases.delete(key);
+  // Tell the main thread to forget this lease. It remembers every established
+  // lease so it can notify the browser when a generation dies holding one; a
+  // lease that ended normally must not stay on that list, and only this side
+  // knows it ended.
+  post({
+    type: DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED,
+    leaseId: lease.binding.leaseId,
+    leaseGeneration: lease.binding.leaseGeneration,
+  });
   const run = Promise.resolve().then(async () => {
     directFileMetric('lease_evicted', { activeAttempts: lease.activeAttempts.size, canceled: cancelActive });
     if (cancelActive) {

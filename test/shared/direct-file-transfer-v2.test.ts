@@ -24,6 +24,9 @@ import {
   validateDirectFileTransferDataMessage,
   validateDirectFileTransferResumeTicketClaims,
   validateDirectFileTransferServerMessage,
+  DIRECT_FILE_TRANSFER_OPERATION_STATE,
+  isDirectFileTransferOperationDischarged,
+  isDirectFileTransferTerminalShapedOperationMessage,
 } from '../../shared/direct-file-transfer.js';
 
 const serverId = 'server-12345678';
@@ -386,5 +389,51 @@ describe('direct file transfer v2 shared protocol', () => {
       .toBe(DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL);
     expect(classifyDirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, 3))
       .toBe(DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL);
+  });
+});
+
+describe('operation discharge vs terminal wire shape', () => {
+  // The consumer-impact checklist made concrete: these two predicates answer
+  // different questions and must differ on EXACTLY one state. Conflating them
+  // is what appended idleExpiresAt to a not_found frame and got it discarded.
+  const status = (state: string) => ({ type: DIRECT_FILE_TRANSFER_MSG.STATUS, state });
+
+  it('differ on exactly not_found, and agree everywhere else', () => {
+    const disagreements = Object.values(DIRECT_FILE_TRANSFER_OPERATION_STATE).filter((state) => (
+      isDirectFileTransferOperationDischarged(status(state))
+        !== isDirectFileTransferTerminalShapedOperationMessage(status(state))
+    ));
+    expect(disagreements).toEqual([DIRECT_FILE_TRANSFER_OPERATION_STATE.NOT_FOUND]);
+  });
+
+  it('the shape predicate matches what the validator will actually accept', () => {
+    // The reverse assertion: for every state, "terminal-shaped" must agree with
+    // whether the shared validator requires idleExpiresAt on that STATUS.
+    for (const state of Object.values(DIRECT_FILE_TRANSFER_OPERATION_STATE)) {
+      const base = {
+        type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: 'daemon-0001',
+        browserTabId: 'browser-tab-0001',
+        leaseId: 'lease-0001',
+        leaseGeneration: 1,
+        daemonGeneration: 1,
+        requestId: 'request-0001',
+        attemptId: 'attempt-0001',
+        attempt: 1,
+        direction: 'upload',
+        operationId: 'operation-0001',
+        state,
+      };
+      const shaped = isDirectFileTransferTerminalShapedOperationMessage(base);
+      expect(
+        validateDirectFileTransferServerMessage({ ...base, idleExpiresAt: Date.now() + 60_000 }).ok,
+        `idleExpiresAt is accepted for ${state} iff it is terminal-shaped`,
+      ).toBe(shaped);
+      expect(
+        validateDirectFileTransferServerMessage(base).ok,
+        `omitting idleExpiresAt is accepted for ${state} iff it is NOT terminal-shaped`,
+      ).toBe(!shaped);
+    }
   });
 });

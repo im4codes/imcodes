@@ -46,6 +46,7 @@ export const DIRECT_FILE_TRANSFER_MSG = {
   LEASE_INIT: 'direct_file.v2.lease_init',
   LEASE_READY: 'direct_file.v2.lease_ready',
   LEASE_PREPARED: 'direct_file.v2.lease_prepared',
+  LEASE_LOST: 'direct_file.v2.lease_lost',
   LEASE_REBIND: 'direct_file.v2.lease_rebind',
   LEASE_REBOUND: 'direct_file.v2.lease_rebound',
   OPERATION_INIT: 'direct_file.v2.operation_init',
@@ -452,6 +453,21 @@ export interface DirectFileTransferLeasePrepared extends DirectFileTransferLease
   requestId: string;
 }
 
+/**
+ * An established lease did not survive the daemon's transfer child.
+ *
+ * Unsolicited by construction. An idle lease has no outstanding request, so
+ * there is no requestId to answer and nothing for the lost-worker sweep to
+ * fail; the lease binding is the only identity that outlives the request that
+ * created it. Without this the browser learns its peer is gone only when its
+ * own ICE consent check finally times out, which is why a recycle that the
+ * daemon completes in milliseconds stalled clients for a median of ~57s.
+ */
+export interface DirectFileTransferLeaseLost extends DirectFileTransferLeaseBinding {
+  type: typeof DIRECT_FILE_TRANSFER_MSG.LEASE_LOST;
+  protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
+}
+
 export interface DirectFileTransferLeaseRebind {
   type: typeof DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
@@ -754,6 +770,7 @@ export type DirectFileTransferDaemonCommand =
 
 export type DirectFileTransferDaemonMessage =
   | DirectFileTransferLeasePrepared
+  | DirectFileTransferLeaseLost
   | DirectFileTransferLeaseRebound
   | DirectFileTransferLeaseAnswer
   | DirectFileTransferLeaseIce
@@ -763,6 +780,7 @@ export type DirectFileTransferDaemonMessage =
 
 export type DirectFileTransferServerMessage =
   | DirectFileTransferLeaseReady
+  | DirectFileTransferLeaseLost
   | DirectFileTransferLeaseRebound
   | DirectFileTransferAuthorized
   | DirectFileTransferLeaseAnswer
@@ -1187,6 +1205,15 @@ export function validateDirectFileTransferDaemonMessage(value: unknown): DirectF
       || !isLeaseBinding(value)) return invalid();
     return { ok: true, value: value as unknown as DirectFileTransferLeasePrepared };
   }
+  if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST) {
+    // No requestId: this message exists precisely because there is no live
+    // request to answer. Keys stay exact so it cannot be confused with a
+    // correlated reply.
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration'])
+      || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION
+      || !isLeaseBinding(value)) return invalid();
+    return { ok: true, value: value as unknown as DirectFileTransferLeaseLost };
+  }
   if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND && validateLeaseReady(value, DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND)) return { ok: true, value: value as unknown as DirectFileTransferLeaseRebound };
   if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER && isLeaseOfferOrAnswer(value, DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER)) return { ok: true, value: value as unknown as DirectFileTransferLeaseAnswer };
   if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE && isLeaseIce(value)) return { ok: true, value: value as unknown as DirectFileTransferLeaseIce };
@@ -1388,6 +1415,52 @@ export function validateDirectFileTransferDataMessage(value: unknown): DirectFil
 }
 
 /** True only for v2 message names understood by this protocol. */
+/**
+ * True only for an outcome that DISCHARGES an operation's obligation.
+ *
+ * STATUS is not automatically an answer: STATUS_QUERY deliberately reuses the
+ * active attempt's requestId, so a `streaming`/`attempting` reply carries the
+ * same correlation as the PREPARE it is reporting on. Treating that as a
+ * settlement deletes the pending failure the daemon owes that attempt if its
+ * child later dies -- and the browser keeps active attempts alive across
+ * LEASE_LOST precisely because it expects that correlated error.
+ */
+/**
+ * WIRE SHAPE: exactly the operation outcomes whose STATUS carries
+ * `idleExpiresAt`.
+ *
+ * Defined against the very `TERMINAL_STATES` set the validator uses, so the
+ * two cannot drift. Anything that decides message SHAPE -- appending
+ * idleExpiresAt, propagating a new idle window the browser can only read from
+ * that field -- must ask THIS question, never the discharge one below.
+ */
+export function isDirectFileTransferTerminalShapedOperationMessage(
+  message: { type: string; state?: unknown },
+): boolean {
+  if (message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL) return true;
+  if (message.type !== DIRECT_FILE_TRANSFER_MSG.STATUS) return false;
+  return TERMINAL_STATES.has(message.state as string);
+}
+
+/**
+ * OBLIGATION DISCHARGE: has this attempt ended, so the daemon no longer owes it
+ * a correlated failure if a child generation dies?
+ *
+ * A strictly wider question than the shape above, and the two must stay
+ * separate. `not_found` ends an attempt -- the browser answers it with a
+ * NON-RETRYABLE OPERATION_NOT_FOUND -- but its STATUS is NOT terminal-shaped:
+ * `isServerStatus` forbids `idleExpiresAt` on it. Conflating the two made the
+ * Server append that field to a not_found frame, which then failed validation
+ * and was discarded by the browser before it could reach that very branch.
+ */
+export function isDirectFileTransferOperationDischarged(
+  message: { type: string; state?: unknown },
+): boolean {
+  return isDirectFileTransferTerminalShapedOperationMessage(message)
+    || (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS
+      && message.state === DIRECT_FILE_TRANSFER_OPERATION_STATE.NOT_FOUND);
+}
+
 export function isDirectFileTransferMessageType(value: unknown): value is string {
   return typeof value === 'string' && (Object.values(DIRECT_FILE_TRANSFER_MSG) as string[]).includes(value);
 }
@@ -1401,6 +1474,7 @@ export function isLegacyDirectFileTransferMessageType(value: unknown): boolean {
 
 export function isDirectFileTransferDaemonMessageType(value: unknown): boolean {
   return value === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED
+    || value === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST
     || value === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND
     || value === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER
     || value === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE
@@ -1438,6 +1512,27 @@ export const DIRECT_FILE_TRANSFER_WORKER_MSG = {
   COMMAND: 'dft.worker.command',
   /** worker -> main: a control message to hand to that sender's transport. */
   CONTROL: 'dft.worker.control',
+  /**
+   * worker -> main: this lease is gone, forget it.
+   *
+   * The main thread has to remember every established lease so it can tell the
+   * browser when a child generation dies with it. Only the worker knows when a
+   * lease ends normally (idle TTL, explicit close), so without this the proxy
+   * registry could never shrink and would have to invent a ceiling -- and any
+   * ceiling below the worker's own unbounded `leases` map silently drops the
+   * obligation to notify whichever live lease it displaced.
+   */
+  LEASE_CLOSED: 'dft.worker.lease_closed',
+  /**
+   * worker -> main: the exit about to happen is a PLANNED retirement recycle.
+   *
+   * The child kills itself for a hard recycle, so the parent sees an ordinary
+   * SIGKILL and cannot tell a healthy, deliberate recycle from a crash. It
+   * therefore applied the escalating crash backoff to it: by the sixth recycle
+   * the replacement did not start for 3.2s, which no client retry envelope can
+   * absorb. Declaring intent is what separates the two.
+   */
+  RECYCLING: 'dft.worker.recycling',
   /** worker -> main: the worker finished booting and declares its generation. */
   READY: 'dft.worker.ready',
   /** main -> worker: begin graceful shutdown. */
@@ -1603,9 +1698,16 @@ export interface DirectFileTransferWorkerControlEnvelope extends DirectFileTrans
   emittedAt: number;
 }
 
+export interface DirectFileTransferWorkerLeaseClosedEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED;
+  leaseId: string;
+  leaseGeneration: number;
+}
+
 export interface DirectFileTransferWorkerSignalEnvelope extends DirectFileTransferWorkerEnvelopeBase {
   type:
     | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.READY
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING
     | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN
     | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REQUEST;
 }
@@ -1660,6 +1762,7 @@ export interface DirectFileTransferWorkerHostResultEnvelope extends DirectFileTr
 export type DirectFileTransferWorkerEnvelope =
   | DirectFileTransferWorkerCommandEnvelope
   | DirectFileTransferWorkerControlEnvelope
+  | DirectFileTransferWorkerLeaseClosedEnvelope
   | DirectFileTransferWorkerSignalEnvelope
   | DirectFileTransferWorkerQuiesceEnvelope
   | DirectFileTransferWorkerQuiesceResultEnvelope
@@ -1704,6 +1807,16 @@ export function validateDirectFileTransferWorkerEnvelope(
       // bounded here rather than trusted because it came from our own worker.
       if (!isWithinDirectFileTransferIpcLimits(value.message)) return undefined;
       return value as unknown as DirectFileTransferWorkerControlEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED:
+      // Fail closed on identity: forgetting the wrong lease would silently
+      // drop its loss notification, which is the exact defect this envelope
+      // exists to prevent.
+      if (!isBoundedString(value.leaseId, DIRECT_FILE_TRANSFER_LIMITS.LEASE_ID_BYTES)
+        || !IDENTIFIER_RE.test(value.leaseId)
+        || !isPositiveSafeInteger(value.leaseGeneration)) return undefined;
+      return value as unknown as DirectFileTransferWorkerLeaseClosedEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING:
+      return value as unknown as DirectFileTransferWorkerSignalEnvelope;
     case DIRECT_FILE_TRANSFER_WORKER_MSG.READY:
     case DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN:
     case DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REQUEST:

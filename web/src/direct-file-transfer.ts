@@ -232,6 +232,9 @@ type Lease = {
    */
   controlEpoch: number;
   controlAbort: AbortController;
+  /** Bounded retry of a retained warm rebuild that raced daemon recovery. */
+  warmRetryTimer: ReturnType<typeof setTimeout> | null;
+  warmRetryAttempt: number;
   unsubscribeCapability: (() => void) | null;
   unsubscribeTerminalObserver: (() => void) | null;
   active: Map<string, ActiveAttempt>;
@@ -431,6 +434,8 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     leaseSignalRequestId: null,
     controlEpoch: 0,
     controlAbort: new AbortController(),
+    warmRetryTimer: null,
+    warmRetryAttempt: 0,
     unsubscribeCapability: null,
     unsubscribeTerminalObserver: null,
     active: new Map(),
@@ -458,6 +463,7 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     void rebindLease(lease).catch(() => undefined);
   });
   lease.unsubscribeTerminalObserver = ws.onMessage((raw) => {
+    observeLeaseLost(lease, raw);
     observeLateTerminalDeadline(lease, raw);
   });
   byServer.set(serverId, lease);
@@ -591,6 +597,49 @@ function acquireLease(ws: WsClient, serverId: string): { lease: Lease; release: 
   };
 }
 
+/**
+ * Bounded retry for a retained warm rebuild that raced the daemon's recovery.
+ *
+ * LEASE_LOST is emitted the instant a child generation dies, but the daemon
+ * only spawns its replacement after its own backoff. The rebuild this triggers
+ * can therefore land inside that window and be answered `retryable`
+ * (`direct_runtime_child_recovering`). Nothing else would ever try again: the
+ * capability deliberately stays advertised -- withdrawing it would flap the
+ * whole feature during a crash loop -- and the idle timer returns early because
+ * the binding was just cleared. Without this the lease parks at NONE until an
+ * unrelated user action, which is precisely the dead window LEASE_LOST exists
+ * to remove.
+ *
+ * Bounded on purpose: a daemon that is genuinely down must not be spun against.
+ * Once the attempts are spent the lease parks as before, and the next real use
+ * or capability snapshot owns recovery.
+ */
+const RETAINED_WARM_RETRY_BASE_MS = 100;
+const RETAINED_WARM_RETRY_MAX_ATTEMPTS = 5;
+
+function clearWarmRetry(lease: Lease): void {
+  if (lease.warmRetryTimer) clearTimeout(lease.warmRetryTimer);
+  lease.warmRetryTimer = null;
+}
+
+function scheduleRetainedWarmRetry(lease: Lease, error: unknown): void {
+  clearWarmRetry(lease);
+  if (lease.prewarmRefs === 0 || lease.connectionStatus !== DIRECT_FILE_CONNECTION_STATUS.NONE) return;
+  // Only a daemon that said "try again" is retried. A terminal refusal is an
+  // answer, and repeating it would be a busy loop against a settled outcome.
+  if (!(error instanceof DirectFileTransferFailure) || !error.retryable) return;
+  if (lease.warmRetryAttempt >= RETAINED_WARM_RETRY_MAX_ATTEMPTS) return;
+  const attempt = ++lease.warmRetryAttempt;
+  // Epoch-guarded: a control invalidation that happens while this is pending
+  // owns the next rebuild itself, and this timer must not start a second one.
+  const epoch = lease.controlEpoch;
+  lease.warmRetryTimer = setTimeout(() => {
+    lease.warmRetryTimer = null;
+    if (lease.controlEpoch !== epoch || lease.prewarmRefs === 0) return;
+    warmRetainedLease(lease);
+  }, RETAINED_WARM_RETRY_BASE_MS * (2 ** (attempt - 1)));
+}
+
 function warmRetainedLease(lease: Lease): void {
   if (lease.prewarmRefs === 0 || !supportsLease(lease.ws)) return;
   // Both resolved states are stable until the control socket/network changes.
@@ -607,13 +656,16 @@ function warmRetainedLease(lease: Lease): void {
       // browser peer: node-datachannel cannot ICE-restart the still-bound
       // daemon peer, so reusing that split lease makes the real upload fail.
       if (lease.active.size === 0) clearLeaseBinding(lease);
+      lease.warmRetryAttempt = 0;
       setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
       return;
     }
+    lease.warmRetryAttempt = 0;
     setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
-  })().catch(() => {
+  })().catch((error: unknown) => {
     if (lease.active.size === 0) closePeer(lease);
     setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.NONE);
+    scheduleRetainedWarmRetry(lease, error);
   }).finally(() => {
     if (lease.warming === warming) lease.warming = null;
     armLeaseIdleTimer(lease);
@@ -747,6 +799,47 @@ function retainTerminalGrace(lease: Lease, active: ActiveAttempt): void {
  * window, so a late validated Server terminal/status/error can refresh the
  * authority's idle deadline without replaying an operation.
  */
+/**
+ * The daemon's transfer child died and took this lease's peer with it.
+ *
+ * Unsolicited by construction, so it is observed on the lease's own listener
+ * rather than a request waiter: an idle lease has no outstanding request for
+ * the daemon to answer. Acting on it immediately is the whole point -- the
+ * remote peer is already gone, so waiting out ICE consent freshness preserves
+ * nothing and cost production a median ~57s of dead direct connectivity.
+ *
+ * Binding-exact: a message for another lease, another lease generation or a
+ * superseded daemon generation must never tear down a lease that is still
+ * live, which is the failure mode that would turn this fix into an outage.
+ */
+function observeLeaseLost(lease: Lease, raw: ServerMessage): void {
+  const parsed = validateDirectFileTransferServerMessage(raw);
+  if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_MSG.LEASE_LOST) return;
+  const message = parsed.value;
+  if (message.serverId !== lease.serverId
+    || message.browserTabId !== lease.browserTabId
+    || message.leaseId !== lease.leaseId
+    || message.leaseGeneration !== lease.leaseGeneration
+    || message.daemonGeneration !== lease.daemonGeneration) return;
+  // invalidateLeaseControl keeps an in-flight byte stream's attempt binding on
+  // purpose; those attempts are failed separately by the daemon's own
+  // lost-worker sweep, which does have their request ids. Only the idle case
+  // -- the one nothing else can reach -- is rebuilt here.
+  invalidateLeaseControl(lease);
+  // A new loss is a new recovery cycle: it must not inherit a spent budget
+  // from an earlier one.
+  clearWarmRetry(lease);
+  lease.warmRetryAttempt = 0;
+  if (lease.prewarmRefs === 0) return;
+  // A warm attempt still owns `lease.warming`, and warmRetainedLease refuses to
+  // start while it does. Cancelling it above is not enough: the queued rebuild
+  // could run before that rejection propagates and bounce off the guard, so
+  // wait for the owner to actually release instead of racing it.
+  const owner = lease.warming;
+  if (owner) void owner.then(() => warmRetainedLease(lease), () => warmRetainedLease(lease));
+  else queueMicrotask(() => warmRetainedLease(lease));
+}
+
 function observeLateTerminalDeadline(lease: Lease, raw: ServerMessage): void {
   const parsed = validateDirectFileTransferServerMessage(raw);
   if (!parsed.ok) return;
@@ -1081,7 +1174,9 @@ function leaseSignalMatches(
   lease: Lease,
   requestId: string,
 ): boolean {
-  return message.requestId === requestId
+  // An unsolicited message (LEASE_LOST) has no request to correlate to and
+  // must never satisfy a waiter.
+  return 'requestId' in message && message.requestId === requestId
     && hasLeaseBinding(lease)
     && 'leaseId' in message && message.leaseId === lease.leaseId
     && message.leaseGeneration === lease.leaseGeneration
@@ -1365,7 +1460,7 @@ async function selectedPeerRoute(peer: RTCPeerConnection | null): Promise<Direct
 }
 
 function attemptMessageMatches(message: DirectFileTransferServerMessage, active: ActiveAttempt): boolean {
-  return message.requestId === active.requestId
+  return 'requestId' in message && message.requestId === active.requestId
     && 'attemptId' in message && message.attemptId === active.attemptId
     && 'operationId' in message && message.operationId === active.operationId;
 }
@@ -2415,14 +2510,33 @@ async function probeLeasePeer(
   // next offer/ICE exchange could never converge.
   const channel = lease.bootstrapChannel;
   if (!channel) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
-  await waitForChannelOpen(channel, peer, lease.controlAbort.signal);
+  // Captured once: invalidateLeaseControl REPLACES the controller, so reading
+  // lease.controlAbort later would watch the successor's signal and never see
+  // this probe's own cancellation.
+  const signal = lease.controlAbort.signal;
+  await waitForChannelOpen(channel, peer, signal);
   const nonce = crypto.randomUUID();
   const started = performance.now();
   return new Promise<DirectConnectivityProbeResult>((resolve, reject) => {
+    // Only `waitForChannelOpen` above used to observe cancellation. Once the
+    // channel was open this wait could settle on a pong or on PROBE_TIMEOUT_MS
+    // and nothing else -- so a worker recycle DURING the probe left the peer
+    // dead while this promise kept `lease.warming` owned for the full 8s, long
+    // past the window LEASE_LOST exists to close. The peer is gone; there is
+    // nothing to wait for.
+    if (signal.aborted) return reject(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+    let settled = false;
     const timer = setTimeout(() => done(directError(DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT)), DIRECT_FILE_TRANSFER_LIMITS.PROBE_TIMEOUT_MS);
+    const onAbort = () => done(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+    const onClosed = () => done(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
     const done = (error?: unknown, value?: DirectConnectivityProbeResult) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       channel.removeEventListener('message', onMessage);
+      channel.removeEventListener('close', onClosed);
+      channel.removeEventListener('error', onClosed);
+      signal.removeEventListener('abort', onAbort);
       if (error) reject(error); else resolve(value!);
     };
     const onMessage = (event: MessageEvent) => {
@@ -2439,6 +2553,9 @@ async function probeLeasePeer(
       });
     };
     channel.addEventListener('message', onMessage);
+    channel.addEventListener('close', onClosed);
+    channel.addEventListener('error', onClosed);
+    signal.addEventListener('abort', onAbort, { once: true });
     sendData(channel, {
       type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,

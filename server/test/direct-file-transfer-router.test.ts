@@ -12,6 +12,7 @@ import {
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_TERMINAL_STATE,
+  DIRECT_FILE_TRANSFER_OPERATION_STATE,
   validateDirectFileTransferServerMessage,
   type DirectFileTransferLeaseReady,
 } from '../../shared/direct-file-transfer.js';
@@ -148,6 +149,209 @@ describe('DirectFileTransferRouter v2', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.useRealTimers();
+  });
+
+
+  it('P4: a not_found status reaches the browser as a VALID frame', () => {
+    // daemon -> router -> shared validator, end to end. `not_found` discharges
+    // an attempt, so the daemon settles its obligation on it -- but its STATUS
+    // is NOT terminal-shaped: isServerStatus forbids idleExpiresAt on it.
+    // Reusing the discharge predicate as a wire-shape predicate made the router
+    // append that field, the frame failed validation, and the browser dropped
+    // it in parseMatchingControl before it could reach its own non-retryable
+    // OPERATION_NOT_FOUND branch -- leaving recovery to a 15s deadline.
+    const f = fixture();
+    const lease = readyLease(f);
+    expect(f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease))).toBe(true);
+    const authorized = f.daemonMessages.at(-1)!;
+
+    const before = f.messages(f.browserA).length;
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+      requestId: authorized.requestId,
+      attemptId: ATTEMPT_ID,
+      attempt: 1,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+      operationId: OPERATION_ID,
+      state: DIRECT_FILE_TRANSFER_OPERATION_STATE.NOT_FOUND,
+    }, lease.daemonGeneration);
+
+    const routed = f.messages(f.browserA).slice(before)
+      .find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS);
+    expect(routed, 'the not_found status must reach the browser at all').toBeDefined();
+    expect(routed, 'a not_found STATUS may not carry idleExpiresAt').not.toHaveProperty('idleExpiresAt');
+    expect(
+      validateDirectFileTransferServerMessage(routed).ok,
+      'the browser drops anything the shared validator rejects',
+    ).toBe(true);
+  });
+
+  it('P4: not_found releases its attempt route, so the next operation is still authorized', () => {
+    // Wire validity is not lifecycle discharge. The router released an attempt
+    // only for TERMINAL / ERROR / committed|canceled|failed -- an INLINE copy
+    // of the terminal-SHAPE set deciding a lifecycle question. `not_found` ends
+    // an operation, but its route survived until the two-hour authority timer,
+    // counting against MAX_ACTIVE_CHANNELS_PER_LEASE the whole time. The
+    // previous regression checked only that the frame validated, so it could
+    // not see this.
+    const f = fixture();
+    const lease = readyLease(f);
+    const cap = DIRECT_FILE_TRANSFER_LIMITS.MAX_ACTIVE_CHANNELS_PER_LEASE;
+
+    for (let i = 0; i < cap; i += 1) {
+      expect(
+        f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease, {
+          requestId: `not-found-attempt-request-${i}`,
+          attemptId: `not-found-attempt-${i}`,
+          operationId: `not-found-operation-${i}`,
+          clientUploadId: `not-found-operation-${i}`,
+        })),
+        `operation ${i} must be authorized`,
+      ).toBe(true);
+      const authorized = f.daemonMessages.at(-1)!;
+      f.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: SERVER_ID,
+        browserTabId: TAB_A,
+        leaseId: lease.leaseId,
+        leaseGeneration: lease.leaseGeneration,
+        daemonGeneration: lease.daemonGeneration,
+        requestId: authorized.requestId,
+        attemptId: `not-found-attempt-${i}`,
+        attempt: 1,
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+        operationId: `not-found-operation-${i}`,
+        state: DIRECT_FILE_TRANSFER_OPERATION_STATE.NOT_FOUND,
+      }, lease.daemonGeneration);
+    }
+
+    // Every route must have been released; a further distinct operation is
+    // admitted rather than refused as too_many_channels.
+    const before = f.messages(f.browserA).length;
+    expect(
+      f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease, {
+        requestId: 'after-not-found-request',
+        attemptId: 'after-not-found-attempt',
+        operationId: 'after-not-found-operation',
+        clientUploadId: 'after-not-found-operation',
+      })),
+      'four ended operations must not keep the lease at its channel ceiling',
+    ).toBe(true);
+    expect(
+      f.messages(f.browserA).slice(before).filter((message) => (
+        message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
+      )),
+      'no too_many_channels refusal',
+    ).toEqual([]);
+  });
+
+  it('P4: a committed status still carries idleExpiresAt and still validates', () => {
+    // The boundary assertion the consumer-impact checklist requires: narrowing
+    // the shape predicate must not stop terminal-SHAPED outcomes from carrying
+    // the field the validator requires of them.
+    const f = fixture();
+    const lease = readyLease(f);
+    expect(f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease))).toBe(true);
+    const authorized = f.daemonMessages.at(-1)!;
+
+    const before = f.messages(f.browserA).length;
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+      requestId: authorized.requestId,
+      attemptId: ATTEMPT_ID,
+      attempt: 1,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+      operationId: OPERATION_ID,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.CANCELED,
+    }, lease.daemonGeneration);
+
+    const routed = f.messages(f.browserA).slice(before)
+      .find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS);
+    expect(routed).toBeDefined();
+    expect(routed, 'a terminal-shaped STATUS must carry it').toHaveProperty('idleExpiresAt');
+    expect(validateDirectFileTransferServerMessage(routed).ok).toBe(true);
+  });
+
+  it('P4: routes a lost-lease notice to exactly its own lease socket', () => {
+    const f = fixture();
+    const leaseA = readyLease(f, f.browserA, 'user-a');
+
+    // A second live lease on another socket. LEASE_LOST carries no requestId,
+    // so nothing but the lease id can decide where it goes; cross-talk here
+    // would tear down a lease whose peer is perfectly healthy.
+    expect(f.router.handleBrowser(f.browserB, 'user-b', {
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'lease-request-2',
+      serverId: SERVER_ID,
+      browserTabId: 'browser-tab-b1',
+    })).toBe(true);
+    const prepareB = f.daemonMessages.at(-1)!;
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'lease-request-2',
+      serverId: SERVER_ID,
+      browserTabId: 'browser-tab-b1',
+      leaseId: prepareB.leaseId,
+      leaseGeneration: prepareB.leaseGeneration,
+      daemonGeneration: prepareB.daemonGeneration,
+    }, prepareB.daemonGeneration as number);
+
+    const beforeB = f.messages(f.browserB).length;
+    expect(f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: leaseA.leaseId,
+      leaseGeneration: leaseA.leaseGeneration,
+      daemonGeneration: leaseA.daemonGeneration,
+    }, leaseA.daemonGeneration)).toBe(true);
+
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      leaseId: leaseA.leaseId,
+      leaseGeneration: leaseA.leaseGeneration,
+      daemonGeneration: leaseA.daemonGeneration,
+    });
+    expect(f.messages(f.browserB), 'another lease must not be disturbed').toHaveLength(beforeB);
+  });
+
+  it('P4: drops a lost-lease notice for an unknown or superseded lease', () => {
+    const f = fixture();
+    const leaseA = readyLease(f, f.browserA, 'user-a');
+    const before = f.messages(f.browserA).length;
+    const lost = (overrides: Record<string, unknown>) => ({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: leaseA.leaseId,
+      leaseGeneration: leaseA.leaseGeneration,
+      daemonGeneration: leaseA.daemonGeneration,
+      ...overrides,
+    });
+    f.router.handleDaemon(lost({ leaseId: 'lease-that-never-existed' }), leaseA.daemonGeneration);
+    f.router.handleDaemon(lost({ browserTabId: 'browser-tab-b1' }), leaseA.daemonGeneration);
+    f.router.handleDaemon(lost({ leaseGeneration: leaseA.leaseGeneration + 1 }), leaseA.daemonGeneration);
+    // A notice stamped by a daemon generation this Server pod has moved past
+    // must not reach the browser either.
+    f.router.handleDaemon(lost({}), leaseA.daemonGeneration - 1);
+    expect(f.messages(f.browserA)).toHaveLength(before);
   });
 
   it('waits for daemon LEASE_PREPARED before ready or lease-scoped signaling', () => {

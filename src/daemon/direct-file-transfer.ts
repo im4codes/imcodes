@@ -26,10 +26,13 @@ import {
   DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
   isCurrentDirectFileTransferWorkerGeneration,
   validateDirectFileTransferDaemonCommand,
+  isDirectFileTransferOperationDischarged,
   validateDirectFileTransferDaemonMessage,
   validateDirectFileTransferWorkerEnvelope,
   type DirectConnectivityRuntimeStatus,
   type DirectFileTransferDaemonCommand,
+  type DirectFileTransferLeaseBinding,
+  type DirectFileTransferLeasePrepared,
 } from '../../shared/direct-file-transfer.js';
 import {
   spawnDirectFileTransferChild,
@@ -64,6 +67,19 @@ interface WorkerHandle {
 let handle: WorkerHandle | null = null;
 let generationCounter = 0;
 let restarts = 0;
+/**
+ * Generation whose exit was declared a planned retirement recycle.
+ *
+ * A recycle is the child killing itself on purpose, so the exit is
+ * indistinguishable from a crash at the OS boundary. Charging it to the crash
+ * counter made the replacement start later and later -- 100/200/400/800/1600/
+ * 3200ms -- while the browser is holding a lease it has just been told is dead
+ * and retrying on its own schedule. By the sixth recycle every client attempt
+ * lands before the daemon even starts the replacement, and the lease parks.
+ * Planned recycles therefore restart at the base delay and do not escalate;
+ * real crashes still do, so a crash loop cannot flap the child.
+ */
+let plannedRecycleGeneration: number | null = null;
 let shuttingDown = false;
 let restartTimer: ReturnType<typeof setTimeout> | null = null;
 let stableTimer: ReturnType<typeof setTimeout> | null = null;
@@ -84,7 +100,12 @@ let runtimeStatusProjection: DirectConnectivityRuntimeStatus = {
 const sendersById = new Map<string, FileTransferSender>();
 const idsBySender = new WeakMap<FileTransferSender, string>();
 let senderSeq = 0;
-const MAX_PROXY_SENDERS = DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY * 2;
+/**
+ * Exported so the boundary regression can drive past the REAL ceiling rather
+ * than re-deriving it; a test that hardcodes 512 stops testing anything the
+ * day this changes.
+ */
+export const MAX_PROXY_SENDERS = DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY * 2;
 
 /** Stable opaque id per transport, so the worker can address it without holding it. */
 function senderIdFor(sender: FileTransferSender): string {
@@ -173,6 +194,7 @@ export function __resetDirectFileTransferForTests(): void {
   handle = null;
   generationCounter = 0;
   restarts = 0;
+  plannedRecycleGeneration = null;
   shuttingDown = false;
   availableProjection = false;
   runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
@@ -180,6 +202,7 @@ export function __resetDirectFileTransferForTests(): void {
   senderSeq = 0;
   controlEnvelopeObserver = null;
   pendingByKey.clear();
+  establishedLeases.clear();
   claimTokensByHandle.clear();
   claimHandleSeq = 0;
   inFlightHostMutations.clear();
@@ -219,7 +242,23 @@ function postToWorker(active: WorkerHandle, envelope: Record<string, unknown>): 
 }
 
 interface PendingDispatch {
-  senderId: string;
+  /**
+   * The transport itself, not an id to look up later.
+   *
+   * `sendersById` is a bounded ROUTING INDEX: it evicts its oldest entry at
+   * MAX_PROXY_SENDERS. Resolving through it here meant a request whose id had
+   * been displaced by 512 later transports got no failure at all when its
+   * generation died -- and the sweep then cleared the obligation anyway. The
+   * browser deliberately keeps an active attempt alive across LEASE_LOST and
+   * relies on exactly this correlated error to fail it, so losing it puts that
+   * attempt back on the ICE-timeout path this whole change removes. A pending
+   * lease that was never established gets neither signal, which is worse.
+   *
+   * Same fix as `establishedLeases`, applied to its sibling: reachability lasts
+   * as long as the obligation, and the obligation is already bounded here by
+   * OPERATION_LEDGER_CAPACITY.
+   */
+  sender: FileTransferSender;
   failure: Record<string, unknown>;
 }
 
@@ -229,7 +268,11 @@ function pendingKey(senderId: string, requestId: string): string {
   return `${senderId}\u0000${requestId}`;
 }
 
-function rememberPending(senderId: string, command: DirectFileTransferDaemonCommand): boolean {
+function rememberPending(
+  sender: FileTransferSender,
+  senderId: string,
+  command: DirectFileTransferDaemonCommand,
+): boolean {
   // ICE is an event, not a request: the child intentionally emits no matching
   // acknowledgement. Retaining it would fill the bounded proxy ledger during
   // a long negotiation and eventually reject real work even though nothing is
@@ -240,7 +283,7 @@ function rememberPending(senderId: string, command: DirectFileTransferDaemonComm
     const key = pendingKey(senderId, requestId);
     if (!pendingByKey.has(key)
       && pendingByKey.size >= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY) return false;
-    pendingByKey.set(key, { senderId, failure: runtimeRecoveringMessage(command) });
+    pendingByKey.set(key, { sender, failure: runtimeRecoveringMessage(command) });
   }
   return true;
 }
@@ -299,10 +342,75 @@ function sendFailClosedMessage(sender: FileTransferSender, message: Record<strin
 
 function failPendingForLostWorker(): void {
   for (const pending of pendingByKey.values()) {
-    const sender = sendersById.get(pending.senderId);
-    if (sender) sendFailClosedMessage(sender, pending.failure);
+    sendFailClosedMessage(pending.sender, pending.failure);
   }
   pendingByKey.clear();
+}
+
+/**
+ * Established leases, and the transport that owns each one.
+ *
+ * `pendingByKey` cannot serve this: it is cleared the moment LEASE_PREPARED
+ * settles, which is precisely when a lease becomes established. So an idle
+ * lease has no correlated request, the lost-worker sweep above finds nothing
+ * to fail, and a child that dies holding that lease takes it away silently.
+ *
+ * The browser then discovers the loss only when its own ICE consent check
+ * expires. Production measured a median ~57s of that, against a replacement
+ * child this parent had already spawned ~200ms after the kill.
+ */
+const establishedLeases = new Map<string, { sender: FileTransferSender; binding: DirectFileTransferLeaseBinding }>();
+
+function leaseRegistryKey(leaseId: string, leaseGeneration: number): string {
+  return `${leaseId}\u0000${leaseGeneration}`;
+}
+
+function rememberEstablishedLease(sender: FileTransferSender, message: DirectFileTransferLeasePrepared): void {
+  // Deliberately uncapped, and bounded by LEASE_CLOSED instead.
+  //
+  // A ceiling here can only ever fail open: nothing else bounds live leases at
+  // any particular number -- not the worker's own `leases` map, not the
+  // Server's admission -- so evicting the oldest entry silently drops the
+  // obligation to notify a browser that still holds a working route, which is
+  // exactly the dead window this whole change removes. The worker already
+  // holds a whole PeerConnection per live lease, so one small binding record
+  // per lease is strictly cheaper than what it is willing to carry, and the
+  // worker reports every close so this map shrinks with its own.
+  // The transport is held here, not looked up later through `sendersById`.
+  // That map is a bounded routing index and evicts its oldest entry at
+  // MAX_PROXY_SENDERS; resolving through it made a lease's only route to its
+  // browser expire on an unrelated counter, so the sweep below skipped a live
+  // lease and then cleared its obligation. Reachability now lasts exactly as
+  // long as the lease does: LEASE_CLOSED and generation loss both drop it.
+  establishedLeases.set(leaseRegistryKey(message.leaseId, message.leaseGeneration), {
+    sender,
+    binding: {
+      serverId: message.serverId,
+      browserTabId: message.browserTabId,
+      leaseId: message.leaseId,
+      leaseGeneration: message.leaseGeneration,
+      daemonGeneration: message.daemonGeneration,
+    },
+  });
+}
+
+/**
+ * Tell every established lease that it did not survive this child.
+ *
+ * Lease-scoped on purpose. Withdrawing the advertised capability would be the
+ * wrong granularity: a crash loop would flap the whole feature set, and this
+ * daemon's ability to serve direct transfers is unchanged -- only these peer
+ * connections, which died with the child's address space, are gone.
+ */
+function invalidateEstablishedLeasesForLostWorker(): void {
+  for (const entry of establishedLeases.values()) {
+    sendFailClosedMessage(entry.sender, {
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...entry.binding,
+    });
+  }
+  establishedLeases.clear();
 }
 
 /* --------------------------------------------------------------------------
@@ -451,20 +559,29 @@ function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () =
     // The transport is a shared, authenticated channel to the browser. A worker
     // may only put a message on it that the daemon protocol actually describes;
     // "it is a plain object" is not the same statement.
-    if (!validateDirectFileTransferDaemonMessage(envelope.message).ok) {
+    const validated = validateDirectFileTransferDaemonMessage(envelope.message);
+    if (!validated.ok) {
       logger.warn(
         { event: 'direct_file_v2.control_rejected', messageType: (envelope.message as { type?: unknown }).type },
         'worker control message failed daemon protocol validation and was not forwarded',
       );
       return;
     }
+    // A non-terminal STATUS is NOT an answer. STATUS_QUERY deliberately reuses
+    // the active attempt's requestId, so settling on a `streaming`/`attempting`
+    // reply deleted the obligation that OPERATION PREPARE registered: a later
+    // child recycle then emitted LEASE_LOST with no correlated operation error,
+    // and the browser -- which keeps active attempts alive across LEASE_LOST
+    // exactly because it expects that error -- fell back to ICE detection.
     if (envelope.message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
-      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
       || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED
       || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER
       || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND
-      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.STATUS) {
+      || isDirectFileTransferOperationDischarged(envelope.message as { type: string; state?: unknown })) {
       settlePending(envelope.senderId, envelope.message);
+    }
+    if (validated.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED) {
+      rememberEstablishedLease(sender, validated.value);
     }
     try {
       sender.send(envelope.message);
@@ -501,6 +618,19 @@ function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () =
         }
       })
       .finally(() => finishHostMutation(active.generation, mutationClientUploadId));
+    return;
+  }
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING) {
+    // Bound to this exact generation: a late declaration from a corpse must not
+    // excuse a genuine crash of the generation that replaced it.
+    plannedRecycleGeneration = active.generation;
+    return;
+  }
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED) {
+    // A lease that ended normally is not a lease that was lost with its child.
+    establishedLeases.delete(leaseRegistryKey(envelope.leaseId, envelope.leaseGeneration));
     return;
   }
 
@@ -554,6 +684,7 @@ function failWorkerGeneration(
     if (stableTimer) clearTimeout(stableTimer);
     stableTimer = null;
     failPendingForLostWorker();
+    invalidateEstablishedLeasesForLostWorker();
     availableProjection = true;
     runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE };
     logger.warn(
@@ -584,11 +715,15 @@ function failWorkerGeneration(
 
 function scheduleWorkerRestart(code: number | null, signal: NodeJS.Signals | null, generation: number): void {
   if (shuttingDown || nativeAdmissionClosed || restartTimer) return;
-  restarts = Math.min(Number.MAX_SAFE_INTEGER, restarts + 1);
-  const delayMs = Math.min(
-    DIRECT_FILE_TRANSFER_RESTART_MAX_MS,
-    DIRECT_FILE_TRANSFER_RESTART_BASE_MS * (2 ** Math.min(7, restarts - 1)),
-  );
+  const planned = plannedRecycleGeneration === generation;
+  plannedRecycleGeneration = null;
+  if (!planned) restarts = Math.min(Number.MAX_SAFE_INTEGER, restarts + 1);
+  const delayMs = planned
+    ? DIRECT_FILE_TRANSFER_RESTART_BASE_MS
+    : Math.min(
+      DIRECT_FILE_TRANSFER_RESTART_MAX_MS,
+      DIRECT_FILE_TRANSFER_RESTART_BASE_MS * (2 ** Math.min(7, restarts - 1)),
+    );
   logger.warn(
     { event: 'direct_file_v2.child_crash', code, signal, generation, crashCount: restarts },
     'transfer child exited; daemon and sessions remain online',
@@ -731,7 +866,7 @@ export async function handleDirectFileTransferCommand(
     return false;
   }
   const senderId = senderIdFor(sender);
-  if (!rememberPending(senderId, parsed.value)) {
+  if (!rememberPending(sender, senderId, parsed.value)) {
     sendRuntimeRecovering(sender, parsed.value);
     return false;
   }

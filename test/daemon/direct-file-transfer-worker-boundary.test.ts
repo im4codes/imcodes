@@ -21,6 +21,7 @@ import {
   DIRECT_FILE_TRANSFER_RESTART_BASE_MS,
   DIRECT_FILE_TRANSFER_RESTART_MAX_MS,
   DIRECT_FILE_TRANSFER_STABLE_WINDOW_MS,
+  MAX_PROXY_SENDERS,
   getDirectConnectivityRuntimeStatus,
   handleDirectFileTransferCommand,
   isDirectFileTransferAvailable,
@@ -311,6 +312,88 @@ describe('direct file transfer worker boundary', () => {
     expect(workerGeneration()).toBe(spawned.at(-1)!.generation);
   });
 
+  it('P4: a declared retirement recycle restarts at the base delay and never escalates', async () => {
+    // The mismatch this closes. A hard recycle is the child killing ITSELF, so
+    // the parent saw an ordinary SIGKILL and charged a healthy, deliberate
+    // recycle to the crash counter: 100/200/400/800/1600/3200ms, resetting only
+    // after a 60s stable window. Meanwhile the browser has just been told its
+    // lease is dead and is retrying on its own schedule. By the sixth recycle
+    // every client attempt lands before the daemon even STARTS the replacement,
+    // so the lease parks at NONE. Production recycles roughly every 23 minutes,
+    // well inside the 60s reset, so the counter does climb.
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    ready(spawned[0]!);
+
+    for (let i = 0; i < 6; i += 1) {
+      const active = spawned.at(-1)!;
+      // The worker declares intent, exactly as closeOrRetireNative does before
+      // calling requestHardRecycle, and only then dies.
+      active.emitEnvelope({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING });
+      active.emit('exit', null, 'SIGKILL');
+
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS - 1);
+      expect(spawned, `recycle ${i + 1} must not start before the base delay`).toHaveLength(i + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(
+        spawned,
+        `recycle ${i + 1} must start AT the base delay, not an escalated one`,
+      ).toHaveLength(i + 2);
+      ready(spawned.at(-1)!);
+    }
+
+    // A real crash after six planned recycles still escalates from the base:
+    // the crash-loop defence is intact, it simply is not charged for recycles.
+    spawned.at(-1)!.emit('exit', null, 'SIGSEGV');
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS - 1);
+    expect(spawned).toHaveLength(7);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(spawned, 'the first genuine crash is still the base delay').toHaveLength(8);
+  });
+
+  it('P4: an undeclared SIGKILL is still treated as a crash', async () => {
+    // The counterweight. If the parent assumed every SIGKILL were planned it
+    // would spin on a child that is genuinely dying, which is what the
+    // escalating backoff exists to prevent.
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    ready(spawned[0]!);
+
+    spawned.at(-1)!.emit('exit', null, 'SIGKILL');
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
+    expect(spawned).toHaveLength(2);
+    ready(spawned.at(-1)!);
+
+    spawned.at(-1)!.emit('exit', null, 'SIGKILL');
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS * 2 - 1);
+    expect(spawned, 'a second undeclared exit must escalate').toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(spawned).toHaveLength(3);
+  });
+
+  it('P4: a declaration from a dead generation cannot excuse the next crash', async () => {
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const first = spawned[0]!;
+    ready(first);
+    first.emitEnvelope({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING });
+    first.emit('exit', null, 'SIGKILL');
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
+    expect(spawned).toHaveLength(2);
+    ready(spawned[1]!);
+
+    // The replacement crashes for real. The previous generation's declaration
+    // must not carry over and mask it.
+    spawned[1]!.emit('exit', null, 'SIGSEGV');
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS - 1);
+    expect(spawned).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(spawned, 'a crash after a recycle is still a crash').toHaveLength(3);
+  });
+
   it('resets the exponential delay after one healthy stable-running window', async () => {
     vi.useFakeTimers();
     const a = sender();
@@ -355,6 +438,457 @@ describe('direct file transfer worker boundary', () => {
 
     await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
     expect(spawned).toHaveLength(2);
+  });
+
+  it('P4: keeps an active operation failable after a non-terminal STATUS recovery', async () => {
+    // STATUS_QUERY deliberately reuses the ACTIVE ATTEMPT's requestId, so a
+    // `streaming` reply carries the same correlation as the PREPARE it reports
+    // on. Settling on it deleted that attempt's pending obligation, and a later
+    // recycle then emitted LEASE_LOST with no correlated operation error --
+    // while the browser keeps active attempts alive across LEASE_LOST exactly
+    // because it expects that error. The existing ceiling test cannot see this:
+    // it crashes before any status recovery happens.
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const worker = spawned[0]!;
+    ready(worker);
+    const senderId = worker.posted
+      .find((entry) => entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND)!.senderId as string;
+    worker.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: leasePreparedControl(),
+      emittedAt: Date.now(),
+    });
+    const operation = operationPrepareCommand();
+    await handleDirectFileTransferCommand(operation, a.handle);
+
+    // A reconnect asks after the attempt it already owns, and the child answers
+    // with a NON-terminal state.
+    await handleDirectFileTransferCommand({
+      type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...BINDING,
+      requestId: operation.requestId,
+      attemptId: operation.attemptId,
+      attempt: operation.attempt,
+      direction: operation.direction,
+      operationId: operation.operationId,
+    }, a.handle);
+    worker.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: {
+        type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...BINDING,
+        requestId: operation.requestId,
+        attemptId: operation.attemptId,
+        attempt: operation.attempt,
+        direction: operation.direction,
+        operationId: operation.operationId,
+        state: 'streaming',
+      },
+      emittedAt: Date.now(),
+    });
+    a.sent.length = 0;
+
+    worker.emit('exit', null, 'SIGKILL');
+
+    expect(
+      a.sent.filter((message) => (message as { type?: unknown }).type === DIRECT_FILE_TRANSFER_MSG.ERROR),
+      'a non-terminal status recovery must not discharge the operation obligation',
+    ).toEqual([
+      expect.objectContaining({
+        scope: 'operation',
+        requestId: operation.requestId,
+        attemptId: operation.attemptId,
+        operationId: operation.operationId,
+        error: 'connection_failed',
+        retryable: true,
+        detail: 'direct_runtime_child_recovering',
+      }),
+    ]);
+    // Both halves of the obligation, together: the lease is told AND its
+    // in-flight attempt is failed. Either one alone leaves the browser in the
+    // state this change exists to remove.
+    expect(
+      a.sent.some((message) => (message as { type?: unknown }).type === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST),
+      'the lease loss must accompany the operation error',
+    ).toBe(true);
+  });
+
+  it('P4: a not_found status recovery discharges it and does not leak the ledger', async () => {
+    // NOT_FOUND is deliberately absent from DIRECT_FILE_TRANSFER_TERMINAL_STATE
+    // -- that constant also drives message shapes and outcome metrics -- but it
+    // ends an attempt just as surely: the browser answers it with a
+    // NON-RETRYABLE OPERATION_NOT_FOUND. Deciding discharge by that shape
+    // constant alone leaked one bounded-ledger entry per status recovery, and
+    // OPERATION_LEDGER_CAPACITY of them denied direct transfer outright while
+    // the worker was perfectly healthy. The `canceled` counterweight above
+    // cannot see this, because `canceled` IS in the constant.
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const worker = spawned[0]!;
+    ready(worker);
+    const senderId = worker.posted
+      .find((entry) => entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND)!.senderId as string;
+    worker.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: leasePreparedControl(),
+      emittedAt: Date.now(),
+    });
+
+    // Exactly the ledger's capacity of valid, distinct status recoveries that
+    // each answer `not_found`.
+    for (let i = 0; i < DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY; i += 1) {
+      const requestId = `not-found-request-${String(i).padStart(4, '0')}`;
+      const attemptId = `not-found-attempt-${String(i).padStart(4, '0')}`;
+      const operationId = `not-found-operation-${String(i).padStart(4, '0')}`;
+      await expect(handleDirectFileTransferCommand({
+        type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...BINDING,
+        requestId,
+        attemptId,
+        attempt: 1,
+        direction: 'upload',
+        operationId,
+      }, a.handle)).resolves.toBe(true);
+      worker.emitEnvelope({
+        type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+        senderId,
+        message: {
+          type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          ...BINDING,
+          requestId,
+          attemptId,
+          attempt: 1,
+          direction: 'upload',
+          operationId,
+          state: 'not_found',
+        },
+        emittedAt: Date.now(),
+      });
+    }
+
+    // (1) No capacity accumulation: real work is still admitted by a worker
+    // that never stopped being ready.
+    await expect(
+      handleDirectFileTransferCommand(
+        leasePrepareCommand({ requestId: 'after-not-found', leaseId: 'lease-after-not-found' }), a.handle,
+      ),
+      'a healthy worker must not start refusing work because status recoveries piled up',
+    ).resolves.toBe(true);
+
+    // (2) No spurious lost-worker error for attempts that already ended.
+    a.sent.length = 0;
+    worker.emit('exit', null, 'SIGKILL');
+    expect(
+      a.sent.filter((message) => (
+        (message as { type?: unknown }).type === DIRECT_FILE_TRANSFER_MSG.ERROR
+        && (message as { scope?: unknown }).scope === 'operation'
+      )),
+      'attempts already answered not_found must not be failed again',
+    ).toEqual([]);
+  });
+
+  it('P4: a TERMINAL status recovery does discharge it', async () => {
+    // The counterweight: an obligation that never settles would fill the
+    // bounded pending ledger and start rejecting real work.
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const worker = spawned[0]!;
+    ready(worker);
+    const senderId = worker.posted
+      .find((entry) => entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND)!.senderId as string;
+    worker.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: leasePreparedControl(),
+      emittedAt: Date.now(),
+    });
+    const operation = operationPrepareCommand();
+    await handleDirectFileTransferCommand(operation, a.handle);
+    worker.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: {
+        type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...BINDING,
+        requestId: operation.requestId,
+        attemptId: operation.attemptId,
+        attempt: operation.attempt,
+        direction: operation.direction,
+        operationId: operation.operationId,
+        state: 'canceled',
+      },
+      emittedAt: Date.now(),
+    });
+    a.sent.length = 0;
+
+    worker.emit('exit', null, 'SIGKILL');
+
+    expect(
+      a.sent.filter((message) => (message as { type?: unknown }).type === DIRECT_FILE_TRANSFER_MSG.ERROR),
+      'a settled attempt must not be failed again',
+    ).toEqual([]);
+  });
+
+  it('P4: fails a pending request past the sender ceiling, not only established leases', async () => {
+    // The sibling hole. `establishedLeases` was fixed to hold its transport
+    // directly, but the pending ledger still resolved through `sendersById` --
+    // a bounded ROUTING INDEX that evicts its oldest entry at
+    // MAX_PROXY_SENDERS. A request whose transport had been displaced by 512
+    // later ones therefore got NO failure when its generation died, and the
+    // sweep cleared the obligation anyway. A lease that was never established
+    // gets neither signal, which is strictly worse than the idle case.
+    vi.useFakeTimers();
+    const first = sender();
+    await handleDirectFileTransferCommand(
+      leasePrepareCommand({ requestId: 'pending-request-0000', leaseId: 'pending-lease-0000' }), first.handle,
+    );
+    const worker = spawned[0]!;
+    ready(worker);
+    // Never settled: this request is still in flight when the child dies.
+    expect(first.sent).toEqual([]);
+
+    // Displace it out of the routing index with MAX_PROXY_SENDERS later
+    // transports. ICE is acknowledgement-free, so it does not consume the
+    // separate pending-ledger capacity and cannot mask the effect.
+    for (let i = 0; i < MAX_PROXY_SENDERS; i += 1) {
+      await handleDirectFileTransferCommand({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...BINDING,
+        requestId: `displacing-ice-${i}`,
+        candidate: `candidate:${i} 1 udp 1 127.0.0.1 9 typ host`,
+        mid: '0',
+      }, sender().handle);
+    }
+
+    worker.emit('exit', null, 'SIGKILL');
+
+    expect(first.sent, 'a displaced pending request must still be failed').toEqual([
+      expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        requestId: 'pending-request-0000',
+        error: 'connection_failed',
+        retryable: true,
+        detail: 'direct_runtime_child_recovering',
+      }),
+    ]);
+  });
+
+  it('P4: fails an active operation past the sender ceiling, alongside its lease loss', async () => {
+    // The browser deliberately KEEPS an active attempt across LEASE_LOST and
+    // relies on this correlated operation error to fail it. Losing the error
+    // puts that attempt back on the ICE-timeout path even though the lease
+    // itself was told -- so both signals have to survive the ceiling.
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const worker = spawned[0]!;
+    ready(worker);
+    const senderId = worker.posted
+      .find((entry) => entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND)!.senderId as string;
+    worker.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: leasePreparedControl(),
+      emittedAt: Date.now(),
+    });
+    const operation = operationPrepareCommand({ requestId: 'active-request-0000' });
+    await handleDirectFileTransferCommand(operation, a.handle);
+    a.sent.length = 0;
+
+    for (let i = 0; i < MAX_PROXY_SENDERS; i += 1) {
+      await handleDirectFileTransferCommand({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...BINDING,
+        requestId: `displacing-ice-${i}`,
+        candidate: `candidate:${i} 1 udp 1 127.0.0.1 9 typ host`,
+        mid: '0',
+      }, sender().handle);
+    }
+
+    worker.emit('exit', null, 'SIGKILL');
+
+    expect(
+      a.sent.filter((message) => (message as { type?: unknown }).type === DIRECT_FILE_TRANSFER_MSG.ERROR),
+      'the in-flight operation must be failed even after its transport was displaced',
+    ).toEqual([
+      expect.objectContaining({
+        scope: 'operation',
+        requestId: operation.requestId,
+        attemptId: operation.attemptId,
+        operationId: operation.operationId,
+        error: 'connection_failed',
+        retryable: true,
+        detail: 'direct_runtime_child_recovering',
+      }),
+    ]);
+    expect(
+      a.sent.some((message) => (message as { type?: unknown }).type === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST),
+      'and its lease is still told',
+    ).toBe(true);
+  });
+
+  it('P4: forgets a lease the worker closed, so a later loss does not name it', async () => {
+    // The registry is uncapped, so LEASE_CLOSED is the only thing that keeps it
+    // in step with the worker's own `leases`. Without this the map would grow
+    // without bound and a long-dead lease would be named at every recycle.
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const first = spawned[0]!;
+    ready(first);
+    const senderId = first.posted
+      .find((entry) => entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND)!.senderId as string;
+    first.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: leasePreparedControl(),
+      emittedAt: Date.now(),
+    });
+    a.sent.length = 0;
+
+    // The lease ended on its own terms -- idle TTL or an explicit close.
+    first.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED,
+      leaseId: BINDING.leaseId,
+      leaseGeneration: BINDING.leaseGeneration,
+    });
+    first.emit('exit', null, 'SIGKILL');
+
+    expect(a.sent, 'a lease that already ended was not lost with the child').toEqual([]);
+  });
+
+  it('P4: tells every live established lease, past the proxy sender ceiling', async () => {
+    // Regression for the capacity+1 hole: the registry used to evict the
+    // least-recently-established lease at OPERATION_LEDGER_CAPACITY, silently
+    // dropping the obligation to notify it. That browser still held a valid
+    // route and fell straight back to the ICE-timeout dead window this whole
+    // change exists to remove. Nothing bounds live leases at this number --
+    // neither the child's own `leases` map nor the Server's admission -- so a
+    // proxy-invented ceiling below them can only ever fail open.
+    vi.useFakeTimers();
+    // Past the SENDER ceiling, not just the registry's. Uncapping
+    // `establishedLeases` alone was not enough: every notification still had to
+    // resolve a transport through `sendersById`, which evicts its oldest entry
+    // at MAX_PROXY_SENDERS and takes that lease's only route to its browser
+    // with it. Whichever bound is lowest decides the obligation, so the
+    // regression has to clear the highest one.
+    const count = MAX_PROXY_SENDERS + 1;
+    const transports: Array<{ leaseId: string; transport: ReturnType<typeof sender> }> = [];
+    let worker: FakeWorker | null = null;
+    for (let i = 0; i < count; i += 1) {
+      const leaseId = `bulk-lease-${String(i).padStart(4, '0')}`;
+      const requestId = `bulk-request-${String(i).padStart(4, '0')}`;
+      const transport = sender();
+      transports.push({ leaseId, transport });
+      await handleDirectFileTransferCommand(
+        leasePrepareCommand({ requestId, leaseId }), transport.handle,
+      );
+      if (!worker) {
+        worker = spawned[0]!;
+        ready(worker);
+      }
+      // Settle immediately, exactly as production does. This both frees the
+      // bounded pending slot and is what makes each lease *established*.
+      const command = worker.posted.find((entry) => (
+        entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND
+        && (entry.command as { requestId?: unknown }).requestId === requestId
+      ))!;
+      worker.emitEnvelope({
+        type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+        senderId: command.senderId as string,
+        message: leasePreparedControl({ requestId, leaseId }),
+        emittedAt: Date.now(),
+      });
+    }
+    for (const entry of transports) {
+      expect(entry.transport.sent, `lease ${entry.leaseId} is established`).toHaveLength(1);
+    }
+
+    worker!.emit('exit', null, 'SIGKILL');
+
+    const unnotified = transports.filter(({ transport }) => !transport.sent.some((message) => (
+      (message as { type?: unknown }).type === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST
+    )));
+    expect(
+      unnotified.map(({ leaseId }) => leaseId),
+      'every live established lease must be told, not just the newest capacity',
+    ).toEqual([]);
+  });
+
+  it('P4: explicitly invalidates an established idle lease when its child generation dies', async () => {
+    vi.useFakeTimers();
+    const a = sender();
+    await handleDirectFileTransferCommand(leasePrepareCommand(), a.handle);
+    const first = spawned[0]!;
+    ready(first);
+    expect(isDirectFileTransferAvailable()).toBe(true);
+
+    // Settle the lease exactly as production does. Once LEASE_PREPARED comes
+    // back the proxy clears its pending record, so the lease is established
+    // and idle. That -- not the in-flight shape covered above -- is what
+    // strands a browser: nothing correlates it to a request any more, so the
+    // lost-worker sweep has nothing to fail and the client is told nothing.
+    const senderId = first.posted
+      .find((entry) => entry.type === DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND)!.senderId as string;
+    first.emitEnvelope({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL,
+      senderId,
+      message: leasePreparedControl(),
+      emittedAt: Date.now(),
+    });
+    expect(a.sent, 'the lease is established, not in flight').toEqual([leasePreparedControl()]);
+
+    // The retirement-budget hard recycle SIGKILLs this exact child. Every
+    // PeerConnection it held dies with its address space, so the lease the
+    // browser still believes in cannot be served by the replacement.
+    first.emit('exit', null, 'SIGKILL');
+
+    // The dead lease is named explicitly, on the transport that still holds
+    // it. Capability withdrawal would be the wrong granularity: the retry test
+    // above pins 'a child crash must not withdraw P2P' as an invariant, and a
+    // crash loop would flap the advertised feature set. What did not survive
+    // is this lease, not the daemon's ability to serve direct transfers.
+    expect(a.sent).toEqual([
+      leasePreparedControl(),
+      {
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: BINDING.serverId,
+        browserTabId: BINDING.browserTabId,
+        leaseId: BINDING.leaseId,
+        leaseGeneration: BINDING.leaseGeneration,
+        daemonGeneration: BINDING.daemonGeneration,
+      },
+    ]);
+    expect(
+      isDirectFileTransferAvailable(),
+      'the lease died, not the capability',
+    ).toBe(true);
+
+    // Late lifecycle signals from the corpse must not re-announce a loss the
+    // browser has already acted on; it would tear down the lease it just built.
+    first.emit('exit', null, 'SIGKILL');
+    expect(a.sent).toHaveLength(2);
+
+    // The replacement generation serves new leases; the lost one is not resurrected.
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_RESTART_BASE_MS);
+    expect(spawned).toHaveLength(2);
+    ready(spawned[1]!);
+    expect(isDirectFileTransferAvailable()).toBe(true);
   });
 
   it('binds child-crash fallback to the exact in-flight operation tuple', async () => {
@@ -441,15 +975,26 @@ describe('direct file transfer worker boundary', () => {
     const command = operationPrepareCommand({ requestId: 'ipc-race-request' });
 
     await expect(handleDirectFileTransferCommand(command, transport.handle)).resolves.toBe(false);
-    expect(transport.sent).toEqual([expect.objectContaining({
-      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
-      requestId: command.requestId,
-      attemptId: command.attemptId,
-      operationId: command.operationId,
-      error: 'connection_failed',
-      retryable: true,
-      detail: 'direct_runtime_child_recovering',
-    })]);
+    // The bootstrap lease above was established, so retiring this generation
+    // also invalidates it -- a separate obligation from the command failure
+    // this test pins. Both are asserted exhaustively, and in emission order,
+    // so a duplicate of either still fails here.
+    expect(transport.sent).toEqual([
+      expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+        leaseId: BINDING.leaseId,
+        leaseGeneration: BINDING.leaseGeneration,
+      }),
+      expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        requestId: command.requestId,
+        attemptId: command.attemptId,
+        operationId: command.operationId,
+        error: 'connection_failed',
+        retryable: true,
+        detail: 'direct_runtime_child_recovering',
+      }),
+    ]);
     expect(workerGeneration(), 'broken IPC retires the generation instead of leaving a sink').toBe(0);
   });
 

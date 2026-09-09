@@ -301,6 +301,82 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('reports a closed lease across the child boundary so the proxy stops tracking it', async () => {
+    // The proxy remembers every established lease so it can tell the browser
+    // when a generation dies holding one. Only this side knows when a lease
+    // ends normally, so without this envelope the proxy registry could never
+    // shrink and would have to invent a ceiling -- and any ceiling below this
+    // runtime's own unbounded `leases` map silently drops the obligation to
+    // notify whichever live lease it displaced.
+    vi.useFakeTimers();
+    const { direct } = await readyLease();
+    const posted: Array<Record<string, unknown>> = [];
+    await direct.startDirectFileTransferChildRuntime({
+      kind: 'imcodes-direct-file-transfer',
+      generation: 1,
+      send: (envelope: Record<string, unknown>) => { posted.push(envelope); },
+      subscribe: () => {},
+      requestHardRecycle: () => {},
+    });
+
+    // Let the lease end on its own terms rather than poking closeLease: the
+    // idle TTL is the path production actually takes.
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS);
+
+    expect(posted).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED,
+      leaseId,
+      leaseGeneration: 1,
+    }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('declares a planned recycle across the boundary before killing itself', async () => {
+    // The other half of the chain. The child kills itself for a hard recycle,
+    // so the parent sees an ordinary SIGKILL and cannot tell a deliberate
+    // recycle from a crash -- it charged this to the escalating crash backoff,
+    // which by the sixth recycle starts the replacement 3.2s late, long after
+    // any client retry envelope has given up on the lease it was just told is
+    // dead. The declaration must therefore reach the parent BEFORE the exit.
+    vi.useFakeTimers();
+    const { direct, sender } = await readyLease();
+    const posted: Array<Record<string, unknown>> = [];
+    let recycleRequestedAfter = -1;
+    await direct.startDirectFileTransferChildRuntime({
+      kind: 'imcodes-direct-file-transfer',
+      generation: 1,
+      send: (envelope: Record<string, unknown>) => { posted.push(envelope); },
+      subscribe: () => {},
+      requestHardRecycle: () => { recycleRequestedAfter = posted.length; },
+    });
+
+    for (let index = 1; index <= direct.DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES; index += 1) {
+      await direct.handleDirectFileTransferCommand({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId,
+        browserTabId,
+        leaseId,
+        leaseGeneration: 1,
+        daemonGeneration: 1,
+        requestId: `recycle-declare-offer-${index}`,
+        sdp: `recycle-declare-sdp-${index}`,
+      }, sender);
+      await vi.advanceTimersByTimeAsync(0);
+    }
+
+    expect(recycleRequestedAfter, 'the retirement budget must actually recycle').toBeGreaterThanOrEqual(0);
+    const declarations = posted
+      .map((envelope, index) => ({ envelope, index }))
+      .filter(({ envelope }) => envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING);
+    expect(declarations, 'exactly one declaration per recycle').toHaveLength(1);
+    expect(
+      declarations[0]!.index,
+      'the parent must learn this is planned BEFORE the process dies',
+    ).toBeLessThan(recycleRequestedAfter);
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('keeps replacement peers live until the explicit native retirement bound', async () => {
     vi.useFakeTimers();
     const { direct, sender } = await readyLease();

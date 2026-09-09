@@ -158,7 +158,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' | 'lease_init_recovering_once' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number; secondOfferAnswerDelayMs?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -289,6 +289,20 @@ function createWs(
     sent.push(message);
     if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT) {
         if (++leaseInitCount === 1 && mode === 'drop_first_lease_ready') return;
+        if (leaseInitCount === 2 && mode === 'lease_init_recovering_once') {
+          // The daemon is inside its own replacement-child backoff: it answers
+          // the rebuild retryably instead of granting a lease.
+          queueMicrotask(() => emit({
+            type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+            requestId: message.requestId,
+            error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+            retryable: true,
+            detail: 'direct_runtime_child_recovering',
+          }));
+          return;
+        }
         // The idle deadline is issued at LEASE_INIT, not when the browser
         // receives the delayed READY. This makes the test catch a browser
         // implementation that incorrectly starts a fresh five-minute timer
@@ -705,6 +719,291 @@ describe('direct file transfer v2 browser broker', () => {
       expect(message).not.toHaveProperty('previewHandle');
       expect(message).not.toHaveProperty('sessionName');
     }
+    release?.();
+  });
+
+  it('P4: rebuilds a lease the daemon reports lost, without waiting out ICE consent', async () => {
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities);
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+    const offer = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)!;
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+
+    // The daemon's transfer child was recycled and took this peer with it.
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+    });
+
+    // No timer is advanced anywhere in this test. That is the point: the
+    // rebuild must not be waiting on ICE consent freshness, which is what cost
+    // production a median ~57s of dead direct connectivity per child recycle.
+    await vi.waitFor(() => expect(
+      sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT),
+    ).toHaveLength(2));
+    release?.();
+  });
+
+  it('P4: rebuilds within 2s when the first rebuild races the daemon\'s own recovery', async () => {
+    // The timing this whole change exists for, end to end. LEASE_LOST is sent
+    // the instant the child generation dies, but the daemon only spawns its
+    // replacement after a backoff, so the browser's immediate rebuild can land
+    // inside that window and be answered `retryable`. Nothing else would ever
+    // retry it: the capability stays advertised on purpose (a crash loop must
+    // not flap the feature), and the idle timer returns early because the
+    // binding was just cleared. Without a bounded retry the lease parks at NONE
+    // until an unrelated user action -- the very dead window LEASE_LOST removes.
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities, 'lease_init_recovering_once');
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+    const offer = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)!;
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+
+    const lostAt = Date.now();
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+    });
+
+    // The second LEASE_INIT is the one the daemon refuses while recovering.
+    await vi.waitFor(
+      () => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2),
+      { timeout: 2_000, interval: 10 },
+    );
+
+    // No capability change, no user action: recovery must come from the client
+    // honouring `retryable` on its own.
+    await vi.waitFor(
+      () => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(3),
+      { timeout: 2_000, interval: 10 },
+    );
+    await vi.waitFor(
+      () => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2),
+      { timeout: 2_000, interval: 10 },
+    );
+    expect(
+      Date.now() - lostAt,
+      'the client-visible rebuild window is the p95 < 2s acceptance',
+    ).toBeLessThan(2_000);
+    release?.();
+  });
+
+  it('P4: rebuilds in under 2s when the recycle lands mid health-probe', async () => {
+    // The window the other lost-lease tests could not reach: every one of them
+    // emits after the fake has already answered the probe. If the worker
+    // recycles WHILE the probe is outstanding, the pong wait used to be
+    // uncancellable -- it could settle only on a pong that will never come or
+    // on PROBE_TIMEOUT_MS (8s) -- and it holds `lease.warming` the whole time,
+    // so the queued rebuild bounced straight off warmRetainedLease's guard.
+    // The peer is already dead; there is nothing to wait for.
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities);
+    const originalDataHandler = FakePeerConnection.onDataChannel;
+    let probePayload: Record<string, unknown> | null = null;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        // Hold the probe: never answer it, and never let the fake answer it.
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
+          probePayload = payload;
+          return;
+        }
+      }
+      originalDataHandler?.(channel, value);
+    };
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    try {
+      await vi.waitFor(() => expect(probePayload).not.toBeNull());
+      const offer = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)!;
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+
+      const lostAt = Date.now();
+      emit({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: offer.serverId,
+        browserTabId: offer.browserTabId,
+        leaseId: offer.leaseId,
+        leaseGeneration: offer.leaseGeneration,
+        daemonGeneration: offer.daemonGeneration,
+      });
+
+      // No timer is advanced anywhere here. If recovery needed the 8s probe
+      // timeout to fire, this could not pass -- which is exactly the point.
+      await vi.waitFor(
+        () => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2),
+        { timeout: 2_000, interval: 10 },
+      );
+      await vi.waitFor(
+        () => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2),
+        { timeout: 2_000, interval: 10 },
+      );
+      expect(
+        Date.now() - lostAt,
+        'a recycle during the probe must not cost the full probe timeout',
+      ).toBeLessThan(2_000);
+    } finally {
+      FakePeerConnection.onDataChannel = originalDataHandler;
+      release?.();
+    }
+  });
+
+  it('P4: abandons an outstanding probe when the data channel drops under it', async () => {
+    // The other trigger. A dead child takes the SCTP association with it, so
+    // the channel closes before any LEASE_LOST can arrive -- control has NOT
+    // been invalidated and the abort listener cannot fire. Without a close
+    // listener the pong wait would still sit out the full 8s PROBE_TIMEOUT_MS
+    // holding `lease.warming`, which is the same stall by a different door.
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const originalDataHandler = FakePeerConnection.onDataChannel;
+    const probes: FakeDataChannel[] = [];
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
+          probes.push(channel);
+          return;
+        }
+      }
+      originalDataHandler?.(channel, value);
+    };
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    try {
+      await vi.waitFor(() => expect(probes).toHaveLength(1));
+      const droppedAt = Date.now();
+      probes[0]!.dispatchEvent(new Event('close'));
+
+      // No timer advanced: recovery must not need the 8s probe timeout.
+      await vi.waitFor(() => expect(probes.length).toBeGreaterThan(1), { timeout: 2_000, interval: 10 });
+      expect(
+        Date.now() - droppedAt,
+        'a dropped channel must not cost the full probe timeout',
+      ).toBeLessThan(2_000);
+    } finally {
+      FakePeerConnection.onDataChannel = originalDataHandler;
+      release?.();
+    }
+  });
+
+  it('P4: ignores a lost-lease notice that does not name this exact lease', async () => {
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities);
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+    const offer = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)!;
+
+    // Tearing down a live lease on a mismatched notice would turn this fix
+    // into the outage it is meant to prevent, so every field is load-bearing.
+    const lost = (overrides: Record<string, unknown>) => ({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+      ...overrides,
+    });
+    emit(lost({ leaseId: 'some-other-lease' }));
+    emit(lost({ browserTabId: 'some-other-tab' }));
+    emit(lost({ leaseGeneration: (offer.leaseGeneration as number) + 1 }));
+    emit(lost({ daemonGeneration: (offer.daemonGeneration as number) + 1 }));
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    release?.();
+  });
+
+  it('P4: a relay-retired lease is not stranded, so resume\'s relay branch is not load-bearing here', async () => {
+    // Acceptance asks whether resumeDirectFileTransfers' `connectionStatus ===
+    // RELAY -> continue` blocks recovery. It does not, and this measures why
+    // rather than asserting it: the relay verdict already retires the whole
+    // lease (clearLeaseBinding, "node-datachannel cannot ICE-restart the
+    // still-bound daemon peer"). A relay-status idle lease therefore holds no
+    // binding at all -- there is nothing for a child recycle to strand, and a
+    // LEASE_LOST naming a lease this browser no longer holds is correctly
+    // ignored instead of forcing a pointless rebuild.
+    const { prewarmDirectFileLease, subscribeDirectFileConnectionStatus, uploadFileWithDirectFallback } =
+      await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities);
+    const originalDataHandler = FakePeerConnection.onDataChannel;
+    let probeChannel: FakeDataChannel | null = null;
+    let probePayload: Record<string, unknown> | null = null;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
+          probeChannel = channel;
+          probePayload = payload;
+          return;
+        }
+      }
+      originalDataHandler?.(channel, value);
+    };
+    let status = DIRECT_FILE_CONNECTION_STATUS.NONE;
+    const unsubscribe = subscribeDirectFileConnectionStatus(ws, 'server-1', (next) => { status = next; });
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(probePayload).not.toBeNull());
+    const payload = probePayload!;
+    probeChannel!.dispatchEvent(new MessageEvent('message', {
+      data: JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: payload.serverId,
+        browserTabId: payload.browserTabId,
+        leaseId: payload.leaseId,
+        leaseGeneration: payload.leaseGeneration,
+        daemonGeneration: payload.daemonGeneration,
+        nonce: payload.nonce,
+        rttMs: 1,
+        localCandidate: { address: '10.0.0.1', port: 5000, type: 'relay', transportType: 'udp' },
+        remoteCandidate: { address: '10.0.0.2', port: 5001, type: 'host', transportType: 'udp' },
+      }),
+    }));
+    await vi.waitFor(() => expect(status).toBe(DIRECT_FILE_CONNECTION_STATUS.RELAY));
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: payload.serverId,
+      browserTabId: payload.browserTabId,
+      leaseId: payload.leaseId,
+      leaseGeneration: payload.leaseGeneration,
+      daemonGeneration: payload.daemonGeneration,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(
+      sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT),
+      'the lease was already retired by the relay verdict; nothing to rebuild',
+    ).toHaveLength(1);
+
+    // Not stranded: the next real use still mints a fresh lease, which is the
+    // property that would be broken if the relay branch were load-bearing.
+    FakePeerConnection.onDataChannel = originalDataHandler;
+    await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('after-relay.txt', 'after'),
+    });
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    unsubscribe();
     release?.();
   });
 

@@ -17,6 +17,8 @@ import {
   isDirectFileTransferMessageType,
   isLegacyDirectFileTransferMessageType,
   validateDirectFileTransferBrowserMessage,
+  isDirectFileTransferOperationDischarged,
+  isDirectFileTransferTerminalShapedOperationMessage,
   validateDirectFileTransferDaemonMessage,
   validateDirectFileTransferResumeTicketClaims,
   type DirectFileTransferAttemptBinding,
@@ -26,6 +28,7 @@ import {
   type DirectFileTransferIceServerConfig,
   type DirectFileTransferLeaseRebind,
   type DirectFileTransferLeasePrepared,
+  type DirectFileTransferLeaseLost,
   type DirectFileTransferOperationInit,
   type DirectFileTransferResumeTicketClaims,
   type DirectFileTransferCancel,
@@ -58,6 +61,7 @@ type StatusRecoveryMetricEvent = 'queried' | 'responded' | 'send_failed' | 'time
 type ControlRelayDirection = 'browser_to_daemon' | 'daemon_to_browser'
   | 'server_to_daemon' | 'server_to_browser';
 type ControlRelayFamily = 'lease_prepare' | 'lease_ready' | 'lease_rebound' | 'lease_signal'
+  | 'lease_lost'
   | 'operation_prepare' | 'operation_authorized' | 'cancel' | 'status'
   | 'terminal' | 'error';
 
@@ -266,6 +270,11 @@ export class DirectFileTransferRouter {
       return true;
     }
 
+    if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST) {
+      this.handleLeaseLost(parsed.value, daemonGeneration);
+      return true;
+    }
+
     if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER
       || parsed.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE) {
       this.handleDaemonLeaseSignal(parsed.value, daemonGeneration);
@@ -305,13 +314,17 @@ export class DirectFileTransferRouter {
       return true;
     }
 
+    // Everything below correlates by requestId. A message that carries none
+    // has already been dispatched above; it must not fall into these lookups
+    // as `undefined`.
+    if (!('requestId' in parsed.value)) return true;
     const recovery = this.recoveryQueries.get(parsed.value.requestId);
     if (recovery && this.daemonMessageMatchesRecovery(parsed.value, recovery, daemonGeneration)) {
       const lease = this.leases.get(recovery.leaseId);
       // A terminal recovery is the first point at which this fresh Server pod
       // knows the browser's old attempt ended. Start and propagate a new idle
       // window before the browser consumes the authoritative outcome.
-      if (lease && this.isTerminalOperationMessage(parsed.value)) this.touchLease(lease);
+      if (lease && this.isTerminalShapedOperationMessage(parsed.value)) this.touchLease(lease);
       if (lease?.socket) this.hooks.sendBrowser(lease.socket, this.withServerAttachment(parsed.value, lease));
       this.observeStatusRecovery('responded');
       this.observeControlRelay('daemon_to_browser', 'status');
@@ -345,9 +358,19 @@ export class DirectFileTransferRouter {
       );
       this.deleteAttempt(attempt);
     } else if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.STATUS
-      && (parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED
-        || parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.CANCELED
-        || parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED)) {
+      && isDirectFileTransferOperationDischarged(parsed.value)) {
+      // DISCHARGE, not wire shape. This branch releases the attempt route, and
+      // an inline copy of the terminal-SHAPE set was deciding it: `not_found`
+      // ends an operation -- the browser answers it non-retryably -- but is not
+      // terminal-shaped, so its route was retained until the two-hour authority
+      // timer while still counting against MAX_ACTIVE_CHANNELS_PER_LEASE and
+      // suppressing lease expiry. The shape question stays separate below, so
+      // a not_found frame still carries no idleExpiresAt.
+      //
+      // deleteAttempt() extends the lease deadline once the last attempt goes,
+      // and the browser cannot learn that from a not_found frame. That
+      // divergence is one-directional and safe: the Server's deadline is the
+      // LATER one, so the browser expires first and re-initialises.
       operation.terminal = true;
       this.observeAttempt(
         parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED ? 'succeeded' : 'terminal_failed',
@@ -892,6 +915,32 @@ export class DirectFileTransferRouter {
     }
   }
 
+  /**
+   * The daemon's transfer child died and took this lease's peer with it.
+   *
+   * Alone among daemon messages this one answers no request: an idle lease has
+   * no outstanding requestId, which is precisely why the browser could not be
+   * told before and waited out its own ICE consent check instead. It is
+   * therefore routed by lease identity, and only ever to that lease's own
+   * socket -- delivering it anywhere else would tear down a healthy peer.
+   */
+  private handleLeaseLost(message: DirectFileTransferLeaseLost, daemonGeneration: number): void {
+    const lease = this.leases.get(message.leaseId);
+    if (!lease || lease.daemonGeneration !== daemonGeneration
+      || message.serverId !== this.hooks.serverId()
+      || message.browserTabId !== lease.browserTabId
+      || message.leaseGeneration !== lease.leaseGeneration
+      || message.daemonGeneration !== lease.daemonGeneration) return;
+    // The daemon-side peer is gone, so this route may not be signalled into
+    // again: the next use has to re-prepare against the replacement child.
+    lease.prepared = false;
+    lease.needsRebind = true;
+    this.rescheduleLeaseTimers(lease);
+    if (!lease.socket) return;
+    this.hooks.sendBrowser(lease.socket, message as unknown as Record<string, unknown>);
+    this.observeControlRelay('daemon_to_browser', 'lease_lost');
+  }
+
   private handleLeasePrepared(message: DirectFileTransferLeasePrepared, daemonGeneration: number): void {
     const pending = this.leaseRequestIds.get(message.requestId);
     const lease = pending ? this.leases.get(pending.leaseId) : undefined;
@@ -1041,7 +1090,7 @@ export class DirectFileTransferRouter {
     lease: DirectFileTransferLeaseRoute,
   ): Record<string, unknown> {
     const result: Record<string, unknown> = { ...message };
-    if (this.isTerminalOperationMessage(message)
+    if (this.isTerminalShapedOperationMessage(message)
       || (message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
         && message.scope === DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION)) {
       result.idleExpiresAt = lease.idleExpiresAt;
@@ -1052,12 +1101,17 @@ export class DirectFileTransferRouter {
     return result;
   }
 
-  private isTerminalOperationMessage(message: DirectFileTransferDaemonMessage): boolean {
-    return message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
-      || (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS
-        && (message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED
-          || message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.CANCELED
-          || message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED));
+  /**
+   * WIRE SHAPE, not obligation discharge.
+   *
+   * Both callers use this to decide whether a frame carries `idleExpiresAt`
+   * (directly, or by propagating a fresh idle window the browser can only read
+   * from that field). `not_found` ends an attempt but its STATUS is not
+   * terminal-shaped, and appending the field to it makes the frame fail
+   * `validateDirectFileTransferServerMessage` and be discarded.
+   */
+  private isTerminalShapedOperationMessage(message: DirectFileTransferDaemonMessage): boolean {
+    return isDirectFileTransferTerminalShapedOperationMessage(message);
   }
 
   private sendLeaseReady(socket: WebSocket, requestId: string, lease: DirectFileTransferLeaseRoute): void {
