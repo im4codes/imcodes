@@ -653,19 +653,30 @@ export function buildAutoAuditModeControlPrompt(input: {
 
 export function buildSupervisionWaitingHeartbeatPrompt(
   snapshot: Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined,
-  locale?: SupervisionUiLocale,
+  _locale?: SupervisionUiLocale,
 ): string {
   if (!isAutomaticSupervisionEnabled(snapshot)) return '';
-  const lines: Record<SupervisionUiLocale, string> = {
-    en: `Re-read authoritative task state now. If an exact delegated/implementing/auditing assignment is stale while its bound target is ready, append one continuation to the original assignment now with the same stable idempotency key; never create a replacement. If a durable recovery already exists, do not duplicate it. Escalate a deterministic internal authority defect to Brain, not the user. End every nonterminal response with exactly one final ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}; use ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} only when Brain also lacks required external human information.`,
-    'zh-CN': `现在重新读取权威任务状态。若精确 delegated/implementing/auditing assignment 已停滞且绑定目标 ready，立即用同一个稳定幂等键向原 assignment 追加一次 continuation；绝不创建替代对象。已有持久恢复则不得重复。可确定的内部权限缺陷升级给 Brain，不交给用户。每个非终态响应必须且只能以一个最终 ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 结束；仅当 Brain 也缺少必要的外部人工信息时使用 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
-    'zh-TW': `現在重新讀取權威任務狀態。若精確 delegated/implementing/auditing assignment 已停滯且綁定目標 ready，立即用同一個穩定冪等鍵向原 assignment 追加一次 continuation；絕不建立替代物件。已有持久恢復則不得重複。可確定的內部權限缺陷升級給 Brain，不交給使用者。每個非終態回應必須且只能以一個最終 ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 結束；僅當 Brain 也缺少必要的外部人工資訊時使用 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
-    es: `Vuelve a leer ahora el estado autoritativo. Si la asignación exacta está estancada y su destino está listo, añade una sola continuación a la asignación original con la misma clave idempotente; nunca la reemplaces ni dupliques una recuperación duradera. Escala a Brain los defectos internos deterministas. Termina toda respuesta no terminal con exactamente un ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} final; usa ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} solo si Brain también carece de información humana externa necesaria.`,
-    ru: `Сейчас перечитайте авторитетное состояние задачи. Если точное назначение застряло, а его цель готова, один раз добавьте продолжение к исходному назначению с тем же стабильным ключом идемпотентности; не создавайте замену и не дублируйте устойчивое восстановление. Однозначные внутренние дефекты эскалируйте Brain. Каждый нетерминальный ответ завершайте ровно одним финальным ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}; ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} допустим только когда Brain также не хватает необходимых внешних данных человека.`,
-    ja: `権威あるタスク状態を今すぐ再読してください。正確な assignment が停滞し、束縛先が ready なら、同じ安定 idempotency key で元の assignment に continuation を一度だけ追加し、代替オブジェクトや重複した永続 recovery を作らないでください。確定的な内部権限障害は Brain にエスカレーションします。非終端応答は必ず最終の ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 一つだけで終え、Brain にも必要な外部の人的情報がない場合だけ ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} を使ってください。`,
-    ko: `권위 있는 작업 상태를 지금 다시 읽으세요. 정확한 assignment가 정체되고 바인딩 대상이 ready이면 동일한 안정 idempotency key로 원래 assignment에 continuation을 한 번만 추가하고 대체 객체나 중복 영구 복구를 만들지 마세요. 확정 가능한 내부 권한 결함은 Brain으로 에스컬레이션하세요. 모든 비종료 응답은 마지막 ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 하나로만 끝내고, Brain도 필요한 외부 사람 정보를 갖지 못한 경우에만 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}을 사용하세요.`,
-  };
-  return `[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]\n${lines[locale ?? 'en']}`;
+  return [
+    `[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`,
+    JSON.stringify({
+      contractRefs: [
+        SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
+        SUPERVISION_CONTRACT_IDS.MESSAGING,
+        SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+      ],
+      binding: { mode: 'continue_existing' },
+      action: 'advance_safe_unfinished',
+      terminal: {
+        when: 'no_active_task_or_all_relevant_terminal',
+        marker: SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+        stopHeartbeat: true,
+      },
+      nonterminal: {
+        marker: SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+        receiptWait: 'check_next_heartbeat',
+      },
+    }),
+  ].join('\n');
 }
 
 export type SupervisionAuditHeartbeatAction =

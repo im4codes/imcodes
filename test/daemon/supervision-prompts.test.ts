@@ -177,18 +177,41 @@ describe('supervision prompts', () => {
     expect(prompt).not.toContain(SUPERVISION_CONTRACT_PREAMBLE_END);
   });
 
-  it('makes each waiting heartbeat one bounded active same-object recovery turn', () => {
+  it('references standing recovery contracts and stops once no active task remains', () => {
     const heartbeat = buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.SUPERVISED }, 'zh-CN');
     expect(heartbeat).toContain('[Contract: supervision_waiting_heartbeat_v1]');
-    expect(heartbeat).toContain('重新读取权威任务状态');
-    expect(heartbeat).toContain('原 assignment');
-    expect(heartbeat).toContain('同一个稳定幂等键');
-    expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
-    expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
-    expect(Buffer.byteLength(heartbeat, 'utf8')).toBeLessThanOrEqual(2_200);
+    const payload = JSON.parse(heartbeat.split('\n')[1]!);
+    expect(payload).toEqual({
+      contractRefs: [
+        SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
+        SUPERVISION_CONTRACT_IDS.MESSAGING,
+        SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+      ],
+      binding: { mode: 'continue_existing' },
+      action: 'advance_safe_unfinished',
+      terminal: {
+        when: 'no_active_task_or_all_relevant_terminal',
+        marker: SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+        stopHeartbeat: true,
+      },
+      nonterminal: {
+        marker: SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+        receiptWait: 'check_next_heartbeat',
+      },
+    });
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      expect(buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.SUPERVISED }, locale))
+        .toBe(heartbeat);
+    }
+    for (const duplicatedRule of [
+      '原 assignment',
+      'stable idempotency key',
+      'never create a replacement',
+      'Escalate a deterministic internal authority defect',
+    ]) expect(heartbeat).not.toContain(duplicatedRule);
+    expect(Buffer.byteLength(heartbeat, 'utf8')).toBeLessThanOrEqual(900);
     for (const forbidden of [
       SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
-      SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
       SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
       SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
     ]) expect(heartbeat).not.toContain(forbidden);
