@@ -621,3 +621,99 @@ describe('the relay range comes from the deployment config, not from a number in
     }
   });
 });
+
+describe('the updater is not inside the scope it watches', () => {
+  // Measured on the 43 deployment, 2026-09-09: the watchtower service carried
+  // the same com.centurylinklabs.watchtower.scope label as the application, so
+  // every update session had to resolve the updater's own image first. That
+  // image lives on a different registry than the application's, and when that
+  // registry is slow the session burns its whole budget there and never
+  // reaches the application container. Last application update was
+  // 2026-09-08T22:41:31Z; the 24h that followed contained 48 update sessions
+  // that were aborted mid-run and zero that completed, while a newer
+  // application image sat available on a registry answering in 70ms.
+  const SCOPE_LABEL = 'com.centurylinklabs.watchtower.scope';
+
+  type ComposeService = {
+    labels?: string[];
+    volumes?: string[];
+    environment?: Record<string, unknown>;
+    command?: string | string[];
+  };
+
+  async function composeServices(turnEnabled: boolean): Promise<Record<string, ComposeService>> {
+    const { dockerComposeTemplate } = await import('../../src/setup/templates.js');
+    const { parse } = await import('yaml');
+    const doc = parse(dockerComposeTemplate({ turn: { enabled: turnEnabled } })) as {
+      services: Record<string, ComposeService>;
+    };
+    return doc.services;
+  }
+
+  function scopeLabelOf(service: ComposeService): string | undefined {
+    const hit = (service.labels ?? []).find((label) => label.startsWith(`${SCOPE_LABEL}=`));
+    return hit === undefined ? undefined : hit.slice(SCOPE_LABEL.length + 1);
+  }
+
+  /** The scope the updater actually filters on, taken from the updater itself. */
+  function watchedScope(services: Record<string, ComposeService>): string {
+    const updater = services.watchtower;
+    expect(updater, 'no watchtower service in the generated compose file').toBeDefined();
+    const fromEnv = String(updater.environment?.WATCHTOWER_SCOPE ?? '');
+    const command = Array.isArray(updater.command) ? updater.command.join(' ') : String(updater.command ?? '');
+    const fromFlag = /--scope[= ](\S+)/.exec(command)?.[1] ?? '';
+    expect(fromEnv, 'the updater declares no WATCHTOWER_SCOPE').not.toBe('');
+    expect(fromFlag, 'the --scope flag and WATCHTOWER_SCOPE disagree').toBe(fromEnv);
+    return fromEnv;
+  }
+
+  it('never lists the updater among the containers it updates', async () => {
+    const services = await composeServices(true);
+    const watched = watchedScope(services);
+
+    expect(
+      scopeLabelOf(services.watchtower),
+      'the updater is labelled with the scope it watches, so it must resolve its own image before the application\'s',
+    ).toBeUndefined();
+
+    const inScope = Object.entries(services)
+      .filter(([, service]) => scopeLabelOf(service) === watched)
+      .map(([name]) => name);
+    expect(inScope).not.toContain('watchtower');
+  });
+
+  it('keeps every holder of the docker socket out of the watched scope', async () => {
+    const services = await composeServices(true);
+    const watched = watchedScope(services);
+
+    for (const [name, service] of Object.entries(services)) {
+      const drivesDocker = (service.volumes ?? []).some((volume) => String(volume).includes('/var/run/docker.sock'));
+      if (!drivesDocker) continue;
+      expect(
+        scopeLabelOf(service),
+        `${name} both performs updates and is subject to them`,
+      ).not.toBe(watched);
+    }
+  });
+
+  it('still updates the application and TURN containers automatically', async () => {
+    const services = await composeServices(true);
+    const watched = watchedScope(services);
+
+    expect(scopeLabelOf(services.server), 'the application would stop receiving automatic updates').toBe(watched);
+    expect(scopeLabelOf(services.turn), 'TURN would stop receiving automatic updates').toBe(watched);
+  });
+
+  it('labels exactly the updatable application services, in both TURN modes', async () => {
+    for (const turnEnabled of [false, true]) {
+      const services = await composeServices(turnEnabled);
+      const watched = watchedScope(services);
+      const labelled = Object.entries(services).filter(([, service]) => scopeLabelOf(service) !== undefined);
+
+      expect(labelled.map(([name]) => name)).toEqual(turnEnabled ? ['server', 'turn'] : ['server']);
+      for (const [name, service] of labelled) {
+        expect(scopeLabelOf(service), `${name} is labelled with a scope the updater does not watch`).toBe(watched);
+      }
+    }
+  });
+});

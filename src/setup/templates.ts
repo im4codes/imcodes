@@ -115,8 +115,10 @@ ${turnService}
       WATCHTOWER_POLL_INTERVAL: 300
       WATCHTOWER_CLEANUP: "true"
       WATCHTOWER_SCOPE: imcodes
-    labels:
-      - com.centurylinklabs.watchtower.scope=imcodes
+    # Deliberately unlabelled: an updater inside its own watched scope has to
+    # resolve its own image before it can reach the application's, so a slow or
+    # unreachable updater registry starves every application update behind it.
+    # Watchtower is infrastructure and is updated on purpose, not on a poll.
     command: --scope imcodes
 
 volumes:
