@@ -5055,7 +5055,7 @@ describe('SupervisionAutomation', () => {
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
       expect(prompt).toContain('[Contract: supervision_waiting_heartbeat_v1]');
-      expect(prompt).toContain('检查当前任务状态');
+      expect(prompt).toContain('重新读取权威任务状态');
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
       expect(prompt).not.toContain('Waiting check');
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
@@ -5244,7 +5244,7 @@ describe('SupervisionAutomation', () => {
 
       await vi.advanceTimersByTimeAsync(4 * 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('检查当前任务状态');
+      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('重新读取权威任务状态');
 
       await vi.advanceTimersByTimeAsync(20 * 60_000 + 1);
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
@@ -6210,6 +6210,158 @@ describe('SupervisionAutomation', () => {
         event.eventType === 'implementation_heartbeat'
         && event.payload?.source === 'implementation_watchdog_runtime_unavailable'
       ))).toHaveLength(0);
+    });
+
+    it('wakes one stale auditing auditor on the exact attempt and never duplicates the append', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-delegated-audit-task';
+      const assignmentId = 'watchdog-delegated-auditor';
+      const revision = 'watchdog-delegated-audit-r1';
+      const attemptId = 'auto-audit-watchdog-delegated';
+      const identity = liveWorkerIdentity('deck_watchdog_auditor');
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'wake a silent exact auditor', currentRevision: revision, now: 1_000,
+      } as never)).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'auditor', required: true, identity,
+        auditAttemptId: attemptId, auditRevision: revision, now: 2_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId, identity, status: 'auditing', now: 3_000,
+      })).toMatchObject({ ok: true });
+      mockTransportRuntime.send.mockClear();
+
+      const due = 3_000 + 10 * 60_000;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due - 1);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(mockTransportRuntime.send).toHaveBeenCalledWith(
+        expect.stringContaining(`\"auditAttemptId\":\"${attemptId}\"`),
+        `supervision-audit-heartbeat:${assignmentId}:${attemptId}:1`,
+        undefined,
+        undefined,
+        expect.objectContaining({ timelineCommitted: true, deliveryMode: 'append' }),
+      );
+      expect(mockTransportRuntime.send.mock.calls[0]?.[0]).toContain(`\"auditRevision\":\"${revision}\"`);
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
+      });
+      const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId: `supervision-audit-heartbeat:${assignmentId}:${attemptId}:1`,
+        text: prompt,
+        now: due,
+      })).toBe(true);
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId: `supervision-audit-heartbeat:${assignmentId}:${attemptId}:1`,
+        text: prompt.replace(attemptId, 'wrong-attempt'),
+        now: due,
+      })).toBe(false);
+
+      (mockTransportRuntime.pendingEntries as Array<{ clientMessageId: string }>).push({
+        clientMessageId: `supervision-audit-heartbeat:${assignmentId}:${attemptId}:1`,
+      });
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      mockTransportRuntime.pendingEntries.length = 0;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
+        taskId,
+        assignmentId,
+        attemptId,
+        revision,
+        disposition: 'waiting_for_brain',
+        exactError: 'audit heartbeat completed without durable progress or a structured verdict',
+      });
+    });
+
+    it('leaves a stale delegated auditor exclusively to ready-audit redelivery', async () => {
+      // Coupled with supervision-auto-audit's production-shaped stale
+      // redelivery test, this pins one owner per state: dispatchReadyAudit owns
+      // ready_for_audit + delegated and this watchdog must emit nothing.
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-delegated-audit-owner-task';
+      const assignmentId = 'watchdog-delegated-audit-owner';
+      const revision = 'watchdog-delegated-audit-owner-r1';
+      const attemptId = 'auto-audit-watchdog-owner';
+      const identity = liveWorkerIdentity('deck_watchdog_delegated_auditor');
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'one owner for delegated audit redelivery', currentRevision: revision,
+        auditPolicy: 'auto_strict_cross_vendor', now: 1_000,
+      } as never)).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'auditor', required: true, identity,
+        auditAttemptId: attemptId, auditRevision: revision, now: 2_000,
+      })).toMatchObject({ ok: true });
+      mockTransportRuntime.send.mockClear();
+
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
+
+      expect(mockTransportRuntime.send).not.toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringMatching(/^supervision-audit-heartbeat:/),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_heartbeat'
+        && event.payload?.source === 'audit_watchdog'
+      ))).toHaveLength(0);
+    });
+
+    it('never selects or drains an auditor bound to a superseded revision', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-superseded-audit-task';
+      const assignmentId = 'watchdog-superseded-auditor';
+      const currentRevision = 'watchdog-current-r2';
+      const staleRevision = 'watchdog-stale-r1';
+      const attemptId = 'auto-audit-watchdog-stale';
+      const identity = liveWorkerIdentity('deck_watchdog_stale_auditor');
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'never wake a superseded audit', currentRevision, now: 1_000,
+      } as never)).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'auditor', required: true, identity,
+        auditAttemptId: attemptId, auditRevision: staleRevision, now: 2_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId, identity, status: 'auditing', now: 3_000,
+      })).toMatchObject({ ok: true });
+      mockTransportRuntime.send.mockClear();
+
+      const due = 3_000 + 10 * 60_000;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_heartbeat'
+        && event.payload?.source === 'audit_watchdog'
+      ))).toHaveLength(0);
+
+      const stalePrompt = JSON.stringify({
+        contractRefs: [SUPERVISION_CONTRACT_IDS.AUDIT_HEARTBEAT, SUPERVISION_CONTRACT_IDS.MESSAGING],
+        binding: {
+          mode: 'continue_existing', taskId, assignmentId,
+          auditAttemptId: attemptId, auditRevision: staleRevision,
+        },
+        action: 'complete_exact_audit',
+      });
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId: `supervision-audit-heartbeat:${assignmentId}:${attemptId}:1`,
+        text: stalePrompt,
+        now: due,
+      })).toBe(false);
     });
 
     it('escalates one structured blocker instead of sending a second no-progress heartbeat', async () => {

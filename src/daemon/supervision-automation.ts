@@ -6,6 +6,7 @@ import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../shared/delegation-
 import { getSession, listSessions, upsertSession, type SessionRecord } from '../store/session-store.js';
 import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
 import {
+  AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX,
   IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT,
   parkTransientRuntimeExhaustedOnce,
   resolveImplementationHeartbeatDelivery,
@@ -73,6 +74,7 @@ import {
 import {
   getSupervisionStateStore,
   getSupervisionTaskRegistry,
+  isSupervisionAssignmentContinuable,
   SUPERVISION_STATE_VERSION,
   type PersistedSupervisionSessionIdentity,
   type PersistedSupervisionWaitState,
@@ -1307,8 +1309,24 @@ class SupervisionAutomation {
     for (const task of registry.list()) {
       const events = registry.listEvents(task.taskId);
       for (const assignment of task.assignments) {
-        if (assignment.role !== 'implementer'
-          || (assignment.status !== 'delegated' && assignment.status !== 'implementing')) continue;
+        const watchdogKind = assignment.role === 'implementer'
+          && (assignment.status === 'delegated' || assignment.status === 'implementing')
+          ? 'implementation' as const
+          : assignment.role === 'auditor'
+            // ready_for_audit + delegated is already owned by
+            // dispatchReadyAudit's deterministic stale redelivery. Giving the
+            // watchdog that same state created two independent appends on the
+            // same ten-minute tick. The watchdog begins only after the audit
+            // has actually started; one shared continuation predicate owns
+            // the revision fence for both this path and queued delivery.
+            && ['implementing', 'auditing'].includes(assignment.status)
+            && isSupervisionAssignmentContinuable({
+              taskCurrentRevision: task.currentRevision,
+              assignment,
+            })
+            ? 'audit' as const
+            : undefined;
+        if (!watchdogKind) continue;
         // A durable blocker is already the visible, actionable state. The
         // worker has no authority to clear it, so another heartbeat cannot
         // produce progress -- it only burns quota and hides the blocker behind
@@ -1329,16 +1347,20 @@ class SupervisionAutomation {
                 .filter((event) => event.eventType !== 'implementation_heartbeat')
                 .map((event) => event.createdAt),
             );
+        const heartbeatSource = watchdogKind === 'audit' ? 'audit_watchdog' : 'implementation_watchdog';
+        const unavailableSource = watchdogKind === 'audit'
+          ? 'audit_watchdog_runtime_unavailable'
+          : 'implementation_watchdog_runtime_unavailable';
         const reminders = assignmentEvents.filter((event) => (
           event.eventType === 'implementation_heartbeat'
-          && event.payload?.source === 'implementation_watchdog'
+          && event.payload?.source === heartbeatSource
           && (assignment.status === 'delegated'
             ? event.status === 'delegated'
             : event.createdAt > progressAt)
         ));
         const runtimeRetries = assignmentEvents.filter((event) => (
           event.eventType === 'implementation_heartbeat'
-          && event.payload?.source === 'implementation_watchdog_runtime_unavailable'
+          && event.payload?.source === unavailableSource
           && (assignment.status === 'delegated'
             ? event.status === 'delegated'
             : event.createdAt > progressAt)
@@ -1376,7 +1398,9 @@ class SupervisionAutomation {
           // already-woken delegated assignment into a false blocker. The real
           // delegated -> implementing transition resets progress and re-enables
           // the started-work watchdog below.
-          if (reminders.length > 0 && assignment.status === 'delegated') continue;
+          if (watchdogKind === 'implementation'
+            && reminders.length > 0
+            && assignment.status === 'delegated') continue;
           if (authority.status === 'transient_unavailable') {
             const retryNumber = runtimeRetries.length + 1;
             if (retryNumber >= IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT) {
@@ -1386,12 +1410,10 @@ class SupervisionAutomation {
                 retryCount: retryNumber,
                 now,
               });
+            } else if (watchdogKind === 'audit') {
+              registry.recordAuditHeartbeatUnavailable({ assignmentId: assignment.assignmentId, retryNumber, now });
             } else {
-              registry.recordImplementationHeartbeatUnavailable({
-                assignmentId: assignment.assignmentId,
-                retryNumber,
-                now,
-              });
+              registry.recordImplementationHeartbeatUnavailable({ assignmentId: assignment.assignmentId, retryNumber, now });
             }
             continue;
           }
@@ -1409,13 +1431,22 @@ class SupervisionAutomation {
         // disconnected. Never enqueue a second watchdog reminder behind the
         // first one: cooldown controls cadence, this queue check provides the
         // independent hard bound of one pending reminder per assignment.
-        const reminderIdPrefix = `supervision-implementation-heartbeat:${assignment.assignmentId}:`;
+        const reminderIdPrefix = watchdogKind === 'audit'
+          ? `${AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX}${assignment.assignmentId}:${assignment.auditAttemptId}:`
+          : `supervision-implementation-heartbeat:${assignment.assignmentId}:`;
         if (runtime.pendingEntries.some((entry) => entry.clientMessageId.startsWith(reminderIdPrefix))) continue;
         // One unanswered heartbeat is the bounded liveness probe. A second
         // equivalent prompt would only solicit another refusal/no-op. Convert
         // that state into one durable structured escalation instead; the
         // persisted blocker above stops later ticks and process restarts.
         if (reminders.length > 0) {
+          // One exact audit wake-up is enough. A later unchanged tick records
+          // one structured waiting_for_brain blocker instead of stacking a
+          // second prompt behind the first.
+          if (watchdogKind === 'audit') {
+            registry.recordAuditNoProgressBlocker({ assignmentId: assignment.assignmentId, now });
+            continue;
+          }
           const escalationKey = `${task.taskId}\0${assignment.assignmentId}`;
           if (this.implementationBlockerEscalationsInFlight.has(escalationKey)) continue;
           this.implementationBlockerEscalationsInFlight.add(escalationKey);
@@ -1447,22 +1478,28 @@ class SupervisionAutomation {
         }
         const reminderNumber = reminders.length + 1;
         const clientMessageId = `${reminderIdPrefix}${reminderNumber}`;
-        const recorded = registry.recordImplementationHeartbeat({
-          assignmentId: assignment.assignmentId,
-          reminderNumber,
-          clientMessageId,
-          now,
-        });
+        const recorded = watchdogKind === 'audit'
+          ? registry.recordAuditHeartbeat({ assignmentId: assignment.assignmentId, reminderNumber, clientMessageId, now })
+          : registry.recordImplementationHeartbeat({ assignmentId: assignment.assignmentId, reminderNumber, clientMessageId, now });
         if (!recorded.ok) continue;
-        const prompt = JSON.stringify({
-          contractRefs: [
-            SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
-            SUPERVISION_CONTRACT_IDS.MESSAGING,
-            SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
-          ],
-          binding: { mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId },
-          action: 'advance_safe_unfinished',
-        });
+        const prompt = watchdogKind === 'audit'
+          ? JSON.stringify({
+              contractRefs: [SUPERVISION_CONTRACT_IDS.AUDIT_HEARTBEAT, SUPERVISION_CONTRACT_IDS.MESSAGING],
+              binding: {
+                mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId,
+                auditAttemptId: assignment.auditAttemptId, auditRevision: assignment.auditRevision,
+              },
+              action: 'complete_exact_audit',
+            })
+          : JSON.stringify({
+              contractRefs: [
+                SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
+                SUPERVISION_CONTRACT_IDS.MESSAGING,
+                SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+              ],
+              binding: { mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId },
+              action: 'advance_safe_unfinished',
+            });
         timelineEmitter.emit(
           rebound.identity.sessionName,
           'user.message',

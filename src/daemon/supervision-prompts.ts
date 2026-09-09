@@ -504,7 +504,11 @@ export function buildSupervisionMessagingContract(): string {
       direct: ['exact_pass_or_rework', 'unique_auditor_delivery', 'evidence_determined_repair'],
       brainChatter: false,
     },
-    heartbeat: { reminderOnly: true, substitutesReply: false },
+    heartbeat: {
+      active: 'resume_one_stale_exact_assignment',
+      dedupe: 'stable_until_state_change',
+      substitutesReply: false,
+    },
     gate: 'tool_schema+authority_handler',
   });
 }
@@ -653,13 +657,13 @@ export function buildSupervisionWaitingHeartbeatPrompt(
 ): string {
   if (!isAutomaticSupervisionEnabled(snapshot)) return '';
   const lines: Record<SupervisionUiLocale, string> = {
-    en: `Check the current task state. Continue any safe work now. If waiting for a receipt, remain waiting and check again on the next heartbeat. Return ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} only when real human input is required.`,
-    'zh-CN': `检查当前任务状态；有安全工作就继续推进；等待回执则保持等待并在下次心跳继续检查。只有确需人工输入时才返回 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
-    'zh-TW': `檢查目前任務狀態；有安全工作就繼續推進；等待回執則保持等待並在下次心跳繼續檢查。只有確需人工輸入時才回傳 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
-    es: `Comprueba el estado actual. Continúa cualquier trabajo seguro. Si esperas un recibo, sigue esperando y comprueba de nuevo en el próximo latido. Devuelve ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} solo si hace falta intervención humana real.`,
-    ru: `Проверьте текущее состояние задачи. Продолжайте безопасную работу. Если ждёте квитанцию, продолжайте ждать и проверьте снова при следующем heartbeat. Возвращайте ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} только когда действительно нужен человек.`,
-    ja: `現在のタスク状態を確認し、安全に進められる作業を続行してください。回执待ちなら待機を維持し、次の heartbeat で再確認します。人の入力が本当に必要な場合だけ ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} を返してください。`,
-    ko: `현재 작업 상태를 확인하고 안전한 작업은 계속 진행하세요. 영수증을 기다리는 중이면 대기를 유지하고 다음 heartbeat에서 다시 확인하세요. 실제 사람 입력이 필요한 경우에만 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}을 반환하세요.`,
+    en: `Re-read authoritative task state now. If an exact delegated/implementing/auditing assignment is stale while its bound target is ready, append one continuation to the original assignment now with the same stable idempotency key; never create a replacement. If a durable recovery already exists, do not duplicate it. Escalate a deterministic internal authority defect to Brain, not the user. End every nonterminal response with exactly one final ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}; use ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} only when Brain also lacks required external human information.`,
+    'zh-CN': `现在重新读取权威任务状态。若精确 delegated/implementing/auditing assignment 已停滞且绑定目标 ready，立即用同一个稳定幂等键向原 assignment 追加一次 continuation；绝不创建替代对象。已有持久恢复则不得重复。可确定的内部权限缺陷升级给 Brain，不交给用户。每个非终态响应必须且只能以一个最终 ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 结束；仅当 Brain 也缺少必要的外部人工信息时使用 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
+    'zh-TW': `現在重新讀取權威任務狀態。若精確 delegated/implementing/auditing assignment 已停滯且綁定目標 ready，立即用同一個穩定冪等鍵向原 assignment 追加一次 continuation；絕不建立替代物件。已有持久恢復則不得重複。可確定的內部權限缺陷升級給 Brain，不交給使用者。每個非終態回應必須且只能以一個最終 ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 結束；僅當 Brain 也缺少必要的外部人工資訊時使用 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
+    es: `Vuelve a leer ahora el estado autoritativo. Si la asignación exacta está estancada y su destino está listo, añade una sola continuación a la asignación original con la misma clave idempotente; nunca la reemplaces ni dupliques una recuperación duradera. Escala a Brain los defectos internos deterministas. Termina toda respuesta no terminal con exactamente un ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} final; usa ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} solo si Brain también carece de información humana externa necesaria.`,
+    ru: `Сейчас перечитайте авторитетное состояние задачи. Если точное назначение застряло, а его цель готова, один раз добавьте продолжение к исходному назначению с тем же стабильным ключом идемпотентности; не создавайте замену и не дублируйте устойчивое восстановление. Однозначные внутренние дефекты эскалируйте Brain. Каждый нетерминальный ответ завершайте ровно одним финальным ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}; ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} допустим только когда Brain также не хватает необходимых внешних данных человека.`,
+    ja: `権威あるタスク状態を今すぐ再読してください。正確な assignment が停滞し、束縛先が ready なら、同じ安定 idempotency key で元の assignment に continuation を一度だけ追加し、代替オブジェクトや重複した永続 recovery を作らないでください。確定的な内部権限障害は Brain にエスカレーションします。非終端応答は必ず最終の ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 一つだけで終え、Brain にも必要な外部の人的情報がない場合だけ ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} を使ってください。`,
+    ko: `권위 있는 작업 상태를 지금 다시 읽으세요. 정확한 assignment가 정체되고 바인딩 대상이 ready이면 동일한 안정 idempotency key로 원래 assignment에 continuation을 한 번만 추가하고 대체 객체나 중복 영구 복구를 만들지 마세요. 확정 가능한 내부 권한 결함은 Brain으로 에스컬레이션하세요. 모든 비종료 응답은 마지막 ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING} 하나로만 끝내고, Brain도 필요한 외부 사람 정보를 갖지 못한 경우에만 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}을 사용하세요.`,
   };
   return `[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]\n${lines[locale ?? 'en']}`;
 }

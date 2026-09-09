@@ -12,6 +12,7 @@ import {
 } from './supervision-state-store.js';
 
 export const IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX = 'supervision-implementation-heartbeat:';
+export const AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX = 'supervision-audit-heartbeat:';
 export const IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT = 6;
 export type ImplementationHeartbeatAuthorityResult =
   | { status: 'authorized' }
@@ -57,11 +58,14 @@ function parkUnresolvedOnce(
   now: number,
 ): void {
   if (assignment.blocker?.trim()) return;
+  const kind = assignment.role === 'auditor'
+    ? 'audit_heartbeat_identity_rebind_required'
+    : 'implementation_heartbeat_identity_rebind_required';
   getSupervisionTaskRegistry().updateAssignment({
     assignmentId: assignment.assignmentId,
     identity: assignment.identity,
     blocker: JSON.stringify({
-      kind: 'implementation_heartbeat_identity_rebind_required',
+      kind,
       taskId,
       assignmentId: assignment.assignmentId,
       candidateCount,
@@ -79,11 +83,14 @@ export function parkTransientRuntimeExhaustedOnce(input: {
 }): void {
   const assignment = getSupervisionTaskRegistry().getAssignment(input.assignmentId);
   if (!assignment || assignment.taskId !== input.taskId || assignment.blocker?.trim()) return;
+  const kind = assignment.role === 'auditor'
+    ? 'audit_heartbeat_runtime_unavailable'
+    : 'implementation_heartbeat_runtime_unavailable';
   getSupervisionTaskRegistry().updateAssignment({
     assignmentId: assignment.assignmentId,
     identity: assignment.identity,
     blocker: JSON.stringify({
-      kind: 'implementation_heartbeat_runtime_unavailable',
+      kind,
       taskId: input.taskId,
       assignmentId: input.assignmentId,
       retryCount: input.retryCount,
@@ -154,19 +161,46 @@ export function authorizeImplementationHeartbeatDelivery(input: {
   return resolveImplementationHeartbeatDelivery(input).status === 'authorized';
 }
 
-function parseHeartbeatBinding(text: string): { taskId: string; assignmentId: string } | undefined {
+type HeartbeatBinding = {
+  kind: 'implementation' | 'audit';
+  taskId: string;
+  assignmentId: string;
+  auditAttemptId?: string;
+  auditRevision?: string;
+};
+
+function parseHeartbeatBinding(text: string): HeartbeatBinding | undefined {
   try {
     const value = JSON.parse(text) as {
       contractRefs?: unknown;
-      binding?: { taskId?: unknown; assignmentId?: unknown };
+      binding?: {
+        taskId?: unknown;
+        assignmentId?: unknown;
+        auditAttemptId?: unknown;
+        auditRevision?: unknown;
+      };
       action?: unknown;
     };
     if (!Array.isArray(value.contractRefs)
-      || !value.contractRefs.includes(SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT)
-      || value.action !== 'advance_safe_unfinished'
       || typeof value.binding?.taskId !== 'string'
       || typeof value.binding.assignmentId !== 'string') return undefined;
-    return { taskId: value.binding.taskId, assignmentId: value.binding.assignmentId };
+    if (value.contractRefs.includes(SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT)
+      && value.action === 'advance_safe_unfinished') {
+      return { kind: 'implementation', taskId: value.binding.taskId, assignmentId: value.binding.assignmentId };
+    }
+    if (value.contractRefs.includes(SUPERVISION_CONTRACT_IDS.AUDIT_HEARTBEAT)
+      && value.action === 'complete_exact_audit'
+      && typeof value.binding.auditAttemptId === 'string'
+      && typeof value.binding.auditRevision === 'string') {
+      return {
+        kind: 'audit',
+        taskId: value.binding.taskId,
+        assignmentId: value.binding.assignmentId,
+        auditAttemptId: value.binding.auditAttemptId,
+        auditRevision: value.binding.auditRevision,
+      };
+    }
+    return undefined;
   } catch {
     return undefined;
   }
@@ -179,12 +213,33 @@ export function authorizeQueuedSupervisionHeartbeatDelivery(input: {
   text: string;
   now?: number;
 }): boolean {
-  const looksLikeHeartbeat = input.clientMessageId.startsWith(IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX);
+  const looksLikeImplementation = input.clientMessageId.startsWith(IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX);
+  const looksLikeAudit = input.clientMessageId.startsWith(AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX);
+  const looksLikeHeartbeat = looksLikeImplementation || looksLikeAudit;
   const binding = parseHeartbeatBinding(input.text);
   if (!looksLikeHeartbeat && !binding) return true;
   if (!looksLikeHeartbeat || !binding) return false;
   try {
-    return authorizeImplementationHeartbeatDelivery({ ...binding, targetSessionName: input.targetSessionName, now: input.now });
+    const registry = getSupervisionTaskRegistry();
+    const assignment = registry.getAssignment(binding.assignmentId);
+    const task = registry.getTaskRecord(binding.taskId);
+    if (!assignment || !task || assignment.taskId !== task.taskId) return false;
+    if (binding.kind === 'implementation') {
+      if (!looksLikeImplementation || assignment.role !== 'implementer') return false;
+    } else if (!looksLikeAudit
+      || assignment.role !== 'auditor'
+      || assignment.auditAttemptId !== binding.auditAttemptId
+      || assignment.auditRevision !== binding.auditRevision) return false;
+    // The shared continuation predicate in the authority resolver below is
+    // the single task-current-revision fence. Keeping a second copy here made
+    // one of the two guards mutation-invisible and allowed the two call sites
+    // to drift without a load-bearing test.
+    return authorizeImplementationHeartbeatDelivery({
+      taskId: binding.taskId,
+      assignmentId: binding.assignmentId,
+      targetSessionName: input.targetSessionName,
+      now: input.now,
+    });
   } catch {
     // A registry outage is not authority. Preserve fail-closed delivery for the
     // control message while leaving ordinary queued user traffic untouched.

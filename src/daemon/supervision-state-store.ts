@@ -10,6 +10,7 @@ import {
 } from '../../shared/supervision-participant-authority.js';
 import { SUPERVISION_ID_PREFIXES } from '../../shared/supervision-durable-identity.js';
 import { matchesProjectSessionConsumer } from '../../shared/actionable-consumer-scope.js';
+import { SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS } from '../../shared/agent-delegation.js';
 
 import {
   canTransitionSupervisionTaskStatus,
@@ -3029,6 +3030,130 @@ export class SupervisionTaskRegistry {
     }, input.now ?? Date.now());
     const event = this.listEvents(assignment.taskId).at(-1);
     return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
+  }
+
+  /** Persist one exact auditor wake-up without treating it as audit progress. */
+  recordAuditHeartbeat(input: {
+    assignmentId: string;
+    now?: number;
+    reminderNumber: number;
+    clientMessageId: string;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskEvent> {
+    const assignment = this.getAssignment(input.assignmentId);
+    if (!assignment) return { ok: false, reason: 'not_found' };
+    if (assignment.role !== 'auditor'
+      || !['delegated', 'implementing', 'auditing'].includes(assignment.status)
+      || !assignment.auditAttemptId
+      || !assignment.auditRevision) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    const now = input.now ?? Date.now();
+    this.#appendEvent(assignment.taskId, assignment.assignmentId, 'implementation_heartbeat', assignment.status, {
+      source: 'audit_watchdog',
+      substantiveProgress: false,
+      reminderNumber: input.reminderNumber,
+      clientMessageId: input.clientMessageId,
+      auditAttemptId: assignment.auditAttemptId,
+      auditRevision: assignment.auditRevision,
+    }, now);
+    this.#recordAssignmentHeartbeat(assignment, now);
+    const event = this.listEvents(assignment.taskId).at(-1);
+    return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
+  }
+
+  /** Persist bounded runtime-unavailable backoff for an exact auditor. */
+  recordAuditHeartbeatUnavailable(input: {
+    assignmentId: string;
+    now?: number;
+    retryNumber: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskEvent> {
+    const assignment = this.getAssignment(input.assignmentId);
+    if (!assignment) return { ok: false, reason: 'not_found' };
+    if (assignment.role !== 'auditor'
+      || !['delegated', 'implementing', 'auditing'].includes(assignment.status)
+      || !assignment.auditAttemptId
+      || !assignment.auditRevision) {
+      return { ok: false, reason: 'invalid_transition' };
+    }
+    this.#appendEvent(assignment.taskId, assignment.assignmentId, 'implementation_heartbeat', assignment.status, {
+      source: 'audit_watchdog_runtime_unavailable',
+      substantiveProgress: false,
+      retryNumber: input.retryNumber,
+      auditAttemptId: assignment.auditAttemptId,
+      auditRevision: assignment.auditRevision,
+    }, input.now ?? Date.now());
+    const event = this.listEvents(assignment.taskId).at(-1);
+    return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
+  }
+
+  /**
+   * Convert one unanswered exact-auditor wake into a durable Brain-owned
+   * escalation. This is deliberately assignment-local: it neither replaces
+   * the auditor nor rewrites the audit attempt/revision.
+   */
+  recordAuditNoProgressBlocker(input: {
+    assignmentId: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const assignment = this.getAssignment(input.assignmentId);
+      const task = assignment ? this.getTaskRecord(assignment.taskId) : undefined;
+      if (!assignment || !task || assignment.role !== 'auditor'
+        || !['delegated', 'implementing', 'auditing'].includes(assignment.status)
+        || !assignment.auditAttemptId || !assignment.auditRevision
+        || assignment.auditRevision !== task.currentRevision
+        || isTerminalSupervisionTaskStatus(task.status)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      const exactError = 'audit heartbeat completed without durable progress or a structured verdict';
+      const blockerFingerprint = createHash('sha256').update(JSON.stringify({
+        taskId: task.taskId,
+        assignmentId: assignment.assignmentId,
+        attemptId: assignment.auditAttemptId,
+        revision: assignment.auditRevision,
+        status: assignment.status,
+        exactError,
+      })).digest('hex');
+      const blocker = JSON.stringify({
+        taskId: task.taskId,
+        assignmentId: assignment.assignmentId,
+        attemptId: assignment.auditAttemptId,
+        revision: assignment.auditRevision,
+        exactError,
+        completedSafeWork: 'one exact same-object auditor wake-up was durably delivered; no replacement, Git, or lifecycle side effect was created',
+        options: ['resume_exact_auditor', 'repair_same_object_audit_delivery'],
+        recommendedNextAction: 'the authoritative Brain must resume this exact auditor assignment and audit attempt in place',
+        blockerFingerprint,
+        disposition: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN,
+      });
+      if (assignment.blocker === blocker) {
+        this.#db.exec('ROLLBACK');
+        return { ok: true, value: assignment, replay: true };
+      }
+      if (assignment.blocker) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
+      const recorded = { ...assignment, blocker };
+      this.#db.prepare(
+        'UPDATE supervision_task_assignments SET blocker = ?, payload_json = ? WHERE assignment_id = ?',
+      ).run(blocker, JSON.stringify(recorded), assignment.assignmentId);
+      this.#appendEvent(task.taskId, assignment.assignmentId, 'implementation_heartbeat', assignment.status, {
+        source: 'audit_watchdog_no_progress',
+        substantiveProgress: false,
+        blockerFingerprint,
+        auditAttemptId: assignment.auditAttemptId,
+        auditRevision: assignment.auditRevision,
+      }, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: recorded };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /**

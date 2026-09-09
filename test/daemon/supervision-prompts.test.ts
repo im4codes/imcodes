@@ -68,7 +68,11 @@ describe('supervision prompts', () => {
     expect(messaging.automaticAudit).toMatchObject({
       eligibility: 'supervision_delegation_eligibility_v1',
     });
-    expect(messaging.heartbeat.substitutesReply).toBe(false);
+    expect(messaging.heartbeat).toMatchObject({
+      active: 'resume_one_stale_exact_assignment',
+      dedupe: 'stable_until_state_change',
+      substitutesReply: false,
+    });
 
     const eligibility = JSON.parse(buildSupervisionDelegationEligibilityPolicy('en'));
     expect(eligibility.independentAudit.automatic).toMatchObject({
@@ -173,12 +177,13 @@ describe('supervision prompts', () => {
     expect(prompt).not.toContain(SUPERVISION_CONTRACT_PREAMBLE_END);
   });
 
-  it('keeps waiting heartbeat payload fixed, short, mode-gated, and free of standing contracts', () => {
+  it('makes each waiting heartbeat one bounded active same-object recovery turn', () => {
     const heartbeat = buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.SUPERVISED }, 'zh-CN');
     expect(heartbeat).toContain('[Contract: supervision_waiting_heartbeat_v1]');
-    expect(heartbeat).toContain('检查当前任务状态');
-    expect(heartbeat).toContain('有安全工作就继续推进');
-    expect(heartbeat).toContain('等待回执则保持等待并在下次心跳继续检查');
+    expect(heartbeat).toContain('重新读取权威任务状态');
+    expect(heartbeat).toContain('原 assignment');
+    expect(heartbeat).toContain('同一个稳定幂等键');
+    expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
     expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
     expect(Buffer.byteLength(heartbeat, 'utf8')).toBeLessThanOrEqual(2_200);
     for (const forbidden of [
@@ -741,7 +746,11 @@ describe('supervision user authority clause', () => {
       brain: 'waiting_for_brain',
       external: 'needs_input',
     });
-    expect(messaging.heartbeat).toEqual({ reminderOnly: true, substitutesReply: false });
+    expect(messaging.heartbeat).toEqual({
+      active: 'resume_one_stale_exact_assignment',
+      dedupe: 'stable_until_state_change',
+      substitutesReply: false,
+    });
     expect(messaging.gate).toBe('tool_schema+authority_handler');
     // automaticAudit no longer restates target/ignore/order; it POINTS at the
     // single definition, which must still ship in the same preamble.
