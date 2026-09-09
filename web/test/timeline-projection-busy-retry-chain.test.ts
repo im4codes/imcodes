@@ -4,7 +4,7 @@ import {
   RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS,
   TIMELINE_HISTORY_ERROR_REASONS,
 } from '../../shared/timeline-history-errors.js';
-import { TIMELINE_RESPONSE_SOURCES, TIMELINE_RESPONSE_STATUS } from '../../shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS } from '../../shared/timeline-protocol.js';
 
 /**
  * The exact frame the daemon emits for a saturated projection. Built here in the
@@ -14,7 +14,7 @@ import { TIMELINE_RESPONSE_SOURCES, TIMELINE_RESPONSE_STATUS } from '../../share
  */
 function daemonHistoryErrorFrame(errorReason: string, recoverable?: boolean) {
   return {
-    type: 'timeline.history',
+    type: TIMELINE_MESSAGES.HISTORY,
     sessionName: 'deck_saturated_brain',
     requestId: 'hist-1',
     events: [],
@@ -75,6 +75,5 @@ describe('projection_busy retries end to end; projection_unavailable does not', 
       daemonHistoryErrorFrame(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, true),
       true,
     )).toBe(false);
-    expect(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE).toBe('main_sqlite');
   });
 });

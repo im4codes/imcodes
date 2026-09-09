@@ -24,6 +24,11 @@ describe('RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS', () => {
     expect(isRecoverableTimelineRequestErrorReason(TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED)).toBe(true);
     expect(isRecoverableTimelineRequestErrorReason(TIMELINE_REQUEST_ERROR_REASONS.TIMEOUT)).toBe(true);
     expect(isRecoverableTimelineRequestErrorReason(TIMELINE_REQUEST_ERROR_REASONS.UNAVAILABLE)).toBe(true);
+    // The projection exists but was too busy to answer (SQLITE_BUSY after
+    // busy_timeout while a writer checkpoints the WAL). Momentary, so the
+    // client should come back — unlike PROJECTION_UNAVAILABLE below, where
+    // absence is durable and the daemon's own fallback is the answer.
+    expect(isRecoverableTimelineRequestErrorReason(TIMELINE_REQUEST_ERROR_REASONS.PROJECTION_BUSY)).toBe(true);
   });
 
   it('marks request-shape / terminal reasons as NOT recoverable', () => {
@@ -52,12 +57,22 @@ describe('RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS', () => {
     expect(isRecoverableTimelineRequestErrorReason('')).toBe(false);
   });
 
-  it('exports an immutable allow-list', () => {
-    const initialSize = RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS.size;
-    expect(initialSize).toBeGreaterThan(0);
-    // Mutation attempts should not be possible — the set is typed
-    // ReadonlySet. We still anchor the count so an unintended widening
-    // shows up in CI immediately.
-    expect(initialSize).toBe(4);
+  it('exports an immutable allow-list of exactly the intended reasons', () => {
+    // Pinned by identity, not just by count: a count alone cannot tell a
+    // deliberate addition from a swap that happens to keep the size. Any
+    // widening, narrowing OR substitution fails here.
+    expect([...RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS].sort()).toEqual([
+      TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED,
+      TIMELINE_REQUEST_ERROR_REASONS.PROJECTION_BUSY,
+      TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+      TIMELINE_REQUEST_ERROR_REASONS.TIMEOUT,
+      TIMELINE_REQUEST_ERROR_REASONS.UNAVAILABLE,
+    ].sort());
+    // PROJECTION_BUSY is the fifth, added by the audited projection-saturation
+    // fix; PROJECTION_UNAVAILABLE deliberately stays out.
+    expect(RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS.size).toBe(5);
+    expect(RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS.has(
+      TIMELINE_REQUEST_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+    )).toBe(false);
   });
 });
