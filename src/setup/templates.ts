@@ -44,6 +44,24 @@ function deploymentNetworkMode(turn: TurnDeploymentTemplateConfig | undefined): 
   });
 }
 
+/**
+ * Durable store for superseded controlled-node artifacts.
+ *
+ * tsk_jgt resolves its retention directory as IMCODES_NODE_EXE_VERSION_DIR, or
+ * `<IMCODES_NODE_EXE_DIR>/versions` when unset. The image sets
+ * IMCODES_NODE_EXE_DIR=/app/controlled-node-executables, so the default lands
+ * inside the image layer and every retained version — plus every install code
+ * minted against one — is destroyed the moment the Server image is replaced.
+ * Production confirmed the shape: imcodes-im-server-1 ran with no volumes at all.
+ *
+ * The mount path is deliberately OUTSIDE /app/controlled-node-executables. That
+ * directory is replaced wholesale with each image; keeping retained bytes in a
+ * separate tree means a new image cannot ship content over them, and the volume
+ * is the only thing that persists across replacement.
+ */
+export const NODE_EXE_VERSION_VOLUME = 'node_exe_versions';
+export const NODE_EXE_VERSION_DIR = '/var/lib/imcodes/node-exe-versions';
+
 export function dockerComposeTemplate(opts?: {
   ghcrPrefix?: string;
   turn?: TurnDeploymentTemplateConfig;
@@ -148,6 +166,10 @@ ${turnSharedService}
       TURN_CREDENTIAL_TTL_SECONDS: "\${TURN_CREDENTIAL_TTL_SECONDS:-}"
       TURN_RELAY_MIN_PORT: "\${TURN_RELAY_MIN_PORT:-}"
       TURN_RELAY_MAX_PORT: "\${TURN_RELAY_MAX_PORT:-}"
+      # Retained superseded artifacts live on a named volume, not in the image.
+      IMCODES_NODE_EXE_VERSION_DIR: ${NODE_EXE_VERSION_DIR}
+    volumes:
+      - ${NODE_EXE_VERSION_VOLUME}:${NODE_EXE_VERSION_DIR}
     labels:
       - com.centurylinklabs.watchtower.scope=imcodes
     depends_on:
@@ -188,6 +210,9 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  # Declared explicitly so an upgrade neither renames nor drops it; existing
+  # named volumes above are untouched.
+  ${NODE_EXE_VERSION_VOLUME}:
 `;
 }
 

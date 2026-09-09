@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const { execSyncMock, execFileSyncMock, setupState } = vi.hoisted(() => ({
   execSyncMock: vi.fn(),
@@ -1703,4 +1704,514 @@ describe('the selected network strategy survives recovery', () => {
     expect(errorSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
       .toContain('conflicts with the explicit relay range');
   });
+});
+
+/**
+ * Retention of superseded Windows artifacts is content-addressed on disk, and
+ * tsk_jgt resolves its store as `IMCODES_NODE_EXE_VERSION_DIR` or, unset,
+ * `<IMCODES_NODE_EXE_DIR>/versions`. The image sets
+ * IMCODES_NODE_EXE_DIR=/app/controlled-node-executables, so the default lands
+ * INSIDE the image layer: replacing the Server image discards every retained
+ * version and every install code minted against one. Production evidence showed
+ * imcodes-im-server-1 with no volumes at all, so the source fix was inert.
+ */
+describe('retained Windows artifact versions survive Server image replacement', () => {
+  useIsolatedSetupEnvironment();
+
+  const dockerAvailable = (() => {
+    try {
+      return spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 60_000 }).status === 0;
+    } catch {
+      return false;
+    }
+  })();
+
+  async function templates() {
+    return await import('../../src/setup/templates.js');
+  }
+
+  async function parseYaml(text: string): Promise<Record<string, never>> {
+    const { parse } = await import('yaml');
+    return parse(text) as Record<string, never>;
+  }
+
+  it('declares the durable version volume and points the env at its mount, in generated Compose', async () => {
+    const { dockerComposeTemplate, NODE_EXE_VERSION_VOLUME, NODE_EXE_VERSION_DIR } = await templates();
+    const doc = await parseYaml(dockerComposeTemplate({})) as {
+      services: Record<string, { environment?: Record<string, string>; volumes?: string[] }>;
+      volumes: Record<string, unknown>;
+    };
+
+    // Declared explicitly and deterministically, not implied by a bind.
+    expect(Object.keys(doc.volumes)).toContain(NODE_EXE_VERSION_VOLUME);
+    expect(doc.services.server?.volumes ?? [])
+      .toContain(`${NODE_EXE_VERSION_VOLUME}:${NODE_EXE_VERSION_DIR}`);
+    expect(doc.services.server?.environment?.IMCODES_NODE_EXE_VERSION_DIR).toBe(NODE_EXE_VERSION_DIR);
+  });
+
+  it('keeps the retained store outside the mutable current-artifact directory', async () => {
+    // The current artifact directory is replaced wholesale with the image. If
+    // the retained store lived beneath it, a new image would be free to ship
+    // bytes over the top of retained versions, which is the failure this whole
+    // slice exists to prevent.
+    const { NODE_EXE_VERSION_DIR } = await templates();
+    const imageArtifactDir = '/app/controlled-node-executables';
+    expect(NODE_EXE_VERSION_DIR.startsWith(`${imageArtifactDir}/`)).toBe(false);
+    expect(NODE_EXE_VERSION_DIR).not.toBe(imageArtifactDir);
+  });
+
+  it('ships the same volume, mount and env in the repository Compose file', async () => {
+    // The generated file covers new installs; the checked-in file is what an
+    // existing deployment is upgraded against. Both must carry the contract or
+    // the fix reaches only half the fleet.
+    const { NODE_EXE_VERSION_VOLUME, NODE_EXE_VERSION_DIR } = await templates();
+    const shipped = await parseYaml(readFileSync(fileURLToPath(new URL('../../docker-compose.yml', import.meta.url)), 'utf8')) as {
+      services: Record<string, { environment?: Record<string, string>; volumes?: string[] }>;
+      volumes: Record<string, unknown>;
+    };
+    expect(Object.keys(shipped.volumes)).toContain(NODE_EXE_VERSION_VOLUME);
+    expect(shipped.services.server?.volumes ?? [])
+      .toContain(`${NODE_EXE_VERSION_VOLUME}:${NODE_EXE_VERSION_DIR}`);
+    expect(shipped.services.server?.environment?.IMCODES_NODE_EXE_VERSION_DIR).toBe(NODE_EXE_VERSION_DIR);
+  });
+
+  it('leaves unrelated volumes and TURN modes untouched', async () => {
+    // An upgrade must not renumber or drop existing named volumes, or an
+    // operator loses their database and certificates to a retention fix.
+    const { dockerComposeTemplate, NODE_EXE_VERSION_VOLUME } = await templates();
+    for (const turn of [undefined, { enabled: true, networkMode: 'host' as const }]) {
+      const doc = await parseYaml(dockerComposeTemplate(turn ? { turn } : {})) as {
+        services: Record<string, { volumes?: string[] }>;
+        volumes: Record<string, unknown>;
+      };
+      expect(Object.keys(doc.volumes)).toEqual(
+        expect.arrayContaining(['pgdata', 'caddy_data', 'caddy_config', NODE_EXE_VERSION_VOLUME]),
+      );
+      // The retention volume belongs to the server only.
+      expect(doc.services.caddy?.volumes ?? []).not.toContain(NODE_EXE_VERSION_VOLUME);
+      expect((doc.services.postgres?.volumes ?? []).join(' ')).not.toContain(NODE_EXE_VERSION_VOLUME);
+    }
+  });
+
+  it.skipIf(!dockerAvailable)('resolves the env and mount through real docker compose config', async () => {
+    const { dockerComposeTemplate, envTemplate, NODE_EXE_VERSION_VOLUME, NODE_EXE_VERSION_DIR } = await templates();
+    const projectDir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-version-volume-'));
+    try {
+      writeFileSync(join(projectDir, 'docker-compose.yml'), dockerComposeTemplate({}));
+      writeFileSync(join(projectDir, '.env'), envTemplate({
+        domain: 'example.test', postgresPassword: 'p', jwtSigningKey: 'j', adminPassword: 'a',
+      }));
+      const result = spawnSync('docker', [
+        'compose', '-f', join(projectDir, 'docker-compose.yml'),
+        '--env-file', join(projectDir, '.env'), 'config',
+      ], { encoding: 'utf8', timeout: 300_000, maxBuffer: 64 * 1024 * 1024 });
+      expect(result.stderr ?? '').not.toMatch(/error/i);
+      expect(result.status).toBe(0);
+      const model = await parseYaml(result.stdout ?? '') as {
+        services: Record<string, { environment?: Record<string, string>; volumes?: { source?: string; target?: string; type?: string }[] }>;
+        volumes: Record<string, unknown>;
+      };
+      expect(model.services.server?.environment?.IMCODES_NODE_EXE_VERSION_DIR).toBe(NODE_EXE_VERSION_DIR);
+      const mount = (model.services.server?.volumes ?? [])
+        .find((entry) => entry.target === NODE_EXE_VERSION_DIR);
+      expect(mount, 'server must mount the retained-version volume').toBeTruthy();
+      expect(mount?.type).toBe('volume');
+      expect(mount?.source).toContain(NODE_EXE_VERSION_VOLUME);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  }, 300_000);
+
+  it.skipIf(!dockerAvailable)('migrates a pre-fix container\'s retained tree into the durable volume', async () => {
+    // The production shape the previous version of this test missed. A pre-fix
+    // deployment has NO volume: its retained versions sit in the container's
+    // writable layer at <IMCODES_NODE_EXE_DIR>/versions, and `compose up -d`
+    // discards that layer when it recreates the service. Declaring the volume
+    // alone therefore does not preserve anything -- the new container simply
+    // starts with an empty one. Starting the "old" container already mounting
+    // the new volume, as the earlier test did, proved only ordinary volume
+    // reuse and would have passed with no migration at all.
+    const { stageRetainedArtifactVersions, restoreRetainedArtifactVersions, LEGACY_NODE_EXE_VERSION_DIR } =
+      await import('../../src/setup/setup-flow.js');
+    const { NODE_EXE_VERSION_DIR } = await templates();
+
+    const suffix = `${Date.now()}`;
+    const oldName = `imcodes-legacy-server-${suffix}`;
+    const newName = `imcodes-new-server-${suffix}`;
+    const volume = `imcodes-versions-${suffix}`;
+    const digest = 'c'.repeat(64);
+    const legacyPinned = `${LEGACY_NODE_EXE_VERSION_DIR}/win-x64/${digest}.bin`;
+    const durablePinned = `${NODE_EXE_VERSION_DIR}/win-x64/${digest}.bin`;
+    const docker = (args: string[]) => spawnSync('docker', args, { encoding: 'utf8', timeout: 300_000 });
+
+    // The helpers locate the service through `compose ps -aq server`; that one
+    // lookup is stubbed so the test does not need a full compose project, while
+    // every docker inspect/exec/cp below runs for real against real containers.
+    const withContainer = (id: string) => ({
+      // spawnSync, not execSync: this file mocks execSync, and the point of the
+      // test is that the real docker inspect/exec/cp calls run.
+      runQuiet: (cmd: string, cwd: string) => {
+        if (cmd.includes('ps -aq server') || cmd.includes('ps -q server')) return id;
+        const out = spawnSync(cmd, { cwd, encoding: 'utf8', shell: true, timeout: 300_000 });
+        if (out.status !== 0) throw new Error(out.stderr || `command failed: ${cmd}`);
+        return (out.stdout ?? '').trim();
+      },
+    });
+
+    try {
+      // 1. Pre-fix container: no volume, retained bytes in the writable layer.
+      expect(docker(['run', '-d', '--name', oldName, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expect(docker(['exec', oldName, 'sh', '-c',
+        `mkdir -p ${LEGACY_NODE_EXE_VERSION_DIR}/win-x64 && printf pinned-legacy-bytes > ${legacyPinned}`,
+      ]).status).toBe(0);
+
+      // 2. Stage before replacement.
+      const staged = stageRetainedArtifactVersions('docker compose', process.cwd(), {
+        ...withContainer(oldName),
+        mkdtemp: () => mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-migrate-')),
+      });
+      expect(staged.kind, 'a pre-fix container with retained bytes must stage them').toBe('staged');
+      const stagedDir = (staged as { kind: 'staged'; dir: string }).dir;
+      expect(readFileSync(join(stagedDir, 'win-x64', `${digest}.bin`), 'utf8')).toBe('pinned-legacy-bytes');
+
+      // 3. Replacement: old container gone, new one starts on an EMPTY volume.
+      expect(docker(['rm', '-f', oldName]).status).toBe(0);
+      expect(docker(['run', '-d', '--name', newName, '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
+        'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      const beforeRestore = docker(['exec', newName, 'sh', '-c', `cat ${durablePinned} 2>/dev/null || true`]);
+      expect(beforeRestore.stdout.trim(), 'the replacement starts with nothing; migration is what saves it').toBe('');
+
+      // 4. Restore into the durable volume.
+      expect(restoreRetainedArtifactVersions('docker compose', process.cwd(), stagedDir, withContainer(newName)))
+        .toBe(true);
+      const afterRestore = docker(['exec', newName, 'sh', '-c', `cat ${durablePinned}`]);
+      expect(afterRestore.status, afterRestore.stderr).toBe(0);
+      expect(afterRestore.stdout.trim()).toBe('pinned-legacy-bytes');
+
+      // 5. And they now survive every FURTHER replacement, from a different image.
+      expect(docker(['rm', '-f', newName]).status).toBe(0);
+      const afterSecondReplacement = docker(['run', '--rm', '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
+        'alpine:3.20', 'cat', durablePinned]);
+      expect(afterSecondReplacement.status, afterSecondReplacement.stderr).toBe(0);
+      expect(afterSecondReplacement.stdout.trim()).toBe('pinned-legacy-bytes');
+      rmSync(stagedDir, { recursive: true, force: true });
+    } finally {
+      docker(['rm', '-f', oldName]);
+      docker(['rm', '-f', newName]);
+      docker(['volume', 'rm', '-f', volume]);
+    }
+  }, 600_000);
+});
+
+describe('retained-artifact migration fails closed instead of losing data', () => {
+  useIsolatedSetupEnvironment();
+
+  async function flow() {
+    return await import('../../src/setup/setup-flow.js');
+  }
+
+  it('never reports a failed attempt as "nothing to migrate"', async () => {
+    // These were both null before, so the caller could not tell "there is
+    // nothing to preserve" from "I could not find out". It then replaced the
+    // container, destroying the only copy of the bytes it had just failed to
+    // read. Each failing step must be distinguishable from absence.
+    const { stageRetainedArtifactVersions } = await flow();
+    const boom = (marker: string) => () => { throw new Error(marker); };
+
+    const failing: Array<[string, { runQuiet: (c: string, d: string) => string; mkdtemp: () => string }]> = [
+      ['compose-ps', { runQuiet: boom('ps exploded'), mkdtemp: () => '/tmp/unused' }],
+      ['docker-inspect', {
+        runQuiet: (cmd: string) => {
+          if (cmd.includes('ps -aq server')) return 'container-1';
+          throw new Error('inspect exploded');
+        },
+        mkdtemp: () => '/tmp/unused',
+      }],
+      ['legacy-listing', {
+        runQuiet: (cmd: string) => {
+          if (cmd.includes('ps -aq server')) return 'container-1';
+          if (cmd.includes('State.Running')) return 'true';
+          if (cmd.includes('inspect')) return '/some/other/mount';
+          throw new Error('exec exploded');
+        },
+        mkdtemp: () => mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-listing-fail-')),
+      }],
+      ['staging-dir', {
+        runQuiet: (cmd: string) => {
+          if (cmd.includes('ps -aq server')) return 'container-1';
+          if (cmd.includes('State.Running')) return 'true';
+          if (cmd.includes('inspect')) return '/some/other/mount';
+          return 'win-x64';
+        },
+        mkdtemp: boom('no temp space'),
+      }],
+      ['docker-cp', {
+        runQuiet: (cmd: string) => {
+          if (cmd.includes('ps -aq server')) return 'container-1';
+          if (cmd.includes('State.Running')) return 'true';
+          if (cmd.includes('inspect')) return '/some/other/mount';
+          if (cmd.includes('docker cp')) throw new Error('cp exploded');
+          return 'win-x64';
+        },
+        mkdtemp: () => mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-stage-fail-')),
+      }],
+    ];
+
+    for (const [step, deps] of failing) {
+      const result = stageRetainedArtifactVersions('docker compose', process.cwd(), deps);
+      expect(result.kind, `${step} must be reported as a failure`).toBe('failed');
+      expect((result as { step: string }).step).toBe(step);
+    }
+  });
+
+  it('fails closed when the service resolves to more than one container', async () => {
+    // Two candidates and no way to know which holds the real retained bytes.
+    // Picking the first is a guess, and guessing here loses data silently, so
+    // ambiguity is a failure that blocks replacement.
+    const { stageRetainedArtifactVersions, assertRetainedArtifactStagingSafe } = await flow();
+    const result = stageRetainedArtifactVersions('docker compose', process.cwd(), {
+      runQuiet: () => 'container-a\ncontainer-b',
+      mkdtemp: () => '/tmp/unused',
+    });
+    expect(result.kind).toBe('failed');
+    expect((result as { step: string }).step).toBe('compose-ps');
+    expect((result as { detail: string }).detail).toContain('container-a');
+    expect(() => assertRetainedArtifactStagingSafe(result))
+      .toThrow(/Refusing to replace the server container/);
+  });
+
+  it('only treats a recognised missing-path copy error as absence', async () => {
+    // On a stopped container `cp` is both probe and copy, so its error is the
+    // only signal. A genuinely missing directory is benign; anything else -
+    // permissions, I/O, a daemon error we have never seen - must fail closed,
+    // because continuing destroys bytes we could not read.
+    const { stageRetainedArtifactVersions, assertRetainedArtifactStagingSafe } = await flow();
+    const stoppedDeps = (cpError: Error) => ({
+      runQuiet: (cmd: string) => {
+        if (cmd.includes('ps -aq server')) return 'container-1';
+        if (cmd.includes('State.Running')) return 'false';
+        if (cmd.includes('inspect')) return '/some/other/mount';
+        if (cmd.includes('docker cp')) throw cpError;
+        return '';
+      },
+      mkdtemp: () => mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-cp-class-')),
+      readdir: () => [] as string[],
+    });
+
+    const missing = stageRetainedArtifactVersions('docker compose', process.cwd(),
+      stoppedDeps(new Error('Error response from daemon: lstat /app/...: no such file or directory')));
+    expect(missing.kind, 'a genuinely missing legacy directory stays upgradeable').toBe('none');
+    expect(() => assertRetainedArtifactStagingSafe(missing)).not.toThrow();
+
+    for (const unknown of [
+      new Error('Error response from daemon: permission denied'),
+      new Error('unexpected EOF from daemon'),
+    ]) {
+      const result = stageRetainedArtifactVersions('docker compose', process.cwd(), stoppedDeps(unknown));
+      expect(result.kind, `unrecognised copy error must fail closed: ${unknown.message}`).toBe('failed');
+      expect((result as { step: string }).step).toBe('docker-cp');
+      expect(() => assertRetainedArtifactStagingSafe(result))
+        .toThrow(/Refusing to replace the server container/);
+    }
+  });
+
+  it('blocks container replacement when staging failed, and only then', async () => {
+    // The guard is what makes the distinction matter: a failed attempt must
+    // stop the upgrade before `compose up -d` discards the old writable layer,
+    // while genuine absence must not block anything.
+    const { assertRetainedArtifactStagingSafe } = await flow();
+    expect(() => assertRetainedArtifactStagingSafe({ kind: 'failed', step: 'docker-cp', detail: 'cp exploded' }))
+      .toThrow(/Refusing to replace the server container/);
+    expect(() => assertRetainedArtifactStagingSafe({ kind: 'none' })).not.toThrow();
+    expect(() => assertRetainedArtifactStagingSafe({ kind: 'staged', dir: '/tmp/x' })).not.toThrow();
+  });
+
+  it('keeps the staged bytes when the restore fails', async () => {
+    // After replacement the staging directory is the only surviving copy.
+    // Deleting it unconditionally turned a transient failure into permanent
+    // loss, so a failed restore must leave it on disk and say where it is.
+    const { finalizeRetainedArtifactMigration } = await flow();
+    const staging = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-restore-fail-'));
+    writeFileSync(join(staging, 'pinned.bin'), 'only-copy');
+    try {
+      const removed: string[] = [];
+      const outcome = finalizeRetainedArtifactMigration('docker compose', process.cwd(), staging, {
+        restore: () => false,
+        remove: (path: string) => { removed.push(path); },
+      });
+      expect(outcome.restored).toBe(false);
+      expect(outcome.retainedStagingDir).toBe(staging);
+      expect(removed, 'a failed restore must not delete the only copy').toEqual([]);
+      expect(existsSync(join(staging, 'pinned.bin'))).toBe(true);
+      expect(readFileSync(join(staging, 'pinned.bin'), 'utf8')).toBe('only-copy');
+
+      // And a successful restore still cleans up, so the fix does not leak.
+      const removedOnSuccess: string[] = [];
+      const good = finalizeRetainedArtifactMigration('docker compose', process.cwd(), staging, {
+        restore: () => true,
+        remove: (path: string) => { removedOnSuccess.push(path); },
+      });
+      expect(good).toEqual({ restored: true });
+      expect(removedOnSuccess).toEqual([staging]);
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('legacy discovery distinguishes unreadable from absent, against real containers', () => {
+  useIsolatedSetupEnvironment();
+
+  const dockerAvailable = (() => {
+    try {
+      return spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 60_000 }).status === 0;
+    } catch {
+      return false;
+    }
+  })();
+
+  it.skipIf(!dockerAvailable)('blocks replacement when the legacy directory cannot be listed', async () => {
+    // The masked form (`ls ... 2>/dev/null || true`) turned EACCES into exit 0
+    // with empty stdout, so the failure state was unreachable for precisely the
+    // errors that matter and the caller replaced the container anyway. Mocking
+    // runQuiet to throw could never have caught that, because the real shell
+    // never failed. This drives real containers and a really unreadable
+    // directory instead.
+    const { stageRetainedArtifactVersions, assertRetainedArtifactStagingSafe, LEGACY_NODE_EXE_VERSION_DIR } =
+      await import('../../src/setup/setup-flow.js');
+    const suffix = `${Date.now()}`;
+    const volume = `imcodes-unreadable-${suffix}`;
+    const prep = `imcodes-prep-${suffix}`;
+    const legacy = `imcodes-legacy-unreadable-${suffix}`;
+    const emptyBox = `imcodes-legacy-empty-${suffix}`;
+    const missingBox = `imcodes-legacy-missing-${suffix}`;
+    const artifactRoot = LEGACY_NODE_EXE_VERSION_DIR.replace(/\/versions$/, '');
+    const docker = (args: string[]) => spawnSync('docker', args, { encoding: 'utf8', timeout: 300_000 });
+    const realRunQuiet = (id: string) => ({
+      runQuiet: (cmd: string, cwd: string) => {
+        if (cmd.includes('ps -aq server') || cmd.includes('ps -q server')) return id;
+        const out = spawnSync(cmd, { cwd, encoding: 'utf8', shell: true, timeout: 300_000 });
+        if (out.status !== 0) throw new Error(out.stderr || `command failed: ${cmd}`);
+        return (out.stdout ?? '').trim();
+      },
+      mkdtemp: () => mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-unreadable-')),
+    });
+
+    try {
+      // Root prepares a versions directory that a non-root user cannot read.
+      expect(docker(['run', '--rm', '-v', `${volume}:${artifactRoot}`, '--name', prep, 'busybox:1.36',
+        'sh', '-c', `mkdir -p ${LEGACY_NODE_EXE_VERSION_DIR} && chmod 000 ${LEGACY_NODE_EXE_VERSION_DIR}`,
+      ]).status).toBe(0);
+      // The "legacy server" runs as that non-root user, so `ls` genuinely fails.
+      expect(docker(['run', '-d', '--name', legacy, '--user', '1000:1000',
+        '-v', `${volume}:${artifactRoot}`, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+
+      const unreadable = stageRetainedArtifactVersions('docker compose', process.cwd(), realRunQuiet(legacy));
+      expect(unreadable.kind, 'an unreadable legacy directory is a failure, not an absence').toBe('failed');
+      expect((unreadable as { step: string }).step).toBe('legacy-listing');
+      // And that failure must stop the upgrade before anything is replaced.
+      expect(() => assertRetainedArtifactStagingSafe(unreadable))
+        .toThrow(/Refusing to replace the server container/);
+
+      // Missing directory: benign, must NOT block.
+      expect(docker(['run', '-d', '--name', missingBox, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      const missing = stageRetainedArtifactVersions('docker compose', process.cwd(), realRunQuiet(missingBox));
+      expect(missing.kind, 'a missing legacy directory is nothing to migrate').toBe('none');
+      expect(() => assertRetainedArtifactStagingSafe(missing)).not.toThrow();
+
+      // Present but empty and readable: also benign, must NOT block.
+      expect(docker(['run', '-d', '--name', emptyBox, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expect(docker(['exec', emptyBox, 'mkdir', '-p', LEGACY_NODE_EXE_VERSION_DIR]).status).toBe(0);
+      const empty = stageRetainedArtifactVersions('docker compose', process.cwd(), realRunQuiet(emptyBox));
+      expect(empty.kind, 'an empty readable legacy directory is nothing to migrate').toBe('none');
+      expect(() => assertRetainedArtifactStagingSafe(empty)).not.toThrow();
+    } finally {
+      for (const name of [legacy, emptyBox, missingBox]) docker(['rm', '-f', name]);
+      docker(['volume', 'rm', '-f', volume]);
+    }
+  }, 600_000);
+});
+
+describe('a stopped pre-fix Server still gets migrated', () => {
+  useIsolatedSetupEnvironment();
+
+  const dockerAvailable = (() => {
+    try {
+      return spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 60_000 }).status === 0;
+    } catch {
+      return false;
+    }
+  })();
+
+  it.skipIf(!dockerAvailable)('stages pinned bytes from an exited legacy container and survives replacement', async () => {
+    // `compose ps -q` hides stopped containers, so an exited or
+    // operator-stopped legacy Server produced no id, was read as a fresh
+    // install, and was recreated -- discarding a writable layer that was still
+    // perfectly copyable. A stopped container is the state an operator is most
+    // likely to upgrade from, and `docker exec` cannot probe it, so discovery
+    // and the probe both had to change.
+    const { stageRetainedArtifactVersions, restoreRetainedArtifactVersions, assertRetainedArtifactStagingSafe,
+      LEGACY_NODE_EXE_VERSION_DIR } = await import('../../src/setup/setup-flow.js');
+    const { NODE_EXE_VERSION_DIR } = await import('../../src/setup/templates.js');
+
+    const suffix = `${Date.now()}`;
+    const stopped = `imcodes-stopped-legacy-${suffix}`;
+    const replacement = `imcodes-stopped-new-${suffix}`;
+    const emptyStopped = `imcodes-stopped-empty-${suffix}`;
+    const volume = `imcodes-stopped-vol-${suffix}`;
+    const digest = 'd'.repeat(64);
+    const docker = (args: string[]) => spawnSync('docker', args, { encoding: 'utf8', timeout: 300_000 });
+    const withContainer = (id: string, running = false) => ({
+      runQuiet: (cmd: string, cwd: string) => {
+        // Faithful to docker: the running-only query cannot see a stopped
+        // container, which is the whole defect this test exists for.
+        if (cmd.includes('ps -aq server')) return id;
+        if (cmd.includes('ps -q server')) return running ? id : '';
+        const out = spawnSync(cmd, { cwd, encoding: 'utf8', shell: true, timeout: 300_000 });
+        if (out.status !== 0) {
+          const error = new Error(out.stderr || `command failed: ${cmd}`);
+          (error as { stderr?: string }).stderr = out.stderr ?? '';
+          throw error;
+        }
+        return (out.stdout ?? '').trim();
+      },
+      mkdtemp: () => mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-stopped-')),
+    });
+
+    try {
+      // A legacy container that has since exited, with retained bytes on its layer.
+      expect(docker(['run', '-d', '--name', stopped, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expect(docker(['exec', stopped, 'sh', '-c',
+        `mkdir -p ${LEGACY_NODE_EXE_VERSION_DIR}/win-x64 && printf stopped-pinned-bytes > ${LEGACY_NODE_EXE_VERSION_DIR}/win-x64/${digest}.bin`,
+      ]).status).toBe(0);
+      expect(docker(['stop', stopped]).status).toBe(0);
+
+      const staged = stageRetainedArtifactVersions('docker compose', process.cwd(), withContainer(stopped));
+      expect(staged.kind, 'a stopped legacy container must still be migrated').toBe('staged');
+      const stagedDir = (staged as { kind: 'staged'; dir: string }).dir;
+      expect(readFileSync(join(stagedDir, 'win-x64', `${digest}.bin`), 'utf8')).toBe('stopped-pinned-bytes');
+      expect(() => assertRetainedArtifactStagingSafe(staged)).not.toThrow();
+
+      // Replacement, then restore into the durable volume.
+      expect(docker(['rm', '-f', stopped]).status).toBe(0);
+      expect(docker(['run', '-d', '--name', replacement, '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
+        'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expect(restoreRetainedArtifactVersions('docker compose', process.cwd(), stagedDir, withContainer(replacement, true)))
+        .toBe(true);
+      const after = docker(['exec', replacement, 'cat', `${NODE_EXE_VERSION_DIR}/win-x64/${digest}.bin`]);
+      expect(after.status, after.stderr).toBe(0);
+      expect(after.stdout.trim()).toBe('stopped-pinned-bytes');
+      rmSync(stagedDir, { recursive: true, force: true });
+
+      // A stopped container with no legacy directory stays benign and upgradeable.
+      expect(docker(['run', '-d', '--name', emptyStopped, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expect(docker(['stop', emptyStopped]).status).toBe(0);
+      const none = stageRetainedArtifactVersions('docker compose', process.cwd(), withContainer(emptyStopped));
+      expect(none.kind, 'a stopped container with no legacy tree has nothing to migrate').toBe('none');
+      expect(() => assertRetainedArtifactStagingSafe(none)).not.toThrow();
+    } finally {
+      for (const name of [stopped, replacement, emptyStopped]) docker(['rm', '-f', name]);
+      docker(['volume', 'rm', '-f', volume]);
+    }
+  }, 600_000);
 });

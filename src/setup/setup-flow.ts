@@ -13,11 +13,11 @@
 
 import { randomBytes, createHash } from 'node:crypto';
 import { writeFile, readFile, mkdir, chmod, unlink } from 'node:fs/promises';
-import { existsSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync, readdirSync} from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
-import { homedir, hostname } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import {
   dockerComposeTemplate,
   caddyfileTemplate,
@@ -25,6 +25,8 @@ import {
   turnEntrypointTemplate,
   turnserverConfigTemplate,
   type TurnDeploymentTemplateConfig,
+  NODE_EXE_VERSION_VOLUME,
+  NODE_EXE_VERSION_DIR,
 } from './templates.js';
 import {
   TURN_RELAY_CAPACITY,
@@ -828,6 +830,248 @@ async function writeConfigs(
   }
 }
 
+
+// ── Retained-artifact migration ─────────────────────────────────────────────
+
+/**
+ * Where a pre-fix deployment kept superseded controlled-node artifacts.
+ *
+ * Before the named volume existed, tsk_jgt's store resolved to
+ * `<IMCODES_NODE_EXE_DIR>/versions`, and the image sets IMCODES_NODE_EXE_DIR to
+ * /app/controlled-node-executables. Those bytes therefore live in the old
+ * container's writable layer, which `compose up -d` discards when it recreates
+ * the service. Declaring the volume alone does not save them: the new container
+ * starts with an empty volume and every install code minted against a
+ * superseded digest stops resolving on the first upgrade.
+ */
+export const LEGACY_NODE_EXE_VERSION_DIR = '/app/controlled-node-executables/versions';
+
+/**
+ * Printed when the legacy directory does not exist at all.
+ *
+ * A sentinel rather than an empty listing, because "not there" and "there but
+ * unreadable" must not produce the same output. Chosen to be impossible as a
+ * real directory entry produced by `ls -A`.
+ */
+export const LEGACY_ABSENT_SENTINEL = '__imcodes_legacy_versions_absent__';
+
+/**
+ * Copy the pre-fix retained tree OUT of the running container, before anything
+ * replaces it.
+ *
+ * Returns the staging directory, or null when there is nothing to migrate —
+ * a fresh install, an already-migrated deployment (the container already has
+ * the volume mounted at the new path), or an empty legacy tree. Every failure
+ * is non-fatal: an upgrade must not be blocked by a best-effort copy, and the
+ * caller logs rather than throws.
+ */
+/**
+ * Outcome of staging, as three states rather than two.
+ *
+ * `none` and `failed` were previously both `null`, and the caller read that as
+ * "nothing to preserve" and went on to replace the container - destroying the
+ * only copy of bytes it had just failed to read. Absence and failure demand
+ * opposite responses, so they are no longer the same value. (`already` is
+ * folded into `none`: the bytes are already in the durable volume.)
+ */
+export type RetainedArtifactStaging =
+  | { kind: 'none' }
+  | { kind: 'staged'; dir: string }
+  | { kind: 'failed'; step: string; detail: string };
+
+/**
+ * True only for docker's "that path is not in the container" error.
+ *
+ * Used solely on the stopped-container path, where `exec` is unavailable and
+ * `cp` is both the probe and the copy. Recognised absence is benign; anything
+ * unrecognised is treated as a failure, so a new or reworded docker error can
+ * only ever make this stricter, never quieter.
+ */
+function isMissingContainerPathError(error: unknown): boolean {
+  const text = `${error instanceof Error ? error.message : String(error)} `
+    + `${(error as { stderr?: unknown } | null)?.stderr ?? ''}`;
+  return /no such file or directory|could not find the file/i.test(text);
+}
+
+function stagingFailure(step: string, error: unknown): RetainedArtifactStaging {
+  return { kind: 'failed', step, detail: error instanceof Error ? error.message : String(error) };
+}
+
+/**
+ * Copy the pre-fix retained tree OUT of the running container, before anything
+ * replaces it.
+ *
+ * Returns `none` only when there is genuinely nothing to preserve: no server
+ * container, a container that already mounts the durable path, or an empty
+ * legacy tree. Anything that went wrong while trying to find out returns
+ * `failed`, because the caller must not treat an unanswered question as a "no".
+ */
+export function stageRetainedArtifactVersions(
+  compose: string,
+  dir: string,
+  deps: {
+    runQuiet: (cmd: string, cwd: string) => string;
+    mkdtemp: () => string;
+    readdir?: (path: string) => string[];
+  } = {
+    runQuiet,
+    mkdtemp: () => mkdtempSync(join(tmpdir(), 'imcodes-node-exe-versions-')),
+  },
+): RetainedArtifactStaging {
+  let containerIds: string[];
+  try {
+    // `-a`: compose ps omits stopped containers by default, so an ordinary
+    // exited or operator-stopped legacy Server produced no id and was read as a
+    // fresh install -- then recreated, discarding a writable layer that was
+    // still perfectly copyable. Stopped containers are exactly the ones an
+    // operator is most likely to be upgrading from.
+    containerIds = deps.runQuiet(
+      `${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} ps -aq server`,
+      dir,
+    ).split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch (err) {
+    return stagingFailure('compose-ps', err);
+  }
+  // No server in any state: a fresh install has nothing to preserve.
+  if (containerIds.length === 0) return { kind: 'none' };
+  // More than one candidate is ambiguous, and guessing which holds the real
+  // retained bytes is exactly the kind of assumption that loses them.
+  if (containerIds.length > 1) {
+    return { kind: 'failed', step: 'compose-ps', detail: `ambiguous server containers: ${containerIds.join(', ')}` };
+  }
+  const containerId = containerIds[0]!;
+
+  try {
+    const mounts = deps.runQuiet(
+      `docker inspect -f '{{range .Mounts}}{{.Destination}}\n{{end}}' ${containerId}`,
+      dir,
+    );
+    // Already migrated: the retained bytes live in the volume and survive on
+    // their own, so there is nothing to stage.
+    if (mounts.split('\n').some((line) => line.trim() === NODE_EXE_VERSION_DIR)) return { kind: 'none' };
+  } catch (err) {
+    return stagingFailure('docker-inspect', err);
+  }
+
+  let running = false;
+  try {
+    running = deps.runQuiet(`docker inspect -f '{{.State.Running}}' ${containerId}`, dir).trim() === 'true';
+  } catch (err) {
+    return stagingFailure('docker-state', err);
+  }
+
+  let staging: string;
+  try {
+    staging = deps.mkdtemp();
+  } catch (err) {
+    return stagingFailure('staging-dir', err);
+  }
+
+  if (running) {
+    // Running container: probe with an explicit exit status. No masking -- a
+    // missing directory answers with a sentinel and anything else lets `ls`
+    // exit non-zero, which becomes a failure rather than an empty listing.
+    let listing: string;
+    try {
+      listing = deps.runQuiet(
+        `docker exec ${containerId} sh -c `
+        + `'if [ ! -d "${LEGACY_NODE_EXE_VERSION_DIR}" ]; then echo ${LEGACY_ABSENT_SENTINEL}; exit 0; fi; `
+        + `ls -A "${LEGACY_NODE_EXE_VERSION_DIR}"'`,
+        dir,
+      );
+    } catch (err) {
+      return stagingFailure('legacy-listing', err);
+    }
+    if (listing.trim() === LEGACY_ABSENT_SENTINEL || !listing.trim()) return { kind: 'none' };
+  }
+
+  try {
+    // `docker cp` works against stopped containers, which is why the stopped
+    // path relies on it rather than on `exec`.
+    deps.runQuiet(`docker cp ${containerId}:${LEGACY_NODE_EXE_VERSION_DIR}/. ${staging}/`, dir);
+  } catch (err) {
+    // A genuinely absent legacy directory is benign and must stay upgradeable.
+    // Everything else fails closed: an unrecognised copy error is exactly the
+    // case where continuing would destroy bytes we could not read.
+    if (!running && isMissingContainerPathError(err)) return { kind: 'none' };
+    return stagingFailure('docker-cp', err);
+  }
+  const listStaged = deps.readdir ?? ((path: string) => readdirSync(path));
+  if (!running && listStaged(staging).length === 0) return { kind: 'none' };
+  return { kind: 'staged', dir: staging };
+}
+
+/**
+ * Refuse to continue when migration was attempted and failed.
+ *
+ * Replacement is irreversible: `compose up -d` discards the old writable layer,
+ * and with it the only copy of bytes we just proved we cannot read. Stopping
+ * here leaves the deployment exactly as it was, which is recoverable; carrying
+ * on is not.
+ */
+export function assertRetainedArtifactStagingSafe(staging: RetainedArtifactStaging): void {
+  if (staging.kind !== 'failed') return;
+  throw new Error(
+    `Refusing to replace the server container: could not preserve retained Windows installers `
+    + `(${staging.step}: ${staging.detail}). The existing deployment is untouched. `
+    + `Resolve the Docker error and re-run setup, or remove `
+    + `${LEGACY_NODE_EXE_VERSION_DIR} in the running container if those installers are expendable.`,
+  );
+}
+
+/**
+ * Restore staged bytes into the recreated server's durable volume.
+ *
+ * Must run AFTER the container has actually been replaced; writing into the old
+ * container would simply be discarded with it. Copying into the container path
+ * lands in the mounted volume, so the bytes outlive every later replacement.
+ */
+export function restoreRetainedArtifactVersions(
+  compose: string,
+  dir: string,
+  staging: string,
+  deps: { runQuiet: (cmd: string, cwd: string) => string } = { runQuiet },
+): boolean {
+  try {
+    const containerId = deps.runQuiet(
+      `${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} ps -q server`,
+      dir,
+    ).split('\n')[0]?.trim() ?? '';
+    if (!containerId) return false;
+    deps.runQuiet(`docker exec ${containerId} sh -c 'mkdir -p ${NODE_EXE_VERSION_DIR}'`, dir);
+    deps.runQuiet(`docker cp ${staging}/. ${containerId}:${NODE_EXE_VERSION_DIR}/`, dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Restore, then delete the staging copy ONLY if the restore actually succeeded.
+ *
+ * After replacement the staging directory is the sole surviving copy. Deleting
+ * it unconditionally turned an ordinary transient failure - a disk hiccup, a
+ * permission problem, a container not ready yet - into permanent data loss, so
+ * the copy is retained on failure and its path is reported for manual recovery.
+ */
+export function finalizeRetainedArtifactMigration(
+  compose: string,
+  dir: string,
+  staging: string,
+  deps: {
+    restore: (compose: string, dir: string, staging: string) => boolean;
+    remove: (path: string) => void;
+  } = {
+    restore: restoreRetainedArtifactVersions,
+    remove: (path) => rmSync(path, { recursive: true, force: true }),
+  },
+): { restored: boolean; retainedStagingDir?: string } {
+  const restored = deps.restore(compose, dir, staging);
+  if (!restored) return { restored: false, retainedStagingDir: staging };
+  deps.remove(staging);
+  return { restored: true };
+}
+
 // ── Docker lifecycle ────────────────────────────────────────────────────────
 
 function composeCmd(compose: string, dir: string, args: string): void {
@@ -1069,6 +1313,13 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   } else {
     log('Updating configuration files...');
   }
+  // Stage retained artifacts BEFORE anything recreates the server. A pre-fix
+  // container keeps them in its writable layer, which `compose up -d` discards.
+  const stagedVersions = stageRetainedArtifactVersions(compose, dir);
+  // A failed attempt is not the same as nothing to do: stop before anything is
+  // rewritten or recreated, leaving the existing deployment intact.
+  assertRetainedArtifactStagingSafe(stagedVersions);
+  if (stagedVersions.kind === 'staged') log('Preserving retained Windows installers from the previous container...');
   await writeConfigs(dir, domain, secrets, mirrorMode, turn);
   await persistSecrets(dir, secrets);
   log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', TURN config' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
@@ -1115,6 +1366,16 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   composeCmd(compose, dir, 'up -d');
   log('All services running.');
 
+  // Restore only now: the server has actually been replaced, so this lands in
+  // the durable volume rather than in a container about to be discarded.
+  if (stagedVersions.kind === 'staged') {
+    const outcome = finalizeRetainedArtifactMigration(compose, dir, stagedVersions.dir);
+    log(outcome.restored
+      ? 'Retained Windows installers migrated into the durable volume.'
+      : `Could not migrate retained Windows installers. The only copy is preserved at ${outcome.retainedStagingDir}; `
+        + `copy it into the server's ${NODE_EXE_VERSION_DIR} to keep existing install codes resolvable.`);
+  }
+
   // 9. Self-bind
   log('Binding daemon to local server...');
   await selfBind(secrets);
@@ -1130,7 +1391,11 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   │  Admin login:    admin / ${secrets.adminPassword}
   │  Bind URL:       ${bindUrl}
 ${turn ? `  │  TURN relay:     turn:${turn.host}:${turn.port} (DNS only)\n` : ''}  │
-${turn ? `  │  TURN capacity:   ${describeTurnRelayCapacity(turn.relayMinPort, turn.relayMaxPort)} (${turn.networkMode} networking)\n` : ''}${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}${turn.networkMode === 'host' ? ' (host networking: Docker does NOT open these, the host firewall must)' : ''}\n  │\n` : ''}  │  This machine is bound and daemon is running.
+${turn ? `  │  TURN capacity:   ${describeTurnRelayCapacity(turn.relayMinPort, turn.relayMaxPort)} (${turn.networkMode} networking)\n` : ''}${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}${turn.networkMode === 'host' ? ' (host networking: Docker does NOT open these, the host firewall must)' : ''}\n  │\n` : ''}  │  Installer retention: docker volume ${NODE_EXE_VERSION_VOLUME} (keeps superseded
+  │                        Windows installers; do not prune it or existing
+  │                        install codes stop resolving)
+  │
+  │  This machine is bound and daemon is running.
   │
   │  To connect another machine:
   │    npm install -g imcodes
