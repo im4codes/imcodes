@@ -58,29 +58,22 @@ describe('temporary TURN credentials', () => {
     expect(readTurnServiceConfig({ ...env, TURN_CREDENTIAL_TTL_SECONDS: '60' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...env, TURN_RELAY_MIN_PORT: '50000', TURN_RELAY_MAX_PORT: '49000' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...env, TURN_PORT: '49180' })).toBeUndefined();
-    // CONTRACT CHANGE, deliberate: a 257-port range used to be refused because
-    // the ceiling was 256 ports. That ceiling is what silently invalidated the
-    // production 49201-50200 range and left both P2P features with no relay
-    // candidate at all. The rule is now a resource cap of
-    // TURN_SERVICE_DEFAULTS.RELAY_PORT_MAX_COUNT ports, exercised at its exact
-    // boundary below, so a real coturn range is usable and a typo still is not.
+    // CONTRACT CHANGE, deliberate and now complete: this file first encoded a
+    // 256-port ceiling, which silently invalidated the production 49201-50200
+    // range. That was replaced by a 4096-port resource cap, which was still a
+    // number in application code and still able to refuse a correctly
+    // configured TURN service — coturn's own default span is 16384 ports. The
+    // width limit is gone entirely; the relay range is deployment
+    // configuration, and only protocol-valid checks reject.
     expect(readTurnServiceConfig({ ...env, TURN_RELAY_MIN_PORT: '49000', TURN_RELAY_MAX_PORT: '49256' })).toMatchObject({
       relayMinPort: 49_000,
       relayMaxPort: 49_256,
     });
-    const maxCount = TURN_SERVICE_DEFAULTS.RELAY_PORT_MAX_COUNT;
-    expect(readTurnServiceConfig({
-      ...env,
-      TURN_RELAY_MIN_PORT: '20000',
-      TURN_RELAY_MAX_PORT: String(20_000 + maxCount - 1),
-    }), `${maxCount} relay ports is the documented cap and must be usable`).toMatchObject({
-      relayMaxPort: 20_000 + maxCount - 1,
+    expect(readTurnServiceConfig({ ...env, TURN_RELAY_MIN_PORT: '49152', TURN_RELAY_MAX_PORT: '65535' }),
+      "coturn's own default relay range must be usable").toMatchObject({
+      relayMinPort: 49_152,
+      relayMaxPort: 65_535,
     });
-    expect(readTurnServiceConfig({
-      ...env,
-      TURN_RELAY_MIN_PORT: '20000',
-      TURN_RELAY_MAX_PORT: String(20_000 + maxCount),
-    }), 'one port past the cap must still fail closed').toBeUndefined();
     expect(createTurnIceServers('user-a', { env: { ...env, TURN_ENABLED: 'false' } })).toEqual([
       'stun:stun.cloudflare.com:3478',
     ]);
@@ -146,11 +139,13 @@ describe('the production relay range is a valid relay range', () => {
     expect(readTurnServiceConfig({ ...PRODUCTION_ENV, TURN_RELAY_MIN_PORT: '50201' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...PRODUCTION_ENV, TURN_RELAY_MAX_PORT: '70000' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...PRODUCTION_ENV, TURN_PORT: '49500' })).toBeUndefined();
+    // A wide span is NOT "genuinely wrong": it is a deployment decision that
+    // coturn honours, so the runtime must honour it too.
     expect(readTurnServiceConfig({
       ...PRODUCTION_ENV,
       TURN_RELAY_MIN_PORT: '10000',
       TURN_RELAY_MAX_PORT: '60000',
-    })).toBeUndefined();
+    })).toMatchObject({ relayMinPort: 10_000, relayMaxPort: 60_000 });
   });
 
   it('still hands out STUN only when TURN is deliberately switched off', () => {

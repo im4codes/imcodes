@@ -493,7 +493,6 @@ describe('the TURN relay range rule is shared, not copied', () => {
   it('accepts the production range and refuses what is genuinely wrong', async () => {
     const {
       TURN_RELAY_RANGE_REJECTION,
-      TURN_SERVICE_DEFAULTS,
       parseTurnRelayRange,
     } = await import('../../shared/turn-service.js');
 
@@ -501,11 +500,10 @@ describe('the TURN relay range rule is shared, not copied', () => {
     expect(parseTurnRelayRange({ port: 3480, relayMinPort: 49_201, relayMaxPort: 50_200 }))
       .toEqual({ relayMinPort: 49_201, relayMaxPort: 50_200 });
 
-    const cap = TURN_SERVICE_DEFAULTS.RELAY_PORT_MAX_COUNT;
-    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 20_000, relayMaxPort: 20_000 + cap - 1 }))
-      .toEqual({ relayMinPort: 20_000, relayMaxPort: 20_000 + cap - 1 });
-    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 20_000, relayMaxPort: 20_000 + cap }))
-      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.TOO_MANY_PORTS });
+    // No width ceiling: the range is deployment configuration, so a wide but
+    // protocol-valid span must be accepted exactly as coturn would serve it.
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 49_152, relayMaxPort: 65_535 }))
+      .toEqual({ relayMinPort: 49_152, relayMaxPort: 65_535 });
     expect(parseTurnRelayRange({ port: 3480, relayMinPort: 50_200, relayMaxPort: 49_201 }))
       .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.INVERTED });
     expect(parseTurnRelayRange({ port: 3480, relayMinPort: 49_201, relayMaxPort: 70_000 }))
@@ -526,6 +524,100 @@ describe('the TURN relay range rule is shared, not copied', () => {
         .not.toMatch(/relayMaxPort\s*-\s*relayMinPort/);
       expect(source, `${name} hard-codes a relay-range ceiling`)
         .not.toMatch(/>\s*255\b/);
+    }
+  });
+});
+
+/**
+ * The relay range has ONE source of truth: the deployment configuration.
+ *
+ * The original incident was two implementations of the same rule with
+ * different ceilings — the installer wrote 49201-50200 into .env, into coturn's
+ * min-port/max-port and into the Docker publish range, and the server runtime
+ * then refused that exact deployment and served every client a STUN-only ICE
+ * list. Collapsing the rule into one shared function fixed the disagreement,
+ * but a fixed width in application code reintroduces the same failure shape one
+ * size larger: coturn's OWN default relay range is 49152-65535, i.e. 16384
+ * ports, and any application-side cap below that rejects a correctly
+ * configured TURN service for reasons the TURN service knows nothing about.
+ *
+ * So this pins the property rather than a number: whatever range the deployment
+ * configures, coturn's config, the .env the runtime reads, and the runtime's
+ * own validation must all describe the SAME ports. Only protocol-valid checks
+ * may reject — port bounds, min <= max, and a listener sitting inside the relay
+ * range.
+ */
+describe('the relay range comes from the deployment config, not from a number in code', () => {
+  const RANGES = [
+    { label: 'coturn default', relayMinPort: 49_152, relayMaxPort: 65_535 },
+    { label: 'production im.zhinet.work', relayMinPort: 49_201, relayMaxPort: 50_200 },
+    { label: 'small deployment', relayMinPort: 49_160, relayMaxPort: 49_200 },
+    { label: 'single relay port', relayMinPort: 50_000, relayMaxPort: 50_000 },
+  ];
+
+  it.each(RANGES.map((r) => [r.label, r] as const))(
+    'accepts %s and describes the same ports in coturn, .env and the runtime',
+    async (_label, range) => {
+      const { parseTurnRelayRange } = await import('../../shared/turn-service.js');
+      const { turnserverConfigTemplate, envTemplate } = await import('../../src/setup/templates.js');
+
+      const turn = {
+        host: 'turn.example.test',
+        port: 3480,
+        externalIp: '203.0.113.10',
+        sharedSecret: 'x'.repeat(64),
+        credentialTtlSeconds: 86_400,
+        ...range,
+      };
+
+      // 1. What coturn is told.
+      const coturn = turnserverConfigTemplate(turn);
+      expect(coturn).toContain(`min-port=${range.relayMinPort}`);
+      expect(coturn).toContain(`max-port=${range.relayMaxPort}`);
+
+      // 2. What the runtime reads. The compose file publishes exactly these two
+      //    env values as its UDP range, so .env is the shared hand-off.
+      const env = envTemplate({
+        domain: 'example.test',
+        postgresPassword: 'p',
+        jwtSigningKey: 'j',
+        adminPassword: 'a',
+        turn: { enabled: true, ...turn },
+      });
+      expect(env).toContain(`TURN_RELAY_MIN_PORT=${range.relayMinPort}`);
+      expect(env).toContain(`TURN_RELAY_MAX_PORT=${range.relayMaxPort}`);
+
+      // 3. What the runtime and the installer both validate through.
+      expect(
+        parseTurnRelayRange({ port: turn.port, ...range }),
+        'the shared rule rejected a range the TURN service is correctly configured with',
+      ).toEqual({ relayMinPort: range.relayMinPort, relayMaxPort: range.relayMaxPort });
+    },
+  );
+
+  it('still fails closed on the protocol-valid checks only', async () => {
+    const { TURN_RELAY_RANGE_REJECTION, parseTurnRelayRange } = await import('../../shared/turn-service.js');
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 0, relayMaxPort: 50_000 }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.MIN_PORT_INVALID });
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 49_201, relayMaxPort: 70_000 }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.MAX_PORT_INVALID });
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 50_200, relayMaxPort: 49_201 }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.INVERTED });
+    expect(parseTurnRelayRange({ port: 49_500, relayMinPort: 49_201, relayMaxPort: 50_200 }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.LISTENER_INSIDE_RANGE });
+  });
+
+  it('keeps no width limit of its own in application code', async () => {
+    // A width cap in code is a second source of truth by definition: it can
+    // refuse a range the TURN service is happily serving, and nothing in the
+    // deployment tells it what the limit is.
+    const shared = readFileSync(join(import.meta.dirname, '../../shared/turn-service.ts'), 'utf8');
+    expect(shared, 'shared/turn-service.ts still caps the relay width in code')
+      .not.toMatch(/RELAY_PORT_MAX_COUNT|TOO_MANY_PORTS/);
+    for (const rel of ['../../src/setup/setup-flow.ts', '../../server/src/ws/turn-credentials.ts']) {
+      const source = readFileSync(join(import.meta.dirname, rel), 'utf8');
+      expect(source, `${rel} still references a code-side relay width cap`)
+        .not.toMatch(/RELAY_PORT_MAX_COUNT|TOO_MANY_PORTS/);
     }
   });
 });

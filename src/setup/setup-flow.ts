@@ -438,9 +438,6 @@ async function resolveTurnDeployment(
   if ('rejection' in relayRange) {
     // `fatal` never returns, which is also what narrows `relayRange` below —
     // no second copy of the rule, and no unchecked non-null assertion either.
-    if (relayRange.rejection === TURN_RELAY_RANGE_REJECTION.TOO_MANY_PORTS) {
-      fatal(`TURN relay port range may contain at most ${TURN_SERVICE_DEFAULTS.RELAY_PORT_MAX_COUNT} UDP ports.`);
-    }
     if (relayRange.rejection === TURN_RELAY_RANGE_REJECTION.LISTENER_INSIDE_RANGE) {
       fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
     }
