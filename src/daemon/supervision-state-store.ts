@@ -6378,6 +6378,11 @@ export class SupervisionTaskRegistry {
     scopeFiles?: readonly string[];
     leaseAction: SupervisionRecoveryLeaseAction;
     identity?: PersistedSupervisionTaskAssignmentIdentity;
+    executionBinding?: SupervisionExecutionBinding;
+    provisioning?: SupervisionProvisioningEvidence;
+    expectedRevision?: string;
+    expectedGeneration?: number;
+    evidenceManifestSha256?: string;
     idempotencyKey: string;
     reason: string;
     now?: number;
@@ -6388,6 +6393,9 @@ export class SupervisionTaskRegistry {
     const reason = normalizeTaskString(input.reason);
     const taskStatus = input.taskStatus;
     const assignmentStatus = input.assignmentStatus;
+    const expectedRevision = normalizeTaskString(input.expectedRevision);
+    const expectedGeneration = input.expectedGeneration;
+    const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
     const scopeFiles = input.scopeFiles === undefined
       ? undefined
       : normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
@@ -6405,7 +6413,12 @@ export class SupervisionTaskRegistry {
       || (taskStatus !== undefined && !allowedStatuses.includes(taskStatus))
       || (assignmentStatus !== undefined && !allowedStatuses.includes(assignmentStatus))
       || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)
-      || !validIdentity) {
+      || !validIdentity
+      || (expectedGeneration !== undefined
+        && (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0))
+      || (evidenceManifestSha256 !== undefined && !FINALIZATION_SHA256_RE.test(evidenceManifestSha256))
+      || Boolean(input.executionBinding) !== Boolean(input.provisioning)
+      || ((input.executionBinding || input.provisioning) && !input.identity)) {
       return { ok: false, reason: 'invalid' };
     }
 
@@ -6466,6 +6479,63 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'role_forbidden' };
       }
+      const replacesBoundExecutionAuthority = Boolean(
+        input.identity && (assignment.executionBinding || assignment.provisioning),
+      );
+      const executionAuthorityFencePresent = Boolean(
+        expectedRevision || expectedGeneration !== undefined || evidenceManifestSha256,
+      );
+      if (replacesBoundExecutionAuthority && (!input.executionBinding || !input.provisioning)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid' };
+      }
+      if (replacesBoundExecutionAuthority && (!expectedRevision || expectedGeneration === undefined)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid' };
+      }
+      if (!replacesBoundExecutionAuthority && executionAuthorityFencePresent) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid' };
+      }
+      if (replacesBoundExecutionAuthority) {
+        if (task.currentRevision !== expectedRevision) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'old_revision' };
+        }
+        const bundle = task.integrationBundle;
+        const exactEvidence = bundle
+          ? bundle.revision === expectedRevision
+            && bundle.manifestSha256 === evidenceManifestSha256
+          : evidenceManifestSha256 === undefined;
+        if (!exactEvidence) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'manifest_mismatch' };
+        }
+      }
+      if (input.executionBinding && input.provisioning && input.identity) {
+        const requested = input.executionBinding.requested;
+        const selected = input.provisioning.selectedConfig;
+        const exactSelectedConfig = Boolean(selected
+          && selected.capabilityId === requested.capabilityId
+          && selected.agentType === requested.agentType
+          && selected.providerFamily === requested.providerFamily
+          && selected.runtimeType === requested.runtimeType
+          && selected.model === requested.model
+          && selected.ccPresetId === requested.ccPresetId);
+        const exactRecoveredAuthority = input.executionBinding.origin === 'reused'
+          && runtimeIdentityMetadataMatches(input.executionBinding.actual, input.identity)
+          && input.provisioning.selectedPool === input.executionBinding.pool
+          && input.provisioning.origin === 'reused'
+          && exactSelectedConfig
+          && input.provisioning.provisionAttemptId === undefined
+          && input.provisioning.createdSessionName === undefined
+          && input.provisioning.failureReason === undefined
+          && input.provisioning.degradedReason === undefined;
+        if (!exactRecoveredAuthority) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'invalid' };
+        }
+      }
 
       const nextAssignmentStatus = assignmentStatus ?? assignment.status;
       const repairsControlState = taskStatus !== undefined
@@ -6489,17 +6559,35 @@ export class SupervisionTaskRegistry {
         && event.payload?.requestedLeaseAction === input.leaseAction
         && event.payload?.reason === reason
         && JSON.stringify(event.payload?.requestedIdentity ?? null) === JSON.stringify(input.identity ?? null)
+        && JSON.stringify(event.payload?.requestedExecutionBinding ?? null) === JSON.stringify(input.executionBinding ?? null)
+        && JSON.stringify(event.payload?.requestedProvisioning ?? null) === JSON.stringify(input.provisioning ?? null)
+        && event.payload?.expectedRevision === (expectedRevision ?? null)
+        && event.payload?.expectedGeneration === (expectedGeneration ?? null)
+        && event.payload?.evidenceManifestSha256 === (evidenceManifestSha256 ?? null)
       ));
+      const replayStillOwnsExactGeneration = !replacesBoundExecutionAuthority || Boolean(
+        input.identity && input.executionBinding && input.provisioning
+        && assignment.generation === expectedGeneration! + 1
+        && runtimeIdentityMetadataMatches(assignment.identity, input.identity)
+        && supervisionSelectedExecutionBindingMatches(assignment.executionBinding, input.executionBinding)
+        && JSON.stringify(assignment.provisioning) === JSON.stringify(input.provisioning),
+      );
       if (priorEvents.length > 0) {
         this.#db.exec('ROLLBACK');
-        return exactReplay
+        return exactReplay && replayStillOwnsExactGeneration
           ? { ok: true, value: task, replay: true }
           : { ok: false, reason: 'conflicting_replay' };
+      }
+      if (replacesBoundExecutionAuthority && assignment.generation !== expectedGeneration) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
       }
 
       const nextAssignment: PersistedSupervisionTaskAssignment = {
         ...assignment,
         identity: input.identity ?? assignment.identity,
+        ...(input.executionBinding ? { executionBinding: input.executionBinding } : {}),
+        ...(input.provisioning ? { provisioning: input.provisioning } : {}),
         status: nextAssignmentStatus,
         scopeFiles: scopeFiles ?? assignment.scopeFiles,
         leaseId: input.leaseAction === 'renew' ? this.#mintLeaseId()
@@ -6616,11 +6704,22 @@ export class SupervisionTaskRegistry {
         requestedScopeFiles: scopeFiles ?? null,
         requestedLeaseAction: input.leaseAction,
         requestedIdentity: input.identity ?? null,
+        requestedExecutionBinding: input.executionBinding ?? null,
+        requestedProvisioning: input.provisioning ?? null,
+        expectedRevision: expectedRevision ?? null,
+        expectedGeneration: expectedGeneration ?? null,
+        evidenceManifestSha256: evidenceManifestSha256 ?? null,
         taskStatus: nextTask.status,
         assignmentStatus: nextAssignment.status,
         scopeFiles: nextAssignment.scopeFiles,
         leaseAction: input.leaseAction,
         ...(input.identity ? { identity: input.identity, priorIdentity: assignment.identity } : {}),
+        ...(input.executionBinding ? {
+          executionBinding: input.executionBinding,
+          priorExecutionBinding: assignment.executionBinding ?? null,
+          provisioning: input.provisioning,
+          priorProvisioning: assignment.provisioning ?? null,
+        } : {}),
         priorTaskStatus: task.status,
         priorAssignmentStatus: assignment.status,
         priorScopeFiles: assignment.scopeFiles,

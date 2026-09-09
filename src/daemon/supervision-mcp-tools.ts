@@ -49,6 +49,7 @@ import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-
 import {
   supervisionSelectedExecutionBindingMatches,
   type SupervisionExecutionBinding,
+  type SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
 
 type ToolResult = Record<string, unknown>;
@@ -84,6 +85,7 @@ export interface SupervisionVisibilityItem {
     validationState?: string;
     generation?: number;
     executionBinding?: SupervisionExecutionBinding;
+    provisioning?: SupervisionProvisioningEvidence;
     identity?: {
       sessionName?: string;
       sessionInstanceId?: string;
@@ -297,6 +299,11 @@ export interface SupervisionRegistryPort {
       sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
       agentType: string; providerFamily: string;
     };
+    executionBinding?: SupervisionExecutionBinding;
+    provisioning?: SupervisionProvisioningEvidence;
+    expectedRevision?: string;
+    expectedGeneration?: number;
+    evidenceManifestSha256?: string;
     idempotencyKey: string;
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
@@ -384,6 +391,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     assignmentId: z.string().min(1).optional(),
     rebindSessionName: z.string().min(1).optional(),
     expectedRevision: z.string().min(1).optional(),
+    expectedGeneration: z.number().int().min(0).optional(),
     auditAttemptId: z.string().min(1).optional(),
     fromRevision: z.string().min(1).optional(),
     toRevision: z.string().min(1).optional(),
@@ -737,6 +745,9 @@ export function createSupervisionMcpToolHandlers(
       const assignmentId = String(input.assignmentId ?? '').trim();
       const rebindSessionName = String(input.rebindSessionName ?? '').trim();
       const expectedRevision = String(input.expectedRevision ?? '').trim();
+      const expectedGeneration = typeof input.expectedGeneration === 'number'
+        ? input.expectedGeneration
+        : undefined;
       const auditAttemptId = String(input.auditAttemptId ?? '').trim();
       const fromRevision = String(input.fromRevision ?? '').trim();
       const toRevision = String(input.toRevision ?? '').trim();
@@ -900,8 +911,12 @@ export function createSupervisionMcpToolHandlers(
           ...(auditTrigger !== undefined ? { auditTrigger } : {}),
         });
       }
+      const coordinationFieldsPresent = Boolean(
+        taskStatus || assignmentStatus || scopeFiles.length > 0 || leaseAction || idempotencyKey,
+      );
       const validatedImplementerRecoveryRequested = Boolean(
-        expectedRevision || (rebindSessionName && (ownedFiles.length > 0 || evidenceManifestSha256)),
+        !coordinationFieldsPresent
+        && (expectedRevision || (rebindSessionName && (ownedFiles.length > 0 || evidenceManifestSha256))),
       );
       if (validatedImplementerRecoveryRequested) {
         if (!assignmentId || !rebindSessionName || !expectedRevision || ownedFiles.length === 0
@@ -1090,6 +1105,37 @@ export function createSupervisionMcpToolHandlers(
           agentType: identity.agentType,
           providerFamily: identity.providerFamily,
         } : undefined;
+        const assignment = task.assignments?.find((candidate) => candidate.assignmentId === assignmentId);
+        const refreshesExecutionAuthority = Boolean(
+          reboundIdentity && (assignment?.executionBinding || assignment?.provisioning),
+        );
+        const executionAuthorityFencePresent = Boolean(
+          expectedRevision || expectedGeneration !== undefined || evidenceManifestSha256,
+        );
+        if (refreshesExecutionAuthority
+          && (!expectedRevision || !Number.isSafeInteger(expectedGeneration) || expectedGeneration! < 0)) {
+          return err(
+            'validation_failed',
+            'coordination execution-authority rebind requires expectedRevision and expectedGeneration',
+          );
+        }
+        if (!refreshesExecutionAuthority && executionAuthorityFencePresent) {
+          return err(
+            'validation_failed',
+            'coordination revision/evidence fences require an execution-authority rebind',
+          );
+        }
+        const reboundExecutionBinding = refreshesExecutionAuthority
+          ? deps.resolveAuditorRecoveryBinding?.(rebindSessionName!)
+          : undefined;
+        if (refreshesExecutionAuthority && !reboundExecutionBinding) {
+          return err('identity_rejected', 'coordination identity target has no selected execution binding');
+        }
+        const reboundProvisioning: SupervisionProvisioningEvidence | undefined = reboundExecutionBinding ? {
+          selectedPool: reboundExecutionBinding.pool,
+          selectedConfig: reboundExecutionBinding.requested,
+          origin: 'reused',
+        } : undefined;
         const coordinated = reg.coordinateTaskAssignment?.({
           taskId,
           assignmentId,
@@ -1098,6 +1144,13 @@ export function createSupervisionMcpToolHandlers(
           ...(scopeFiles.length > 0 ? { scopeFiles } : {}),
           leaseAction: leaseAction as SupervisionRecoveryLeaseAction,
           ...(reboundIdentity ? { identity: reboundIdentity } : {}),
+          ...(reboundExecutionBinding ? {
+            executionBinding: reboundExecutionBinding,
+            provisioning: reboundProvisioning,
+            expectedRevision,
+            expectedGeneration: expectedGeneration!,
+            ...(evidenceManifestSha256 ? { evidenceManifestSha256 } : {}),
+          } : {}),
           idempotencyKey,
           reason,
         });

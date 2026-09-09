@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, realpath } from 'node:fs/promises';
+import { mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
@@ -21,6 +22,13 @@ import {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
 } from '../../src/daemon/supervision-state-store.js';
+import {
+  createSupervisionMcpToolHandlers,
+  type SupervisionRegistryPort,
+} from '../../src/daemon/supervision-mcp-tools.js';
+import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
+import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
 
 function session(overrides: Partial<SessionRecord> & Pick<SessionRecord, 'name' | 'projectName' | 'role'>): SessionRecord {
   return {
@@ -420,6 +428,346 @@ describe('send-tool', () => {
         error: 'task assignment execution binding conflicts with exact target; authoritative rebind required',
       });
       expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('atomically refreshes recovered identity, execution binding, and provisioning before SAME assignment continuation', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'tsk_recovered_execution_target';
+    const assignmentId = 'asg_recovered_execution_target';
+    const coordinatorAssignmentId = `${assignmentId}-coordinator`;
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit', backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1', maxParseRetries: 1, maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const oldWorker = session({
+      name: 'deck_alpha_old_cc', projectName: 'alpha', role: 'w1', label: 'Old CC',
+      agentType: 'claude-code-sdk', runtimeType: 'transport', activeModel: 'opus',
+    } as never);
+    const worker = session({
+      name: 'deck_alpha_recovered_cx', projectName: 'alpha', role: 'w1', label: 'Recovered Cx',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    const oldConfig = {
+      capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:opus',
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model: 'opus',
+    };
+    const replacementConfig = {
+      capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const replacementBinding = {
+      pool: 'primary' as const,
+      requested: replacementConfig,
+      actual: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+      },
+      origin: 'reused' as const,
+    };
+    const replacementIdentity = {
+      sessionName: worker.name,
+      sessionInstanceId: worker.sessionInstanceId!,
+      runtimeEpoch: worker.runtimeEpoch!,
+      agentType: worker.agentType,
+      providerFamily: 'openai',
+    };
+    const replacementProvisioning = {
+      selectedPool: 'primary' as const,
+      selectedConfig: replacementConfig,
+      origin: 'reused' as const,
+    };
+    const r1 = 'execution-authority-r1';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'recover exact owner',
+      currentRevision: r1,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId: coordinatorAssignmentId, taskId, role: 'coordinator', required: false, scopeFiles: [],
+      identity: {
+        sessionName: brain.name, sessionInstanceId: brain.sessionInstanceId!, runtimeEpoch: brain.runtimeEpoch!,
+        agentType: brain.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', scopeFiles: [], auditRevision: r1,
+      identity: {
+        sessionName: oldWorker.name, sessionInstanceId: oldWorker.sessionInstanceId!, runtimeEpoch: oldWorker.runtimeEpoch!,
+        agentType: oldWorker.agentType, providerFamily: 'anthropic',
+      },
+      executionBinding: {
+        pool: 'primary', origin: 'spawned', requested: oldConfig,
+        actual: {
+          sessionName: oldWorker.name, sessionInstanceId: oldWorker.sessionInstanceId!, runtimeEpoch: oldWorker.runtimeEpoch!,
+          agentType: oldWorker.agentType, providerFamily: 'anthropic', runtimeType: 'transport', model: 'opus',
+        },
+      },
+      provisioning: {
+        selectedPool: 'primary', selectedConfig: oldConfig, origin: 'spawned',
+        provisionAttemptId: 'old-provision-attempt', createdSessionName: oldWorker.name,
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId, intent: 'start', toStatus: 'implementing',
+    })).toMatchObject({ ok: true });
+    const bundleSource = await realpath(await mkdtemp(join(tmpdir(), 'imcodes-recovery-authority-')));
+    await writeFile(join(bundleSource, 'authority.txt'), 'r1 frozen authority\n');
+    const frozen = freezeSupervisionIntegrationBundle({
+      taskId, assignmentId, revision: r1,
+      snapshot: {
+        worktreePath: bundleSource,
+        headSha: 'a'.repeat(40),
+        files: [{
+          path: 'authority.txt',
+          sha256: createHash('sha256').update('r1 frozen authority\n').digest('hex'),
+        }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      },
+      bundleRoot: join(bundleSource, 'bundles'),
+    });
+    if (!frozen.ok) throw new Error(frozen.reason);
+    expect(registry.bindIntegrationBundle({
+      taskId, assignmentId,
+      identity: registry.getAssignment(assignmentId)!.identity,
+      revision: r1, bundle: frozen.bundle,
+    })).toMatchObject({ ok: true });
+    const expectedGeneration = registry.getAssignment(assignmentId)!.generation;
+
+    const registryPort = {
+      getStatus: (id: string) => registry.get(id)?.status,
+      applyIntent: (input: Parameters<typeof registry.applyTaskIntent>[0]) => registry.applyTaskIntent(input),
+      list: (filter: Parameters<typeof registry.list>[0]) => registry.list(filter) as never,
+      get: (id: string) => registry.get(id) as never,
+      recover: (input: Parameters<typeof registry.recoverTask>[0]) => registry.recoverTask(input),
+      coordinateTaskAssignment: (input: Parameters<typeof registry.coordinateTaskAssignment>[0]) => (
+        registry.coordinateTaskAssignment(input)
+      ),
+      housekeeping: (input: Parameters<typeof registry.housekeeping>[0]) => registry.housekeeping(input),
+    } as unknown as SupervisionRegistryPort;
+    const resolveIdentity = (name: string) => name === worker.name ? {
+      sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+      agentType: worker.agentType, providerFamily: 'openai', projectName: 'alpha',
+    } : name === brain.name ? {
+      sessionName: brain.name, sessionInstanceId: brain.sessionInstanceId!, runtimeEpoch: brain.runtimeEpoch!,
+      agentType: brain.agentType, providerFamily: 'openai', projectName: 'alpha',
+    } : undefined;
+    const brainCaller = {
+      userId: 'user-1', sessionName: brain.name, projectName: 'alpha', transport: 'stdio',
+    } as McpRuntimeCaller;
+    const withoutBindingResolver = createSupervisionMcpToolHandlers(brainCaller, {
+      registry: registryPort,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: resolveIdentity,
+    });
+    const brainHandlers = createSupervisionMcpToolHandlers(brainCaller, {
+      registry: registryPort,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: resolveIdentity,
+      resolveAuditorRecoveryBinding: (name) => name === worker.name ? replacementBinding : undefined,
+    });
+    const recoveryRequest = {
+      taskId, assignmentId, taskStatus: 'delegated', assignmentStatus: 'delegated',
+      leaseAction: 'renew', rebindSessionName: worker.name,
+      expectedRevision: r1, expectedGeneration,
+      evidenceManifestSha256: frozen.bundle.manifestSha256,
+      idempotencyKey: 'recover-execution-target-once', reason: 'replace unavailable Claude owner with live Codex owner',
+    } as const;
+    try {
+      const authoritySnapshot = () => JSON.stringify({
+        task: registry.get(taskId),
+        events: registry.listEvents(taskId),
+      });
+      const storeRecoveryBase = {
+        taskId,
+        assignmentId,
+        leaseAction: 'renew' as const,
+        identity: replacementIdentity,
+        expectedRevision: r1,
+        expectedGeneration,
+        evidenceManifestSha256: frozen.bundle.manifestSha256,
+      };
+
+      const beforeBindingWithoutProvisioning = authoritySnapshot();
+      expect(registry.coordinateTaskAssignment({
+        taskId,
+        assignmentId: coordinatorAssignmentId,
+        leaseAction: 'renew',
+        identity: replacementIdentity,
+        executionBinding: replacementBinding,
+        idempotencyKey: 'reject-binding-without-provisioning',
+        reason: 'execution authority must be replaced atomically',
+      })).toMatchObject({ ok: false, reason: 'invalid' });
+      expect(authoritySnapshot()).toBe(beforeBindingWithoutProvisioning);
+
+      const beforeAuthorityWithoutIdentity = authoritySnapshot();
+      expect(registry.coordinateTaskAssignment({
+        taskId,
+        assignmentId: coordinatorAssignmentId,
+        leaseAction: 'renew',
+        executionBinding: replacementBinding,
+        provisioning: replacementProvisioning,
+        idempotencyKey: 'reject-authority-without-identity',
+        reason: 'execution authority requires the exact runtime identity',
+      })).toMatchObject({ ok: false, reason: 'invalid' });
+      expect(authoritySnapshot()).toBe(beforeAuthorityWithoutIdentity);
+
+      const contradictoryAuthority = [
+        {
+          label: 'selected pool contradicts the execution binding',
+          executionBinding: replacementBinding,
+          provisioning: { ...replacementProvisioning, selectedPool: 'economy' as const },
+        },
+        {
+          label: 'recovered provisioning claims a spawned origin',
+          executionBinding: replacementBinding,
+          provisioning: { ...replacementProvisioning, origin: 'spawned' as const },
+        },
+        {
+          label: 'recovered provisioning retains a provision attempt',
+          executionBinding: replacementBinding,
+          provisioning: { ...replacementProvisioning, provisionAttemptId: 'stale-attempt' },
+        },
+      ];
+      for (const [index, contradiction] of contradictoryAuthority.entries()) {
+        const before = authoritySnapshot();
+        expect(registry.coordinateTaskAssignment({
+          ...storeRecoveryBase,
+          executionBinding: contradiction.executionBinding,
+          provisioning: contradiction.provisioning,
+          idempotencyKey: `reject-contradictory-authority-${index}`,
+          reason: contradiction.label,
+        })).toMatchObject({ ok: false, reason: 'invalid' });
+        expect(authoritySnapshot()).toBe(before);
+      }
+
+      const beforeFencedCoordinationWithoutRebind = authoritySnapshot();
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        taskId,
+        assignmentId,
+        taskStatus: 'delegated',
+        assignmentStatus: 'delegated',
+        leaseAction: 'renew',
+        expectedRevision: r1,
+        expectedGeneration,
+        evidenceManifestSha256: frozen.bundle.manifestSha256,
+        idempotencyKey: 'reject-fenced-coordination-without-rebind',
+        reason: 'revision fences are valid only for an execution-authority rebind',
+      })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(authoritySnapshot()).toBe(beforeFencedCoordinationWithoutRebind);
+
+      const beforeGenerationMismatch = JSON.stringify(registry.get(taskId));
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        ...recoveryRequest,
+        expectedGeneration: expectedGeneration + 1,
+        idempotencyKey: 'reject-stale-r1-generation', reason: 'must bind exact assignment generation',
+      })).resolves.toMatchObject({ status: 'error', reason: 'conflicting_replay' });
+      expect(JSON.stringify(registry.get(taskId))).toBe(beforeGenerationMismatch);
+
+      const beforeEvidenceMismatch = JSON.stringify(registry.get(taskId));
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        ...recoveryRequest,
+        evidenceManifestSha256: 'f'.repeat(64),
+        idempotencyKey: 'reject-wrong-r1-evidence', reason: 'must bind exact frozen evidence',
+      })).resolves.toMatchObject({ status: 'error', reason: 'manifest_mismatch' });
+      expect(JSON.stringify(registry.get(taskId))).toBe(beforeEvidenceMismatch);
+
+      await expect(withoutBindingResolver[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({
+          status: 'error', reason: 'identity_rejected',
+          detail: 'coordination identity target has no selected execution binding',
+        });
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        identity: { sessionName: oldWorker.name },
+        executionBinding: { actual: { sessionName: oldWorker.name } },
+        provisioning: { createdSessionName: oldWorker.name },
+      });
+
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: false });
+
+      const workerHandlers = createSupervisionMcpToolHandlers({
+        userId: 'user-1', sessionName: worker.name, projectName: 'alpha', transport: 'stdio',
+      } as McpRuntimeCaller, { registry: registryPort, resolveSessionIdentity: resolveIdentity });
+      await expect(workerHandlers[SUPERVISION_MCP_TOOLS.INTENT]({
+        taskId, assignmentId, intent: 'start',
+      })).resolves.toMatchObject({ status: 'ok', fromStatus: 'delegated', toStatus: 'implementing' });
+
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        identity: { sessionName: worker.name, agentType: 'codex-sdk', providerFamily: 'openai' },
+        executionBinding: replacementBinding,
+        provisioning: { selectedPool: 'primary', selectedConfig: replacementConfig, origin: 'reused' },
+      });
+      expect(registry.getAssignment(assignmentId)?.provisioning).not.toHaveProperty('createdSessionName');
+      expect(registry.getAssignment(assignmentId)?.provisioning).not.toHaveProperty('provisionAttemptId');
+      const recoveredGeneration = registry.getAssignment(assignmentId)?.generation;
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: true });
+      expect(registry.getAssignment(assignmentId)?.generation).toBe(recoveredGeneration);
+      expect(registry.getAssignment(assignmentId)?.status).toBe('implementing');
+
+      expect(registry.coordinateTaskAssignment({
+        taskId,
+        assignmentId,
+        leaseAction: 'renew',
+        identity: replacementIdentity,
+        executionBinding: replacementBinding,
+        provisioning: replacementProvisioning,
+        expectedRevision: r1,
+        expectedGeneration: recoveredGeneration,
+        evidenceManifestSha256: frozen.bundle.manifestSha256,
+        idempotencyKey: 'drift-authority-after-recorded-recovery',
+        reason: 'simulate a later authoritative recovery before an old replay arrives',
+      })).toMatchObject({ ok: true });
+      const beforeDriftedReplay = authoritySnapshot();
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'error', reason: 'conflicting_replay' });
+      expect(authoritySnapshot()).toBe(beforeDriftedReplay);
+
+      expect(registry.updateTask({ taskId, currentRevision: 'execution-authority-r2' }))
+        .toMatchObject({ ok: true });
+      const beforeDelayedR1 = JSON.stringify(registry.get(taskId));
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'error', reason: 'old_revision' });
+      expect(JSON.stringify(registry.get(taskId))).toBe(beforeDelayedR1);
+
+      const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+      await expect(dispatchSendMessage(caller, {
+        target: oldWorker.name, message: 'must not return to superseded owner',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, { listSessions: () => [brain, oldWorker, worker], dispatchMessage }))
+        .resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+      await expect(dispatchSendMessage(caller, {
+        target: worker.name, message: 'resume SAME recovered assignment',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, {
+        listSessions: () => [brain, worker], dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/recovered/repo', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      })).resolves.toMatchObject({ status: 'accepted', taskId, assignmentId });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
     } finally {
       resetSupervisionTaskRegistryForTests();
     }
