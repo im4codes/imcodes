@@ -34,10 +34,21 @@ describe('P0 direct transfer native crash containment', () => {
       pathToFileURL(path.join(process.cwd(), 'test/daemon/fixtures/direct-file-transfer-sigsegv-child.mjs')),
       { workerData: { kind: DIRECT_FILE_TRANSFER_WORKER_KIND, generation: 1 } },
     );
-    const ready = await waitForChildMessage(child) as { type: string; pid: number };
-    expect(ready).toMatchObject({ type: 'fixture.ready' });
+    const ready = await waitForChildMessage(child) as { type: string; pid: number; phase: number };
+    expect(ready).toMatchObject({ type: 'fixture.ready', phase: 0 });
     expect(ready.pid).not.toBe(parentPid);
-    const [code, signal] = await once(child, 'exit') as [number | null, NodeJS.Signals | null];
+
+    const armedMessage = waitForChildMessage(child);
+    child.postMessage({});
+    await expect(armedMessage).resolves.toMatchObject({
+      type: 'fixture.ready',
+      pid: ready.pid,
+      phase: 1,
+    });
+
+    const exit = once(child, 'exit');
+    child.postMessage({});
+    const [code, signal] = await exit as [number | null, NodeJS.Signals | null];
     expect(code).toBeNull();
     expect(signal).toBe('SIGSEGV');
     expect(process.pid).toBe(parentPid);
