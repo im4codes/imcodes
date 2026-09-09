@@ -9,6 +9,7 @@ import {
   RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_MODE,
   SUPERVISION_SUPPORTED_UI_LOCALES,
+  SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS,
 } from '../../shared/supervision-config.js';
 import {
   SUPERVISION_CONTRACT_IDS,
@@ -183,12 +184,13 @@ describe('supervision prompts', () => {
     const payload = JSON.parse(heartbeat.split('\n')[1]!);
     expect(payload).toEqual({
       contractRefs: [
-        SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
+        SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
+        SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
         SUPERVISION_CONTRACT_IDS.MESSAGING,
         SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
       ],
       binding: { mode: 'continue_existing' },
-      action: 'advance_safe_unfinished',
+      action: 'exhaust_all_authorized_recovery_paths_to_resume_exact_same_task_and_assignment_in_place',
       terminal: {
         when: 'no_active_task_or_all_relevant_terminal',
         marker: SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
@@ -210,10 +212,14 @@ describe('supervision prompts', () => {
       'Escalate a deterministic internal authority defect',
     ]) expect(heartbeat).not.toContain(duplicatedRule);
     expect(Buffer.byteLength(heartbeat, 'utf8')).toBeLessThanOrEqual(900);
+    expect(heartbeat).not.toMatch(/[\u3400-\u9fff]/u);
+    for (const referenced of payload.contractRefs) {
+      expect(SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS).toContain(referenced);
+    }
     for (const forbidden of [
       SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
-      SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
       SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
+      SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
     ]) expect(heartbeat).not.toContain(forbidden);
     expect(buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.OFF }, 'zh-CN')).toBe('');
 

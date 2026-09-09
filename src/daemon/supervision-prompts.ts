@@ -660,12 +660,13 @@ export function buildSupervisionWaitingHeartbeatPrompt(
     `[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`,
     JSON.stringify({
       contractRefs: [
-        SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT,
+        SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
+        SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
         SUPERVISION_CONTRACT_IDS.MESSAGING,
         SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
       ],
       binding: { mode: 'continue_existing' },
-      action: 'advance_safe_unfinished',
+      action: 'exhaust_all_authorized_recovery_paths_to_resume_exact_same_task_and_assignment_in_place',
       terminal: {
         when: 'no_active_task_or_all_relevant_terminal',
         marker: SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
