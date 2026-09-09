@@ -142,21 +142,31 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
-async function waitForChildClose(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (child.exitCode != null || child.signalCode != null) return true;
   return await new Promise<boolean>((resolve) => {
     let settled = false;
-    const finish = (closed: boolean) => {
+    const finish = (exited: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      child.off('close', onClose);
-      resolve(closed);
+      child.off('close', onDone);
+      child.off('exit', onDone);
+      resolve(exited);
     };
-    const onClose = () => finish(true);
+    const onDone = () => finish(true);
     const timer = setTimeout(() => finish(false), timeoutMs);
     timer.unref?.();
-    child.once('close', onClose);
+    // BOTH events, and 'exit' is the one that matters. 'close' fires only once
+    // every stdio pipe has been flushed and released, and those pipes can be
+    // held open by exactly the descendants this teardown is about to SIGKILL —
+    // an inherited stdout keeps the parent's 'close' pending long after the
+    // leader is gone. Waiting for 'close' alone therefore burns the whole grace
+    // window on a process that already died, delaying the escalation that would
+    // free those pipes in the first place. A leader that has exited is finished
+    // as far as teardown is concerned.
+    child.once('close', onDone);
+    child.once('exit', onDone);
   });
 }
 
@@ -193,10 +203,10 @@ export async function killProcessTree(
     // we can still ask it to terminate via its own `kill()` method. This
     // keeps mock-based tests (where child.pid is undefined) working.
     if (child) {
-      const closedPromise = waitForChildClose(child, opts?.gracefulMs ?? 1_000);
+      const exitedPromise = waitForChildExit(child, opts?.gracefulMs ?? 1_000);
       try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      const closed = await closedPromise;
-      if (!closed) {
+      const exited = await exitedPromise;
+      if (!exited) {
         try { child.kill('SIGKILL'); } catch { /* gone */ }
       }
     }

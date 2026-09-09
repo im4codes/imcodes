@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const childProcessMock = vi.hoisted(() => ({
@@ -12,15 +13,28 @@ const childProcessMock = vi.hoisted(() => ({
     cb?.(null, 'ok\n', '');
     return {} as never;
   }),
-  spawn: vi.fn(() => ({
-    killed: false,
-    kill: vi.fn(function (this: { killed: boolean }) {
-      this.killed = true;
+  // A real EventEmitter that dies when signalled, because that is what a
+  // process does and what teardown now waits for. The previous fake had no-op
+  // `once`/`on`, so it modelled a child that never reports its own death: with
+  // the audited awaited teardown, killProcessTree could then only escape via
+  // its grace timer, and under fake timers nothing advances that timer once the
+  // test's advance window has passed. The provider was fine; the fake could not
+  // answer the question teardown had started asking.
+  spawn: vi.fn(() => {
+    const child = new EventEmitter() as EventEmitter & {
+      killed: boolean;
+      kill: (signal?: NodeJS.Signals) => boolean;
+    };
+    child.killed = false;
+    child.kill = vi.fn((_signal?: NodeJS.Signals) => {
+      child.killed = true;
+      // Asynchronous, like a real signal delivery: teardown must observe the
+      // exit through its listener, not synchronously inside kill().
+      setImmediate(() => child.emit('exit', null, _signal ?? 'SIGTERM'));
       return true;
-    }),
-    once: vi.fn(),
-    on: vi.fn(),
-  }) as never),
+    }) as never;
+    return child;
+  }) as never,
 }));
 
 vi.mock('node:child_process', () => ({
@@ -891,6 +905,11 @@ describe('ClaudeCodeSdkProvider', () => {
 
     expect(run.closed).toBe(true);
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    // The awaited teardown resolved on the child's own exit, so no escalation
+    // was needed. Pinning the absence matters: if teardown ever stops observing
+    // the exit it would sit out the whole grace window and SIGKILL a process
+    // that had already died.
+    expect(child.kill).not.toHaveBeenCalledWith('SIGKILL');
   });
 
   it('fresh createSession ignores previous internal continuity for the same route', async () => {
