@@ -14,6 +14,7 @@ import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import { recordTurnUsage } from '../store/context-store.js';
 import { getSession } from '../store/session-store.js';
+import { registerSessionStateProbeObserver } from '../store/session-state-probe-events.js';
 import logger from '../util/logger.js';
 import { recordTimelineEmit } from './latency-tracer.js';
 import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
@@ -419,3 +420,7 @@ export class TimelineEmitter {
 }
 
 export const timelineEmitter = new TimelineEmitter();
+
+registerSessionStateProbeObserver((sessionName, state) => {
+  timelineEmitter.emit(sessionName, 'session.state', { state });
+});

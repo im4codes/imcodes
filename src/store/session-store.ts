@@ -16,6 +16,7 @@ import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
 
 const DEBOUNCE_MS = 500;
 
@@ -328,7 +329,6 @@ function reconcilePersistedSessions(): boolean {
 async function probeSessionStates(targetPath: string): Promise<void> {
   try {
     const { detectStatusAsync } = await import('../agent/detect.js');
-    const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
     let mutated = false;
     for (const s of Object.values(store.sessions)) {
       if (s.state !== 'running') continue;
@@ -348,7 +348,7 @@ async function probeSessionStates(targetPath: string): Promise<void> {
         s.state = newState;
         s.updatedAt = Date.now();
         mutated = true;
-        try { timelineEmitter.emit(s.name, 'session.state', { state: newState }); } catch { /* emitter may not be ready */ }
+        emitSessionStateProbeCorrection(s.name, newState);
       }
     }
     if (mutated) scheduleWrite(targetPath);

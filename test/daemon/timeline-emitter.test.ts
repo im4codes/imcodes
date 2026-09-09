@@ -13,6 +13,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 
 import { TimelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import { emitSessionStateProbeCorrection } from '../../src/store/session-state-probe-events.js';
 import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
 describe('TimelineEmitter — seq counter', () => {
@@ -74,6 +75,17 @@ describe('TimelineEmitter — seq counter', () => {
     emitter.emit('session-a', 'user.message', { text: 'hi' });
     emitter.emit('session-a', 'assistant.text', { text: 'hello' });
     expect(timelineStore.append).toHaveBeenCalledTimes(2);
+  });
+
+  it('forwards one startup-probe correction through the registered timeline bridge', () => {
+    emitSessionStateProbeCorrection('deck_probe_bridge_brain', 'idle');
+
+    expect(timelineStore.append).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(timelineStore.append).mock.calls[0]?.[0]).toMatchObject({
+      sessionId: 'deck_probe_bridge_brain',
+      type: 'session.state',
+      payload: { state: 'idle' },
+    });
   });
 
   it('preserves repeated user messages when allowDuplicate is set', () => {

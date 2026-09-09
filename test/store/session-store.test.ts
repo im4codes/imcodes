@@ -389,9 +389,12 @@ describe('session-store', () => {
       vi.doMock('../../src/agent/detect.js', () => ({
         detectStatusAsync: vi.fn(() => detection),
       }));
-      vi.doMock('../../src/daemon/timeline-emitter.js', () => ({
-        timelineEmitter: { emit: vi.fn(() => observeEmit()) },
+      vi.doMock('../../src/store/session-state-probe-events.js', () => ({
+        emitSessionStateProbeCorrection: vi.fn(() => observeEmit()),
       }));
+      vi.doMock('../../src/daemon/timeline-emitter.js', () => {
+        throw new Error('session-store startup probing must not load timeline-emitter');
+      });
       try {
         await writeSessionsFixture({
           sessions: {
@@ -430,6 +433,7 @@ describe('session-store', () => {
         expect(firstStore.sessions.deck_probe_brain?.state).toBe('idle');
       } finally {
         vi.doUnmock('../../src/agent/detect.js');
+        vi.doUnmock('../../src/store/session-state-probe-events.js');
         vi.doUnmock('../../src/daemon/timeline-emitter.js');
         vi.stubEnv('HOME', firstHome);
         rmSync(secondHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
