@@ -889,8 +889,12 @@ program
   .option('--turn-host <host>', 'Separate DNS-only TURN hostname (default: turn.<domain>; never orange-cloud proxied)')
   .option('--turn-port <port>', 'TURN UDP/TCP listener port (default: 3479)')
   .option('--turn-external-ip <ipv4>', 'Public IPv4 advertised by coturn')
-  .option('--turn-relay-min-port <port>', 'First TURN relay UDP port (default: 49160)')
-  .option('--turn-relay-max-port <port>', 'Last TURN relay UDP port (default: 49200)')
+  .option(
+    '--turn-relay-capacity <allocations>',
+    'Maximum concurrent TURN relay allocations, not users (1-30000, default: 100)',
+  )
+  .option('--turn-relay-min-port <port>', 'First TURN relay UDP port (explicit override; needs --turn-relay-max-port)')
+  .option('--turn-relay-max-port <port>', 'Last TURN relay UDP port (explicit override; needs --turn-relay-min-port)')
   .option('--turn-dns-only', 'Confirm the TURN hostname is not proxied by Cloudflare or another HTTP proxy')
   .action(async (opts: {
     domain: string;
@@ -899,6 +903,7 @@ program
     turnHost?: string;
     turnPort?: string;
     turnExternalIp?: string;
+    turnRelayCapacity?: string;
     turnRelayMinPort?: string;
     turnRelayMaxPort?: string;
     turnDnsOnly?: boolean;
@@ -910,6 +915,7 @@ program
       turnHost: opts.turnHost,
       turnPort: opts.turnPort,
       turnExternalIp: opts.turnExternalIp,
+      turnRelayCapacity: opts.turnRelayCapacity,
       turnRelayMinPort: opts.turnRelayMinPort,
       turnRelayMaxPort: opts.turnRelayMaxPort,
       turnDnsOnly: opts.turnDnsOnly,

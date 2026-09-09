@@ -27,13 +27,25 @@ import {
   type TurnDeploymentTemplateConfig,
 } from './templates.js';
 import {
+  TURN_RELAY_CAPACITY,
+  TURN_RELAY_NETWORK,
+  TURN_RELAY_NETWORK_MODES,
   TURN_RELAY_RANGE_REJECTION,
   TURN_SERVICE_DEFAULTS,
   TURN_SERVICE_ENV,
+  parseTurnRelayCapacity,
   parseTurnRelayRange,
   isTurnServiceHost,
   isTurnServiceIpv4,
   isTurnServicePort,
+  isTurnRelayNetworkMode,
+  turnRelayCapacityForRange,
+  turnRelayCapacityRejectionMessage,
+  turnRelayNetworkMode,
+  turnRelayPortCount,
+  turnRelayRangeForCapacity,
+  type TurnRelayNetworkMode,
+  type TurnRelayRangeOrigin,
 } from '../../shared/turn-service.js';
 import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
@@ -68,6 +80,17 @@ async function confirm(prompt: string): Promise<boolean> {
     rl.question(`  ${prompt} [y/N] `, (answer) => {
       rl.close();
       resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
+}
+
+/** Free-text prompt. An empty line means "use the documented default". */
+async function ask(prompt: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`  ${prompt} `, (answer) => {
+      rl.close();
+      resolve(answer.trim());
     });
   });
 }
@@ -273,6 +296,7 @@ interface SetupFlowOptions {
   turnHost?: string;
   turnPort?: string | number;
   turnExternalIp?: string;
+  turnRelayCapacity?: string | number;
   turnRelayMinPort?: string | number;
   turnRelayMaxPort?: string | number;
   turnDnsOnly?: boolean;
@@ -350,7 +374,7 @@ async function persistSecrets(dir: string, secrets: SetupSecrets): Promise<void>
   await chmod(secretsPath, 0o600);
 }
 
-function parsePortOption(value: string | number | undefined, fallback: number): number | undefined {
+function parsePortOption(value: string | number | undefined, fallback?: number): number | undefined {
   if (value === undefined) return fallback;
   if (typeof value === 'number') return isTurnServicePort(value) ? value : undefined;
   if (!/^\d{1,5}$/.test(value)) return undefined;
@@ -370,18 +394,39 @@ function parseBoundedInteger(
   return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : undefined;
 }
 
-function recoverTurnDeployment(dir: string): Partial<EnabledTurnDeployment> | undefined {
+/**
+ * A recovered deployment, plus whether it published a relay range of its own.
+ * That flag is load-bearing: an existing range must be preserved exactly, so
+ * "absent" and "present but unreadable" cannot be collapsed into a default.
+ */
+type RecoveredTurnDeployment = Partial<EnabledTurnDeployment> & {
+  relayRangeConfigured: boolean;
+  /** Exactly what TURN_RELAY_NETWORK_MODE said, so an unusable value can fail closed. */
+  relayNetworkModeRaw?: string;
+};
+
+function recoverTurnDeployment(dir: string): RecoveredTurnDeployment | undefined {
   const envPath = join(dir, '.env');
   if (!existsSync(envPath)) return undefined;
   const env = parseEnvFile(readFileSync(envPath, 'utf8'));
   if (env[TURN_SERVICE_ENV.ENABLED] !== 'true') return undefined;
+  const relayNetworkModeRaw = env[TURN_SERVICE_ENV.RELAY_NETWORK_MODE];
   return {
     enabled: true,
     host: env[TURN_SERVICE_ENV.HOST],
     port: parsePortOption(env[TURN_SERVICE_ENV.PORT], TURN_SERVICE_DEFAULTS.PORT),
     externalIp: env[TURN_SERVICE_ENV.EXTERNAL_IP],
-    relayMinPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MIN_PORT], TURN_SERVICE_DEFAULTS.RELAY_MIN_PORT),
-    relayMaxPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MAX_PORT], TURN_SERVICE_DEFAULTS.RELAY_MAX_PORT),
+    // No default fallback here on purpose. Substituting the current default
+    // range for a deployment that already published one is exactly how an
+    // upgrade silently moves — and shrinks — the ports coturn is bound to.
+    relayRangeConfigured: env[TURN_SERVICE_ENV.RELAY_MIN_PORT] !== undefined
+      || env[TURN_SERVICE_ENV.RELAY_MAX_PORT] !== undefined,
+    relayMinPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MIN_PORT]),
+    relayMaxPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MAX_PORT]),
+    // The deployment's own record of how its container is attached. Absent
+    // means legacy, which is bridge — the only shape older installers built.
+    relayNetworkModeRaw,
+    networkMode: isTurnRelayNetworkMode(relayNetworkModeRaw) ? relayNetworkModeRaw : undefined,
     sharedSecret: env[TURN_SERVICE_ENV.SHARED_SECRET],
     credentialTtlSeconds: parseBoundedInteger(
       env[TURN_SERVICE_ENV.CREDENTIAL_TTL_SECONDS],
@@ -390,6 +435,203 @@ function recoverTurnDeployment(dir: string): Partial<EnabledTurnDeployment> | un
       TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_MAX_SECONDS,
     ),
   };
+}
+
+function requireTurnRelayCapacity(value: string | number | undefined): number {
+  const parsed = parseTurnRelayCapacity(value);
+  if ('rejection' in parsed) fatal(turnRelayCapacityRejectionMessage(parsed.rejection));
+  return parsed.capacity;
+}
+
+function describeTurnRelayCapacity(relayMinPort: number, relayMaxPort: number): string {
+  const capacity = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+  return `${capacity} concurrent relay allocation${capacity === 1 ? '' : 's'}`;
+}
+
+function warnIfTurnRelayRangeMoved(
+  recovered: RecoveredTurnDeployment | undefined,
+  next: { relayMinPort: number; relayMaxPort: number },
+): void {
+  const { relayMinPort, relayMaxPort } = recovered ?? {};
+  if (relayMinPort === undefined || relayMaxPort === undefined) return;
+  if (relayMinPort === next.relayMinPort && relayMaxPort === next.relayMaxPort) return;
+  const before = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+  const after = turnRelayCapacityForRange(next.relayMinPort, next.relayMaxPort);
+  console.warn(`\n  Warning: the TURN relay range changes from ${relayMinPort}-${relayMaxPort} `
+    + `(${before} concurrent allocations) to ${next.relayMinPort}-${next.relayMaxPort} (${after}). `
+    + 'Open the new UDP range in the firewall before relying on it.'
+    + (after < before
+      ? ` This REDUCES capacity: allocations beyond ${after} concurrent relays will be refused.`
+      : '')
+    + '\n');
+}
+
+/**
+ * Decide the relay range, from exactly one authority per run.
+ *
+ * The capacity question is the normal path: "how many concurrent relay
+ * allocations" is answerable, and standard coturn turns it into a port count
+ * 1:1. The derived range is anchored at the top of the port space precisely so
+ * the largest accepted answer still fits — a fixed low start cannot hold 30000
+ * ports.
+ *
+ * An explicit port range stays supported and stays authoritative when given,
+ * because a range already published to coturn, to Docker and to a firewall is
+ * deployment configuration, not something application code gets to second-guess
+ * by width. Only the protocol rule in `parseTurnRelayRange` may refuse it. What
+ * IS refused here is ambiguity: a capacity that disagrees with an explicit
+ * range, or half a range on a fresh install, fails closed instead of quietly
+ * picking a winner.
+ */
+interface ResolvedTurnRelayRange {
+  relayMinPort: number;
+  relayMaxPort: number;
+  rangeOrigin: TurnRelayRangeOrigin;
+}
+
+async function resolveTurnRelayRange(
+  opts: SetupFlowOptions,
+  recovered: RecoveredTurnDeployment | undefined,
+): Promise<ResolvedTurnRelayRange> {
+  const explicitMin = opts.turnRelayMinPort !== undefined;
+  const explicitMax = opts.turnRelayMaxPort !== undefined;
+
+  if (explicitMin || explicitMax) {
+    const relayMinPort = explicitMin
+      ? parsePortOption(opts.turnRelayMinPort)
+      : recovered?.relayMinPort;
+    const relayMaxPort = explicitMax
+      ? parsePortOption(opts.turnRelayMaxPort)
+      : recovered?.relayMaxPort;
+    if (relayMinPort === undefined) {
+      fatal(explicitMin
+        ? 'TURN relay port range is invalid.'
+        : `--turn-relay-max-port was given without --turn-relay-min-port, and no existing `
+          + `${TURN_SERVICE_ENV.RELAY_MIN_PORT} was found to pair it with. Pass both ports, or pass `
+          + '--turn-relay-capacity instead.');
+    }
+    if (relayMaxPort === undefined) {
+      fatal(explicitMax
+        ? 'TURN relay port range is invalid.'
+        : `--turn-relay-min-port was given without --turn-relay-max-port, and no existing `
+          + `${TURN_SERVICE_ENV.RELAY_MAX_PORT} was found to pair it with. Pass both ports, or pass `
+          + '--turn-relay-capacity instead.');
+    }
+    if (opts.turnRelayCapacity !== undefined) {
+      const requested = requireTurnRelayCapacity(opts.turnRelayCapacity);
+      const offered = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+      if (requested !== offered) {
+        fatal(`--turn-relay-capacity ${requested} conflicts with the explicit relay range `
+          + `${relayMinPort}-${relayMaxPort}, which serves ${offered} concurrent relay allocations. `
+          + 'Pass one or the other, or make the two agree.');
+      }
+    }
+    warnIfTurnRelayRangeMoved(recovered, { relayMinPort, relayMaxPort });
+    // An explicit capacity was stated and agrees with these ports, so setup may
+    // still choose the network strategy for it.
+    return {
+      relayMinPort,
+      relayMaxPort,
+      rangeOrigin: opts.turnRelayCapacity === undefined ? 'configured' : 'capacity',
+    };
+  }
+
+  if (opts.turnRelayCapacity !== undefined) {
+    const range = turnRelayRangeForCapacity(requireTurnRelayCapacity(opts.turnRelayCapacity));
+    warnIfTurnRelayRangeMoved(recovered, range);
+    return { ...range, rangeOrigin: 'capacity' };
+  }
+
+  if (recovered?.relayRangeConfigured) {
+    // The existing deployment's own answer. Preserved verbatim — including
+    // 49201-50200, which is not derivable from any capacity anchor — and never
+    // re-derived from the current default.
+    if (recovered.relayMinPort === undefined || recovered.relayMaxPort === undefined) {
+      fatal(`Existing ${TURN_SERVICE_ENV.RELAY_MIN_PORT}/${TURN_SERVICE_ENV.RELAY_MAX_PORT} in .env is not a `
+        + 'usable UDP port range. Fix those two values, or pass --turn-relay-min-port and --turn-relay-max-port '
+        + 'explicitly; setup will not replace a configured relay range with a default.');
+    }
+    return {
+      relayMinPort: recovered.relayMinPort,
+      relayMaxPort: recovered.relayMaxPort,
+      rangeOrigin: 'configured',
+    };
+  }
+
+  if (!process.stdin.isTTY) {
+    return { ...turnRelayRangeForCapacity(TURN_RELAY_CAPACITY.DEFAULT_ALLOCATIONS), rangeOrigin: 'capacity' };
+  }
+  console.log('\n  TURN relay capacity is the maximum number of CONCURRENT relayed connections, not users.');
+  console.log('  Standard coturn binds one UDP port per relayed connection, so this many ports are published.');
+  const answer = await ask(`Maximum concurrent TURN relay allocations `
+    + `(${TURN_RELAY_CAPACITY.MIN_ALLOCATIONS}-${TURN_RELAY_CAPACITY.MAX_ALLOCATIONS}) `
+    + `[${TURN_RELAY_CAPACITY.DEFAULT_ALLOCATIONS}]:`);
+  return { ...turnRelayRangeForCapacity(requireTurnRelayCapacity(answer)), rangeOrigin: 'capacity' };
+}
+
+/**
+ * Apply the network strategy the shared rule chose, and refuse the one shape it
+ * cannot honestly deliver.
+ *
+ * Nothing here reduces the capacity or edits the range. Host networking is only
+ * ever selected for a capacity the operator asked for, and only where it exists;
+ * a range the deployment already publishes keeps publishing it, with the cost
+ * stated rather than silently changed.
+ */
+function resolveTurnRelayNetworkMode(
+  range: ResolvedTurnRelayRange,
+  recovered: RecoveredTurnDeployment | undefined,
+): TurnRelayNetworkMode {
+  const raw = recovered?.relayNetworkModeRaw;
+  if (raw !== undefined && !isTurnRelayNetworkMode(raw)) {
+    // Fail closed. Both guesses are damaging and neither is recoverable from
+    // the range alone, so setup will not pick one on the operator's behalf.
+    fatal(`${TURN_SERVICE_ENV.RELAY_NETWORK_MODE} in .env is "${raw}", which is not a network mode. `
+      + `Set it to one of ${TURN_RELAY_NETWORK_MODES.join(' or ')} to state how this deployment's TURN `
+      + 'container is attached; setup will not guess, because guessing either republishes every relay port '
+      + 'or moves a running relay off the bridge.');
+  }
+  const mode = turnRelayNetworkMode({ ...range, persistedMode: recovered?.networkMode });
+  if (recovered?.networkMode !== undefined && recovered.networkMode !== mode) {
+    console.warn(`\n  Warning: the TURN container moves from ${recovered.networkMode} to ${mode} networking. `
+      + (mode === 'host'
+        ? 'Docker will no longer publish the relay range; open it in the host firewall.'
+        : 'Docker will publish the relay range again; the host firewall rule for it is no longer required.')
+      + '\n');
+  }
+  return mode;
+}
+
+function applyTurnRelayNetworkStrategy(
+  range: ResolvedTurnRelayRange,
+  networkMode: TurnRelayNetworkMode,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const ports = turnRelayPortCount(range.relayMinPort, range.relayMaxPort);
+  const oversizedForBridge = ports > TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS;
+  if (networkMode === 'host') {
+    if (platform !== 'linux') {
+      // Fail closed instead of publishing 30000 bridge mappings, and instead of
+      // quietly serving a smaller relay than the one that was requested.
+      fatal(`${ports} concurrent relay allocations need Docker host networking, which only exists on Linux; `
+        + `this host is ${platform}. Deploy TURN on a Linux host, or choose a capacity of at most `
+        + `${TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS} allocations, which a bridge deployment publishes `
+        + 'safely. Setup will not reduce the requested capacity for you.');
+    }
+    console.warn(`\n  Note: ${ports} relay ports is past the ${TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS} `
+      + 'a Docker bridge can publish sanely, so the TURN container uses host networking. Docker will NOT open '
+      + `the UDP range for you: allow ${range.relayMinPort}-${range.relayMaxPort}/udp in the host firewall.\n`);
+    return;
+  }
+  if (oversizedForBridge) {
+    // Reachable only for a range the deployment already configured, which is
+    // preserved exactly — ports and network mode. Say what it costs.
+    console.warn(`\n  Warning: the configured relay range ${range.relayMinPort}-${range.relayMaxPort} publishes `
+      + `${ports} UDP ports through the Docker bridge, and Docker expands that into one mapping, one proxy and `
+      + 'its own DNAT rules per port — a slow start and a very large resolved Compose model. The range and its '
+      + 'network mode are preserved exactly. To have setup pick host networking instead, re-run with '
+      + '--turn-relay-capacity <allocations>.\n');
+  }
 }
 
 async function resolveTurnDeployment(
@@ -402,6 +644,7 @@ async function resolveTurnDeployment(
   const turnConfigRequested = opts.turnHost !== undefined
     || opts.turnPort !== undefined
     || opts.turnExternalIp !== undefined
+    || opts.turnRelayCapacity !== undefined
     || opts.turnRelayMinPort !== undefined
     || opts.turnRelayMaxPort !== undefined;
   let enabled = opts.turn ?? (Boolean(recovered) || turnConfigRequested);
@@ -416,14 +659,8 @@ async function resolveTurnDeployment(
   const defaultHost = domain.toLowerCase().startsWith('turn.') ? domain : `turn.${domain}`;
   const host = (opts.turnHost ?? recovered?.host ?? defaultHost).trim().toLowerCase();
   const port = parsePortOption(opts.turnPort, recovered?.port ?? TURN_SERVICE_DEFAULTS.PORT);
-  const relayMinPort = parsePortOption(
-    opts.turnRelayMinPort,
-    recovered?.relayMinPort ?? TURN_SERVICE_DEFAULTS.RELAY_MIN_PORT,
-  );
-  const relayMaxPort = parsePortOption(
-    opts.turnRelayMaxPort,
-    recovered?.relayMaxPort ?? TURN_SERVICE_DEFAULTS.RELAY_MAX_PORT,
-  );
+  const resolvedRelayRange = await resolveTurnRelayRange(opts, recovered);
+  const { relayMinPort, relayMaxPort, rangeOrigin } = resolvedRelayRange;
   const discoveredExternalIp = opts.turnExternalIp === undefined ? discoverPublicIpv4()?.trim() : undefined;
   let externalIp = (opts.turnExternalIp ?? recovered?.externalIp ?? discoveredExternalIp)?.trim();
 
@@ -446,6 +683,8 @@ async function resolveTurnDeployment(
   if (port === 80 || port === 443) {
     fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
   }
+  const networkMode = resolveTurnRelayNetworkMode(resolvedRelayRange, recovered);
+  applyTurnRelayNetworkStrategy(resolvedRelayRange, networkMode);
   if (!externalIp || !isTurnServiceIpv4(externalIp)) {
     fatal('Could not determine the TURN server public IPv4. Pass --turn-external-ip <ipv4>.');
   }
@@ -525,6 +764,13 @@ async function resolveTurnDeployment(
     // Narrowed by the shared rule above, not by a second copy of it.
     relayMinPort: relayRange.relayMinPort,
     relayMaxPort: relayRange.relayMaxPort,
+    // Carried into the generated Compose file so the installer and the template
+    // ask the SAME shared rule which network strategy this range gets.
+    rangeOrigin,
+    // Persisted into .env, because it cannot be re-derived from the range on
+    // the next run: a wide range is equally consistent with a legacy bridge
+    // deployment and a host one.
+    networkMode,
     sharedSecret: secrets.turnSharedSecret,
     credentialTtlSeconds: recoveredCredentialTtlSeconds === undefined || upgradeLegacyCredentialTtl
       ? TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_SECONDS
@@ -560,11 +806,20 @@ async function writeConfigs(
   await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain));
   const turnConfigPath = join(dir, 'turnserver.conf');
   const turnEntrypointPath = join(dir, 'turn-entrypoint.sh');
-  if (turn) {
+  // The bridge-address entrypoint belongs to bridge mode only. In host mode
+  // there is no bridge address to translate, and the address it would discover
+  // is a HOST address that denied-peer-ip may deliberately be blocking, so the
+  // wrapper is neither mounted nor left lying around.
+  const usesBridgeEntrypoint = turn?.networkMode === 'bridge';
+  if (turn && usesBridgeEntrypoint) {
     await writeFile(turnConfigPath, turnserverConfigTemplate(turn), { encoding: 'utf8', mode: 0o600 });
     await chmod(turnConfigPath, 0o600);
     await writeFile(turnEntrypointPath, turnEntrypointTemplate(), { encoding: 'utf8', mode: 0o700 });
     await chmod(turnEntrypointPath, 0o700);
+  } else if (turn) {
+    await writeFile(turnConfigPath, turnserverConfigTemplate(turn), { encoding: 'utf8', mode: 0o600 });
+    await chmod(turnConfigPath, 0o600);
+    if (existsSync(turnEntrypointPath)) await unlink(turnEntrypointPath);
   } else if (existsSync(turnConfigPath)) {
     await unlink(turnConfigPath);
     if (existsSync(turnEntrypointPath)) await unlink(turnEntrypointPath);
@@ -875,7 +1130,7 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   │  Admin login:    admin / ${secrets.adminPassword}
   │  Bind URL:       ${bindUrl}
 ${turn ? `  │  TURN relay:     turn:${turn.host}:${turn.port} (DNS only)\n` : ''}  │
-${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}\n  │\n` : ''}  │  This machine is bound and daemon is running.
+${turn ? `  │  TURN capacity:   ${describeTurnRelayCapacity(turn.relayMinPort, turn.relayMaxPort)} (${turn.networkMode} networking)\n` : ''}${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}${turn.networkMode === 'host' ? ' (host networking: Docker does NOT open these, the host firewall must)' : ''}\n  │\n` : ''}  │  This machine is bound and daemon is running.
   │
   │  To connect another machine:
   │    npm install -g imcodes

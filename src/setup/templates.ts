@@ -1,8 +1,15 @@
 /** Embedded deployment templates for `imcodes setup`. */
 
 import {
+  TURN_RELAY_CAPACITY,
   TURN_SERVICE_DEFAULTS,
   TURN_SERVICE_DENIED_PEER_RANGES,
+  TURN_SERVICE_ENV,
+  turnRelayCapacityForRange,
+  turnRelayNetworkMode,
+  turnRelayPortCount,
+  type TurnRelayNetworkMode,
+  type TurnRelayRangeOrigin,
 } from '../../shared/turn-service.js';
 
 export interface TurnDeploymentTemplateConfig {
@@ -14,6 +21,27 @@ export interface TurnDeploymentTemplateConfig {
   relayMaxPort?: number;
   sharedSecret?: string;
   credentialTtlSeconds?: number;
+  /** Decides the network strategy. See turnRelayNetworkMode. */
+  rangeOrigin?: TurnRelayRangeOrigin;
+  /**
+   * The resolved network strategy for this deployment. Written to .env and
+   * rendered into the Compose file from the SAME value, so the record and the
+   * container can never describe different shapes.
+   */
+  networkMode?: TurnRelayNetworkMode;
+}
+
+/**
+ * One answer per deployment, used by every generated file. `.env` persists it
+ * and docker-compose.yml renders it; deriving it twice is how the record and
+ * the container drift apart.
+ */
+function deploymentNetworkMode(turn: TurnDeploymentTemplateConfig | undefined): TurnRelayNetworkMode {
+  return turn?.networkMode ?? turnRelayNetworkMode({
+    relayMinPort: turn?.relayMinPort,
+    relayMaxPort: turn?.relayMaxPort,
+    rangeOrigin: turn?.rangeOrigin,
+  });
 }
 
 export function dockerComposeTemplate(opts?: {
@@ -23,14 +51,22 @@ export function dockerComposeTemplate(opts?: {
 }): string {
   const ghcr = opts?.ghcrPrefix ?? 'ghcr.io';
   const turnImage = opts?.turnImage ?? TURN_SERVICE_DEFAULTS.IMAGE;
-  const turnService = opts?.turn?.enabled ? `
-  turn:
-    image: ${turnImage}
+  // Same relay range either way. Bridge mode publishes it; host mode cannot,
+  // because Docker turns a published RANGE into one mapping, one proxy and its
+  // own DNAT rules PER PORT. See turnRelayNetworkMode for the measured rule.
+  const turnNetworkMode = deploymentNetworkMode(opts?.turn);
+  const turnRelayPorts = opts?.turn?.relayMinPort !== undefined && opts?.turn?.relayMaxPort !== undefined
+    ? turnRelayPortCount(opts.turn.relayMinPort, opts.turn.relayMaxPort)
+    : undefined;
+  const turnSharedService = `    image: ${turnImage}
     # The pinned image runs as nobody by default, but the REST secret config is
     # deliberately 0600. Start as root only long enough for coturn to read it;
     # proc-user/proc-group in turnserver.conf drop the daemon back to nobody.
     user: "0:0"
-    restart: unless-stopped
+    restart: unless-stopped`;
+  const turnBridgeService = `
+  turn:
+${turnSharedService}
     ports:
       - "\${TURN_PORT}:\${TURN_PORT}/udp"
       - "\${TURN_PORT}:\${TURN_PORT}/tcp"
@@ -45,7 +81,34 @@ export function dockerComposeTemplate(opts?: {
     command: ["-c", "/etc/coturn/turnserver.conf"]
     labels:
       - com.centurylinklabs.watchtower.scope=imcodes
-` : '';
+`;
+  const turnHostService = `
+  turn:
+${turnSharedService}
+    # ${turnRelayPorts ?? 'Many'} relay ports. Docker expands a published range into one host
+    # mapping, one userland proxy and its own DNAT rules PER PORT, so publishing
+    # this range through the bridge produces a multi-megabyte Compose model and
+    # a container that takes minutes to start. coturn's own container
+    # documentation recommends host networking for large relay ranges, so the
+    # range is not published at all: coturn binds the host's interfaces.
+    #
+    # Two consequences, both deliberate:
+    #  1. Docker does NOT open these ports for you. The host firewall must allow
+    #     the UDP range itself — the installer summary says so.
+    #  2. There is no bridge address to translate, so the container-IP
+    #     allowed-peer exception used in bridge mode is absent here. In host mode
+    #     "hostname -i" returns a HOST address, which may be private, and
+    #     allowing it would re-open exactly what denied-peer-ip exists to block.
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    labels:
+      - com.centurylinklabs.watchtower.scope=imcodes
+`;
+  const turnService = opts?.turn?.enabled
+    ? (turnNetworkMode === 'host' ? turnHostService : turnBridgeService)
+    : '';
   return `services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -153,6 +216,7 @@ TURN_SHARED_SECRET=${vars.turn.sharedSecret}
 TURN_CREDENTIAL_TTL_SECONDS=${vars.turn.credentialTtlSeconds}
 TURN_RELAY_MIN_PORT=${vars.turn.relayMinPort}
 TURN_RELAY_MAX_PORT=${vars.turn.relayMaxPort}
+${TURN_SERVICE_ENV.RELAY_NETWORK_MODE}=${deploymentNetworkMode(vars.turn)}
 ` : 'TURN_ENABLED=false\n';
   return `DOMAIN=${vars.domain}
 POSTGRES_PASSWORD=${vars.postgresPassword}
@@ -162,7 +226,9 @@ ${turn}
 `;
 }
 
-export function turnserverConfigTemplate(turn: Required<Omit<TurnDeploymentTemplateConfig, 'enabled'>>): string {
+export function turnserverConfigTemplate(
+  turn: Required<Omit<TurnDeploymentTemplateConfig, 'enabled' | 'rangeOrigin' | 'networkMode'>>,
+): string {
   const deniedPeers = TURN_SERVICE_DENIED_PEER_RANGES
     .map((range) => `denied-peer-ip=${range}`)
     .join('\n');
@@ -180,8 +246,12 @@ external-ip=${turn.externalIp}
 min-port=${turn.relayMinPort}
 max-port=${turn.relayMaxPort}
 stale-nonce=600
-user-quota=32
-total-quota=64
+# Per-credential safety limit: a distinct question from the deployment total.
+user-quota=${TURN_RELAY_CAPACITY.USER_QUOTA_ALLOCATIONS}
+# Read back OUT of the configured relay range, so coturn can never be told it
+# may hold more concurrent allocations than it has relay ports to bind, nor
+# fewer than the ports this deployment published and opened in its firewall.
+total-quota=${turnRelayCapacityForRange(turn.relayMinPort, turn.relayMaxPort)}
 no-tls
 no-dtls
 no-tcp-relay

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const { execSyncMock, execFileSyncMock, setupState } = vi.hoisted(() => ({
@@ -12,7 +13,11 @@ const { execSyncMock, execFileSyncMock, setupState } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('node:child_process', () => ({
+// Only the two calls setup makes are mocked. The rest of child_process stays
+// real so the Compose assertions below can actually run `docker compose config`
+// against a generated file instead of trusting the string we generated.
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:child_process')>()),
   execSync: (...args: unknown[]) => execSyncMock(...args),
   execFileSync: (...args: unknown[]) => execFileSyncMock(...args),
 }));
@@ -67,7 +72,8 @@ function installCommandMocks() {
   execFileSyncMock.mockReturnValue('203.0.113.10\n');
 }
 
-describe('setupFlow contracts', () => {
+/** Isolated project dir, mocked child_process/os/readline, per test. */
+function useIsolatedSetupEnvironment(): void {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
@@ -84,6 +90,10 @@ describe('setupFlow contracts', () => {
     projectDir = '';
     setupState.home = '';
   });
+}
+
+describe('setupFlow contracts', () => {
+  useIsolatedSetupEnvironment();
 
   it('generates deployment files, bootstraps the database, and self-binds the daemon', async () => {
     const { setupFlow } = await import('../../src/setup/setup-flow.js');
@@ -150,8 +160,8 @@ describe('setupFlow contracts', () => {
     expect(env).toContain('TURN_HOST=turn.example.com');
     expect(env).toContain('TURN_PORT=3479');
     expect(env).toContain('TURN_CREDENTIAL_TTL_SECONDS=86400');
-    expect(env).toContain('TURN_RELAY_MIN_PORT=49160');
-    expect(env).toContain('TURN_RELAY_MAX_PORT=49200');
+    expect(env).toContain('TURN_RELAY_MIN_PORT=65436');
+    expect(env).toContain('TURN_RELAY_MAX_PORT=65535');
     expect(sharedSecret).toMatch(/^[a-f0-9]{64}$/);
     expect(compose).toContain('\n  turn:\n');
     expect(compose).toContain('coturn/coturn:4.15.0-alpine');
@@ -183,6 +193,7 @@ describe('setupFlow contracts', () => {
     expect(turnEntrypoint).toContain('--allowed-peer-ip="${turn_container_ipv4}-${turn_container_ipv4}"');
     expect(turnEntrypoint).toContain('exec docker-entrypoint.sh "$@"');
     expect(turnConfig).toContain('user-quota=32');
+    expect(turnConfig).toContain('total-quota=100');
     expect(turnConfig).not.toContain('\ncli\n');
     expect(turnConfig).not.toContain('no-cli');
     expect(turnConfig).not.toContain('no-loopback-peers');
@@ -715,5 +726,981 @@ describe('the updater is not inside the scope it watches', () => {
         expect(scopeLabelOf(service), `${name} is labelled with a scope the updater does not watch`).toBe(watched);
       }
     }
+  });
+});
+
+/**
+ * Relay capacity is the question the installer can actually ask.
+ *
+ * "How many ports?" is unanswerable by an operator; "how many people can be
+ * relaying at the same time?" is. Standard coturn — multiplex-peer deliberately
+ * off — binds one UDP relay endpoint per allocation, so the answer converts to
+ * ports 1:1, and that conversion is the only place the two ever meet.
+ *
+ * The failure this replaces was a relay range invented in code: 49160-49200,
+ * 41 ports, on a deployment expected to serve real concurrent traffic, with a
+ * coturn total-quota of 64 that did not match the 41 ports it had to bind. The
+ * numbers disagreed with each other and neither came from the deployment.
+ */
+describe('TURN relay capacity is asked in allocations and answered in ports', () => {
+  useIsolatedSetupEnvironment();
+
+  const exitOnFatal = () => vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+    throw new Error(`exit:${code}`);
+  }) as never);
+
+  async function shared() {
+    return import('../../shared/turn-service.js');
+  }
+
+  it('defaults to 100, accepts 1 and 30000, and refuses 30001 with deployment guidance', async () => {
+    const {
+      TURN_RELAY_CAPACITY,
+      TURN_RELAY_CAPACITY_REJECTION,
+      parseTurnRelayCapacity,
+      turnRelayCapacityRejectionMessage,
+    } = await shared();
+
+    expect(TURN_RELAY_CAPACITY.DEFAULT_ALLOCATIONS).toBe(100);
+    expect(parseTurnRelayCapacity(undefined)).toEqual({ capacity: 100 });
+    expect(parseTurnRelayCapacity('')).toEqual({ capacity: 100 });
+    expect(parseTurnRelayCapacity('   ')).toEqual({ capacity: 100 });
+    expect(parseTurnRelayCapacity('1')).toEqual({ capacity: 1 });
+    expect(parseTurnRelayCapacity(1)).toEqual({ capacity: 1 });
+    expect(parseTurnRelayCapacity('30000')).toEqual({ capacity: 30_000 });
+    expect(parseTurnRelayCapacity(30_000)).toEqual({ capacity: 30_000 });
+
+    // Never clamped. A request for more than one node can relay must fail, not
+    // quietly become 30000 and look healthy until it drops calls under load.
+    expect(parseTurnRelayCapacity('30001'))
+      .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.ABOVE_MAX });
+    expect(parseTurnRelayCapacity(30_001))
+      .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.ABOVE_MAX });
+    expect(parseTurnRelayCapacity(100_000))
+      .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.ABOVE_MAX });
+    expect(parseTurnRelayCapacity('0'))
+      .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.BELOW_MIN });
+
+    const guidance = turnRelayCapacityRejectionMessage(TURN_RELAY_CAPACITY_REJECTION.ABOVE_MAX);
+    expect(guidance).toContain('30000');
+    expect(guidance).toMatch(/additional TURN nodes/);
+    expect(guidance).toMatch(/public IPv4 addresses/);
+  });
+
+  it('refuses anything that is not a whole number of allocations', async () => {
+    const { TURN_RELAY_CAPACITY_REJECTION, parseTurnRelayCapacity } = await shared();
+    for (const invalid of ['abc', '1.5', '-5', '1e4', '0x10', '100 users', '١٠٠', '+5', '1,000']) {
+      expect(parseTurnRelayCapacity(invalid), `${invalid} was accepted as a capacity`)
+        .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.NOT_A_POSITIVE_INTEGER });
+    }
+    expect(parseTurnRelayCapacity(1.5))
+      .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.NOT_A_POSITIVE_INTEGER });
+    expect(parseTurnRelayCapacity(Number.NaN))
+      .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.NOT_A_POSITIVE_INTEGER });
+    expect(parseTurnRelayCapacity(Number.POSITIVE_INFINITY))
+      .toEqual({ rejection: TURN_RELAY_CAPACITY_REJECTION.NOT_A_POSITIVE_INTEGER });
+  });
+
+  it('turns every accepted capacity into a protocol-valid range that round-trips', async () => {
+    const {
+      TURN_RELAY_CAPACITY,
+      parseTurnRelayRange,
+      turnRelayCapacityForRange,
+      turnRelayRangeForCapacity,
+    } = await shared();
+
+    for (const capacity of [1, 2, 41, 100, 999, 1_000, 16_384, 29_999, 30_000]) {
+      const range = turnRelayRangeForCapacity(capacity);
+      // The whole reason the range is anchored at the top: a fixed low start
+      // cannot hold 30000 ports, and an out-of-range port is not a range.
+      expect(parseTurnRelayRange({ port: 3479, ...range }), `capacity ${capacity} produced an invalid range`)
+        .toEqual(range);
+      expect(range.relayMaxPort).toBe(TURN_RELAY_CAPACITY.RANGE_END_PORT);
+      expect(range.relayMinPort).toBeGreaterThan(1_024);
+      expect(turnRelayCapacityForRange(range.relayMinPort, range.relayMaxPort)).toBe(capacity);
+    }
+
+    expect(turnRelayRangeForCapacity(1)).toEqual({ relayMinPort: 65_535, relayMaxPort: 65_535 });
+    expect(turnRelayRangeForCapacity(100)).toEqual({ relayMinPort: 65_436, relayMaxPort: 65_535 });
+    expect(turnRelayRangeForCapacity(30_000)).toEqual({ relayMinPort: 35_536, relayMaxPort: 65_535 });
+
+    // Larger capacity is a superset, never a different neighbourhood.
+    expect(turnRelayRangeForCapacity(30_000).relayMinPort)
+      .toBeLessThan(turnRelayRangeForCapacity(100).relayMinPort);
+  });
+
+  it('keeps the deployment total and the per-credential limit as two different numbers', async () => {
+    const { TURN_RELAY_CAPACITY } = await shared();
+    const { turnserverConfigTemplate } = await import('../../src/setup/templates.js');
+
+    const render = (relayMinPort: number, relayMaxPort: number) => turnserverConfigTemplate({
+      host: 'turn.example.test',
+      port: 3480,
+      externalIp: '203.0.113.10',
+      sharedSecret: 'x'.repeat(64),
+      credentialTtlSeconds: 86_400,
+      relayMinPort,
+      relayMaxPort,
+    });
+
+    // total-quota is read back out of the range, so coturn can never be told it
+    // may hold more concurrent allocations than it has ports to bind.
+    expect(render(65_535, 65_535)).toContain('total-quota=1');
+    expect(render(65_436, 65_535)).toContain('total-quota=100');
+    expect(render(49_201, 50_200)).toContain('total-quota=1000');
+    expect(render(35_536, 65_535)).toContain('total-quota=30000');
+    for (const config of [render(65_535, 65_535), render(35_536, 65_535)]) {
+      expect(config).toContain(`user-quota=${TURN_RELAY_CAPACITY.USER_QUOTA_ALLOCATIONS}`);
+      // Standard coturn only: nothing here may assume shared relay ports.
+      expect(config).not.toContain('multiplex');
+    }
+  });
+
+  it('sizes a fresh non-interactive install for the default 100 allocations', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+    });
+
+    const env = readFileSync(join(projectDir, '.env'), 'utf8');
+    const turnConfig = readFileSync(join(projectDir, 'turnserver.conf'), 'utf8');
+    const compose = readFileSync(join(projectDir, 'docker-compose.yml'), 'utf8');
+    expect(env).toContain('TURN_RELAY_MIN_PORT=65436');
+    expect(env).toContain('TURN_RELAY_MAX_PORT=65535');
+    expect(turnConfig).toContain('min-port=65436');
+    expect(turnConfig).toContain('max-port=65535');
+    expect(turnConfig).toContain('total-quota=100');
+    // The published UDP range is the same two values, by reference.
+    expect(compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    const summary = logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(summary).toContain('100 concurrent relay allocations');
+    expect(summary).toContain('UDP 65436-65535');
+  });
+
+  it.each([
+    { capacity: 1, min: 65_535, max: 65_535, quota: 1, summary: '1 concurrent relay allocation' },
+    { capacity: 250, min: 65_286, max: 65_535, quota: 250, summary: '250 concurrent relay allocations' },
+    { capacity: 1_024, min: 64_512, max: 65_535, quota: 1_024, summary: '1024 concurrent relay allocations' },
+  ])('sizes an explicit capacity of $capacity into $min-$max', async ({ capacity, min, max, quota, summary }) => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnRelayCapacity: capacity,
+    });
+
+    const env = readFileSync(join(projectDir, '.env'), 'utf8');
+    const turnConfig = readFileSync(join(projectDir, 'turnserver.conf'), 'utf8');
+    expect(env).toContain(`TURN_RELAY_MIN_PORT=${min}`);
+    expect(env).toContain(`TURN_RELAY_MAX_PORT=${max}`);
+    expect(turnConfig).toContain(`min-port=${min}`);
+    expect(turnConfig).toContain(`max-port=${max}`);
+    expect(turnConfig).toContain(`total-quota=${quota}`);
+    const printed = logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(printed).toContain(summary);
+    expect(printed).toContain(`UDP ${min}-${max}`);
+  });
+
+  it('refuses 30001 allocations before writing any deployment file', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = exitOnFatal();
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await expect(setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnRelayCapacity: '30001',
+    })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const message = errorSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(message).toMatch(/additional TURN nodes/);
+    expect(message).toMatch(/public IPv4 addresses/);
+    // Not clamped to the maximum behind the operator's back.
+    expect(existsSync(join(projectDir, '.env'))).toBe(false);
+    expect(existsSync(join(projectDir, 'turnserver.conf'))).toBe(false);
+  });
+
+  it.each(['abc', '0', '1.5', '-5'])('refuses the invalid capacity %s before writing anything', async (invalid) => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = exitOnFatal();
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await expect(setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnRelayCapacity: invalid,
+    })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errorSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toMatch(/TURN relay capacity must be/);
+    expect(existsSync(join(projectDir, '.env'))).toBe(false);
+  });
+
+  it('asks interactively and takes an empty answer as the documented default', async () => {
+    const original = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    try {
+      setupState.answer = '';
+      const { setupFlow } = await import('../../src/setup/setup-flow.js');
+      await setupFlow('app.example.com', {
+        turn: true,
+        turnHost: 'turn.example.com',
+        turnExternalIp: '203.0.113.10',
+        turnDnsOnly: true,
+      });
+      expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_MIN_PORT=65436');
+      expect(readFileSync(join(projectDir, 'turnserver.conf'), 'utf8')).toContain('total-quota=100');
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: original, configurable: true });
+    }
+  });
+
+  it('takes an interactive answer of 500 allocations', async () => {
+    const original = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    try {
+      setupState.answer = '500';
+      const { setupFlow } = await import('../../src/setup/setup-flow.js');
+      await setupFlow('app.example.com', {
+        turn: true,
+        turnHost: 'turn.example.com',
+        turnExternalIp: '203.0.113.10',
+        turnDnsOnly: true,
+      });
+      const env = readFileSync(join(projectDir, '.env'), 'utf8');
+      expect(env).toContain('TURN_RELAY_MIN_PORT=65036');
+      expect(env).toContain('TURN_RELAY_MAX_PORT=65535');
+      expect(readFileSync(join(projectDir, 'turnserver.conf'), 'utf8')).toContain('total-quota=500');
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: original, configurable: true });
+    }
+  });
+});
+
+/**
+ * Upgrades must not move the ports underneath a running coturn.
+ *
+ * Production publishes 49201-50200. That range is not derivable from any
+ * capacity anchor, it is already in coturn's min-port/max-port, in the Docker
+ * publish list and in the firewall, and it is what live allocations are bound
+ * to. A capacity default that silently replaced it would shrink the deployment
+ * from 1000 concurrent relays to 100 and relocate every port, which is the same
+ * class of defect as the width cap that refused it outright.
+ */
+describe('an existing relay range survives the capacity question', () => {
+  useIsolatedSetupEnvironment();
+
+  const TURN_SECRET = 'c'.repeat(64);
+
+  function writeExistingDeployment(relay: { min?: string; max?: string }): void {
+    writeFileSync(join(projectDir, '.env'), [
+      'DOMAIN=app.example.com',
+      'POSTGRES_PASSWORD=postgres-secret',
+      'JWT_SIGNING_KEY=jwt-secret',
+      'DEFAULT_ADMIN_PASSWORD=admin-secret',
+      'TURN_ENABLED=true',
+      'TURN_HOST=turn.example.com',
+      'TURN_PORT=3480',
+      'TURN_EXTERNAL_IP=203.0.113.10',
+      `TURN_SHARED_SECRET=${TURN_SECRET}`,
+      'TURN_CREDENTIAL_TTL_SECONDS=86400',
+      ...(relay.min === undefined ? [] : [`TURN_RELAY_MIN_PORT=${relay.min}`]),
+      ...(relay.max === undefined ? [] : [`TURN_RELAY_MAX_PORT=${relay.max}`]),
+    ].join('\n'));
+    writeFileSync(join(projectDir, '.setup-secrets.json'), JSON.stringify({
+      serverToken: 'server-token',
+      serverId: 'server-id',
+      apiKeyRaw: 'deck_' + 'a'.repeat(64),
+      apiKeyId: 'api-key-id',
+      turnSharedSecret: TURN_SECRET,
+    }));
+  }
+
+  it('preserves 49201-50200 and sizes coturn to the 1000 allocations it already serves', async () => {
+    writeExistingDeployment({ min: '49201', max: '50200' });
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await setupFlow('app.example.com', { turnDnsOnly: true });
+
+    const env = readFileSync(join(projectDir, '.env'), 'utf8');
+    const turnConfig = readFileSync(join(projectDir, 'turnserver.conf'), 'utf8');
+    expect(env).toContain('TURN_RELAY_MIN_PORT=49201');
+    expect(env).toContain('TURN_RELAY_MAX_PORT=50200');
+    expect(env).not.toContain('TURN_RELAY_MIN_PORT=65436');
+    expect(turnConfig).toContain('min-port=49201');
+    expect(turnConfig).toContain('max-port=50200');
+    expect(turnConfig).toContain('total-quota=1000');
+    expect(logSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('1000 concurrent relay allocations');
+  });
+
+  it('does not shrink a recovered range even when a TTY is available to ask', async () => {
+    const original = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    try {
+      writeExistingDeployment({ min: '49201', max: '50200' });
+      setupState.answer = '1';
+      const { setupFlow } = await import('../../src/setup/setup-flow.js');
+      await setupFlow('app.example.com', { turnDnsOnly: true });
+      expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_MAX_PORT=50200');
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: original, configurable: true });
+    }
+  });
+
+  it('completes a half-given explicit override from the existing range', async () => {
+    writeExistingDeployment({ min: '49201', max: '50200' });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await setupFlow('app.example.com', { turnDnsOnly: true, turnRelayMaxPort: '50500' });
+
+    const env = readFileSync(join(projectDir, '.env'), 'utf8');
+    expect(env).toContain('TURN_RELAY_MIN_PORT=49201');
+    expect(env).toContain('TURN_RELAY_MAX_PORT=50500');
+    expect(readFileSync(join(projectDir, 'turnserver.conf'), 'utf8')).toContain('total-quota=1300');
+    expect(warnSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('49201-50200');
+  });
+
+  it('warns in full when an explicit capacity relocates and reduces an existing range', async () => {
+    writeExistingDeployment({ min: '49201', max: '50200' });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await setupFlow('app.example.com', { turnDnsOnly: true, turnRelayCapacity: '100' });
+
+    const warning = warnSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(warning).toContain('49201-50200');
+    expect(warning).toContain('65436-65535');
+    expect(warning).toMatch(/REDUCES capacity/);
+    expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_MIN_PORT=65436');
+  });
+
+  it('fails closed when a requested capacity contradicts an explicit range', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await expect(setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnPort: '3480',
+      turnRelayCapacity: '100',
+      turnRelayMinPort: '49201',
+      turnRelayMaxPort: '50200',
+    })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const message = errorSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(message).toContain('100');
+    expect(message).toContain('49201-50200');
+    expect(message).toContain('1000');
+    expect(existsSync(join(projectDir, '.env'))).toBe(false);
+  });
+
+  it('accepts a capacity that agrees with the explicit range it is paired with', async () => {
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnPort: '3480',
+      turnRelayCapacity: '1000',
+      turnRelayMinPort: '49201',
+      turnRelayMaxPort: '50200',
+    });
+
+    expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_MIN_PORT=49201');
+    expect(readFileSync(join(projectDir, 'turnserver.conf'), 'utf8')).toContain('total-quota=1000');
+  });
+
+  it('fails closed on half an explicit range with nothing to pair it with', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await expect(setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnRelayMinPort: '49201',
+    })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errorSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('--turn-relay-max-port');
+    expect(existsSync(join(projectDir, '.env'))).toBe(false);
+  });
+
+  it('fails closed on a lone max port that would otherwise pair with a default min', async () => {
+    // 65500 sits INSIDE the default derived range, so a silent pairing would be
+    // protocol-valid and simply serve 65 allocations instead of the requested
+    // ones. Fail closed: half a range is not an answer.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await expect(setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnRelayMaxPort: '65500',
+    })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errorSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('--turn-relay-min-port');
+    expect(existsSync(join(projectDir, '.env'))).toBe(false);
+  });
+
+  it('refuses to replace an unreadable configured range with a default', async () => {
+    writeExistingDeployment({ min: '49201', max: '99999' });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await expect(setupFlow('app.example.com', { turnDnsOnly: true })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errorSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toMatch(/TURN_RELAY_MIN_PORT\/TURN_RELAY_MAX_PORT/);
+  });
+
+  it('still refuses a listener sitting inside the capacity-derived range', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+
+    await expect(setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnPort: '65500',
+      turnRelayCapacity: '100',
+    })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(existsSync(join(projectDir, 'turnserver.conf'))).toBe(false);
+  });
+});
+
+/**
+ * A capacity nobody can deploy is not a capacity.
+ *
+ * The relay range is published through Docker, and Docker expands a published
+ * RANGE into one host mapping, one userland proxy and its own DNAT rules PER
+ * PORT. Measured on this change: the 30000-port range that capacity 30000
+ * produces resolves to a 2,793,973-byte `docker compose config` model with
+ * 30000 mappings — accepted by the parser, undeployable in practice. coturn's
+ * own container documentation recommends host networking for large relay
+ * ranges for exactly this reason.
+ *
+ * So the strategy is chosen from the range, by one shared rule both the
+ * installer and the template call, with the threshold set from measured
+ * evidence: production already runs an explicit 1000-port bridge range, so the
+ * known-good shape stays on the known-good path.
+ */
+describe('a large relay range uses host networking instead of thousands of bridge mappings', () => {
+  useIsolatedSetupEnvironment();
+
+  const LINUX_ONLY_CAPACITY = 30_000;
+
+  function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
+    const original = process.platform;
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    return run().finally(() => {
+      Object.defineProperty(process, 'platform', { value: original, configurable: true });
+    });
+  }
+
+  async function runSetup(opts: Record<string, unknown>): Promise<void> {
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+    await setupFlow('app.example.com', {
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      ...opts,
+    });
+  }
+
+  it('switches at the exact threshold and nowhere else', async () => {
+    const { TURN_RELAY_NETWORK, turnRelayNetworkMode, turnRelayRangeForCapacity } =
+      await import('../../shared/turn-service.js');
+
+    expect(TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS).toBe(1_024);
+    expect(turnRelayNetworkMode(turnRelayRangeForCapacity(1_024))).toBe('bridge');
+    expect(turnRelayNetworkMode(turnRelayRangeForCapacity(1_025))).toBe('host');
+    expect(turnRelayNetworkMode(turnRelayRangeForCapacity(100))).toBe('bridge');
+    expect(turnRelayNetworkMode(turnRelayRangeForCapacity(30_000))).toBe('host');
+
+    // Production's 1000-port range is the evidence the threshold is set from.
+    expect(turnRelayNetworkMode({ relayMinPort: 49_201, relayMaxPort: 50_200 })).toBe('bridge');
+
+    // A range the deployment already publishes keeps publishing it, however
+    // wide: changing that would move who opens the ports.
+    expect(turnRelayNetworkMode({ relayMinPort: 35_536, relayMaxPort: 65_535, rangeOrigin: 'configured' }))
+      .toBe('bridge');
+    expect(turnRelayNetworkMode({ relayMinPort: 35_536, relayMaxPort: 65_535, rangeOrigin: 'capacity' }))
+      .toBe('host');
+
+    // An unmeasurable range cannot be shown to exceed anything.
+    expect(turnRelayNetworkMode({})).toBe('bridge');
+    expect(turnRelayNetworkMode({ relayMinPort: 65_535, relayMaxPort: 1 })).toBe('bridge');
+  });
+
+  it('keeps the fresh default and the threshold itself on the bridge, publishing the range', async () => {
+    await runSetup({ turnRelayCapacity: 1_024 });
+
+    const compose = readFileSync(join(projectDir, 'docker-compose.yml'), 'utf8');
+    expect(compose).not.toContain('network_mode: host');
+    expect(compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(compose).toContain('./turn-entrypoint.sh:/usr/local/bin/imcodes-turn-entrypoint:ro');
+    expect(existsSync(join(projectDir, 'turn-entrypoint.sh'))).toBe(true);
+    expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_MIN_PORT=64512');
+  });
+
+  it('renders capacity 30000 as host networking with the range intact and no publication', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await withPlatform('linux', () => runSetup({ turnRelayCapacity: LINUX_ONLY_CAPACITY }));
+
+    const compose = readFileSync(join(projectDir, 'docker-compose.yml'), 'utf8');
+    const env = readFileSync(join(projectDir, '.env'), 'utf8');
+    const turnConfig = readFileSync(join(projectDir, 'turnserver.conf'), 'utf8');
+
+    expect(compose).toContain('network_mode: host');
+    // Not one published relay port, and not the placeholder either.
+    expect(compose).not.toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(compose).not.toContain('${TURN_PORT}:${TURN_PORT}/udp');
+    // The bridge-address exception must not follow the container into host mode:
+    // there `hostname -i` is a HOST address, possibly one denied-peer-ip blocks.
+    expect(compose).not.toContain('turn-entrypoint');
+    expect(compose).not.toContain('entrypoint:');
+    expect(existsSync(join(projectDir, 'turn-entrypoint.sh'))).toBe(false);
+
+    // Everything the capacity determines is unchanged by the network strategy.
+    expect(env).toContain('TURN_RELAY_MIN_PORT=35536');
+    expect(env).toContain('TURN_RELAY_MAX_PORT=65535');
+    expect(turnConfig).toContain('min-port=35536');
+    expect(turnConfig).toContain('max-port=65535');
+    expect(turnConfig).toContain('total-quota=30000');
+    expect(turnConfig).toContain('user-quota=32');
+    expect(turnConfig).not.toContain('multiplex');
+
+    const summary = logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(summary).toContain('30000 concurrent relay allocations (host networking)');
+    expect(summary).toContain('host networking: Docker does NOT open these');
+    expect(warnSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('35536-65535/udp in the host firewall');
+  });
+
+  it('fails closed where host networking does not exist, without reducing the capacity', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+
+    await withPlatform('darwin', async () => {
+      await expect(runSetup({ turnRelayCapacity: 1_025 })).rejects.toThrow('exit:1');
+    });
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const message = errorSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(message).toContain('host networking');
+    expect(message).toContain('darwin');
+    expect(message).toMatch(/will not reduce the requested capacity/);
+    expect(existsSync(join(projectDir, '.env'))).toBe(false);
+    expect(existsSync(join(projectDir, 'docker-compose.yml'))).toBe(false);
+  });
+
+  it('preserves a configured wide range on the bridge and states what it costs', async () => {
+    // A range already published to coturn, Docker and a firewall keeps its
+    // shape — ports AND network mode — even above the threshold.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await withPlatform('linux', () => runSetup({
+      turnPort: '3480',
+      turnRelayMinPort: '35536',
+      turnRelayMaxPort: '65535',
+    }));
+
+    const compose = readFileSync(join(projectDir, 'docker-compose.yml'), 'utf8');
+    expect(compose).not.toContain('network_mode: host');
+    expect(compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_MIN_PORT=35536');
+    const warning = warnSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(warning).toContain('30000 UDP ports through the Docker bridge');
+    expect(warning).toContain('--turn-relay-capacity');
+    expect(warning).toContain('preserved exactly');
+  });
+
+  it('lets an explicit capacity choose host networking for the same wide range', async () => {
+    // Same ports, but the operator stated the capacity, so setup owns the
+    // mechanics of delivering it.
+    await withPlatform('linux', () => runSetup({
+      turnPort: '3480',
+      turnRelayCapacity: '30000',
+      turnRelayMinPort: '35536',
+      turnRelayMaxPort: '65535',
+    }));
+
+    expect(readFileSync(join(projectDir, 'docker-compose.yml'), 'utf8')).toContain('network_mode: host');
+    expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_MAX_PORT=65535');
+  });
+});
+
+/**
+ * The generated Compose file is validated by Docker, not by us reading strings.
+ *
+ * This is the assertion that would have caught the defect: capacity 30000 in
+ * bridge mode resolves to a multi-megabyte model with 30000 port mappings.
+ */
+describe('docker compose validates both network strategies', () => {
+  useIsolatedSetupEnvironment();
+
+  const dockerAvailable = (() => {
+    try {
+      return spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 60_000 }).status === 0;
+    } catch {
+      return false;
+    }
+  })();
+
+  function renderDeployment(relayMinPort: number, relayMaxPort: number, rangeOrigin: 'capacity' | 'configured') {
+    return {
+      enabled: true as const,
+      host: 'turn.example.test',
+      port: 3480,
+      externalIp: '203.0.113.10',
+      sharedSecret: 'x'.repeat(64),
+      credentialTtlSeconds: 86_400,
+      relayMinPort,
+      relayMaxPort,
+      rangeOrigin,
+    };
+  }
+
+  async function writeAndResolve(
+    relayMinPort: number,
+    relayMaxPort: number,
+    rangeOrigin: 'capacity' | 'configured',
+  ): Promise<{ status: number | null; stdout: string; stderr: string }> {
+    const { dockerComposeTemplate, envTemplate } = await import('../../src/setup/templates.js');
+    const turn = renderDeployment(relayMinPort, relayMaxPort, rangeOrigin);
+    writeFileSync(join(projectDir, 'docker-compose.yml'), dockerComposeTemplate({ turn }));
+    writeFileSync(join(projectDir, '.env'), envTemplate({
+      domain: 'example.test',
+      postgresPassword: 'p',
+      jwtSigningKey: 'j',
+      adminPassword: 'a',
+      turn,
+    }));
+    const result = spawnSync(
+      'docker',
+      ['compose', '-f', join(projectDir, 'docker-compose.yml'), '--env-file', join(projectDir, '.env'), 'config'],
+      // The bridge shape for a wide range resolves to megabytes; the default
+      // 1 MB maxBuffer would truncate it and kill the child mid-write.
+      { encoding: 'utf8', timeout: 300_000, maxBuffer: 64 * 1024 * 1024 },
+    );
+    return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+  }
+
+  it.skipIf(!dockerAvailable)('resolves the default 100-allocation bridge range', async () => {
+    const { stdout, stderr, status } = await writeAndResolve(65_436, 65_535, 'capacity');
+    expect(stderr).not.toMatch(/error/i);
+    expect(status).toBe(0);
+    expect(stdout).not.toContain('network_mode: host');
+    // Docker expands the published range into one mapping per port.
+    const published = stdout.match(/published:/g)?.length ?? 0;
+    expect(published).toBeGreaterThanOrEqual(100);
+    expect(stdout).toContain('published: "65436"');
+    expect(stdout).toContain('published: "65535"');
+  }, 300_000);
+
+  it.skipIf(!dockerAvailable)('resolves capacity 30000 to a bounded host-networking model', async () => {
+    const { stdout, stderr, status } = await writeAndResolve(35_536, 65_535, 'capacity');
+    expect(stderr).not.toMatch(/error/i);
+    expect(status).toBe(0);
+    expect(stdout).toContain('network_mode: host');
+    // No relay mapping at all, and nothing near the 2,793,973-byte model the
+    // bridge shape produced for this same range.
+    expect(stdout).not.toContain('published: "35536"');
+    expect(stdout.length).toBeLessThan(20_000);
+  }, 300_000);
+
+  it.skipIf(!dockerAvailable)('shows why: the same range published through the bridge is enormous', async () => {
+    // The configured-origin path preserves bridge publication, which is exactly
+    // the model size that makes host networking necessary for capacity 30000.
+    const { stdout, status } = await writeAndResolve(35_536, 65_535, 'configured');
+    expect(status).toBe(0);
+    expect(stdout).not.toContain('network_mode: host');
+    expect(stdout.length).toBeGreaterThan(1_000_000);
+  }, 300_000);
+});
+
+/**
+ * The network strategy has to survive the next `imcodes setup`.
+ *
+ * The strategy was decided from the capacity the operator asked for — but the
+ * capacity is not written anywhere. Only the resulting ports are. On the next
+ * ordinary run the deployment is recovered from those ports, which makes its
+ * range 'configured', and a configured range deliberately keeps its existing
+ * mode rather than re-deriving one from its width. With nothing persisted,
+ * "existing mode" defaulted to bridge, and a host deployment was silently
+ * rewritten back into the 30000-port bridge publication it exists to avoid.
+ *
+ * So the mode is deployment state, persisted in .env, exactly like the range.
+ * It cannot be inferred: a wide range is equally consistent with a legacy
+ * bridge deployment and a host one, and both wrong guesses are damaging.
+ */
+describe('the selected network strategy survives recovery', () => {
+  useIsolatedSetupEnvironment();
+
+  function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
+    const original = process.platform;
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    return run().finally(() => {
+      Object.defineProperty(process, 'platform', { value: original, configurable: true });
+    });
+  }
+
+  async function setup(opts: Record<string, unknown> = {}): Promise<void> {
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+    await setupFlow('app.example.com', opts);
+  }
+
+  function generated() {
+    return {
+      env: readFileSync(join(projectDir, '.env'), 'utf8'),
+      compose: readFileSync(join(projectDir, 'docker-compose.yml'), 'utf8'),
+      turnConfig: readFileSync(join(projectDir, 'turnserver.conf'), 'utf8'),
+      entrypointExists: existsSync(join(projectDir, 'turn-entrypoint.sh')),
+    };
+  }
+
+  /** A deployment written by an installer that predates the persisted mode. */
+  function writeLegacyDeployment(relayMinPort: number, relayMaxPort: number, extra: string[] = []): void {
+    writeFileSync(join(projectDir, '.env'), [
+      'DOMAIN=app.example.com',
+      'POSTGRES_PASSWORD=postgres-secret',
+      'JWT_SIGNING_KEY=jwt-secret',
+      'DEFAULT_ADMIN_PASSWORD=admin-secret',
+      'TURN_ENABLED=true',
+      'TURN_HOST=turn.example.com',
+      'TURN_PORT=3480',
+      'TURN_EXTERNAL_IP=203.0.113.10',
+      `TURN_SHARED_SECRET=${'f'.repeat(64)}`,
+      'TURN_CREDENTIAL_TTL_SECONDS=86400',
+      `TURN_RELAY_MIN_PORT=${relayMinPort}`,
+      `TURN_RELAY_MAX_PORT=${relayMaxPort}`,
+      ...extra,
+    ].join('\n'));
+    writeFileSync(join(projectDir, '.setup-secrets.json'), JSON.stringify({
+      serverToken: 'server-token',
+      serverId: 'server-id',
+      apiKeyRaw: 'deck_' + 'a'.repeat(64),
+      apiKeyId: 'api-key-id',
+      turnSharedSecret: 'f'.repeat(64),
+    }));
+  }
+
+  it('keeps 30000 allocations on host networking across an ordinary second run', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await withPlatform('linux', () => setup({
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+      turnRelayCapacity: 30_000,
+    }));
+    const first = generated();
+    const firstSummary = logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(first.env).toContain('TURN_RELAY_NETWORK_MODE=host');
+    logSpy.mockClear();
+
+    // An ordinary re-run: no capacity, no ports, no flags at all.
+    await withPlatform('linux', () => setup());
+    const second = generated();
+    const secondSummary = logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+
+    // The exact assertion the audit RED makes.
+    expect(second.compose, 'the second run rewrote the deployment back to bridge networking')
+      .toContain('network_mode: host');
+    expect(second.compose).not.toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(second.entrypointExists).toBe(false);
+
+    // Range, quota, mode and guidance all survive unchanged.
+    expect(second.env).toContain('TURN_RELAY_MIN_PORT=35536');
+    expect(second.env).toContain('TURN_RELAY_MAX_PORT=65535');
+    expect(second.env).toContain('TURN_RELAY_NETWORK_MODE=host');
+    expect(second.turnConfig).toContain('min-port=35536');
+    expect(second.turnConfig).toContain('max-port=65535');
+    expect(second.turnConfig).toContain('total-quota=30000');
+    expect(second.compose).toBe(first.compose);
+    expect(second.turnConfig).toBe(first.turnConfig);
+    expect(secondSummary).toContain('30000 concurrent relay allocations (host networking)');
+    expect(secondSummary).toContain('UDP 35536-65535');
+    expect(secondSummary).toContain('host networking: Docker does NOT open these');
+    expect(firstSummary).toContain('30000 concurrent relay allocations (host networking)');
+  });
+
+  it('keeps the default 100 allocations on bridge networking across a second run', async () => {
+    await setup({
+      turn: true,
+      turnHost: 'turn.example.com',
+      turnExternalIp: '203.0.113.10',
+      turnDnsOnly: true,
+    });
+    const first = generated();
+    expect(first.env).toContain('TURN_RELAY_NETWORK_MODE=bridge');
+
+    await setup();
+    const second = generated();
+    expect(second.env).toContain('TURN_RELAY_MIN_PORT=65436');
+    expect(second.env).toContain('TURN_RELAY_NETWORK_MODE=bridge');
+    expect(second.compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(second.compose).not.toContain('network_mode: host');
+    expect(second.entrypointExists).toBe(true);
+    expect(second.compose).toBe(first.compose);
+    expect(second.turnConfig).toBe(first.turnConfig);
+  });
+
+  it('leaves a legacy wide range on the bridge it was always deployed with', async () => {
+    // 30000 ports, no persisted mode: this deployment has been publishing them
+    // through the bridge all along. Inferring host from the width would move a
+    // running relay off Docker's own port mappings on a routine re-run.
+    writeLegacyDeployment(35_536, 65_535);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await withPlatform('linux', () => setup({ turnDnsOnly: true }));
+
+    const { env, compose } = generated();
+    expect(compose).not.toContain('network_mode: host');
+    expect(compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(env).toContain('TURN_RELAY_MIN_PORT=35536');
+    expect(env).toContain('TURN_RELAY_MAX_PORT=65535');
+    // Now recorded, so the shape is no longer a guess on the next run either.
+    expect(env).toContain('TURN_RELAY_NETWORK_MODE=bridge');
+    expect(warnSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('30000 UDP ports through the Docker bridge');
+  });
+
+  it('fails closed on a persisted mode it cannot understand', async () => {
+    writeLegacyDeployment(49_201, 50_200, ['TURN_RELAY_NETWORK_MODE=hostt']);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+
+    await expect(setup({ turnDnsOnly: true })).rejects.toThrow('exit:1');
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const message = errorSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(message).toContain('TURN_RELAY_NETWORK_MODE');
+    expect(message).toContain('hostt');
+    expect(message).toContain('bridge or host');
+    expect(message).toMatch(/will not guess/);
+    // The existing deployment file is left exactly as it was.
+    expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('TURN_RELAY_NETWORK_MODE=hostt');
+    expect(existsSync(join(projectDir, 'docker-compose.yml'))).toBe(false);
+  });
+
+  it('keeps a recovered host deployment on host when its range is widened', async () => {
+    writeLegacyDeployment(35_536, 65_535, ['TURN_RELAY_NETWORK_MODE=host']);
+
+    await withPlatform('linux', () => setup({ turnDnsOnly: true, turnRelayMinPort: '30000' }));
+
+    const { env, compose } = generated();
+    expect(compose).toContain('network_mode: host');
+    expect(env).toContain('TURN_RELAY_MIN_PORT=30000');
+    expect(env).toContain('TURN_RELAY_MAX_PORT=65535');
+    expect(env).toContain('TURN_RELAY_NETWORK_MODE=host');
+    expect(readFileSync(join(projectDir, 'turnserver.conf'), 'utf8')).toContain('total-quota=35536');
+  });
+
+  it('refuses to recover a host deployment where host networking does not exist', async () => {
+    writeLegacyDeployment(35_536, 65_535, ['TURN_RELAY_NETWORK_MODE=host']);
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await withPlatform('darwin', async () => {
+      await expect(setup({ turnDnsOnly: true })).rejects.toThrow('exit:1');
+    });
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('lets a deliberate capacity change move the deployment back to bridge, loudly', async () => {
+    writeLegacyDeployment(35_536, 65_535, ['TURN_RELAY_NETWORK_MODE=host']);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await withPlatform('linux', () => setup({ turnDnsOnly: true, turnRelayCapacity: '100' }));
+
+    const { env, compose } = generated();
+    expect(compose).not.toContain('network_mode: host');
+    expect(compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
+    expect(env).toContain('TURN_RELAY_MIN_PORT=65436');
+    expect(env).toContain('TURN_RELAY_NETWORK_MODE=bridge');
+    expect(readFileSync(join(projectDir, 'turnserver.conf'), 'utf8')).toContain('total-quota=100');
+    const warning = warnSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(warning).toContain('from host to bridge networking');
+    expect(warning).toContain('REDUCES capacity');
+    expect(warning).toContain('35536-65535');
+  });
+
+  it('still refuses a capacity that contradicts an explicit range on a recovered deployment', async () => {
+    writeLegacyDeployment(35_536, 65_535, ['TURN_RELAY_NETWORK_MODE=host']);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+
+    await withPlatform('linux', async () => {
+      await expect(setup({
+        turnDnsOnly: true,
+        turnRelayCapacity: '100',
+        turnRelayMinPort: '35536',
+        turnRelayMaxPort: '65535',
+      })).rejects.toThrow('exit:1');
+    });
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errorSpy.mock.calls.map((call) => call.join(' ')).join('\n'))
+      .toContain('conflicts with the explicit relay range');
   });
 });
