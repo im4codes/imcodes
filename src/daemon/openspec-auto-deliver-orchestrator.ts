@@ -4149,7 +4149,16 @@ export function describeOpenSpecAutoDeliverRunsForTests(): Array<{
   }));
 }
 
-export function clearOpenSpecAutoDeliverRunsForTests(): void {
+export async function clearOpenSpecAutoDeliverRunsForTests(): Promise<void> {
+  // Timeline events intentionally launch async advances without blocking the
+  // emitter. Quiesce the tracked acceptance advances before test fixtures tear
+  // down their project roots or reset shared transport mocks; otherwise a
+  // completion from the previous test can observe the removed tasks.md and
+  // publish a misleading `tasks_unreadable` terminal into the next test.
+  const acceptanceAdvances = [...acceptanceAuditAdvancesInFlight.values()];
+  if (acceptanceAdvances.length > 0) {
+    await Promise.allSettled(acceptanceAdvances);
+  }
   for (const timer of auditPollTimers.values()) clearTimeout(timer);
   auditPollTimers.clear();
   for (const timer of auditFixRetryTimers.values()) clearTimeout(timer);

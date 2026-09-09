@@ -531,7 +531,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }));
     ensureTransportRuntimeForPendingResendMock.mockClear();
     clearAllResend();
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     getSessionMock.mockImplementation((name: string) => ({
       name,
       projectName: 'demo',
@@ -558,7 +558,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   });
 
   afterEach(async () => {
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     clearAllResend();
     await rm(projectDir, { recursive: true, force: true });
     await Promise.all(extraTempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
@@ -2902,6 +2902,30 @@ exec "${realGit}" "$@"
     expect([...p2pRuns.values()]).toHaveLength(1);
   });
 
+  it('does not let an in-flight idle advance send into the next test after test cleanup', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-cleanup-in-flight-idle');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: ['authorized production release still pending'],
+      repair_completion: repairCompletion({
+        status: 'blocked',
+        previous_items_complete: true,
+        completed_items: ['all in-repo repair items verified'],
+        incomplete_items: [],
+        blocked_items: ['9.3 authorized commit/push/CI/production release'],
+        summary: 'All in-repo repairs are complete; only an authorized external release remains.',
+      }),
+    });
+
+    await emitDeckDemoIdle();
+    await clearOpenSpecAutoDeliverRunsForTests();
+    await rm(projectDir, { recursive: true, force: true });
+    serverLinkMock.send.mockClear();
+
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(serverLinkMock.send.mock.calls).toEqual([]);
+  });
+
   it('delivers (passed) when the only unchecked tasks are accepted external/deferred gates', async () => {
     // One in-repo task done + one external release gate deliberately left
     // unchecked and declared skippable. External verification must not block
@@ -3365,7 +3389,7 @@ exec "${realGit}" "$@"
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStale);
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStale);
 
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
@@ -3384,7 +3408,7 @@ exec "${realGit}" "$@"
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
