@@ -505,8 +505,8 @@ export function buildSupervisionMessagingContract(): string {
       brainChatter: false,
     },
     heartbeat: {
-      active: 'resume_one_stale_exact_assignment',
-      dedupe: 'stable_until_state_change',
+      active: 'resume_stale_exact',
+      dedupe: 'state_change',
       substitutesReply: false,
     },
     gate: 'tool_schema+authority_handler',

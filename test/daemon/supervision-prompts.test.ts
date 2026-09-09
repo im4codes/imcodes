@@ -69,8 +69,8 @@ describe('supervision prompts', () => {
       eligibility: 'supervision_delegation_eligibility_v1',
     });
     expect(messaging.heartbeat).toMatchObject({
-      active: 'resume_one_stale_exact_assignment',
-      dedupe: 'stable_until_state_change',
+      active: 'resume_stale_exact',
+      dedupe: 'state_change',
       substitutesReply: false,
     });
 
@@ -747,8 +747,8 @@ describe('supervision user authority clause', () => {
       external: 'needs_input',
     });
     expect(messaging.heartbeat).toEqual({
-      active: 'resume_one_stale_exact_assignment',
-      dedupe: 'stable_until_state_change',
+      active: 'resume_stale_exact',
+      dedupe: 'state_change',
       substitutesReply: false,
     });
     expect(messaging.gate).toBe('tool_schema+authority_handler');
