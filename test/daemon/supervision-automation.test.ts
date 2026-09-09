@@ -162,6 +162,31 @@ const {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function expectWaitingHeartbeatContract(value: unknown): void {
+  const lines = String(value).split('\n');
+  expect(lines).toHaveLength(2);
+  expect(lines[0]).toBe(`[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`);
+  expect(JSON.parse(lines[1]!)).toEqual({
+    contractRefs: [
+      SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
+      SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
+      SUPERVISION_CONTRACT_IDS.MESSAGING,
+      SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+    ],
+    binding: { mode: 'continue_existing' },
+    action: 'exhaust_all_authorized_recovery_paths_to_resume_exact_same_task_and_assignment_in_place',
+    terminal: {
+      when: 'no_active_task_or_all_relevant_terminal',
+      marker: SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+      stopHeartbeat: true,
+    },
+    nonterminal: {
+      marker: SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+      receiptWait: 'check_next_heartbeat',
+    },
+  });
+}
+
 async function waitForRunPhase(phase: 'execution' | 'auditing' | 'finalizing', timeoutMs = 10_000) {
   const deadline = performance.now() + timeoutMs;
   while (supervisionAutomation.getActiveRun('deck_supervision_brain')?.phase !== phase) {
@@ -5029,7 +5054,7 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
-  it('sends a localized waiting heartbeat after ten minutes without consuming continue budget', async () => {
+  it('sends a locale-invariant structured waiting heartbeat after ten minutes without consuming continue budget', async () => {
     const snapshot = await seedSession('supervised', false, 2, { uiLocale: 'zh-CN' });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     try {
@@ -5054,9 +5079,7 @@ describe('SupervisionAutomation', () => {
 
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-      expect(prompt).toContain('[Contract: supervision_waiting_heartbeat_v1]');
-      expect(prompt).toContain('重新读取权威任务状态');
-      expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
+      expectWaitingHeartbeatContract(prompt);
       expect(prompt).not.toContain('Waiting check');
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
         commandId: 'cmd-heartbeat-zh',
@@ -5244,7 +5267,7 @@ describe('SupervisionAutomation', () => {
 
       await vi.advanceTimersByTimeAsync(4 * 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('重新读取权威任务状态');
+      expectWaitingHeartbeatContract(mockTransportRuntime.send.mock.calls[0]?.[0]);
 
       await vi.advanceTimersByTimeAsync(20 * 60_000 + 1);
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
