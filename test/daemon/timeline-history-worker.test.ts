@@ -249,3 +249,107 @@ describe('timeline history worker', () => {
     });
   });
 });
+
+describe('timeline history worker: transient readiness failure is not absence', () => {
+  const originalHome = process.env.HOME;
+  let tempDir: string | null = null;
+
+  afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock('node:worker_threads');
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+    tempDir = null;
+  });
+
+  /**
+   * Load the worker against a projection DB whose readiness probe THROWS rather
+   * than returning a "not ready" row. Under peak load the real throw is
+   * SQLITE_BUSY: the reader exhausts busy_timeout while a writer checkpoints the
+   * WAL. Dropping the sessions table reproduces the same control flow -- the
+   * probe raises instead of answering -- deterministically and in milliseconds,
+   * without racing a real writer.
+   */
+  async function loadWorkerWithThrowingReadiness() {
+    tempDir = mkdtempSync(join(tmpdir(), 'imcodes-timeline-history-busy-'));
+    const dbPath = join(tempDir, 'timeline.sqlite');
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE timeline_projection_events (
+          session_id TEXT NOT NULL, append_ordinal INTEGER NOT NULL, event_id TEXT NOT NULL,
+          ts INTEGER NOT NULL, seq INTEGER NOT NULL, epoch INTEGER NOT NULL, type TEXT NOT NULL,
+          source TEXT NOT NULL, confidence TEXT NOT NULL, payload_json TEXT NOT NULL
+        );
+      `);
+      // No timeline_projection_sessions table: the readiness SELECT raises.
+    } finally {
+      db.close();
+    }
+    vi.doMock('node:worker_threads', () => ({
+      workerData: { dbPath },
+      parentPort: { on: vi.fn(), postMessage: vi.fn() },
+    }));
+    return await import('../../src/daemon/timeline-history-worker.js');
+  }
+
+  it('reports a raising readiness probe as transient, never as projection_unavailable', async () => {
+    // This is the exact fail-open behind the incident. sessionProjectionReady()
+    // swallows ANY throw and returns false, so a transient saturation error is
+    // reported with the one reason the command layer treats as "the projection
+    // genuinely does not exist" -- and its response to that is to run heavy
+    // SQLite/synthesize/sanitize on the main event loop, precisely when the
+    // process is already saturated.
+    //
+    // Absence and busy must therefore be different signals. Only absence may
+    // license the main-thread path.
+    const worker = await loadWorkerWithThrowingReadiness();
+    const result = await worker.handleTimelineHistoryWorkerRequest({
+      workerRequestId: 1,
+      workerSlotId: 1,
+      workerGeneration: 1,
+      sessionName: 'deck_saturated_brain',
+      limit: 100,
+      maxResponseBytes: 512_000,
+      contentTypes: ['assistant.text'],
+      stateTypes: ['session.state'],
+    } as TimelineHistoryWorkerRequest);
+
+    expect(result.kind).toBe('error');
+    const reason = (result as { reason: string }).reason;
+    expect(reason, 'a throwing readiness probe must not be reported as absence')
+      .not.toBe(TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+    expect(reason).toBe(TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_BUSY);
+  });
+
+  it('still reports genuine absence as projection_unavailable', async () => {
+    // The by-design case must survive: a session with no projection row is
+    // legitimately unavailable, and that is the only case allowed to reach the
+    // main thread.
+    tempDir = mkdtempSync(join(tmpdir(), 'imcodes-timeline-history-absent-'));
+    const dbPath = join(tempDir, 'timeline.sqlite');
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = new DatabaseSync(dbPath);
+    try { createProjectionSchema(db); } finally { db.close(); }
+    vi.doMock('node:worker_threads', () => ({
+      workerData: { dbPath },
+      parentPort: { on: vi.fn(), postMessage: vi.fn() },
+    }));
+    const worker = await import('../../src/daemon/timeline-history-worker.js');
+    const result = await worker.handleTimelineHistoryWorkerRequest({
+      workerRequestId: 1,
+      workerSlotId: 1,
+      workerGeneration: 1,
+      sessionName: 'deck_never_projected_brain',
+      limit: 100,
+      maxResponseBytes: 512_000,
+      contentTypes: ['assistant.text'],
+      stateTypes: ['session.state'],
+    } as TimelineHistoryWorkerRequest);
+    expect(result.kind).toBe('error');
+    expect((result as { reason: string }).reason)
+      .toBe(TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+  });
+});

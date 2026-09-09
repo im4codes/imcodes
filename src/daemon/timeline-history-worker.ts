@@ -60,19 +60,39 @@ function workerError(message: TimelineHistoryWorkerRequest, reason: TimelineHist
   };
 }
 
-function sessionProjectionReady(sessionName: string): boolean {
+/**
+ * Three outcomes, deliberately not two.
+ *
+ * `absent` means the projection answered and said it cannot serve this session
+ * (no row, wrong version, not finished building). That is durable, and it is
+ * the ONLY state that may send the request to the main thread.
+ *
+ * `busy` means the probe could not answer at all -- it raised. Under peak load
+ * that is SQLITE_BUSY after busy_timeout expires while a writer checkpoints the
+ * WAL. Previously this was swallowed into `false` and reported as absence, so
+ * saturation was answered by running heavy SQLite, synthesize and sanitize on
+ * the event loop: the incident. An unanswered probe now fails closed to a
+ * retryable signal rather than being read as a durable verdict.
+ */
+type ProjectionReadiness = 'ready' | 'absent' | 'busy';
+
+function sessionProjectionReadiness(sessionName: string): ProjectionReadiness {
+  let row: Record<string, unknown> | undefined;
   try {
-    const row = ensureDb().prepare(`
+    row = ensureDb().prepare(`
       SELECT status, projection_version
       FROM timeline_projection_sessions
       WHERE session_id = ?
     `).get(sessionName) as Record<string, unknown> | undefined;
-    return !!row
-      && String(row.status) === 'ready'
-      && Number(row.projection_version) === EXPECTED_TIMELINE_PROJECTION_VERSION;
   } catch {
-    return false;
+    // No verdict was produced. Do not invent one.
+    return 'busy';
   }
+  return !!row
+    && String(row.status) === 'ready'
+    && Number(row.projection_version) === EXPECTED_TIMELINE_PROJECTION_VERSION
+    ? 'ready'
+    : 'absent';
 }
 
 function rowToEvent(row: Record<string, unknown>): TimelineEvent {
@@ -159,8 +179,11 @@ export async function handleTimelineHistoryWorkerRequest(
 ): Promise<TimelineHistoryWorkerResult> {
   const tRead = Date.now();
   try {
-    if (!sessionProjectionReady(message.sessionName)) {
-      return workerError(message, TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+    const readiness = sessionProjectionReadiness(message.sessionName);
+    if (readiness !== 'ready') {
+      return workerError(message, readiness === 'busy'
+        ? TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_BUSY
+        : TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     }
 
     const limit = Math.max(1, Math.min(Math.trunc(message.limit), 2000));

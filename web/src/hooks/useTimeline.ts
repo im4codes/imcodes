@@ -1704,6 +1704,18 @@ function createTimelineHistoryResponseNotice(msg: TimelineProtocolServerMessage)
   };
 }
 
+/**
+ * Exposed for the production-chain regression: a daemon history frame must be
+ * classified here exactly as it is at runtime, so the test cannot pass against
+ * a re-implementation of the rule it is meant to protect.
+ */
+export function __shouldRetryTimelineHistoryResponseForTests(
+  msg: TimelineEventsServerMessage,
+  hasRenderedEvents: boolean,
+): boolean {
+  return shouldRetryTimelineHistoryResponse(msg, hasRenderedEvents);
+}
+
 function shouldRetryTimelineHistoryResponse(msg: TimelineEventsServerMessage, hasRenderedEvents: boolean): boolean {
   if (getTimelineEvents(msg).length > 0 || hasRenderedEvents) return false;
   if (msg.recoverable === true) return true;

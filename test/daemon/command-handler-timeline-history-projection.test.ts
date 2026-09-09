@@ -292,6 +292,49 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
+  it('never runs the main-thread build when the projection is merely busy', async () => {
+    // The incident in one test. Saturation used to reach the command layer as
+    // projection_unavailable, and the response to that is buildTimelineHistoryOnMain:
+    // two more projection round-trips plus synthesize and sanitize ON the event
+    // loop, while the process is already overloaded. Busy must instead produce a
+    // determinate, retryable answer and touch nothing heavy.
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_busy', agentType: 'codex' });
+    historyWorkerDispatchMock.mockRejectedValue(new TimelineHistoryPoolErrorMock(
+      TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+    ));
+    readByTypesPreferredMock.mockImplementation(async () => {
+      throw new Error('main-thread projection read must not be reached when busy');
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_busy',
+      requestId: 'hist-busy',
+      limit: 5,
+    }, serverLink as any);
+    await flushAsync();
+
+    // The main path is never entered: no second read, no synthesize, no sanitize.
+    expect(readByTypesPreferredMock).not.toHaveBeenCalled();
+    const sent = serverLink.send.mock.calls.map((call: unknown[]) => call[0] as Record<string, unknown>)
+      .filter((msg) => msg.requestId === 'hist-busy');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.source).not.toBe(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE);
+    // Determinate and marked with the field the client actually reads. An
+    // invented `retryable` field would travel the wire and be ignored, leaving
+    // the user with a silently lost history instead of a retry.
+    expect(sent[0]).toMatchObject({
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+      recoverable: true,
+    });
+    // Nothing in the timeline bridge or client carries a retry-after hint, so
+    // emitting one would be a second unread field. Pin its absence.
+    expect(sent[0]).not.toHaveProperty('retryable');
+    expect(sent[0]).not.toHaveProperty('retryAfterMs');
+  });
+
   it('uses type-filtered reads and preserves substantive budgeting plus session.state interleaving', async () => {
     readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
       types.includes('session.state')

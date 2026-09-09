@@ -6177,12 +6177,38 @@ interface TimelineHistoryBuildResult {
   status: TimelineResponseStatus;
   errorReason?: TimelineRequestErrorReason | string;
   cursorReset?: boolean;
+  /**
+   * The established wire signal for "momentary, come back" -- read by the web
+   * client in shouldRetryTimelineHistoryResponse. Named `recoverable` because
+   * that is the field the client actually consumes; an invented `retryable`
+   * field would have travelled the wire and been ignored, which is a fix only
+   * in appearance.
+   */
+  recoverable?: boolean;
   detailRefs: TimelinePayloadMetadata['detailRefs'];
 }
 
 const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
 
-function timelineHistoryErrorResult(source: string, errorReason: TimelineRequestErrorReason | string): TimelineHistoryBuildResult {
+/**
+ * Reasons that mean "the projection could not answer right now".
+ *
+ * These must never reach buildTimelineHistoryOnMain. Running the heavy path on
+ * the event loop is the worst available response to saturation, and it is what
+ * turned a worker timeout into a blocked main thread in production.
+ */
+const TIMELINE_HISTORY_TRANSIENT_REASONS = new Set<string>([
+  TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+  TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+  TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
+  TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+]);
+
+function timelineHistoryErrorResult(
+  source: string,
+  errorReason: TimelineRequestErrorReason | string,
+  options?: { recoverable: true },
+): TimelineHistoryBuildResult {
   return {
     events: [],
     eventsRead: 0,
@@ -6196,6 +6222,7 @@ function timelineHistoryErrorResult(source: string, errorReason: TimelineRequest
     source,
     status: TIMELINE_RESPONSE_STATUS.ERROR,
     errorReason,
+    ...(options?.recoverable ? { recoverable: true } : {}),
     detailRefs: [],
   };
 }
@@ -6215,9 +6242,22 @@ function buildTimelineHistory(params: TimelineHistoryRequestParams): Promise<Tim
   if (shouldUseTimelineHistoryWorkerPool() && initialRecord?.agentType !== 'opencode') {
     return buildTimelineHistoryWithWorker(params).catch(async (err) => {
       const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
+      // Genuine, durable absence is the ONLY case that may run on the main
+      // thread: the projection cannot serve this session at all, so there is no
+      // worker path to wait for. Everything transient is refused here.
       if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) {
         logger.debug({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
         return await buildTimelineHistoryOnMain(params);
+      }
+      if (TIMELINE_HISTORY_TRANSIENT_REASONS.has(reason)) {
+        // Saturation: answer determinately and cheaply. Doing the work here
+        // would add main-thread SQLite, synthesize and sanitize to a process
+        // that is already behind, which is exactly how a slow worker became a
+        // blocked event loop.
+        logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history projection saturated; returning retryable response without main-thread work');
+        // No retry-after hint: nothing in the timeline bridge or client carries
+        // or consumes one, so emitting it would be a second unread field.
+        return timelineHistoryErrorResult(`worker_${reason}`, reason, { recoverable: true });
       }
       logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker failed; returning terminal error response');
       return timelineHistoryErrorResult(`worker_${reason}`, reason);
@@ -6433,6 +6473,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       hasMore,
       nextCursor: buildTimelineNextCursor(result.events, timelineEmitter.epoch),
       cursorReset: result.cursorReset,
+      recoverable: result.recoverable,
       droppedEvents: result.droppedEvents,
       truncatedEvents: result.truncatedEvents,
       detailRefs: result.detailRefs && result.detailRefs.length > 0 ? result.detailRefs : undefined,
