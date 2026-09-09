@@ -22,6 +22,17 @@ export const TURN_SERVICE_DEFAULTS = {
   CREDENTIAL_TTL_MIN_SECONDS: 5 * 60,
   CREDENTIAL_TTL_MAX_SECONDS: 24 * 60 * 60,
   SHARED_SECRET_BYTES: 32,
+  /**
+   * How many relay UDP ports one deployment may publish.
+   *
+   * A real coturn deployment wants hundreds to thousands of relay ports —
+   * im.zhinet.work runs 49201-50200, a thousand of them — and the previous
+   * 256-port ceiling silently invalidated exactly that. The cap exists only so
+   * a typo cannot ask Docker and the firewall to publish tens of thousands of
+   * ports; it is not a security boundary. Peer reachability is bounded by
+   * TURN_SERVICE_DENIED_PEER_RANGES, not by how many relay ports exist.
+   */
+  RELAY_PORT_MAX_COUNT: 4096,
   SUBJECT_HEX_LENGTH: 24,
   CREDENTIAL_EXPIRY_SAFETY_MS: 60 * 1000,
 } as const;
@@ -45,6 +56,74 @@ export const TURN_SERVICE_DENIED_PEER_RANGES = [
   'fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
   'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
 ] as const;
+
+/**
+ * Why a relay port range was refused. Env var NAMES and shapes only.
+ *
+ * This exists because the rule had been written twice — once in the installer
+ * and once in the server runtime — with different ceilings, so the installer
+ * happily wrote a range into .env, coturn and the Docker publish list that the
+ * runtime then rejected. One rule, one place, both callers.
+ */
+export const TURN_RELAY_RANGE_REJECTION = {
+  MIN_PORT_INVALID: 'relay_min_port_invalid',
+  MAX_PORT_INVALID: 'relay_max_port_invalid',
+  INVERTED: 'relay_range_inverted',
+  TOO_MANY_PORTS: 'relay_range_too_many_ports',
+  LISTENER_INSIDE_RANGE: 'listener_port_inside_relay_range',
+} as const;
+
+export type TurnRelayRangeRejection =
+  typeof TURN_RELAY_RANGE_REJECTION[keyof typeof TURN_RELAY_RANGE_REJECTION];
+
+/** How many UDP ports the range covers, inclusive. */
+export function turnRelayPortCount(relayMinPort: number, relayMaxPort: number): number {
+  return relayMaxPort - relayMinPort + 1;
+}
+
+/**
+ * The one relay-range rule. `null` means usable.
+ *
+ * Fail-closed cases kept exactly as before: a port outside 1-65535, an
+ * inverted range, and a listener sitting inside the relay range (which would
+ * make coturn fight its own allocations).
+ */
+export function validateTurnRelayRange(input: {
+  port?: number;
+  relayMinPort?: number;
+  relayMaxPort?: number;
+}): TurnRelayRangeRejection | null {
+  const { port, relayMinPort, relayMaxPort } = input;
+  if (!isTurnServicePort(relayMinPort)) return TURN_RELAY_RANGE_REJECTION.MIN_PORT_INVALID;
+  if (!isTurnServicePort(relayMaxPort)) return TURN_RELAY_RANGE_REJECTION.MAX_PORT_INVALID;
+  if (relayMinPort > relayMaxPort) return TURN_RELAY_RANGE_REJECTION.INVERTED;
+  if (turnRelayPortCount(relayMinPort, relayMaxPort) > TURN_SERVICE_DEFAULTS.RELAY_PORT_MAX_COUNT) {
+    return TURN_RELAY_RANGE_REJECTION.TOO_MANY_PORTS;
+  }
+  if (port !== undefined && port >= relayMinPort && port <= relayMaxPort) {
+    return TURN_RELAY_RANGE_REJECTION.LISTENER_INSIDE_RANGE;
+  }
+  return null;
+}
+
+/**
+ * The same rule, in the shape a caller can use directly: either the validated
+ * range or the exact reason it was refused. Returning the numbers is what lets
+ * both call sites narrow without re-implementing the presence checks.
+ */
+export type TurnRelayRangeResult =
+  | { relayMinPort: number; relayMaxPort: number }
+  | { rejection: TurnRelayRangeRejection };
+
+export function parseTurnRelayRange(input: {
+  port?: number;
+  relayMinPort?: number;
+  relayMaxPort?: number;
+}): TurnRelayRangeResult {
+  const rejection = validateTurnRelayRange(input);
+  if (rejection !== null) return { rejection };
+  return { relayMinPort: input.relayMinPort as number, relayMaxPort: input.relayMaxPort as number };
+}
 
 export interface TurnServiceConfig {
   host: string;

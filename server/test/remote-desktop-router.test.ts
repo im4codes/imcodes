@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
+import { createTurnIceServerAuthority } from '../src/ws/turn-credentials.js';
 import type { Database } from '../src/db/client.js';
 import type { ControlledMachineAccessRow } from '../src/share/machine-access.js';
 import {
@@ -80,6 +81,7 @@ function daemonHostAccess(now = Date.now()): ControlledMachineAccessRow {
 }
 
 function fixture(options: {
+  turnEnv?: Record<string, string | undefined>;
   access?: ControlledMachineAccessRow | null;
   resolveAccess?: (userId: string) => Promise<ControlledMachineAccessRow | null>;
   credentialExpiresAt?: number;
@@ -123,13 +125,16 @@ function fixture(options: {
     featureEnabled: () => featureEnabled,
     daemonGeneration: () => generation,
     allocateRouteGeneration: options.allocateRouteGeneration ?? (async () => generation),
-    iceServers: () => ({
-      iceServers: [
-        'stun:stun.example.test:3478',
-        { urls: ['turn:turn.example.test:3478?transport=udp'], username: 'temporary-user', credential: 'temporary-password' },
-      ],
-      ...(options.credentialExpiresAt === undefined ? {} : { credentialExpiresAt: options.credentialExpiresAt }),
-    }),
+    iceServers: (userId: string) => (options.turnEnv
+      // The REAL authority, exactly as bridge.ts wires it.
+      ? createTurnIceServerAuthority(userId, { env: options.turnEnv })
+      : {
+        iceServers: [
+          'stun:stun.example.test:3478',
+          { urls: ['turn:turn.example.test:3478?transport=udp'], username: 'temporary-user', credential: 'temporary-password' },
+        ],
+        ...(options.credentialExpiresAt === undefined ? {} : { credentialExpiresAt: options.credentialExpiresAt }),
+      }),
     sendDaemon: vi.fn((message, expectedGeneration) => {
       if (!available || expectedGeneration !== generation) return false;
       daemonMessages.push(message);
@@ -1477,5 +1482,48 @@ describe('RemoteDesktopRouter', () => {
       reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
     });
     expect(f.router.stats().active).toBe(0);
+  });
+});
+
+/**
+ * The same production environment, the other surface. Remote desktop consumes
+ * the identical authority through the identical bridge hook, so the STUN-only
+ * downgrade broke it the same way and at the same stage: prepare_ready and an
+ * SDP answer, then nothing to nominate.
+ */
+const PRODUCTION_TURN_ENV = {
+  TURN_ENABLED: 'true',
+  TURN_HOST: 'im.zhinet.work',
+  TURN_PORT: '3480',
+  TURN_EXTERNAL_IP: '43.248.99.95',
+  TURN_SHARED_SECRET: 'x'.repeat(64),
+  TURN_CREDENTIAL_TTL_SECONDS: '86400',
+  TURN_RELAY_MIN_PORT: '49201',
+  TURN_RELAY_MAX_PORT: '50200',
+} as const;
+
+describe('a relay-required remote desktop receives real relay material', () => {
+  it('carries UDP + TCP TURN from the production relay range to daemon and browser', async () => {
+    const f = fixture({ turnEnv: PRODUCTION_TURN_ENV });
+    await authorize(f);
+
+    const relayUrls = (servers: readonly unknown[]): string[] => servers
+      .filter((entry): entry is { urls: string[] } => typeof entry === 'object' && entry !== null)
+      .flatMap((entry) => entry.urls)
+      .filter((url) => url.startsWith('turn:') || url.startsWith('turns:'));
+
+    const prepare = f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE)!;
+    expect(relayUrls(prepare.iceServers as unknown[])).toEqual([
+      'turn:im.zhinet.work:3480?transport=udp',
+      'turn:im.zhinet.work:3480?transport=tcp',
+    ]);
+    const authorized = f.messages(f.browserA).find((message) => (
+      message.type === REMOTE_DESKTOP_MSG.AUTHORIZED
+    ))!;
+    expect(relayUrls(authorized.iceServers as unknown[])).toEqual([
+      'turn:im.zhinet.work:3480?transport=udp',
+      'turn:im.zhinet.work:3480?transport=tcp',
+    ]);
+    expect(JSON.stringify(f.daemonMessages)).not.toContain(PRODUCTION_TURN_ENV.TURN_SHARED_SECRET);
   });
 });

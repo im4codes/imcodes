@@ -27,8 +27,10 @@ import {
   type TurnDeploymentTemplateConfig,
 } from './templates.js';
 import {
+  TURN_RELAY_RANGE_REJECTION,
   TURN_SERVICE_DEFAULTS,
   TURN_SERVICE_ENV,
+  parseTurnRelayRange,
   isTurnServiceHost,
   isTurnServiceIpv4,
   isTurnServicePort,
@@ -427,13 +429,24 @@ async function resolveTurnDeployment(
 
   if (!isTurnServiceHost(host)) fatal('TURN host must be a valid DNS hostname.');
   if (!port) fatal('TURN listener port must be between 1 and 65535.');
-  if (!relayMinPort || !relayMaxPort || relayMinPort > relayMaxPort) {
+  // The SAME rule the server runtime applies. These were two separate
+  // implementations with different ceilings, so this installer wrote a relay
+  // range into .env, coturn's min-port/max-port and the Docker publish list
+  // that the runtime then refused — serving every client a STUN-only ICE list
+  // against a healthy coturn.
+  const relayRange = parseTurnRelayRange({ port, relayMinPort, relayMaxPort });
+  if ('rejection' in relayRange) {
+    // `fatal` never returns, which is also what narrows `relayRange` below —
+    // no second copy of the rule, and no unchecked non-null assertion either.
+    if (relayRange.rejection === TURN_RELAY_RANGE_REJECTION.TOO_MANY_PORTS) {
+      fatal(`TURN relay port range may contain at most ${TURN_SERVICE_DEFAULTS.RELAY_PORT_MAX_COUNT} UDP ports.`);
+    }
+    if (relayRange.rejection === TURN_RELAY_RANGE_REJECTION.LISTENER_INSIDE_RANGE) {
+      fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
+    }
     fatal('TURN relay port range is invalid.');
   }
-  if (relayMaxPort - relayMinPort > 255) {
-    fatal('TURN relay port range may contain at most 256 UDP ports.');
-  }
-  if (port === 80 || port === 443 || (port >= relayMinPort && port <= relayMaxPort)) {
+  if (port === 80 || port === 443) {
     fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
   }
   if (!externalIp || !isTurnServiceIpv4(externalIp)) {
@@ -512,8 +525,9 @@ async function resolveTurnDeployment(
     host,
     port,
     externalIp,
-    relayMinPort,
-    relayMaxPort,
+    // Narrowed by the shared rule above, not by a second copy of it.
+    relayMinPort: relayRange.relayMinPort,
+    relayMaxPort: relayRange.relayMaxPort,
     sharedSecret: secrets.turnSharedSecret,
     credentialTtlSeconds: recoveredCredentialTtlSeconds === undefined || upgradeLegacyCredentialTtl
       ? TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_SECONDS

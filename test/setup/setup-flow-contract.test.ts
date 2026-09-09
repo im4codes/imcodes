@@ -476,3 +476,56 @@ describe('setupFlow contracts', () => {
     expect(execSyncMock.mock.calls.map(([cmd]) => String(cmd)).some((cmd) => cmd.includes('down -v'))).toBe(false);
   });
 });
+
+/**
+ * The installer and the server runtime must agree about what a valid TURN relay
+ * range is.
+ *
+ * They did not. This installer capped the range at 256 UDP ports and the server
+ * runtime capped it at 256 independently — then production was configured with
+ * 49201-50200 (1000 ports), written into .env, into coturn's min-port/max-port
+ * and into the Docker publish list, and the runtime silently refused the whole
+ * TURN configuration and served every client a STUN-only ICE list. Mobile
+ * direct-file transfer and remote desktop both died at ICE with a healthy
+ * coturn sitting there. One rule, one place, or it happens again.
+ */
+describe('the TURN relay range rule is shared, not copied', () => {
+  it('accepts the production range and refuses what is genuinely wrong', async () => {
+    const {
+      TURN_RELAY_RANGE_REJECTION,
+      TURN_SERVICE_DEFAULTS,
+      parseTurnRelayRange,
+    } = await import('../../shared/turn-service.js');
+
+    // im.zhinet.work, the range this incident was about.
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 49_201, relayMaxPort: 50_200 }))
+      .toEqual({ relayMinPort: 49_201, relayMaxPort: 50_200 });
+
+    const cap = TURN_SERVICE_DEFAULTS.RELAY_PORT_MAX_COUNT;
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 20_000, relayMaxPort: 20_000 + cap - 1 }))
+      .toEqual({ relayMinPort: 20_000, relayMaxPort: 20_000 + cap - 1 });
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 20_000, relayMaxPort: 20_000 + cap }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.TOO_MANY_PORTS });
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 50_200, relayMaxPort: 49_201 }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.INVERTED });
+    expect(parseTurnRelayRange({ port: 3480, relayMinPort: 49_201, relayMaxPort: 70_000 }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.MAX_PORT_INVALID });
+    expect(parseTurnRelayRange({ port: 49_500, relayMinPort: 49_201, relayMaxPort: 50_200 }))
+      .toEqual({ rejection: TURN_RELAY_RANGE_REJECTION.LISTENER_INSIDE_RANGE });
+  });
+
+  it('leaves neither call site with its own copy of the arithmetic', () => {
+    // A drift guard, because the duplicate rule is the actual defect. Both
+    // files must delegate; neither may compute the span or hard-code a ceiling.
+    const setup = readFileSync(join(import.meta.dirname, '../../src/setup/setup-flow.ts'), 'utf8');
+    const runtime = readFileSync(join(import.meta.dirname, '../../server/src/ws/turn-credentials.ts'), 'utf8');
+    for (const [name, source] of [['setup-flow.ts', setup], ['turn-credentials.ts', runtime]] as const) {
+      expect(source, `${name} must delegate to the shared relay-range rule`)
+        .toContain('parseTurnRelayRange');
+      expect(source, `${name} recomputes the relay span instead of delegating`)
+        .not.toMatch(/relayMaxPort\s*-\s*relayMinPort/);
+      expect(source, `${name} hard-codes a relay-range ceiling`)
+        .not.toMatch(/>\s*255\b/);
+    }
+  });
+});

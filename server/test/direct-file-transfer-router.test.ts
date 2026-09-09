@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import { DirectFileTransferRouter } from '../src/ws/direct-file-transfer-router.js';
+import { createTurnIceServerAuthority } from '../src/ws/turn-credentials.js';
 import logger from '../src/util/logger.js';
 import { getCounter, resetMetricsForTests, snapshotCounters } from '../src/util/metrics.js';
 import {
@@ -1145,5 +1146,66 @@ describe('DirectFileTransferRouter v2', () => {
       error: DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE,
       retryable: true,
     });
+  });
+});
+
+/**
+ * One production-shaped environment, both surfaces. im.zhinet.work publishes
+ * relay UDP 49201-50200; the runtime rejected that span and served STUN only,
+ * so neither feature could ever gather a relay candidate. The secret is a
+ * correct-LENGTH placeholder: range validation never needs the real one.
+ */
+const PRODUCTION_TURN_ENV = {
+  TURN_ENABLED: 'true',
+  TURN_HOST: 'im.zhinet.work',
+  TURN_PORT: '3480',
+  TURN_EXTERNAL_IP: '43.248.99.95',
+  TURN_SHARED_SECRET: 'x'.repeat(64),
+  TURN_CREDENTIAL_TTL_SECONDS: '86400',
+  TURN_RELAY_MIN_PORT: '49201',
+  TURN_RELAY_MAX_PORT: '50200',
+} as const;
+
+const relayUrls = (servers: readonly unknown[]): string[] => servers
+  .filter((entry): entry is { urls: string[] } => typeof entry === 'object' && entry !== null)
+  .flatMap((entry) => entry.urls)
+  .filter((url) => url.startsWith('turn:') || url.startsWith('turns:'));
+
+describe('a relay-required browser receives real relay material', () => {
+  it('hands the lease UDP + TCP TURN from the production relay range', () => {
+    const browser = {} as WebSocket;
+    const messages: Array<Record<string, unknown>> = [];
+    const daemonMessages: Array<Record<string, unknown>> = [];
+    const router = new DirectFileTransferRouter({
+      serverId: () => SERVER_ID,
+      daemonAvailable: () => true,
+      daemonSupportsDirect: () => true,
+      daemonGeneration: () => 3,
+      resumeTicketSigningKey: () => 'test-direct-file-transfer-resume-signing-key',
+      // The REAL authority, exactly as bridge.ts wires it.
+      iceServers: (userId) => createTurnIceServerAuthority(userId, { env: PRODUCTION_TURN_ENV }),
+      sendDaemon: (message) => { daemonMessages.push(message as Record<string, unknown>); return true; },
+      sendBrowser: (_socket, message) => { messages.push(message as Record<string, unknown>); },
+    });
+
+    expect(router.handleBrowser(browser, 'user-mobile', leaseInit())).toBe(true);
+    const prepare = daemonMessages.at(-1)!;
+    router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: LEASE_REQUEST,
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: prepare.leaseId,
+      leaseGeneration: prepare.leaseGeneration,
+      daemonGeneration: prepare.daemonGeneration,
+    }, prepare.daemonGeneration as number);
+    const ready = messages.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_READY);
+    expect(ready, 'the lease never became ready').toBeDefined();
+    expect(relayUrls(ready!.iceServers as unknown[])).toEqual([
+      'turn:im.zhinet.work:3480?transport=udp',
+      'turn:im.zhinet.work:3480?transport=tcp',
+    ]);
+    expect(JSON.stringify(messages)).not.toContain(PRODUCTION_TURN_ENV.TURN_SHARED_SECRET);
   });
 });
