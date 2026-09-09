@@ -2,6 +2,12 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -168,6 +174,10 @@ interface QwenSessionState {
   qwenConversationId: string;
   runtimeActivityGeneration?: ActivityGeneration;
   child: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `child`; released when the child exits or is reaped. */
+  agentResource?: AgentProcessResource;
   currentMessageId: string | null;
   currentText: string;
   pendingFinalText?: string;
@@ -678,7 +688,7 @@ export class QwenProvider implements TransportProvider {
       if (state.child && !state.child.killed) {
         // Tree-kill: qwen CLI forks children (web_search etc.) that survive
         // a wrapper-only SIGTERM. See killProcessTree for walk+SIGKILL logic.
-        void killProcessTree(state.child);
+        await killProcessTree(state.child, { ownsProcessGroup: true });
       }
       await this.cleanupSessionSettings(state);
       this.sessions.delete(sessionId);
@@ -708,6 +718,7 @@ export class QwenProvider implements TransportProvider {
       settingsPath: existing?.settingsPath,
       qwenConversationId,
       child: existing?.child ?? null,
+      resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
       pendingFinalText: existing?.pendingFinalText,
@@ -728,7 +739,7 @@ export class QwenProvider implements TransportProvider {
     if (state?.child && !state.child.killed) {
       // Tree-kill so any child forked by the qwen CLI (web_search etc.) is
       // also terminated — see provider disconnect comment.
-      void killProcessTree(state.child);
+      await killProcessTree(state.child, { ownsProcessGroup: true });
     }
     if (state) await this.cleanupSessionSettings(state);
     this.sessions.delete(sessionId);
@@ -897,6 +908,11 @@ export class QwenProvider implements TransportProvider {
     const resolved = resolveExecutableForSpawn(QWEN_BIN);
     const finalArgs = [...resolved.prependArgs, ...args];
     const child = spawn(resolved.executable, finalArgs, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       cwd: state.cwd,
       env: {
         ...process.env,
@@ -910,6 +926,9 @@ export class QwenProvider implements TransportProvider {
       windowsHide: true,
     });
     state.child = child;
+    // Crash coverage: if the daemon dies without running teardown, the startup
+    // sweep reaps this group using the registry's process-start fingerprint.
+    state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
     this.sessions.set(sessionId, state);
     if (isCompactControl) {
       this.emitStatus(sessionId, state, {
@@ -941,17 +960,22 @@ export class QwenProvider implements TransportProvider {
     const armResultCompletionFallback = (): void => {
       if (state.cancelled || !state.pendingFinalText) return;
       clearResultCompletionFallback();
-      resultCompletionTimer = setTimeout(() => {
+      resultCompletionTimer = setTimeout(async () => {
         resultCompletionTimer = null;
         if (completed || sawError || state.cancelled || !state.pendingFinalText) return;
         const finalText = state.pendingFinalText;
         const messageId = state.currentMessageId ?? undefined;
         const metadata = state.pendingFinalMetadata;
+        // A timer callback has no caller to await it, so the escalation is held
+        // in a local instead of discarded. Completion still emits on its
+        // original timing; only the reap outlives it.
+        let reaped: Promise<void> | null = null;
         if (state.child === child) {
           state.child = null;
-          void killProcessTree(child, { gracefulMs: 500 });
+          reaped = killProcessTree(child, { gracefulMs: 500, ownsProcessGroup: true });
         }
         emitComplete(finalText, messageId, metadata);
+        if (reaped) await reaped;
       }, QWEN_RESULT_COMPLETION_FALLBACK_MS);
       resultCompletionTimer.unref?.();
     };
@@ -1385,7 +1409,7 @@ export class QwenProvider implements TransportProvider {
     // left Qwen CLI's grandchildren (web_search, bash helpers) alive.
     // killProcessTree walks the descendant tree via `ps` and sends SIGTERM
     // → SIGKILL to each pid explicitly (2s grace).
-    void killProcessTree(child, { gracefulMs: 2_000 });
+    await killProcessTree(child, { gracefulMs: 2_000, ownsProcessGroup: true });
     // Reset conversation so next send uses --session-id with a fresh ID
     // instead of --resume on the conversation stuck in a tool-call loop.
     state.started = false;

@@ -3,6 +3,15 @@ export const SESSION_RESOURCE_KIND = {
   TMUX: 'tmux',
   BROWSER: 'browser',
   CONTAINER: 'container',
+  /**
+   * A session-owned agent CLI process that leads its own POSIX process group.
+   *
+   * Deliberately NOT reusing MCP: the memory-MCP CPU sweeper only inspects
+   * MCP-kind records and can release them as PROCESS_MISSING, which for a
+   * long-running agent CLI would be a wrong kill. A distinct kind keeps the
+   * startup fingerprint sweep while staying out of that sampler.
+   */
+  AGENT: 'agent',
 } as const;
 
 export type SessionResourceKind = typeof SESSION_RESOURCE_KIND[keyof typeof SESSION_RESOURCE_KIND];

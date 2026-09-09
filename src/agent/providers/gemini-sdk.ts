@@ -491,7 +491,7 @@ export class GeminiSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    this.teardownChild();
+    await this.teardownChild();
     this.acpToRoute.clear();
     this.sessions.clear();
     this.config = null;
@@ -710,7 +710,7 @@ export class GeminiSdkProvider implements TransportProvider {
   }
 
   private async startAcpServer(config: ProviderConfig): Promise<void> {
-    this.teardownChild();
+    await this.teardownChild();
 
     // Auto-trust: a headless `gemini --acp` has no human to answer folder-trust
     // prompts, so an untrusted session cwd makes Gemini skip project agents and
@@ -721,6 +721,11 @@ export class GeminiSdkProvider implements TransportProvider {
     const resolved = resolveExecutableForSpawn(binaryPath);
     const args = [...resolved.prependArgs, '--acp'];
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
       windowsHide: true,
@@ -1372,13 +1377,15 @@ export class GeminiSdkProvider implements TransportProvider {
 
   // ── Helpers ─────────────────────────────────────────────────────────────
 
-  private teardownChild(): void {
+  // Async on purpose: teardown must be awaitable, or shutdown resolves while
+  // the SIGTERM->SIGKILL window is still open and the SIGKILL never lands.
+  private async teardownChild(): Promise<void> {
     // Closing the ACP connection is implicit when we close stdin. The SDK's
     // internal readers finish when stdout ends. tree-kill the CLI so its
     // node wrapper doesn't leave grandchildren behind.
     if (this.child && !this.child.killed) {
       try { this.child.stdin.end(); } catch { /* noop */ }
-      void killProcessTree(this.child);
+      await killProcessTree(this.child, { ownsProcessGroup: true });
     }
     this.child = null;
     this.connection = null;

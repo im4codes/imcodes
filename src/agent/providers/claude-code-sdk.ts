@@ -2,6 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { constants as fsConstants, statSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { query, type PermissionMode, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -166,6 +172,10 @@ interface ClaudeSdkSessionState {
   currentText: string;
   currentQuery: ReturnType<typeof query> | null;
   currentChild: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `currentChild`, released when it exits or is reaped. */
+  agentResource?: AgentProcessResource;
   completed: boolean;
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
@@ -471,6 +481,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, ClaudeSdkSessionState>();
+
+  /**
+   * Teardowns started from synchronous helpers.
+   *
+   * Three call sites are sync by contract — one returns a boolean used in
+   * conditions, one arms a timer — so they cannot await the escalation. They
+   * must not DISCARD it either: a dropped promise is how a SIGTERM lands with
+   * its SIGKILL never following. They are tracked here and drained by
+   * `disconnect()`, which is what daemon shutdown awaits.
+   */
+  private pendingTeardowns = new Set<Promise<void>>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -534,7 +555,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.clearResultCompletionFallback(state);
       this.clearTaskNotificationWake(state);
       try { state.currentQuery?.close(); } catch {}
-      this.terminateChild(state);
+      await this.terminateChild(state);
+    }
+    // Anything a synchronous helper started must finish its escalation before
+    // shutdown reports this phase complete.
+    if (this.pendingTeardowns.size > 0) {
+      await Promise.allSettled([...this.pendingTeardowns]);
     }
     this.sessions.clear();
     this.config = null;
@@ -564,6 +590,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       currentText: existing?.currentText ?? '',
       currentQuery: null,
       currentChild: null,
+      resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       completed: false,
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
@@ -686,7 +713,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.clearResultCompletionFallback(state);
       this.clearTaskNotificationWake(state);
       try { state.currentQuery?.close(); } catch {}
-      this.terminateChild(state);
+      await this.terminateChild(state);
       this.sessions.delete(sessionId);
     }
   }
@@ -861,7 +888,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     try {
       state.currentQuery.close();
     } catch {}
-    this.terminateChild(state);
+    await this.terminateChild(state);
   }
 
   private async startQuery(
@@ -934,6 +961,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     };
     options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
       const child = spawn(req.command, req.args, {
+        // Own process group and session on POSIX. A reparented descendant keeps
+        // its PGID but loses its PPID, so after the agent parent dies this is the
+        // only ownership token teardown still has. Without it the eight vitest
+        // workers of the incident were unreachable on PPID=1.
+        detached: process.platform !== 'win32',
         cwd: req.cwd,
         env: req.env,
         signal: req.signal,
@@ -941,6 +973,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         windowsHide: true,
       });
       state.currentChild = child;
+      // Crash coverage: if the daemon dies without running teardown, the
+      // startup sweep reaps this group using the registry's process-start
+      // fingerprint. Registration is async and this callback must return the
+      // ChildProcess synchronously, so the lease object retains the pending
+      // registration and `release()` awaits it.
+      state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
       child.once('exit', () => {
         if (state.currentChild === child) state.currentChild = null;
       });
@@ -1187,7 +1225,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const authRefreshRetries = state.currentAuthRefreshRetriesRemaining ?? CLAUDE_AUTH_REFRESH_RETRY_LIMIT;
     const previousResumeId = state.resumeId;
     try { state.currentQuery?.close(); } catch {}
-    this.terminateChild(state);
+    // Sync caller: retained rather than awaited, and drained by disconnect().
+    this.trackTeardown(this.terminateChild(state));
     state.currentQuery = null;
     state.currentChild = null;
     state.pendingComplete = undefined;
@@ -1861,7 +1900,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return;
       }
       try { q.close(); } catch {}
-      this.terminateChild(state);
+      // Sync caller: retained rather than awaited, and drained by disconnect().
+      this.trackTeardown(this.terminateChild(state));
       state.currentQuery = null;
       state.currentChild = null;
       for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
@@ -2505,7 +2545,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const q = state.currentQuery;
     state.currentQuery = null;
     try { q.close(); } catch {}
-    this.terminateChild(state);
+    // Sync caller: retained rather than awaited, and drained by disconnect().
+    this.trackTeardown(this.terminateChild(state));
     state.currentChild = null;
     logger.info({
       provider: this.id,
@@ -3025,22 +3066,35 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     } catch {}
     try { q.close(); } catch {}
     if (child && !child.killed) {
-      void killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS });
+      await killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS, ownsProcessGroup: true });
     }
     if (state.currentChild === child) state.currentChild = null;
+    // The group is gone, so the lease must go too — otherwise a later startup
+    // sweep would hold a record for a pid that is no longer ours.
+    const lease = state.agentResource;
+    state.agentResource = undefined;
+    await lease?.release();
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, ...(details !== undefined ? { details } : {}) };
   }
 
-  private terminateChild(state: ClaudeSdkSessionState): void {
+  /** Retain a teardown a synchronous caller cannot await, so shutdown can. */
+  private trackTeardown(teardown: Promise<void>): void {
+    this.pendingTeardowns.add(teardown);
+    void teardown.catch(() => {}).finally(() => { this.pendingTeardowns.delete(teardown); });
+  }
+
+  // Async on purpose: teardown must be awaitable, or shutdown resolves while
+  // the SIGTERM->SIGKILL window is still open and the SIGKILL never lands.
+  private async terminateChild(state: ClaudeSdkSessionState): Promise<void> {
     const child = state.currentChild;
     if (!child || child.killed) return;
     // Tree-kill instead of single SIGTERM: the claude-code wrapper may spawn
     // native descendants that survive a wrapper-only kill. killProcessTree
     // walks the descendant tree via `ps` and SIGKILLs stragglers after
     // FORCE_KILL_TIMEOUT_MS. Fire-and-forget so callers stay synchronous.
-    void killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS });
+    await killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS, ownsProcessGroup: true });
   }
 }

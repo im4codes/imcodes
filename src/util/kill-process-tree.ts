@@ -88,6 +88,16 @@ export async function collectDescendantPids(rootPid: number): Promise<number[]> 
 export interface KillProcessTreeOptions {
   /** Time between SIGTERM sweep and the SIGKILL fallback, in ms. Default 1000. */
   gracefulMs?: number;
+  /**
+   * The target leads its own POSIX process group and session, because whoever
+   * spawned it passed `detached: true`.
+   *
+   * This is asserted by the creator of the group and is NEVER inferred. It is
+   * what lets teardown reach a descendant whose parent already died: a
+   * reparented process loses its PPID (it becomes 1) but keeps its PGID, and
+   * the parentage walk below can only see PPID.
+   */
+  ownsProcessGroup?: boolean;
 }
 
 function pidAlive(pid: number): boolean {
@@ -96,6 +106,39 @@ function pidAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * How many live processes are in process group `pgid`.
+ *
+ * Only `pgid` is read, because that is the one field every POSIX `ps` agrees
+ * on. An earlier version of this also required `sid === pgid` as a second
+ * factor; macOS `ps` has no `sid` keyword at all and reports `sess` as 0 for
+ * every process, so that check could never succeed there and would have
+ * silently disabled group reaping on the platform the daemon itself runs on.
+ */
+async function groupMemberCount(pgid: number): Promise<number> {
+  if (process.platform === 'win32') return 0;
+  try {
+    const { stdout } = await execFileP('ps', ['-A', '-o', 'pid,pgid'], { timeout: 5_000 });
+    let members = 0;
+    for (const line of stdout.split('\n').slice(1)) {
+      const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+      if (!match) continue;
+      if (Number(match[2]) === pgid) members += 1;
+    }
+    return members;
+  } catch {
+    return 0;
+  }
+}
+
+function signalGroup(pgid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pgid, signal);
+  } catch {
+    /* group already empty */
   }
 }
 
@@ -170,8 +213,61 @@ export async function killProcessTree(
     return;
   }
 
+  // A group signal is the only thing that reaches a descendant whose parent
+  // already exited: the parentage walk below reads PPID, and reparenting is
+  // exactly the event that destroys PPID. Signal the group FIRST, so the whole
+  // group is already terminating before any parent gets the chance to exit and
+  // scatter its children to init.
+  //
+  // Once the leader is gone its pid could in principle have been recycled, so
+  // the group is only signalled while it still holds a member reporting
+  // `pgid === sid === rootPid`. While the leader is alive its pid cannot be
+  // recycled at all — Node holds the child until it reaps it — so that case
+  // needs no proof.
+  // Honoured only when we hold the ChildProcess handle. A bare pid carries no
+  // proof of anything: the caller cannot know the slot was not recycled, and
+  // group-signalling a stranger is exactly the failure mode this must not
+  // introduce. With the handle, Node owns the wait, so an unreaped child's pid
+  // is provably still ours.
+  // SNAPSHOT BEFORE ANY SIGNAL.
+  //
+  // This ordering is load-bearing and was wrong in an earlier revision. A
+  // descendant that created its OWN session or process group is not a member
+  // of our group, so the group signal never reaches it. And the moment the
+  // wrapper exits it reparents to init, which erases the PPID link `ps` walks.
+  // Signalling first therefore destroyed the only identity that could still
+  // find such a grandchild — the very case this module's header warns about,
+  // where an SDK wrapper detaches its own native child.
+  //
+  // The instant before the first signal is the one moment both identities
+  // coexist, so the snapshot is taken there. The group sweep is retained
+  // afterwards because it still covers same-group descendants, including any
+  // forked after this snapshot.
   const descendants = await collectDescendantPids(rootPid);
-  const orderedDescendants = [...descendants.reverse()];
+  const orderedDescendants = [...descendants].reverse();
+
+  const ownsGroup = opts?.ownsProcessGroup === true && child != null;
+  let groupProven = false;
+  if (ownsGroup) {
+    const leaderAlive = child
+      ? (child.exitCode == null && child.signalCode == null)
+      : pidAlive(rootPid);
+    if (leaderAlive) {
+      // Node has not reaped the child, so the kernel cannot hand its pid to
+      // anyone else. The group id is provably still ours.
+      groupProven = true;
+    } else if (!pidAlive(rootPid)) {
+      // The leader is gone AND its pid slot is free. A process group can only
+      // carry id G if the process whose pid is G once led it, and joining an
+      // existing group requires being in that group's session. With no live
+      // process holding pid rootPid, nothing unrelated can be leading group
+      // rootPid, so whatever remains in it descends from our leader.
+      groupProven = (await groupMemberCount(rootPid)) > 0;
+    }
+    // Remaining case: the pid was recycled by a live unrelated process. Refuse
+    // the group signal outright rather than guess.
+    if (groupProven) signalGroup(rootPid, 'SIGTERM');
+  }
 
   // SIGTERM leaves first so parents don't immediately fork replacements.
   for (const pid of orderedDescendants) {
@@ -186,12 +282,21 @@ export async function killProcessTree(
     try { process.kill(rootPid, 'SIGTERM'); } catch { /* already gone */ }
   }
 
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, gracefulMs);
-    timer.unref?.();
-  });
+  // Deliberately NOT unref'd, so the escalation window holds the runtime open
+  // until the SIGKILL sweep below has run.
+  //
+  // Honest scope: this is hardening, not a demonstrated fix. Mutation testing
+  // in an isolated subprocess and on Linux 211 both showed the escalation still
+  // completing with the timer unref'd, because the `ps` children spawned above
+  // keep the loop alive across the window. A bare multi-case script was once
+  // observed exiting with node code 13 on an unsettled await here, so the
+  // failure mode is real but shape-dependent and was not reproduced.
+  await new Promise<void>((resolve) => { setTimeout(resolve, gracefulMs); });
 
-  // SIGKILL sweep.
+  // SIGKILL sweep. The group goes first for the same reason as above, and it
+  // also covers anything forked AFTER the snapshot was taken, which the
+  // descendant list structurally cannot.
+  if (groupProven) signalGroup(rootPid, 'SIGKILL');
   for (const pid of orderedDescendants) {
     if (!pidAlive(pid)) continue;
     try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }

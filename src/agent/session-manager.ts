@@ -2759,9 +2759,24 @@ export async function restoreTransportSessions(
         await runtime.kill({ detachProviderSession: true }).catch(() => {});
         return;
       }
+      // The persisted identity is the startup sweep's ownership authority.
+      // Omitting it makes `agentResourceOwner()` return null, so a restored
+      // per-session provider registers no AGENT lease — and after a daemon
+      // crash the original orphan leak comes straight back. The fresh-launch
+      // path already passes all three fields; restore silently passed one.
+      //
+      // Read the LIVE record rather than the captured `s`: the authority check
+      // immediately above has just confirmed the live record still matches the
+      // expected restore authority, so this is the identity that will own the
+      // process we are about to start.
+      const restoreIdentity = getSession(s.name) ?? s;
+      const restoredSessionInstanceId = restoreIdentity.sessionInstanceId?.trim();
+      const restoredRuntimeEpoch = restoreIdentity.runtimeEpoch?.trim();
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         sessionName: s.name,
+        ...(restoredSessionInstanceId ? { sessionInstanceId: restoredSessionInstanceId } : {}),
+        ...(restoredRuntimeEpoch ? { runtimeEpoch: restoredRuntimeEpoch } : {}),
         projectName: s.projectName,
         serverId: boundServerId,
         providerId: provider.id,

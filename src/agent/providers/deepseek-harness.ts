@@ -18,6 +18,12 @@
  * instead of a process start.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type {
@@ -108,6 +114,10 @@ interface DeepseekHarnessSessionState {
   /** Durable harness session id, used to resume after a restart. */
   harnessSessionId?: string;
   child: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `child`; released when the child exits or is reaped. */
+  agentResource?: AgentProcessResource;
   reader: ReadlineInterface | null;
   /** Resolves when the bridge has published its ready frame. */
   readyPromise: Promise<void> | null;
@@ -164,6 +174,14 @@ export class DeepseekHarnessProvider implements TransportProvider {
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, DeepseekHarnessSessionState>();
+
+  /**
+   * Teardowns started from `failStartup`, which is synchronous by contract and
+   * therefore cannot await the escalation. Discarding it would let a SIGTERM
+   * land with its SIGKILL never following, so it is retained here and drained
+   * by `disconnect()` — the call daemon shutdown awaits.
+   */
+  private pendingTeardowns = new Set<Promise<void>>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -186,6 +204,9 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // Independent waits: serial teardown would multiply the per-child grace
     // period by the number of live sessions on every daemon shutdown.
     await Promise.all([...this.sessions.keys()].map((sessionId) => this.endSession(sessionId)));
+    if (this.pendingTeardowns.size > 0) {
+      await Promise.allSettled([...this.pendingTeardowns]);
+    }
     this.config = null;
     logger.info({ provider: this.id }, 'DeepSeek Harness provider disconnected');
   }
@@ -206,6 +227,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     this.sessions.set(routeId, {
       routeId,
       sessionName: config.sessionName ?? existing?.sessionName,
+      resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       projectName: config.projectName ?? existing?.projectName,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
@@ -436,6 +458,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // provider does.
     const executable = resolveExecutableForSpawn(resolveDshBinary());
     const child = spawn(executable.executable, [...executable.prependArgs, ...buildDshArgs(overlayPath)], {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       cwd: state.cwd,
       env: {
         ...process.env,
@@ -454,6 +481,9 @@ export class DeepseekHarnessProvider implements TransportProvider {
       windowsHide: true,
     });
     state.child = child;
+    // Crash coverage: if the daemon dies without running teardown, the startup
+    // sweep reaps this group using the registry's process-start fingerprint.
+    state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
     state.readySettled = false;
     let readyTimer: ReturnType<typeof setTimeout> | null = null;
     const readyPromise = new Promise<void>((resolve, reject) => {
@@ -543,7 +573,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.resolveReady = null;
     if (state.child === child) this.detachChild(state);
     state.turnActive = false;
-    void killProcessTree(child).catch(() => {});
+    // Retained, not discarded: disconnect() drains this before shutdown
+    // reports the phase complete.
+    const reaped = killProcessTree(child, { ownsProcessGroup: true }).catch(() => {});
+    this.pendingTeardowns.add(reaped);
+    void reaped.finally(() => { this.pendingTeardowns.delete(reaped); });
     if (reject) {
       reject(new Error(message));
       return;
@@ -586,7 +620,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // killProcessTree owns the graceful-then-SIGKILL escalation and no-ops when
     // the child already exited; the harness spawns its own tool subprocesses,
     // which a bare kill would orphan (Windows has no process group to signal).
-    await killProcessTree(child, { gracefulMs: SHUTDOWN_GRACE_MS }).catch(() => {});
+    await killProcessTree(child, { gracefulMs: SHUTDOWN_GRACE_MS, ownsProcessGroup: true }).catch(() => {});
   }
 
   private write(state: DeepseekHarnessSessionState, command: DshBridgeCommand): boolean {

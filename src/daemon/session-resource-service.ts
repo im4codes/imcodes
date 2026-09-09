@@ -86,6 +86,33 @@ export async function registerMcpProcessResource(
   return resourceId;
 }
 
+/**
+ * Register a session-owned agent CLI that leads its own process group.
+ *
+ * `killTree: true` makes the registry signal the GROUP (negative pid), and
+ * `register()` stamps the process start time so the startup sweep can prove
+ * the pid is still the same process before signalling anything. That is the
+ * authority: an identity fingerprint, never command text.
+ *
+ * Only per-session children belong here. Providers that share one process
+ * across every session (gemini-sdk, codex-sdk, kimi-sdk) must NOT be
+ * registered under a single session's owner, or one session's teardown would
+ * reap another session's live agent.
+ */
+export async function registerAgentProcessResource(
+  owner: SessionResourceOwner,
+  pid: number,
+): Promise<string> {
+  const resourceId = `agent:${owner.runtimeEpoch}:${pid}`;
+  await registry.register({
+    resourceId,
+    kind: SESSION_RESOURCE_KIND.AGENT,
+    owner,
+    handle: { type: SESSION_RESOURCE_HANDLE_TYPE.PID, pid, killTree: true },
+  });
+  return resourceId;
+}
+
 export async function sweepComputerUseOrphanedResources(): Promise<ReleaseSummary> {
   return registry.releaseResourceIdPrefixes(
     ['browser:', 'computer-use-mcp:'],
@@ -147,6 +174,7 @@ export async function releaseSessionChildResources(record: SessionRecord): Promi
     SESSION_RESOURCE_KIND.MCP,
     SESSION_RESOURCE_KIND.BROWSER,
     SESSION_RESOURCE_KIND.CONTAINER,
+    SESSION_RESOURCE_KIND.AGENT,
   ], SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED);
 }
 

@@ -3016,7 +3016,7 @@ export class CodexSdkProvider implements TransportProvider {
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead.
     if (child && !child.killed) {
-      void killProcessTree(child);
+      await killProcessTree(child, { ownsProcessGroup: true });
     }
     this.threadToSession.clear();
     this.rawSpawnAgentCalls.clear();
@@ -3143,6 +3143,11 @@ export class CodexSdkProvider implements TransportProvider {
     const spawnEnv = this.buildSpawnEnv(config);
     const authFingerprint = await readCodexAuthFingerprint(spawnEnv);
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: spawnEnv,
       windowsHide: true,
