@@ -1,4 +1,4 @@
-import { IMCODES_MEMORY_MCP_ARGS, IMCODES_MEMORY_MCP_COMMAND } from './getDefaultMcpServers.js';
+import { IMCODES_MEMORY_MCP_LAUNCH_ARGS, IMCODES_MEMORY_MCP_LAUNCH_COMMAND } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { IMCODES_MCP_TOOL_CATALOG_MODE_ENV } from '../../../shared/memory-mcp-env.js';
 import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
@@ -15,9 +15,9 @@ export function getDefaultCodexMcpArgs(): string[] {
   const prefix = `mcp_servers.${IMCODES_MEMORY_MCP_SERVER_NAME}`;
   return [
     '-c',
-    `${prefix}.command=${tomlString(IMCODES_MEMORY_MCP_COMMAND)}`,
+    `${prefix}.command=${tomlString(IMCODES_MEMORY_MCP_LAUNCH_COMMAND)}`,
     '-c',
-    `${prefix}.args=${tomlStringArray(IMCODES_MEMORY_MCP_ARGS)}`,
+    `${prefix}.args=${tomlStringArray(IMCODES_MEMORY_MCP_LAUNCH_ARGS)}`,
     '-c',
     `${prefix}.env.${IMCODES_MCP_TOOL_CATALOG_MODE_ENV}=${tomlString(MCP_TOOL_CATALOG_MODES.STATIC_FULL)}`,
   ];

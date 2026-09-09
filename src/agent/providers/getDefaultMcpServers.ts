@@ -1,4 +1,5 @@
 import type { SessionConfig } from '../transport-provider.js';
+import { IMCODES_MCP_PARENT_PID_ENV } from '../../daemon/mcp-stdio-lifecycle.js';
 import { IMCODES_SESSION_ENV } from '../../../shared/imcodes-send.js';
 import {
   buildMemoryMcpServerEnv,
@@ -24,6 +25,65 @@ import {
 
 export const IMCODES_MEMORY_MCP_COMMAND = 'imcodes';
 export const IMCODES_MEMORY_MCP_ARGS = ['memory', 'mcp'] as const;
+
+/**
+ * The shape every real MCP launch actually uses.
+ *
+ * The memory server guards against being orphaned by comparing its parent
+ * against the one it observed at startup. That cannot see a parent which died
+ * before the server's first instruction: the very first `process.ppid` it
+ * reads is already the reparent target, so every later read matches it and the
+ * guard can never fire. Only the spawner can settle that, by declaring who it
+ * is -- so on POSIX the launch is an exec-preserving shell that captures its
+ * own parent (the MCP client) and then BECOMES the server:
+ *
+ *   sh -c 'IMCODES_MCP_PARENT_PID=$PPID exec "$0" "$@"' imcodes memory mcp
+ *
+ * `exec` matters: no shell survives, so stdio, exit status and signal delivery
+ * stay exactly as they were without a wrapper.
+ *
+ * This NARROWS the undeclared window from "the server's own module evaluation"
+ * (Node boot, tens of milliseconds) to "before the wrapper shell starts"
+ * (about a millisecond). It does not CLOSE it, and no userspace wrapper can:
+ * a wrapper stopped before it reads `$PPID` observes the reparent target too.
+ * Closing it needs an OS parent-death primitive -- `prctl(PR_SET_PDEATHSIG)`,
+ * kqueue `NOTE_EXIT`, a Windows Job Object -- none reachable from plain Node.
+ *
+ * Windows keeps the direct launch: it has no `exec`, so any wrapper there
+ * would leave an intermediate process between the client and the server and
+ * break signal/exit-code fidelity. It therefore keeps the module-evaluation
+ * snapshot only, and is not narrowed.
+ */
+export const IMCODES_MEMORY_MCP_LAUNCH_COMMAND = process.platform === 'win32'
+  ? IMCODES_MEMORY_MCP_COMMAND
+  : 'sh';
+
+export const IMCODES_MEMORY_MCP_LAUNCH_ARGS: readonly string[] = process.platform === 'win32'
+  ? [...IMCODES_MEMORY_MCP_ARGS]
+  : [
+    '-c',
+    `${IMCODES_MCP_PARENT_PID_ENV}=$PPID exec "$0" "$@"`,
+    IMCODES_MEMORY_MCP_COMMAND,
+    ...IMCODES_MEMORY_MCP_ARGS,
+  ];
+
+/**
+ * True for an entry this daemon owns, in either the direct or wrapped shape.
+ *
+ * Configs written before the wrapper existed still name the bare command, and
+ * must keep being recognised -- otherwise the writer would stop seeing its own
+ * entry and append a duplicate beside it.
+ */
+export function isImcodesMemoryMcpLaunch(command: unknown, args: unknown): boolean {
+  if (typeof command !== 'string' || !Array.isArray(args)) return false;
+  const matches = (expectedCommand: string, expectedArgs: readonly string[]): boolean => (
+    command === expectedCommand
+    && args.length === expectedArgs.length
+    && args.every((arg, index) => arg === expectedArgs[index])
+  );
+  return matches(IMCODES_MEMORY_MCP_LAUNCH_COMMAND, IMCODES_MEMORY_MCP_LAUNCH_ARGS)
+    || matches(IMCODES_MEMORY_MCP_COMMAND, IMCODES_MEMORY_MCP_ARGS);
+}
 // Was a local copy of the sentinel that shared/memory-namespace.ts already
 // exports. Four such copies existed, which is how the two halves of the
 // register/resolve invariant came to disagree in the first place.
@@ -104,8 +164,8 @@ export function getDefaultMcpServers(
   return {
     [IMCODES_MEMORY_MCP_SERVER_NAME]: {
       type: 'stdio',
-      command: IMCODES_MEMORY_MCP_COMMAND,
-      args: [...IMCODES_MEMORY_MCP_ARGS],
+      command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+      args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
       env: {
         ...buildIdentityEnv(config),
         [IMCODES_MCP_TOOL_CATALOG_MODE_ENV]: toolCatalogMode,

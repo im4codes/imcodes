@@ -26,7 +26,12 @@ import { getDefaultCodexMcpArgs, getCodexAppServerArgs } from '../../../src/agen
 import {
   getDefaultAcpMcpServers,
   getDefaultMcpServers,
+  IMCODES_MEMORY_MCP_ARGS,
+  IMCODES_MEMORY_MCP_COMMAND,
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../../src/agent/providers/getDefaultMcpServers.js';
+import { IMCODES_MCP_PARENT_PID_ENV } from '../../../src/daemon/mcp-stdio-lifecycle.js';
 import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../../shared/session-resource-lifecycle.js';
 
@@ -85,8 +90,8 @@ describe('managed provider MCP registration helpers', () => {
 
     expect(server).toMatchObject({
       type: 'stdio',
-      command: 'imcodes',
-      args: ['memory', 'mcp'],
+      command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+      args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
     });
     expect(server.env[IMCODES_DAEMON_USER_ID_ENV]).toBe('user-secret-ish');
     expect(JSON.parse(server.env[IMCODES_DAEMON_NAMESPACE_ENV])).toEqual({
@@ -159,8 +164,8 @@ describe('managed provider MCP registration helpers', () => {
     const [server] = getDefaultAcpMcpServers(sessionConfig);
 
     expect(server.name).toBe(IMCODES_MEMORY_MCP_SERVER_NAME);
-    expect(server.command).toBe('imcodes');
-    expect(server.args).toEqual(['memory', 'mcp']);
+    expect(server.command).toBe(IMCODES_MEMORY_MCP_LAUNCH_COMMAND);
+    expect(server.args).toEqual([...IMCODES_MEMORY_MCP_LAUNCH_ARGS]);
     expect(server.env).toContainEqual({ name: IMCODES_DAEMON_USER_ID_ENV, value: 'user-secret-ish' });
     expect(server.env).toContainEqual({
       name: IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
@@ -222,5 +227,40 @@ describe('managed provider MCP registration helpers', () => {
   it('pins Gemini model-list probe as MCP-free', async () => {
     const source = await readFile(new URL('../../../src/agent/providers/gemini-sdk.ts', import.meta.url), 'utf8');
     expect(source).toMatch(/listModels[\s\S]*newSession\(\{\s*cwd:[\s\S]*mcpServers:\s*\[\]/);
+  });
+});
+
+describe('production parent-identity injection', () => {
+  it('declares the host parent pid on every real POSIX launch, exec-preserving', () => {
+    // R2 shipped the `expectedParentPid` check with NO producer: the only
+    // setter anywhere in the repository was a test, so the mechanism protected
+    // nothing real. This pins the declaration to the launch shape MCP clients
+    // actually run, rather than to a helper or a test-supplied env.
+    if (process.platform === 'win32') {
+      // Windows has no `exec`: a wrapper would leave an intermediate process
+      // between client and server and break signal/exit-code fidelity, so this
+      // platform keeps the direct launch and is deliberately not narrowed.
+      expect(IMCODES_MEMORY_MCP_LAUNCH_COMMAND).toBe(IMCODES_MEMORY_MCP_COMMAND);
+      expect([...IMCODES_MEMORY_MCP_LAUNCH_ARGS]).toEqual([...IMCODES_MEMORY_MCP_ARGS]);
+      return;
+    }
+    expect(IMCODES_MEMORY_MCP_LAUNCH_COMMAND).toBe('sh');
+    const script = IMCODES_MEMORY_MCP_LAUNCH_ARGS[1] ?? '';
+    expect(script, 'the wrapper must declare its own parent').toContain(`${IMCODES_MCP_PARENT_PID_ENV}=$PPID`);
+    expect(script, 'exec: no shell survives, so stdio/exit/signals are unchanged').toContain('exec "$0" "$@"');
+    expect(
+      [...IMCODES_MEMORY_MCP_LAUNCH_ARGS].slice(2),
+      'the wrapped command is the real server, unchanged',
+    ).toEqual([IMCODES_MEMORY_MCP_COMMAND, ...IMCODES_MEMORY_MCP_ARGS]);
+  });
+
+  it('routes the stdio and Codex consumers through that same shape', () => {
+    // One source of truth. A consumer left on the bare command would spawn a
+    // server with no declared parent and silently lose the protection.
+    const server = getDefaultMcpServers(sessionConfig)[IMCODES_MEMORY_MCP_SERVER_NAME];
+    expect(server.command).toBe(IMCODES_MEMORY_MCP_LAUNCH_COMMAND);
+    expect(server.args).toEqual([...IMCODES_MEMORY_MCP_LAUNCH_ARGS]);
+    const codex = getDefaultCodexMcpArgs(sessionConfig).join(' ');
+    expect(codex).toContain(`command=${JSON.stringify(IMCODES_MEMORY_MCP_LAUNCH_COMMAND)}`);
   });
 });

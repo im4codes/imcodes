@@ -1,5 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { createIdempotentShutdown, installMcpStdioLifecycle,
+  IMCODES_MCP_PARENT_PID_ENV, MCP_PROCESS_START_PARENT_PID } from './mcp-stdio-lifecycle.js';
 import http from 'http';
 import { resolveLiveHookPort } from './hook-port.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
@@ -681,9 +683,47 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
 
 export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): Promise<void> {
   let cleanup: (() => Promise<void>) | null = null;
+  const env = options.env ?? process.env;
+  // The orphan guard, armed BEFORE any awaited startup work.
+  //
+  // A clean EOF already drains this process today, but the leaked children were
+  // the shape where EOF never arrives because another process still holds the
+  // write end of stdin; only parent liveness catches that. Arming it after
+  // `loadStore()`/`registerMcpProcessResource()` left a real hole: an owner that
+  // died during that window reparented this process first, so the snapshot and
+  // every later poll both read the reparent target and the guard could never
+  // fire. The snapshot itself is taken at module evaluation, earlier still --
+  // see MCP_PROCESS_START_PARENT_PID.
+  //
+  // Teardown is indirected because it does not exist yet: whatever cleanup is
+  // registered by the time the guard fires is what runs, and before that a
+  // parent-loss exit has nothing to release beyond the process itself.
+  let activeShutdown: () => Promise<void> = async () => {};
+  const declaredParentPid = Number(env[IMCODES_MCP_PARENT_PID_ENV]);
+  installMcpStdioLifecycle({
+    stdin: process.stdin,
+    shutdown: () => activeShutdown(),
+    exit: (code) => process.exit(code),
+    getParentPid: () => process.ppid,
+    initialParentPid: MCP_PROCESS_START_PARENT_PID,
+    ...(Number.isSafeInteger(declaredParentPid) && declaredParentPid > 0
+      ? { expectedParentPid: declaredParentPid }
+      : {}),
+    // Armed is reported on stderr, never stdout: stdout is the JSON-RPC channel.
+    // This is the line that proves the guard is live before the server answers
+    // anything, which is precisely the window the leak lived in.
+    onArmed: (parentPid) => {
+      process.stderr.write(`[memory-mcp] parent liveness guard armed (parent=${parentPid})\n`);
+    },
+    // Tests need detection within seconds; production does not care whether a
+    // leaked process is reaped in 1s or 30s, so the default stays cheap.
+    ...(Number.isFinite(Number(env.IMCODES_MCP_PARENT_POLL_MS))
+      && Number(env.IMCODES_MCP_PARENT_POLL_MS) > 0
+      ? { parentPollMs: Number(env.IMCODES_MCP_PARENT_POLL_MS) }
+      : {}),
+  });
   try {
     await loadStore();
-    const env = options.env ?? process.env;
     let rssPressureReported = false;
     const guard = createDefaultMemoryMcpResourceGuard(env, ({ cpuRatio, strikes }) => {
       process.stderr.write(`[memory-mcp] sustained single-core CPU: ratio=${cpuRatio.toFixed(2)} strikes=${strikes}; rejecting calls until a healthy CPU window (stdio preserved)\n`);
@@ -711,17 +751,22 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
       previousWall = now;
     }, MEMORY_MCP_WATCHDOG.SAMPLE_INTERVAL_MS);
     cpuTimer.unref?.();
-    const activeCleanup = async () => {
-      clearInterval(cpuTimer);
-      if (owner && resourceId) await releaseSessionResource(resourceId, owner).catch(() => {});
-    };
+    // Idempotent: a signal, an EOF and a parent-loss tick can all land in the
+    // same turn of the loop. Whoever arrives first owns the teardown; everyone
+    // else awaits that same promise instead of racing a second release/close.
+    const { release: activeCleanup, shutdown } = createIdempotentShutdown({
+      release: async () => {
+        clearInterval(cpuTimer);
+        if (owner && resourceId) await releaseSessionResource(resourceId, owner).catch(() => {});
+      },
+      close: () => server.close(),
+    });
     cleanup = activeCleanup;
     process.once('beforeExit', () => { void activeCleanup(); });
     for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-      process.once(signal, () => {
-        void activeCleanup().finally(() => server.close()).finally(() => process.exit(0));
-      });
+      process.once(signal, () => { void shutdown().finally(() => process.exit(0)); });
     }
+    activeShutdown = shutdown;
     await server.connect(new StdioServerTransport());
   } catch (err) {
     await cleanup?.();
