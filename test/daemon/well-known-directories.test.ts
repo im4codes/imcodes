@@ -3,7 +3,9 @@ import {
   clearWellKnownDirectoryCache,
   expandWindowsEnvironmentPath,
   parseWindowsRegistryValue,
+  parseWindowsRegistrySubkeys,
   parseXdgUserDirs,
+  isWindowsServiceProfile,
   resolveWellKnownDirectory,
   wellKnownDirectoryCandidates,
   WELL_KNOWN_DIRECTORY,
@@ -128,6 +130,134 @@ describe('Windows known folders', () => {
   it('expands case-insensitively, as the Windows environment is', () => {
     expect(expandWindowsEnvironmentPath('%userprofile%\\Desktop', { USERPROFILE: 'C:\\Users\\k' }))
       .toBe('C:\\Users\\k\\Desktop');
+  });
+});
+
+describe('running as a Windows service', () => {
+  /**
+   * The reported bug. The controlled node installs itself as a scheduled task
+   * under S-1-5-18, so `os.homedir()` is
+   * `C:\Windows\System32\config\systemprofile` and `HKCU` is the systemprofile
+   * hive -- every single shortcut landed there instead of on the real desktop.
+   *
+   * Fixtures below are verbatim from a real Windows host (172.16.253.201).
+   */
+  const SYSTEM_PROFILE = 'C:\\Windows\\System32\\config\\systemprofile';
+  const USER_SID = 'S-1-5-21-3538260842-503494245-3046904370-1001';
+
+  // Real `reg query HKU`: service SIDs, the user, and their _Classes companion.
+  const REAL_HKU = [
+    '',
+    'HKEY_USERS\\S-1-5-19',
+    'HKEY_USERS\\S-1-5-20',
+    `HKEY_USERS\\${USER_SID}`,
+    `HKEY_USERS\\${USER_SID}_Classes`,
+    'HKEY_USERS\\S-1-5-18',
+    '',
+  ].join('\r\n');
+
+  const serviceDeps = (over: Partial<Parameters<typeof resolveWellKnownDirectory>[1]> = {}) => ({
+    platform: 'win32' as const,
+    homedir: () => SYSTEM_PROFILE,
+    env: { USERPROFILE: SYSTEM_PROFILE },
+    listWindowsRegistrySubkeys: async () => parseWindowsRegistrySubkeys(REAL_HKU),
+    readWindowsRegistryValue: async (key: string) => (
+      key.endsWith(USER_SID) ? 'C:\\Users\\admin' : null
+    ),
+    ...over,
+  });
+
+  it('identifies the service profile it is running under', () => {
+    expect(isWindowsServiceProfile(SYSTEM_PROFILE)).toBe(true);
+    expect(isWindowsServiceProfile(`${SYSTEM_PROFILE}\\`)).toBe(true);
+    expect(isWindowsServiceProfile('C:\\Windows\\ServiceProfiles\\LocalService')).toBe(true);
+    expect(isWindowsServiceProfile('C:\\Windows\\ServiceProfiles\\NetworkService')).toBe(true);
+    expect(isWindowsServiceProfile('C:\\Users\\admin'), 'a real person').toBe(false);
+    // Must not be fooled by a user who merely has such a folder name.
+    expect(isWindowsServiceProfile('C:\\Users\\systemprofile-backup')).toBe(false);
+  });
+
+  it('picks the one signed-in human out of a real HKU listing', () => {
+    const names = parseWindowsRegistrySubkeys(REAL_HKU);
+    expect(names).toContain(USER_SID);
+    expect(names, 'the _Classes companion is listed too').toContain(`${USER_SID}_Classes`);
+  });
+
+  it('reads Downloads from the interactive user hive, not HKCU', async () => {
+    let hiveAsked = '';
+    const resolved = await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DOWNLOADS, serviceDeps({
+      readWindowsShellFolder: async (_valueName: string, hiveRoot: string) => {
+        hiveAsked = hiveRoot;
+        return hiveRoot === `HKU\\${USER_SID}` ? 'C:\\Users\\admin\\Downloads' : SYSTEM_PROFILE;
+      },
+      directoryExists: exists('C:\\Users\\admin\\Downloads', 'C:\\Users\\admin'),
+    }));
+    expect(hiveAsked, 'HKCU is the systemprofile hive here').toBe(`HKU\\${USER_SID}`);
+    expect(resolved).toBe('C:\\Users\\admin\\Downloads');
+  });
+
+  it('expands %USERPROFILE% to the human, not to systemprofile', async () => {
+    // `User Shell Folders` stores the unexpanded form. Expanding it against
+    // OUR environment puts it straight back under the service profile -- the
+    // exact shape of the reported bug.
+    // The target is OneDrive-redirected so it differs from the plain
+    // `$HOME\Desktop` join, and that join deliberately does not exist. Without
+    // this the English-join fallback would rescue a wrong expansion and the
+    // test would pass for the wrong reason.
+    const resolved = await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DESKTOP, serviceDeps({
+      readWindowsShellFolder: async () => '%USERPROFILE%\\OneDrive\\Desktop',
+      directoryExists: exists('C:\\Users\\admin\\OneDrive\\Desktop', 'C:\\Users\\admin'),
+    }));
+    expect(resolved).toBe('C:\\Users\\admin\\OneDrive\\Desktop');
+    expect(resolved).not.toContain('systemprofile');
+  });
+
+  it('falls back to the human home, not the service profile, when nothing exists', async () => {
+    // The whole point of the fix: even total failure must not put the user
+    // back in C:\Windows\System32\config\systemprofile.
+    const resolved = await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DOCUMENTS, serviceDeps({
+      readWindowsShellFolder: async () => null,
+      directoryExists: async () => false,
+    }));
+    expect(resolved).toBe('C:\\Users\\admin');
+    expect(resolved).not.toContain('systemprofile');
+  });
+
+  it('returns the human home for HOME, never the service profile', async () => {
+    const resolved = await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.HOME, serviceDeps());
+    expect(resolved).toBe('C:\\Users\\admin');
+  });
+
+  it('refuses to guess when two people are signed in', async () => {
+    const second = 'S-1-5-21-3538260842-503494245-3046904370-1002';
+    const resolved = await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.HOME, serviceDeps({
+      listWindowsRegistrySubkeys: async () => [USER_SID, second],
+    }));
+    // Silently picking one would put ANOTHER user's Desktop behind the button.
+    expect(resolved).toBe(SYSTEM_PROFILE);
+  });
+
+  it('falls back when ProfileList has no path for the SID', async () => {
+    const resolved = await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.HOME, serviceDeps({
+      readWindowsRegistryValue: async () => null,
+    }));
+    expect(resolved).toBe(SYSTEM_PROFILE);
+  });
+
+  it('leaves an ordinary interactive Windows session alone', async () => {
+    // A daemon a person started themselves must keep using HKCU.
+    let hiveAsked = '';
+    await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DESKTOP, {
+      platform: 'win32',
+      homedir: () => 'C:\\Users\\k',
+      env: { USERPROFILE: 'C:\\Users\\k' },
+      listWindowsRegistrySubkeys: async () => { throw new Error('must not probe HKU'); },
+      readWindowsShellFolder: async (_v: string, hiveRoot: string) => {
+        hiveAsked = hiveRoot; return 'C:\\Users\\k\\Desktop';
+      },
+      directoryExists: exists('C:\\Users\\k\\Desktop'),
+    });
+    expect(hiveAsked).toBe('HKCU');
   });
 });
 

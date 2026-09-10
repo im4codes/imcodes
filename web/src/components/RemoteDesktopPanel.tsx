@@ -18,6 +18,10 @@ import {
   isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
+import {
+  isPointOverRemoteDesktopOverlay,
+  REMOTE_DESKTOP_OVERLAY_CLASS,
+} from '../remote-desktop-pointer-overlay.js';
 import { downloadAttachment } from '../api.js';
 import { createMachineFileHandle, type MachineListItem } from '../api/machines.js';
 import { MachineDirectoryWsAdapter } from '../machine-directory-ws-adapter.js';
@@ -1339,6 +1343,21 @@ export function RemoteDesktopPanel({
       pointerMovesOutsideRef.current += 1;
       return;
     }
+    // The file window floats ON TOP of the desktop, so being inside the stage
+    // rect no longer means the pointer is on the desktop. Dragging or resizing
+    // that window was also driving the remote cursor, which is what made the
+    // remote screen flicker and the drag feel like it kept breaking.
+    //
+    // Hit-testing rather than `event.target` on purpose: pointer capture
+    // retargets events to the dragged window even when the pointer is over the
+    // desktop, which is why target ownership was rejected here originally.
+    // `elementFromPoint` is pure geometry, so it answers the occlusion
+    // question without inheriting that problem.
+    if (filePanelOpen && !fileDrawerMinimized
+      && isPointOverRemoteDesktopOverlay(clientX, clientY)) {
+      pointerMovesOutsideRef.current += 1;
+      return;
+    }
     pointerMovesSeenRef.current += 1;
     const normalized = normalizedClientPoint(clientX, clientY);
     const point = normalized && stickRemoteDesktopPointerToEdges(
@@ -1350,7 +1369,10 @@ export function RemoteDesktopPanel({
       return;
     }
     clientRef.current?.pointerMove(point.x, point.y);
-  }, [normalizedClientPoint]);
+    // The window-open flags are read above, so they must be dependencies:
+    // without them the effect below keeps the FIRST closure and the guard
+    // would still see the window as closed after it is opened.
+  }, [normalizedClientPoint, filePanelOpen, fileDrawerMinimized]);
 
   useEffect(() => {
     const onWindowMouseMove = (event: globalThis.MouseEvent) => {
@@ -2487,7 +2509,7 @@ export function RemoteDesktopPanel({
             defaultH={720}
             minW={720}
             minH={420}
-            className="remote-desktop-file-window"
+            className={REMOTE_DESKTOP_OVERLAY_CLASS}
             hideTitleBar
             dragHandleSelector=".remote-desktop-file-drawer-head"
           >

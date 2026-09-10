@@ -12,6 +12,10 @@ import {
   FILE_TRANSFER_DIRECTORY_PATH,
   isFileTransferWellKnownDirectoryPath,
 } from '../../shared/transport/file-transfer.js';
+import {
+  isPointOverRemoteDesktopOverlay,
+  REMOTE_DESKTOP_OVERLAY_CLASS,
+} from '../src/remote-desktop-pointer-overlay.js';
 
 const read = (relative: string) => readFileSync(
   fileURLToPath(new URL(relative, import.meta.url)),
@@ -75,7 +79,7 @@ describe('the file drawer scrolls instead of clipping', () => {
 
 describe('the file drawer is its own window', () => {
   it('reuses FloatingPanel rather than hand-rolling drag and resize', () => {
-    expect(remoteDesktop).toMatch(/className="remote-desktop-file-window"/);
+    expect(remoteDesktop).toContain('className={REMOTE_DESKTOP_OVERLAY_CLASS}');
     expect(remoteDesktop).toMatch(/dragHandleSelector=("|\{')\.remote-desktop-file-drawer-head/);
   });
 
@@ -94,7 +98,7 @@ describe('the file drawer is its own window', () => {
     // subtree is rendered, so a portal to <body> would make the window vanish
     // exactly when the user most wants it.
     expect(styles).toContain('.remote-desktop-panel:fullscreen');
-    const drawerAt = remoteDesktop.indexOf('remote-desktop-file-window');
+    const drawerAt = remoteDesktop.indexOf('className={REMOTE_DESKTOP_OVERLAY_CLASS}');
     const bodyReturn = remoteDesktop.indexOf('if (embedded) return panelBody;');
     expect(drawerAt).toBeGreaterThan(-1);
     expect(drawerAt, 'the window must be rendered within panelBody').toBeLessThan(bodyReturn);
@@ -166,6 +170,56 @@ describe('a sentinel is never accepted as a send destination', () => {
     // Real paths must obviously not be swallowed by it.
     expect(isFileTransferWellKnownDirectoryPath('C:\\Users\\k\\Downloads')).toBe(false);
     expect(isFileTransferWellKnownDirectoryPath('/home/ai/Downloads')).toBe(false);
+  });
+});
+
+describe('the file window does not leak pointer input into the desktop', () => {
+  /**
+   * Reported: dragging or resizing the file window made the remote screen
+   * flicker and the drag "kept breaking". The desktop forwards pointer moves
+   * from a WINDOW-level capture listener, deciding purely by coordinates --
+   * see the comment at that listener, which deliberately ignores
+   * `event.target` because pointer capture retargets it. Once the file window
+   * became draggable, every drag was also driving the remote cursor.
+   */
+  it('treats a point over the file window as not on the desktop', () => {
+    const overlay = { closest: (sel: string) => (sel === `.${REMOTE_DESKTOP_OVERLAY_CLASS}` ? {} : null) };
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => overlay as unknown as Element)).toBe(true);
+  });
+
+  it('lets a point on the bare desktop through', () => {
+    const stage = { closest: () => null };
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => stage as unknown as Element)).toBe(false);
+    expect(isPointOverRemoteDesktopOverlay(10, 10, () => null)).toBe(false);
+  });
+
+  it('guards the forwarder before it reaches the remote client', () => {
+    const forwarder = remoteDesktop.slice(
+      remoteDesktop.indexOf('const sendDesktopPointerMove'),
+      remoteDesktop.indexOf('const onStagePointerMove'),
+    );
+    expect(forwarder).toContain('isPointOverRemoteDesktopOverlay(clientX, clientY)');
+    // The guard must precede the actual send, not merely exist.
+    expect(forwarder.indexOf('isPointOverRemoteDesktopOverlay'))
+      .toBeLessThan(forwarder.indexOf('clientRef.current?.pointerMove'));
+  });
+
+  it('re-reads the window-open flags instead of capturing them once', () => {
+    // A stale closure here would leave the guard permanently disabled, and
+    // every test above would still pass.
+    const forwarder = remoteDesktop.slice(
+      remoteDesktop.indexOf('const sendDesktopPointerMove'),
+      remoteDesktop.indexOf('const onStagePointerMove'),
+    );
+    expect(forwarder).toMatch(/\}, \[normalizedClientPoint, filePanelOpen, fileDrawerMinimized\]\)/);
+  });
+
+  it('derives the overlay selector from one constant', () => {
+    // The class is both applied to the window and matched by the hit test; two
+    // literals would drift apart silently.
+    expect(remoteDesktop).toContain('className={REMOTE_DESKTOP_OVERLAY_CLASS}');
+    expect(remoteDesktop).not.toContain('className="remote-desktop-file-window"');
+    expect(styles).toContain('.remote-desktop-file-window');
   });
 });
 

@@ -66,11 +66,38 @@ const WINDOWS_SHELL_FOLDER_VALUES: Record<Exclude<WellKnownDirectoryKind, 'home'
  * `Shell Folders` holds already-expanded paths and is what Explorer reads;
  * `User Shell Folders` is the authoring copy and holds `%USERPROFILE%\...`.
  * Prefer the expanded one, fall back to expanding the other.
+ *
+ * The hive is a PARAMETER because `HKCU` is merely whoever this process
+ * happens to be. Installed as a scheduled task under `S-1-5-18` (installer.ts
+ * writes that UserId), the process is LocalSystem, whose `HKCU` is the
+ * systemprofile hive -- which is why every folder resolved to
+ * `C:\Windows\System32\config\systemprofile\...` instead of the real desktop.
  */
-const WINDOWS_SHELL_FOLDER_KEYS = [
-  'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders',
-  'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders',
-] as const;
+function windowsShellFolderKeys(hiveRoot: string): readonly string[] {
+  const base = `${hiveRoot}\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer`;
+  return [`${base}\\Shell Folders`, `${base}\\User Shell Folders`];
+}
+
+const WINDOWS_PROFILE_LIST_KEY =
+  'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList';
+
+/** This process's own profile when it is a service account, not a person. */
+const WINDOWS_SERVICE_PROFILE_RE =
+  /(?:config[\\/]systemprofile|ServiceProfiles[\\/](?:LocalService|NetworkService))[\\/]?$/i;
+
+/**
+ * Real human accounts only. `S-1-5-18/19/20` (System, LocalService,
+ * NetworkService) and `S-1-5-80-*` (service SIDs) deliberately do not match.
+ */
+const WINDOWS_USER_SID_RE = /^S-1-5-21-\d+-\d+-\d+-\d+$/;
+
+/**
+ * Whether this process's profile belongs to a service account, in which case
+ * its folders are not the ones any human is looking at.
+ */
+export function isWindowsServiceProfile(home: string): boolean {
+  return WINDOWS_SERVICE_PROFILE_RE.test(home.replace(/[\\/]+$/, ''));
+}
 
 const XDG_CONFIG_KEYS: Record<Exclude<WellKnownDirectoryKind, 'home'>, string> = {
   [WELL_KNOWN_DIRECTORY.DESKTOP]: 'XDG_DESKTOP_DIR',
@@ -86,8 +113,12 @@ export interface WellKnownDirectoryDeps {
   homedir?: () => string;
   env?: NodeJS.ProcessEnv;
   readFile?: (filePath: string) => Promise<string>;
-  /** Resolves one `Shell Folders` value, or null when it is absent. */
-  readWindowsShellFolder?: (valueName: string) => Promise<string | null>;
+  /** Resolves one `Shell Folders` value under `hiveRoot`, or null if absent. */
+  readWindowsShellFolder?: (valueName: string, hiveRoot: string) => Promise<string | null>;
+  /** Leaf subkey names under a registry key. */
+  listWindowsRegistrySubkeys?: (key: string) => Promise<string[]>;
+  /** One registry value, or null. */
+  readWindowsRegistryValue?: (key: string, valueName: string) => Promise<string | null>;
   /** True when the path exists and is a directory. */
   directoryExists?: (candidate: string) => Promise<boolean>;
 }
@@ -100,24 +131,89 @@ async function defaultDirectoryExists(candidate: string): Promise<boolean> {
   }
 }
 
-async function defaultReadWindowsShellFolder(valueName: string): Promise<string | null> {
-  for (const key of WINDOWS_SHELL_FOLDER_KEYS) {
-    try {
-      // Fixed key and a value name from a closed map above -- never caller
-      // input -- and execFile takes an argv array, so there is no shell to
-      // inject into.
-      const { stdout } = await execFileAsync(
-        'reg',
-        ['query', key, '/v', valueName],
-        { timeout: WINDOWS_REGISTRY_TIMEOUT_MS, windowsHide: true },
-      );
-      const parsed = parseWindowsRegistryValue(stdout, valueName);
-      if (parsed) return parsed;
-    } catch {
-      // Missing value, missing hive, or reg.exe unavailable: try the next key.
-    }
+/**
+ * One registry value, or null.
+ *
+ * Keys and value names come from the closed sets above, or from a SID this
+ * module itself matched against WINDOWS_USER_SID_RE -- never from caller
+ * input -- and execFile takes an argv array, so there is no shell to inject
+ * into.
+ */
+async function readWindowsRegistryValue(key: string, valueName: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'reg',
+      ['query', key, '/v', valueName],
+      { timeout: WINDOWS_REGISTRY_TIMEOUT_MS, windowsHide: true },
+    );
+    return parseWindowsRegistryValue(stdout, valueName);
+  } catch {
+    return null;
+  }
+}
+
+/** Leaf names of the subkeys `reg query <key>` lists. */
+export function parseWindowsRegistrySubkeys(stdout: string): string[] {
+  const names: string[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('HKEY_')) continue;
+    const leaf = trimmed.slice(trimmed.lastIndexOf('\\') + 1);
+    if (leaf) names.push(leaf);
+  }
+  return names;
+}
+
+async function defaultListWindowsRegistrySubkeys(key: string): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync(
+      'reg',
+      ['query', key],
+      { timeout: WINDOWS_REGISTRY_TIMEOUT_MS, windowsHide: true },
+    );
+    return parseWindowsRegistrySubkeys(stdout);
+  } catch {
+    return [];
+  }
+}
+
+async function defaultReadWindowsShellFolder(
+  valueName: string,
+  hiveRoot: string,
+): Promise<string | null> {
+  for (const key of windowsShellFolderKeys(hiveRoot)) {
+    const parsed = await readWindowsRegistryValue(key, valueName);
+    if (parsed) return parsed;
   }
   return null;
+}
+
+/**
+ * The signed-in human whose folders we should be resolving, when we are a
+ * service and therefore are not that human.
+ *
+ * A logged-on user has their hive mounted under `HKEY_USERS\<SID>`, and
+ * `ProfileList` maps that SID to the profile directory. Only one qualifying
+ * hive is accepted: with two people signed in there is no single right answer,
+ * and silently picking one would put another user's Desktop behind a button
+ * labelled "Desktop". `windows-user-session.ts` refuses ambiguity the same way
+ * ("ambiguous active user sessions").
+ */
+export async function resolveWindowsInteractiveUser(
+  deps: WellKnownDirectoryDeps = {},
+): Promise<{ sid: string; home: string } | null> {
+  const listSubkeys = deps.listWindowsRegistrySubkeys ?? defaultListWindowsRegistrySubkeys;
+  const readValue = deps.readWindowsRegistryValue ?? readWindowsRegistryValue;
+
+  const candidates = (await listSubkeys('HKU')).filter((name) => WINDOWS_USER_SID_RE.test(name));
+  // `_Classes` companions are already excluded by the SID pattern.
+  const unique = [...new Set(candidates)];
+  if (unique.length !== 1) return null;
+
+  const sid = unique[0]!;
+  const profile = await readValue(`${WINDOWS_PROFILE_LIST_KEY}\\${sid}`, 'ProfileImagePath');
+  if (!profile) return null;
+  return { sid, home: expandWindowsEnvironmentPath(profile, deps.env ?? process.env) };
 }
 
 /**
@@ -206,32 +302,71 @@ async function resolveLinuxDirectory(
  * Exported so a test can assert the ORDER without spawning `reg.exe` or
  * touching a real home directory.
  */
+/** Whose folders we are resolving, which is not always who we are. */
+interface TargetUser {
+  home: string;
+  /** Registry root holding this user's per-user settings. */
+  windowsHive: string;
+  /** Environment to expand `%VAR%` against; `%USERPROFILE%` must be theirs. */
+  env: NodeJS.ProcessEnv;
+}
+
+/**
+ * Resolve the account whose Desktop/Downloads/Documents the caller means.
+ *
+ * Normally that is this process. But the controlled node installs itself as a
+ * scheduled task running as LocalSystem, and a LaunchDaemon/systemd unit runs
+ * as root -- none of which is the person at the keyboard. On Windows we can
+ * recover the real account; elsewhere we currently cannot, and say so rather
+ * than pretending.
+ */
+async function resolveTargetUser(
+  platform: NodeJS.Platform,
+  ownHome: string,
+  env: NodeJS.ProcessEnv,
+  deps: WellKnownDirectoryDeps,
+): Promise<TargetUser> {
+  const own: TargetUser = { home: ownHome, windowsHive: 'HKCU', env };
+  if (platform !== 'win32' || !isWindowsServiceProfile(ownHome)) return own;
+
+  const interactive = await resolveWindowsInteractiveUser(deps);
+  if (!interactive) return own;
+  return {
+    home: interactive.home,
+    windowsHive: `HKU\\${interactive.sid}`,
+    // `User Shell Folders` stores `%USERPROFILE%\Desktop`; expanding that
+    // against OUR environment would put it straight back under systemprofile.
+    env: { ...env, USERPROFILE: interactive.home },
+  };
+}
+
 export async function wellKnownDirectoryCandidates(
   kind: WellKnownDirectoryKind,
   deps: WellKnownDirectoryDeps = {},
 ): Promise<string[]> {
   const platform = deps.platform ?? process.platform;
-  const homeDir = deps.homedir?.() ?? osHomedir();
-  if (kind === WELL_KNOWN_DIRECTORY.HOME) return [homeDir];
-
+  const ownHome = deps.homedir?.() ?? osHomedir();
   const env = deps.env ?? process.env;
+  const target = await resolveTargetUser(platform, ownHome, env, deps);
+  if (kind === WELL_KNOWN_DIRECTORY.HOME) return [target.home];
+
   const readFile = deps.readFile ?? ((filePath: string) => fsReadFile(filePath, 'utf8'));
   const platformPath = platform === 'win32' ? path.win32 : path.posix;
   const candidates: string[] = [];
 
   if (platform === 'win32') {
     const readShellFolder = deps.readWindowsShellFolder ?? defaultReadWindowsShellFolder;
-    const recorded = await readShellFolder(WINDOWS_SHELL_FOLDER_VALUES[kind]);
-    if (recorded) candidates.push(expandWindowsEnvironmentPath(recorded, env));
+    const recorded = await readShellFolder(WINDOWS_SHELL_FOLDER_VALUES[kind], target.windowsHive);
+    if (recorded) candidates.push(expandWindowsEnvironmentPath(recorded, target.env));
   } else if (platform !== 'darwin') {
-    const configured = await resolveLinuxDirectory(kind, homeDir, env, readFile);
+    const configured = await resolveLinuxDirectory(kind, target.home, target.env, readFile);
     if (configured) candidates.push(configured);
   }
 
   // macOS always lands here, and it is the correct answer there: the on-disk
   // names are English and only the Finder display is localized.
-  candidates.push(platformPath.join(homeDir, ENGLISH_DIRECTORY_NAMES[kind]));
-  candidates.push(homeDir);
+  candidates.push(platformPath.join(target.home, ENGLISH_DIRECTORY_NAMES[kind]));
+  candidates.push(target.home);
   return candidates.filter((candidate, index) => candidates.indexOf(candidate) === index);
 }
 
@@ -254,23 +389,29 @@ export async function resolveWellKnownDirectory(
   kind: WellKnownDirectoryKind,
   deps: WellKnownDirectoryDeps = {},
 ): Promise<string> {
-  const homeDir = deps.homedir?.() ?? osHomedir();
-  if (kind === WELL_KNOWN_DIRECTORY.HOME) return homeDir;
+  const ownHome = deps.homedir?.() ?? osHomedir();
 
-  // Cache per (kind, home) so a test that swaps homedir is not served another
-  // test's answer, and a real user switching accounts cannot be either.
-  const cacheKey = `${deps.platform ?? process.platform}:${homeDir}:${kind}`;
+  // Cache per (kind, own home) so a test that swaps homedir is not served
+  // another test's answer, and a real user switching accounts cannot be
+  // either. Keyed on OUR home rather than the target's, because the target is
+  // what the lookup produces.
+  const cacheKey = `${deps.platform ?? process.platform}:${ownHome}:${kind}`;
   const cached = resolutionCache.get(cacheKey);
   if (cached) return cached;
 
   const directoryExists = deps.directoryExists ?? defaultDirectoryExists;
   const pending = (async () => {
     const candidates = await wellKnownDirectoryCandidates(kind, deps);
+    // HOME yields exactly one candidate and must not be existence-filtered
+    // down to our own profile; an unreachable home is still the right answer.
+    if (kind === WELL_KNOWN_DIRECTORY.HOME) return candidates[0] ?? ownHome;
     for (const candidate of candidates) {
       if (await directoryExists(candidate)) return candidate;
     }
-    return homeDir;
-  })().catch(() => homeDir);
+    // Last resort is the TARGET's home, not ours -- falling back to the
+    // service profile is the bug this whole path exists to avoid.
+    return candidates.at(-1) ?? ownHome;
+  })().catch(() => ownHome);
 
   resolutionCache.set(cacheKey, pending);
   return pending;
