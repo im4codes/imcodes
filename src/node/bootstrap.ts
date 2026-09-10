@@ -19,6 +19,7 @@ import {
   persistInstallIdentity,
   redeemEnrollmentV2,
   type ControlledNodeCredential,
+  type FileIdentity,
   type PendingInstallIdentity,
   type StagedExecutableReceipt,
   type VerifiedEnrollmentSource,
@@ -237,6 +238,92 @@ function assertReceiptMatchesInspection(receipt: StagedExecutableReceipt, inspec
 export async function verifyStagedExecutableReceipt(receipt: StagedExecutableReceipt): Promise<void> {
   const inspected = await inspectVerifiedExecutable(receipt.path);
   assertReceiptMatchesInspection(receipt, inspected);
+}
+
+/**
+ * Re-derive the staged receipt when the installed copy no longer matches it.
+ *
+ * The receipt lives in the journal, but the executable it describes is replaced
+ * by upgrade paths that do not all rewrite the journal. When they drift, the
+ * installed copy fails its own byte-identity check and `isCurrentExecutableStable`
+ * says false -- which the bootstrap reads as "I am an installer". It then stages
+ * nothing (there is no enrollment trailer to stage), "hands off" to a service
+ * that is already this process, and exits 0. The watchdog restarts it a minute
+ * later into the same conclusion. A whole fleet of machines sat in that loop for
+ * days: offline, exit code 0, not one line of log explaining it.
+ *
+ * Receipt drift at the installed path is a stale record, not an identity claim.
+ * The honest discriminator between "installed copy" and "installer" is the
+ * enrollment trailer, and the bootstrap already relies on it everywhere else, so
+ * use it here: a trailer-free image running from stagedExePath IS the installed
+ * copy, whatever the receipt remembers. Heal the receipt from the bytes on disk
+ * and let the node run.
+ *
+ * This grants nothing to an attacker. The receipt is a local integrity note with
+ * no signature behind it, sitting in the same SYSTEM-only directory as the
+ * executable and the journal -- anyone able to swap the exe can rewrite the note
+ * beside it. All it ever actually stopped was the machine's own recovery.
+ */
+async function healStaleStagedReceipt(
+  deps: ControlledNodeBootstrapDeps,
+  journal: InstallJournal,
+): Promise<InstallJournal | null> {
+  if (!journal.stagedExePath || !journal.stagedReceipt) return null;
+  let stagedRealPath: string;
+  let currentRealPath: string;
+  try {
+    stagedRealPath = await realpath(journal.stagedExePath);
+    currentRealPath = await realpath(deps.sourceExecutablePath);
+  } catch {
+    return null;
+  }
+  if (stagedRealPath !== currentRealPath) return null;
+
+  let source: VerifiedEnrollmentSource | null = null;
+  try {
+    source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
+    // A trailer means this really is an installer package; leave it to the
+    // install path, which restages and hands off on purpose.
+    if (await source.readEnrollmentBlobWithRange()) return null;
+  } catch {
+    return null;
+  } finally {
+    if (source) await source.close().catch(() => {});
+  }
+
+  let receipt: StagedExecutableReceipt;
+  try {
+    const inspected = await inspectVerifiedExecutable(deps.sourceExecutablePath);
+    const st = await lstat(deps.sourceExecutablePath);
+    if (st.size !== inspected.size) return null;
+    const identity: FileIdentity = {
+      ...(typeof st.dev === 'number' ? { dev: st.dev } : {}),
+      ...(typeof st.ino === 'number' ? { ino: st.ino } : {}),
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+    };
+    receipt = {
+      path: journal.stagedExePath,
+      size: inspected.size,
+      sha256: inspected.sha256,
+      sourceIdentity: identity,
+      stagedIdentity: identity,
+    };
+  } catch {
+    return null;
+  }
+
+  deps.warn(
+    `staged executable no longer matches its install receipt and carries no enrollment trailer; `
+    + `adopting the installed image at ${journal.stagedExePath} as the stable runtime`,
+  );
+  return deps.writeInstallPhase(deps.journalPath, journal.phase, {
+    now: Math.max(deps.now, journal.updatedAt),
+    previous: journal,
+    stagedExePath: journal.stagedExePath,
+    stagedReceipt: receipt,
+  });
 }
 
 /**
@@ -613,7 +700,14 @@ async function ensureServiceStartRequested(
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
   const existing = await deps.loadCredential();
   let journal = await loadJournalOrThrow(deps);
-  const stableRuntime = await deps.isStableRuntime(journal);
+  let stableRuntime = await deps.isStableRuntime(journal);
+  if (existing && !stableRuntime) {
+    const healed = await healStaleStagedReceipt(deps, journal);
+    if (healed) {
+      journal = healed;
+      stableRuntime = true;
+    }
+  }
 
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
     // A transient maintenance failure on an already healthy stable runtime must

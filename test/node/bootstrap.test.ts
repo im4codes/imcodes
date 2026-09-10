@@ -787,3 +787,163 @@ describe('reinstall from a fresh download (real install journal)', () => {
     });
   });
 });
+
+describe('stale staged receipt on the installed copy (the 财/1472527657 outage)', () => {
+  // Reproduces a real fleet outage. An upgrade replaced
+  // C:\ProgramData\imcodes-node\imcodes-node.exe but never rewrote the
+  // install journal, so stagedReceipt kept describing the previous build.
+  // From then on the installed copy failed its own byte-identity check, decided
+  // it must be an installer, "handed off" to a service that was already itself,
+  // and exited 0 -- every minute, for days, with no log line and a success exit
+  // code. The node showed as offline and nothing on the machine said why.
+  async function installedCopy(bytes: string) {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stale-receipt-'));
+    const exePath = join(dir, 'imcodes-node.exe');
+    await writeFile(exePath, bytes);
+    return { dir, exePath, journalPath: join(dir, 'install-journal.json') };
+  }
+
+  async function writeJournalWithReceipt(
+    journalPath: string,
+    exePath: string,
+    receipt: { size: number; sha256: string },
+  ) {
+    await writeFile(journalPath, JSON.stringify({
+      version: 1,
+      phase: 'service_healthy',
+      updatedAt: 1788506418284,
+      installId: IDENTITY.installId,
+      nodeTokenHash: IDENTITY.nodeTokenHash,
+      sourceExePath: 'C:\\Users\\JT\\AppData\\Local\\Temp\\imcodes-install-67c4\\imcodes-node.exe',
+      stagedExePath: exePath,
+      stagedReceipt: {
+        path: exePath,
+        size: receipt.size,
+        sha256: receipt.sha256,
+        sourceIdentity: { size: receipt.size, mtimeMs: 1, ctimeMs: 1 },
+        stagedIdentity: { size: receipt.size, mtimeMs: 1, ctimeMs: 1 },
+      },
+      serverId: CRED.serverId,
+      serviceName: 'imcodes-node',
+      serviceReceipt: SERVICE_RECEIPT,
+      serviceStartRequestedAt: 1787979309460,
+      cleanupStatus: 'skipped',
+      healthyAt: 1787979327216,
+    }, null, 2), 'utf8');
+  }
+
+  it('runs the runtime instead of exiting 0 when the receipt is stale', async () => {
+    const { dir, exePath, journalPath } = await installedCopy('new build bytes after an upgrade');
+    try {
+      // The receipt still describes the PREVIOUS build, exactly as on 财.
+      await writeJournalWithReceipt(journalPath, exePath, {
+        size: 81772752,
+        sha256: '6a198353f074ee42f70f6dc1639cda4b15ed1d85d614b240f2f6ec856c4f4081',
+      });
+      const deps = makeDeps({
+        journalPath,
+        stagedExecutablePath: exePath,
+        sourceExecutablePath: exePath,
+        loadCredential: vi.fn(async () => CRED),
+        loadInstallJournal: realLoadInstallJournal,
+        writeInstallPhase: realWriteInstallPhase,
+        // The real check, against the real file. A mocked isStableRuntime would
+        // simply assert what I already believe.
+        isStableRuntime: (journal: InstallJournal) => isCurrentExecutableStable(journal, exePath),
+        // The installed copy is trailer-free: it is not an installer, and the
+        // bootstrap already knows how to tell.
+        openVerifiedEnrollmentSource: vi.fn(async () => makeSource({
+          sourcePath: exePath,
+          readEnrollmentBlobWithRange: vi.fn(async () => null),
+        })),
+      });
+
+      const result = await bootstrapControlledNodeWithDisposition(deps);
+
+      expect(result.disposition).toBe('run_runtime');
+      expect(result.credential).toEqual(CRED);
+      // The receipt heals to the bytes actually on disk, so the next start is
+      // stable without re-deriving anything.
+      const healed = await realLoadInstallJournal(journalPath);
+      const actual = createHash('sha256').update('new build bytes after an upgrade').digest('hex');
+      expect(healed.stagedReceipt?.sha256).toBe(actual);
+      expect(healed.stagedReceipt?.size).toBe('new build bytes after an upgrade'.length);
+      expect(await isCurrentExecutableStable(healed, exePath)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still treats a real installer package as an installer, not a stale receipt', async () => {
+    // Negative control. Healing must not swallow the genuine install path: a
+    // package carrying an enrollment trailer is an installer even when it runs
+    // from the staged path, and must stage + hand off as before.
+    const { dir, exePath, journalPath } = await installedCopy('installer bytes with trailer');
+    try {
+      await writeJournalWithReceipt(journalPath, exePath, {
+        size: 81772752,
+        sha256: '6a198353f074ee42f70f6dc1639cda4b15ed1d85d614b240f2f6ec856c4f4081',
+      });
+      const upgraded: StagedExecutableReceipt = { ...STAGED_RECEIPT, path: exePath, sha256: 'a'.repeat(64) };
+      const deps = makeDeps({
+        journalPath,
+        stagedExecutablePath: exePath,
+        sourceExecutablePath: exePath,
+        loadCredential: vi.fn(async () => CRED),
+        loadInstallJournal: realLoadInstallJournal,
+        writeInstallPhase: realWriteInstallPhase,
+        isStableRuntime: (journal: InstallJournal) => isCurrentExecutableStable(journal, exePath),
+        openVerifiedEnrollmentSource: vi.fn(async () => makeSource({
+          sourcePath: exePath,
+          readEnrollmentBlobWithRange: vi.fn(async () => TRAILER),
+          stageTrailerFreeExecutable: vi.fn(async () => upgraded),
+        })),
+      });
+
+      const result = await bootstrapControlledNodeWithDisposition(deps);
+
+      expect(result.disposition).toBe('handoff_complete');
+      expect((await realLoadInstallJournal(journalPath)).stagedReceipt?.sha256).toBe('a'.repeat(64));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not adopt an executable running from somewhere other than the staged path', async () => {
+    // Negative control. Only the copy AT the installed path may heal its own
+    // receipt; a build run from a download folder is still an installer.
+    const { dir, exePath, journalPath } = await installedCopy('installed bytes');
+    const strayDir = await mkdtemp(join(tmpdir(), 'imcodes-stray-'));
+    const strayPath = join(strayDir, 'imcodes-node.exe');
+    try {
+      await writeFile(strayPath, 'downloaded elsewhere');
+      await writeJournalWithReceipt(journalPath, exePath, {
+        size: 81772752,
+        sha256: '6a198353f074ee42f70f6dc1639cda4b15ed1d85d614b240f2f6ec856c4f4081',
+      });
+      const deps = makeDeps({
+        journalPath,
+        stagedExecutablePath: exePath,
+        sourceExecutablePath: strayPath,
+        loadCredential: vi.fn(async () => CRED),
+        loadInstallJournal: realLoadInstallJournal,
+        writeInstallPhase: realWriteInstallPhase,
+        isStableRuntime: (journal: InstallJournal) => isCurrentExecutableStable(journal, strayPath),
+        openVerifiedEnrollmentSource: vi.fn(async () => makeSource({
+          sourcePath: strayPath,
+          readEnrollmentBlobWithRange: vi.fn(async () => null),
+        })),
+      });
+
+      const result = await bootstrapControlledNodeWithDisposition(deps);
+
+      expect(result.disposition).toBe('handoff_complete');
+      // The stray run leaves the installed copy's receipt untouched.
+      expect((await realLoadInstallJournal(journalPath)).stagedReceipt?.sha256)
+        .toBe('6a198353f074ee42f70f6dc1639cda4b15ed1d85d614b240f2f6ec856c4f4081');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(strayDir, { recursive: true, force: true });
+    }
+  });
+});
