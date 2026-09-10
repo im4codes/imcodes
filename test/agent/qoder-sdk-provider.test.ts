@@ -181,6 +181,10 @@ import {
 } from '../../src/agent/qoder-sdk-config.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -626,8 +630,8 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
     const memoryServer = call.options.mcpServers?.[IMCODES_MEMORY_MCP_SERVER_NAME] as any;
     expect(memoryServer).toMatchObject({
       type: 'stdio',
-      command: 'imcodes',
-      args: ['memory', 'mcp'],
+      command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+      args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
     });
     expect(memoryServer.env.IMCODES_SERVER_TOKEN).toBeUndefined();
     expect(memoryServer.env.OPENAI_API_KEY).toBeUndefined();

@@ -296,6 +296,10 @@ import {
   IMCODES_DAEMON_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
 } from '../../shared/memory-mcp-env.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
@@ -5950,8 +5954,8 @@ describe('CodexSdkProvider', () => {
     expect(JSON.stringify(spawnArgs)).not.toContain('user-secret-ish');
     expect(JSON.stringify(spawnArgs)).not.toContain('github.com/acme/project');
     expect(mcpServer).toMatchObject({
-      command: 'imcodes',
-      args: ['memory', 'mcp'],
+      command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+      args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
       env: {
         [IMCODES_DAEMON_USER_ID_ENV]: 'user-secret-ish',
         [IMCODES_DAEMON_SESSION_NAME_ENV]: 'deck_repo_w1',

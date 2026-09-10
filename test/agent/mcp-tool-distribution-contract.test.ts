@@ -10,7 +10,11 @@ import {
   MCP_TOOL_RUNTIME_BOUNDARIES,
   getMcpToolDistributionContract,
 } from '../../shared/mcp-tool-distribution.js';
-import { getDefaultMcpServers } from '../../src/agent/providers/getDefaultMcpServers.js';
+import {
+  getDefaultMcpServers,
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 
 describe('shared MCP tool distribution contract', () => {
@@ -74,7 +78,11 @@ describe('shared MCP tool distribution contract', () => {
         providerId: agentType,
         cwd: '/tmp/contract',
       })[IMCODES_MEMORY_MCP_SERVER_NAME];
-      expect(server, agentType).toMatchObject({ type: 'stdio', command: 'imcodes', args: ['memory', 'mcp'] });
+      expect(server, agentType).toMatchObject({
+        type: 'stdio',
+        command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+        args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
+      });
     }
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('already backend-active');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('complete paginated tools/list');

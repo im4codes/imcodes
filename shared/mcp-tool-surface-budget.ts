@@ -27,15 +27,22 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // The synchronized identity surface adds four bounded CRUD/refresh contracts.
 // Keep explicit headroom over the measured full catalog rather than
 // silently dropping these tools from STATIC_FULL hosts.
-// Full identity, verification-machine, and explicit execution-configuration
-// contracts currently measure 44,359 authored bytes. Retain their complete
-// validation guidance with a sub-1 KiB reviewable ceiling instead of truncating
-// fields required for safe MCP calls.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 45_000;
-// MCP SDK framing currently measures 50,283 bytes for the full catalog while
-// the independently enforced authored payload remains below 44 KiB. Keep less
-// than 1 KiB of explicit protocol-only headroom rather than failing at 50,000.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 51_000;
+//
+// Measured at 45,019 authored bytes across 62 tools. The previous 45,000
+// ceiling was set when the catalog measured 44,940, leaving 60 bytes of
+// headroom -- less than one optional schema field. Adding the
+// `expectedGeneration` execution-authority fence to supervision_task_recover
+// cost 79 bytes and broke it. That is a ratchet at its limit, not bloat: the
+// tool count did not change, and trimming description prose to buy back 35
+// bytes would be exactly the "make the number go down" move this file exists
+// to prevent. So the ceiling moves deliberately, with roughly the same ~700
+// bytes of reviewable headroom the earlier figures were given.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 45_700;
+// Raw = authored + per-tool MCP SDK framing, which currently costs 6,016 bytes
+// across the 62 published tools (~97 each). Held at the authored ceiling plus
+// that framing plus a little room, so protocol growth still cannot hide behind
+// the authored figure. Measured 51,035.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 51_800;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

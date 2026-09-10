@@ -3,6 +3,10 @@ import {
   OpenCodeSdkProvider,
   openCodeSdkRuntimeHooks,
 } from '../../src/agent/providers/opencode-sdk.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
@@ -351,7 +355,7 @@ describe('OpenCodeSdkProvider', () => {
         mcp: expect.objectContaining({
           'imcodes-memory': expect.objectContaining({
             type: 'local',
-            command: ['imcodes', 'memory', 'mcp'],
+            command: [IMCODES_MEMORY_MCP_LAUNCH_COMMAND, ...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
             environment: expect.objectContaining({ IMCODES_DAEMON_SESSION_NAME: 'deck_proj_brain' }),
           }),
         }),
