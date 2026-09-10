@@ -410,54 +410,221 @@ function childSubagentIdFromRolloutPath(path: string): string | undefined {
   return match?.[1];
 }
 
+/**
+ * The fields one rollout scan accumulates.
+ *
+ * Every one of them folds over a PREFIX of the file: `cwd`, `prompt`, `model`,
+ * `imcodesSessionName` and `startedAtMs` keep their first value, `spawn` and
+ * `usageTotalTokens` keep their last, and `completed`/`output` latch once
+ * `task_complete` appears. Because no field can be un-set by a later line,
+ * folding bytes [0, n) then bytes [n, m) gives the same answer as folding
+ * [0, m) in one go -- which is what makes resuming from a byte offset sound.
+ */
+interface CodexRolloutFold {
+  spawn: ReturnType<typeof readCodexChildSubagentSpawn>;
+  prompt?: string;
+  model?: string;
+  cwd?: string;
+  imcodesSessionName?: string;
+  completed: boolean;
+  output?: string;
+  usageTotalTokens?: number;
+  startedAtMs?: number;
+}
+
+interface CodexRolloutScan {
+  /** File size the fold was last advanced to. */
+  size: number;
+  mtimeMs: number;
+  /** Bytes already consumed, including the carried `partial` below. */
+  offset: number;
+  /**
+   * Trailing bytes after the last newline, not yet folded.
+   *
+   * Kept as bytes rather than a string on purpose: a read can stop in the
+   * middle of a multi-byte character, and decoding that eagerly would bake a
+   * replacement character into the carried line.
+   */
+  partial: Buffer;
+  fold: CodexRolloutFold;
+}
+
+/**
+ * Resumable rollout scans, keyed by path.
+ *
+ * Before this, every poll re-read and re-`JSON.parse`d each admitted rollout
+ * from byte zero, and discovery ran twice per tick, so each file was folded
+ * twice. Replayed against one developer's real `~/.codex/sessions` (5.8 GB,
+ * ~4500 files), a poll admitting 6 files totalling 417 MB cost ~4630 ms of
+ * synchronous parsing per tick -- against a 2000 ms interval, per Codex
+ * session, on the daemon's main thread. The same replay with this cache costs
+ * ~1210 ms once to warm and ~9.5 ms per tick thereafter.
+ *
+ * The cost also grew without bound: it scales with rollout size, and rollouts
+ * only ever get longer.
+ *
+ * `codex-watcher.ts` already advances a `fileOffset` over these same files and
+ * `gemini-watcher.ts` already short-circuits on unchanged size/mtime; this
+ * brings the subagent snapshot in line with both.
+ */
+const codexRolloutScans = new Map<string, CodexRolloutScan>();
+const CODEX_ROLLOUT_SCAN_CACHE_MAX = 512;
+const CODEX_ROLLOUT_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+function emptyCodexRolloutFold(): CodexRolloutFold {
+  return { spawn: null, completed: false };
+}
+
+function foldCodexRolloutLine(fold: CodexRolloutFold, line: string): void {
+  const record = parseCodexRolloutJsonLine(line);
+  if (!record) return;
+  if (fold.startedAtMs === undefined) {
+    const timestamp = meaningfulString(record.timestamp);
+    const parsedTimestamp = timestamp ? Date.parse(timestamp) : NaN;
+    if (Number.isFinite(parsedTimestamp)) fold.startedAtMs = parsedTimestamp;
+  }
+  const payload = codexRolloutPayload(record);
+  const nextSpawn = readCodexChildSubagentSpawn(payload);
+  if (nextSpawn) fold.spawn = nextSpawn;
+  if (!fold.cwd) fold.cwd = meaningfulString(payload.cwd);
+  if (!fold.imcodesSessionName) {
+    fold.imcodesSessionName = readImcodesSessionNameFromBaseInstructions(
+      readCodexRolloutBaseInstructionsText(payload),
+    );
+  }
+  if (!fold.prompt) fold.prompt = readCodexRolloutUserMessage(payload);
+  if (!fold.model) fold.model = meaningfulString(payload.model);
+  const totalTokens = readCodexRolloutUsageTotalTokens(payload);
+  if (totalTokens !== undefined) fold.usageTotalTokens = totalTokens;
+  if (payload.type === 'task_complete') {
+    fold.completed = true;
+    fold.output = meaningfulString(payload.last_agent_message)
+      ?? meaningfulString(payload.result)
+      ?? meaningfulString(payload.message)
+      ?? 'completed';
+  }
+}
+
+function rememberCodexRolloutScan(rolloutPath: string, scan: CodexRolloutScan): void {
+  // Re-insert to refresh recency, then evict oldest-first. Thousands of rollout
+  // files accumulate on a working machine, so this must not grow with the
+  // archive -- only with the rollouts actually being polled.
+  codexRolloutScans.delete(rolloutPath);
+  codexRolloutScans.set(rolloutPath, scan);
+  while (codexRolloutScans.size > CODEX_ROLLOUT_SCAN_CACHE_MAX) {
+    const oldest = codexRolloutScans.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    codexRolloutScans.delete(oldest);
+  }
+}
+
+/**
+ * Advance (or reuse) the fold for one rollout file.
+ *
+ * Unchanged size AND mtime means the previous fold is still exact and nothing
+ * is read at all. Growth reads only the appended bytes. Anything else -- a
+ * shrink, a replacement, a rewrite in place -- restarts from zero, because
+ * only append-only growth is safely resumable and rollouts are append-only.
+ *
+ * Reads are chunked, so peak allocation stays bounded by the chunk size plus
+ * one line no matter how large the rollout has grown. A first scan is still
+ * O(file); what disappears is paying that cost again on every tick.
+ */
+async function advanceCodexRolloutScan(rolloutPath: string): Promise<CodexRolloutFold | null> {
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const info = await stat(rolloutPath);
+    size = info.size;
+    mtimeMs = info.mtimeMs;
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  }
+
+  const cached = codexRolloutScans.get(rolloutPath);
+  if (cached && cached.size === size && cached.mtimeMs === mtimeMs) {
+    rememberCodexRolloutScan(rolloutPath, cached);
+    return finishCodexRolloutFold(cached);
+  }
+
+  // Copy the fold rather than aliasing the cached one: two sessions can poll
+  // the same rollout concurrently, and each in-flight scan must own its
+  // accumulator instead of advancing a shared object at a different offset.
+  const scan: CodexRolloutScan = cached && size >= cached.size
+    ? { ...cached, size, mtimeMs, fold: { ...cached.fold } }
+    : { size, mtimeMs, offset: 0, partial: Buffer.alloc(0), fold: emptyCodexRolloutFold() };
+
+  let handle;
+  try {
+    handle = await open(rolloutPath, 'r');
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  }
+  try {
+    const buffer = Buffer.allocUnsafe(CODEX_ROLLOUT_SCAN_CHUNK_BYTES);
+    while (scan.offset < size) {
+      const want = Math.min(CODEX_ROLLOUT_SCAN_CHUNK_BYTES, size - scan.offset);
+      const { bytesRead } = await handle.read(buffer, 0, want, scan.offset);
+      if (bytesRead <= 0) break;
+      scan.offset += bytesRead;
+      const pending = Buffer.concat([scan.partial, buffer.subarray(0, bytesRead)]);
+      const lastNewline = pending.lastIndexOf(0x0a);
+      if (lastNewline < 0) {
+        scan.partial = pending;
+        continue;
+      }
+      // Decode only up to the last newline: whatever follows may be half a
+      // character as well as half a line, and both must wait for more bytes.
+      const complete = pending.subarray(0, lastNewline).toString('utf8');
+      scan.partial = Buffer.from(pending.subarray(lastNewline + 1));
+      for (const line of complete.split('\n')) foldCodexRolloutLine(scan.fold, line);
+    }
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+
+  rememberCodexRolloutScan(rolloutPath, scan);
+  return finishCodexRolloutFold(scan);
+}
+
+/**
+ * The fold as of end-of-file, including any last line that has no newline yet.
+ *
+ * Codex appends a record and its newline separately, so the final line is
+ * routinely readable before it is terminated -- the previous whole-file read
+ * saw it, and dropping it would delay `task_complete` by a tick. It is folded
+ * into a copy so the persisted fold stays exactly "all complete lines", which
+ * is what the byte offset promises and what makes resuming safe.
+ */
+function finishCodexRolloutFold(scan: CodexRolloutScan): CodexRolloutFold {
+  if (scan.partial.length === 0) return scan.fold;
+  const withPartial: CodexRolloutFold = { ...scan.fold };
+  foldCodexRolloutLine(withPartial, scan.partial.toString('utf8'));
+  return withPartial;
+}
+
 async function readCodexChildSubagentRolloutSnapshot(
   rolloutPath: string,
   parentThreadId?: string,
 ): Promise<CodexChildSubagentRolloutSnapshot | null> {
-  let text: string;
-  try {
-    text = await readFile(rolloutPath, 'utf8');
-  } catch {
-    return null;
-  }
-  let spawn: ReturnType<typeof readCodexChildSubagentSpawn> = null;
-  let prompt: string | undefined;
-  let model: string | undefined;
-  let cwd: string | undefined;
-  let imcodesSessionName: string | undefined;
-  let completed = false;
-  let output: string | undefined;
-  let usageTotalTokens: number | undefined;
-  let startedAtMs: number | undefined;
-  for (const line of text.split('\n')) {
-    const record = parseCodexRolloutJsonLine(line);
-    if (!record) continue;
-    if (startedAtMs === undefined) {
-      const timestamp = meaningfulString(record.timestamp);
-      const parsedTimestamp = timestamp ? Date.parse(timestamp) : NaN;
-      if (Number.isFinite(parsedTimestamp)) startedAtMs = parsedTimestamp;
-    }
-    const payload = codexRolloutPayload(record);
-    const nextSpawn = readCodexChildSubagentSpawn(payload);
-    if (nextSpawn) spawn = nextSpawn;
-    if (!cwd) cwd = meaningfulString(payload.cwd);
-    if (!imcodesSessionName) {
-      imcodesSessionName = readImcodesSessionNameFromBaseInstructions(
-        readCodexRolloutBaseInstructionsText(payload),
-      );
-    }
-    if (!prompt) prompt = readCodexRolloutUserMessage(payload);
-    if (!model) model = meaningfulString(payload.model);
-    const totalTokens = readCodexRolloutUsageTotalTokens(payload);
-    if (totalTokens !== undefined) usageTotalTokens = totalTokens;
-    if (payload.type === 'task_complete') {
-      completed = true;
-      output = meaningfulString(payload.last_agent_message)
-        ?? meaningfulString(payload.result)
-        ?? meaningfulString(payload.message)
-        ?? 'completed';
-    }
-  }
+  const fold = await advanceCodexRolloutScan(rolloutPath);
+  if (!fold) return null;
+  const {
+    spawn,
+    prompt,
+    model,
+    cwd,
+    imcodesSessionName,
+    completed,
+    output,
+    usageTotalTokens,
+    startedAtMs,
+  } = fold;
   if (!spawn) return null;
   if (parentThreadId && spawn.parentThreadId !== parentThreadId) return null;
   const agentId = spawn.agentId ?? childSubagentIdFromRolloutPath(rolloutPath);
@@ -479,39 +646,18 @@ async function readCodexChildSubagentRolloutSnapshot(
   };
 }
 
-async function discoverCodexChildSubagentRollouts(
-  env: Record<string, string | undefined>,
-  parentThreadId: string,
-  minMtimeMs: number,
-): Promise<CodexChildSubagentRolloutSnapshot[]> {
-  return discoverCodexChildSubagentRolloutsByPredicate(env, minMtimeMs, async (rolloutPath) => (
-    readCodexChildSubagentRolloutSnapshot(rolloutPath, parentThreadId)
-  ));
-}
-
-async function discoverCodexChildSubagentRolloutsBySession(
-  env: Record<string, string | undefined>,
-  sessionId: string,
-  cwd: string,
-  minMtimeMs: number,
-): Promise<CodexChildSubagentRolloutSnapshot[]> {
-  const normalizedCwd = normalizeTransportCwd(cwd) ?? cwd;
-  return discoverCodexChildSubagentRolloutsByPredicate(env, minMtimeMs, async (rolloutPath) => {
-    const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
-    if (!snapshot) return null;
-    if (snapshot.imcodesSessionName !== sessionId) return null;
-    if (snapshot.cwd) {
-      const snapshotCwd = normalizeTransportCwd(snapshot.cwd) ?? snapshot.cwd;
-      if (snapshotCwd !== normalizedCwd) return null;
-    }
-    return snapshot;
-  });
-}
-
-async function discoverCodexChildSubagentRolloutsByPredicate(
+/**
+ * Every child-subagent rollout touched since `minMtimeMs`, read once.
+ *
+ * This used to run twice per tick behind two predicates -- once matching the
+ * parent thread and once matching the session -- so every candidate file was
+ * walked, stat'd and folded twice to answer two questions about the same
+ * bytes. The predicates are pure functions of the snapshot, so they belong
+ * after the traversal, not around it.
+ */
+async function discoverCodexChildSubagentRolloutSnapshots(
   env: Record<string, string | undefined>,
   minMtimeMs: number,
-  readSnapshot: (rolloutPath: string) => Promise<CodexChildSubagentRolloutSnapshot | null>,
 ): Promise<CodexChildSubagentRolloutSnapshot[]> {
   const codexHome = getCodexHome(env);
   const snapshots: CodexChildSubagentRolloutSnapshot[] = [];
@@ -532,11 +678,23 @@ async function discoverCodexChildSubagentRolloutsByPredicate(
       } catch {
         continue;
       }
-      const snapshot = await readSnapshot(rolloutPath);
+      const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
       if (snapshot) snapshots.push(snapshot);
     }
   }
   return snapshots;
+}
+
+function codexChildSubagentRolloutMatchesSession(
+  snapshot: CodexChildSubagentRolloutSnapshot,
+  sessionId: string,
+  cwd: string,
+): boolean {
+  if (snapshot.imcodesSessionName !== sessionId) return false;
+  if (!snapshot.cwd) return true;
+  const normalizedCwd = normalizeTransportCwd(cwd) ?? cwd;
+  const snapshotCwd = normalizeTransportCwd(snapshot.cwd) ?? snapshot.cwd;
+  return snapshotCwd === normalizedCwd;
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -4190,11 +4348,11 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.threadId) return;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
-    const snapshots = await discoverCodexChildSubagentRollouts(
+    const discovered = await discoverCodexChildSubagentRolloutSnapshots(
       env,
-      state.threadId,
       state.childSubagentRolloutStartedAt,
     );
+    const snapshots = discovered.filter((snapshot) => snapshot.parentThreadId === state.threadId);
     const seenRolloutPaths = new Set(snapshots.map((snapshot) => snapshot.rolloutPath));
     const rememberSnapshot = (snapshot: CodexChildSubagentRolloutSnapshot | null | undefined): void => {
       if (!snapshot || seenRolloutPaths.has(snapshot.rolloutPath)) return;
@@ -4211,13 +4369,14 @@ export class CodexSdkProvider implements TransportProvider {
         rememberSnapshot(snapshot);
       }
     }
-    const sessionSnapshots = await discoverCodexChildSubagentRolloutsBySession(
-      env,
-      state.imcodesSessionName ?? sessionId,
-      state.cwd,
-      state.childSubagentRolloutStartedAt,
-    );
-    for (const snapshot of sessionSnapshots) rememberSnapshot(snapshot);
+    // Same traversal, second question: rollouts belonging to this session even
+    // when they do not name this thread as their parent.
+    const sessionName = state.imcodesSessionName ?? sessionId;
+    for (const snapshot of discovered) {
+      if (codexChildSubagentRolloutMatchesSession(snapshot, sessionName, state.cwd)) {
+        rememberSnapshot(snapshot);
+      }
+    }
     for (const snapshot of snapshots) {
       if (state.childSubagentRolloutCompletedIds.has(snapshot.agentId)) continue;
       const existingById = this.trackedSubagentThreads.get(snapshot.agentId);
