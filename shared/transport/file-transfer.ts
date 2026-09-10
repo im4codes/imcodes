@@ -225,6 +225,20 @@ export interface FileDirectoryEntry {
   path: string;
   isDir: boolean;
   hidden: boolean;
+  /**
+   * Capacity of the filesystem this entry sits on, when the daemon could
+   * measure it. Only populated for volume roots -- a per-file `statfs` on a
+   * 512-entry listing would be 512 syscalls for a number that is the same for
+   * every one of them.
+   */
+  totalBytes?: number;
+  freeBytes?: number;
+}
+
+/** Non-negative, finite, and small enough to be a real byte count. */
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    && value <= Number.MAX_SAFE_INTEGER;
 }
 
 export interface FileDirectoryListDone {
@@ -564,14 +578,25 @@ export function validateControlledFileTransferResponse(
     const entries: FileDirectoryEntry[] = [];
     for (const entry of v.entries) {
       if (!isObject(entry)
-        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden']))
+        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden', 'totalBytes', 'freeBytes']))
         || !isBoundedString(entry.name, 1024)
         || !isBoundedString(entry.path, FILE_TRANSFER_PATH_MAX_BYTES)
         || typeof entry.isDir !== 'boolean'
-        || typeof entry.hidden !== 'boolean') {
+        || typeof entry.hidden !== 'boolean'
+        || (entry.totalBytes !== undefined && !isByteCount(entry.totalBytes))
+        || (entry.freeBytes !== undefined && !isByteCount(entry.freeBytes))) {
         return { ok: false, error: 'invalid_directory_entry' };
       }
-      entries.push(entry as unknown as FileDirectoryEntry);
+      // Rebuilt field by field, so anything not listed here is dropped rather
+      // than forwarded; the capacity fields have to be carried explicitly.
+      entries.push({
+        name: entry.name,
+        path: entry.path,
+        isDir: entry.isDir,
+        hidden: entry.hidden,
+        ...(entry.totalBytes !== undefined ? { totalBytes: entry.totalBytes } : {}),
+        ...(entry.freeBytes !== undefined ? { freeBytes: entry.freeBytes } : {}),
+      } as FileDirectoryEntry);
     }
     return {
       ok: true,

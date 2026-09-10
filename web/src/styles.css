@@ -12624,3 +12624,39 @@ button.quick-agent-delegation-preset.active {
   .supervision-task-console-task.activity-idle,
   .supervision-task-console-task.activity-needs_input { animation: none; }
 }
+
+/* Volume capacity beside a drive root in the file tree. Only volume roots
+   carry it, so this never appears on ordinary rows. */
+.fb-node-capacity {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+  margin-left: 8px;
+  font-size: 10.5px;
+  color: #7f9fb4;
+  white-space: nowrap;
+}
+
+.fb-node-capacity-bar {
+  position: relative;
+  width: 42px;
+  height: 4px;
+  overflow: hidden;
+  background: rgb(127 159 180 / 28%);
+  border-radius: 999px;
+}
+
+.fb-node-capacity-bar::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--fb-capacity-used, 0%);
+  content: '';
+  background: linear-gradient(90deg, #4aa8d8, #6ad0ff);
+}
+
+/* Nearly full is the case worth noticing before starting a transfer. */
+.fb-node-capacity-bar[style*="9_"]::before,
+.fb-node-capacity-bar::before {
+  transition: width 0.2s ease;
+}

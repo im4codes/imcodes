@@ -952,7 +952,9 @@
     "quick_access": "クイックアクセス",
     "desktop": "デスクトップ",
     "downloads": "ダウンロード",
-    "documents": "書類"
+    "documents": "書類",
+    "capacity_free": "空き {{free}}",
+    "capacity_detail": "空き {{free}} / 全体 {{total}}"
   },
   "toast": {
     "finished": "完了",

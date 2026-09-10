@@ -952,7 +952,9 @@
     "quick_access": "快捷访问",
     "desktop": "桌面",
     "downloads": "下载",
-    "documents": "文档"
+    "documents": "文档",
+    "capacity_free": "剩余 {{free}}",
+    "capacity_detail": "剩余 {{free}} / 共 {{total}}"
   },
   "toast": {
     "finished": "完成了",

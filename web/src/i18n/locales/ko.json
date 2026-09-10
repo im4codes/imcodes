@@ -952,7 +952,9 @@
     "quick_access": "빠른 액세스",
     "desktop": "바탕 화면",
     "downloads": "다운로드",
-    "documents": "문서"
+    "documents": "문서",
+    "capacity_free": "{{free}} 남음",
+    "capacity_detail": "{{total}} 중 {{free}} 남음"
   },
   "toast": {
     "finished": "완료됨",

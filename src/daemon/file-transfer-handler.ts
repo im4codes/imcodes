@@ -3,7 +3,7 @@
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
 import { constants as fsConstants, createReadStream, createWriteStream, realpathSync } from 'node:fs';
-import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
+import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, statfs, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -1025,6 +1025,30 @@ function sendDirectoryListError(sender: FileTransferSender, requestId: string, e
 }
 
 /** Bounded controlled-node browser used by the integrated remote desktop file manager. */
+/**
+ * Free and total bytes for the volume a path sits on, or nothing.
+ *
+ * Reported only for volume ROOTS. Running this per entry would be one syscall
+ * per row for a number identical across all of them, and a 512-entry listing
+ * is on the critical path of a click.
+ *
+ * `statfs` is unavailable on older runtimes and can fail on a drive that is
+ * present but not ready (an empty card reader, a disconnected network drive),
+ * so a failure degrades to "no capacity shown" rather than dropping the drive
+ * from the listing entirely.
+ */
+async function volumeCapacity(target: string): Promise<{ totalBytes?: number; freeBytes?: number }> {
+  try {
+    const info = await statfs(target);
+    const total = Number(info.blocks) * Number(info.bsize);
+    const free = Number(info.bavail) * Number(info.bsize);
+    if (!Number.isFinite(total) || !Number.isFinite(free) || total <= 0) return {};
+    return { totalBytes: total, freeBytes: Math.max(0, Math.min(free, total)) };
+  } catch {
+    return {};
+  }
+}
+
 export async function handleFileDirectoryList(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
   const parsed = validateFileDirectoryListRequest(cmd);
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
@@ -1040,7 +1064,7 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
           .map(async (drive): Promise<FileDirectoryEntry | null> => {
             try {
               await readdir(drive);
-              return { name: drive, path: drive, isDir: true, hidden: false };
+              return { name: drive, path: drive, isDir: true, hidden: false, ...(await volumeCapacity(drive)) };
             } catch {
               return null;
             }

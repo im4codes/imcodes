@@ -952,7 +952,9 @@
     "quick_access": "Быстрый доступ",
     "desktop": "Рабочий стол",
     "downloads": "Загрузки",
-    "documents": "Документы"
+    "documents": "Документы",
+    "capacity_free": "Свободно {{free}}",
+    "capacity_detail": "Свободно {{free}} из {{total}}"
   },
   "toast": {
     "finished": "завершено",

@@ -1,6 +1,7 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FILE_TRANSFER_DIRECTORY_PATH } from '@shared/transport/file-transfer.js';
+import { formatByteSize } from '../util/byte-size.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -203,6 +204,9 @@ type FsNode = {
   hidden?: boolean;
   children?: FsNode[];  // undefined = leaf/file; [] = unloaded dir; [...] = loaded
   isLoading?: boolean;
+  /** Volume capacity, present only on volume roots the daemon could measure. */
+  totalBytes?: number;
+  freeBytes?: number;
 };
 
 interface FileBrowserSnapshot {
@@ -863,6 +867,8 @@ export function FileBrowser({
             isDir: e.isDir,
             hidden: e.hidden,
             children: e.isDir ? [] : undefined,
+            ...(typeof e.totalBytes === 'number' ? { totalBytes: e.totalBytes } : {}),
+            ...(typeof e.freeBytes === 'number' ? { freeBytes: e.freeBytes } : {}),
           }));
 
         loadedRef.current.add(nodeId);
@@ -2606,6 +2612,7 @@ function FsTreeNode({
   previewPath: string | null;
   depth?: number;
 }) {
+  const { t } = useTranslation();
   const isExpanded = expandedPaths.has(node.id);
   const isSelected = selectedPaths.has(node.id);
   const isAlready = alreadySet.has(node.id);
@@ -2651,6 +2658,27 @@ function FsTreeNode({
             : '📄'}
         </span>
         <span class="fb-node-name">{node.name}</span>
+        {typeof node.freeBytes === 'number' && typeof node.totalBytes === 'number' && (
+          <span
+            class="fb-node-capacity"
+            title={t('file_browser.capacity_detail', {
+              free: formatByteSize(node.freeBytes),
+              total: formatByteSize(node.totalBytes),
+            })}
+          >
+            {t('file_browser.capacity_free', { free: formatByteSize(node.freeBytes) })}
+            <span
+              class="fb-node-capacity-bar"
+              aria-hidden="true"
+              style={{
+                // Used share, so a nearly-full volume reads as a full bar.
+                '--fb-capacity-used': `${Math.round(
+                  Math.max(0, Math.min(1, 1 - node.freeBytes / node.totalBytes)) * 100,
+                )}%`,
+              } as Record<string, string>}
+            />
+          </span>
+        )}
         {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
         {isAlready && <span class="fb-node-badge">↑</span>}
       </div>

@@ -952,7 +952,9 @@
     "quick_access": "Quick access",
     "desktop": "Desktop",
     "downloads": "Downloads",
-    "documents": "Documents"
+    "documents": "Documents",
+    "capacity_free": "{{free}} free",
+    "capacity_detail": "{{free}} free of {{total}}"
   },
   "toast": {
     "finished": "finished",
