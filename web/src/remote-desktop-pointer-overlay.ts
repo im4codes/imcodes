@@ -67,10 +67,13 @@ const FILE_WINDOW_MIN_TRAVEL = 80;
  * already fills the workspace, matching it exactly would produce a window that
  * cannot be moved, so it gives back up to FILE_WINDOW_MIN_TRAVEL pixels.
  *
- * Without a host measurement it falls back to a fraction of the viewport. The
- * drawer this window replaced was sized relative to the panel
- * (`calc(100% - 24px)`); windowing it is what turned those into absolute
- * pixels, and this restores the relative intent.
+ * Only the FIRST open uses this at all: FloatingPanel persists geometry per
+ * window id, so once the window has been dragged or resized that size is what
+ * reopens. This is the starting point, not a cap.
+ *
+ * It errs large on purpose. A default small enough that the panes show nothing
+ * forces a resize before the window is usable, which is exactly the friction
+ * this is meant to remove.
  */
 export function remoteDesktopFileWindowDefaultSize(options: {
   viewportWidth: number;
@@ -85,10 +88,12 @@ export function remoteDesktopFileWindowDefaultSize(options: {
     h: options.viewportHeight,
   };
 
-  const wanted = options.hostSize ?? {
-    width: Math.round(options.viewportWidth * 0.72),
-    height: Math.round(options.viewportHeight * 0.62),
-  };
+  // With no host to copy, open as large as the workspace allows: `fit` below
+  // still subtracts the travel floor, so this is the biggest window that can
+  // also be dragged. A fraction of the viewport was the wrong fallback -- it
+  // could open small enough that the panes show almost nothing, which is the
+  // opposite of the point.
+  const wanted = options.hostSize ?? { width: workspace.w, height: workspace.h };
 
   const fit = (want: number, available: number, min: number): number => {
     // Leave travel, but never at the cost of going under the minimum: below

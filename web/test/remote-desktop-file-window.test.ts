@@ -168,12 +168,38 @@ describe('the file window opens at the remote desktop window size', () => {
     expect(result.height).toBe(MIN_H);
   });
 
-  it('falls back to a fraction of the viewport with no host to measure', () => {
-    const result = size({ w: 1440, h: 780 });
-    expect(result.width).toBeLessThan(1440);
-    expect(result.height).toBeLessThan(780);
-    expect(result.width).toBeGreaterThanOrEqual(MIN_W);
-    expect(result.height).toBeGreaterThanOrEqual(MIN_H);
+  it('opens as large as it can when there is no host to measure', () => {
+    // A default small enough that the panes show nothing forces a resize
+    // before the window is usable -- the exact friction this is removing. So
+    // the fallback is the largest window that is still draggable, not a
+    // fraction of the viewport.
+    const workspace = { w: 1440, h: 780 };
+    const result = size(workspace);
+    expect(workspace.w - result.width, 'still draggable').toBe(MIN_TRAVEL);
+    expect(workspace.h - result.height, 'still draggable').toBe(MIN_TRAVEL);
+  });
+
+  it('never opens small enough to hide the panes', () => {
+    // Across every realistic viewport the first open must fill most of the
+    // workspace, not a fraction of it.
+    for (const [w, h] of [[1440, 780], [1680, 900], [1920, 960], [1280, 700]]) {
+      const result = size({ w, h });
+      expect(result.width / w, `${w}x${h} width share`).toBeGreaterThan(0.9);
+      expect(result.height / h, `${w}x${h} height share`).toBeGreaterThan(0.85);
+    }
+  });
+
+  it('remembers a size the user chose instead of reimposing the default', () => {
+    // FloatingPanel persists geometry per window id and `loadGeom` prefers the
+    // stored value over defaultW/defaultH, so an enlarged window reopens
+    // enlarged. Pinned here because the default is only ever the FIRST open.
+    const panel = read('../src/components/FloatingPanel.tsx');
+    expect(panel).toMatch(/useState\(\(\) => loadGeom\(/);
+    expect(panel).toMatch(/saveGeom\(id, geom\)/);
+    const loadGeom = panel.slice(panel.indexOf('function loadGeom'), panel.indexOf('function saveGeom'));
+    expect(loadGeom, 'stored geometry must win over the defaults').toContain('localStorage.getItem');
+    expect(loadGeom.indexOf('localStorage.getItem'))
+      .toBeLessThan(loadGeom.lastIndexOf('return clampGeomToViewport(fallback'));
   });
 
   it('never exceeds the workspace, whatever the host reports', () => {
