@@ -3,6 +3,10 @@ import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '.
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -90,8 +94,8 @@ function expectMemoryMcpEnv(
 ): void {
   const server = (serverConfig as Record<string, any> | undefined)?.[IMCODES_MEMORY_MCP_SERVER_NAME];
   expect(server).toMatchObject({
-    command: 'imcodes',
-    args: ['memory', 'mcp'],
+    command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+    args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
   });
   expect(server?.env).toMatchObject({
     [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: expected.sessionName,
