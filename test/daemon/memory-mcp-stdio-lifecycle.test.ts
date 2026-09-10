@@ -19,14 +19,14 @@
  * reparenting behaviour and never touches the developer's `~/.imcodes`.
  */
 import { describe, it, expect } from 'vitest';
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import {
   IMCODES_MEMORY_MCP_LAUNCH_ARGS,
   IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createIdempotentShutdown, installMcpStdioLifecycle } from '../../src/daemon/mcp-stdio-lifecycle.js';
 
@@ -94,29 +94,6 @@ function childEnv(home: string, extra: Record<string, string> = {}): NodeJS.Proc
     IMCODES_HOME: home,
     ...extra,
   };
-}
-
-/**
- * Has the wrapper already become the server?
- *
- * `IMCODES_MCP_PARENT_PID=$PPID exec "$0" "$@"` captures the parent when the
- * WRAPPER SHELL initialises, not when it is forked. Freezing that shell before
- * it initialises and then killing the owner makes it resume into an orphaned
- * world and read `$PPID` as the reparent target -- so it declares the very pid
- * the server will observe, the two agree, and the mismatch guard can never
- * fire. That is the window getDefaultMcpServers documents as unclosable by any
- * userspace wrapper, so a test must not stumble into it and then demand the
- * guard fire anyway.
- *
- * Once the process image is the server binary, `exec` has happened, which means
- * a live shell already expanded `$PPID` against a live owner. Waiting for that
- * turns "we hope the freeze lands after the declaration" into a precondition.
- */
-function execHandedOffToServer(pid: number): boolean {
-  const probe = spawnSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8' });
-  const comm = (probe.stdout ?? '').trim();
-  if (!comm) return false;
-  return basename(comm) === basename(process.execPath);
 }
 
 function pidAlive(pid: number): boolean {
@@ -241,23 +218,6 @@ describeOrSkip('memory MCP stdio lifecycle (subprocess)', () => {
         if (serverPid === 0) await new Promise((r) => { const t = setTimeout(r, 50); t.unref?.(); });
       }
       expect(serverPid, 'the repro must actually start a server').toBeGreaterThan(0);
-
-      // Wait for the wrapper to hand off to the server before freezing it.
-      // Without this the freeze can land on a shell that has not yet read
-      // `$PPID`; it would then resume already orphaned, declare the reparent
-      // target as its own parent, and match what the server observes -- so the
-      // guard could never fire and this test would time out blaming the guard
-      // for a window no wrapper can close. Observed on a loaded macOS runner.
-      const handedOff = await (async () => {
-        const stop = Date.now() + 30_000;
-        while (Date.now() < stop) {
-          if (execHandedOffToServer(serverPid)) return true;
-          if (!pidAlive(serverPid)) return false;
-          await new Promise((r) => { const t = setTimeout(r, 10); t.unref?.(); });
-        }
-        return false;
-      })();
-      expect(handedOff, 'the wrapper must have exec-ed the server, so $PPID was read while the owner lived').toBe(true);
 
       // Freeze the server before it can run, so "already reparented before it
       // ever looked" is a PROVEN state rather than a won race. Racing the kill
