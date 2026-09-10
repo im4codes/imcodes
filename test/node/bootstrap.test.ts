@@ -10,6 +10,10 @@ import {
   journalPathFor,
   type ControlledNodeBootstrapDeps,
 } from '../../src/node/bootstrap.js';
+import {
+  loadInstallJournal as realLoadInstallJournal,
+  writeInstallPhase as realWriteInstallPhase,
+} from '../../src/node/install-journal.js';
 import type { InstallJournal, InstallPhase, ServiceReceipt } from '../../src/node/install-journal.js';
 import type {
   ControlledNodeCredential,
@@ -677,5 +681,109 @@ describe('isCurrentExecutableStable', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('reinstall from a fresh download (real install journal)', () => {
+  // These drive the REAL writeInstallPhase/loadInstallJournal against a temp
+  // file on purpose. makeDeps' fake writer just spreads the patch and enforces
+  // no invariants at all, so a reinstall test built on it would pass no matter
+  // what the journal rules say -- which is precisely how the bug that made
+  // already-installed machines un-reinstallable got shipped.
+  async function withJournal<T>(run: (journalPath: string) => Promise<T>): Promise<T> {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-reinstall-'));
+    try {
+      return await run(join(dir, 'install.json'));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  function realJournalDeps(journalPath: string, over: Partial<ControlledNodeBootstrapDeps> = {}) {
+    return makeDeps({
+      journalPath,
+      loadInstallJournal: realLoadInstallJournal,
+      writeInstallPhase: realWriteInstallPhase,
+      ...over,
+    });
+  }
+
+  it('installs again from a new temp path after the machine is already enrolled', async () => {
+    await withJournal(async (journalPath) => {
+      const firstRun = await bootstrapControlledNodeWithDisposition(realJournalDeps(journalPath, {
+        sourceExecutablePath: '/tmp/download-a/imcodes-node',
+        generateInstallIdentity: vi.fn(() => ({ ...IDENTITY, sourceExePath: '/tmp/download-a/imcodes-node' })),
+      }));
+      expect(firstRun.journal.sourceExePath).toBe('/tmp/download-a/imcodes-node');
+
+      // The second package is a DIFFERENT build. Restaging identical bytes
+      // short-circuits before the journal write, so reusing STAGED_RECEIPT here
+      // would skip the write under test and prove nothing.
+      const upgradedReceipt: StagedExecutableReceipt = { ...STAGED_RECEIPT, sha256: 'f'.repeat(64) };
+      const secondRun = await bootstrapControlledNodeWithDisposition(realJournalDeps(journalPath, {
+        now: 456,
+        sourceExecutablePath: '/tmp/download-b/imcodes-node',
+        loadCredential: vi.fn(async () => CRED),
+        loadInstallIdentity: vi.fn(async () => ({ ...IDENTITY, sourceExePath: '/tmp/download-a/imcodes-node' })),
+        openVerifiedEnrollmentSource: vi.fn(async () => makeSource({
+          sourcePath: '/tmp/download-b/imcodes-node',
+          stageTrailerFreeExecutable: vi.fn(async () => upgradedReceipt),
+        })),
+      }));
+
+      expect(secondRun.credential).toEqual(CRED);
+      // Recorded, not frozen: the journal now names the package that actually
+      // installed these bytes.
+      expect(secondRun.journal.sourceExePath).toBe('/tmp/download-b/imcodes-node');
+      expect(secondRun.journal.stagedReceipt?.sha256).toBe('f'.repeat(64));
+      expect((await realLoadInstallJournal(journalPath)).sourceExePath).toBe('/tmp/download-b/imcodes-node');
+    });
+  });
+
+  it('recovers a machine whose journal already drifted from its install identity', async () => {
+    // Machines in the field ran the build that wrote the current run's path into
+    // the journal while the identity file kept the first one. They must heal on
+    // the next install, not stay bricked forever.
+    await withJournal(async (journalPath) => {
+      const elevated = await realWriteInstallPhase(journalPath, 'elevated', { now: 1 });
+      await realWriteInstallPhase(journalPath, 'credential_prepared', {
+        now: 2,
+        previous: elevated,
+        installId: IDENTITY.installId,
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: '/tmp/download-drifted/imcodes-node',
+      });
+
+      const result = await bootstrapControlledNodeWithDisposition(realJournalDeps(journalPath, {
+        sourceExecutablePath: '/tmp/download-c/imcodes-node',
+        loadInstallIdentity: vi.fn(async () => ({ ...IDENTITY, sourceExePath: '/tmp/download-a/imcodes-node' })),
+      }));
+
+      expect(result.credential).toEqual(CRED);
+      // The drifted value is gone. It heals to the persisted identity's path
+      // rather than this run's: the enrolled phase writes last and carries
+      // identity.sourceExePath, which is the durable record of the two.
+      expect(result.journal.sourceExePath).toBe('/tmp/download-a/imcodes-node');
+      expect(result.journal.phase).toBe('service_start_requested');
+    });
+  });
+
+  it('still refuses a journal whose installId belongs to another node', async () => {
+    // Dropping the sourceExePath gate must not loosen the checks that actually
+    // identify the node.
+    await withJournal(async (journalPath) => {
+      const elevated = await realWriteInstallPhase(journalPath, 'elevated', { now: 1 });
+      await realWriteInstallPhase(journalPath, 'credential_prepared', {
+        now: 2,
+        previous: elevated,
+        installId: 'inst-other',
+        nodeTokenHash: IDENTITY.nodeTokenHash,
+        sourceExePath: '/tmp/download-a/imcodes-node',
+      });
+
+      await expect(bootstrapControlledNodeWithDisposition(realJournalDeps(journalPath, {
+        loadInstallIdentity: vi.fn(async () => ({ ...IDENTITY })),
+      }))).rejects.toThrow(/installId/);
+    });
   });
 });

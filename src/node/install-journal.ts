@@ -184,10 +184,17 @@ function validateJournalMetadata(journal: InstallJournal): void {
   if (index >= healthyIndex && journal.healthyAt === undefined) invalidJournal('service_healthy requires healthyAt');
 }
 
+// sourceExePath is deliberately NOT here. It records where THIS installer run
+// was launched from -- a per-run temp path on every platform that downloads the
+// package. Freezing it turned an ordinary reinstall into a hard failure: the
+// second run stages from a new temp path, the write is rejected as an immutable
+// change, and no amount of reinstalling clears it. The field is local
+// provenance only: it is never sent to the server, never gates enrollment, and
+// nothing reads it back. Whether it changes has no effect on the install, so it
+// must not be able to block one.
 const IMMUTABLE_JOURNAL_FIELDS = [
   'installId',
   'nodeTokenHash',
-  'sourceExePath',
   'stagedExePath',
   'serverId',
   'serviceName',

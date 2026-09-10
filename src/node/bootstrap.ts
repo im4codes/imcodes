@@ -314,9 +314,12 @@ async function ensureIdentityPrepared(
   if (journal.nodeTokenHash !== undefined && journal.nodeTokenHash !== identity.nodeTokenHash) {
     throw new Error('controlled node install identity does not match journal nodeTokenHash');
   }
-  if (journal.sourceExePath !== undefined && journal.sourceExePath !== identity.sourceExePath) {
-    throw new Error('controlled node install identity does not match journal sourceExePath');
-  }
+  // No sourceExePath equality gate. installId/nodeTokenHash identify the node
+  // and are checked above; sourceExePath only records which file this run was
+  // launched from, which legitimately differs on every reinstall from a fresh
+  // download. Machines whose journal already drifted from their identity file
+  // (the earlier build wrote the current run's path here) recover on the next
+  // run instead of being permanently unable to reinstall.
   if (phaseIndex(journal.phase) < phaseIndex('credential_prepared')) {
     journal = await deps.writeInstallPhase(deps.journalPath, 'credential_prepared', {
       now: deps.now,
