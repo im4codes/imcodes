@@ -10612,7 +10612,8 @@ button.quick-agent-delegation-preset.active {
   display: grid;
   gap: 14px;
   padding: 18px 20px;
-  text-align: left;
+  justify-items: center;
+  text-align: center;
   background: linear-gradient(145deg, rgb(9 28 43 / 88%), rgb(4 15 26 / 92%));
   border: 1px solid rgb(84 184 230 / 26%);
   border-radius: 16px;
@@ -10625,53 +10626,50 @@ button.quick-agent-delegation-preset.active {
   letter-spacing: .01em;
 }
 
-.remote-desktop-connection-progress ol {
+/* Four dots, one per connect stage, read left to right. The stage text is
+   still in the DOM for screen readers and as a hover title; it is the four
+   text rows that were noise, not the information. */
+.remote-desktop-connection-dots {
   margin: 0;
   padding: 0;
-  display: grid;
-  gap: 9px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
   list-style: none;
 }
 
-.remote-desktop-connection-progress li {
-  display: grid;
-  grid-template-columns: 25px minmax(0, 1fr);
-  gap: 10px;
-  align-items: center;
-  color: #688096;
-  font-size: 13px;
+.remote-desktop-connection-dots li {
+  display: block;
+  line-height: 0;
 }
 
-.remote-desktop-connection-progress li > span:first-child {
-  width: 25px;
-  height: 25px;
-  display: grid;
-  place-items: center;
-  color: #7890a2;
-  background: rgb(20 48 68 / 72%);
-  border: 1px solid rgb(79 130 159 / 38%);
+.remote-desktop-connection-step-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.remote-desktop-connection-dot {
+  display: block;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
-  font-size: 11px;
-  font-weight: 800;
+  background: rgb(20 48 68 / 90%);
+  border: 1px solid rgb(79 130 159 / 45%);
+  transition: background .2s ease, border-color .2s ease;
 }
 
-.remote-desktop-connection-progress li.is-complete {
-  color: #9bb7c9;
-}
-
-.remote-desktop-connection-progress li.is-complete > span:first-child {
-  color: #06251d;
+.remote-desktop-connection-dots li.is-complete .remote-desktop-connection-dot {
   background: #55d6a1;
   border-color: #89efc4;
 }
 
-.remote-desktop-connection-progress li.is-current {
-  color: #e5f7ff;
-  font-weight: 700;
-}
-
-.remote-desktop-connection-progress li.is-current > span:first-child {
-  color: #031b29;
+.remote-desktop-connection-dots li.is-current .remote-desktop-connection-dot {
   background: #64d9ff;
   border-color: #a4edff;
   box-shadow: 0 0 0 4px rgb(74 205 255 / 11%), 0 0 18px rgb(65 196 255 / 30%);
@@ -10724,21 +10722,6 @@ button.quick-agent-delegation-preset.active {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-.remote-desktop-connection-summary > span {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.remote-desktop-connection-summary > span::before {
-  content: '';
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #64d2a4;
-  box-shadow: 0 0 8px rgb(100 210 164 / 60%);
 }
 
 .remote-desktop-nerd-toggle {
@@ -11334,6 +11317,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-diagnostics,
+.remote-desktop-stats,
 .remote-desktop-files {
   display: flex;
   align-items: center;
@@ -11343,8 +11327,8 @@ button.quick-agent-delegation-preset.active {
 
 /* Telemetry reads as instrument fields, not a paragraph: each fact is its own
    chip with a hairline separator, so a glance can find one number. */
-.remote-desktop-diagnostics {
-  flex: 1 0 100%;
+.remote-desktop-diagnostics,
+.remote-desktop-stats {
   gap: 0 14px;
   row-gap: 6px;
   color: #8fb4d0;
@@ -11353,7 +11337,19 @@ button.quick-agent-delegation-preset.active {
   letter-spacing: .01em;
 }
 
-.remote-desktop-diagnostics > span {
+.remote-desktop-diagnostics {
+  flex: 1 0 100%;
+}
+
+/* Takes the row and lets the nerd toggle keep its natural width at the end.
+   min-width:0 so a long field wraps instead of shoving the button off. */
+.remote-desktop-stats {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.remote-desktop-diagnostics > span,
+.remote-desktop-stats > span {
   position: relative;
   white-space: nowrap;
 }
@@ -11361,7 +11357,8 @@ button.quick-agent-delegation-preset.active {
 /* Drawn after each field rather than before the next one: when the row wraps,
    a mark trailing a line reads as continuation, while one leading a line reads
    as a mistake. */
-.remote-desktop-diagnostics > span:not(:last-child)::after {
+.remote-desktop-diagnostics > span:not(:last-child)::after,
+.remote-desktop-stats > span:not(:last-child)::after {
   content: '';
   position: absolute;
   right: -7px;

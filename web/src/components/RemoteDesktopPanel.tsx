@@ -2415,7 +2415,7 @@ export function RemoteDesktopPanel({
                   <strong>
                     {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING
                       ? t('remote_desktop.connection_retrying', { count: snapshot.reconnectCount ?? 1 })
-                      : t(`remote_desktop.state.${snapshot.state}`)}
+                      : t('remote_desktop.connection_optimizing')}
                   </strong>
                   {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING
                     && (snapshot.terminalReason ?? snapshot.error) && (
@@ -2429,7 +2429,14 @@ export function RemoteDesktopPanel({
                       })}
                     </small>
                   )}
-                  <ol aria-label={t('remote_desktop.connection_progress')}>
+                  {/* Four dots, one per stage. The stage names stay in the DOM
+                      for screen readers -- dropping them would leave a
+                      non-sighted user with four unlabelled shapes and no way to
+                      tell which part of connecting is slow. */}
+                  <ol
+                    class="remote-desktop-connection-dots"
+                    aria-label={t('remote_desktop.connection_progress')}
+                  >
                     {REMOTE_DESKTOP_CONNECTION_STEPS.map((step, index) => {
                       const complete = index < activeConnectionStep;
                       const current = index === activeConnectionStep;
@@ -2438,9 +2445,12 @@ export function RemoteDesktopPanel({
                           key={step}
                           class={complete ? 'is-complete' : current ? 'is-current' : 'is-pending'}
                           aria-current={current ? 'step' : undefined}
+                          title={t(`remote_desktop.connection_steps.${step}`)}
                         >
-                          <span aria-hidden="true">{complete ? '✓' : index + 1}</span>
-                          <span>{t(`remote_desktop.connection_steps.${step}`)}</span>
+                          <span class="remote-desktop-connection-dot" aria-hidden="true" />
+                          <span class="remote-desktop-connection-step-label">
+                            {t(`remote_desktop.connection_steps.${step}`)}
+                          </span>
                         </li>
                       );
                     })}
@@ -2741,8 +2751,29 @@ export function RemoteDesktopPanel({
         )}
 
         <footer class="remote-desktop-footer">
+          {/* Always on: the facts you read while judging whether the session is
+              usable -- who is on it, over which link, at what resolution, frame
+              rate, bitrate and loss, and for how long. The nerd toggle keeps the
+              counters that only matter once something is already wrong. */}
           <div class="remote-desktop-connection-summary">
-            <span aria-live="polite">{t('remote_desktop.connection_optimizing')}</span>
+            <div class="remote-desktop-stats" aria-label={t('remote_desktop.diagnostics')}>
+              <span class="remote-desktop-diagnostic-machine">{machine.displayName}</span>
+              <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
+              <span aria-live="polite" data-viewer-count={viewerCount}>{t('remote_desktop.viewers', { count: viewerCount })}</span>
+              <span aria-live="polite" data-controller-count={controllerCount}>{t('remote_desktop.controllers', { count: controllerCount })}</span>
+              <span>{t('remote_desktop.route', { route: snapshot.route ?? '—' })}</span>
+              {selectedDisplay && <span>{selectedDisplay.width}×{selectedDisplay.height} · {Math.round(selectedDisplay.dpiScale * 100)}% DPI</span>}
+              {snapshot.quality && (
+                <>
+                  <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
+                  <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
+                  <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
+                  <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
+                  <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
+                </>
+              )}
+              <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
+            </div>
             <button
               type="button"
               class="remote-desktop-nerd-toggle"
@@ -2760,21 +2791,6 @@ export function RemoteDesktopPanel({
               class="remote-desktop-diagnostics"
               aria-label={t('remote_desktop.diagnostics')}
             >
-              <span class="remote-desktop-diagnostic-machine">{machine.displayName}</span>
-              <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
-              <span aria-live="polite" data-viewer-count={viewerCount}>{t('remote_desktop.viewers', { count: viewerCount })}</span>
-              <span aria-live="polite" data-controller-count={controllerCount}>{t('remote_desktop.controllers', { count: controllerCount })}</span>
-              <span>{t('remote_desktop.route', { route: snapshot.route ?? '—' })}</span>
-              {selectedDisplay && <span>{selectedDisplay.width}×{selectedDisplay.height} · {Math.round(selectedDisplay.dpiScale * 100)}% DPI</span>}
-              {snapshot.quality && (
-                <>
-                  <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
-                  <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
-                  <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
-                  <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
-                  <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
-                </>
-              )}
               {snapshot.pointerMovesSent !== undefined && (
                 <span>{t('remote_desktop.pointer_move_connection', {
                   calls: snapshot.pointerMoveCalls ?? 0,
@@ -2797,7 +2813,6 @@ export function RemoteDesktopPanel({
               {inputBlockedHint() && (
                 <span class="remote-desktop-input-blocked">{inputBlockedHint()}</span>
               )}
-              <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
               <span>{t('remote_desktop.reconnects', { count: snapshot.reconnectCount ?? 0 })}</span>
               <span>{t('remote_desktop.capability', { version: snapshot.capabilityVersion ?? REMOTE_DESKTOP_CAPABILITY })}</span>
             </div>

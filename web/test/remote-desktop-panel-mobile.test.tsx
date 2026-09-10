@@ -654,18 +654,24 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
     expect(container.querySelector('.remote-desktop-header')).toBeNull();
     expect(container.querySelector('.remote-desktop-presence')).toBeNull();
+    // "优化连接中" belongs to the connecting overlay in the middle of the
+    // screen, not to the footer, where it sat beside every stacked toolbar and
+    // said nothing about a session that was already up.
     expect(container.querySelector('.remote-desktop-connection-summary')?.textContent)
-      .toContain('remote_desktop.connection_optimizing');
+      .not.toContain('remote_desktop.connection_optimizing');
+    // Presence and link are readable without asking for them.
+    expect(container.querySelector('[data-viewer-count]')?.closest('.remote-desktop-stats')).not.toBeNull();
+    expect(container.querySelector('[data-controller-count]')?.closest('.remote-desktop-stats')).not.toBeNull();
+    expect(container.querySelector('.remote-desktop-stats')?.textContent).toContain('remote_desktop.route');
+    expect(container.querySelector('.remote-desktop-stats')?.textContent).toContain('remote_desktop.duration');
     expect(container.querySelector('.remote-desktop-diagnostics')).toBeNull();
-    expect(container.querySelector('[data-viewer-count="1"]')).toBeNull();
     const toggle = getByRole('button', { name: 'remote_desktop.nerd_stats_show' });
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
 
     act(() => (toggle as HTMLButtonElement).click());
 
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    expect(container.querySelector('[data-viewer-count="1"]')?.closest('footer')).not.toBeNull();
-    expect(container.querySelector('[data-controller-count="1"]')?.closest('footer')).not.toBeNull();
+    expect(container.querySelector('.remote-desktop-diagnostics')).not.toBeNull();
   });
 
   it('uses the compact toolbar as the drag handle and keeps eight-way resize', async () => {
@@ -930,16 +936,25 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       rawCapability: 'secret-capability-marker',
       inputHistory: 'KeyA',
     }));
+    // Resolution, frame rate and bitrate are always on: they are how you tell a
+    // usable session from a bad one, so they must not need a toggle first.
+    const stats = container.querySelector('.remote-desktop-stats');
+    expect(stats?.textContent).toContain('1920×1080');
+    expect(stats?.textContent).toContain('29 FPS');
+    expect(stats?.textContent).toContain('4.2 Mbps · 24 ms');
+    expect(stats?.textContent).toContain('remote_desktop.encoder');
+    expect(stats?.textContent).toContain('remote_desktop.quality');
+    expect(stats?.textContent).toContain('remote_desktop.dropped_frames');
     expect(container.querySelector('.remote-desktop-diagnostics')).toBeNull();
     act(() => (container.querySelector('.remote-desktop-nerd-toggle') as HTMLButtonElement).click());
-    const diagnostics = container.querySelector('.remote-desktop-diagnostics');
-    expect(diagnostics?.textContent).toContain('1920×1080');
-    expect(diagnostics?.textContent).toContain('29 FPS');
-    expect(diagnostics?.textContent).toContain('4.2 Mbps · 24 ms');
-    expect(diagnostics?.textContent).not.toContain('secret-sdp-marker');
-    expect(diagnostics?.textContent).not.toContain('secret-turn-marker');
-    expect(diagnostics?.textContent).not.toContain('secret-capability-marker');
-    expect(diagnostics?.textContent).not.toContain('KeyA');
+    // Checked across the WHOLE footer, not just the nerd panel: moving fields
+    // into an always-visible row would otherwise be a way to leak past a test
+    // that only ever looked inside the panel.
+    const footer = container.querySelector('.remote-desktop-footer');
+    expect(footer?.textContent).not.toContain('secret-sdp-marker');
+    expect(footer?.textContent).not.toContain('secret-turn-marker');
+    expect(footer?.textContent).not.toContain('secret-capability-marker');
+    expect(footer?.textContent).not.toContain('KeyA');
   });
 
   it('shows each handshake and media step while the desktop connection advances', async () => {
@@ -955,7 +970,15 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const assertCurrentStep = (key: string) => {
       const progress = container.querySelector('.remote-desktop-connection-progress');
       expect(progress?.querySelectorAll('li')).toHaveLength(4);
+      // Four dots, not four rows of text -- and one dot per stage, so the
+      // count cannot drift away from REMOTE_DESKTOP_CONNECTION_STEPS.
+      expect(progress?.querySelectorAll('.remote-desktop-connection-dot')).toHaveLength(4);
+      // The heading is the one line of prose here.
+      expect(progress?.querySelector('strong')?.textContent)
+        .toContain('remote_desktop.connection_optimizing');
+      // The stage name stays reachable for screen readers and on hover.
       expect(progress?.querySelector('[aria-current="step"]')?.textContent).toContain(key);
+      expect(progress?.querySelector('[aria-current="step"]')?.getAttribute('title')).toBe(key);
     };
 
     act(() => clientHooks[0]!.onSnapshot({ ...snapshot, state: REMOTE_DESKTOP_STATE.AUTHORIZING }));
