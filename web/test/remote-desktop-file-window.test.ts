@@ -14,8 +14,6 @@ import {
 } from '../../shared/transport/file-transfer.js';
 import {
   isPointOverRemoteDesktopOverlay,
-  remoteDesktopFileWindowDefaultSize,
-  remoteDesktopFileWindowWorkspace,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../src/remote-desktop-pointer-overlay.js';
 
@@ -79,182 +77,43 @@ describe('the file drawer scrolls instead of clipping', () => {
   });
 });
 
-describe('the file drawer is its own window', () => {
-  it('reuses FloatingPanel rather than hand-rolling drag and resize', () => {
-    expect(remoteDesktop).toContain('className={REMOTE_DESKTOP_OVERLAY_CLASS}');
-    expect(remoteDesktop).toMatch(/dragHandleSelector=("|\{')\.remote-desktop-file-drawer-head/);
-  });
-
-  it('gives the file window a stacking order above its parent panel', () => {
-    expect(remoteDesktop).toMatch(/zIndex=\{\(zIndex \?\? 10020\) \+ 2\}/);
-  });
-
-  it('no longer positions itself, so the window owns its geometry', () => {
+describe('the file drawer covers the whole remote desktop panel', () => {
+  /**
+   * It was briefly a draggable, resizable FloatingPanel. That fought the
+   * desktop for pointer input along its edges -- hovering them lit the desktop
+   * window's own resize handles and drove the remote cursor -- and it could not
+   * be moved anyway once it was large enough to be useful, because the clamp
+   * confines a window to `workspace - size`. Covering everything removes the
+   * edges, the geometry and the contest in one move.
+   */
+  it('is positioned over the panel rather than owning a window geometry', () => {
     const drawer = ruleBody('.remote-desktop-file-drawer');
-    expect(drawer).not.toMatch(/position:\s*absolute/);
-    expect(drawer).not.toMatch(/\bbottom:\s*58px/);
+    expect(drawer).toMatch(/position:\s*absolute/);
+    expect(drawer).toMatch(/inset:\s*0/);
+  });
+
+  it('carries the overlay class the pointer guard hit-tests for', () => {
+    // The guard matches `.closest('.<class>')`, so the class must be on the
+    // covering element itself now that no panel wrapper supplies it.
+    expect(remoteDesktop).toContain('remote-desktop-file-drawer ${REMOTE_DESKTOP_OVERLAY_CLASS}');
+  });
+
+  it('no longer wraps the drawer in a floating window', () => {
+    // A leftover wrapper would reintroduce both the edges and the clamp.
+    expect(remoteDesktop).not.toContain('remote-desktop-file-window');
+    expect(remoteDesktop).not.toMatch(/dragHandleSelector=("|\{')\.remote-desktop-file-drawer-head/);
+    expect(styles).not.toContain('.remote-desktop-file-window');
   });
 
   it('stays inside the remote desktop panel so fullscreen still paints it', () => {
     // `.remote-desktop-panel:fullscreen` exists; only the fullscreen element's
-    // subtree is rendered, so a portal to <body> would make the window vanish
-    // exactly when the user most wants it.
+    // subtree is rendered, so a portal to <body> would make it vanish exactly
+    // when the user most wants it.
     expect(styles).toContain('.remote-desktop-panel:fullscreen');
-    const drawerAt = remoteDesktop.indexOf('className={REMOTE_DESKTOP_OVERLAY_CLASS}');
+    const drawerAt = remoteDesktop.indexOf('REMOTE_DESKTOP_OVERLAY_CLASS}`}');
     const bodyReturn = remoteDesktop.indexOf('if (embedded) return panelBody;');
     expect(drawerAt).toBeGreaterThan(-1);
-    expect(drawerAt, 'the window must be rendered within panelBody').toBeLessThan(bodyReturn);
-  });
-});
-
-describe('the file window opens at the remote desktop window size', () => {
-  /**
-   * Two requirements pulling against each other, so both are asserted.
-   *
-   * "Open it the same size as the remote desktop window so I never have to
-   * resize it" -- and -- the earlier report that drag "follows for a bit then
-   * stops" and resize "grows a little then breaks". Neither gesture was
-   * broken: FloatingPanel confines a window to `workspace - size`, so a window
-   * the size of the workspace cannot move at all. Matching the host exactly is
-   * therefore right only while it still leaves travel.
-   */
-  const MIN_W = 720;
-  const MIN_H = 420;
-  const MIN_TRAVEL = 80;
-
-  const size = (workspace: { w: number; h: number }, host?: { width: number; height: number }) =>
-    remoteDesktopFileWindowDefaultSize({
-      viewportWidth: workspace.w,
-      viewportHeight: workspace.h,
-      hostSize: host ?? null,
-      workspace,
-    });
-
-  it('matches the host window exactly when there is room to spare', () => {
-    // The stated request, in the case where nothing has to give.
-    const result = size({ w: 1920, h: 1000 }, { width: 1200, height: 760 });
-    expect(result).toEqual({ width: 1200, height: 760 });
-  });
-
-  it('still matches when the host is only just small enough', () => {
-    // Host leaves exactly the travel floor: no adjustment is warranted.
-    const result = size({ w: 1400, h: 900 }, { width: 1320, height: 820 });
-    expect(result).toEqual({ width: 1320, height: 820 });
-  });
-
-  it('gives back travel when the host already fills the workspace', () => {
-    // The 13" case: the desktop window is itself clamped to the workspace, so
-    // copying it verbatim would produce a window that cannot be dragged.
-    const workspace = { w: 1440, h: 636 };
-    const result = size(workspace, { width: 1440, height: 636 });
-    expect(workspace.w - result.width, 'horizontal travel').toBeGreaterThanOrEqual(MIN_TRAVEL);
-    expect(workspace.h - result.height, 'vertical travel').toBeGreaterThanOrEqual(MIN_TRAVEL);
-  });
-
-  it('prefers the minimum size over the travel floor when they conflict', () => {
-    // A workspace barely larger than the minimum cannot supply both; the
-    // window must stay usable rather than shrink below its own floor.
-    const result = size({ w: 760, h: 460 }, { width: 760, height: 460 });
-    expect(result.width).toBe(MIN_W);
-    expect(result.height).toBe(MIN_H);
-  });
-
-  it('raises a host smaller than the minimum up to the minimum', () => {
-    // A collapsed or mid-animation host measurement must not produce a window
-    // below its own floor -- the clamp would then fight the minimum and the
-    // window would jump on first paint.
-    const result = size({ w: 1920, h: 1000 }, { width: 300, height: 200 });
-    expect(result.width).toBe(MIN_W);
-    expect(result.height).toBe(MIN_H);
-  });
-
-  it('opens as large as it can when there is no host to measure', () => {
-    // A default small enough that the panes show nothing forces a resize
-    // before the window is usable -- the exact friction this is removing. So
-    // the fallback is the largest window that is still draggable, not a
-    // fraction of the viewport.
-    const workspace = { w: 1440, h: 780 };
-    const result = size(workspace);
-    expect(workspace.w - result.width, 'still draggable').toBe(MIN_TRAVEL);
-    expect(workspace.h - result.height, 'still draggable').toBe(MIN_TRAVEL);
-  });
-
-  it('never opens small enough to hide the panes', () => {
-    // Across every realistic viewport the first open must fill most of the
-    // workspace, not a fraction of it.
-    for (const [w, h] of [[1440, 780], [1680, 900], [1920, 960], [1280, 700]]) {
-      const result = size({ w, h });
-      expect(result.width / w, `${w}x${h} width share`).toBeGreaterThan(0.9);
-      expect(result.height / h, `${w}x${h} height share`).toBeGreaterThan(0.85);
-    }
-  });
-
-  it('remembers a size the user chose instead of reimposing the default', () => {
-    // FloatingPanel persists geometry per window id and `loadGeom` prefers the
-    // stored value over defaultW/defaultH, so an enlarged window reopens
-    // enlarged. Pinned here because the default is only ever the FIRST open.
-    const panel = read('../src/components/FloatingPanel.tsx');
-    expect(panel).toMatch(/useState\(\(\) => loadGeom\(/);
-    expect(panel).toMatch(/saveGeom\(id, geom\)/);
-    const loadGeom = panel.slice(panel.indexOf('function loadGeom'), panel.indexOf('function saveGeom'));
-    expect(loadGeom, 'stored geometry must win over the defaults').toContain('localStorage.getItem');
-    expect(loadGeom.indexOf('localStorage.getItem'))
-      .toBeLessThan(loadGeom.lastIndexOf('return clampGeomToViewport(fallback'));
-  });
-
-  it('never exceeds the workspace, whatever the host reports', () => {
-    // A stale or fullscreen host measurement must not produce a window the
-    // clamp will immediately shrink on first paint.
-    const workspace = { w: 1280, h: 700 };
-    const result = size(workspace, { width: 5000, height: 5000 });
-    expect(result.width).toBeLessThanOrEqual(workspace.w);
-    expect(result.height).toBeLessThanOrEqual(workspace.h);
-  });
-
-  it('would have failed with the fixed 1120x720 default that shipped', () => {
-    // The original regression, stated as a number: on a 13" laptop that left
-    // 36px of vertical travel, which is what "it just stops" was.
-    const workspace = { w: 1440, h: 636 };
-    expect(workspace.h - 720, 'the old default did not even fit').toBeLessThan(0);
-    const result = size(workspace, { width: 1440, height: 636 });
-    expect(workspace.h - result.height).toBeGreaterThanOrEqual(MIN_TRAVEL);
-  });
-
-  it('measures the host instead of assuming its configured default', () => {
-    // That window persists its own geometry, so `defaultH={760}` is not
-    // necessarily its current height.
-    expect(remoteDesktop).toContain('floating-panel-remote-desktop-${machine.serverId}');
-    expect(remoteDesktop).toContain('getBoundingClientRect()');
-    expect(remoteDesktop).toContain('defaultW={fileWindowSize.width}');
-    expect(remoteDesktop).not.toMatch(/defaultW=\{1120\}/);
-  });
-
-  it('subtracts the same bottom reserve the clamp does', () => {
-    // Behavioural, not a source grep: computing against a different workspace
-    // than FloatingPanel clamps with is how a window is resized on first paint.
-    const originalW = window.innerWidth;
-    const originalH = window.innerHeight;
-    try {
-      Object.defineProperty(window, 'innerWidth', { value: 1440, configurable: true });
-      Object.defineProperty(window, 'innerHeight', { value: 900, configurable: true });
-      const workspace = remoteDesktopFileWindowWorkspace();
-      expect(workspace.w).toBe(1440);
-      // 100px bottom reserve, plus whatever the (absent) tab bar contributes.
-      expect(workspace.h, 'the 100px bottom reserve must be honoured')
-        .toBeLessThanOrEqual(800);
-      expect(workspace.h).toBeGreaterThan(0);
-    } finally {
-      Object.defineProperty(window, 'innerWidth', { value: originalW, configurable: true });
-      Object.defineProperty(window, 'innerHeight', { value: originalH, configurable: true });
-    }
-  });
-
-  it('sizes against the same workspace the clamp enforces', () => {
-    // Computing against a different workspace than FloatingPanel clamps with
-    // is how a window ends up resized the instant it appears.
-    const overlay = read('../src/remote-desktop-pointer-overlay.ts');
-    expect(overlay).toContain('viewportWorkspaceBelowSessionTabs');
-    expect(overlay).toContain('reserveWorkspaceBottom');
+    expect(drawerAt, 'must be rendered within panelBody').toBeLessThan(bodyReturn);
   });
 });
 
@@ -368,11 +227,11 @@ describe('the file window does not leak pointer input into the desktop', () => {
   });
 
   it('derives the overlay selector from one constant', () => {
-    // The class is both applied to the window and matched by the hit test; two
-    // literals would drift apart silently.
-    expect(remoteDesktop).toContain('className={REMOTE_DESKTOP_OVERLAY_CLASS}');
-    expect(remoteDesktop).not.toContain('className="remote-desktop-file-window"');
-    expect(styles).toContain('.remote-desktop-file-window');
+    // The class is both applied to the covering element and matched by the hit
+    // test; two literals would drift apart silently and the guard would stop
+    // firing without any test noticing.
+    expect(remoteDesktop).toContain('${REMOTE_DESKTOP_OVERLAY_CLASS}');
+    expect(remoteDesktop).not.toContain('"remote-desktop-file-window"');
   });
 });
 

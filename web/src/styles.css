@@ -10760,36 +10760,6 @@ button.quick-agent-delegation-preset.active {
   border-color: rgb(79 193 235 / 34%);
 }
 
-/* The FloatingPanel shell around the file drawer. The panel paints its own
-   dark chrome; the drawer supplies the neon skin, so the shell only needs to
-   stop it double-drawing a background. */
-.remote-desktop-file-window {
-  background: transparent !important;
-  border: 1px solid rgb(91 207 255 / 58%) !important;
-  border-radius: 14px !important;
-  box-shadow:
-    0 22px 64px rgb(0 0 0 / 64%),
-    inset 0 1px 0 rgb(255 255 255 / 8%),
-    0 0 30px rgb(31 184 255 / 12%) !important;
-}
-
-/* The drag handle. Suppressing selection stops a drag from painting the title
-   blue on the way past. */
-.remote-desktop-file-window .remote-desktop-file-drawer-head {
-  cursor: grab;
-  user-select: none;
-}
-
-.remote-desktop-file-window .remote-desktop-file-drawer-head:active {
-  cursor: grabbing;
-}
-
-/* FloatingPanel's own mousedown guard already skips <button>, so this is only
-   about the cursor not lying about what a click will do. */
-.remote-desktop-file-window .remote-desktop-file-drawer-head button {
-  cursor: pointer;
-}
-
 /* Quick access: home / Desktop / Downloads / Documents (+ This PC). Wraps
    rather than clipping: the labels are translated, and Russian and Japanese
    are far wider than English. */
@@ -10833,10 +10803,14 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-file-drawer {
-  /* Fills the FloatingPanel that owns its geometry; it no longer positions
-     itself. */
-  width: 100%;
-  height: 100%;
+  /* Covers the whole remote desktop panel. It used to be a draggable window,
+     which fought the desktop for pointer input along its edges and could not
+     be moved anyway once it was large enough to be useful -- the clamp confines
+     a window to `workspace - size`. Covering everything removes the edges, the
+     geometry and the contest at once. */
+  position: absolute;
+  inset: 0;
+  z-index: 12;
   min-height: 0;
   overflow: hidden;
   padding: 12px;
@@ -11488,12 +11462,6 @@ button.quick-agent-delegation-preset.active {
      document instead of three nested scrollers fighting for a short viewport.
      `display: block` deliberately drops the grid rows that the desktop layout
      needs. */
-  .remote-desktop-file-window {
-    inset: 92px 8px 8px !important;
-    width: auto !important;
-    height: auto !important;
-  }
-
   .remote-desktop-file-drawer {
     max-height: none;
     overflow: auto;

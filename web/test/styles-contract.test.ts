@@ -173,16 +173,14 @@ describe('styles.css regression contracts', () => {
       : '';
     expect(mobileBlock).toBeTruthy();
 
-    // The guarantee is unchanged -- pinned to the viewport, and laid out in
-    // document flow -- but it is now split across two elements: the drawer
-    // became the CONTENT of a FloatingPanel, and the panel owns geometry.
-    // The panel writes left/top/width/height as INLINE styles, so only
-    // `!important` here can pin it to the phone viewport.
-    const windowRule = mobileBlock.match(/\.remote-desktop-file-window\s*\{[^}]*\}/)?.[0];
-    expect(windowRule, 'the mobile file window must be viewport-bound').toBeTruthy();
-    expect(windowRule).toMatch(/inset:[^;]*!important/);
-    expect(windowRule).toMatch(/width:\s*auto\s*!important/);
-    expect(windowRule).toMatch(/height:\s*auto\s*!important/);
+    // The guarantee is unchanged -- bounded to the visible area, and laid out
+    // in document flow. It is back on one element: the drawer covers the
+    // remote desktop panel directly (`position: absolute; inset: 0`) instead
+    // of being the content of a floating window that owned its own geometry.
+    const desktopRule = css.match(/\n\.remote-desktop-file-drawer\s*\{[^}]*\}/)?.[0];
+    expect(desktopRule, 'the drawer must bound itself to the panel').toBeTruthy();
+    expect(desktopRule).toMatch(/position:\s*absolute/);
+    expect(desktopRule).toMatch(/inset:\s*0/);
 
     const drawerRule = mobileBlock.match(/\.remote-desktop-file-drawer\s*\{[^}]*\}/)?.[0];
     expect(drawerRule).toMatch(/display:\s*block/);

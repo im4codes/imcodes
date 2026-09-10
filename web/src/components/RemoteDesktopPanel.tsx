@@ -20,8 +20,6 @@ import {
 } from '@shared/transport/file-transfer.js';
 import {
   isPointOverRemoteDesktopOverlay,
-  remoteDesktopFileWindowDefaultSize,
-  remoteDesktopFileWindowWorkspace,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../remote-desktop-pointer-overlay.js';
 import { downloadAttachment } from '../api.js';
@@ -353,26 +351,6 @@ export function RemoteDesktopPanel({
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
   const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
-  // Sized against the viewport, not fixed pixels: FloatingPanel confines a
-  // window to `workspace - size`, so a near-workspace-sized default leaves it
-  // barely able to move or grow.
-  const fileWindowSize = useMemo(() => {
-    // Match the remote desktop window it belongs to, measured rather than
-    // assumed: that window persists its own geometry, so its configured
-    // default is not necessarily its current size.
-    const host = document
-      .querySelector<HTMLElement>(`[data-testid="floating-panel-remote-desktop-${machine.serverId}"]`)
-      ?.getBoundingClientRect();
-    return remoteDesktopFileWindowDefaultSize({
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-      hostSize: host ? { width: host.width, height: host.height } : null,
-      workspace: remoteDesktopFileWindowWorkspace(),
-    });
-    // Measured when the window first opens; re-measuring on every render would
-    // fight the user's own resize of it.
-  }, [machine.serverId, filePanelOpen]);
-
   const machineDirectoryAdapter = useMemo(
     () => new MachineDirectoryWsAdapter(machine.serverId),
     [machine.serverId],
@@ -2517,25 +2495,14 @@ export function RemoteDesktopPanel({
         })()}
 
         {filePanelOpen && !fileDrawerMinimized && (
-          // Its own window, reusing the same drag/resize/persist machinery as
-          // every other floating panel rather than growing a second one. It
-          // stays a DOM DESCENDANT of .remote-desktop-panel on purpose: that
-          // element can go fullscreen, and only the fullscreen element's
-          // subtree is painted, so a portal to <body> would vanish there.
-          <FloatingPanel
-            id={`remote-desktop-files-${machine.serverId}`}
-            title={t('remote_desktop.files')}
-            onClose={() => setFilePanelOpen(false)}
-            zIndex={(zIndex ?? 10020) + 2}
-            defaultW={fileWindowSize.width}
-            defaultH={fileWindowSize.height}
-            minW={720}
-            minH={420}
-            className={REMOTE_DESKTOP_OVERLAY_CLASS}
-            hideTitleBar
-            dragHandleSelector=".remote-desktop-file-drawer-head"
+          // Covers the whole remote desktop window rather than floating over it.
+          // A draggable window here fought the desktop for pointer input at its
+          // edges and could not move anyway once it was this large, so the size
+          // that makes it useful is the size that makes a window pointless.
+          <aside
+            class={`remote-desktop-file-drawer ${REMOTE_DESKTOP_OVERLAY_CLASS}`}
+            aria-label={t('remote_desktop.files')}
           >
-          <aside class="remote-desktop-file-drawer" aria-label={t('remote_desktop.files')}>
             <div class="remote-desktop-file-drawer-head">
               <div class="remote-desktop-file-drawer-copy">
                 <strong>{t('remote_desktop.files')}</strong>
@@ -2771,7 +2738,6 @@ export function RemoteDesktopPanel({
               {transferError && <span role="alert">{transferError}</span>}
             </section>
           </aside>
-          </FloatingPanel>
         )}
 
         <footer class="remote-desktop-footer">
