@@ -20,6 +20,7 @@ import {
 } from '@shared/transport/file-transfer.js';
 import {
   isPointOverRemoteDesktopOverlay,
+  remoteDesktopFileWindowDefaultSize,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../remote-desktop-pointer-overlay.js';
 import { downloadAttachment } from '../api.js';
@@ -351,6 +352,14 @@ export function RemoteDesktopPanel({
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
   const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
+  // Sized against the viewport, not fixed pixels: FloatingPanel confines a
+  // window to `workspace - size`, so a near-workspace-sized default leaves it
+  // barely able to move or grow.
+  const fileWindowSize = useMemo(
+    () => remoteDesktopFileWindowDefaultSize(window.innerWidth, window.innerHeight),
+    [],
+  );
+
   const machineDirectoryAdapter = useMemo(
     () => new MachineDirectoryWsAdapter(machine.serverId),
     [machine.serverId],
@@ -2505,8 +2514,8 @@ export function RemoteDesktopPanel({
             title={t('remote_desktop.files')}
             onClose={() => setFilePanelOpen(false)}
             zIndex={(zIndex ?? 10020) + 2}
-            defaultW={1120}
-            defaultH={720}
+            defaultW={fileWindowSize.width}
+            defaultH={fileWindowSize.height}
             minW={720}
             minH={420}
             className={REMOTE_DESKTOP_OVERLAY_CLASS}

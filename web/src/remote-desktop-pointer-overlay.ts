@@ -39,3 +39,27 @@ export function isPointOverRemoteDesktopOverlay(
   const element = elementAtPoint(clientX, clientY);
   return Boolean(element?.closest(`.${REMOTE_DESKTOP_OVERLAY_CLASS}`));
 }
+
+/**
+ * A default size for the file window that leaves room to actually move it.
+ *
+ * FloatingPanel clamps with `clampGeometryFullyIntoWorkspace`, so a window is
+ * confined to `workspace - size` in each axis. The workspace is the viewport
+ * minus the session tab bar and a 100px bottom reserve, which on a laptop is
+ * often only ~750px tall -- so a fixed 720px-tall default left about 36px of
+ * travel and about 36px of growth. Both gestures started correctly and then
+ * appeared to "break" the moment they hit that wall.
+ *
+ * The old drawer sized itself RELATIVE to the panel (`calc(100% - 24px)`);
+ * turning it into a window is what turned those into absolute pixels. This
+ * restores the relative intent.
+ */
+export function remoteDesktopFileWindowDefaultSize(
+  viewportWidth: number,
+  viewportHeight: number,
+): { width: number; height: number } {
+  return {
+    width: Math.max(720, Math.min(1120, Math.round(viewportWidth * 0.72))),
+    height: Math.max(420, Math.min(720, Math.round(viewportHeight * 0.62))),
+  };
+}

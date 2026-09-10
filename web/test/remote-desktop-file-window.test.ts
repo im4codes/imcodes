@@ -14,6 +14,7 @@ import {
 } from '../../shared/transport/file-transfer.js';
 import {
   isPointOverRemoteDesktopOverlay,
+  remoteDesktopFileWindowDefaultSize,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../src/remote-desktop-pointer-overlay.js';
 
@@ -102,6 +103,92 @@ describe('the file drawer is its own window', () => {
     const bodyReturn = remoteDesktop.indexOf('if (embedded) return panelBody;');
     expect(drawerAt).toBeGreaterThan(-1);
     expect(drawerAt, 'the window must be rendered within panelBody').toBeLessThan(bodyReturn);
+  });
+});
+
+describe('the file window has room to move and grow', () => {
+  /**
+   * Reported as "drag follows for a bit then stops" and "resize grows a little
+   * then breaks". Neither gesture was broken -- both were hitting
+   * `clampGeometryFullyIntoWorkspace`, which confines a window to
+   * `workspace - size` on each axis. The workspace is the viewport minus the
+   * session tab bar minus a 100px bottom reserve, so a fixed 720px-tall
+   * default left only tens of pixels of travel on a laptop.
+   *
+   * These assert TRAVEL in pixels rather than "a size was chosen", because a
+   * size that merely looks reasonable can still leave a window immobile.
+   */
+  const BOTTOM_RESERVE = 100;
+  const TAB_BAR = 44;
+
+  /** What FloatingPanel's clamp leaves, given a viewport and a window size. */
+  function travel(viewportW: number, viewportH: number) {
+    const size = remoteDesktopFileWindowDefaultSize(viewportW, viewportH);
+    return {
+      x: viewportW - size.width,
+      y: (viewportH - TAB_BAR - BOTTOM_RESERVE) - size.height,
+      size,
+    };
+  }
+
+  const VIEWPORTS: Array<[string, number, number]> = [
+    ['13" laptop', 1440, 780],
+    ['15" laptop', 1680, 900],
+    ['1080p maximised', 1920, 960],
+    ['half-width window', 1024, 720],
+    ['very short window', 1280, 620],
+  ];
+
+  const MIN_W = 720;
+  const MIN_H = 420;
+
+  for (const [name, w, h] of VIEWPORTS) {
+    it(`leaves usable travel on a ${name}`, () => {
+      const { x, y, size } = travel(w, h);
+      // A window already at its minimum cannot be shrunk further to buy room,
+      // so the requirement is "leave travel OR be at the floor" -- stating it
+      // any other way would be a threshold bent to make the test pass.
+      const widthAtFloor = size.width === MIN_W;
+      const heightAtFloor = size.height === MIN_H;
+      if (!widthAtFloor) {
+        expect(x, `${name}: horizontal travel (window ${size.width}px)`).toBeGreaterThanOrEqual(120);
+      }
+      if (!heightAtFloor) {
+        expect(y, `${name}: vertical travel (window ${size.height}px)`).toBeGreaterThanOrEqual(120);
+      }
+      // Either way it must still fit, or the clamp shrinks it on first paint.
+      expect(size.height, `${name}: must fit the workspace`).toBeLessThanOrEqual(h - TAB_BAR - BOTTOM_RESERVE);
+    });
+  }
+
+  it('would have failed with the fixed 1120x720 default that shipped', () => {
+    // The regression itself, stated as a number: on a 13" laptop the old
+    // default left 36px of vertical travel, which is what "it just stops" was.
+    const oldVerticalTravel = (780 - TAB_BAR - BOTTOM_RESERVE) - 720;
+    expect(oldVerticalTravel).toBeLessThan(50);
+    expect(travel(1440, 780).y, 'the new default must be far better').toBeGreaterThan(oldVerticalTravel);
+  });
+
+  it('never drops below the window minimums', () => {
+    // Shrinking to gain travel must not produce a window smaller than the
+    // minW/minH the panel is given, or the clamp fights the minimum instead.
+    for (const [name, w, h] of [...VIEWPORTS, ['tiny', 400, 300] as [string, number, number]]) {
+      const size = remoteDesktopFileWindowDefaultSize(w, h);
+      expect(size.width, `${name} width`).toBeGreaterThanOrEqual(720);
+      expect(size.height, `${name} height`).toBeGreaterThanOrEqual(420);
+    }
+  });
+
+  it('does not grow past the old maximum on a huge display', () => {
+    const size = remoteDesktopFileWindowDefaultSize(3840, 2160);
+    expect(size.width).toBeLessThanOrEqual(1120);
+    expect(size.height).toBeLessThanOrEqual(720);
+  });
+
+  it('is wired into the panel instead of fixed pixels', () => {
+    expect(remoteDesktop).toContain('defaultW={fileWindowSize.width}');
+    expect(remoteDesktop).toContain('defaultH={fileWindowSize.height}');
+    expect(remoteDesktop).not.toMatch(/defaultW=\{1120\}/);
   });
 });
 
