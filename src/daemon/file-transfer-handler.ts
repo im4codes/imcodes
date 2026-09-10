@@ -14,6 +14,7 @@ import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_DIRECTORY_PATH,
+  isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
@@ -39,11 +40,24 @@ import {
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
 } from '../../shared/transport/file-transfer.js';
+import {
+  resolveWellKnownDirectory,
+  WELL_KNOWN_DIRECTORY,
+  type WellKnownDirectoryKind,
+} from './well-known-directories.js';
 import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
+
+/** Sentinel path -> the directory it names. */
+const WELL_KNOWN_DIRECTORY_BY_SENTINEL: Record<string, WellKnownDirectoryKind> = {
+  [FILE_TRANSFER_DIRECTORY_PATH.HOME]: WELL_KNOWN_DIRECTORY.HOME,
+  [FILE_TRANSFER_DIRECTORY_PATH.DESKTOP]: WELL_KNOWN_DIRECTORY.DESKTOP,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS]: WELL_KNOWN_DIRECTORY.DOWNLOADS,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS]: WELL_KNOWN_DIRECTORY.DOCUMENTS,
+};
 
 /** Minimal reusable sender boundary implemented by both ServerLink and the thin node runtime. */
 export interface FileTransferSender {
@@ -1042,7 +1056,15 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
       return;
     }
 
-    const canonical = await resolveCanonical(parsed.value.path, 'strict');
+    // A well-known sentinel becomes a concrete path HERE, before the gate --
+    // never instead of it. `resolveCanonical` and the sensitive-path denylist
+    // still decide whether the resolved directory may be listed, so a shortcut
+    // can only ever reach somewhere the user could already have typed.
+    const requestedPath = isFileTransferWellKnownDirectoryPath(parsed.value.path)
+      ? await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path])
+      : parsed.value.path;
+
+    const canonical = await resolveCanonical(requestedPath, 'strict');
     if (!canonical) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
     const directoryStat = await lstat(canonical.realPath);
     if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {

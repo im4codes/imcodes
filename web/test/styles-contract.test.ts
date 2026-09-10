@@ -172,10 +172,21 @@ describe('styles.css regression contracts', () => {
       ? css.slice(mobileStart, mobileEnd)
       : '';
     expect(mobileBlock).toBeTruthy();
+
+    // The guarantee is unchanged -- pinned to the viewport, and laid out in
+    // document flow -- but it is now split across two elements: the drawer
+    // became the CONTENT of a FloatingPanel, and the panel owns geometry.
+    // The panel writes left/top/width/height as INLINE styles, so only
+    // `!important` here can pin it to the phone viewport.
+    const windowRule = mobileBlock.match(/\.remote-desktop-file-window\s*\{[^}]*\}/)?.[0];
+    expect(windowRule, 'the mobile file window must be viewport-bound').toBeTruthy();
+    expect(windowRule).toMatch(/inset:[^;]*!important/);
+    expect(windowRule).toMatch(/width:\s*auto\s*!important/);
+    expect(windowRule).toMatch(/height:\s*auto\s*!important/);
+
     const drawerRule = mobileBlock.match(/\.remote-desktop-file-drawer\s*\{[^}]*\}/)?.[0];
-    expect(drawerRule).toMatch(/position:\s*fixed/);
-    expect(drawerRule).toMatch(/width:\s*calc\(100dvw - 16px\)/);
     expect(drawerRule).toMatch(/display:\s*block/);
+    expect(drawerRule).toMatch(/overflow:\s*auto/);
     const explorerRule = mobileBlock.match(/\.remote-desktop-file-explorer\s*\{[^}]*\}/)?.[0];
     expect(explorerRule).toMatch(/grid-template-columns:\s*minmax\(0, 1fr\)/);
     const queueRule = mobileBlock.match(/\.remote-desktop-transfer-queue\s*\{[^}]*\}/)?.[0];

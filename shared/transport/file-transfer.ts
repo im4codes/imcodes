@@ -77,10 +77,46 @@ export const FILE_TRANSFER_DIRECTORY_CAPABILITY = 'file.transfer.directory.v1' a
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
 export const FILE_TRANSFER_DIRECTORY_MAX_ENTRIES = 512;
+/**
+ * Sentinel paths the daemon resolves on the REMOTE machine's behalf.
+ *
+ * Only the daemon knows where these actually live: `Downloads` may have been
+ * redirected on Windows, and on Linux it is whatever `user-dirs.dirs` says --
+ * possibly localized ("Téléchargements"). So the browser asks by NAME and the
+ * daemon answers with the real path in `resolvedPath`.
+ *
+ * They ride in the existing `path` field on purpose. `validateFileDirectoryListRequest`
+ * enforces `hasOnlyKeys(['type','requestId','path'])` and the server route
+ * re-checks the same key set, so a new request field would be a breaking change
+ * across three layers; a new sentinel value is not. `:drives:` already
+ * established the pattern.
+ */
 export const FILE_TRANSFER_DIRECTORY_PATH = {
   WINDOWS_DRIVES: ':drives:',
   WINDOWS_DRIVES_ROOT: '__imcodes_windows_drives__',
+  HOME: ':home:',
+  DESKTOP: ':desktop:',
+  DOWNLOADS: ':downloads:',
+  DOCUMENTS: ':documents:',
 } as const;
+
+/** The sentinels that resolve to a well-known user directory. */
+export const FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS = [
+  FILE_TRANSFER_DIRECTORY_PATH.HOME,
+  FILE_TRANSFER_DIRECTORY_PATH.DESKTOP,
+  FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS,
+  FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS,
+] as const;
+
+export type FileTransferWellKnownDirectoryPath =
+  (typeof FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS)[number];
+
+export function isFileTransferWellKnownDirectoryPath(
+  value: unknown,
+): value is FileTransferWellKnownDirectoryPath {
+  return typeof value === 'string'
+    && (FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS as readonly string[]).includes(value);
+}
 
 /** Machine-readable upload-error codes shared by the daemon (producer), server
  *  (relay) and web (localized display). */

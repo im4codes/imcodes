@@ -948,7 +948,11 @@
     "rename_failed": "Failed to rename item",
     "delete_confirm": "Delete {{name}}? This cannot be undone.",
     "delete_failed": "Failed to delete item",
-    "invalid_name": "Name cannot contain path separators"
+    "invalid_name": "Name cannot contain path separators",
+    "quick_access": "Quick access",
+    "desktop": "Desktop",
+    "downloads": "Downloads",
+    "documents": "Documents"
   },
   "toast": {
     "finished": "finished",

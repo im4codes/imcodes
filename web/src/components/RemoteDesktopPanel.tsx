@@ -15,6 +15,7 @@ import {
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_PATH,
+  isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
 import { downloadAttachment } from '../api.js';
@@ -493,10 +494,16 @@ export function RemoteDesktopPanel({
     ? (supportsDirectoryTransfer ? selectedRemoteFile : legacyFetchPath.trim())
     : '';
   const handleRemotePathChange = useCallback((path: string) => {
-    const isRoot = path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES
+    // A sentinel is a REQUEST, not a location. The browser publishes it the
+    // instant navigation starts and only rewrites it to the daemon's
+    // `resolvedPath` once the listing lands, so accepting it here would briefly
+    // advertise ":downloads:" as the send destination -- and a send in that
+    // window would target a directory that does not exist.
+    const isUnresolved = path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES
       || path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT
+      || isFileTransferWellKnownDirectoryPath(path)
       || path === t('file_browser.this_pc');
-    setDestinationDirectory(isRoot ? '' : path);
+    setDestinationDirectory(isUnresolved ? '' : path);
     setSelectedRemoteFile('');
   }, [t]);
   const handleRemoteSelectionChange = useCallback((path: string | null, isDirectory: boolean) => {
@@ -2466,6 +2473,24 @@ export function RemoteDesktopPanel({
         })()}
 
         {filePanelOpen && !fileDrawerMinimized && (
+          // Its own window, reusing the same drag/resize/persist machinery as
+          // every other floating panel rather than growing a second one. It
+          // stays a DOM DESCENDANT of .remote-desktop-panel on purpose: that
+          // element can go fullscreen, and only the fullscreen element's
+          // subtree is painted, so a portal to <body> would vanish there.
+          <FloatingPanel
+            id={`remote-desktop-files-${machine.serverId}`}
+            title={t('remote_desktop.files')}
+            onClose={() => setFilePanelOpen(false)}
+            zIndex={(zIndex ?? 10020) + 2}
+            defaultW={1120}
+            defaultH={720}
+            minW={720}
+            minH={420}
+            className="remote-desktop-file-window"
+            hideTitleBar
+            dragHandleSelector=".remote-desktop-file-drawer-head"
+          >
           <aside class="remote-desktop-file-drawer" aria-label={t('remote_desktop.files')}>
             <div class="remote-desktop-file-drawer-head">
               <div class="remote-desktop-file-drawer-copy">
@@ -2623,6 +2648,7 @@ export function RemoteDesktopPanel({
                       readOnly
                       hideFooter
                       hideBreadcrumbConfirm
+                      quickAccess
                       onCurrentPathChange={handleRemotePathChange}
                       onSelectedPathChange={handleRemoteSelectionChange}
                       onPreviewFile={() => {}}
@@ -2701,6 +2727,7 @@ export function RemoteDesktopPanel({
               {transferError && <span role="alert">{transferError}</span>}
             </section>
           </aside>
+          </FloatingPanel>
         )}
 
         <footer class="remote-desktop-footer">

@@ -948,7 +948,11 @@
     "rename_failed": "No se pudo renombrar el elemento",
     "delete_confirm": "¿Eliminar {{name}}? Esta acción no se puede deshacer.",
     "delete_failed": "No se pudo eliminar el elemento",
-    "invalid_name": "El nombre no puede contener separadores de ruta"
+    "invalid_name": "El nombre no puede contener separadores de ruta",
+    "quick_access": "Acceso rápido",
+    "desktop": "Escritorio",
+    "downloads": "Descargas",
+    "documents": "Documentos"
   },
   "toast": {
     "finished": "terminó",

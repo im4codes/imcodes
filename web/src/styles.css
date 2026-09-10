@@ -10760,16 +10760,94 @@ button.quick-agent-delegation-preset.active {
   border-color: rgb(79 193 235 / 34%);
 }
 
+/* The FloatingPanel shell around the file drawer. The panel paints its own
+   dark chrome; the drawer supplies the neon skin, so the shell only needs to
+   stop it double-drawing a background. */
+.remote-desktop-file-window {
+  background: transparent !important;
+  border: 1px solid rgb(91 207 255 / 58%) !important;
+  border-radius: 14px !important;
+  box-shadow:
+    0 22px 64px rgb(0 0 0 / 64%),
+    inset 0 1px 0 rgb(255 255 255 / 8%),
+    0 0 30px rgb(31 184 255 / 12%) !important;
+}
+
+/* The drag handle. Suppressing selection stops a drag from painting the title
+   blue on the way past. */
+.remote-desktop-file-window .remote-desktop-file-drawer-head {
+  cursor: grab;
+  user-select: none;
+}
+
+.remote-desktop-file-window .remote-desktop-file-drawer-head:active {
+  cursor: grabbing;
+}
+
+/* FloatingPanel's own mousedown guard already skips <button>, so this is only
+   about the cursor not lying about what a click will do. */
+.remote-desktop-file-window .remote-desktop-file-drawer-head button {
+  cursor: pointer;
+}
+
+/* Quick access: home / Desktop / Downloads / Documents (+ This PC). Wraps
+   rather than clipping: the labels are translated, and Russian and Japanese
+   are far wider than English. */
+.fb-quick-access {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 6px 0;
+}
+
+.fb-quick-access-btn {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #cfe8f5;
+  white-space: nowrap;
+  cursor: pointer;
+  background: rgb(20 46 66 / 70%);
+  border: 1px solid rgb(91 207 255 / 26%);
+  border-radius: 999px;
+}
+
+.fb-quick-access-btn:hover {
+  color: #eaf8ff;
+  background: rgb(31 74 103 / 82%);
+  border-color: rgb(91 207 255 / 52%);
+}
+
+.fb-quick-access-btn:focus-visible {
+  outline: 2px solid rgb(91 207 255 / 70%);
+  outline-offset: 1px;
+}
+
+.fb-quick-access-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .remote-desktop-file-drawer {
-  position: absolute;
-  z-index: 12;
-  right: 12px;
-  bottom: 58px;
-  width: min(1120px, calc(100% - 24px));
-  max-height: min(760px, calc(100% - 108px));
+  /* Fills the FloatingPanel that owns its geometry; it no longer positions
+     itself. */
+  width: 100%;
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
   padding: 12px;
   display: grid;
+  /* The fix for "the tree will not scroll and the transfer list disappears".
+     These rows were implicitly `auto`, so the explorer grew to its content,
+     pushed the queue past the clip edge, and left .fb-tree's overflow-y:auto
+     with no bounded ancestor to scroll against. `minmax(0, 1fr)` gives the
+     explorer the leftover space AND permits it to shrink below its content,
+     which is what turns the inner overflow into a real scrollbar. */
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 11px;
   color: #e7f7ff;
   background:
@@ -10927,11 +11005,6 @@ button.quick-agent-delegation-preset.active {
   border-radius: 8px;
 }
 
-.remote-desktop-file-drawer .remote-desktop-transfer-list {
-  max-height: 210px;
-  overflow: auto;
-}
-
 .remote-desktop-directory-picker {
   position: absolute;
   z-index: 2;
@@ -10951,7 +11024,10 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-file-explorer {
-  min-height: 360px;
+  /* A 360px floor here re-broke the chain: a row that cannot shrink below its
+     content is the same as an auto row. The window's own minH keeps it
+     usable instead. */
+  min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 126px minmax(0, 1fr);
   gap: 10px;
@@ -10959,7 +11035,7 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-file-pane {
   min-width: 0;
-  min-height: 360px;
+  min-height: 0;
   overflow: hidden;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
@@ -11198,8 +11274,10 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-transfer-queue {
+  /* Always visible: it is the third grid row and sizes to content, capped so a
+     long queue cannot eat the explorer. */
   min-height: 118px;
-  max-height: 230px;
+  max-height: min(230px, 40%);
   overflow: hidden;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -11406,11 +11484,17 @@ button.quick-agent-delegation-preset.active {
     width: calc(100% - 16px);
   }
 
+  /* On phones the columns stack, so let the whole drawer scroll as one
+     document instead of three nested scrollers fighting for a short viewport.
+     `display: block` deliberately drops the grid rows that the desktop layout
+     needs. */
+  .remote-desktop-file-window {
+    inset: 92px 8px 8px !important;
+    width: auto !important;
+    height: auto !important;
+  }
+
   .remote-desktop-file-drawer {
-    position: fixed;
-    inset: 92px auto 8px 8px;
-    width: calc(100dvw - 16px);
-    max-width: calc(100dvw - 16px);
     max-height: none;
     overflow: auto;
     display: block;

@@ -948,7 +948,11 @@
     "rename_failed": "項目の名前変更に失敗しました",
     "delete_confirm": "{{name}} を削除しますか？この操作は元に戻せません。",
     "delete_failed": "項目の削除に失敗しました",
-    "invalid_name": "名前にパス区切り文字は使用できません"
+    "invalid_name": "名前にパス区切り文字は使用できません",
+    "quick_access": "クイックアクセス",
+    "desktop": "デスクトップ",
+    "downloads": "ダウンロード",
+    "documents": "書類"
   },
   "toast": {
     "finished": "完了",

@@ -1,5 +1,6 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import { FILE_TRANSFER_DIRECTORY_PATH } from '@shared/transport/file-transfer.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -64,7 +65,7 @@ import { resizeHandleHoverEvents } from './window-resize.js';
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 /** Sentinel path that asks the daemon to list Windows drive roots. */
-const WINDOWS_DRIVES_PATH = ':drives:';
+const WINDOWS_DRIVES_PATH = FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES;
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -161,6 +162,14 @@ export interface FileBrowserProps {
   onCurrentPathChange?: (path: string) => void;
   /** Embedded hosts may provide their own primary action outside the browser. */
   hideBreadcrumbConfirm?: boolean;
+  /**
+   * Show a one-click row for the user's home / Desktop / Downloads / Documents.
+   *
+   * Opt-in because only a remote-machine browser can honour it: the paths are
+   * sentinels the DAEMON resolves (see FILE_TRANSFER_DIRECTORY_PATH), so a
+   * browser pointed at anything else would navigate to a literal ":desktop:".
+   */
+  quickAccess?: boolean;
   /** The second argument exposes the already-loaded single-file preview so a
    * host can consume explicitly selected text without issuing a duplicate read. */
   onConfirm: (paths: string[], preview?: FileBrowserPreviewState) => void;
@@ -511,6 +520,7 @@ export function FileBrowser({
   onSelectedPathChange,
   onCurrentPathChange,
   hideBreadcrumbConfirm = false,
+  quickAccess = false,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -2333,12 +2343,41 @@ export function FileBrowser({
   const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === thisPcLabel;
   const isAtDrives = currentLabel === thisPcLabel;
 
+  // Sentinels, not paths: the daemon resolves each to wherever it really lives
+  // on the remote machine (a relocated Downloads, a localized XDG directory).
+  const quickAccessTargets = [
+    { path: FILE_TRANSFER_DIRECTORY_PATH.HOME, label: t('file_browser.home'), icon: '🏠' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DESKTOP, label: t('file_browser.desktop'), icon: '🖥️' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS, label: t('file_browser.downloads'), icon: '⬇️' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS, label: t('file_browser.documents'), icon: '📄' },
+    // Only meaningful where drive letters exist.
+    ...(looksLikeWindows
+      ? [{ path: WINDOWS_DRIVES_PATH, label: t('file_browser.this_pc'), icon: '💾' }]
+      : []),
+  ];
+
   const breadcrumb = (
     <div class="fb-nav-stack">
+      {quickAccess && (
+        <div class="fb-quick-access" role="group" aria-label={t('file_browser.quick_access')}>
+          {quickAccessTargets.map((target) => (
+            <button
+              key={target.path}
+              type="button"
+              class="fb-quick-access-btn"
+              title={target.label}
+              onClick={() => navigateTo(target.path)}
+            >
+              <span aria-hidden="true">{target.icon}</span>
+              <span class="fb-quick-access-label">{target.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
       <div class="fb-nav">
         <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
         <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
-        {looksLikeWindows && (
+        {looksLikeWindows && !quickAccess && (
           <button
             class="fb-nav-btn"
             onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
