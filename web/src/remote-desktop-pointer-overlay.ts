@@ -1,3 +1,8 @@
+import {
+  reserveWorkspaceBottom,
+  viewportWorkspaceBelowSessionTabs,
+} from './desktop-window-maximize.js';
+
 /**
  * Which pointer positions belong to the remote desktop, and which belong to a
  * window floating above it.
@@ -40,26 +45,78 @@ export function isPointOverRemoteDesktopOverlay(
   return Boolean(element?.closest(`.${REMOTE_DESKTOP_OVERLAY_CLASS}`));
 }
 
+/** Never smaller than the window's own minimums. */
+const FILE_WINDOW_MIN_W = 720;
+const FILE_WINDOW_MIN_H = 420;
+
 /**
- * A default size for the file window that leaves room to actually move it.
+ * Enough room left over that a drag visibly moves the window.
  *
- * FloatingPanel clamps with `clampGeometryFullyIntoWorkspace`, so a window is
- * confined to `workspace - size` in each axis. The workspace is the viewport
- * minus the session tab bar and a 100px bottom reserve, which on a laptop is
- * often only ~750px tall -- so a fixed 720px-tall default left about 36px of
- * travel and about 36px of growth. Both gestures started correctly and then
- * appeared to "break" the moment they hit that wall.
- *
- * The old drawer sized itself RELATIVE to the panel (`calc(100% - 24px)`);
- * turning it into a window is what turned those into absolute pixels. This
- * restores the relative intent.
+ * FloatingPanel confines a window to `workspace - size`, so a window exactly
+ * the size of the workspace cannot be dragged at all -- which is precisely how
+ * the fixed 1120x720 default came across as "drag just stops".
  */
-export function remoteDesktopFileWindowDefaultSize(
-  viewportWidth: number,
-  viewportHeight: number,
-): { width: number; height: number } {
-  return {
-    width: Math.max(720, Math.min(1120, Math.round(viewportWidth * 0.72))),
-    height: Math.max(420, Math.min(720, Math.round(viewportHeight * 0.62))),
+const FILE_WINDOW_MIN_TRAVEL = 80;
+
+/**
+ * How big the file window should open.
+ *
+ * The request is "same size as the remote desktop window, so I never have to
+ * resize it", and that is what `hostSize` delivers whenever it fits. The only
+ * adjustment is the travel floor above: on a display where the desktop window
+ * already fills the workspace, matching it exactly would produce a window that
+ * cannot be moved, so it gives back up to FILE_WINDOW_MIN_TRAVEL pixels.
+ *
+ * Without a host measurement it falls back to a fraction of the viewport. The
+ * drawer this window replaced was sized relative to the panel
+ * (`calc(100% - 24px)`); windowing it is what turned those into absolute
+ * pixels, and this restores the relative intent.
+ */
+export function remoteDesktopFileWindowDefaultSize(options: {
+  viewportWidth: number;
+  viewportHeight: number;
+  /** Measured size of the remote desktop window, when it can be measured. */
+  hostSize?: { width: number; height: number } | null;
+  /** Workspace the clamp will apply; defaults to FloatingPanel's own. */
+  workspace?: { w: number; h: number };
+}): { width: number; height: number } {
+  const workspace = options.workspace ?? {
+    w: options.viewportWidth,
+    h: options.viewportHeight,
   };
+
+  const wanted = options.hostSize ?? {
+    width: Math.round(options.viewportWidth * 0.72),
+    height: Math.round(options.viewportHeight * 0.62),
+  };
+
+  const fit = (want: number, available: number, min: number): number => {
+    // Leave travel, but never at the cost of going under the minimum: below
+    // that the clamp would fight the minimum instead and the window would be
+    // resized on first paint.
+    const ceiling = Math.max(min, available - FILE_WINDOW_MIN_TRAVEL);
+    return Math.max(min, Math.min(want, ceiling));
+  };
+
+  return {
+    width: fit(wanted.width, workspace.w, FILE_WINDOW_MIN_W),
+    height: fit(wanted.height, workspace.h, FILE_WINDOW_MIN_H),
+  };
+}
+
+/**
+ * The workspace FloatingPanel's clamp will actually use.
+ *
+ * Deliberately the same two helpers the panel itself calls rather than a
+ * private approximation: a sizing rule computed against a different workspace
+ * than the clamp enforces is how a window ends up resized on first paint.
+ */
+export function remoteDesktopFileWindowWorkspace(): { w: number; h: number } {
+  const bounds = reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    minW: FILE_WINDOW_MIN_W,
+    minH: FILE_WINDOW_MIN_H,
+  }));
+  return { w: bounds.w, h: bounds.h };
 }

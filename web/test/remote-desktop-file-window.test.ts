@@ -15,6 +15,7 @@ import {
 import {
   isPointOverRemoteDesktopOverlay,
   remoteDesktopFileWindowDefaultSize,
+  remoteDesktopFileWindowWorkspace,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../src/remote-desktop-pointer-overlay.js';
 
@@ -106,89 +107,128 @@ describe('the file drawer is its own window', () => {
   });
 });
 
-describe('the file window has room to move and grow', () => {
+describe('the file window opens at the remote desktop window size', () => {
   /**
-   * Reported as "drag follows for a bit then stops" and "resize grows a little
-   * then breaks". Neither gesture was broken -- both were hitting
-   * `clampGeometryFullyIntoWorkspace`, which confines a window to
-   * `workspace - size` on each axis. The workspace is the viewport minus the
-   * session tab bar minus a 100px bottom reserve, so a fixed 720px-tall
-   * default left only tens of pixels of travel on a laptop.
+   * Two requirements pulling against each other, so both are asserted.
    *
-   * These assert TRAVEL in pixels rather than "a size was chosen", because a
-   * size that merely looks reasonable can still leave a window immobile.
+   * "Open it the same size as the remote desktop window so I never have to
+   * resize it" -- and -- the earlier report that drag "follows for a bit then
+   * stops" and resize "grows a little then breaks". Neither gesture was
+   * broken: FloatingPanel confines a window to `workspace - size`, so a window
+   * the size of the workspace cannot move at all. Matching the host exactly is
+   * therefore right only while it still leaves travel.
    */
-  const BOTTOM_RESERVE = 100;
-  const TAB_BAR = 44;
-
-  /** What FloatingPanel's clamp leaves, given a viewport and a window size. */
-  function travel(viewportW: number, viewportH: number) {
-    const size = remoteDesktopFileWindowDefaultSize(viewportW, viewportH);
-    return {
-      x: viewportW - size.width,
-      y: (viewportH - TAB_BAR - BOTTOM_RESERVE) - size.height,
-      size,
-    };
-  }
-
-  const VIEWPORTS: Array<[string, number, number]> = [
-    ['13" laptop', 1440, 780],
-    ['15" laptop', 1680, 900],
-    ['1080p maximised', 1920, 960],
-    ['half-width window', 1024, 720],
-    ['very short window', 1280, 620],
-  ];
-
   const MIN_W = 720;
   const MIN_H = 420;
+  const MIN_TRAVEL = 80;
 
-  for (const [name, w, h] of VIEWPORTS) {
-    it(`leaves usable travel on a ${name}`, () => {
-      const { x, y, size } = travel(w, h);
-      // A window already at its minimum cannot be shrunk further to buy room,
-      // so the requirement is "leave travel OR be at the floor" -- stating it
-      // any other way would be a threshold bent to make the test pass.
-      const widthAtFloor = size.width === MIN_W;
-      const heightAtFloor = size.height === MIN_H;
-      if (!widthAtFloor) {
-        expect(x, `${name}: horizontal travel (window ${size.width}px)`).toBeGreaterThanOrEqual(120);
-      }
-      if (!heightAtFloor) {
-        expect(y, `${name}: vertical travel (window ${size.height}px)`).toBeGreaterThanOrEqual(120);
-      }
-      // Either way it must still fit, or the clamp shrinks it on first paint.
-      expect(size.height, `${name}: must fit the workspace`).toBeLessThanOrEqual(h - TAB_BAR - BOTTOM_RESERVE);
+  const size = (workspace: { w: number; h: number }, host?: { width: number; height: number }) =>
+    remoteDesktopFileWindowDefaultSize({
+      viewportWidth: workspace.w,
+      viewportHeight: workspace.h,
+      hostSize: host ?? null,
+      workspace,
     });
-  }
 
-  it('would have failed with the fixed 1120x720 default that shipped', () => {
-    // The regression itself, stated as a number: on a 13" laptop the old
-    // default left 36px of vertical travel, which is what "it just stops" was.
-    const oldVerticalTravel = (780 - TAB_BAR - BOTTOM_RESERVE) - 720;
-    expect(oldVerticalTravel).toBeLessThan(50);
-    expect(travel(1440, 780).y, 'the new default must be far better').toBeGreaterThan(oldVerticalTravel);
+  it('matches the host window exactly when there is room to spare', () => {
+    // The stated request, in the case where nothing has to give.
+    const result = size({ w: 1920, h: 1000 }, { width: 1200, height: 760 });
+    expect(result).toEqual({ width: 1200, height: 760 });
   });
 
-  it('never drops below the window minimums', () => {
-    // Shrinking to gain travel must not produce a window smaller than the
-    // minW/minH the panel is given, or the clamp fights the minimum instead.
-    for (const [name, w, h] of [...VIEWPORTS, ['tiny', 400, 300] as [string, number, number]]) {
-      const size = remoteDesktopFileWindowDefaultSize(w, h);
-      expect(size.width, `${name} width`).toBeGreaterThanOrEqual(720);
-      expect(size.height, `${name} height`).toBeGreaterThanOrEqual(420);
+  it('still matches when the host is only just small enough', () => {
+    // Host leaves exactly the travel floor: no adjustment is warranted.
+    const result = size({ w: 1400, h: 900 }, { width: 1320, height: 820 });
+    expect(result).toEqual({ width: 1320, height: 820 });
+  });
+
+  it('gives back travel when the host already fills the workspace', () => {
+    // The 13" case: the desktop window is itself clamped to the workspace, so
+    // copying it verbatim would produce a window that cannot be dragged.
+    const workspace = { w: 1440, h: 636 };
+    const result = size(workspace, { width: 1440, height: 636 });
+    expect(workspace.w - result.width, 'horizontal travel').toBeGreaterThanOrEqual(MIN_TRAVEL);
+    expect(workspace.h - result.height, 'vertical travel').toBeGreaterThanOrEqual(MIN_TRAVEL);
+  });
+
+  it('prefers the minimum size over the travel floor when they conflict', () => {
+    // A workspace barely larger than the minimum cannot supply both; the
+    // window must stay usable rather than shrink below its own floor.
+    const result = size({ w: 760, h: 460 }, { width: 760, height: 460 });
+    expect(result.width).toBe(MIN_W);
+    expect(result.height).toBe(MIN_H);
+  });
+
+  it('raises a host smaller than the minimum up to the minimum', () => {
+    // A collapsed or mid-animation host measurement must not produce a window
+    // below its own floor -- the clamp would then fight the minimum and the
+    // window would jump on first paint.
+    const result = size({ w: 1920, h: 1000 }, { width: 300, height: 200 });
+    expect(result.width).toBe(MIN_W);
+    expect(result.height).toBe(MIN_H);
+  });
+
+  it('falls back to a fraction of the viewport with no host to measure', () => {
+    const result = size({ w: 1440, h: 780 });
+    expect(result.width).toBeLessThan(1440);
+    expect(result.height).toBeLessThan(780);
+    expect(result.width).toBeGreaterThanOrEqual(MIN_W);
+    expect(result.height).toBeGreaterThanOrEqual(MIN_H);
+  });
+
+  it('never exceeds the workspace, whatever the host reports', () => {
+    // A stale or fullscreen host measurement must not produce a window the
+    // clamp will immediately shrink on first paint.
+    const workspace = { w: 1280, h: 700 };
+    const result = size(workspace, { width: 5000, height: 5000 });
+    expect(result.width).toBeLessThanOrEqual(workspace.w);
+    expect(result.height).toBeLessThanOrEqual(workspace.h);
+  });
+
+  it('would have failed with the fixed 1120x720 default that shipped', () => {
+    // The original regression, stated as a number: on a 13" laptop that left
+    // 36px of vertical travel, which is what "it just stops" was.
+    const workspace = { w: 1440, h: 636 };
+    expect(workspace.h - 720, 'the old default did not even fit').toBeLessThan(0);
+    const result = size(workspace, { width: 1440, height: 636 });
+    expect(workspace.h - result.height).toBeGreaterThanOrEqual(MIN_TRAVEL);
+  });
+
+  it('measures the host instead of assuming its configured default', () => {
+    // That window persists its own geometry, so `defaultH={760}` is not
+    // necessarily its current height.
+    expect(remoteDesktop).toContain('floating-panel-remote-desktop-${machine.serverId}');
+    expect(remoteDesktop).toContain('getBoundingClientRect()');
+    expect(remoteDesktop).toContain('defaultW={fileWindowSize.width}');
+    expect(remoteDesktop).not.toMatch(/defaultW=\{1120\}/);
+  });
+
+  it('subtracts the same bottom reserve the clamp does', () => {
+    // Behavioural, not a source grep: computing against a different workspace
+    // than FloatingPanel clamps with is how a window is resized on first paint.
+    const originalW = window.innerWidth;
+    const originalH = window.innerHeight;
+    try {
+      Object.defineProperty(window, 'innerWidth', { value: 1440, configurable: true });
+      Object.defineProperty(window, 'innerHeight', { value: 900, configurable: true });
+      const workspace = remoteDesktopFileWindowWorkspace();
+      expect(workspace.w).toBe(1440);
+      // 100px bottom reserve, plus whatever the (absent) tab bar contributes.
+      expect(workspace.h, 'the 100px bottom reserve must be honoured')
+        .toBeLessThanOrEqual(800);
+      expect(workspace.h).toBeGreaterThan(0);
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { value: originalW, configurable: true });
+      Object.defineProperty(window, 'innerHeight', { value: originalH, configurable: true });
     }
   });
 
-  it('does not grow past the old maximum on a huge display', () => {
-    const size = remoteDesktopFileWindowDefaultSize(3840, 2160);
-    expect(size.width).toBeLessThanOrEqual(1120);
-    expect(size.height).toBeLessThanOrEqual(720);
-  });
-
-  it('is wired into the panel instead of fixed pixels', () => {
-    expect(remoteDesktop).toContain('defaultW={fileWindowSize.width}');
-    expect(remoteDesktop).toContain('defaultH={fileWindowSize.height}');
-    expect(remoteDesktop).not.toMatch(/defaultW=\{1120\}/);
+  it('sizes against the same workspace the clamp enforces', () => {
+    // Computing against a different workspace than FloatingPanel clamps with
+    // is how a window ends up resized the instant it appears.
+    const overlay = read('../src/remote-desktop-pointer-overlay.ts');
+    expect(overlay).toContain('viewportWorkspaceBelowSessionTabs');
+    expect(overlay).toContain('reserveWorkspaceBottom');
   });
 });
 

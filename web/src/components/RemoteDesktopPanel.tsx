@@ -21,6 +21,7 @@ import {
 import {
   isPointOverRemoteDesktopOverlay,
   remoteDesktopFileWindowDefaultSize,
+  remoteDesktopFileWindowWorkspace,
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../remote-desktop-pointer-overlay.js';
 import { downloadAttachment } from '../api.js';
@@ -355,10 +356,22 @@ export function RemoteDesktopPanel({
   // Sized against the viewport, not fixed pixels: FloatingPanel confines a
   // window to `workspace - size`, so a near-workspace-sized default leaves it
   // barely able to move or grow.
-  const fileWindowSize = useMemo(
-    () => remoteDesktopFileWindowDefaultSize(window.innerWidth, window.innerHeight),
-    [],
-  );
+  const fileWindowSize = useMemo(() => {
+    // Match the remote desktop window it belongs to, measured rather than
+    // assumed: that window persists its own geometry, so its configured
+    // default is not necessarily its current size.
+    const host = document
+      .querySelector<HTMLElement>(`[data-testid="floating-panel-remote-desktop-${machine.serverId}"]`)
+      ?.getBoundingClientRect();
+    return remoteDesktopFileWindowDefaultSize({
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      hostSize: host ? { width: host.width, height: host.height } : null,
+      workspace: remoteDesktopFileWindowWorkspace(),
+    });
+    // Measured when the window first opens; re-measuring on every render would
+    // fight the user's own resize of it.
+  }, [machine.serverId, filePanelOpen]);
 
   const machineDirectoryAdapter = useMemo(
     () => new MachineDirectoryWsAdapter(machine.serverId),
