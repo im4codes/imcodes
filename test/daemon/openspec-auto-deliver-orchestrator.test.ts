@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -120,7 +120,18 @@ async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): 
   const root = join(projectDir, 'openspec', 'changes', name);
   await mkdir(join(root, 'specs', 'demo'), { recursive: true });
   await writeFile(join(root, 'proposal.md'), '# Proposal\n', 'utf8');
-  await writeFile(join(root, 'tasks.md'), tasks, 'utf8');
+  // tasks.md MUST land atomically. `writeFile` truncates before it writes, and
+  // the orchestrator re-reads this file every 20ms in test mode, so a plain
+  // rewrite is observable as an empty file by a poll that lands inside that
+  // window. `readTaskStatsForRun` retries a THROWN read error but not a
+  // successful read of truncated content -- it reports `total: 0`, which
+  // terminalizes the run as needs_human/tasks_missing_checkboxes. The run is
+  // then over, so every later wait times out no matter how long its budget is.
+  // Measured ~8% truncated reads under contention; rename() is atomic, so a
+  // concurrent poll sees either the old content or the new, never neither.
+  const tasksTmp = join(root, `tasks.md.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  await writeFile(tasksTmp, tasks, 'utf8');
+  await rename(tasksTmp, join(root, 'tasks.md'));
   await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
