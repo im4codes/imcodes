@@ -3275,7 +3275,15 @@
     "tab_verification": "Dispositivos de verificación",
     "group_filter_label": "Grupos de máquinas",
     "group_direct": "Mías y compartidas conmigo",
-    "group_all": "Todas"
+    "group_all": "Todas",
+    "team_machines_empty": "Aún no hay máquinas en este grupo.",
+    "team_machine_pick": "Elige una máquina para añadir",
+    "team_machine_not_yours": "No es tuya",
+    "team_error_user_not_found": "No existe ese nombre de usuario.",
+    "team_error_user_required": "Escribe un nombre de usuario.",
+    "team_error_self_add_denied": "Ya estás en este grupo.",
+    "team_error_group_manage_denied": "No gestionas este grupo.",
+    "team_error_desk_membership_required": "Esa persona no puede entrar en este grupo."
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

@@ -3274,7 +3274,15 @@
     "tab_verification": "검증 장치",
     "group_filter_label": "머신 그룹",
     "group_direct": "내 것과 개별 공유",
-    "group_all": "전체"
+    "group_all": "전체",
+    "team_machines_empty": "이 그룹에 아직 머신이 없습니다.",
+    "team_machine_pick": "추가할 머신 선택",
+    "team_machine_not_yours": "내 것이 아님",
+    "team_error_user_not_found": "그런 사용자 이름이 없습니다.",
+    "team_error_user_required": "사용자 이름을 입력하세요.",
+    "team_error_self_add_denied": "이미 이 그룹에 있습니다.",
+    "team_error_group_manage_denied": "이 그룹을 관리할 권한이 없습니다.",
+    "team_error_desk_membership_required": "그 사람은 이 그룹에 들어올 수 없습니다."
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

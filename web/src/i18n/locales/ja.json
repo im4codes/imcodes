@@ -3274,7 +3274,15 @@
     "tab_verification": "検証デバイス",
     "group_filter_label": "マシングループ",
     "group_direct": "自分のと個別共有",
-    "group_all": "すべて"
+    "group_all": "すべて",
+    "team_machines_empty": "このグループにはまだマシンがありません。",
+    "team_machine_pick": "追加するマシンを選ぶ",
+    "team_machine_not_yours": "自分のものではない",
+    "team_error_user_not_found": "そのユーザー名はありません。",
+    "team_error_user_required": "ユーザー名を入力してください。",
+    "team_error_self_add_denied": "すでにこのグループにいます。",
+    "team_error_group_manage_denied": "このグループを管理できません。",
+    "team_error_desk_membership_required": "その人はこのグループに入れません。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

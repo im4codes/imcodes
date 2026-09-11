@@ -3275,7 +3275,15 @@
     "tab_verification": "Verification devices",
     "group_filter_label": "Machine groups",
     "group_direct": "Mine & shared with me",
-    "group_all": "All"
+    "group_all": "All",
+    "team_machines_empty": "No machines in this group yet.",
+    "team_machine_pick": "Choose a machine to add",
+    "team_machine_not_yours": "Not yours",
+    "team_error_user_not_found": "No user with that username.",
+    "team_error_user_required": "Enter a username.",
+    "team_error_self_add_denied": "You are already in this group.",
+    "team_error_group_manage_denied": "You do not manage this group.",
+    "team_error_desk_membership_required": "That person is not allowed in this group."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

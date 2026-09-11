@@ -3275,7 +3275,15 @@
     "tab_verification": "授权验证设备",
     "group_filter_label": "机器分组",
     "group_direct": "我的和单独共享",
-    "group_all": "全部"
+    "group_all": "全部",
+    "team_machines_empty": "这个分组里还没有机器。",
+    "team_machine_pick": "选择要加入的机器",
+    "team_machine_not_yours": "不是你的机器",
+    "team_error_user_not_found": "没有这个用户名。",
+    "team_error_user_required": "请输入用户名。",
+    "team_error_self_add_denied": "你已经在这个分组里了。",
+    "team_error_group_manage_denied": "你没有管理这个分组的权限。",
+    "team_error_desk_membership_required": "这个人不能加入该分组。"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

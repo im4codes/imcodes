@@ -3274,7 +3274,15 @@
     "tab_verification": "Проверочные устройства",
     "group_filter_label": "Группы машин",
     "group_direct": "Мои и общие со мной",
-    "group_all": "Все"
+    "group_all": "Все",
+    "team_machines_empty": "В этой группе пока нет машин.",
+    "team_machine_pick": "Выберите машину",
+    "team_machine_not_yours": "Не ваша",
+    "team_error_user_not_found": "Такого имени пользователя нет.",
+    "team_error_user_required": "Введите имя пользователя.",
+    "team_error_self_add_denied": "Вы уже в этой группе.",
+    "team_error_group_manage_denied": "Вы не управляете этой группой.",
+    "team_error_desk_membership_required": "Этого человека нельзя добавить."
   },
   "peerAuditQuick": {
     "iconLabel": "Пир-аудит",

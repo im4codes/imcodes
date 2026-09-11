@@ -163,7 +163,7 @@ teamRoutes.post('/:id/member', requireAuth(), async (c) => {
   const teamId = c.req.param('id');
   const body = await c.req.json<{ user?: string; role?: string }>().catch(() => null);
   const identifier = body?.user?.trim();
-  if (!identifier) return c.json({ error: 'invalid_body', reason: 'user_required' }, 400);
+  if (!identifier) return c.json({ error: 'user_required' }, 400);
   const role = body?.role === 'admin' ? 'admin' : 'member';
 
   // Only a manager of THIS team may add to it. Checked before the lookup so a
@@ -172,11 +172,14 @@ teamRoutes.post('/:id/member', requireAuth(), async (c) => {
     "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')",
     [teamId, userId],
   );
-  if (!manager) return c.json({ error: 'forbidden' }, 403);
+  if (!manager) return c.json({ error: 'group_manage_denied' }, 403);
 
   const target = await resolveUserByIdentifier(c.env.DB as Database, identifier);
-  if (!target) return c.json({ error: 'not_found', reason: 'user_not_found' }, 404);
-  if (target.id === userId) return c.json({ error: 'invalid_body', reason: 'self_add_denied' }, 400);
+  // The specific cause travels as `error`, which is the field the client reads
+  // to choose a message. A bare 'not_found' arrives at the UI as "404" and the
+  // person is left guessing whether the group, the route or the name was wrong.
+  if (!target) return c.json({ error: 'user_not_found' }, 404);
+  if (target.id === userId) return c.json({ error: 'self_add_denied' }, 400);
 
   // Already a member: succeed without changing their role. Re-adding someone
   // must never quietly demote an admin back to member.

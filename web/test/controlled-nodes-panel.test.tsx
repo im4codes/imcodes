@@ -1248,36 +1248,83 @@ describe('ControlledNodesPanel teams tab', () => {
     (container.querySelector('[data-testid="controlled-nodes-tab-teams"]') as HTMLButtonElement).click();
   });
 
-  it('puts an owned machine in a team and takes it back out', async () => {
+  it('adds a machine by picking it, and removes the ones already in the group', async () => {
+    // The group panel answers "what is in this group". It used to list every
+    // machine you own with an Add button, so it looked identical whichever
+    // group was selected.
     listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
     getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
-    machines = [{
-      serverId: 'srv-1', nodeId: '1234567890', refName: 'ops-1', displayName: 'Ops 1',
-      online: true, execEnabled: true, accessRole: 'owner' as const,
-    }];
+    machines = [
+      {
+        serverId: 'srv-in', nodeId: '1234567890', refName: 'in', displayName: 'Already in',
+        online: true, execEnabled: true, accessRole: 'owner' as const,
+        teamId: 'team-1', teamName: 'Ops',
+      },
+      {
+        serverId: 'srv-out', nodeId: '1234567891', refName: 'out', displayName: 'Not in',
+        online: true, execEnabled: true, accessRole: 'owner' as const,
+      },
+    ];
     const { container } = render(<ControlledNodesPanel />);
     openTeams(container);
 
-    const action = await waitFor(() => {
-      const el = container.querySelector('[data-testid="controlled-nodes-team-machine-srv-1"]') as HTMLButtonElement | null;
-      if (!el) throw new Error('machine action not rendered');
+    const pick = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-machine-pick"]') as HTMLSelectElement | null;
+      if (!el) throw new Error('machine picker not rendered');
       return el;
     });
-    await act(async () => { fireEvent.click(action); });
-    expect(bindMachineToTeam).toHaveBeenCalledWith('srv-1', 'team-1');
+    // Only machines that are NOT already in the group are offerable.
+    const options = Array.from(pick.querySelectorAll('option')).map((o) => o.value);
+    expect(options).toEqual(['', 'srv-out']);
+    // And the one already in it is listed with a way out, not a way in.
+    expect(container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-in"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-out"]')).toBeNull();
 
-    machines = [{ ...machines[0]!, teamId: 'team-1', teamName: 'Ops' }];
-    const { container: second } = render(<ControlledNodesPanel />);
-    openTeams(second);
-    const remove = await waitFor(() => {
-      const el = second.querySelector('[data-testid="controlled-nodes-team-machine-srv-1"]') as HTMLButtonElement | null;
-      if (!el) throw new Error('machine action not rendered');
+    await act(async () => { fireEvent.input(pick, { target: { value: 'srv-out' } }); });
+    await act(async () => {
+      fireEvent.click(container.querySelector('[data-testid="controlled-nodes-machine-add"]') as HTMLButtonElement);
+    });
+    expect(bindMachineToTeam).toHaveBeenCalledWith('srv-out', 'team-1');
+
+    // The panel disables its actions while one is in flight, so wait for the
+    // add to finish rather than clicking into a disabled button and calling
+    // that a failure.
+    const removeIn = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-in"]') as HTMLButtonElement | null;
+      if (!el || el.disabled) throw new Error('remove action still busy');
       return el;
     });
-    await act(async () => { fireEvent.click(remove); });
-    // null, not '': the server rejects a blank team, so a malformed body can
+    await act(async () => { fireEvent.click(removeIn); });
+    // null, not '': the server rejects a blank group, so a malformed body can
     // never silently unfile a machine.
-    expect(bindMachineToTeam).toHaveBeenLastCalledWith('srv-1', null);
+    expect(bindMachineToTeam).toHaveBeenLastCalledWith('srv-in', null);
+  });
+
+  it('says what went wrong instead of showing a status code', async () => {
+    // "Add user" answered 404 and the screen said nothing, which is
+    // indistinguishable from a broken button.
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    const { ApiError } = await import('../src/api.js');
+    addTeamMember.mockRejectedValueOnce(new ApiError(404, JSON.stringify({ error: 'user_not_found' })));
+    machines = [];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const input = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-member-name"]') as HTMLInputElement | null;
+      if (!el) throw new Error('member input not rendered');
+      return el;
+    });
+    await act(async () => { fireEvent.input(input, { target: { value: 'ghost' } }); });
+    await act(async () => {
+      fireEvent.click(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('controlled_nodes.team_error_user_not_found');
+    });
+    expect(container.textContent, 'a raw status code is not an explanation').not.toContain('API 404');
   });
 
   it('never offers to file a machine the person does not own', async () => {

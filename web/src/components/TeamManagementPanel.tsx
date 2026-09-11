@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
+  ApiError,
   addTeamMember,
   bindMachineToTeam,
   createTeam,
@@ -37,8 +38,25 @@ export function TeamManagementPanel({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /**
+   * Say what went wrong, in words.
+   *
+   * The server names the cause in `error`; an unmapped one still shows rather
+   * than being swallowed, because a silent failure is the thing being fixed
+   * here -- a button that does nothing is indistinguishable from a broken app.
+   */
   const report = (cause: unknown): void => {
-    setError(cause instanceof Error && cause.message ? cause.message : String(cause));
+    const code = cause instanceof ApiError ? cause.code : null;
+    const known = code && [
+      'user_not_found',
+      'user_required',
+      'self_add_denied',
+      'group_manage_denied',
+      'desk_membership_required',
+    ].includes(code);
+    setError(known
+      ? t(`controlled_nodes.team_error_${code}`)
+      : cause instanceof Error && cause.message ? cause.message : String(cause));
   };
 
   const loadTeams = useCallback(async () => {
@@ -99,9 +117,13 @@ export function TeamManagementPanel({
 
   const canManage = detail?.myRole === 'owner' || detail?.myRole === 'admin';
   const isOwner = detail?.myRole === 'owner';
-  // Only machines this person owns can be filed into a team: putting someone
-  // else's machine in a group is not a filing decision, it is taking it.
-  const ownedMachines = machines.filter((machine) => machine.accessRole === 'owner');
+  const groupMachines = machines.filter((machine) => machine.teamId === selectedId);
+  // Only your own machines can be filed. Putting someone else's into your group
+  // is not filing it, it is taking it.
+  const addableMachines = machines.filter(
+    (machine) => machine.accessRole === 'owner' && machine.teamId !== selectedId,
+  );
+  const [machineToAdd, setMachineToAdd] = useState('');
   const memberLabel = (member: TeamDetail['members'][number]): string =>
     member.username || member.display_name || member.user_id;
 
@@ -144,7 +166,14 @@ export function TeamManagementPanel({
                   class={`controlled-nodes-team-chip${team.id === selectedId ? ' is-active' : ''}`}
                   data-testid={`controlled-nodes-team-chip-${team.id}`}
                   onClick={() => setSelectedId(team.id)}
-                >{team.name}</button>
+                >
+                  {team.name}
+                  {/* The count is what makes one chip different from another
+                      before you click it. */}
+                  <span class="controlled-nodes-team-chip-count">
+                    {machines.filter((machine) => machine.teamId === team.id).length}
+                  </span>
+                </button>
               ))}
             </div>
 
@@ -218,36 +247,66 @@ export function TeamManagementPanel({
                 <div class="controlled-nodes-team-block">
                   <h4>{t('controlled_nodes.team_machines')}</h4>
                   <p class="controlled-nodes-muted">{t('controlled_nodes.team_machines_hint')}</p>
-                  {ownedMachines.length === 0
-                    ? <p class="controlled-nodes-muted">{t('controlled_nodes.team_machines_none')}</p>
+
+                  {/* What is IN this group. Listing every machine you own here
+                      with an Add button meant the panel looked identical for
+                      every group -- it was answering "what could go in" while
+                      claiming to answer "what is in". */}
+                  {groupMachines.length === 0
+                    ? <p class="controlled-nodes-muted">{t('controlled_nodes.team_machines_empty')}</p>
                     : (
                       <ul class="controlled-nodes-team-list">
-                        {ownedMachines.map((machine) => {
-                          const inThisTeam = machine.teamId === selectedId;
-                          return (
-                            <li key={machine.serverId}>
-                              <span class="controlled-nodes-team-name">{machine.displayName}</span>
-                              {machine.teamId && !inThisTeam && (
-                                <span class="controlled-nodes-role-tag">{machine.teamName}</span>
-                              )}
+                        {groupMachines.map((machine) => (
+                          <li key={machine.serverId}>
+                            <span class="controlled-nodes-team-name">{machine.displayName}</span>
+                            {machine.accessRole === 'owner' ? (
                               <button
                                 type="button"
-                                class={inThisTeam ? 'controlled-nodes-danger-btn' : 'controlled-nodes-action-btn'}
-                                data-testid={`controlled-nodes-team-machine-${machine.serverId}`}
+                                class="controlled-nodes-danger-btn"
+                                data-testid={`controlled-nodes-team-machine-remove-${machine.serverId}`}
+                                disabled={busy}
                                 onClick={() => void run(async () => {
-                                  await bindMachineToTeam(machine.serverId, inThisTeam ? null : selectedId);
+                                  await bindMachineToTeam(machine.serverId, null);
                                   await onMachinesChanged();
                                 })}
-                              >
-                                {t(inThisTeam
-                                  ? 'controlled_nodes.team_machine_remove'
-                                  : 'controlled_nodes.team_machine_add')}
-                              </button>
-                            </li>
-                          );
-                        })}
+                              >{t('controlled_nodes.team_machine_remove')}</button>
+                            ) : (
+                              <span class="controlled-nodes-role-tag">{t('controlled_nodes.team_machine_not_yours')}</span>
+                            )}
+                          </li>
+                        ))}
                       </ul>
                     )}
+
+                  {/* Adding is a choice from a list, not a list of choices. */}
+                  {addableMachines.length > 0 && (
+                    <div class="controlled-nodes-team-create">
+                      <select
+                        class="controlled-nodes-input"
+                        data-testid="controlled-nodes-machine-pick"
+                        value={machineToAdd}
+                        onInput={(event) => setMachineToAdd(event.currentTarget.value)}
+                      >
+                        <option value="">{t('controlled_nodes.team_machine_pick')}</option>
+                        {addableMachines.map((machine) => (
+                          <option key={machine.serverId} value={machine.serverId}>
+                            {machine.teamName ? `${machine.displayName} · ${machine.teamName}` : machine.displayName}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        class="controlled-nodes-action-btn"
+                        data-testid="controlled-nodes-machine-add"
+                        disabled={busy || !machineToAdd}
+                        onClick={() => void run(async () => {
+                          await bindMachineToTeam(machineToAdd, selectedId);
+                          setMachineToAdd('');
+                          await onMachinesChanged();
+                        })}
+                      >{t('controlled_nodes.team_machine_add')}</button>
+                    </div>
+                  )}
                 </div>
               </div>
             )}

@@ -118,15 +118,18 @@ describe('POST /api/team/:id/member', () => {
 
   it('rejects an unknown username, a blank one, and adding yourself', async () => {
     const app = buildApp();
-    for (const [body, status] of [
-      [{ user: 'no-such-person' }, 404],
-      [{ user: '   ' }, 400],
-      [{}, 400],
+    for (const [body, status, code] of [
+      [{ user: 'no-such-person' }, 404, 'user_not_found'],
+      [{ user: '   ' }, 400, 'user_required'],
+      [{}, 400, 'user_required'],
     ] as const) {
       const response = await app.request(`/api/team/${teamId}/member`, {
         method: 'POST', headers: auth(ownerId), body: JSON.stringify(body),
       });
       expect(response.status).toBe(status);
+      // The cause has to be readable by the client, or the UI can only ever
+      // show the person a bare status code.
+      expect(await response.json()).toMatchObject({ error: code });
     }
     const self = await app.request(`/api/team/${teamId}/member`, {
       method: 'POST', headers: auth(ownerId), body: JSON.stringify({ user: ownerId }),

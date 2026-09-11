@@ -3840,6 +3840,16 @@ html.native-ios-mac .chat-dl-btn {
   color: #cffafe;
 }
 
+.controlled-nodes-team-chip-count {
+  margin-left: 7px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(125, 211, 252, 0.14);
+  color: #a5f3fc;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 .controlled-nodes-team-detail {
   display: grid;
   gap: 14px;
