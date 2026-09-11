@@ -1459,3 +1459,37 @@ describe('ControlledNodesPanel machine grouping', () => {
     expect(container.textContent, 'the machine list is not on this tab').not.toContain('Mine');
   });
 });
+
+describe('ControlledNodesPanel install instructions', () => {
+  it('gives each OS both routes as full-width rows, not spans in a 64px column', async () => {
+    // They were two <span>s dropped straight into a two-column grid whose first
+    // track is 64px, so the second one wrapped at about a dozen characters and
+    // read as a vertical ribbon. The regression is a layout one, so the shape
+    // is what is asserted: a labelled row per route, inside the OS card.
+    const { container } = renderInstallTab();
+    const card = await waitFor(() => {
+      const el = container.querySelector('.controlled-nodes-usage-os li');
+      if (!el) throw new Error('per-OS install card not rendered');
+      return el;
+    });
+
+    const routes = card.querySelectorAll('.controlled-nodes-usage-route');
+    expect(routes, 'both install routes, every OS').toHaveLength(2);
+    for (const route of Array.from(routes)) {
+      // A tag plus a paragraph. A bare text node would land in whatever grid
+      // cell came next, which is exactly how this broke.
+      expect(route.querySelector('.controlled-nodes-usage-route-tag')).not.toBeNull();
+      expect(route.querySelector('p')).not.toBeNull();
+    }
+    expect(card.textContent).toContain('controlled_nodes.usage_route_command');
+    expect(card.textContent).toContain('controlled_nodes.usage_route_download');
+  });
+
+  it('does not squeeze the instructions into a 64px track', async () => {
+    const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'), 'utf8');
+    const block = css.slice(css.indexOf('.controlled-nodes-usage-os li {'));
+    // The old rule. Reintroducing it puts the text back in the ribbon.
+    expect(block.slice(0, 400)).not.toContain('grid-template-columns: 64px');
+    expect(css).toContain('.controlled-nodes-usage-route {');
+  });
+});

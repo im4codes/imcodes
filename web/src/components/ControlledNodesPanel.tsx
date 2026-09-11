@@ -1046,15 +1046,26 @@ export function ControlledNodesPanel({
               .filter(({ os }) => availableOses.includes(os))
               .map(({ os, commandKey, downloadKey }) => (
                 <li key={os}>
-                  <strong>{PLATFORM_PRESENTATION[os].name}</strong>
-                  <span class="controlled-nodes-usage-route">
-                    <em>{t('controlled_nodes.usage_route_command')}</em>
-                    {t(commandKey)}
-                  </span>
-                  <span class="controlled-nodes-usage-route">
-                    <em>{t('controlled_nodes.usage_route_download')}</em>
-                    {t(downloadKey)}
-                  </span>
+                  <div class="controlled-nodes-usage-os-head">
+                    <span class="controlled-nodes-usage-os-glyph" aria-hidden="true">
+                      {PLATFORM_PRESENTATION[os].glyph}
+                    </span>
+                    <strong>{PLATFORM_PRESENTATION[os].name}</strong>
+                  </div>
+                  {/* Two routes, each a full-width row. They used to be two
+                      spans dropped into a 64px grid column, which squeezed the
+                      text into a ribbon a dozen characters wide. */}
+                  {([
+                    ['command', commandKey],
+                    ['download', downloadKey],
+                  ] as const).map(([route, key]) => (
+                    <div key={route} class={`controlled-nodes-usage-route is-${route}`}>
+                      <span class="controlled-nodes-usage-route-tag">
+                        {t(`controlled_nodes.usage_route_${route}`)}
+                      </span>
+                      <p>{t(key)}</p>
+                    </div>
+                  ))}
                 </li>
               ))}
           </ul>

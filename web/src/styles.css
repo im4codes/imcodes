@@ -4134,8 +4134,10 @@ html.native-ios-mac .chat-dl-btn {
 }
 .controlled-nodes-usage {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  /* Four steps forced into three columns left one orphaned on a second row and
+     every cell too narrow to read. Let the count decide the columns. */
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 9px;
   counter-reset: controlled-node-step;
 }
 .controlled-nodes-usage li {
@@ -4144,21 +4146,21 @@ html.native-ios-mac .chat-dl-btn {
   align-items: flex-start;
   gap: 9px;
   min-width: 0;
-  padding: 10px;
+  padding: 12px 13px;
   border: 1px solid rgba(125, 211, 252, 0.1);
   border-radius: 8px;
   background: rgba(5, 12, 22, 0.42);
 }
 .controlled-nodes-usage li > span {
   color: #22d3ee;
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 800;
-  line-height: 1.55;
+  line-height: 1.7;
 }
 .controlled-nodes-usage p {
   margin: 0;
-  color: #94a3b8;
-  font-size: 10px;
+  color: #a8bed2;
+  font-size: 12px;
   line-height: 1.55;
 }
 .controlled-nodes-usage-os {
@@ -4166,25 +4168,86 @@ html.native-ios-mac .chat-dl-btn {
   gap: 6px;
   margin-top: 10px;
 }
+/* One card per OS, and inside it one full-width row per install route. The
+   previous layout dropped both routes into a 64px grid column, so the text
+   wrapped at about a dozen characters and read as a vertical ribbon. */
 .controlled-nodes-usage-os li {
   display: grid;
-  grid-template-columns: 64px minmax(0, 1fr);
-  align-items: baseline;
-  gap: 10px;
-  padding: 7px 9px;
-  border-left: 1px solid rgba(167, 139, 250, 0.38);
-  background: linear-gradient(90deg, rgba(124, 58, 237, 0.07), transparent 74%);
+  gap: 8px;
+  padding: 13px 15px;
+  border: 1px solid rgba(167, 139, 250, 0.2);
+  border-left-width: 3px;
+  border-radius: 10px;
+  background: linear-gradient(100deg, rgba(124, 58, 237, 0.09), rgba(8, 15, 28, 0.4) 70%);
 }
+
+.controlled-nodes-usage-os-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.controlled-nodes-usage-os-glyph {
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
 .controlled-nodes-usage-os strong {
-  color: #c4b5fd;
-  font-size: 9px;
-  letter-spacing: 0.04em;
+  color: #ddd6fe;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
 }
-.controlled-nodes-usage-os span {
-  color: #64748b;
-  font-size: 9px;
-  line-height: 1.5;
+
+/* The tag column is fixed so both routes line up; the text takes the rest and
+   is sized to be read, not squinted at. */
+.controlled-nodes-usage-route {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: start;
+  gap: 11px;
 }
+
+.controlled-nodes-usage-route p {
+  margin: 0;
+  color: #b6cbdd;
+  font-size: 12.5px;
+  line-height: 1.75;
+}
+
+.controlled-nodes-usage-route-tag {
+  justify-self: start;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+/* The two routes are told apart by colour as well as by label: the pasted
+   command needs an already-elevated terminal, the file needs the launch itself
+   to elevate, and confusing them is the most common way an install fails. */
+.controlled-nodes-usage-route.is-command .controlled-nodes-usage-route-tag {
+  border: 1px solid rgba(34, 211, 238, 0.4);
+  background: rgba(8, 145, 178, 0.2);
+  color: #a5f3fc;
+}
+
+.controlled-nodes-usage-route.is-download .controlled-nodes-usage-route-tag {
+  border: 1px solid rgba(167, 139, 250, 0.4);
+  background: rgba(124, 58, 237, 0.2);
+  color: #ddd6fe;
+}
+
+@media (max-width: 640px) {
+  .controlled-nodes-usage-route {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+}
+
 .controlled-nodes-muted,
 .controlled-nodes-error,
 .verification-machines-error {
