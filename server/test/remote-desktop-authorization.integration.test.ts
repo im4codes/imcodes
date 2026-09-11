@@ -78,19 +78,10 @@ async function grant(
   role: 'viewer' | 'participant',
   expiresAt: number | null = null,
 ) {
-  // A grant is only effective inside the machine's Desk, so the recipient joins
-  // it here exactly as a real Desk-scoped grant would require.
-  const bound = await db.queryOne<{ team_id: string | null }>(
-    'SELECT team_id FROM servers WHERE id = $1',
-    [serverId],
-  );
-  if (bound?.team_id) {
-    await db.execute(
-      `INSERT INTO team_members (team_id, user_id, role, joined_at)
-       VALUES ($1, $2, 'member', $3) ON CONFLICT DO NOTHING`,
-      [bound.team_id, recipientId, Date.now()],
-    );
-  }
+  // The recipient is deliberately NOT put in the machine's team. Team
+  // membership is a grant in its own right, so adding it here would keep the
+  // session alive after this share is downgraded or expires -- and downgrade
+  // and expiry are exactly what these tests exist to prove.
   return createOrUpdateShare(db, {
     id: `rd-share-${hex(8)}`,
     target: { kind: 'server', serverId },

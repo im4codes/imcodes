@@ -391,53 +391,17 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
   const targetUserId = targetUser.id;
   if (targetUserId === userId) return c.json({ error: 'invalid_body', reason: 'self_share_denied' }, 400);
 
-  // Desk scope for controlled nodes. resolveTargetUser above matches ANY user
-  // in the instance by id or username, which is correct for ordinary Tab
-  // sharing but must not be able to hand a personal, SYSTEM-capable machine to
-  // someone outside its Desk. Admission (machine-access.ts) already refuses
-  // such a grant, so without this check the API would cheerfully write a row
-  // that can never grant anything -- an owner would believe they had shared the
-  // machine when they had not. Refusing at write time keeps the stored state
-  // and the effective state the same thing.
-  const controlledTarget = await c.env.DB.queryOne<{ team_id: string | null }>(
-    `SELECT team_id FROM servers WHERE id = $1 AND node_role = $2 AND revoked_at IS NULL`,
-    [serverId, NODE_ROLE.CONTROLLED],
-  );
-  if (controlledTarget) {
-    // An unbound machine has no Desk to share within; bind it first.
-    if (!controlledTarget.team_id) {
-      await auditShareLifecycle(c, {
-        actionType: 'share.create',
-        decision: 'rejected',
-        actorUserId: userId,
-        targetUserId,
-        target: normalizedTarget,
-        // SHARE_DENIAL_REASONS is the canonical cross-surface vocabulary and a
-        // Desk refusal is precisely "this target is not available to that
-        // user"; the exact cause travels in the response below rather than
-        // widening a shared enum from here.
-        reason: 'share-target-unavailable',
-        createdAt: now,
-      });
-      return c.json({ error: 'forbidden', reason: 'desk_unbound' }, 403);
-    }
-    const targetMembership = await c.env.DB.queryOne<{ present: number }>(
-      `SELECT 1 AS present FROM team_members WHERE team_id = $1 AND user_id = $2`,
-      [controlledTarget.team_id, targetUserId],
-    );
-    if (!targetMembership) {
-      await auditShareLifecycle(c, {
-        actionType: 'share.create',
-        decision: 'rejected',
-        actorUserId: userId,
-        targetUserId,
-        target: normalizedTarget,
-        reason: 'share-target-unavailable',
-        createdAt: now,
-      });
-      return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
-    }
-  }
+  // No team is required to share one machine with one person. Sharing a group
+  // of machines with a team is the other mechanism, and the two are
+  // independent: making the first go through the second meant a machine could
+  // not be shared at all until it was put in a team, and then only with people
+  // already in that team.
+  //
+  // The write-time check this replaces reasoned correctly from a premise that
+  // no longer holds. It refused to store a grant admission would not honour, so
+  // that stored state and effective state stayed the same thing. Admission
+  // honours an individual grant on its own now, so that same principle points
+  // the other way.
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'invalid_body', reason: 'share-target-unavailable' }, 400);
 

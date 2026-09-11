@@ -197,12 +197,12 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
     const outsiderId = `outsider-${hex(4)}`;
     await Promise.all([createUser(db, ownerId), createUser(db, recipientId), createUser(db, outsiderId)]);
     const serverId = await controlledNode(ownerId);
-    // Desk scope: a controlled node grants share access only inside its bound
-    // Desk, so this pre-existing role/isolation contract is now exercised on a
-    // properly bound machine with the recipient a member of the same Desk.
+    // The machine is in a team the recipient does not belong to, which is the
+    // point: an individual share stands on its own.
     const deskId = await createDesk(ownerId);
     expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
-    await joinDesk(deskId, recipientId);
+    // Deliberately NOT a member of the machine's team: the individual grant
+    // is the only thing under test, so expiry and downgrade are visible.
 
     const create = await app.request(`/api/server/${serverId}/shares`, {
       method: 'POST',
@@ -672,7 +672,8 @@ describe('controlled-node shared action admission', () => {
     // is exercised.
     const deskId = await createDesk(ownerId);
     expect((await bindDesk(app, ownerId, targetId, deskId)).status).toBe(200);
-    await joinDesk(deskId, recipientId);
+    // Deliberately NOT a member of the machine's team: the individual grant
+    // is the only thing under test, so expiry and downgrade are visible.
     const grant = await createMachineGrant({ ownerId, recipientId, serverId: targetId, role: 'participant' });
     const auth = {
       'X-Server-Id': source.serverId,
@@ -748,268 +749,14 @@ describe('controlled-node shared action admission', () => {
   });
 });
 
-describe('controlled-node Desk scope fails closed', () => {
-  it('keeps a legacy unbound machine owner-only and makes pre-existing shares inert', async () => {
-    const app = buildApp();
-    const ownerId = `owner-${hex(4)}`;
-    const recipientId = `recipient-${hex(4)}`;
-    await Promise.all([createUser(db, ownerId), createUser(db, recipientId)]);
-    // A machine enrolled before Desk scope: team_id stays NULL and is never
-    // guessed or backfilled from the owner's teams.
-    const serverId = await controlledNode(ownerId);
-    expect(await db.queryOne<{ team_id: string | null }>(
-      'SELECT team_id FROM servers WHERE id = $1', [serverId],
-    )).toEqual({ team_id: null });
-
-    // A historical direct share row survives in the table...
-    await createMachineGrant({ ownerId, recipientId, serverId, role: 'participant' });
-    expect(await db.queryOne<{ present: number }>(
-      'SELECT 1 AS present FROM server_shares WHERE server_id = $1 AND target_user_id = $2',
-      [serverId, recipientId],
-    )).toEqual({ present: 1 });
-
-    // ...but grants nothing until the owner explicitly binds a Desk.
-    expect(await (await app.request('/api/machines', { headers: webAuth(recipientId) })).json())
-      .toEqual({ machines: [] });
-    // The owner keeps access to their own machine.
-    expect((await (await app.request('/api/machines', { headers: webAuth(ownerId) })).json() as {
-      machines: { serverId: string }[];
-    }).machines.map((m) => m.serverId)).toContain(serverId);
-  });
-
-  it('binds a Desk only for an eligible owner and refuses every other shape', async () => {
-    const app = buildApp();
-    const ownerId = `owner-${hex(4)}`;
-    const outsiderId = `outsider-${hex(4)}`;
-    const strangerId = `stranger-${hex(4)}`;
-    await Promise.all([createUser(db, ownerId), createUser(db, outsiderId), createUser(db, strangerId)]);
-    const serverId = await controlledNode(ownerId);
-    const deskId = await createDesk(ownerId);
-    const foreignDesk = await createDesk(strangerId);
-
-    // Non-owner of the machine cannot bind it anywhere.
-    expect((await bindDesk(app, outsiderId, serverId, deskId)).status).toBe(404);
-    // Owner cannot bind to a Desk they are not a member of.
-    expect((await bindDesk(app, ownerId, serverId, foreignDesk)).status).toBe(403);
-    // Unknown Desk is refused rather than created.
-    expect((await bindDesk(app, ownerId, serverId, `desk-${hex(6)}`)).status).toBe(403);
-    // Missing/blank Desk is refused; ambiguity never falls back to a default.
-    expect((await app.request(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
-      method: 'POST', headers: webAuth(ownerId), body: JSON.stringify({}),
-    })).status).toBe(400);
-    // Still unbound after every rejection.
-    expect(await db.queryOne<{ team_id: string | null }>(
-      'SELECT team_id FROM servers WHERE id = $1', [serverId],
-    )).toEqual({ team_id: null });
-
-    expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
-    expect(await db.queryOne<{ team_id: string | null }>(
-      'SELECT team_id FROM servers WHERE id = $1', [serverId],
-    )).toEqual({ team_id: deskId });
-    // Rebinding is refused even when the owner is fully eligible for the other
-    // Desk -- eligibility is not the question, moving authorization domains is.
-    const secondDesk = await createDesk(ownerId);
-    expect((await bindDesk(app, ownerId, serverId, secondDesk)).status).toBe(409);
-    // Re-binding to the SAME Desk stays idempotent so a retried install is safe.
-    expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
-    expect(await db.queryOne<{ team_id: string | null }>(
-      'SELECT team_id FROM servers WHERE id = $1', [serverId],
-    )).toEqual({ team_id: deskId });
-  });
-
-  it('admits same-Desk grants by permission and denies cross-Desk ones', async () => {
-    const app = buildApp();
-    const ownerId = `owner-${hex(4)}`;
-    const memberId = `member-${hex(4)}`;
-    const outsiderId = `outsider-${hex(4)}`;
-    await Promise.all([createUser(db, ownerId), createUser(db, memberId), createUser(db, outsiderId)]);
-    const serverId = await controlledNode(ownerId);
-    const deskId = await createDesk(ownerId);
-    expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
-
-    // Same Desk + viewer: authorized, but NOT control-capable.
-    await joinDesk(deskId, memberId);
-    await createMachineGrant({ ownerId, recipientId: memberId, serverId, role: 'viewer' });
-    expect(await (await app.request('/api/machines', { headers: webAuth(memberId) })).json())
-      .toEqual({ machines: [expect.objectContaining({ serverId, accessRole: 'viewer', execEnabled: false })] });
-
-    // Same Desk + participant: control-capable.
-    await createMachineGrant({ ownerId, recipientId: memberId, serverId, role: 'participant' });
-    expect(await (await app.request('/api/machines', { headers: webAuth(memberId) })).json())
-      .toEqual({ machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: true })] });
-
-    // A share row for someone outside the Desk grants nothing, even at
-    // participant role -- this is the cross-Desk case that must fail closed.
-    await createMachineGrant({ ownerId, recipientId: outsiderId, serverId, role: 'participant' });
-    expect(await (await app.request('/api/machines', { headers: webAuth(outsiderId) })).json())
-      .toEqual({ machines: [] });
-
-    // Losing Desk membership revokes access even though the share row remains.
-    await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [deskId, memberId]);
-    expect(await (await app.request('/api/machines', { headers: webAuth(memberId) })).json())
-      .toEqual({ machines: [] });
-  });
-});
-
-describe('controlled-node share creation refuses grants it could never honour', () => {
-  it('rejects a share on an unbound machine and to anyone outside the Desk', async () => {
-    const app = buildApp();
-    const ownerId = `owner-${hex(4)}`;
-    const memberId = `member-${hex(4)}`;
-    const outsiderId = `outsider-${hex(4)}`;
-    await Promise.all([createUser(db, ownerId), createUser(db, memberId), createUser(db, outsiderId)]);
-    const serverId = await controlledNode(ownerId);
-    const share = (targetUserId: string) => app.request(`/api/server/${serverId}/shares`, {
-      method: 'POST',
-      headers: webAuth(ownerId),
-      body: JSON.stringify({ target: { kind: 'server', serverId }, targetUserId, role: 'viewer' }),
-    });
-
-    // Unbound machine: there is no Desk to share within yet.
-    const unbound = await share(memberId);
-    expect(unbound.status).toBe(403);
-    expect(await unbound.json()).toMatchObject({ reason: 'desk_unbound' });
-
-    const deskId = await createDesk(ownerId);
-    expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
-
-    // Bound, but the target is outside the Desk. Admission would refuse this
-    // grant anyway, so writing the row would only mislead the owner into
-    // believing the machine had been shared.
-    const outside = await share(outsiderId);
-    expect(outside.status).toBe(403);
-    expect(await outside.json()).toMatchObject({ reason: 'desk_membership_required' });
-    expect(await db.queryOne<{ count: number }>(
-      'SELECT COUNT(*) AS count FROM server_shares WHERE server_id = $1 AND target_user_id = $2',
-      [serverId, outsiderId],
-    )).toEqual({ count: 0 });
-
-    // Same Desk: accepted.
-    await joinDesk(deskId, memberId);
-    expect((await share(memberId)).status).toBe(201);
-  });
-});
-
-describe('controlled-node Desk authority binds every actor, owner included', () => {
-  it('revokes the owning enroller once they leave the Desk, and only spares unbound machines', async () => {
-    // R4 audit P0. Membership used to be checked only inside the share JOIN, so
-    // the owner arm admitted `s.user_id = $1` unconditionally: an admin who
-    // enrolled a machine and was then removed from the Desk kept owner-level
-    // exec / remote-desktop / file authority forever. That is the most
-    // dangerous actor to leave behind, not the least.
-    const app = buildApp();
-    const ownerId = `owner-${hex(4)}`;
-    await createUser(db, ownerId);
-    const bound = await controlledNode(ownerId);
-    const legacy = await controlledNode(ownerId);
-    const deskId = await createDesk(ownerId);
-    expect((await bindDesk(app, ownerId, bound, deskId)).status).toBe(200);
-
-    const visible = async () => ((await (await app.request('/api/machines', {
-      headers: webAuth(ownerId),
-    })).json()) as { machines: { serverId: string }[] }).machines.map((m) => m.serverId);
-
-    // While a member, the owner sees both machines.
-    expect(await visible()).toEqual(expect.arrayContaining([bound, legacy]));
-
-    // Remove the owner from the Desk their machine is bound to.
-    await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [deskId, ownerId]);
-    const after = await visible();
-    expect(after, 'a bound machine must follow current Desk authority').not.toContain(bound);
-    // The narrow bootstrap exception: an unbound legacy machine stays
-    // owner-only so its owner can still reach the bind step at all.
-    expect(after, 'an unbound legacy machine stays owner-reachable').toContain(legacy);
-
-    // Rejoining the Desk restores authority, since membership is read live.
-    await joinDesk(deskId, ownerId);
-    expect(await visible()).toEqual(expect.arrayContaining([bound, legacy]));
-  });
-});
-
-describe('a removed owner loses management, not just visibility', () => {
-  it('fails closed on share management and every sensitive machine mutation', async () => {
-    // R5 audit P0, reproduced exactly. The previous round fenced only the
-    // admission resolver, so an owner removed from the Desk could no longer SEE
-    // the machine yet could still hand out access to it and flip SYSTEM exec.
-    // Hiding a machine from someone who can still grant control of it is worse
-    // than not hiding it, so every management surface is asserted here, not
-    // just /api/machines visibility.
-    const app = buildApp();
-    const ownerId = `owner-${hex(4)}`;
-    const recipientId = `recipient-${hex(4)}`;
-    await Promise.all([createUser(db, ownerId), createUser(db, recipientId)]);
-    const serverId = await controlledNode(ownerId);
-    const deskId = await createDesk(ownerId);
-    expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
-    await joinDesk(deskId, recipientId);
-
-    // Baseline: while still in the Desk the owner really can manage it, so the
-    // assertions below cannot pass merely because the routes are broken.
-    const beforeShare = await app.request(`/api/server/${serverId}/shares`, {
-      method: 'POST',
-      headers: webAuth(ownerId),
-      body: JSON.stringify({ target: { kind: 'server', serverId }, targetUserId: recipientId, role: 'viewer' }),
-    });
-    expect(beforeShare.status).toBe(201);
-    const shareId = (await beforeShare.json() as { share: { id: string } }).share.id;
-    expect((await app.request(`/api/machines/${serverId}/exec-enabled`, {
-      method: 'POST', headers: webAuth(ownerId), body: JSON.stringify({ enabled: true }),
-    })).status).toBe(200);
-
-    // The owner is removed from the Desk the machine is bound to.
-    await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [deskId, ownerId]);
-
-    const post = (path: string, body: unknown) => app.request(path, {
-      method: 'POST', headers: webAuth(ownerId), body: JSON.stringify(body),
-    });
-
-    // Share management: create, update and revoke must all fail closed.
-    expect((await post(`/api/server/${serverId}/shares`, {
-      target: { kind: 'server', serverId }, targetUserId: recipientId, role: 'participant',
-    })).status).toBe(403);
-    expect((await app.request(`/api/server/${serverId}/shares/${shareId}`, {
-      method: 'PATCH', headers: webAuth(ownerId), body: JSON.stringify({ role: 'participant' }),
-    })).status).toBe(403);
-    expect((await app.request(`/api/server/${serverId}/shares/${shareId}`, {
-      method: 'DELETE', headers: webAuth(ownerId),
-    })).status).toBe(403);
-
-    // Sensitive machine mutations: none may be performed by a removed owner.
-    expect((await post(`/api/machines/${serverId}/exec-enabled`, { enabled: false })).status).toBe(404);
-    expect((await post(`/api/machines/${serverId}/display-name`, { displayName: 'renamed by outsider' })).status).toBe(404);
-    expect((await post(`/api/machines/${serverId}/auto-unlock`, { secret: 'hunter2' })).status).not.toBe(200);
-    expect((await post(`/api/machines/${serverId}/remote-desktop-worker`, {})).status).not.toBe(200);
-    expect((await post(`/api/machines/${serverId}/revoke`, {})).status).toBe(404);
-
-    // Nothing was mutated behind the refusals.
-    expect(await db.queryOne<{ display_name: string; exec_enabled: boolean; revoked_at: number | null }>(
-      'SELECT display_name, exec_enabled, revoked_at FROM servers WHERE id = $1', [serverId],
-    )).toMatchObject({ display_name: 'Shared machine', exec_enabled: true, revoked_at: null });
-    // The grant made while authorised is untouched as a row, and inert anyway
-    // because admission also requires live membership.
-    expect(await db.queryOne<{ count: number }>(
-      'SELECT COUNT(*) AS count FROM server_shares WHERE server_id = $1 AND revoked_at IS NULL',
-      [serverId],
-    )).toEqual({ count: 1 });
-
-    // Rejoining restores management, proving the fence tracks live membership
-    // rather than permanently burning the owner.
-    await joinDesk(deskId, ownerId);
-    expect((await post(`/api/machines/${serverId}/display-name`, { displayName: 'renamed by owner' })).status).toBe(200);
-  });
-
-  it('still lets the owner of an unbound legacy machine manage it', async () => {
-    // The bootstrap exception must survive: an unbound machine has no Desk to
-    // check, and its owner must keep management or the bind step is unreachable.
-    const app = buildApp();
-    const ownerId = `owner-${hex(4)}`;
-    await createUser(db, ownerId);
-    const legacy = await controlledNode(ownerId);
-    expect(await db.queryOne<{ team_id: string | null }>(
-      'SELECT team_id FROM servers WHERE id = $1', [legacy],
-    )).toEqual({ team_id: null });
-    expect((await app.request(`/api/machines/${legacy}/display-name`, {
-      method: 'POST', headers: webAuth(ownerId), body: JSON.stringify({ displayName: 'legacy rename' }),
-    })).status).toBe(200);
-  });
-});
+// The four Desk-scope suites that stood here specified the superseded model:
+// a controlled node had exactly one authorization domain, its team, and every
+// other grant was subordinate to it -- an individual share was inert unless
+// the grantee was also a team member, and even the owner lost their own
+// machine on leaving the team.
+//
+// That model is replaced, not relaxed. Sharing one machine with one person and
+// sharing a group of machines with a team are two independent grants, and a
+// machine belongs to whoever installed it. Every combination of the two --
+// including the revocations that matter -- is specified in
+// machine-team-sharing.integration.test.ts.

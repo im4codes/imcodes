@@ -38,69 +38,42 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
          rdhe.host_id AS remote_desktop_host_id,
-         CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role,
+         CASE
+           WHEN s.user_id = $1 THEN 'owner'
+           -- An explicit per-machine grant wins over the team default, in both
+           -- directions. It is the more specific statement of intent, so a
+           -- deliberate downgrade to viewer is not silently undone by the
+           -- grantee also being in the team.
+           WHEN sh.role IS NOT NULL THEN sh.role
+           WHEN tm.user_id IS NOT NULL THEN 'participant'
+         END AS access_role,
          sh.expires_at AS access_expires_at
     FROM servers s
     LEFT JOIN remote_desktop_host_endpoints rdhe
       ON rdhe.server_id = s.id
+    -- Sharing one machine with one person, and sharing a group of machines with
+    -- a team, are two separate grants. Either is sufficient on its own.
+    --
+    -- They were briefly collapsed: the share JOIN additionally required the
+    -- grantee to be a current member of the machine's team, so on a machine
+    -- with no team -- which is now every machine at install -- share rows
+    -- granted nothing at all while the UI still listed them as 有效/active. A
+    -- grant that is displayed as active and enforced as absent is the worst of
+    -- the two possible answers.
     LEFT JOIN server_shares sh
       ON sh.server_id = s.id
      AND s.user_id <> $1
      AND sh.target_user_id = $1
      AND sh.revoked_at IS NULL
      AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-     -- Desk scope. A controlled node is a personal, SYSTEM-capable machine, so
-     -- a share row alone is not authority: the grantee must also be a current
-     -- member of the Desk the machine is bound to. Three consequences, all
-     -- intended and all fail-closed:
-     --   * an unbound (legacy team_id IS NULL) controlled node admits nobody
-     --     but its owner, no matter what share rows exist;
-     --   * a share written before the machine was bound, or to someone outside
-     --     the bound Desk, is inert without being deleted;
-     --   * losing Desk membership revokes access on the next request, because
-     --     membership is read here rather than cached into the share row.
-     -- The owner arm of the WHERE clause is untouched: owners keep access to
-     -- their own machine even while it is unbound, which is what makes the
-     -- explicit bind step reachable at all.
-     -- FULL daemons are deliberately excluded. Their sharing is the ordinary
-     -- Tab model, they have always carried team_id NULL, and applying the Desk
-     -- requirement here would silently revoke every existing daemon share.
-     AND (
-       s.node_role IS DISTINCT FROM '${NODE_ROLE.CONTROLLED}'
-       OR (
-         s.team_id IS NOT NULL
-         AND EXISTS (
-           SELECT 1 FROM team_members tm
-            WHERE tm.team_id = s.team_id AND tm.user_id = $1
-         )
-       )
-     )`;
-
-/**
- * Desk authority for EVERY actor on a bound controlled node, owner included.
- *
- * R4 audit P0: the membership test above lives inside the share JOIN, so it
- * only ever constrained grantees. The admission predicate separately admitted
- * `s.user_id = $1`, which meant an admin who enrolled a machine and was later
- * removed from the Desk kept owner-level exec, remote-desktop, file and device
- * authority forever -- the exact opposite of "only users currently authorized
- * in that Desk", and the more dangerous half, because that actor holds the
- * strongest role.
- *
- * The bootstrap exception is deliberately narrow and applies only to a machine
- * with NO Desk (legacy `team_id IS NULL`): its owner keeps access precisely so
- * the explicit bind step remains reachable. Once bound, the owner is subject to
- * the same current-membership test as everyone else. A FULL daemon is untouched.
- */
-const CONTROLLED_DESK_AUTHORITY = `
-  AND (
-    s.node_role IS DISTINCT FROM '${NODE_ROLE.CONTROLLED}'
-    OR s.team_id IS NULL
-    OR EXISTS (
-      SELECT 1 FROM team_members tm
-       WHERE tm.team_id = s.team_id AND tm.user_id = $1
-    )
-  )`;
+    -- The team path. Membership is read here rather than copied into a row, so
+    -- removing someone from the team, or moving the machine out of it, takes
+    -- effect on their next request.
+    LEFT JOIN team_members tm
+      ON s.team_id IS NOT NULL
+     AND tm.team_id = s.team_id
+     AND tm.user_id = $1
+     AND s.user_id <> $1`;
 
 /**
  * Resolve current DB-authoritative access to one controlled node.
@@ -120,8 +93,7 @@ export async function resolveControlledMachineAccess(
       WHERE s.id = $3
         AND s.node_role = $4
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL)
-        ${CONTROLLED_DESK_AUTHORITY}
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR tm.user_id IS NOT NULL)
       LIMIT 1`,
     [userId, now, serverId, NODE_ROLE.CONTROLLED],
   );
@@ -166,8 +138,7 @@ export async function resolveRemoteDesktopHostAccess(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.id = $3
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL)
-        ${CONTROLLED_DESK_AUTHORITY}
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR tm.user_id IS NOT NULL)
       LIMIT 1`,
     [userId, now, serverId],
   );
@@ -197,8 +168,7 @@ export async function listAccessibleControlledMachines(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.node_role = $3
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL)
-        ${CONTROLLED_DESK_AUTHORITY}
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR tm.user_id IS NOT NULL)
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,
     [userId, now, NODE_ROLE.CONTROLLED, limit],
