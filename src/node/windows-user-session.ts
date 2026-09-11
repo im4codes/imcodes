@@ -55,6 +55,18 @@ function powershellStdinCommand(value: string): string {
  * No credential/token is inherited by the child; only the explicit command line
  * and the active user's environment are supplied.
  */
+/**
+ * The one line of a PowerShell failure that names the cause.
+ *
+ * PowerShell surrounds it with a positional dump of the script text, which
+ * would bury the sentence someone actually needs inside an error message.
+ */
+export function summariseLauncherFailure(stderr: string): string {
+  const lines = stderr.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const named = lines.find((line) => /Exception|Win32Exception|error|refus|denied|elevation/iu.test(line));
+  return (named ?? lines[0] ?? '').slice(0, 300);
+}
+
 export function launchWindowsActiveUserCommand(
   executable: string,
   argsLine: string,
@@ -62,6 +74,16 @@ export function launchWindowsActiveUserCommand(
   preferLinkedElevatedToken = false,
   allowSecureDesktopFallback = false,
   forceSecureConsole = false,
+  /**
+   * Called with the launcher's own words when it fails.
+   *
+   * This used to be discarded: stderr was 'ignore' and both error handlers were
+   * empty, so a CreateProcessAsUser refusal left no trace anywhere and the only
+   * symptom was whatever timed out 15 seconds later. That is how "the helper
+   * never connects" stayed unexplained -- the one sentence naming the cause was
+   * thrown away at the moment it was produced.
+   */
+  onLaunchFailure?: (detail: string) => void,
 ): void {
   const exe64 = Buffer.from(executable, 'utf8').toString('base64');
   const args64 = Buffer.from(argsLine, 'utf8').toString('base64');
@@ -312,7 +334,10 @@ Add-Type -TypeDefinition $src
     // command-line limit. Feeding it through stdin keeps argv bounded while
     // preserving the same immutable script and avoids exposing its arguments
     // through process inspection.
-    stdio: ['pipe', 'ignore', 'ignore'],
+    //
+    // stderr is captured only when someone asked to hear about failures, so the
+    // fire-and-forget callers keep exactly the stdio shape they had.
+    stdio: ['pipe', 'ignore', onLaunchFailure ? 'pipe' : 'ignore'],
     windowsHide: true,
   };
   const child = spawnImpl(
@@ -320,7 +345,22 @@ Add-Type -TypeDefinition $src
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-'],
     options,
   );
-  child.on('error', () => {});
+  if (onLaunchFailure) {
+    let stderr = '';
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      // Bounded: this is diagnostic text that ends up in an error message, and
+      // a runaway launcher must not be able to grow it without limit.
+      if (stderr.length < 4096) stderr += String(chunk);
+    });
+    child.on('error', (err) => onLaunchFailure(err instanceof Error ? err.message : String(err)));
+    child.on('exit', (code) => {
+      if (code === 0) return;
+      const detail = summariseLauncherFailure(stderr) || `powershell exited with ${String(code)}`;
+      onLaunchFailure(detail);
+    });
+  } else {
+    child.on('error', () => {});
+  }
   child.stdin?.on('error', () => {});
   child.stdin?.end(powershellStdinCommand(linkedTokenScript), 'utf8');
   child.unref();
@@ -336,8 +376,9 @@ export function launchWindowsActiveUserElevatedCommand(
   executable: string,
   argsLine: string,
   spawnImpl: typeof spawn = spawn,
+  onLaunchFailure?: (detail: string) => void,
 ): void {
-  launchWindowsActiveUserCommand(executable, argsLine, spawnImpl, true);
+  launchWindowsActiveUserCommand(executable, argsLine, spawnImpl, true, false, false, onLaunchFailure);
 }
 
 /**

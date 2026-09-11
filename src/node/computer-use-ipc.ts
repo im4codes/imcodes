@@ -45,7 +45,7 @@ import {
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   allowWindowsNamedPipeClients,
-  launchWindowsActiveUserCommand,
+  launchWindowsActiveUserElevatedCommand,
   quoteWindowsArgument,
   windowsNamedPipeClientAclCommand,
 } from './windows-user-session.js';
@@ -118,12 +118,23 @@ export function windowsComputerUseHelperLaunchSpecForTest(
   };
 }
 
-function launchWindowsUserSessionHelper(exe: string, pipe: string): void {
+function launchWindowsUserSessionHelper(
+  exe: string,
+  pipe: string,
+  onLaunchFailure?: (detail: string) => void,
+): void {
   const { executable, argsLine } = windowsComputerUseHelperLaunchSpecForTest(exe, pipe);
   // Launch the helper directly. Routing it through cmd.exe created an extra
   // console-subsystem process on every GUI machine and made a blank console
   // flash/persist whenever the OCU IPC helper was started.
-  launchWindowsActiveUserCommand(executable, argsLine);
+  //
+  // With the active administrator's linked token, exactly as the remote-desktop
+  // worker already does. The helper IS the daemon binary, and that binary is
+  // manifested `requireAdministrator` so its installer can prompt for UAC. Sent
+  // into the interactive user's filtered token it can therefore never start:
+  // CreateProcessAsUser answers ERROR_ELEVATION_REQUIRED before the process
+  // exists. Standard users and non-UAC accounts keep the normal WTS token.
+  launchWindowsActiveUserElevatedCommand(executable, argsLine, spawn, onLaunchFailure);
 }
 
 function launchSameSessionHelper(exe: string, pipe: string): void {
@@ -164,6 +175,8 @@ export class ComputerUseIpcHost {
   private buffer = '';
   private readyPromise: Promise<void> | null = null;
   private readonly path = pipePath();
+  /** Why the last launch attempt failed, when the launcher managed to say. */
+  private lastLaunchFailure: string | null = null;
 
   constructor(private readonly options: ComputerUseIpcHostOptions = {}) {}
 
@@ -222,7 +235,12 @@ export class ComputerUseIpcHost {
         server.close();
         if (this.server === server) this.server = null;
         this.readyPromise = null;
-        reject(new Error('computer_use_helper_connect_timeout'));
+        // Carry the launcher's own words when it left any. A bare timeout says
+        // only that nothing connected; it never says the helper was refused
+        // before it could exist.
+        reject(new Error(this.lastLaunchFailure
+          ? `computer_use_helper_connect_timeout: ${this.lastLaunchFailure}`
+          : 'computer_use_helper_connect_timeout'));
       }, 15_000);
       timer.unref?.();
       server.once('error', (err) => {
@@ -238,7 +256,9 @@ export class ComputerUseIpcHost {
             if (platform === 'win32') {
               allowWindowsComputerUseHelperFiles();
               await allowWindowsPipeClients(this.path);
-              launchWindowsUserSessionHelper(process.execPath, this.path);
+              launchWindowsUserSessionHelper(process.execPath, this.path, (detail) => {
+                this.lastLaunchFailure = detail;
+              });
             } else if (platform === 'darwin') {
               // The socket is visible in /tmp before runtime preparation and
               // artifact download finish. Seal it root-only immediately, then

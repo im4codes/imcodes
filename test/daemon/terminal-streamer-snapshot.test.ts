@@ -515,12 +515,22 @@ describe('TerminalStreamer — snapshot behavior', () => {
     // an orphan left armed shows up as +1.
     const before = vi.getTimerCount();
 
+    const sent: unknown[] = [];
     streamer.subscribe({
       sessionName: 'timer-hygiene-session',
-      send: () => {},
+      send: (frame) => { sent.push(frame); },
       onBootstrapStalled: vi.fn(),
     });
-    await flush();
+
+    // Wait for the paint itself, not for a fixed slice of time. The deadline is
+    // cleared when the capture settles, so advancing a fixed 200ms and
+    // asserting asks the question before the thing it is about has necessarily
+    // happened -- invisible on an idle machine, and a real failure on a loaded
+    // CI runner where the mocked promise chain needs more turns.
+    for (let attempt = 0; attempt < 50 && sent.length === 0; attempt += 1) {
+      await flush();
+    }
+    expect(sent.length, 'the capture must have won the race for this to mean anything').toBeGreaterThan(0);
 
     expect(
       vi.getTimerCount() - before,

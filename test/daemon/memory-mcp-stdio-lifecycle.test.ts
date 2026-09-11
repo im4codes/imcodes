@@ -236,15 +236,18 @@ describeOrSkip('memory MCP stdio lifecycle (subprocess)', () => {
       // process.ppid will already be the reparent target.
       process.kill(serverPid, 'SIGCONT');
 
-      const gone = await new Promise<boolean>((resolve) => {
-        const stop = Date.now() + 45_000;
-        const tick = () => {
-          if (!pidAlive(serverPid)) { resolve(true); return; }
-          if (Date.now() > stop) { resolve(false); return; }
-          const t = setTimeout(tick, 250); t.unref?.();
-        };
-        tick();
-      });
+      // Two different failures used to share one 45s deadline: "the guard never
+      // armed" and "it armed and the process still would not go". Under CI load
+      // the server can simply be slow to reach the guard, and the run then
+      // reported a leak it had no evidence for. Waiting for the guard first
+      // separates them, and each says which one happened.
+      const armed = await waitFor(
+        () => { try { return readFileSync(outFile, 'utf8').includes('parent liveness guard armed'); } catch { return false; } },
+        60_000,
+      );
+      expect(armed, 'the guard never armed, so nothing about leaking was tested').toBe(true);
+
+      const gone = await waitFor(() => !pidAlive(serverPid), 20_000);
       expect(gone, 'a process born already reparented must not become the leak').toBe(true);
     } finally {
       if (serverPid > 0 && pidAlive(serverPid)) { try { process.kill(serverPid, 'SIGKILL'); } catch { /* gone */ } }
@@ -370,6 +373,16 @@ describeOrSkip('memory MCP stdio lifecycle (subprocess)', () => {
     }
   }, 90_000);
 });
+
+/** Poll a condition to a deadline, so slow and stuck stay distinguishable. */
+async function waitFor(ready: () => boolean, budgetMs: number): Promise<boolean> {
+  const stop = Date.now() + budgetMs;
+  while (Date.now() < stop) {
+    if (ready()) return true;
+    await new Promise((resolve) => { const t = setTimeout(resolve, 250); t.unref?.(); });
+  }
+  return ready();
+}
 
 describe('installMcpStdioLifecycle', () => {
   function fakeStdin() {
