@@ -71,7 +71,9 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
 const TEST_DESK = { id: 'desk-1', name: 'Ops Desk', role: 'owner' as const };
 const listMintableDesks = vi.fn(async () => [TEST_DESK]);
 const createTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const }));
-const createTeamInvite = vi.fn(async (..._a: unknown[]) => ({ token: 'invite-token', expiresAt: 0 }));
+const listTeams = vi.fn(async () => [] as { id: string; name: string; role: 'owner' | 'admin' | 'member' }[]);
+const getTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'team-1', name: 'Ops', myRole: 'owner' as const, members: [] as unknown[] }));
+const addTeamMember = vi.fn(async (..._a: unknown[]) => ({ ok: true as const }));
 const bindMachineToTeam = vi.fn(async (..._a: unknown[]) => {});
 
 const downloadControlledNodeExecutable = vi.fn(async () => ({
@@ -120,7 +122,9 @@ vi.mock('../src/api.js', async (importOriginal) => {
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
     listMintableDesks: () => listMintableDesks(),
     createTeam: (...a: unknown[]) => createTeam(...a),
-    createTeamInvite: (...a: unknown[]) => createTeamInvite(...a),
+    listTeams: () => listTeams(),
+    getTeam: (...a: unknown[]) => getTeam(...a),
+    addTeamMember: (...a: unknown[]) => addTeamMember(...a),
     bindMachineToTeam: (...a: unknown[]) => bindMachineToTeam(...a),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
@@ -160,7 +164,10 @@ function setViewportSize(width: number, height: number): void {
 beforeEach(() => {
   listMintableDesks.mockResolvedValue([TEST_DESK]);
   createTeam.mockClear();
-  createTeamInvite.mockClear();
+  listTeams.mockClear();
+  listTeams.mockResolvedValue([]);
+  getTeam.mockClear();
+  addTeamMember.mockClear();
   bindMachineToTeam.mockClear();
   createTeam.mockResolvedValue({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const });
 });
@@ -184,6 +191,22 @@ function rejectRefreshAfterInitialLoad(): void {
   refetch
     .mockResolvedValueOnce(null)
     .mockRejectedValueOnce(new TypeError('Failed to fetch'));
+}
+
+/**
+ * Render and switch to the Download & install tab.
+ *
+ * Downloading lives behind a tab now, so a test that renders and immediately
+ * looks for a download button is looking at the machines list. Switching here
+ * rather than defaulting the panel to this tab keeps the tests describing what
+ * a person does.
+ */
+function renderInstallTab() {
+  const result = render(<ControlledNodesPanel />);
+  act(() => {
+    (result.container.querySelector('[data-testid="controlled-nodes-tab-install"]') as HTMLButtonElement | null)?.click();
+  });
+  return result;
 }
 
 describe('ControlledNodesPanel (12.3)', () => {
@@ -345,7 +368,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('offers one download button per canonical (os, arch) artifact', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_action'));
     // The os/arch detail moved into the button's title when the row gained a
     // second action; assert it is still reachable rather than silently dropped.
@@ -360,7 +383,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('shows artifact metadata (arch + size) when present', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('x64'));
     expect(container.textContent).toContain('universal');
     expect(container.textContent).toContain('21.0 MB');
@@ -369,7 +392,7 @@ describe('ControlledNodesPanel (12.3)', () => {
 
   it('clicking a download button uses desktop flow with the Capacitor web shim present', async () => {
     vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-download-btn');
       if (!b) throw new Error('win x64 download button not found');
@@ -396,7 +419,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     // string on the clipboard — explicitly NOT a download in this browser.
     const writeText = vi.fn(async () => {});
     vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
       if (!b) throw new Error('win x64 copy-link button not found');
@@ -496,7 +519,7 @@ describe('ControlledNodesPanel (12.3)', () => {
       restoreExecCommand = null;
     };
 
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
       if (!b) throw new Error('copy-link button not found');
@@ -516,7 +539,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('offers the copy-link action on every platform row, beside the download button', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => {
       if (!container.querySelector('.controlled-nodes-download-item.is-win')) {
         throw new Error('rows not rendered');
@@ -532,7 +555,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   it('shows a copied confirmation without inventing an expiry, and surfaces mint failures', async () => {
     const writeText = vi.fn(async () => {});
     vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
       if (!b) throw new Error('copy-link button not found');
@@ -558,7 +581,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   it('revokes the stable artifact binding only after explicit confirmation', async () => {
     const confirm = vi.fn(() => true);
     vi.stubGlobal('confirm', confirm);
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const found = container.querySelector(
         '.controlled-nodes-download-item.is-win .controlled-nodes-revoke-link-btn',
@@ -584,7 +607,7 @@ describe('ControlledNodesPanel (12.3)', () => {
         { os: 'mac', filename: 'imcodes-node-macos', sizeBytes: 2000, sha256: null } as never,
       ],
     });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => {
       expect(container.querySelectorAll('.controlled-nodes-download-btn')).toHaveLength(0);
       expect(container.textContent).toContain('controlled_nodes.no_executables');
@@ -593,14 +616,14 @@ describe('ControlledNodesPanel (12.3)', () => {
 
   it('shows availability error distinct from empty catalog', async () => {
     listAvailableExecutables.mockRejectedValueOnce(new Error('network'));
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.availability_error'));
     expect(container.textContent).not.toContain('controlled_nodes.no_executables');
   });
 
   it('shows neutral empty catalog when availability succeeds with no targets', async () => {
     listAvailableExecutables.mockResolvedValueOnce({ available: [], artifacts: [] });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.no_executables'));
     expect(container.textContent).not.toContain('controlled_nodes.availability_error');
   });
@@ -611,13 +634,13 @@ describe('ControlledNodesPanel (12.3)', () => {
       artifacts: [],
       error: 'executable_dir_not_configured',
     } as ControlledNodeAvailability & { error: string });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.no_executables'));
     expect(container.textContent).not.toContain('controlled_nodes.availability_error');
   });
 
   it('shows ticket expiry hint after a successful download mint', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector('.controlled-nodes-download-btn');
       if (!b) throw new Error('download button not found');
@@ -628,13 +651,13 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('shows that the downloaded installer is permanent and reusable', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.usage_step4'));
   });
 
   it('maps mint executable_not_built to a specific message', async () => {
     const { ApiError, controlledNodeDownloadErrorKey } = await import('../src/api.js');
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.querySelector('.controlled-nodes-download-btn')).toBeTruthy());
     downloadControlledNodeExecutable.mockRejectedValueOnce(new ApiError(503, '{"error":"executable_not_built"}'));
     fireEvent.click(container.querySelector('.controlled-nodes-download-btn')!);
@@ -1144,7 +1167,7 @@ describe('ControlledNodesPanel — copy install command', () => {
   it('copies the minted command verbatim, transport pin included', async () => {
     const writeText = vi.fn(async () => {});
     vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
 
     const btn = await waitFor(() => {
       const b = container.querySelector(
@@ -1176,7 +1199,7 @@ describe('ControlledNodesPanel — copy install command', () => {
       configurable: true, writable: true, value: vi.fn(() => false),
     });
     try {
-      const { container } = render(<ControlledNodesPanel />);
+      const { container } = renderInstallTab();
       const btn = await waitFor(() => {
         const b = container.querySelector(
           '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
@@ -1202,7 +1225,7 @@ describe('ControlledNodesPanel — copy install command', () => {
     createControlledNodeInstallCommand.mockRejectedValueOnce(new Error('boom'));
     const writeText = vi.fn(async () => {});
     vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector(
         '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
@@ -1220,66 +1243,114 @@ describe('ControlledNodesPanel — copy install command', () => {
 });
 
 
-describe('ControlledNodesPanel team sharing', () => {
-  it('files an owned machine under a team and takes it back out', async () => {
-    // The endpoint has existed since the feature was built and had no caller
-    // anywhere in the web app, so there was no way to share a group of machines
-    // at all.
-    listMintableDesks.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+describe('ControlledNodesPanel teams tab', () => {
+  const openTeams = (container: HTMLElement) => act(() => {
+    (container.querySelector('[data-testid="controlled-nodes-tab-teams"]') as HTMLButtonElement).click();
+  });
+
+  it('puts an owned machine in a team and takes it back out', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
     machines = [{
       serverId: 'srv-1', nodeId: '1234567890', refName: 'ops-1', displayName: 'Ops 1',
       online: true, execEnabled: true, accessRole: 'owner' as const,
     }];
     const { container } = render(<ControlledNodesPanel />);
-    const select = await waitFor(() => {
-      const el = container.querySelector('[data-testid="controlled-nodes-machine-team-srv-1"]') as HTMLSelectElement | null;
-      if (!el) throw new Error('machine team select not rendered');
+    openTeams(container);
+
+    const action = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-team-machine-srv-1"]') as HTMLButtonElement | null;
+      if (!el) throw new Error('machine action not rendered');
       return el;
     });
-    expect(select.value, 'a machine starts in no team').toBe('');
-
-    await act(async () => { fireEvent.input(select, { target: { value: 'team-1' } }); });
+    await act(async () => { fireEvent.click(action); });
     expect(bindMachineToTeam).toHaveBeenCalledWith('srv-1', 'team-1');
 
-    await act(async () => { fireEvent.input(select, { target: { value: '' } }); });
-    // null, not '': taking a machine out is its own instruction, and the server
-    // rejects a blank one so a malformed body cannot unfile a machine.
+    machines = [{ ...machines[0]!, teamId: 'team-1', teamName: 'Ops' }];
+    const { container: second } = render(<ControlledNodesPanel />);
+    openTeams(second);
+    const remove = await waitFor(() => {
+      const el = second.querySelector('[data-testid="controlled-nodes-team-machine-srv-1"]') as HTMLButtonElement | null;
+      if (!el) throw new Error('machine action not rendered');
+      return el;
+    });
+    await act(async () => { fireEvent.click(remove); });
+    // null, not '': the server rejects a blank team, so a malformed body can
+    // never silently unfile a machine.
     expect(bindMachineToTeam).toHaveBeenLastCalledWith('srv-1', null);
   });
 
-  it('does not offer the team control on a machine someone else owns', async () => {
-    listMintableDesks.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+  it('never offers to file a machine the person does not own', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
     machines = [{
-      serverId: 'srv-2', nodeId: '1234567891', refName: 'shared', displayName: 'Shared',
-      online: true, execEnabled: true, accessRole: 'participant' as const, teamName: 'Ops',
+      serverId: 'srv-2', nodeId: '1234567891', refName: 'theirs', displayName: 'Theirs',
+      online: true, execEnabled: true, accessRole: 'participant' as const,
     }];
     const { container } = render(<ControlledNodesPanel />);
-    await waitFor(() => expect(container.textContent).toContain('Shared'));
-    expect(container.querySelector('[data-testid="controlled-nodes-machine-team-srv-2"]')).toBeNull();
+    openTeams(container);
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.team_machines'));
+    // Putting someone else's machine into your group is not filing it, it is
+    // taking it.
+    expect(container.querySelector('[data-testid="controlled-nodes-team-machine-srv-2"]')).toBeNull();
   });
 
-  it('creates a team and copies an invite link for it', async () => {
-    listMintableDesks.mockResolvedValue([]);
+  it('adds a member by username, the same identifier machine sharing uses', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
     const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
     const input = await waitFor(() => {
-      const el = container.querySelector('[data-testid="controlled-nodes-team-name"]') as HTMLInputElement | null;
-      if (!el) throw new Error('team name input not rendered');
+      const el = container.querySelector('[data-testid="controlled-nodes-member-name"]') as HTMLInputElement | null;
+      if (!el) throw new Error('member input not rendered');
       return el;
     });
-    const create = container.querySelector('[data-testid="controlled-nodes-team-create"]') as HTMLButtonElement;
-    expect(create.disabled, 'an unnamed team is not creatable').toBe(true);
-
-    await act(async () => { fireEvent.input(input, { target: { value: 'Ops' } }); });
-    listMintableDesks.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
-    await act(async () => { fireEvent.click(create); });
-    expect(createTeam).toHaveBeenCalledWith('Ops');
-
-    const invite = await waitFor(() => {
-      const el = container.querySelector('[data-testid="controlled-nodes-team-invite-team-1"]') as HTMLButtonElement | null;
-      if (!el) throw new Error('invite action not rendered');
-      return el;
+    await act(async () => { fireEvent.input(input, { target: { value: 'alice' } }); });
+    await act(async () => {
+      fireEvent.click(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
     });
-    await act(async () => { fireEvent.click(invite); });
-    expect(createTeamInvite).toHaveBeenCalledWith('team-1', 'member');
+    expect(addTeamMember).toHaveBeenCalledWith('team-1', 'alice');
+  });
+
+  it('lets only the owner change roles, and never the owner s own', async () => {
+    // Three roles, and the owner is the only one who appoints admins. A team
+    // where nobody can appoint anyone is a team nobody can run.
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'admin' as const }]);
+    getTeam.mockResolvedValue({
+      id: 'team-1',
+      name: 'Ops',
+      myRole: 'admin',
+      members: [
+        { user_id: 'u-owner', username: 'boss', role: 'owner' as const, joined_at: 1 },
+        { user_id: 'u-mate', username: 'mate', role: 'member' as const, joined_at: 2 },
+      ],
+    });
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    await waitFor(() => expect(container.textContent).toContain('mate'));
+    // An admin may add and remove, but may not promote.
+    expect(container.querySelector('[data-testid="controlled-nodes-member-role-u-mate"]')).toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-member-remove-u-mate"]')).not.toBeNull();
+    // Nobody demotes the owner, including the owner.
+    expect(container.querySelector('[data-testid="controlled-nodes-member-role-u-owner"]')).toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-member-remove-u-owner"]')).toBeNull();
+  });
+
+  it('shows a plain member their team without management controls', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'member' as const }]);
+    getTeam.mockResolvedValue({
+      id: 'team-1',
+      name: 'Ops',
+      myRole: 'member',
+      members: [{ user_id: 'u-mate', username: 'mate', role: 'member' as const, joined_at: 2 }],
+    });
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    await waitFor(() => expect(container.textContent).toContain('mate'));
+    expect(container.querySelector('[data-testid="controlled-nodes-member-name"]')).toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-member-remove-u-mate"]')).toBeNull();
   });
 });

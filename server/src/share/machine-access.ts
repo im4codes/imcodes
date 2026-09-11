@@ -71,13 +71,22 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
      AND sh.target_user_id = $1
      AND sh.revoked_at IS NULL
      AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-    -- The team path. Membership is read here rather than copied into a row, so
-    -- removing someone from the team, or moving the machine out of it, takes
-    -- effect on their next request.
+    -- The team path, and only for those who manage the team.
+    --
+    -- A team has three roles. An ordinary member manages the machines they
+    -- added themselves and nothing else -- they reach those as the owner, not
+    -- through the team -- while the owner and admins manage every machine in
+    -- it. So being in a team means your machines become manageable by the
+    -- people running it; it does not hand you everyone else's.
+    --
+    -- Membership and role are read here rather than copied into a row, so a
+    -- demotion, a removal, or moving the machine out all take effect on the
+    -- next request.
     LEFT JOIN team_members tm
       ON s.team_id IS NOT NULL
      AND tm.team_id = s.team_id
      AND tm.user_id = $1
+     AND tm.role IN ('owner', 'admin')
      AND s.user_id <> $1`;
 
 /**

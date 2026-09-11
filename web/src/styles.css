@@ -3689,8 +3689,46 @@ html.native-ios-mac .chat-dl-btn {
   animation: controlled-nodes-radar 2.8s linear infinite;
 }
 @keyframes controlled-nodes-radar { to { transform: rotate(360deg); } }
-/* Teams: a group you put machines in, kept visually separate from installing
-   and from per-machine sharing, because it is required by neither. */
+/* Tabs use the same vocabulary as the share dialog's: hairline cyan border,
+   inset glow on the active one. A second, different tab look in the same
+   product reads as a different product. */
+.controlled-nodes-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  margin-bottom: 18px;
+  border: 1px solid rgba(125, 211, 252, 0.16);
+  border-radius: 10px;
+  background: rgba(8, 15, 28, 0.62);
+}
+
+.controlled-nodes-tab {
+  flex: 1 1 0;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #94a3b8;
+  font: 750 12px/1.3 var(--imcodes-app-font-family);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.controlled-nodes-tab:hover { color: #e0f2fe; background: rgba(14, 116, 144, 0.12); }
+
+.controlled-nodes-tab.is-active {
+  border-color: rgba(34, 211, 238, 0.34);
+  background: rgba(8, 145, 178, 0.2);
+  color: #cffafe;
+  box-shadow: inset 0 0 14px rgba(34, 211, 238, 0.06);
+}
+
+.controlled-nodes-tab:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 2px; }
+
+.controlled-nodes-teams { display: grid; gap: 14px; }
+
 .controlled-nodes-team-create {
   display: flex;
   align-items: center;
@@ -3698,34 +3736,100 @@ html.native-ios-mac .chat-dl-btn {
   flex-wrap: wrap;
 }
 
-.controlled-nodes-team-create input {
-  flex: 1 1 200px;
+.controlled-nodes-input {
+  flex: 1 1 220px;
   min-width: 0;
-  min-height: 34px;
-  padding: 6px 10px;
-  border: 1px solid rgba(103, 232, 249, 0.28);
+  min-height: 36px;
+  padding: 8px 11px;
+  border: 1px solid rgba(125, 211, 252, 0.22);
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.6);
-  color: #e2f6ff;
+  background: #0b1220;
+  color: #e2e8f0;
   font: 400 12px/1.3 var(--imcodes-app-font-family);
 }
 
-.controlled-nodes-team-create button,
-.controlled-nodes-team-list button {
-  min-height: 34px;
-  padding: 6px 14px;
-  border: 1px solid rgba(103, 232, 249, 0.45);
+.controlled-nodes-input:focus {
+  outline: none;
+  border-color: var(--chrome-accent);
+  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.14);
+}
+
+.controlled-nodes-action-btn,
+.controlled-nodes-danger-btn {
+  min-height: 36px;
+  padding: 7px 14px;
   border-radius: 8px;
-  background: rgba(30, 41, 59, 0.62);
-  color: #a5f3fc;
-  font: 600 11px/1.3 var(--imcodes-app-font-family);
+  font: 750 11px/1.3 var(--imcodes-app-font-family);
+  letter-spacing: .03em;
   cursor: pointer;
 }
 
-.controlled-nodes-team-create button:disabled { cursor: not-allowed; opacity: 0.5; }
+.controlled-nodes-action-btn {
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  background: rgba(8, 145, 178, 0.2);
+  color: #cffafe;
+}
+
+.controlled-nodes-action-btn:hover:not(:disabled) {
+  border-color: rgba(34, 211, 238, 0.6);
+  color: #fff;
+}
+
+.controlled-nodes-action-btn:disabled { cursor: not-allowed; opacity: 0.45; }
+
+.controlled-nodes-danger-btn {
+  border: 1px solid rgba(251, 113, 133, 0.34);
+  background: rgba(76, 5, 25, 0.3);
+  color: #fecdd3;
+}
+
+.controlled-nodes-danger-btn:hover:not(:disabled) { border-color: rgba(251, 113, 133, 0.66); }
+
+.controlled-nodes-team-switch { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.controlled-nodes-team-chip {
+  min-height: 32px;
+  padding: 5px 13px;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.58);
+  color: #94a3b8;
+  font: 700 11px/1.3 var(--imcodes-app-font-family);
+  cursor: pointer;
+}
+
+.controlled-nodes-team-chip.is-active {
+  border-color: rgba(34, 211, 238, 0.5);
+  background: rgba(8, 145, 178, 0.22);
+  color: #cffafe;
+}
+
+.controlled-nodes-team-detail {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.controlled-nodes-team-block {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 12px 14px;
+  border: 1px solid rgba(125, 211, 252, 0.14);
+  border-radius: 10px;
+  background: rgba(8, 15, 28, 0.5);
+}
+
+.controlled-nodes-team-block h4 {
+  margin: 0;
+  color: #e2f6ff;
+  font: 800 11px/1.3 var(--imcodes-app-font-family);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
 
 .controlled-nodes-team-list {
-  margin: 10px 0 0;
+  margin: 0;
   padding: 0;
   list-style: none;
   display: grid;
@@ -3735,29 +3839,65 @@ html.native-ios-mac .chat-dl-btn {
 .controlled-nodes-team-list li {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 6px 10px;
-  border: 1px solid rgba(103, 232, 249, 0.16);
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid rgba(125, 211, 252, 0.12);
   border-radius: 8px;
+  background: rgba(15, 23, 42, 0.42);
 }
 
-.controlled-nodes-team-list .controlled-nodes-team-name { color: #e2f6ff; font-size: 12px; }
-
-.controlled-nodes-machine-team {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
+.controlled-nodes-team-list .controlled-nodes-team-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #f1f9ff;
+  font-size: 12px;
 }
 
-.controlled-nodes-machine-team select {
-  max-width: 160px;
-  padding: 2px 6px;
-  border: 1px solid rgba(103, 232, 249, 0.3);
+.controlled-nodes-role-select {
+  padding: 3px 7px;
+  border: 1px solid rgba(125, 211, 252, 0.26);
   border-radius: 6px;
-  background: rgba(15, 23, 42, 0.6);
+  background: #0b1220;
   color: #a5f3fc;
   font: 400 11px/1.3 var(--imcodes-app-font-family);
+}
+
+/* Each OS gets both routes, labelled. The label is what makes "run as
+   administrator" attach to the right one -- it is the elevated terminal that
+   matters for the pasted command, and the launch method for the file. */
+.controlled-nodes-usage-route {
+  display: block;
+  margin-top: 4px;
+  color: #9fc2da;
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.controlled-nodes-usage-route em {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 7px;
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  border-radius: 999px;
+  color: #a5f3fc;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 750;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+
+.controlled-nodes-role-tag {
+  padding: 2px 8px;
+  border: 1px solid rgba(125, 211, 252, 0.2);
+  border-radius: 999px;
+  color: #8fb4d0;
+  font-size: 10.5px;
+  letter-spacing: .04em;
+  white-space: nowrap;
 }
 
 .controlled-nodes-downloads {

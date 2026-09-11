@@ -80,27 +80,58 @@ describe('a freshly installed machine', () => {
   it('is not reachable through a team it was never associated with', async () => {
     const teamId = await makeTeam(owner);
     await db.execute(
-      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
 
-    // The team exists and the colleague is in it. The machine is still not.
-    expect(await resolveServerRole(db, serverId, colleague)).toBe('none');
+    // The team exists and the colleague runs it. The machine is still not in it.
+    expect(await resolveControlledMachineAccess(db, colleague, serverId, Date.now())).toBeNull();
   });
 });
 
 describe('associating a machine with a team', () => {
-  it('lets everyone in the team manage it, and still nobody outside', async () => {
+  it('gives the people running the team every machine in it, and members only their own', async () => {
+    // Three roles. An ordinary member manages what they added and nothing else;
+    // the owner and admins manage everything in the team. Putting a machine in
+    // a team therefore hands it to the people running the team -- not to
+    // everyone who happens to be in it.
     const teamId = await makeTeam(owner);
+    const admin = await newUser();
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+      [teamId, admin, Date.now()],
+    );
     await db.execute(
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
       [teamId, colleague, Date.now()],
     );
     await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
 
-    expect(await resolveServerRole(db, serverId, owner)).toBe('owner');
-    expect(await resolveServerRole(db, serverId, colleague)).not.toBe('none');
-    expect(await resolveServerRole(db, serverId, stranger)).toBe('none');
+    const roleFor = async (userId: string) =>
+      (await resolveControlledMachineAccess(db, userId, serverId, Date.now()))?.access_role;
+
+    expect(await roleFor(owner)).toBe('owner');
+    expect(await roleFor(admin), 'an admin manages every machine in the team').toBe('participant');
+    // Asserted as an exact value, not `not.toBe('none')`: an absent row also
+    // satisfies that, so the weaker form would pass whatever this returned.
+    expect(await roleFor(colleague), 'a plain member gets nothing through the team').toBeUndefined();
+    expect(await roleFor(stranger)).toBeUndefined();
+  });
+
+  it('still lets a member run the machine they added to the team themselves', async () => {
+    const teamId = await makeTeam(owner);
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      [teamId, colleague, Date.now()],
+    );
+    const theirs = await installMachine(colleague);
+    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [theirs, teamId]);
+
+    // Their own machine, reached as its owner rather than through the team.
+    expect((await resolveControlledMachineAccess(db, colleague, theirs, Date.now()))?.access_role).toBe('owner');
+    // And the people running the team can manage it, which is the point of
+    // putting it there.
+    expect((await resolveControlledMachineAccess(db, owner, theirs, Date.now()))?.access_role).toBe('participant');
   });
 
   it('withdraws access the moment the machine leaves the team', async () => {
@@ -109,30 +140,32 @@ describe('associating a machine with a team', () => {
     // from the group that granted it.
     const teamId = await makeTeam(owner);
     await db.execute(
-      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
     await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
-    expect(await resolveServerRole(db, serverId, colleague)).not.toBe('none');
+    expect((await resolveControlledMachineAccess(db, colleague, serverId, Date.now()))?.access_role)
+      .toBe('participant');
 
     await db.execute('UPDATE servers SET team_id = NULL WHERE id = $1', [serverId]);
 
-    expect(await resolveServerRole(db, serverId, colleague)).toBe('none');
-    expect(await resolveServerRole(db, serverId, owner)).toBe('owner');
+    expect(await resolveControlledMachineAccess(db, colleague, serverId, Date.now())).toBeNull();
+    expect((await resolveControlledMachineAccess(db, owner, serverId, Date.now()))?.access_role).toBe('owner');
   });
 
   it('withdraws access the moment a person leaves the team', async () => {
     const teamId = await makeTeam(owner);
     await db.execute(
-      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
     await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
-    expect(await resolveServerRole(db, serverId, colleague)).not.toBe('none');
+    expect((await resolveControlledMachineAccess(db, colleague, serverId, Date.now()))?.access_role)
+      .toBe('participant');
 
     await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, colleague]);
 
-    expect(await resolveServerRole(db, serverId, colleague)).toBe('none');
+    expect(await resolveControlledMachineAccess(db, colleague, serverId, Date.now())).toBeNull();
   });
 });
 
@@ -189,7 +222,7 @@ describe('sharing one machine with one person', () => {
     // specific statement, so a deliberate downgrade survives.
     const teamId = await makeTeam(owner);
     await db.execute(
-      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
     await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
@@ -210,7 +243,7 @@ describe('sharing one machine with one person', () => {
   it('reaches the machine through the team with no share row at all', async () => {
     const teamId = await makeTeam(owner);
     await db.execute(
-      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
     await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);

@@ -2203,6 +2203,18 @@ export async function joinTeamByToken(token: string): Promise<{ ok: true; teamId
   return apiFetch(`/api/team/join/${encodeURIComponent(token)}`, { method: 'POST' });
 }
 
+/** Add someone to a team by username, the way a machine is shared with them. */
+export async function addTeamMember(
+  teamId: string,
+  user: string,
+  role: 'admin' | 'member' = 'member',
+): Promise<{ ok: true; member: TeamMember }> {
+  return apiFetch(`/api/team/${encodeURIComponent(teamId)}/member`, {
+    method: 'POST',
+    body: JSON.stringify({ user, role }),
+  });
+}
+
 export async function updateTeamMemberRole(teamId: string, memberId: string, role: 'admin' | 'member'): Promise<{ ok: true }> {
   return apiFetch(`/api/team/${encodeURIComponent(teamId)}/member/${encodeURIComponent(memberId)}/role`, {
     method: 'PUT',

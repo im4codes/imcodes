@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
+import { resolveUserByIdentifier } from '../db/user-lookup.js';
+import type { Database } from '../db/client.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 
@@ -148,6 +150,57 @@ teamRoutes.post('/:id/join', requireAuth(), async (c) => {
   }
 
   return c.json({ error: 'token required' }, 400);
+});
+
+// POST /api/team/:id/member — add someone by username (owner/admin only)
+//
+// An invite link is the right tool when you cannot reach the person directly.
+// When you already know who they are, making you generate a link, send it, and
+// wait for them to open it is ceremony -- you are the one with the authority to
+// add them, so you add them.
+teamRoutes.post('/:id/member', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const teamId = c.req.param('id');
+  const body = await c.req.json<{ user?: string; role?: string }>().catch(() => null);
+  const identifier = body?.user?.trim();
+  if (!identifier) return c.json({ error: 'invalid_body', reason: 'user_required' }, 400);
+  const role = body?.role === 'admin' ? 'admin' : 'member';
+
+  // Only a manager of THIS team may add to it. Checked before the lookup so a
+  // non-manager cannot use this route to probe which usernames exist.
+  const manager = await c.env.DB.queryOne<{ role: string }>(
+    "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')",
+    [teamId, userId],
+  );
+  if (!manager) return c.json({ error: 'forbidden' }, 403);
+
+  const target = await resolveUserByIdentifier(c.env.DB as Database, identifier);
+  if (!target) return c.json({ error: 'not_found', reason: 'user_not_found' }, 404);
+  if (target.id === userId) return c.json({ error: 'invalid_body', reason: 'self_add_denied' }, 400);
+
+  // Already a member: succeed without changing their role. Re-adding someone
+  // must never quietly demote an admin back to member.
+  const existing = await c.env.DB.queryOne<{ role: string }>(
+    'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+    [teamId, target.id],
+  );
+  if (!existing) {
+    await c.env.DB.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4)',
+      [teamId, target.id, role, Date.now()],
+    );
+    await logAudit({ userId, action: 'team.member_add', details: { teamId, memberId: target.id, role } }, c.env.DB);
+  }
+
+  return c.json({
+    ok: true,
+    member: {
+      user_id: target.id,
+      username: target.username,
+      display_name: target.display_name,
+      role: existing?.role ?? role,
+    },
+  }, existing ? 200 : 201);
 });
 
 // PUT /api/team/:id/member/:memberId/role — change member role

@@ -6,10 +6,6 @@ import {
   createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
-  bindMachineToTeam,
-  createTeam,
-  createTeamInvite,
-  listMintableDesks,
   revokeControlledNodeRemoteInstallLink,
 } from '../api.js';
 import {
@@ -26,7 +22,6 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
-import type { TeamSummary } from '../api.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { MACHINE_IDENTITY_UNAVAILABLE, normalizeMachineDisplayName } from '@shared/machine-reference.js';
@@ -38,6 +33,7 @@ import { ShareSessionDialog } from './ShareSessionDialog.js';
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
+import { TeamManagementPanel } from './TeamManagementPanel.js';
 import { VerificationMachinesSection } from './VerificationMachinesSection.js';
 
 /**
@@ -138,63 +134,10 @@ export function ControlledNodesPanel({
 
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
-  // Teams this user can file a machine under. Only owner/admin memberships:
-  // the server refuses the rest, so offering them would be a button that fails.
-  const [teams, setTeams] = useState<TeamSummary[]>([]);
-  const [teamName, setTeamName] = useState('');
-  const [teamBusy, setTeamBusy] = useState(false);
-  const [teamError, setTeamError] = useState<string | null>(null);
-  const [invitedTeamId, setInvitedTeamId] = useState<string | null>(null);
-
-  const loadTeams = useCallback(async () => {
-    try {
-      setTeams(await listMintableDesks());
-    } catch {
-      setTeams([]);
-    }
-  }, []);
-
-  useEffect(() => { void loadTeams(); }, [loadTeams]);
-
-  const onCreateTeam = async () => {
-    const name = teamName.trim();
-    if (!name || teamBusy) return;
-    setTeamError(null);
-    setTeamBusy(true);
-    try {
-      await createTeam(name);
-      setTeamName('');
-      await loadTeams();
-    } catch (error) {
-      setTeamError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setTeamBusy(false);
-    }
-  };
-
-  const onInviteToTeam = async (team: TeamSummary) => {
-    setTeamError(null);
-    try {
-      const invite = await createTeamInvite(team.id, 'member');
-      const url = `${window.location.origin}/team/join/${encodeURIComponent(invite.token)}`;
-      copyToClipboard(url, () => {
-        setInvitedTeamId(team.id);
-        window.setTimeout(() => setInvitedTeamId((current) => (current === team.id ? null : current)), 2000);
-      }, () => setTeamError(t('controlled_nodes.team_invite_failed')));
-    } catch (error) {
-      setTeamError(error instanceof Error ? error.message : String(error));
-    }
-  };
-
-  const onMachineTeamChange = async (serverId: string, teamId: string) => {
-    setTeamError(null);
-    try {
-      await bindMachineToTeam(serverId, teamId || null);
-      await refetch();
-    } catch (error) {
-      setTeamError(error instanceof Error ? error.message : String(error));
-    }
-  };
+  // Three things that were stacked on one scrolling page: the machines you can
+  // reach, the groups you share them through, and how to add a new one. Three
+  // separate tasks, so three tabs.
+  const [tab, setTab] = useState<'machines' | 'teams' | 'install'>('machines');
 
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const [linkingKey, setLinkingKey] = useState<string | null>(null);
@@ -582,10 +525,15 @@ export function ControlledNodesPanel({
     setBusyServerId(null);
   };
 
-  const usageOsKeys: Array<{ os: ControlledNodeOs; key: string }> = [
-    { os: 'win', key: 'controlled_nodes.usage_win_run' },
-    { os: 'mac', key: 'controlled_nodes.usage_mac_run' },
-    { os: 'linux', key: 'controlled_nodes.usage_linux_run' },
+  // Two routes onto a machine, and they fail in different ways: the downloaded
+  // executable needs elevation from the shell that launches it, the copied
+  // command needs a terminal that is ALREADY elevated. Saying only "run with
+  // the required privileges" leaves the most common Windows failure -- pasting
+  // into an ordinary PowerShell window -- undescribed.
+  const usageOsKeys: Array<{ os: ControlledNodeOs; commandKey: string; downloadKey: string }> = [
+    { os: 'win', commandKey: 'controlled_nodes.usage_win_command', downloadKey: 'controlled_nodes.usage_win_run' },
+    { os: 'mac', commandKey: 'controlled_nodes.usage_mac_command', downloadKey: 'controlled_nodes.usage_mac_run' },
+    { os: 'linux', commandKey: 'controlled_nodes.usage_linux_command', downloadKey: 'controlled_nodes.usage_linux_run' },
   ];
 
   const showEmptyCatalog = !availLoading && !availError && sortedTargets.length === 0;
@@ -743,10 +691,24 @@ export function ControlledNodesPanel({
         </div>
       </header>
 
+      <div class="controlled-nodes-tabs" role="tablist" aria-label={t('controlled_nodes.tabs_label')}>
+        {(['machines', 'teams', 'install'] as const).map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={tab === id}
+            class={`controlled-nodes-tab${tab === id ? ' is-active' : ''}`}
+            data-testid={`controlled-nodes-tab-${id}`}
+            onClick={() => setTab(id)}
+          >{t(`controlled_nodes.tab_${id}`)}</button>
+        ))}
+      </div>
+
+      {tab === 'machines' && (
       <section class="controlled-nodes-section controlled-nodes-machines-section">
         <div class="controlled-nodes-machines-header">
           <div class="controlled-nodes-section-heading">
-            <span class="controlled-nodes-section-index">01</span>
             <h3>{t('controlled_nodes.machines_title')}</h3>
           </div>
           <div class="controlled-nodes-machines-actions">
@@ -836,23 +798,12 @@ export function ControlledNodesPanel({
                     )
                     : <span title={t('controlled_nodes.version_unknown')}>{t('controlled_nodes.version_unknown')}</span>}
                   <span>{t('controlled_nodes.access_role', { role: t(`share.role.${machineAccessRole(m)}`) })}</span>
-                  {machineAccessRole(m) === 'owner' && teams.length > 0 && (
-                    <label class="controlled-nodes-machine-team">
-                      {t('controlled_nodes.team_label')}
-                      <select
-                        data-testid={`controlled-nodes-machine-team-${m.serverId}`}
-                        value={m.teamId ?? ''}
-                        onInput={(event) => void onMachineTeamChange(m.serverId, event.currentTarget.value)}
-                      >
-                        <option value="">{t('controlled_nodes.team_none')}</option>
-                        {teams.map((team) => (
-                          <option key={team.id} value={team.id}>{team.name}</option>
-                        ))}
-                      </select>
-                    </label>
-                  )}
-                  {machineAccessRole(m) !== 'owner' && m.teamName && (
-                    <span class="controlled-nodes-machine-team-name">{m.teamName}</span>
+                  {/* Which group it is filed under. Changing that lives in the
+                      Teams tab, next to the people it grants -- a dropdown
+                      buried in a metadata row is not where you go looking for
+                      "who else can use this machine". */}
+                  {m.teamName && (
+                    <span class="controlled-nodes-role-tag">{m.teamName}</span>
                   )}
                   {m.autoUnlockConfigured && (
                     <span
@@ -909,57 +860,27 @@ export function ControlledNodesPanel({
         </ul>
       </section>
 
-      <VerificationMachinesSection machines={machines} projectKey={projectKey} />
+      )}
 
-      {/* Teams are how a set of machines is shared with other people. Nothing
-          here is required to install or to share one machine with one person --
-          those are separate, and neither goes through this. */}
-      <section class="controlled-nodes-section controlled-nodes-team-section">
-        <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">02</span>
-          <h3>{t('controlled_nodes.team_section_title')}</h3>
-        </div>
-        <p class="controlled-nodes-muted">{t('controlled_nodes.team_section_hint')}</p>
-        <div class="controlled-nodes-team-create">
-          <input
-            type="text"
-            data-testid="controlled-nodes-team-name"
-            value={teamName}
-            placeholder={t('controlled_nodes.team_create_placeholder')}
-            onInput={(event) => setTeamName(event.currentTarget.value)}
-            onKeyDown={(event) => { if (event.key === 'Enter') void onCreateTeam(); }}
-          />
-          <button
-            type="button"
-            data-testid="controlled-nodes-team-create"
-            disabled={teamBusy || !teamName.trim()}
-            onClick={() => void onCreateTeam()}
-          >{t('controlled_nodes.team_create')}</button>
-        </div>
-        {teamError && <p class="controlled-nodes-error" role="alert">{teamError}</p>}
-        {teams.length > 0 && (
-          <ul class="controlled-nodes-team-list">
-            {teams.map((team) => (
-              <li key={team.id}>
-                <span class="controlled-nodes-team-name">{team.name}</span>
-                <button
-                  type="button"
-                  data-testid={`controlled-nodes-team-invite-${team.id}`}
-                  onClick={() => void onInviteToTeam(team)}
-                >
-                  {t(invitedTeamId === team.id
-                    ? 'controlled_nodes.team_invite_copied'
-                    : 'controlled_nodes.team_invite')}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+      {tab === 'machines' && (
+        <VerificationMachinesSection machines={machines} projectKey={projectKey} />
+      )}
 
+      {tab === 'teams' && (
+        <section class="controlled-nodes-section controlled-nodes-team-section">
+          <div class="controlled-nodes-section-heading">
+            <h3>{t('controlled_nodes.team_section_title')}</h3>
+          </div>
+          <TeamManagementPanel machines={machines} onMachinesChanged={async () => { await refetch(); }} />
+        </section>
+      )}
+
+      {/* Download and install-instructions belong together: they are one task
+          read top to bottom, not two places to look. */}
+      {tab === 'install' && (
+      <>
       <section class="controlled-nodes-section controlled-nodes-download-section">
         <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">03</span>
           <h3>{t('controlled_nodes.add_title')}</h3>
         </div>
         {availLoading && <p class="controlled-nodes-muted">{t('controlled_nodes.loading_availability')}</p>}
@@ -1070,7 +991,6 @@ export function ControlledNodesPanel({
 
       <section class="controlled-nodes-section controlled-nodes-usage-section">
         <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">04</span>
           <h3>{t('controlled_nodes.usage_title')}</h3>
         </div>
         <ol class="controlled-nodes-usage">
@@ -1091,15 +1011,24 @@ export function ControlledNodesPanel({
           <ul class="controlled-nodes-usage-os">
             {usageOsKeys
               .filter(({ os }) => availableOses.includes(os))
-              .map(({ os, key }) => (
+              .map(({ os, commandKey, downloadKey }) => (
                 <li key={os}>
                   <strong>{PLATFORM_PRESENTATION[os].name}</strong>
-                  <span>{t(key)}</span>
+                  <span class="controlled-nodes-usage-route">
+                    <em>{t('controlled_nodes.usage_route_command')}</em>
+                    {t(commandKey)}
+                  </span>
+                  <span class="controlled-nodes-usage-route">
+                    <em>{t('controlled_nodes.usage_route_download')}</em>
+                    {t(downloadKey)}
+                  </span>
                 </li>
               ))}
           </ul>
         )}
       </section>
+      </>
+      )}
 
       {sharingMachine && (
         <ShareSessionDialog
