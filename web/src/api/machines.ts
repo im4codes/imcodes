@@ -414,14 +414,6 @@ export async function bindMachineToTeam(serverId: string, teamId: string | null)
 export async function mintControlledNodeExecutableTicket(
   selection: ControlledNodeArtifactSelection,
   /**
-   * Optionally, a team to associate the machine with at install time.
-   *
-   * Empty is the normal case and means the machine simply belongs to whoever
-   * installs it. Sharing is a later, separate decision about machines that
-   * already exist, so nothing here has to know about teams.
-   */
-  teamId = '',
-  /**
    * The daemon whose machine this install is for, when enrolling to give that
    * machine login-screen control. Recorded on the enrolment so both installs are
    * known to share a machine and the browser keeps offering one entry.
@@ -447,9 +439,6 @@ export async function mintControlledNodeExecutableTicket(
       version: 2,
       os: selection.os,
       arch: selection.arch,
-      // Omitted rather than sent empty: the server's body schema is strict, and
-      // an absent key is what "let the server resolve it" means there.
-      ...(teamId.trim() ? { teamId: teamId.trim() } : {}),
       ...(hostServerId ? { hostServerId } : {}),
       // Omitted for the default so an older server, which rejects unknown keys
       // with its strict body schema, keeps working unchanged.
@@ -478,11 +467,10 @@ export function buildControlledNodeBootstrapUrl(ticket: string): string {
  */
 export async function mintControlledNodeInstallCommand(
   selection: ControlledNodeArtifactSelection,
-  teamId = '',
   hostServerId?: string,
 ): Promise<{ command: string; expiresAt: number; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(
-    selection, teamId, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
   );
   if (!minted.installCommand) throw new Error('install_command_unsupported');
   if (minted.expiresAt === null) throw new Error('invalid_ticket_response');
@@ -504,11 +492,10 @@ export async function mintControlledNodeInstallCommand(
  */
 export async function mintControlledNodeRemoteInstallLink(
   selection: ControlledNodeArtifactSelection,
-  teamId = '',
   hostServerId?: string,
 ): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(
-    selection, teamId, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
   );
   return {
     url: buildControlledNodeBootstrapUrl(minted.ticket),

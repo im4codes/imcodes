@@ -124,11 +124,11 @@ async function warnBeforeInstall(): Promise<boolean> {
   // only when the installer actually carries it: an older installer has no name
   // and the consent block degrades to its unnamed wording rather than implying
   // a binding it cannot evidence.
-  const deskName = blob?.deskName?.trim() || undefined;
+  const ownerName = blob?.ownerName?.trim() || undefined;
   const locale = installerLocale();
   process.stdout.write(`${controlledNodeInstallWarning(locale, {
     ...(serverUrl ? { serverUrl } : {}),
-    ...(deskName ? { deskName } : {}),
+    ...(ownerName ? { ownerName } : {}),
   })}\n`);
 
   const interactive = Boolean(process.stdin.isTTY);

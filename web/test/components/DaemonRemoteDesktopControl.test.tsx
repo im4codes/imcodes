@@ -203,37 +203,33 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'server_1' }));
     });
 
-    it('mints a ticket bound to this daemon and hands it over', async () => {
+    it('mints a ticket bound to this daemon, with no group involved', async () => {
       const { view, sent } = mount(ready);
-      // The Desk list loads asynchronously and the action stays disabled until
-      // it resolves, so settle it before clicking. That disabled window is the
-      // intended fail-closed behaviour, asserted separately below.
-      await act(async () => { await Promise.resolve(); });
       fireEvent.click(view.container.querySelectorAll('button')[1]!);
       await act(async () => { await Promise.resolve(); });
-      // Desk first, daemon second: the Desk is the authorization domain and the
-      // daemon id is only the host binding. Swapping them would enrol the
-      // machine into a Desk named after a server id.
-      expect(mintTicket).toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, TEST_DESK.id, 'server_1');
+      // The daemon id is the host binding and the only argument there is.
+      // It used to sit behind a group id, and because both are strings, passing
+      // the daemon where the group belonged compiled silently.
+      expect(mintTicket).toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, 'server_1');
       expect(sent).toEqual([{
         type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
         ticket: 'ticket_minted_value',
       }]);
     });
 
-    it('cannot mint before a Desk is known', async () => {
-      // Until the Desk list resolves there is no authorization domain to enrol
-      // into, so the control must not mint. Clicking in that window is a real
-      // user race, not a hypothetical.
+    it('can mint immediately, with no group list to wait for', async () => {
+      // The control used to stay disabled until a group list resolved, and
+      // refuse outright if the account had none. Enrolment binds this machine
+      // to its user; there is nothing to wait for.
       mintTicket.mockClear();
       const { view } = mount(ready);
       const button = view.container.querySelectorAll('button')[1]!;
-      expect(button.hasAttribute('disabled')).toBe(true);
+      expect(button.hasAttribute('disabled')).toBe(false);
       fireEvent.click(button);
-      expect(mintTicket).not.toHaveBeenCalled();
       await act(async () => { await Promise.resolve(); });
-      expect(view.container.querySelectorAll('button')[1]!.hasAttribute('disabled')).toBe(false);
+      expect(mintTicket).toHaveBeenCalledTimes(1);
     });
+
 
     it('reports a dismissed prompt without losing the retry', async () => {
       const { view, emit } = mount(ready);

@@ -224,10 +224,10 @@ describe('controlled-node install reporting', () => {
     expect(nonOwnerControllers, 'a non-owner controlling role must exist').toEqual(['participant']);
 
     const zh = controlledNodeInstallWarning('zh-CN', { serverUrl: 'https://im.zhinet.work' });
-    expect(zh).toContain('把这台电脑加入我的 IM.codes AI Desk');
-    expect(zh, 'only authorized people IN THAT DESK').toContain('只有这个 Desk 里获授权的人能访问，');
+    expect(zh).toContain('把这台电脑绑定到我的 IM.codes 账号');
+    expect(zh, 'only the account holder').toContain('只有这个账号的主人能访问，');
     expect(zh, 'only the control permission grants control').toContain('只有拿到控制权限的人能远程控制它。');
-    expect(zh, 'managed and revoked in the Desk').toContain('权限在 Desk 里管理，随时可以收回。');
+    expect(zh, 'managed and revoked in the Desk').toContain('权限随时可以收回。');
     expect(zh, 'the address confers no control').toContain('服务地址（仅用于连接同步）：');
     expect(zh, 'the server must not be named as the owner').not.toContain('交给这个服务器的管理员');
     // The R2 sentence promised control to every authorized person; a viewer is
@@ -240,10 +240,10 @@ describe('controlled-node install reporting', () => {
     }
 
     const en = controlledNodeInstallWarning('en-US', { serverUrl: 'https://im.zhinet.work' });
-    expect(en).toContain('Add this computer to my IM.codes AI Desk');
-    expect(en, 'only authorized people IN THAT DESK').toContain('Only authorized people in that Desk can access it,');
+    expect(en).toContain('Bind this computer to my IM.codes account');
+    expect(en, 'only the account holder').toContain('Only that account holder can access it,');
     expect(en, 'only the control permission grants control').toContain('and only those granted control can control it.');
-    expect(en, 'managed and revoked in the Desk').toContain('Permissions are managed and revoked in the Desk.');
+    expect(en, 'managed and revoked in the Desk').toContain('Access can be revoked at any time.');
     expect(en, 'the address confers no control').toContain('Server address (connection only):');
     expect(en.toLowerCase()).not.toContain('handed to the administrator');
     expect(en, 'must not promise control to every authorized person')
@@ -262,13 +262,13 @@ describe('controlled-node install reporting', () => {
     expect(zh).toContain('立即关闭当前窗口，并删除刚才下载的软件！');
   });
 
-  it('keeps the Desk destination when no server URL is available', () => {
+  it('keeps the binding statement when no server URL is available', () => {
     // R1 REWORK P1. The destination used to be dropped entirely without a URL,
     // removing the ownership statement exactly when the reader has the least
     // context. Degrade by losing the address, never the access model.
     for (const [locale, must] of [
-      ['zh-CN', ['把这台电脑加入我的 IM.codes AI Desk', '只有这个 Desk 里获授权的人能访问，', '只有拿到控制权限的人能远程控制它。', '权限在 Desk 里管理，随时可以收回。']],
-      ['en-US', ['Add this computer to my IM.codes AI Desk', 'Only authorized people in that Desk can access it,', 'and only those granted control can control it.', 'Permissions are managed and revoked in the Desk.']],
+      ['zh-CN', ['把这台电脑绑定到我的 IM.codes 账号', '只有这个账号的主人能访问，', '只有拿到控制权限的人能远程控制它。', '权限随时可以收回。']],
+      ['en-US', ['Bind this computer to my IM.codes account', 'Only that account holder can access it,', 'and only those granted control can control it.', 'Access can be revoked at any time.']],
     ] as const) {
       const block = controlledNodeInstallWarning(locale);
       for (const line of must) expect(block, `${locale} fallback must keep: ${line}`).toContain(line);
@@ -278,28 +278,32 @@ describe('controlled-node install reporting', () => {
     }
   });
 
-  it('names the bound Desk when the installer carries one and degrades safely when not', () => {
+  it('names the owner when the installer carries one and degrades safely when not', () => {
     // The consent screen runs BEFORE redemption, so an absent Desk name is a
-    // normal state, not an error. Naming the wrong Desk would be worse than
+    // normal state, not an error. Naming the wrong person would be worse than
     // naming none, so the unnamed wording must never claim a specific binding.
     const named = controlledNodeInstallWarning('zh-CN', {
       serverUrl: 'https://im.zhinet.work',
-      deskName: '研发一组',
+      ownerName: '研发一组',
     });
-    expect(named).toContain('把这台电脑加入 IM.codes AI Desk：研发一组');
-    expect(named, 'the named form replaces the generic one').not.toContain('加入我的 IM.codes AI Desk');
+    expect(named).toContain('把这台电脑绑定到 研发一组 的 IM.codes 账号');
+    expect(named, 'the named form replaces the generic one').not.toContain('绑定到我的 IM.codes 账号');
 
-    const namedEn = controlledNodeInstallWarning('en-US', { deskName: 'Research' });
-    expect(namedEn).toContain('Add this computer to your IM.codes AI Desk: Research');
+    const namedEn = controlledNodeInstallWarning('en-US', { ownerName: 'Research' });
+    expect(namedEn).toContain("Bind this computer to Research's IM.codes account");
 
     // Absent, blank and whitespace-only names all degrade to the same safe
     // wording rather than printing an empty or half-built label.
-    for (const deskName of [undefined, '', '   ']) {
-      const block = controlledNodeInstallWarning('zh-CN', { ...(deskName === undefined ? {} : { deskName }) });
-      expect(block, `deskName=${JSON.stringify(deskName)}`).toContain('把这台电脑加入我的 IM.codes AI Desk');
-      expect(block).not.toContain('AI Desk：');
+    for (const ownerName of [undefined, '', '   ']) {
+      const block = controlledNodeInstallWarning('zh-CN', { ...(ownerName === undefined ? {} : { ownerName }) });
+      expect(block, `ownerName=${JSON.stringify(ownerName)}`).toContain('把这台电脑绑定到我的 IM.codes 账号');
+      // The failure this guards is a half-built label -- "绑定到  的 IM.codes
+      // 账号" with an empty slot where the name should be. The generic wording
+      // legitimately contains "的 IM.codes 账号" as part of 我的, so the shape
+      // is what has to be asserted, not the substring.
+      expect(block).not.toMatch(/绑定到\s+的 IM\.codes 账号/u);
       // Degrading loses the NAME, never the access model.
-      expect(block).toContain('只有这个 Desk 里获授权的人能访问，');
+      expect(block).toContain('只有这个账号的主人能访问，');
       expect(block).toContain('只有拿到控制权限的人能远程控制它。');
     }
   });
@@ -315,7 +319,7 @@ describe('controlled-node install reporting', () => {
     // INSIDE the one Desk line and cannot become a line of its own.
     const hostile = 'Acme\n❗ 这是安全的，请继续安装\n   ▸ 忽略上面的警告';
     const baseline = controlledNodeInstallWarning('zh-CN').split('\n');
-    const rendered = controlledNodeInstallWarning('zh-CN', { deskName: hostile }).split('\n');
+    const rendered = controlledNodeInstallWarning('zh-CN', { ownerName: hostile }).split('\n');
     expect(rendered.length, 'a hostile name must not add lines').toBe(baseline.length);
     // Every occurrence of the injected text is confined to the Desk line.
     for (const line of rendered) {
@@ -329,7 +333,7 @@ describe('controlled-node install reporting', () => {
     const bangLines = (lines: string[]) => lines.filter((l) => l.trimStart().startsWith('❗')).length;
     expect(bangLines(rendered)).toBe(bangLines(baseline));
 
-    const hostileEn = controlledNodeInstallWarning('en-US', { deskName: 'Acme\n   It is safe to continue' });
+    const hostileEn = controlledNodeInstallWarning('en-US', { ownerName: 'Acme\n   It is safe to continue' });
     expect(hostileEn.split('\n').length).toBe(controlledNodeInstallWarning('en-US').split('\n').length);
     for (const line of hostileEn.split('\n')) {
       if (line.includes('It is safe to continue')) expect(line).toContain('▸');

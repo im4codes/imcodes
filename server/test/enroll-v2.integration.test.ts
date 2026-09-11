@@ -2949,60 +2949,20 @@ describe('controlled-node Desk scope at enrollment', () => {
     expect(created).toEqual({ user_id: userId, team_id: null });
   });
 
-  it('mints with no team, and refuses a team the caller does not manage', async () => {
-    const app = buildApp();
-    const userId = `u_${hex(4)}`;
-    const strangerId = `u_${hex(4)}`;
-    await createUser(db, userId);
-    await createUser(db, strangerId);
-    const o = await owner(userId);
-
-    // No team named: the machine simply belongs to whoever installs it.
-    // Requiring one here is what left a new account unable to install at all.
-    const missing = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
-    });
-    expect(missing.status).toBe(200);
-    // Recorded as unbound rather than quietly attached to some team, so the
-    // machine really is owner-only until its owner decides otherwise.
-    expect(await db.queryOne<{ desk_team_id: string | null }>(
-      'SELECT desk_team_id FROM controlled_node_enrollments_v2 WHERE owner_user_id = $1',
-      [userId],
-    )).toEqual({ desk_team_id: null });
-
-    // A real Desk the caller does not manage is refused, not silently accepted.
-    const foreign = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, teamId: deskOf(strangerId), os: 'linux', arch: 'x64' }),
-    });
-    expect(foreign.status).toBe(403);
-
-    // An unknown Desk is refused rather than created on the fly.
-    const unknown = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, teamId: `desk-${hex(6)}`, os: 'linux', arch: 'x64' }),
-    });
-    expect(unknown.status).toBe(403);
-
-    // The two refusals persisted nothing of their own: still just the one
-    // unbound enrolment from the successful mint above.
-    expect(await db.queryOne<{ count: number }>(
-      'SELECT COUNT(*) AS count FROM controlled_node_enrollments_v2 WHERE owner_user_id = $1',
-      [userId],
-    )).toEqual({ count: 1 });
-  });
-
-  it('names the bound Desk in the installer trailer, bounded and degrading safely', async () => {
+  it('names the OWNER in the installer trailer, bounded and degrading safely', async () => {
+    // The consent screen says whose account this machine is joining. The
+    // nickname, never the username: someone deciding whether to trust an
+    // install recognises a person, not a login handle. It used to carry a group
+    // name, which described neither the person nor what the install does.
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
-    await db.execute('UPDATE teams SET name = $2 WHERE id = $1', [deskOf(userId), '研发一组']);
+    await db.execute('UPDATE users SET display_name = $2 WHERE id = $1', [userId, '老孙']);
 
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
     const { ticket } = await mint.json() as { ticket: string };
@@ -3010,17 +2970,15 @@ describe('controlled-node Desk scope at enrollment', () => {
       headers: { authorization: `Bearer ${ticket}` },
     });
     expect(download.status).toBe(200);
-    // The consent screen can name the exact Desk because the installer carries
-    // it; without this the UI could only ever print the product label.
     const trailer = decodeEnrollmentTrailer(Buffer.from(await download.arrayBuffer()));
-    expect(trailer).toMatchObject({ deskName: '研发一组' });
+    expect(trailer).toMatchObject({ ownerName: '老孙' });
 
-    // A very long Desk name is truncated rather than overflowing the bounded
-    // trailer body, which would otherwise fail the whole download.
-    await db.execute('UPDATE teams SET name = $2 WHERE id = $1', [deskOf(userId), 'D'.repeat(400)]);
+    // A very long name is truncated rather than overflowing the bounded trailer
+    // body, which would otherwise fail the whole download.
+    await db.execute('UPDATE users SET display_name = $2 WHERE id = $1', [userId, 'D'.repeat(400)]);
     const longMint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(longMint.status).toBe(200);
     const longDownload = await app.request('/api/enroll/v2/download', {
@@ -3028,207 +2986,33 @@ describe('controlled-node Desk scope at enrollment', () => {
     });
     expect(longDownload.status).toBe(200);
     const longTrailer = decodeEnrollmentTrailer(Buffer.from(await longDownload.arrayBuffer()));
-    expect(longTrailer?.deskName?.length).toBe(64);
+    expect(longTrailer?.ownerName?.length).toBe(64);
     // Whatever happens to the name, the credential fields still arrive intact.
     expect(longTrailer?.serverUrl).toBeTruthy();
     expect(longTrailer?.enrollToken).toBeTruthy();
   });
 
-  it('carries the Desk through redeem onto the created machine', async () => {
+  it('accepts a group id from an older client and stores none', async () => {
+    // Nothing sends this any more. The body schema is strict, so rejecting it
+    // would 400 every browser still running the previous bundle -- the server
+    // ships before the tab is reloaded, and that ordering is how the last
+    // install outage happened. Accepted, and then ignored: a machine belongs to
+    // whoever installs it.
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
+
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
-
-    const enrollment = await db.queryOne<{ id: string; encrypted_code: string; desk_team_id: string | null }>(
-      `SELECT id, encrypted_code, desk_team_id FROM controlled_node_enrollments_v2
-        WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT 1`,
-      [userId],
-    );
-    expect(enrollment?.desk_team_id).toBe(deskOf(userId));
-    const { decryptBotConfig } = await import('../src/security/crypto.js');
-    const enrollCode = decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
-
-    const redeem = await app.request('/api/enroll/v2/redeem', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        version: 2, enrollToken: enrollCode, installId: `inst-${hex(4)}`,
-        nodeTokenHash: sha256(hex(16)), hostname: 'desk-host', os: 'linux', arch: 'x64',
-      }),
-    });
-    expect(redeem.status).toBe(200);
-    const { serverId } = await redeem.json() as { serverId: string };
-    // The machine is born inside its Desk; nothing has to bind it afterwards.
-    expect(await db.queryOne<{ team_id: string | null }>(
-      'SELECT team_id FROM servers WHERE id = $1', [serverId],
-    )).toEqual({ team_id: deskOf(userId) });
-  });
-
-  it('revalidates Desk authority at redeem, but never breaks an idempotent replay', async () => {
-    // R4 audit P0. A ticket is a durable bearer: authority at mint says nothing
-    // about authority minutes later. Removal and downgrade are both tested,
-    // because a downgrade leaves the row present and would pass a naive
-    // "is a member" check.
-    const app = buildApp();
-    const mintAndCode = async (userId: string) => {
-      const o = await owner(userId);
-      const mint = await app.request('/api/enroll/v2/ticket', {
-        method: 'POST', headers: ticketHeaders(userId, o),
-        body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
-      });
-      expect(mint.status).toBe(200);
-      const row = await db.queryOne<{ encrypted_code: string }>(
-        `SELECT encrypted_code FROM controlled_node_enrollments_v2
-          WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT 1`, [userId],
-      );
-      const { decryptBotConfig } = await import('../src/security/crypto.js');
-      return decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
-    };
-    const redeem = (code: string, installId: string, nodeTokenHash: string) => app.request(
-      '/api/enroll/v2/redeem',
-      {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          version: 2, enrollToken: code, installId, nodeTokenHash,
-          hostname: 'authority-host', os: 'linux', arch: 'x64',
-        }),
-      },
-    );
-
-    // Removed from the Desk between mint and redeem.
-    const removedId = `u_${hex(4)}`;
-    await createUser(db, removedId);
-    const removedCode = await mintAndCode(removedId);
-    await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
-      [deskOf(removedId), removedId]);
-    expect((await redeem(removedCode, `i-${hex(4)}`, sha256(hex(16)))).status).not.toBe(200);
-    expect(await db.queryOne<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM servers WHERE user_id = $1 AND node_role = 'controlled'`,
-      [removedId],
-    )).toEqual({ count: 0 });
-
-    // Downgraded out of a managing role: still a member, no longer authorised.
-    const downgradedId = `u_${hex(4)}`;
-    await createUser(db, downgradedId);
-    const downgradedCode = await mintAndCode(downgradedId);
-    await db.execute(`UPDATE team_members SET role = 'member' WHERE team_id = $1 AND user_id = $2`,
-      [deskOf(downgradedId), downgradedId]);
-    expect((await redeem(downgradedCode, `i-${hex(4)}`, sha256(hex(16)))).status).not.toBe(200);
-    expect(await db.queryOne<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM servers WHERE user_id = $1 AND node_role = 'controlled'`,
-      [downgradedId],
-    )).toEqual({ count: 0 });
-
-    // Idempotency is preserved: a replay of an install that ALREADY produced a
-    // node returns that same node even after authority is lost, because it
-    // grants nothing new. Only creating a new node requires current authority.
-    const replayId = `u_${hex(4)}`;
-    await createUser(db, replayId);
-    const replayCode = await mintAndCode(replayId);
-    const installId = `i-${hex(4)}`;
-    const tokenHash = sha256(hex(16));
-    const first = await redeem(replayCode, installId, tokenHash);
-    expect(first.status).toBe(200);
-    const firstServerId = (await first.json() as { serverId: string }).serverId;
-    await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
-      [deskOf(replayId), replayId]);
-    const replay = await redeem(replayCode, installId, tokenHash);
-    expect(replay.status).toBe(200);
-    expect((await replay.json() as { serverId: string }).serverId).toBe(firstServerId);
-    // And still exactly one machine: the replay created nothing.
-    expect(await db.queryOne<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM servers WHERE user_id = $1 AND node_role = 'controlled'`,
-      [replayId],
-    )).toEqual({ count: 1 });
-  });
-
-  it('refuses to reuse a stable remote-link binding for a different Desk', async () => {
-    // R4 audit P1. The stable identity is (owner, os, arch, host) and excludes
-    // the Desk, so the ON CONFLICT branch used to hand back the existing ticket
-    // with its ORIGINAL Desk while the UI reported the newly chosen one.
-    const app = buildApp();
-    const userId = `u_${hex(4)}`;
-    await createUser(db, userId);
-    const o = await owner(userId);
-    const secondDesk = `desk2-${userId}`;
-    await db.execute(
-      `INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES ($1,'Second Desk',$2,'free',$3)`,
-      [secondDesk, userId, Date.now()],
-    );
-    await db.execute(
-      `INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,'owner',$3)`,
-      [secondDesk, userId, Date.now()],
-    );
-    const mintLink = (teamId: string) => app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({
-        version: 2, teamId, os: 'linux', arch: 'x64',
-        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
-      }),
-    });
-
-    expect((await mintLink(deskOf(userId))).status).toBe(200);
-    // Same stable binding, different Desk: refused rather than answered with a
-    // ticket that installs into the first Desk.
-    const conflict = await mintLink(secondDesk);
-    expect(conflict.status).toBe(409);
-    expect(await conflict.json()).toMatchObject({ reason: 'desk_conflict' });
-    // The original binding is untouched, so links already handed out keep their
-    // meaning.
     expect(await db.queryOne<{ desk_team_id: string | null }>(
       `SELECT desk_team_id FROM controlled_node_enrollments_v2
-        WHERE owner_user_id = $1 AND delivery = 'remote_link' AND revoked_at IS NULL`,
-      [userId],
-    )).toEqual({ desk_team_id: deskOf(userId) });
-    // Re-minting for the SAME Desk still succeeds (idempotent stable link).
-    expect((await mintLink(deskOf(userId))).status).toBe(200);
-  });
-
-  it('still re-checks group authority at redeem, when the ticket names one', async () => {
-    // The half of the old Desk-scope rule that still holds. A ticket carrying a
-    // group is redeemed later, possibly much later: if the minter has since
-    // been removed from that group, a stale installer must not file a new
-    // SYSTEM-capable machine into it. What no longer holds is denying a ticket
-    // that names no group at all -- that is now every ordinary install.
-    const app = buildApp();
-    const userId = `u_${hex(4)}`;
-    await createUser(db, userId);
-    const o = await owner(userId);
-    const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
-    });
-    expect(mint.status).toBe(200);
-    const enrollment = await db.queryOne<{ id: string; encrypted_code: string }>(
-      `SELECT id, encrypted_code FROM controlled_node_enrollments_v2
         WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT 1`,
       [userId],
-    );
-    const { decryptBotConfig } = await import('../src/security/crypto.js');
-    const enrollCode = decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
-
-    // The minter loses their managing role in the group after minting.
-    await db.execute(
-      'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
-      [deskOf(userId), userId],
-    );
-
-    const redeem = await app.request('/api/enroll/v2/redeem', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        version: 2, enrollToken: enrollCode, installId: `inst-${hex(4)}`,
-        nodeTokenHash: sha256(hex(16)), hostname: 'stale-host', os: 'linux', arch: 'x64',
-      }),
-    });
-    expect(redeem.status).toBe(401);
-    expect(await db.queryOne<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM servers WHERE user_id = $1 AND node_role = 'controlled'`,
-      [userId],
-    )).toEqual({ count: 0 });
+    )).toEqual({ desk_team_id: null });
   });
+
 });

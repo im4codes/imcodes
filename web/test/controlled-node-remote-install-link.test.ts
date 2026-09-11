@@ -84,36 +84,29 @@ describe('controlled-node remote install link', () => {
     expect(`${parsed.origin}${parsed.pathname}`).not.toContain('raw-ticket-value');
   });
 
-  it('sends the selected Desk on every mint path and refuses to mint without one', async () => {
-    // R4 audit P0: the server made teamId mandatory while this client still
-    // omitted it, so every production mint returned 400. The server tests could
-    // not catch that -- they called the route directly with a Desk. This asserts
-    // the actual client boundary instead.
+  it('never sends a group on any mint path', async () => {
+    // Enrolment binds a device to a user. A group is an association made
+    // afterwards, on a machine that already exists, so nothing in the mint has
+    // any business naming one -- and while it could, every link minted without
+    // one was refused at redeem with a 401.
     apiFetch.mockResolvedValueOnce(ticketResponse());
-    await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
-    expect(sentBody()).toMatchObject({ teamId: TEST_DESK_ID });
+    await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' });
+    expect(sentBody()).not.toHaveProperty('teamId');
 
     apiFetch.mockResolvedValueOnce(ticketResponse({
-      delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK, expiresAt: null,
+      delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      expiresAt: null,
     }));
-    await mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
-    expect(sentBody()).toMatchObject({ teamId: TEST_DESK_ID });
+    await mintControlledNodeRemoteInstallLink({ os: 'win', arch: 'x64' });
+    expect(lastSentBody()).not.toHaveProperty('teamId');
 
     apiFetch.mockResolvedValueOnce(ticketResponse({
       delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
       installCommand: 'curl -fsSL https://example.test/i | sh',
     }));
-    await mintControlledNodeInstallCommand({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
-    expect(sentBody()).toMatchObject({ teamId: TEST_DESK_ID });
-
-    // A blank Desk now means "the account has none, server decides". The key is
-    // OMITTED rather than sent empty: the server body schema is strict, so an
-    // empty string would be rejected outright instead of resolved.
-    apiFetch.mockResolvedValueOnce(ticketResponse());
-    await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, '   ');
+    await mintControlledNodeInstallCommand({ os: 'win', arch: 'x64' });
     expect(lastSentBody()).not.toHaveProperty('teamId');
   });
-
   it('omits the delivery key entirely for the default, so older servers still mint', async () => {
     // The server body schema is strict; sending `delivery: 'browser'` to a
     // deployment that predates the field would be rejected outright.

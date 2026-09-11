@@ -86,7 +86,7 @@ export function controlledNodeInstallStatus(locale: string): string {
 export const CONTROLLED_NODE_INSTALL_WARNING_SECONDS = 30;
 
 /** Matches the enrollment trailer bound; a name is a label, never a paragraph. */
-const DESK_NAME_MAX_CHARS = 64;
+const OWNER_NAME_MAX_CHARS = 64;
 
 export interface InstallConsentFacts {
   /** Origin that will control this machine, shown so it can be checked. */
@@ -97,7 +97,7 @@ export interface InstallConsentFacts {
    * so the name may genuinely be unknown, and the block degrades to the
    * unnamed-Desk wording rather than inventing or guessing one.
    */
-  deskName?: string;
+  ownerName?: string;
 }
 
 /**
@@ -148,30 +148,33 @@ export function controlledNodeInstallWarning(
   // never afford is an attacker-authored line inside it that reads like the
   // warning's own voice. Collapse to a single bounded line; control characters
   // and line separators become spaces rather than new lines.
-  const deskName = facts.deskName
+  const ownerName = facts.ownerName
     // eslint-disable-next-line no-control-regex
     ?.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim()
-    .slice(0, DESK_NAME_MAX_CHARS);
+    .slice(0, OWNER_NAME_MAX_CHARS);
+  // Whose account this machine is being bound to. Installing binds a device to
+  // a person; groups are an association made later, so naming a group here said
+  // the wrong thing about what was about to happen.
   const desk = zh
     ? [
       '',
-      deskName
-        ? `   ▸ 把这台电脑加入 IM.codes AI Desk：${deskName}`
-        : '   ▸ 把这台电脑加入我的 IM.codes AI Desk',
-      '     只有这个 Desk 里获授权的人能访问，',
+      ownerName
+        ? `   ▸ 把这台电脑绑定到 ${ownerName} 的 IM.codes 账号`
+        : '   ▸ 把这台电脑绑定到我的 IM.codes 账号',
+      '     只有这个账号的主人能访问，',
       '     只有拿到控制权限的人能远程控制它。',
-      '     权限在 Desk 里管理，随时可以收回。',
+      '     权限随时可以收回。',
     ]
     : [
       '',
-      deskName
-        ? `   ▸ Add this computer to your IM.codes AI Desk: ${deskName}`
-        : '   ▸ Add this computer to my IM.codes AI Desk',
-      '     Only authorized people in that Desk can access it,',
+      ownerName
+        ? `   ▸ Bind this computer to ${ownerName}'s IM.codes account`
+        : '   ▸ Bind this computer to my IM.codes account',
+      '     Only that account holder can access it,',
       '     and only those granted control can control it.',
-      '     Permissions are managed and revoked in the Desk.',
+      '     Access can be revoked at any time.',
     ];
   const destination = facts.serverUrl
     ? [

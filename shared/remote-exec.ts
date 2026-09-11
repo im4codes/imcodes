@@ -175,8 +175,8 @@ export function canonicalMachineOs(value: unknown): EnrollmentOs | undefined {
 // then burns the enrollment token. A leaked installer is therefore only useful
 // within the TTL and only for a single claim.
 
-/** Hard bound on the rendered Desk name; also caps the trailer body growth. */
-export const ENROLLMENT_DESK_NAME_MAX_CHARS = 64;
+/** Hard bound on the rendered owner name; also caps the trailer body growth. */
+export const ENROLLMENT_OWNER_NAME_MAX_CHARS = 64;
 
 /** Marker delimiting the appended enrollment blob at the exe tail. */
 export const ENROLLMENT_BLOB_MAGIC = 'IMCODESENROLLv1';
@@ -185,8 +185,11 @@ export interface EnrollmentBlob {
   serverUrl: string;
   enrollToken: string;
   /**
-   * Name of the AI Desk this installer enrols into, so the pre-install consent
-   * screen can name the exact Desk rather than only the product label.
+   * Display name of the person this installer binds the machine to, so the
+   * pre-install consent screen can say whose account it is joining rather than
+   * only the product label. The nickname, never the username: the screen is
+   * read by someone deciding whether to trust an install, and a login handle is
+   * not what they recognise.
    *
    * Optional and additive on purpose: the trailer is JSON, so an older daemon
    * reading a newer installer simply ignores this key, and a newer daemon
@@ -194,7 +197,7 @@ export interface EnrollmentBlob {
    * length-bounded where it is written, because the trailer body has a hard
    * byte ceiling.
    */
-  deskName?: string;
+  ownerName?: string;
 }
 
 /** D-A v2 redeem protocol version — explicit, not inferred from optional fields. */
@@ -322,19 +325,19 @@ export function decodeEnrollmentTrailerWithRange(
     if (typeof parsed?.serverUrl === 'string' && typeof parsed?.enrollToken === 'string'
       && /^https?:\/\//.test(parsed.serverUrl) && parsed.enrollToken.length > 0) {
       // The Desk name is the only human-authored field here, and it is rendered
-      // into the pre-install scam warning. A team name is chosen by a user, so
+      // into the pre-install scam warning. A display name is chosen by a user, so
       // treat it as hostile input: keep it to a single bounded line with no
       // control characters, otherwise a name containing newlines could forge
       // extra lines inside the very block that warns about being scammed.
-      const deskName = typeof parsed.deskName === 'string'
+      const ownerName = typeof parsed.ownerName === 'string'
         // eslint-disable-next-line no-control-regex
-        ? parsed.deskName.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ').trim().slice(0, ENROLLMENT_DESK_NAME_MAX_CHARS)
+        ? parsed.ownerName.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ').trim().slice(0, ENROLLMENT_OWNER_NAME_MAX_CHARS)
         : '';
       return {
         blob: {
           serverUrl: parsed.serverUrl.replace(/\/+$/, ''),
           enrollToken: parsed.enrollToken,
-          ...(deskName ? { deskName } : {}),
+          ...(ownerName ? { ownerName } : {}),
         },
         trailerStart,
         trailerLength,
