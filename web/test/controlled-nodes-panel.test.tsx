@@ -372,9 +372,11 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(btn);
     await waitFor(() => {
       expect(beginControlledNodeDesktopDownload).toHaveBeenCalled();
+      // No team argument. A machine belongs to whoever installs it; sharing
+      // is a separate decision made later about machines that already exist.
       expect(downloadControlledNodeExecutable).toHaveBeenCalledWith(
         { os: 'win', arch: 'x64' },
-        TEST_DESK.id,
+        '',
         expect.objectContaining({ desktopWindow: expect.anything() }),
       );
     });
@@ -399,7 +401,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => {
       // The selected Desk must reach the API from the real UI action.
       expect(createControlledNodeRemoteInstallLink)
-        .toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, TEST_DESK.id);
+        .toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
       expect(writeText).toHaveBeenCalledWith(
         'https://im.example.test/api/enroll/v2/bootstrap#ticket=remote-raw-ticket',
       );
@@ -1149,7 +1151,7 @@ describe('ControlledNodesPanel — copy install command', () => {
 
     await waitFor(() => expect(writeText).toHaveBeenCalled());
     expect(createControlledNodeInstallCommand)
-      .toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, TEST_DESK.id);
+      .toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
     const copied = String(writeText.mock.calls[0]?.[0] ?? '');
     // Verbatim: the UI must not reformat, wrap or truncate a command that will
     // be executed as root.
@@ -1211,99 +1213,3 @@ describe('ControlledNodesPanel — copy install command', () => {
   });
 });
 
-describe('ControlledNodesPanel Desk selection', () => {
-  const winDownloadButton = async (container: HTMLElement) => waitFor(() => {
-    const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-download-btn');
-    if (!b) throw new Error('win x64 download button not found');
-    return b;
-  });
-
-  it('installs straight away when the account has no Desk at all', async () => {
-    // A Desk is a team, and a machine does belong to one -- but that is the data
-    // model's problem. Requiring someone to create a team before installing
-    // their own first machine made a new account unable to install at all, and
-    // made "copy install command" a button that silently did nothing. The mint
-    // now carries no Desk and the server provisions the first one.
-    listMintableDesks.mockResolvedValue([]);
-    downloadControlledNodeExecutable.mockClear();
-    const { container } = render(<ControlledNodesPanel />);
-    const btn = await winDownloadButton(container);
-
-    await waitFor(() => { expect(btn.disabled).toBe(false); });
-    await act(async () => { fireEvent.click(btn); });
-
-    await waitFor(() => { expect(downloadControlledNodeExecutable).toHaveBeenCalledTimes(1); });
-    expect(downloadControlledNodeExecutable.mock.calls[0]![1], 'must not invent a Desk client-side').toBe('');
-    // Nothing on screen tells anyone to go create a team first.
-    expect(container.textContent).not.toContain('controlled_nodes.desk_none');
-    expect(container.textContent).not.toContain('controlled_nodes.desk_required');
-  });
-
-  it('copies the install command with no Desk, instead of doing nothing', async () => {
-    listMintableDesks.mockResolvedValue([]);
-    createControlledNodeInstallCommand.mockClear();
-    const { container } = render(<ControlledNodesPanel />);
-    const copy = await waitFor(() => {
-      const el = container.querySelector('.controlled-nodes-copy-command-btn') as HTMLButtonElement | null;
-      if (!el) throw new Error('copy command action not rendered');
-      return el;
-    });
-
-    await waitFor(() => { expect(copy.disabled).toBe(false); });
-    await act(async () => { fireEvent.click(copy); });
-
-    await waitFor(() => { expect(createControlledNodeInstallCommand).toHaveBeenCalledTimes(1); });
-  });
-
-  it('never defaults when several Desks exist, then uses exactly the chosen one', async () => {
-    // No default: picking an authorization domain on the operator's behalf is
-    // the failure this whole revision exists to prevent.
-    listMintableDesks.mockResolvedValue([
-      { id: 'desk-a', name: 'Desk A', role: 'owner' as const },
-      { id: 'desk-b', name: 'Desk B', role: 'admin' as const },
-    ]);
-    downloadControlledNodeExecutable.mockClear();
-    const { container } = render(<ControlledNodesPanel />);
-    const btn = await winDownloadButton(container);
-    const select = await waitFor(() => {
-      const el = container.querySelector('[data-testid="controlled-nodes-desk-select"]') as HTMLSelectElement | null;
-      if (!el) throw new Error('desk select not rendered');
-      return el;
-    });
-    expect(select.value, 'must not preselect a Desk').toBe('');
-
-    fireEvent.click(btn);
-    await waitFor(() => {
-      expect(container.textContent).toContain('controlled_nodes.desk_required');
-    });
-    expect(downloadControlledNodeExecutable).not.toHaveBeenCalled();
-
-    select.value = 'desk-b';
-    fireEvent.input(select);
-    await waitFor(() => {
-      expect((container.querySelector('[data-testid="controlled-nodes-desk-select"]') as HTMLSelectElement).value)
-        .toBe('desk-b');
-    });
-    // Re-query: the panel re-rendered after the refusal and the selection, so the
-    // earlier node reference may no longer be the mounted button.
-    fireEvent.click(await winDownloadButton(container));
-    await waitFor(() => {
-      expect(downloadControlledNodeExecutable).toHaveBeenCalledWith(
-        { os: 'win', arch: 'x64' },
-        'desk-b',
-        expect.objectContaining({ desktopWindow: expect.anything() }),
-      );
-    });
-  });
-
-  it('shows the single Desk it auto-selected rather than choosing silently', async () => {
-    // Exactly one Desk stays one click, but the operator must be able to see
-    // which Desk that is -- visible confirmation, not a hidden default.
-    const { container } = render(<ControlledNodesPanel />);
-    await waitFor(() => {
-      expect(container.querySelector('[data-testid="controlled-nodes-desk-single"]')?.textContent)
-        .toContain('controlled_nodes.desk_selected');
-    });
-    expect(container.querySelector('[data-testid="controlled-nodes-desk-select"]')).toBeNull();
-  });
-});

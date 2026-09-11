@@ -2901,7 +2901,7 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
 });
 
 describe('controlled-node Desk scope at enrollment', () => {
-  it('refuses to mint without an explicit Desk the caller manages', async () => {
+  it('mints with no team, and refuses a team the caller does not manage', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     const strangerId = `u_${hex(4)}`;
@@ -2909,12 +2909,19 @@ describe('controlled-node Desk scope at enrollment', () => {
     await createUser(db, strangerId);
     const o = await owner(userId);
 
-    // No Desk at all: refused rather than defaulted to the caller's only team.
+    // No team named: the machine simply belongs to whoever installs it.
+    // Requiring one here is what left a new account unable to install at all.
     const missing = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
-    expect(missing.status).toBe(400);
+    expect(missing.status).toBe(200);
+    // Recorded as unbound rather than quietly attached to some team, so the
+    // machine really is owner-only until its owner decides otherwise.
+    expect(await db.queryOne<{ desk_team_id: string | null }>(
+      'SELECT desk_team_id FROM controlled_node_enrollments_v2 WHERE owner_user_id = $1',
+      [userId],
+    )).toEqual({ desk_team_id: null });
 
     // A real Desk the caller does not manage is refused, not silently accepted.
     const foreign = await app.request('/api/enroll/v2/ticket', {
@@ -2930,11 +2937,12 @@ describe('controlled-node Desk scope at enrollment', () => {
     });
     expect(unknown.status).toBe(403);
 
-    // Nothing was persisted by any of the refusals.
+    // The two refusals persisted nothing of their own: still just the one
+    // unbound enrolment from the successful mint above.
     expect(await db.queryOne<{ count: number }>(
       'SELECT COUNT(*) AS count FROM controlled_node_enrollments_v2 WHERE owner_user_id = $1',
       [userId],
-    )).toEqual({ count: 0 });
+    )).toEqual({ count: 1 });
   });
 
   it('names the bound Desk in the installer trailer, bounded and degrading safely', async () => {

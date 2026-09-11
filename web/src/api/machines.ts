@@ -387,15 +387,13 @@ export async function listAvailableExecutableOses(): Promise<string[]> {
 export async function mintControlledNodeExecutableTicket(
   selection: ControlledNodeArtifactSelection,
   /**
-   * The AI Desk this machine will be enrolled into.
+   * Optionally, a team to associate the machine with at install time.
    *
-   * Empty means "the server decides", which is correct in exactly one case: the
-   * account has no Desk yet, so there is nothing to choose between and the mint
-   * provisions the first one. Still positional and still never defaulted
-   * client-side -- picking BETWEEN existing Desks is an authorization decision
-   * and stays with the operator.
+   * Empty is the normal case and means the machine simply belongs to whoever
+   * installs it. Sharing is a later, separate decision about machines that
+   * already exist, so nothing here has to know about teams.
    */
-  teamId: string,
+  teamId = '',
   /**
    * The daemon whose machine this install is for, when enrolling to give that
    * machine login-screen control. Recorded on the enrolment so both installs are
@@ -453,7 +451,7 @@ export function buildControlledNodeBootstrapUrl(ticket: string): string {
  */
 export async function mintControlledNodeInstallCommand(
   selection: ControlledNodeArtifactSelection,
-  teamId: string,
+  teamId = '',
   hostServerId?: string,
 ): Promise<{ command: string; expiresAt: number; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(
@@ -479,7 +477,7 @@ export async function mintControlledNodeInstallCommand(
  */
 export async function mintControlledNodeRemoteInstallLink(
   selection: ControlledNodeArtifactSelection,
-  teamId: string,
+  teamId = '',
   hostServerId?: string,
 ): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(

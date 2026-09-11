@@ -6,9 +6,7 @@ import {
   createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
-  listMintableDesks,
   revokeControlledNodeRemoteInstallLink,
-  type TeamSummary,
 } from '../api.js';
 import {
   artifactSelectionKey,
@@ -133,14 +131,6 @@ export function ControlledNodesPanel({
   const [availLoading, setAvailLoading] = useState(true);
   const [availError, setAvailError] = useState<string | null>(null);
 
-  // Desk selection for every mint path in this panel.
-  //
-  // A controlled node is created inside exactly one Desk and the server refuses
-  // a mint without one, so the Desk is a decision the operator makes, never a
-  // default this component invents. With no mintable Desk the actions are
-  // disabled outright rather than minting something that could not be bound.
-  const [desks, setDesks] = useState<TeamSummary[]>([]);
-  const [selectedDeskId, setSelectedDeskId] = useState<string>('');
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
@@ -192,25 +182,6 @@ export function ControlledNodesPanel({
 
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
 
-  useEffect(() => {
-    let cancelled = false;
-    // Guarded the same way and for the same reason as the daemon control: catch
-    // a synchronous failure without delaying the lookup by a tick.
-    try {
-      void listMintableDesks()
-        .then((rows) => {
-          if (cancelled) return;
-          setDesks(rows);
-        // Exactly one Desk auto-selects so the common case stays one click, but
-        // the chosen Desk is always rendered next to the actions, so this is a
-        // visible confirmation rather than a silent guess. More than one never
-        // defaults.
-        setSelectedDeskId(rows.length === 1 ? rows[0]!.id : '');
-      })
-        .catch(() => { if (!cancelled) setDesks([]); });
-    } catch { setDesks([]); }
-    return () => { cancelled = true; };
-  }, []);
 
   useEffect(() => {
     const updateMobileActions = (): void => {
@@ -297,32 +268,9 @@ export function ControlledNodesPanel({
     }
   }, [manualPresenceRefresh, refreshPresence]);
 
-  /**
-   * Resolve the Desk for THIS action.
-   *
-   * The id is read once, at the moment the action starts, and passed down
-   * explicitly. Nothing later re-reads component state, so an async Desk-list
-   * refresh landing mid-flight cannot move the install to a different Desk than
-   * the one the operator saw when they clicked.
-   */
-  const takeSelectedDesk = (): string | null => {
-    const deskId = selectedDeskId.trim();
-    if (deskId && desks.some((desk) => desk.id === deskId)) return deskId;
-    // Only an unmade choice is an error. With no Desk the server creates the
-    // first one during the mint, so sending nothing is the correct request --
-    // not a failure to be reported at someone who never asked for a Desk.
-    if (desks.length > 1) {
-      setDownloadError(t('controlled_nodes.desk_required'));
-      return null;
-    }
-    return '';
-  };
-
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
     setDownloadError(null);
-    const deskId = takeSelectedDesk();
-    if (deskId === null) return;
     setDownloadingKey(key);
     let desktopWindow: Window | null = null;
     if (!isNative()) {
@@ -335,7 +283,7 @@ export function ControlledNodesPanel({
       }
     }
     try {
-      const ticket = await downloadControlledNodeExecutable(target, deskId, { desktopWindow });
+      const ticket = await downloadControlledNodeExecutable(target, '', { desktopWindow });
       const expiresAt = ticket.expiresAt;
       if (expiresAt !== null) {
         setTicketExpiryByKey((prev) => ({ ...prev, [key]: expiresAt }));
@@ -374,11 +322,9 @@ export function ControlledNodesPanel({
     const key = artifactSelectionKey(target);
     if (commandKey) return;
     setDownloadError(null);
-    const deskId = takeSelectedDesk();
-    if (deskId === null) return;
     setCommandKey(key);
     try {
-      const minted = await createControlledNodeInstallCommand(target, deskId);
+      const minted = await createControlledNodeInstallCommand(target);
       const copied = await new Promise<boolean>((resolve) => {
         copyToClipboard(minted.command, () => resolve(true), () => resolve(false));
       });
@@ -406,11 +352,9 @@ export function ControlledNodesPanel({
     const key = artifactSelectionKey(target);
     if (linkingKey) return;
     setDownloadError(null);
-    const deskId = takeSelectedDesk();
-    if (deskId === null) return;
     setLinkingKey(key);
     try {
-      const link = await createControlledNodeRemoteInstallLink(target, deskId);
+      const link = await createControlledNodeRemoteInstallLink(target);
       const copied = await new Promise<boolean>((resolve) => {
         copyToClipboard(link.url, () => resolve(true), () => resolve(false));
       });
@@ -896,28 +840,6 @@ export function ControlledNodesPanel({
         {showEmptyCatalog && (
           <p class="controlled-nodes-muted">{t('controlled_nodes.no_executables')}</p>
         )}
-        <div class="controlled-nodes-desk-select">
-          {desks.length === 1 && (
-            <p class="controlled-nodes-muted" data-testid="controlled-nodes-desk-single">
-              {t('controlled_nodes.desk_selected', { desk: desks[0]!.name })}
-            </p>
-          )}
-          {desks.length > 1 && (
-            <label class="controlled-nodes-desk-label">
-              {t('controlled_nodes.desk_label')}
-              <select
-                data-testid="controlled-nodes-desk-select"
-                value={selectedDeskId}
-                onInput={(event) => setSelectedDeskId(event.currentTarget.value)}
-              >
-                <option value="">{t('controlled_nodes.desk_choose')}</option>
-                {desks.map((desk) => (
-                  <option key={desk.id} value={desk.id}>{desk.name}</option>
-                ))}
-              </select>
-            </label>
-          )}
-        </div>
         <div class="controlled-nodes-downloads">
           {sortedTargets.map((target) => {
             const key = artifactSelectionKey(target);
@@ -932,12 +854,6 @@ export function ControlledNodesPanel({
             const isCommandCopied = copiedCommandKey === key;
             const linkExpiry = linkExpiryByKey[key];
             const rowBusy = isDownloading || isLinking || isRevokingLink || isCommanding;
-            // Having no Desk is NOT a blocker. A machine still ends up in one,
-            // but the server provisions the first one during the mint, so
-            // installing never waits on someone creating a "team" first.
-            // Choosing between several is still the operator's call, and that is
-            // the only case the picker below exists for.
-            const mintBlocked = rowBusy || desks.length > 1 && !selectedDeskId.trim();
             const platform = PLATFORM_PRESENTATION[target.os];
             return (
               <div key={key} class={`controlled-nodes-download-item is-${target.os}`}>
@@ -952,7 +868,7 @@ export function ControlledNodesPanel({
                   <button
                     type="button"
                     class="controlled-nodes-download-btn"
-                    disabled={mintBlocked}
+                    disabled={rowBusy}
                     title={downloadLabel(target, t)}
                     onClick={() => onDownload(target)}
                   >
@@ -964,7 +880,7 @@ export function ControlledNodesPanel({
                   <button
                     type="button"
                     class="controlled-nodes-copy-link-btn"
-                    disabled={mintBlocked}
+                    disabled={rowBusy}
                     title={t('controlled_nodes.copy_install_link_hint')}
                     aria-live="polite"
                     onClick={() => void onCopyInstallLink(target)}
@@ -978,7 +894,7 @@ export function ControlledNodesPanel({
                   <button
                     type="button"
                     class="controlled-nodes-copy-command-btn"
-                    disabled={mintBlocked}
+                    disabled={rowBusy}
                     title={t('controlled_nodes.copy_install_command_hint')}
                     aria-live="polite"
                     onClick={() => void onCopyInstallCommand(target)}

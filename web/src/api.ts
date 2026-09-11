@@ -1988,7 +1988,7 @@ export async function downloadControlledNodeExecutable(
  */
 export async function createControlledNodeRemoteInstallLink(
   selection: import('./api/machines.js').ControlledNodeArtifactSelection,
-  teamId: string,
+  teamId = '',
   hostServerId?: string,
 ): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
   const { mintControlledNodeRemoteInstallLink } = await import('./api/machines.js');
@@ -2005,7 +2005,7 @@ export async function revokeControlledNodeRemoteInstallLink(
 
 export async function createControlledNodeInstallCommand(
   selection: import('./api/machines.js').ControlledNodeArtifactSelection,
-  teamId: string,
+  teamId = '',
   hostServerId?: string,
 ): Promise<{ command: string; expiresAt: number; ticketId: string }> {
   const { mintControlledNodeInstallCommand } = await import('./api/machines.js');
