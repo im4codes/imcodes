@@ -26,7 +26,7 @@ import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-in
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { MACHINE_IDENTITY_UNAVAILABLE, normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { formatByteSize } from '../util/byte-size.js';
-import { copyToClipboard } from '../util/clipboard.js';
+import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
@@ -341,11 +341,17 @@ export function ControlledNodesPanel({
     setDownloadError(null);
     setCommandKey(key);
     try {
-      const minted = await createControlledNodeInstallCommand(target);
-      const copied = await new Promise<boolean>((resolve) => {
-        copyToClipboard(minted.command, () => resolve(true), () => resolve(false));
+      // The clipboard is engaged BEFORE the mint is awaited. iOS only lets a
+      // page write to the clipboard while the tap still counts, and awaiting
+      // the network spends that -- which is why this button worked on Android
+      // and told iPhone users to check permissions they never lacked.
+      const pending = createControlledNodeInstallCommand(target).then((minted) => minted.command);
+      const copied = new Promise<boolean>((resolve) => {
+        copyToClipboardWhenReady(pending, () => resolve(true), () => resolve(false));
       });
-      if (!copied) {
+      // Awaited first so that a mint failure is reported as a mint failure.
+      await pending;
+      if (!await copied) {
         setDownloadError(t('controlled_nodes.copy_install_command_clipboard_error'));
         return;
       }
@@ -371,10 +377,14 @@ export function ControlledNodesPanel({
     setDownloadError(null);
     setLinkingKey(key);
     try {
-      const link = await createControlledNodeRemoteInstallLink(target);
-      const copied = await new Promise<boolean>((resolve) => {
-        copyToClipboard(link.url, () => resolve(true), () => resolve(false));
+      // Same as the command button above: engage the clipboard inside the tap.
+      const minting = createControlledNodeRemoteInstallLink(target);
+      const copyResult = new Promise<boolean>((resolve) => {
+        copyToClipboardWhenReady(minting.then((minted) => minted.url), () => resolve(true), () => resolve(false));
       });
+      // Awaited first so that a mint failure is reported as a mint failure.
+      const link = await minting;
+      const copied = await copyResult;
       if (!copied) {
         setDownloadError(t('controlled_nodes.copy_install_link_clipboard_error'));
         return;

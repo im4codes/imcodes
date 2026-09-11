@@ -53,7 +53,7 @@ import {
   sendRemoteDesktopChord,
 } from '../remote-desktop-keyboard.js';
 import { formatByteRate, formatByteSize } from '../util/byte-size.js';
-import { copyToClipboard } from '../util/clipboard.js';
+import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { useFullscreen } from '../hooks/useFullscreen.js';
@@ -1689,12 +1689,20 @@ export function RemoteDesktopPanel({
   const copyRemoteSelection = async () => {
     if (!snapshot.inputEnabled) return;
     setClipboardStatus('copying');
-    const text = await clientRef.current?.requestRemoteClipboard();
+    // Engage the clipboard with the promise, inside the tap. Waiting for the
+    // remote machine to answer and only then writing is refused on iOS, where
+    // the write is only allowed while the tap still counts.
+    const pending = Promise.resolve(clientRef.current?.requestRemoteClipboard())
+      .then((text) => text ?? '');
+    const copied = new Promise<boolean>((resolve) => {
+      copyToClipboardWhenReady(pending, () => resolve(true), () => resolve(false));
+    });
+    const text = await pending;
     if (!text) {
       setClipboardStatus('empty');
       return;
     }
-    copyToClipboard(text, () => setClipboardStatus('copied'));
+    setClipboardStatus(await copied ? 'copied' : 'failed');
   };
 
   const stopAndClose = () => {

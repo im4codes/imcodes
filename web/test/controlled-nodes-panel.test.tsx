@@ -1197,6 +1197,78 @@ describe('ControlledNodesPanel — copy install command', () => {
       expect(btn.textContent).toContain('controlled_nodes.copy_install_command_copied'));
   });
 
+  it('reaches the clipboard on an iPhone, where a write after the mint is refused', async () => {
+    // The reported bug: on some iPhones the button answered "无法复制命令,
+    // 请检查剪贴板权限" -- at people whose permissions were fine. iOS only
+    // allows a clipboard write while the tap still counts as a user
+    // activation, and awaiting the mint spends it. Chrome and most Android
+    // browsers allow the late write, which is why it worked on one phone and
+    // not another.
+    //
+    // This clipboard refuses exactly what iOS refuses.
+    let gestureOver = false;
+    const written: string[] = [];
+    class FakeClipboardItem {
+      constructor(readonly items: Record<string, Promise<Blob>>) {}
+    }
+    const write = vi.fn(async (items: FakeClipboardItem[]) => {
+      if (gestureOver) throw new Error('NotAllowedError');
+      written.push(await (await items[0]!.items['text/plain'])!.text());
+    });
+    const writeText = vi.fn(async () => { throw new Error('NotAllowedError'); });
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { write, writeText } });
+    vi.stubGlobal('ClipboardItem', FakeClipboardItem);
+    try {
+      const { container } = renderInstallTab();
+      const btn = await waitFor(() => {
+        const b = container.querySelector(
+          '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+        );
+        if (!b) throw new Error('copy-command button not found');
+        return b;
+      });
+      fireEvent.click(btn);
+      // Everything from here on counts as after the tap.
+      gestureOver = true;
+
+      await waitFor(() =>
+        expect(btn.textContent).toContain('controlled_nodes.copy_install_command_copied'));
+      expect(written).toEqual([
+        (await createControlledNodeInstallCommand.mock.results[0]!.value).command,
+      ]);
+      expect(container.textContent)
+        .not.toContain('controlled_nodes.copy_install_command_clipboard_error');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('still blames the mint, not the clipboard, when minting is what failed', async () => {
+    // Telling someone to check a permission they have, because a server call
+    // failed, is the same bug wearing a different hat.
+    const write = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { write, writeText: vi.fn() } });
+    vi.stubGlobal('ClipboardItem', class { constructor(readonly items: unknown) {} });
+    createControlledNodeInstallCommand.mockRejectedValueOnce(new Error('nope'));
+    try {
+      const { container } = renderInstallTab();
+      const btn = await waitFor(() => {
+        const b = container.querySelector(
+          '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+        );
+        if (!b) throw new Error('copy-command button not found');
+        return b;
+      });
+      fireEvent.click(btn);
+      await waitFor(() =>
+        expect(container.textContent).toContain('controlled_nodes.copy_install_command_error'));
+      expect(container.textContent)
+        .not.toContain('controlled_nodes.copy_install_command_clipboard_error');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('reports a denied clipboard instead of claiming the command was copied', async () => {
     const writeText = vi.fn(async () => { throw new Error('denied'); });
     vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
