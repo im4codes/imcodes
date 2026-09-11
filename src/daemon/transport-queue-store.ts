@@ -1631,6 +1631,29 @@ export class TransportQueueStore {
     return true;
   }
 
+  /**
+   * The recipient identity this session's durable queue is actually bound to.
+   *
+   * `queueBelongsTo` answers "may this caller drain it?" and fails closed. A
+   * read-only projection needs the complementary fact -- WHO owns the rows --
+   * so it can gate on the same authority the rows were stamped with instead of
+   * a second, possibly-drifted one. Returns null for an unbound or legacy
+   * NULL/NULL queue, which stays quarantined exactly as before.
+   */
+  boundRecipient(sessionNameInput: string): QueueRecipientIdentity | null {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const meta = this.db.prepare(`
+      SELECT recipient_session_instance_id AS sessionInstanceId,
+        recipient_runtime_epoch AS runtimeEpoch
+      FROM queue_meta WHERE session_name = ?
+    `).get(sessionName) as { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | undefined;
+    if (!meta) return null;
+    return normalizeQueueRecipient({
+      sessionInstanceId: meta.sessionInstanceId ?? '',
+      runtimeEpoch: meta.runtimeEpoch ?? '',
+    });
+  }
+
   /** Does any aggregate row still carry the pre-identity NULL/NULL shape? */
   hasLegacyRecipientRows(sessionNameInput: string): boolean {
     const sessionName = normalizeSessionName(sessionNameInput);

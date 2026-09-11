@@ -1571,7 +1571,7 @@ async function recoverPersistedTransportQueue(
 ): Promise<number> {
   const recipient = runtime.recipientIdentity;
   const hadLegacyRows = getTransportQueueStore().hasLegacyRecipientRows(sessionName);
-  if (recipient && !runtime.adoptLegacyQueueRecipient()) {
+  if (recipient && !runtime.adoptOrRebindQueueRecipient()) {
     const discarded = runtime.discardDurableQueueStateForRecipientConflict();
     logger.warn(
       { session: sessionName, context, discarded },
@@ -3391,7 +3391,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       // "transport queue recipient rotation rejected". The next enqueue could
       // then add yet another epoch to the same aggregate, making cards visible
       // but neither drainable nor cancellable.
-      if (runtime.recipientIdentity && !runtime.adoptLegacyQueueRecipient()) {
+      if (runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) {
         const discarded = runtime.discardDurableQueueStateForRecipientConflict();
         logger.warn(
           { session: name, discarded },

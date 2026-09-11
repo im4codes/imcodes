@@ -1291,6 +1291,36 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
+   * Ownership recovery that repairs before it destroys.
+   *
+   * `adoptLegacyQueueRecipient` only migrates pre-identity NULL rows; every
+   * other mismatch fell straight through to discarding the whole durable queue.
+   * But a queue one epoch behind THIS SAME instance is not a foreign queue --
+   * it is this session's own work, left behind because the epoch rotated on a
+   * path that never called `rebindQueueRecipient`. Daemon restart is exactly
+   * that path: it rebuilds the runtime directly from the already-rotated
+   * persisted record, so the store is still bound to the previous epoch and the
+   * user's queued messages were silently deleted on every restart.
+   *
+   * The INSTANCE dimension stays absolute. A same-named successor instance is
+   * refused here and still falls through to the destructive path, so a
+   * replacement session can never inherit its predecessor's queue.
+   */
+  adoptOrRebindQueueRecipient(): boolean {
+    if (this.adoptLegacyQueueRecipient()) return true;
+    const mine = this.queueRecipient;
+    if (!mine) return false;
+    const store = getTransportQueueStore();
+    const bound = store.boundRecipient(this.sessionKey);
+    if (!bound
+      || bound.sessionInstanceId !== mine.sessionInstanceId
+      || bound.runtimeEpoch === mine.runtimeEpoch) return false;
+    if (!store.rebindRecipientRuntimeEpoch(this.sessionKey, bound, mine)) return false;
+    this._queueRecipientRecoveryChanged = true;
+    return true;
+  }
+
+  /**
    * Destructive self-heal for a same-name queue bound to a different canonical
    * recipient. This preserves the ownership invariant by never draining stale
    * rows into this runtime; it clears them and binds an empty durable queue so
@@ -1324,7 +1354,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     // same-named successor must not recover it; legacy rows carrying no identity
     // are quarantined by the same gate.
     if (this.queueRecipient && !store.queueBelongsTo(this.sessionKey, this.queueRecipient)) {
-      if (!this.adoptLegacyQueueRecipient()) {
+      if (!this.adoptOrRebindQueueRecipient()) {
         const discarded = this.discardDurableQueueStateForRecipientConflict();
         logger.warn({ session: this.sessionKey, discarded }, 'Discarded stale transport queue state during rehydrate ownership recovery');
         return 0;

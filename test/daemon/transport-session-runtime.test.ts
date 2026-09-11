@@ -985,6 +985,75 @@ describe('TransportSessionRuntime', () => {
       )).toBeTypeOf('string');
     });
 
+    it('recovers a queue left one epoch behind when a restored runtime starts on the rotated epoch', async () => {
+      // The daemon restart path rebuilds a runtime straight from the PERSISTED
+      // record, which already carries the rotated epoch. Nothing calls
+      // rebindQueueRecipient() there, so the durable queue is still bound to the
+      // pre-rotation epoch of the SAME instance. That split is repairable --
+      // rebindRecipientRuntimeEpoch exists for exactly it -- but ownership
+      // recovery only knew "adopt legacy NULL rows" or "destroy", so the user's
+      // queued message was silently discarded on restart.
+      const stale = { sessionInstanceId: 'instance-split', runtimeEpoch: 'epoch-stale' };
+      const current = { sessionInstanceId: 'instance-split', runtimeEpoch: 'epoch-current' };
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_split_brain',
+        recipient: stale,
+        clientMessageId: 'msg-survives-restart',
+        commandId: 'msg-survives-restart',
+        text: 'queued before the epoch rotated',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'msg-survives-restart',
+          text: 'queued before the epoch rotated',
+        }),
+      });
+      const restoredProvider = makeMockProvider();
+      const restored = new TransportSessionRuntime(
+        restoredProvider.provider,
+        'deck_split_brain',
+        current,
+      );
+      await restored.initialize({ sessionKey: 'deck_split_brain' });
+
+      expect(restored.rehydratePendingFromStore()).toBe(1);
+      expect(restored.pendingEntries).toEqual([
+        { clientMessageId: 'msg-survives-restart', text: 'queued before the epoch rotated' },
+      ]);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(
+        'deck_split_brain',
+        'msg-survives-restart',
+        current,
+      )).toBeTypeOf('string');
+    });
+
+    it('still destroys a queue belonging to a DIFFERENT session instance', async () => {
+      const predecessor = { sessionInstanceId: 'instance-predecessor', runtimeEpoch: 'epoch-1' };
+      // A real replacement instance also gets a fresh epoch. Keeping the epoch
+      // equal would short-circuit ownership recovery before the instance
+      // boundary is ever consulted, so the case must differ in BOTH fields.
+      const successor = { sessionInstanceId: 'instance-successor', runtimeEpoch: 'epoch-2' };
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_foreign_brain',
+        recipient: predecessor,
+        clientMessageId: 'msg-of-previous-instance',
+        commandId: 'msg-of-previous-instance',
+        text: 'must never reach the replacement runtime',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'msg-of-previous-instance',
+          text: 'must never reach the replacement runtime',
+        }),
+      });
+      const successorProvider = makeMockProvider();
+      const successorRuntime = new TransportSessionRuntime(
+        successorProvider.provider,
+        'deck_foreign_brain',
+        successor,
+      );
+      await successorRuntime.initialize({ sessionKey: 'deck_foreign_brain' });
+
+      expect(successorRuntime.rehydratePendingFromStore()).toBe(0);
+      expect(successorRuntime.pendingEntries).toEqual([]);
+    });
+
     it('does not retain a runtime-local copy when a durable cancellation beats late enqueue', async () => {
       const recipient = { sessionInstanceId: 'instance-cancelled', runtimeEpoch: 'epoch-cancelled' };
       const lateMock = makeMockProvider();

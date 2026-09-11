@@ -5,7 +5,7 @@ import { deterministicSendMessageId } from '../../shared/send-message-id.js';
 import { containsProhibitedQueueProjectionField } from '../../shared/transport-queue-privacy.js';
 import type { QueueSnapshot, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
-import type { TransportQueueStore } from './transport-queue-store.js';
+import type { QueueRecipientIdentity, TransportQueueStore } from './transport-queue-store.js';
 import { getSession } from '../store/session-store.js';
 import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 
@@ -201,6 +201,41 @@ export type TransportQueueSnapshotPayload = {
   degradedReason?: QueueSnapshot['degradedReason'];
 };
 
+/**
+ * Which recipient identity may this session's queue be projected under?
+ *
+ * The daemon carries TWO authorities for one queue. Rows are stamped at enqueue
+ * with the live runtime's `queueRecipient`; the public projection gated on the
+ * persisted SessionRecord instead. A same-instance epoch rotation the runtime
+ * has not adopted splits them, and the row-level predicate then matches nothing:
+ * the browser shows an empty queue while the runtime still holds the message in
+ * `_pendingMessages` and still delivers it. That is the "queued but invisible"
+ * window.
+ *
+ * Ownership is separated by INSTANCE, not by epoch -- `rebindRecipientRuntimeEpoch`
+ * exists precisely because epochs of one instance are the same logical session.
+ * So we relax the epoch dimension to whatever the queue is actually bound to,
+ * and never the instance dimension: a same-named successor instance stays fully
+ * quarantined, as does a legacy NULL/NULL queue.
+ */
+function resolveProjectionRecipient(
+  sessionName: string,
+  store: TransportQueueStore,
+  record: { sessionInstanceId?: string | null; runtimeEpoch?: string | null } | undefined,
+  hasInstance: boolean,
+  hasEpoch: boolean,
+): QueueRecipientIdentity | null {
+  if (!record || !hasInstance || !hasEpoch) return null;
+  const fromRecord: QueueRecipientIdentity = {
+    sessionInstanceId: record.sessionInstanceId!,
+    runtimeEpoch: record.runtimeEpoch!,
+  };
+  const bound = store.boundRecipient(sessionName);
+  if (!bound) return fromRecord;
+  if (bound.sessionInstanceId !== fromRecord.sessionInstanceId) return fromRecord;
+  return bound;
+}
+
 export function buildTransportQueueSnapshot(
   sessionName: string,
   source: TransportQueueSnapshotSource,
@@ -209,26 +244,22 @@ export function buildTransportQueueSnapshot(
   const record = getSession(sessionName);
   const hasInstance = typeof record?.sessionInstanceId === 'string' && record.sessionInstanceId.length > 0;
   const hasEpoch = typeof record?.runtimeEpoch === 'string' && record.runtimeEpoch.length > 0;
-  let snapshot = record && hasInstance === hasEpoch
-    ? store.readSnapshotSafelyForRecipient(
-        sessionName,
-        hasInstance && hasEpoch
-          ? { sessionInstanceId: record.sessionInstanceId!, runtimeEpoch: record.runtimeEpoch! }
-          : null,
-        source,
-      )
-    : store.readSnapshotSafely(sessionName, source);
+  // One gate, resolved once and reused by every re-read below. The re-reads
+  // exist because the steps in between may durably mutate the queue; each one
+  // must re-apply the SAME recipient gate, never a widened one.
+  const readGated = (): QueueSnapshot => (
+    record && hasInstance === hasEpoch
+      ? store.readSnapshotSafelyForRecipient(
+          sessionName,
+          resolveProjectionRecipient(sessionName, store, record, hasInstance, hasEpoch),
+          source,
+        )
+      : store.readSnapshotSafely(sessionName, source)
+  );
+  let snapshot = readGated();
   try {
     if (backfillLegacySupervisionQueueReferences(store, snapshot)) {
-      snapshot = record && hasInstance === hasEpoch
-        ? store.readSnapshotSafelyForRecipient(
-            sessionName,
-            hasInstance && hasEpoch
-              ? { sessionInstanceId: record.sessionInstanceId!, runtimeEpoch: record.runtimeEpoch! }
-              : null,
-            source,
-          )
-        : store.readSnapshotSafely(sessionName, source);
+      snapshot = readGated();
     }
     const changed = reconcileObsoleteSupervisionQueueFailures(
       store,
@@ -239,29 +270,13 @@ export function buildTransportQueueSnapshot(
       // Re-apply the recipient gate after mutation. dismissFailed returns a
       // store-wide snapshot, which must never become a public cross-generation
       // projection merely because a stale supervision card was retired.
-      snapshot = record && hasInstance === hasEpoch
-        ? store.readSnapshotSafelyForRecipient(
-            sessionName,
-            hasInstance && hasEpoch
-              ? { sessionInstanceId: record.sessionInstanceId!, runtimeEpoch: record.runtimeEpoch! }
-              : null,
-            source,
-          )
-        : store.readSnapshotSafely(sessionName, source);
+      snapshot = readGated();
     }
   } catch {
     // Queue projection remains fail-closed: an unavailable registry never
     // authorizes deletion. Re-read because an earlier item in this bounded pass
     // may already have been durably dismissed before a later lookup failed.
-    snapshot = record && hasInstance === hasEpoch
-      ? store.readSnapshotSafelyForRecipient(
-          sessionName,
-          hasInstance && hasEpoch
-            ? { sessionInstanceId: record.sessionInstanceId!, runtimeEpoch: record.runtimeEpoch! }
-            : null,
-          source,
-        )
-      : store.readSnapshotSafely(sessionName, source);
+    snapshot = readGated();
   }
   // A partial persisted identity proves no recipient at all. Preserve authority
   // metadata for convergence, but never expose queue text across that boundary.
