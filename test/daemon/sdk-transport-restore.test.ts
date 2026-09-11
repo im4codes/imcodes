@@ -386,10 +386,29 @@ function codexRunForSession(sessionName: string, mode?: 'start' | 'resume') {
  *  Preserves the original initial flush, then keeps flushing ONLY if the async
  *  send→provider→run-registration chain hasn't completed yet — uncontended runs
  *  are unchanged (the run is present after the first flush, the loop exits at once). */
-async function settleCodexRun(sessionName: string, mode: 'start' | 'resume') {
+async function settleCodexRun(
+  sessionName: string,
+  mode: 'start' | 'resume',
+  /**
+   * The turn input this run is expected to carry, when the caller goes on to
+   * assert it.
+   *
+   * `thread/start` registers the run with an empty input and `turn/start` fills
+   * it in afterwards, so waiting only for registration returns in the window
+   * between the two -- where the input is still ''. Uncontended that window is
+   * invisible; under coverage instrumentation it is wide enough to land in, and
+   * the assertion then reads the run it was waiting for but not the turn.
+   */
+  expectedInput?: string,
+) {
   await flush();
   const deadline = Date.now() + 5_000;
-  while (!codexRunForSession(sessionName, mode) && Date.now() < deadline) {
+  const settled = (): boolean => {
+    const run = codexRunForSession(sessionName, mode);
+    if (!run) return false;
+    return expectedInput === undefined || run.input === expectedInput;
+  };
+  while (!settled() && Date.now() < deadline) {
     await flush();
   }
 }
@@ -2091,7 +2110,7 @@ describe('sdk transport session restore', () => {
       label: 'Renamed while restored runtime stays attached',
     });
     runtime!.send('continue after daemon restart');
-    await settleCodexRun('deck_sub_sdk_stale_running', 'start');
+    await settleCodexRun('deck_sub_sdk_stale_running', 'start', 'continue after daemon restart');
 
     expect(codexRunForSession('deck_sub_sdk_stale_running', 'resume')).toBeUndefined();
     expect(codexRunForSession('deck_sub_sdk_stale_running', 'start')).toMatchObject({
