@@ -3244,7 +3244,11 @@
     "desk_choose": "Выберите Desk…",
     "desk_selected": "Будет добавлен в Desk: {{desk}}",
     "desk_required": "Перед установкой выберите, к какому AI Desk присоединится этот компьютер.",
-    "desk_none": "Сначала нужен AI Desk. Создайте его или присоединитесь к существующему."
+    "desk_none": "Сначала нужен AI Desk. Создайте его или присоединитесь к существующему.",
+    "desk_create": "Создать AI Desk",
+    "desk_creating": "Создание…",
+    "desk_default_name": "Мой AI Desk",
+    "desk_create_failed": "Не удалось создать AI Desk. Попробуйте ещё раз."
   },
   "peerAuditQuick": {
     "iconLabel": "Пир-аудит",

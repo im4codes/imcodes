@@ -3245,7 +3245,11 @@
     "desk_choose": "Elige un Desk…",
     "desk_selected": "Se añadirá al Desk: {{desk}}",
     "desk_required": "Elige a qué AI Desk se une este equipo antes de instalar.",
-    "desk_none": "Necesitas un AI Desk antes de añadir un equipo. Crea uno o únete a uno."
+    "desk_none": "Necesitas un AI Desk antes de añadir un equipo. Crea uno o únete a uno.",
+    "desk_create": "Crear un AI Desk",
+    "desk_creating": "Creando…",
+    "desk_default_name": "Mi AI Desk",
+    "desk_create_failed": "No se pudo crear el AI Desk. Inténtalo de nuevo."
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

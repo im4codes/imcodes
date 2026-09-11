@@ -3245,7 +3245,11 @@
     "desk_choose": "請選擇一個 Desk…",
     "desk_selected": "將加入這個 Desk：{{desk}}",
     "desk_required": "安裝前請先選擇這台電腦要加入哪個 AI Desk。",
-    "desk_none": "你還沒有 AI Desk，先建立或加入一個才能新增電腦。"
+    "desk_none": "你還沒有 AI Desk，先建立或加入一個才能新增電腦。",
+    "desk_create": "建立 AI Desk",
+    "desk_creating": "建立中…",
+    "desk_default_name": "我的 AI Desk",
+    "desk_create_failed": "建立 AI Desk 失敗，請重試。"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

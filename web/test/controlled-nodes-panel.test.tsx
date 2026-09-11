@@ -70,6 +70,7 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
  */
 const TEST_DESK = { id: 'desk-1', name: 'Ops Desk', role: 'owner' as const };
 const listMintableDesks = vi.fn(async () => [TEST_DESK]);
+const createTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const }));
 
 const downloadControlledNodeExecutable = vi.fn(async () => ({
   version: 2 as const,
@@ -116,6 +117,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
     createControlledNodeInstallCommand: (...a: unknown[]) => createControlledNodeInstallCommand(...a),
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
     listMintableDesks: () => listMintableDesks(),
+    createTeam: (...a: unknown[]) => createTeam(...a),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
   };
@@ -151,7 +153,11 @@ function setViewportSize(width: number, height: number): void {
 // The global afterEach clears every mock, which also drops this one's
 // implementation. Re-establish it before each test so the panel can always
 // resolve a Desk; individual tests override it to exercise the other shapes.
-beforeEach(() => { listMintableDesks.mockResolvedValue([TEST_DESK]); });
+beforeEach(() => {
+  listMintableDesks.mockResolvedValue([TEST_DESK]);
+  createTeam.mockClear();
+  createTeam.mockResolvedValue({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const });
+});
 
 afterEach(() => {
   restoreExecCommand?.();
@@ -1224,11 +1230,69 @@ describe('ControlledNodesPanel Desk selection', () => {
     await waitFor(() => {
       expect(container.textContent).toContain('controlled_nodes.desk_none');
     });
+    // Actually disabled, not merely ignored on click. A button that looks
+    // available and then does nothing is what this reads as from the outside:
+    // "copy just does not work".
+    expect(btn.disabled, 'minting must not be offered without a Desk').toBe(true);
+    for (const selector of ['.controlled-nodes-copy-link-btn', '.controlled-nodes-copy-command-btn']) {
+      const action = container.querySelector(selector) as HTMLButtonElement | null;
+      expect(action?.disabled, `${selector} must not be offered without a Desk`).toBe(true);
+    }
     fireEvent.click(btn);
     await waitFor(() => {
       expect(container.textContent).toContain('controlled_nodes.desk_none');
     });
+    // Said once. The banner and the action error used to print the same
+    // sentence in two places at the same time.
+    expect(container.textContent!.split('controlled_nodes.desk_none').length - 1).toBe(1);
     expect(downloadControlledNodeExecutable).not.toHaveBeenCalled();
+  });
+
+  it('creates the first Desk from the page that needs it, then unblocks minting', async () => {
+    // An account with no Desk was told to "create or join one" by a page with
+    // no way to do either, so a new account could not add its first machine.
+    listMintableDesks.mockResolvedValue([]);
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await winDownloadButton(container);
+    const create = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-create-desk"]') as HTMLButtonElement | null;
+      if (!el) throw new Error('create-desk action not rendered');
+      return el;
+    });
+    expect(btn.disabled).toBe(true);
+
+    await act(async () => { fireEvent.click(create); });
+
+    expect(createTeam).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="controlled-nodes-create-desk"]')).toBeNull();
+    });
+    // The new Desk is selected and named on screen, and minting is live again
+    // -- without a reload, which is the whole point of fixing it here.
+    await waitFor(() => {
+      const single = container.querySelector('[data-testid="controlled-nodes-desk-single"]');
+      expect(single?.textContent).toContain('controlled_nodes.desk_selected');
+    });
+    await waitFor(() => {
+      expect((container.querySelector('.controlled-nodes-download-btn') as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  it('keeps minting blocked and reports why when creating the Desk fails', async () => {
+    listMintableDesks.mockResolvedValue([]);
+    createTeam.mockRejectedValueOnce(new Error('desk_quota_exceeded'));
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await winDownloadButton(container);
+    const create = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-create-desk"]') as HTMLButtonElement | null;
+      if (!el) throw new Error('create-desk action not rendered');
+      return el;
+    });
+
+    await act(async () => { fireEvent.click(create); });
+
+    await waitFor(() => { expect(container.textContent).toContain('desk_quota_exceeded'); });
+    expect(btn.disabled, 'a failed creation must not unblock minting').toBe(true);
   });
 
   it('never defaults when several Desks exist, then uses exactly the chosen one', async () => {
