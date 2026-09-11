@@ -147,13 +147,17 @@ const TICKET_BODY = z
      * single entry.
      */
     /**
-     * The Desk (team) the installed machine will belong to. Required: a
-     * controlled node is created with an authorization domain or not at all.
-     * There is deliberately no "default Desk" fallback -- an owner in one team
-     * today may be in two tomorrow, so inferring it would silently pick an
-     * authorization boundary on the user's behalf.
+     * The Desk (team) the installed machine will belong to.
+     *
+     * Optional only where there is nothing to infer. A controlled node is still
+     * always created with an authorization domain -- what changed is who has to
+     * produce it. An account with no Desk at all has no boundary to pick
+     * wrongly, so demanding one there was not protecting a choice, it was making
+     * someone create a team to install their own machine. Omitted is resolved by
+     * `resolveMintDesk`, which provisions in that case and still refuses to
+     * guess between several.
      */
-    teamId: z.string().trim().min(1).max(128),
+    teamId: z.string().trim().min(1).max(128).optional(),
     hostServerId: z.string().min(1).max(128).optional(),
     /**
      * Omitted means the historical behaviour: a browser standing at the machine,
@@ -162,6 +166,76 @@ const TICKET_BODY = z
     delivery: z.enum(CONTROLLED_NODE_TICKET_DELIVERY_VALUES as readonly [string, ...string[]]).optional(),
   })
   .strict();
+
+/** More than one Desk to choose from: the caller has to say which. */
+export class DeskAmbiguousError extends Error {
+  constructor() { super('desk_required'); }
+}
+
+/** Name for a Desk nobody asked for, because they only asked to install. */
+export const DEFAULT_PERSONAL_DESK_NAME = 'My AI Desk';
+
+/**
+ * The Desk this mint binds to, creating the first one when there is none.
+ *
+ * A controlled node still always gets an authorization domain -- that invariant
+ * is untouched and is still enforced at insert. The question this answers is
+ * who has to produce it. Three cases, and only one of them is a choice:
+ *
+ *   - explicit -> used as given; membership is checked by the caller
+ *   - none     -> provisioned, because an account with zero Desks has no
+ *                 boundary to pick wrongly. Requiring a "team" before someone
+ *                 can install their own machine is ceremony for an internal
+ *                 constraint, and it left a new account unable to install at all
+ *   - several  -> refused. This is the case the no-default rule exists for, and
+ *                 it stays refused
+ *
+ * Exactly one is used rather than refused: it is the same Desk the UI already
+ * selects and displays, so there is nothing to pick wrongly there either.
+ */
+export async function resolveMintDesk(
+  db: Database,
+  userId: string,
+  requested: string | undefined,
+  now: number = Date.now(),
+): Promise<string> {
+  if (requested?.trim()) return requested.trim();
+
+  const mintable = await db.query<{ team_id: string }>(
+    `SELECT tm.team_id FROM team_members tm
+      WHERE tm.user_id = $1 AND tm.role IN ('owner', 'admin')
+      ORDER BY tm.joined_at ASC`,
+    [userId],
+  );
+  if (mintable.length === 1) return mintable[0]!.team_id;
+  if (mintable.length > 1) throw new DeskAmbiguousError();
+
+  return db.transaction(async (tx) => {
+    // Two installs started at once from a Desk-less account would otherwise
+    // each see "none" and each create one, leaving a stray team behind. The
+    // lock is per user and is released with the transaction.
+    await tx.queryOne('SELECT pg_advisory_xact_lock(hashtext($1)) AS locked', [userId]);
+    const existing = await tx.queryOne<{ team_id: string }>(
+      `SELECT tm.team_id FROM team_members tm
+        WHERE tm.user_id = $1 AND tm.role IN ('owner', 'admin')
+        ORDER BY tm.joined_at ASC
+        LIMIT 1`,
+      [userId],
+    );
+    if (existing) return existing.team_id;
+
+    const teamId = randomHex(16);
+    await tx.execute(
+      "INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES ($1, $2, $3, 'free', $4)",
+      [teamId, DEFAULT_PERSONAL_DESK_NAME, userId, now],
+    );
+    await tx.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'owner', $3)",
+      [teamId, userId, now],
+    );
+    return teamId;
+  });
+}
 
 export function createEnrollRoutes(
   artifactCatalog: ArtifactCatalog = createArtifactCatalog(),
@@ -200,7 +274,16 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = TICKET_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
-  const { os, arch, hostServerId, teamId } = parsed.data;
+  const { os, arch, hostServerId } = parsed.data;
+  let teamId: string;
+  try {
+    teamId = await resolveMintDesk(c.env.DB as Database, userId, parsed.data.teamId);
+  } catch (error) {
+    if (error instanceof DeskAmbiguousError) {
+      return c.json({ error: 'invalid_body', reason: 'desk_required' }, 400);
+    }
+    throw error;
+  }
   // The minting user must currently hold a managing role in the Desk they are
   // binding the future machine to. Re-checked inside the redemption
   // transaction as well, because membership can change between minting an

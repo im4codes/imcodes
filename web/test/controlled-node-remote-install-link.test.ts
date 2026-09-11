@@ -42,8 +42,13 @@ function ticketResponse(extra: Record<string, unknown> = {}) {
   };
 }
 
-function sentBody(): Record<string, unknown> {
-  return JSON.parse(String((apiFetch.mock.calls[0]?.[1] as { body: string }).body));
+function sentBody(index = 0): Record<string, unknown> {
+  return JSON.parse(String((apiFetch.mock.calls[index]?.[1] as { body: string }).body));
+}
+
+/** The most recent request, for assertions made after several mints. */
+function lastSentBody(): Record<string, unknown> {
+  return sentBody(apiFetch.mock.calls.length - 1);
 }
 
 beforeEach(() => { configureExpectedUserId('user-rock'); });
@@ -101,12 +106,12 @@ describe('controlled-node remote install link', () => {
     await mintControlledNodeInstallCommand({ os: 'win', arch: 'x64' }, TEST_DESK_ID);
     expect(sentBody()).toMatchObject({ teamId: TEST_DESK_ID });
 
-    // A blank Desk is refused before any request is sent, so a caller cannot
-    // fall back to "no Desk" and let the server decide.
-    const callsBefore = apiFetch.mock.calls.length;
-    await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, '   '))
-      .rejects.toThrow('controlled_node_desk_required');
-    expect(apiFetch.mock.calls.length, 'no request may leave the client').toBe(callsBefore);
+    // A blank Desk now means "the account has none, server decides". The key is
+    // OMITTED rather than sent empty: the server body schema is strict, so an
+    // empty string would be rejected outright instead of resolved.
+    apiFetch.mockResolvedValueOnce(ticketResponse());
+    await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, '   ');
+    expect(lastSentBody()).not.toHaveProperty('teamId');
   });
 
   it('omits the delivery key entirely for the default, so older servers still mint', async () => {

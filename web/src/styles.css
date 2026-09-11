@@ -3854,36 +3854,9 @@ html.native-ios-mac .chat-dl-btn {
 .controlled-nodes-copy-link-btn:disabled,
 .controlled-nodes-copy-command-btn:disabled,
 .controlled-nodes-revoke-link-btn:disabled { cursor: wait; opacity: 0.58; }
-/* Disabled for want of a Desk is not "busy". A wait cursor there reads as
-   "loading, hold on" for something that will never finish on its own. */
-.controlled-nodes-download-item[data-desk-missing="true"] button:disabled { cursor: not-allowed; }
 
-/* The explanation and the action that resolves it sit together: the message
-   already told people to create a Desk, it just never offered to. */
-.controlled-nodes-desk-empty {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-}
 
-.controlled-nodes-create-desk-btn {
-  min-height: 34px;
-  padding: 6px 14px;
-  border: 1px solid rgba(103, 232, 249, 0.45);
-  border-radius: 8px;
-  background: rgba(30, 41, 59, 0.62);
-  color: #a5f3fc;
-  font: 600 11px/1.3 var(--imcodes-app-font-family);
-  cursor: pointer;
-}
 
-.controlled-nodes-create-desk-btn:hover:not(:disabled) {
-  border-color: rgba(103, 232, 249, 0.8);
-  color: #fff;
-}
-
-.controlled-nodes-create-desk-btn:disabled { cursor: wait; opacity: 0.58; }
 .controlled-nodes-revoke-link-btn {
   border-color: rgba(251, 113, 133, 0.28);
   color: #fecdd3;

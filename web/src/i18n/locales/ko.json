@@ -3243,12 +3243,7 @@
     "desk_label": "AI Desk",
     "desk_choose": "Desk 선택…",
     "desk_selected": "이 Desk에 추가됩니다: {{desk}}",
-    "desk_required": "설치하기 전에 이 컴퓨터가 참여할 AI Desk를 선택하세요.",
-    "desk_none": "컴퓨터를 추가하려면 AI Desk가 필요합니다. 먼저 만들거나 참여하세요.",
-    "desk_create": "AI Desk 만들기",
-    "desk_creating": "만드는 중…",
-    "desk_default_name": "내 AI Desk",
-    "desk_create_failed": "AI Desk를 만들지 못했습니다. 다시 시도해 주세요."
+    "desk_required": "설치하기 전에 이 컴퓨터가 참여할 AI Desk를 선택하세요."
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

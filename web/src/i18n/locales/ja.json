@@ -3243,12 +3243,7 @@
     "desk_label": "AI Desk",
     "desk_choose": "Desk を選択…",
     "desk_selected": "この Desk に追加されます：{{desk}}",
-    "desk_required": "インストール前に、このコンピューターが参加する AI Desk を選択してください。",
-    "desk_none": "コンピューターを追加するには AI Desk が必要です。作成するか参加してください。",
-    "desk_create": "AI Desk を作成",
-    "desk_creating": "作成中…",
-    "desk_default_name": "マイ AI Desk",
-    "desk_create_failed": "AI Desk を作成できませんでした。もう一度お試しください。"
+    "desk_required": "インストール前に、このコンピューターが参加する AI Desk を選択してください。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

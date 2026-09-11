@@ -6,7 +6,6 @@ import {
   createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
-  createTeam,
   listMintableDesks,
   revokeControlledNodeRemoteInstallLink,
   type TeamSummary,
@@ -141,8 +140,6 @@ export function ControlledNodesPanel({
   // default this component invents. With no mintable Desk the actions are
   // disabled outright rather than minting something that could not be bound.
   const [desks, setDesks] = useState<TeamSummary[]>([]);
-  const [desksLoaded, setDesksLoaded] = useState(false);
-  const [creatingDesk, setCreatingDesk] = useState(false);
   const [selectedDeskId, setSelectedDeskId] = useState<string>('');
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -209,10 +206,9 @@ export function ControlledNodesPanel({
         // visible confirmation rather than a silent guess. More than one never
         // defaults.
         setSelectedDeskId(rows.length === 1 ? rows[0]!.id : '');
-        setDesksLoaded(true);
       })
-        .catch(() => { if (!cancelled) { setDesks([]); setDesksLoaded(true); } });
-    } catch { setDesks([]); setDesksLoaded(true); }
+        .catch(() => { if (!cancelled) setDesks([]); });
+    } catch { setDesks([]); }
     return () => { cancelled = true; };
   }, []);
 
@@ -311,49 +307,22 @@ export function ControlledNodesPanel({
    */
   const takeSelectedDesk = (): string | null => {
     const deskId = selectedDeskId.trim();
-    if (!deskId || !desks.some((desk) => desk.id === deskId)) {
-      // With no Desk at all the section already states that and offers the
-      // button that fixes it, and the minting actions are disabled, so adding
-      // the same sentence here only printed it on screen twice.
-      if (desks.length > 0) setDownloadError(t('controlled_nodes.desk_required'));
+    if (deskId && desks.some((desk) => desk.id === deskId)) return deskId;
+    // Only an unmade choice is an error. With no Desk the server creates the
+    // first one during the mint, so sending nothing is the correct request --
+    // not a failure to be reported at someone who never asked for a Desk.
+    if (desks.length > 1) {
+      setDownloadError(t('controlled_nodes.desk_required'));
       return null;
     }
-    return deskId;
-  };
-
-  /**
-   * Make the Desk the install requires, from the place that requires it.
-   *
-   * Every controlled node belongs to a Desk -- that is the data model, enforced
-   * server-side down to the insert. But an account with none was told to "create
-   * or join one" on a page that offered no way to do either, so a new account
-   * could not add its first machine at all. The requirement is internal; making
-   * someone go find another screen to satisfy it is not.
-   */
-  const onCreateDesk = async () => {
-    if (creatingDesk) return;
-    setDownloadError(null);
-    setCreatingDesk(true);
-    try {
-      const created = await createTeam(t('controlled_nodes.desk_default_name'));
-      setDesks([{ id: created.id, name: created.name, role: created.role as TeamSummary['role'] }]);
-      // Selected immediately: this is the only Desk, and its name is rendered
-      // next to the actions, so the choice stays visible rather than implied.
-      setSelectedDeskId(created.id);
-    } catch (error) {
-      setDownloadError(error instanceof Error && error.message
-        ? error.message
-        : t('controlled_nodes.desk_create_failed'));
-    } finally {
-      setCreatingDesk(false);
-    }
+    return '';
   };
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
     setDownloadError(null);
     const deskId = takeSelectedDesk();
-    if (!deskId) return;
+    if (deskId === null) return;
     setDownloadingKey(key);
     let desktopWindow: Window | null = null;
     if (!isNative()) {
@@ -406,7 +375,7 @@ export function ControlledNodesPanel({
     if (commandKey) return;
     setDownloadError(null);
     const deskId = takeSelectedDesk();
-    if (!deskId) return;
+    if (deskId === null) return;
     setCommandKey(key);
     try {
       const minted = await createControlledNodeInstallCommand(target, deskId);
@@ -438,7 +407,7 @@ export function ControlledNodesPanel({
     if (linkingKey) return;
     setDownloadError(null);
     const deskId = takeSelectedDesk();
-    if (!deskId) return;
+    if (deskId === null) return;
     setLinkingKey(key);
     try {
       const link = await createControlledNodeRemoteInstallLink(target, deskId);
@@ -928,22 +897,6 @@ export function ControlledNodesPanel({
           <p class="controlled-nodes-muted">{t('controlled_nodes.no_executables')}</p>
         )}
         <div class="controlled-nodes-desk-select">
-          {desksLoaded && desks.length === 0 && (
-            <div class="controlled-nodes-desk-empty">
-              <p class="controlled-nodes-error" role="alert">{t('controlled_nodes.desk_none')}</p>
-              <button
-                type="button"
-                class="controlled-nodes-create-desk-btn"
-                data-testid="controlled-nodes-create-desk"
-                disabled={creatingDesk}
-                onClick={() => void onCreateDesk()}
-              >
-                {t(creatingDesk
-                  ? 'controlled_nodes.desk_creating'
-                  : 'controlled_nodes.desk_create')}
-              </button>
-            </div>
-          )}
           {desks.length === 1 && (
             <p class="controlled-nodes-muted" data-testid="controlled-nodes-desk-single">
               {t('controlled_nodes.desk_selected', { desk: desks[0]!.name })}
@@ -979,18 +932,15 @@ export function ControlledNodesPanel({
             const isCommandCopied = copiedCommandKey === key;
             const linkExpiry = linkExpiryByKey[key];
             const rowBusy = isDownloading || isLinking || isRevokingLink || isCommanding;
-            // An action that cannot succeed is not offered. Minting is scoped to
-            // a Desk, so without one these three have nothing to mint into;
-            // leaving them clickable is what produced a button that "just does
-            // not copy". Revoking is untouched -- it destroys, it does not mint.
-            const mintBlocked = rowBusy || (desksLoaded && desks.length === 0);
+            // Having no Desk is NOT a blocker. A machine still ends up in one,
+            // but the server provisions the first one during the mint, so
+            // installing never waits on someone creating a "team" first.
+            // Choosing between several is still the operator's call, and that is
+            // the only case the picker below exists for.
+            const mintBlocked = rowBusy || desks.length > 1 && !selectedDeskId.trim();
             const platform = PLATFORM_PRESENTATION[target.os];
             return (
-              <div
-                key={key}
-                class={`controlled-nodes-download-item is-${target.os}`}
-                data-desk-missing={desksLoaded && desks.length === 0 ? 'true' : undefined}
-              >
+              <div key={key} class={`controlled-nodes-download-item is-${target.os}`}>
                 <div class="controlled-nodes-platform">
                   <span class="controlled-nodes-platform-glyph" aria-hidden="true">{platform.glyph}</span>
                   <div class="controlled-nodes-platform-copy">

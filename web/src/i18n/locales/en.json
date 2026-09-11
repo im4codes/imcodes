@@ -3244,12 +3244,7 @@
     "desk_label": "AI Desk",
     "desk_choose": "Choose a Desk…",
     "desk_selected": "Will be added to the Desk: {{desk}}",
-    "desk_required": "Choose which AI Desk this machine joins before installing.",
-    "desk_none": "You need an AI Desk before adding a machine. Create or join one first.",
-    "desk_create": "Create an AI Desk",
-    "desk_creating": "Creating…",
-    "desk_default_name": "My AI Desk",
-    "desk_create_failed": "Could not create the AI Desk. Please try again."
+    "desk_required": "Choose which AI Desk this machine joins before installing."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

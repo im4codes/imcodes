@@ -41,7 +41,6 @@ import {
   getApiBaseUrl,
   getExpectedUserId,
   type AttachmentRefResponse,
-  CONTROLLED_NODE_DESK_REQUIRED,
 } from '../api.js';
 
 export type { ControlledNodeArtifactArch, ControlledNodeOs };
@@ -388,11 +387,13 @@ export async function listAvailableExecutableOses(): Promise<string[]> {
 export async function mintControlledNodeExecutableTicket(
   selection: ControlledNodeArtifactSelection,
   /**
-   * The AI Desk this machine will be enrolled into. Required, and required as a
-   * positional argument on purpose: the server rejects a mint without it, and
-   * making it optional here is exactly how R4 shipped a client that 400s on
-   * every production install path. There is deliberately no default -- the Desk
-   * is an authorization domain and must be an explicit choice by the operator.
+   * The AI Desk this machine will be enrolled into.
+   *
+   * Empty means "the server decides", which is correct in exactly one case: the
+   * account has no Desk yet, so there is nothing to choose between and the mint
+   * provisions the first one. Still positional and still never defaulted
+   * client-side -- picking BETWEEN existing Desks is an authorization decision
+   * and stays with the operator.
    */
   teamId: string,
   /**
@@ -414,9 +415,6 @@ export async function mintControlledNodeExecutableTicket(
   if (!expectedOwnerUserId) {
     throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED);
   }
-  // Fail here rather than sending a request the server will reject, and rather
-  // than letting an untyped caller slip through with an empty string.
-  if (!teamId.trim()) throw new Error(CONTROLLED_NODE_DESK_REQUIRED);
   const res = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -424,7 +422,9 @@ export async function mintControlledNodeExecutableTicket(
       version: 2,
       os: selection.os,
       arch: selection.arch,
-      teamId,
+      // Omitted rather than sent empty: the server's body schema is strict, and
+      // an absent key is what "let the server resolve it" means there.
+      ...(teamId.trim() ? { teamId: teamId.trim() } : {}),
       ...(hostServerId ? { hostServerId } : {}),
       // Omitted for the default so an older server, which rejects unknown keys
       // with its strict body schema, keeps working unchanged.
