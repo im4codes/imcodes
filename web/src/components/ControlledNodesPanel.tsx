@@ -35,8 +35,8 @@ import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
 import { TeamManagementPanel } from './TeamManagementPanel.js';
 import {
-  MACHINE_GROUP_ALL,
   MACHINE_GROUP_DIRECT,
+  machineGroupTabs,
   machineGroupsOf,
   machinesInGroup,
 } from '../machine-grouping.js';
@@ -750,11 +750,7 @@ export function ControlledNodesPanel({
         )}
         {machineTeams.length > 0 && (
           <div class="controlled-nodes-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
-            {[
-              { id: MACHINE_GROUP_DIRECT, label: t('controlled_nodes.group_direct') },
-              ...machineTeams.map(([id, label]) => ({ id, label })),
-              { id: MACHINE_GROUP_ALL, label: t('controlled_nodes.group_all') },
-            ].map(({ id, label }) => (
+            {machineGroupTabs(machines).map(({ id, name, count }) => (
               <button
                 key={id}
                 type="button"
@@ -763,7 +759,12 @@ export function ControlledNodesPanel({
                 class={`controlled-nodes-team-chip${machineGroup === id ? ' is-active' : ''}`}
                 data-testid={`controlled-nodes-group-${id}`}
                 onClick={() => setMachineGroup(id)}
-              >{label}</button>
+              >
+                {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}
+                {/* Superscript count: which tabs are worth opening, without
+                    opening them. */}
+                <span class="controlled-nodes-team-chip-count">{count}</span>
+              </button>
             ))}
           </div>
         )}
@@ -835,9 +836,9 @@ export function ControlledNodesPanel({
                       Teams tab, next to the people it grants -- a dropdown
                       buried in a metadata row is not where you go looking for
                       "who else can use this machine". */}
-                  {m.teamName && (
-                    <span class="controlled-nodes-role-tag">{m.teamName}</span>
-                  )}
+                  {(m.teamNames ?? []).map((name) => (
+                    <span key={name} class="controlled-nodes-role-tag">{name}</span>
+                  ))}
                   {m.autoUnlockConfigured && (
                     <span
                       class="controlled-nodes-auto-unlock-badge"

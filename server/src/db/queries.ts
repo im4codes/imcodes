@@ -546,11 +546,15 @@ export async function getServersByUserId(db: Database, userId: string): Promise<
     [userId],
   );
 
+  // Through group membership, which lives in its own table because a machine
+  // can be in several groups. DISTINCT because matching more than one of them
+  // must not list the same machine twice.
   const teamRows = await db.query<DbServer>(
-    `SELECT s.* FROM servers s
-     JOIN team_members tm ON s.team_id = tm.team_id
+    `SELECT DISTINCT ON (s.id, s.created_at) s.* FROM servers s
+     JOIN machine_groups mg ON mg.server_id = s.id
+     JOIN team_members tm ON tm.team_id = mg.team_id
      WHERE tm.user_id = $1 AND s.user_id != $2
-     ORDER BY s.created_at DESC`,
+     ORDER BY s.created_at DESC, s.id`,
     [userId, userId],
   );
 

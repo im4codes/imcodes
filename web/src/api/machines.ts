@@ -97,11 +97,11 @@ export interface MachineListItem {
    */
   hostServerId?: string;
   /**
-   * The team this machine is shared with, when its owner put it in one. Absent
-   * means the machine is the owner's alone -- which is how every machine starts.
+   * Every group this machine is in. Absent means none, which is how every
+   * machine starts; a machine can be in several at once.
    */
-  teamId?: string;
-  teamName?: string;
+  teamIds?: string[];
+  teamNames?: string[];
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -274,6 +274,13 @@ export function buildControlledNodeDownloadTargets(res: ControlledNodeAvailabili
   return [...targets].sort(compareControlledNodeArtifactPairs);
 }
 
+/** Group ids/names, keeping only the strings a caller can actually use. */
+function normalizeGroupIds(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+    : [];
+}
+
 function normalizeMachine(raw: unknown): MachineListItem | null {
   if (!isRecord(raw)) return null;
   const serverId = typeof raw.serverId === 'string' ? raw.serverId : '';
@@ -305,12 +312,18 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     ...(typeof raw.hostServerId === 'string' && raw.hostServerId
       ? { hostServerId: raw.hostServerId }
       : {}),
-    // The group this machine is in. This function rebuilds the object field by
-    // field, so anything not named here is dropped -- which is what happened to
-    // these two: the server sent them, the UI never saw them, so a machine
-    // never appeared to join a group and the Add button looked dead.
-    ...(typeof raw.teamId === 'string' && raw.teamId ? { teamId: raw.teamId } : {}),
-    ...(typeof raw.teamName === 'string' && raw.teamName ? { teamName: raw.teamName } : {}),
+    // The groups this machine is in. This function rebuilds the object field by
+    // field, so anything not named here is dropped -- which is exactly what
+    // happened once already: the server sent them, the UI never saw them, and a
+    // machine never appeared to join a group at all.
+    ...(normalizeGroupIds(raw.teamIds).length > 0
+      ? {
+        teamIds: normalizeGroupIds(raw.teamIds),
+        ...(normalizeGroupIds(raw.teamNames).length === normalizeGroupIds(raw.teamIds).length
+          ? { teamNames: normalizeGroupIds(raw.teamNames) }
+          : {}),
+      }
+      : {}),
   };
 }
 
@@ -396,17 +409,22 @@ export async function listAvailableExecutableOses(): Promise<string[]> {
 }
 
 /**
- * Put a machine in a team, or take it out of one.
+ * Put a machine in one group, or take it out of that one.
  *
- * `null` removes it, which is the owner's alone to do: a machine belongs to
- * whoever installed it, so losing team membership must never leave them unable
- * to get it back.
+ * A machine can be in several groups, so this names the group it is joining or
+ * leaving and does not touch the others. Leaving is the owner's alone to do: a
+ * machine belongs to whoever installed it, so losing a role in a group must
+ * never leave them unable to get their own machine back out of it.
  */
-export async function bindMachineToTeam(serverId: string, teamId: string | null): Promise<void> {
+export async function setMachineGroupMembership(
+  serverId: string,
+  teamId: string,
+  member: boolean,
+): Promise<void> {
   await apiFetch(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ teamId }),
+    body: JSON.stringify({ teamId, member }),
   });
 }
 

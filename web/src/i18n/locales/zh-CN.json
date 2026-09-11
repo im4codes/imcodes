@@ -3284,7 +3284,15 @@
     "team_error_self_add_denied": "你已经在这个分组里了。",
     "team_error_group_manage_denied": "你没有管理这个分组的权限。",
     "team_error_desk_membership_required": "这个人不能加入该分组。",
-    "confirm_again": "确认?"
+    "confirm_again": "确认?",
+    "group_rename": "重命名",
+    "group_rename_placeholder": "{{name}} 的新名称",
+    "group_delete": "删除分组",
+    "group_delete_blocked": "还有 {{count}} 台机器在这个分组里，先把它们移出才能删除。",
+    "team_error_group_has_machines": "这个分组里还有机器，请先移出。",
+    "team_error_group_owner_required": "只有分组所有者能删除它。",
+    "team_error_group_name_required": "请输入名称。",
+    "team_error_group_name_too_long": "名称太长了。"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

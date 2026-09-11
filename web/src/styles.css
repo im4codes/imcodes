@@ -3840,8 +3840,13 @@ html.native-ios-mac .chat-dl-btn {
   color: #cffafe;
 }
 
+/* The superscript on a group tab: how many machines are behind it, so the
+   tabs can be told apart without opening each one. Raised off the baseline
+   because it annotates the name rather than being part of it. */
 .controlled-nodes-team-chip-count {
-  margin-left: 7px;
+  display: inline-block;
+  transform: translateY(-5px);
+  margin-left: 5px;
   padding: 1px 6px;
   border-radius: 999px;
   background: rgba(125, 211, 252, 0.14);
@@ -3849,6 +3854,17 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 10px;
   font-variant-numeric: tabular-nums;
 }
+
+.controlled-nodes-team-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.controlled-nodes-team-header .controlled-nodes-team-create { flex: 1 1 260px; }
+
+.controlled-nodes-team-header .controlled-nodes-muted { margin: 0; }
 
 .controlled-nodes-team-detail {
   display: grid;

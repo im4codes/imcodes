@@ -90,3 +90,45 @@ describe('ControlledNodeQuickMenu', () => {
     expect(document.activeElement).toBe(trigger);
   });
 });
+
+describe('ControlledNodeQuickMenu group tabs', () => {
+  const open = (): void => {
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+  };
+
+  it('carries the same counted tabs as the machines page', async () => {
+    // Same control, same numbers, both built from one place: a count here
+    // that disagreed with the one on the machines tab would make people
+    // distrust both.
+    machines = [
+      node({ serverId: 'own', displayName: 'Own', accessRole: 'owner', teamIds: ['team-1'], teamNames: ['Ops'] }),
+      node({ serverId: 'their', displayName: 'Theirs', accessRole: 'viewer', teamIds: ['team-1'], teamNames: ['Ops'] }),
+      node({ serverId: 'loose', displayName: 'Loose', accessRole: 'owner' }),
+    ];
+    render(<ControlledNodeQuickMenu />);
+    open();
+
+    const countOf = (id: string): string | null | undefined => document
+      .querySelector(`[data-testid="controlled-node-quick-group-${id}"] .controlled-nodes-team-chip-count`)
+      ?.textContent;
+    await waitFor(() => expect(countOf('direct')).toBe('2'));
+    expect(countOf('team-1')).toBe('2');
+    expect(countOf('all')).toBe('3');
+
+    // Your own grouped machine is right there on the default tab.
+    expect(document.body.textContent).toContain('Own');
+    expect(document.body.textContent).toContain('Loose');
+    expect(document.body.textContent).not.toContain('Theirs');
+
+    fireEvent.click(document.querySelector('[data-testid="controlled-node-quick-group-team-1"]') as HTMLButtonElement);
+    await waitFor(() => expect(document.body.textContent).toContain('Theirs'));
+    expect(document.body.textContent).toContain('Own');
+  });
+
+  it('offers no group tabs when nothing is grouped', () => {
+    machines = [node({ serverId: 'loose', displayName: 'Loose', accessRole: 'owner' })];
+    render(<ControlledNodeQuickMenu />);
+    open();
+    expect(document.querySelector('[data-testid="controlled-node-quick-group-direct"]')).toBeNull();
+  });
+});

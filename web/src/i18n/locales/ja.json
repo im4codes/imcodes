@@ -3283,7 +3283,15 @@
     "team_error_self_add_denied": "すでにこのグループにいます。",
     "team_error_group_manage_denied": "このグループを管理できません。",
     "team_error_desk_membership_required": "その人はこのグループに入れません。",
-    "confirm_again": "本当に?"
+    "confirm_again": "本当に?",
+    "group_rename": "名前を変更",
+    "group_rename_placeholder": "{{name}} の新しい名前",
+    "group_delete": "グループを削除",
+    "group_delete_blocked": "まず {{count}} 台のマシンを外してから削除できます。",
+    "team_error_group_has_machines": "このグループにはまだマシンがあります。先に外してください。",
+    "team_error_group_owner_required": "グループを削除できるのはオーナーだけです。",
+    "team_error_group_name_required": "名前を入力してください。",
+    "team_error_group_name_too_long": "名前が長すぎます。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

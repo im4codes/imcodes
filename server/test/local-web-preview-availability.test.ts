@@ -45,9 +45,9 @@ function makeMemDb() {
         const row = servers.get(params[0] as string);
         return (row ? { token_hash: row.token_hash, user_id: row.user_id, node_role: 'full', revoked_at: null } : null) as T | null;
       }
-      if (s.includes('select team_id, user_id from servers where id = $1')) {
+      if (s.includes('select user_id from servers where id = $1')) {
         const row = servers.get(params[0] as string);
-        return (row ? { team_id: row.team_id, user_id: row.user_id } : null) as T | null;
+        return (row ? { user_id: row.user_id } : null) as T | null;
       }
       if (s.includes('select id, user_id from api_keys')) {
         const keyHash = params[0] as string;
@@ -59,7 +59,9 @@ function makeMemDb() {
         }
         return null;
       }
-      if (s.includes('select role from team_members')) {
+      // Group membership lives in `machine_groups` now, keyed by machine
+      // rather than by a single column on the server row.
+      if (s.includes('from machine_groups')) {
         return null;
       }
       return null;

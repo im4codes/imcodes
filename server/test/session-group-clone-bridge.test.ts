@@ -48,15 +48,12 @@ class MockWs extends EventEmitter {
 
 function makeDb(options: {
   ownerUserId?: string;
-  teamId?: string | null;
-  teamRole?: string | null;
   dbSessionNames?: string[];
   skippedCronJobs?: number;
   skippedOrchestrationRuns?: number;
   failUserPreferenceWrites?: boolean;
 } = {}) {
   const ownerUserId = options.ownerUserId ?? 'user-owner';
-  const teamId = options.teamId ?? null;
   const auditRows: unknown[][] = [];
   const userPrefs = new Map<string, string>();
   const dbSessionNames = new Set(options.dbSessionNames ?? []);
@@ -64,10 +61,11 @@ function makeDb(options: {
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
       if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: ownerUserId };
-      if (sql.includes('SELECT team_id, user_id FROM servers')) return { team_id: teamId, user_id: ownerUserId };
-      if (sql.includes('FROM team_members') && params?.[0] === teamId && options.teamRole) {
-        return { role: options.teamRole };
-      }
+      if (sql.includes('SELECT user_id FROM servers')) return { user_id: ownerUserId };
+      // Nobody here is in a group, so the machine-group role lookup finds
+      // nothing. (It used to be answered from a `team_id` column on the server
+      // row; group membership is its own table now.)
+      if (sql.includes('machine_groups')) return null;
       if (sql.includes('FROM user_preferences') && params) {
         const value = userPrefs.get(prefKey(params[0], params[1]));
         return value === undefined ? null : { value };

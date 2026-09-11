@@ -3284,7 +3284,15 @@
     "team_error_self_add_denied": "你已經在這個群組裡了。",
     "team_error_group_manage_denied": "你沒有管理這個群組的權限。",
     "team_error_desk_membership_required": "這個人不能加入該群組。",
-    "confirm_again": "確認?"
+    "confirm_again": "確認?",
+    "group_rename": "重新命名",
+    "group_rename_placeholder": "{{name}} 的新名稱",
+    "group_delete": "刪除群組",
+    "group_delete_blocked": "還有 {{count}} 台機器在這個群組裡，先把它們移出才能刪除。",
+    "team_error_group_has_machines": "這個群組裡還有機器，請先移出。",
+    "team_error_group_owner_required": "只有群組擁有者能刪除它。",
+    "team_error_group_name_required": "請輸入名稱。",
+    "team_error_group_name_too_long": "名稱太長了。"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

@@ -302,41 +302,57 @@ describe('controlled-node ticket normalization', () => {
 });
 
 describe('controlled-node group normalization', () => {
-  it('carries the group through, so a machine can be seen to be in one', async () => {
-    // normalizeMachine rebuilds the object field by field. These two were added
-    // to the server and to the type but not to that rebuild, so the UI never saw
-    // them: a group always looked empty, and a machine that had just been added
-    // to one still offered "Add", which reads as the button doing nothing.
+  it('carries every group through, so a machine can be seen in all of them', async () => {
+    // normalizeMachine rebuilds the object field by field. These were dropped
+    // once already: the server sent them, the UI never saw them, and a machine
+    // never appeared to join a group at all.
     apiFetch.mockResolvedValueOnce({
       machines: [{
         serverId: 'srv-1',
         nodeId: CONTROLLED_NODE_ID_MIN,
         online: true,
         execEnabled: true,
-        teamId: 'team-1',
-        teamName: 'Ops',
+        teamIds: ['team-1', 'team-2'],
+        teamNames: ['Ops', 'Support'],
       }],
     });
     expect(await listControllableMachines()).toEqual([
-      expect.objectContaining({ teamId: 'team-1', teamName: 'Ops' }),
+      expect.objectContaining({ teamIds: ['team-1', 'team-2'], teamNames: ['Ops', 'Support'] }),
     ]);
   });
 
-  it('omits the group rather than inventing one when the server sends none', async () => {
+  it('omits the groups rather than inventing an empty list', async () => {
     apiFetch.mockResolvedValueOnce({
       machines: [{
         serverId: 'srv-2',
         nodeId: CONTROLLED_NODE_ID_MIN,
         online: true,
         execEnabled: true,
-        teamId: '',
-        teamName: 42,
+        teamIds: [],
       }],
     });
     const [machine] = await listControllableMachines();
-    // Absent, not empty-string: "in no group" and "in a group whose id is ''"
-    // must not be the same value downstream.
-    expect(machine).not.toHaveProperty('teamId');
-    expect(machine).not.toHaveProperty('teamName');
+    // Absent, not empty: "in no group" and "an empty group list" must not be
+    // two different values downstream.
+    expect(machine).not.toHaveProperty('teamIds');
+    expect(machine).not.toHaveProperty('teamNames');
+  });
+
+  it('drops non-string entries instead of letting them reach a filter', async () => {
+    apiFetch.mockResolvedValueOnce({
+      machines: [{
+        serverId: 'srv-3',
+        nodeId: CONTROLLED_NODE_ID_MIN,
+        online: true,
+        execEnabled: true,
+        teamIds: ['good', 42, null, ''],
+        teamNames: 'not an array',
+      }],
+    });
+    const [machine] = await listControllableMachines();
+    expect(machine?.teamIds).toEqual(['good']);
+    // Names that do not line up with the ids are dropped whole rather than
+    // shifted onto the wrong groups.
+    expect(machine).not.toHaveProperty('teamNames');
   });
 });

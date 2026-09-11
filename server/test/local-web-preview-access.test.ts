@@ -12,10 +12,12 @@ function makeDb(state: { ownerUserId: string }) {
   return {
     queryOne: async <T = unknown>(sql: string) => {
       const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-      if (s.includes('select team_id, user_id from servers where id = $1')) {
-        return { team_id: null, user_id: state.ownerUserId } as unknown as T;
+      if (s.includes('select user_id from servers where id = $1')) {
+        return { user_id: state.ownerUserId } as unknown as T;
       }
-      if (s.includes('select role from team_members')) return null;
+      // Group membership lives in `machine_groups` now, keyed by machine
+      // rather than by a single column on the server row.
+      if (s.includes('from machine_groups')) return null;
       return null;
     },
     query: async () => [],

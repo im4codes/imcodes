@@ -5,8 +5,8 @@ import type { MachineListItem } from '../api/machines.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import {
-  MACHINE_GROUP_ALL,
   MACHINE_GROUP_DIRECT,
+  machineGroupTabs,
   machineGroupsOf,
   machinesInGroup,
 } from '../machine-grouping.js';
@@ -118,11 +118,7 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
           picking one in the machines tab, so it is the same control. */}
       {groups.length > 0 && (
         <div class="controlled-node-quick-groups" role="none">
-          {[
-            { id: MACHINE_GROUP_DIRECT, label: t('controlled_nodes.group_direct') },
-            ...groups.map(([id, label]) => ({ id, label })),
-            { id: MACHINE_GROUP_ALL, label: t('controlled_nodes.group_all') },
-          ].map(({ id, label }) => (
+          {machineGroupTabs(machines).map(({ id, name, count }) => (
             <button
               key={id}
               type="button"
@@ -130,7 +126,10 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
               class={`controlled-nodes-team-chip${group === id ? ' is-active' : ''}`}
               data-testid={`controlled-node-quick-group-${id}`}
               onClick={() => setGroup(id)}
-            >{label}</button>
+            >
+              {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}
+              <span class="controlled-nodes-team-chip-count">{count}</span>
+            </button>
           ))}
         </div>
       )}

@@ -163,12 +163,27 @@ async function joinDesk(teamId: string, userId: string, role = 'member') {
 }
 
 /** Bind through the authorized route, never by writing servers.team_id directly. */
-async function bindDesk(app: ReturnType<typeof buildApp>, actorId: string, serverId: string, teamId: string | null) {
+/** Join or leave ONE group. A machine can be in several at once. */
+async function bindDesk(
+  app: ReturnType<typeof buildApp>,
+  actorId: string,
+  serverId: string,
+  teamId: string,
+  member = true,
+) {
   return app.request(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
     method: 'POST',
     headers: webAuth(actorId),
-    body: JSON.stringify({ teamId }),
+    body: JSON.stringify({ teamId, member }),
   });
+}
+
+async function groupsOf(serverId: string): Promise<string[]> {
+  const rows = await db.query<{ team_id: string }>(
+    'SELECT team_id FROM machine_groups WHERE server_id = $1 ORDER BY team_id',
+    [serverId],
+  );
+  return rows.map((row) => row.team_id);
 }
 
 async function createMachineGrant(params: {
@@ -761,50 +776,59 @@ describe('controlled-node shared action admission', () => {
 // including the revocations that matter -- is specified in
 // machine-team-sharing.integration.test.ts.
 
-describe('putting a machine in a team, and taking it back out', () => {
-  it('moves between teams and out again, always at the owner s word', async () => {
+describe('putting a machine in groups, and taking it back out', () => {
+  it('joins several groups at once, and leaving one keeps the others', async () => {
+    // The whole point of the join table: shared with ops AND support, without
+    // either displacing the other.
     const app = buildApp();
     const ownerId = `owner-${hex(4)}`;
     await createUser(db, ownerId);
     const serverId = await controlledNode(ownerId);
-    const first = await createDesk(ownerId);
-    const second = await createDesk(ownerId);
+    const ops = await createDesk(ownerId);
+    const support = await createDesk(ownerId);
 
-    expect((await bindDesk(app, ownerId, serverId, first)).status).toBe(200);
-    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
-      .toEqual({ team_id: first });
+    expect((await bindDesk(app, ownerId, serverId, ops)).status).toBe(200);
+    expect((await bindDesk(app, ownerId, serverId, support)).status).toBe(200);
+    expect(await groupsOf(serverId)).toEqual([ops, support].sort());
 
-    // Filing a machine under the wrong group used to be unfixable short of
-    // reinstalling it: rebinding answered 409 and there was no way out at all.
-    expect((await bindDesk(app, ownerId, serverId, second)).status).toBe(200);
-    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
-      .toEqual({ team_id: second });
-
-    expect((await bindDesk(app, ownerId, serverId, null)).status).toBe(200);
-    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
-      .toEqual({ team_id: null });
+    expect((await bindDesk(app, ownerId, serverId, ops, false)).status).toBe(200);
+    expect(await groupsOf(serverId)).toEqual([support]);
   });
 
-  it('lets an owner removed from the team still take their machine back', async () => {
-    // Otherwise a team admin takes the machine hostage: remove the owner from
-    // the team and they can neither move it out nor manage its shares again.
+  it('is idempotent in both directions', async () => {
+    // A retried click must not fail, and must not double-file.
     const app = buildApp();
     const ownerId = `owner-${hex(4)}`;
-    const adminId = `admin-${hex(4)}`;
-    await Promise.all([createUser(db, ownerId), createUser(db, adminId)]);
+    await createUser(db, ownerId);
+    const serverId = await controlledNode(ownerId);
+    const ops = await createDesk(ownerId);
+
+    expect((await bindDesk(app, ownerId, serverId, ops)).status).toBe(200);
+    expect((await bindDesk(app, ownerId, serverId, ops)).status).toBe(200);
+    expect(await groupsOf(serverId)).toEqual([ops]);
+
+    expect((await bindDesk(app, ownerId, serverId, ops, false)).status).toBe(200);
+    expect((await bindDesk(app, ownerId, serverId, ops, false)).status).toBe(200);
+    expect(await groupsOf(serverId)).toEqual([]);
+  });
+
+  it('lets an owner removed from the group still take their machine out', async () => {
+    // Otherwise a group admin takes the machine hostage: remove the owner from
+    // the group and they can never get it back out.
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    await createUser(db, ownerId);
     const serverId = await controlledNode(ownerId);
     const deskId = await createDesk(ownerId);
-    await joinDesk(deskId, adminId, 'admin');
     expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
 
     await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [deskId, ownerId]);
 
-    expect((await bindDesk(app, ownerId, serverId, null)).status).toBe(200);
-    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
-      .toEqual({ team_id: null });
+    expect((await bindDesk(app, ownerId, serverId, deskId, false)).status).toBe(200);
+    expect(await groupsOf(serverId)).toEqual([]);
   });
 
-  it('refuses a team the caller does not manage, and someone else s machine', async () => {
+  it('refuses a group the caller does not manage, and someone else s machine', async () => {
     const app = buildApp();
     const ownerId = `owner-${hex(4)}`;
     const strangerId = `stranger-${hex(4)}`;
@@ -813,22 +837,35 @@ describe('putting a machine in a team, and taking it back out', () => {
     const foreignDesk = await createDesk(strangerId);
     const ownDesk = await createDesk(ownerId);
 
-    // A team the owner is merely not in.
     expect((await bindDesk(app, ownerId, serverId, foreignDesk)).status).toBe(403);
-    // A team that does not exist is refused rather than created.
     expect((await bindDesk(app, ownerId, serverId, `desk-${hex(6)}`)).status).toBe(403);
-    // Someone else's machine, even into a team they do manage.
     expect((await bindDesk(app, strangerId, serverId, foreignDesk)).status).toBe(404);
-    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
-      .toEqual({ team_id: null });
+    expect(await groupsOf(serverId)).toEqual([]);
 
-    // And a blank body still does not silently unfile the machine.
+    // A plain member of a group may not file machines into it either.
+    const memberOnly = `member-${hex(4)}`;
+    await createUser(db, memberOnly);
+    await joinDesk(ownDesk, memberOnly);
+    const theirMachine = await controlledNode(memberOnly);
+    expect((await bindDesk(app, memberOnly, theirMachine, ownDesk)).status).toBe(403);
+    expect(await groupsOf(theirMachine)).toEqual([]);
+  });
+
+  it('refuses a malformed body rather than changing membership by omission', async () => {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    await createUser(db, ownerId);
+    const serverId = await controlledNode(ownerId);
+    const ownDesk = await createDesk(ownerId);
     expect((await bindDesk(app, ownerId, serverId, ownDesk)).status).toBe(200);
-    const malformed = await app.request(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
-      method: 'POST', headers: webAuth(ownerId), body: JSON.stringify({}),
-    });
-    expect(malformed.status).toBe(400);
-    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
-      .toEqual({ team_id: ownDesk });
+
+    for (const body of [{}, { teamId: ownDesk }, { member: false }, { teamId: '', member: false }]) {
+      const malformed = await app.request(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
+        method: 'POST', headers: webAuth(ownerId), body: JSON.stringify(body),
+      });
+      expect(malformed.status, JSON.stringify(body)).toBe(400);
+    }
+    // Membership is exactly as it was.
+    expect(await groupsOf(serverId)).toEqual([ownDesk]);
   });
 });

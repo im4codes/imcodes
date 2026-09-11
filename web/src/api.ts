@@ -2173,10 +2173,27 @@ export async function updateSharedContextRuntimeConfig(serverId: string, config:
   });
 }
 
-/** Put a machine in a team, or take it out of one (`null`). */
-export async function bindMachineToTeam(serverId: string, teamId: string | null): Promise<void> {
-  const { bindMachineToTeam: bind } = await import('./api/machines.js');
-  return bind(serverId, teamId);
+/** Put a machine in one group, or take it out of that one. */
+export async function setMachineGroupMembership(
+  serverId: string,
+  teamId: string,
+  member: boolean,
+): Promise<void> {
+  const { setMachineGroupMembership: set } = await import('./api/machines.js');
+  return set(serverId, teamId, member);
+}
+
+/** Rename a group. */
+export async function renameTeam(teamId: string, name: string): Promise<void> {
+  await apiFetch(`/api/team/${encodeURIComponent(teamId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  });
+}
+
+/** Delete a group. Refused by the server while any machine is still in it. */
+export async function deleteTeam(teamId: string): Promise<void> {
+  await apiFetch(`/api/team/${encodeURIComponent(teamId)}`, { method: 'DELETE' });
 }
 
 export async function createTeam(name: string): Promise<{ id: string; name: string; role: string }> {

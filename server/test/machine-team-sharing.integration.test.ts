@@ -12,6 +12,7 @@ import { runMigrations } from '../src/db/migrate.js';
 import { resolveServerRole } from '../src/security/authorization.js';
 import {
   canOperateControlledMachine,
+  listAccessibleControlledMachines,
   resolveControlledMachineAccess,
 } from '../src/share/machine-access.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
@@ -41,11 +42,19 @@ async function installMachine(userId: string): Promise<string> {
   // what normally mints it.
   const nodeId = String(Math.floor(1e9 + Math.random() * 8.9e9));
   await db.execute(
-    `INSERT INTO servers (id, user_id, team_id, name, token_hash, status, created_at, node_role, node_id)
-     VALUES ($1, $2, NULL, 'test-machine', 'hash', 'offline', $3, $4, $5)`,
+    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, node_id)
+     VALUES ($1, $2, 'test-machine', 'hash', 'offline', $3, $4, $5)`,
     [id, userId, Date.now(), NODE_ROLE.CONTROLLED, nodeId],
   );
   return id;
+}
+
+/** Put a machine in a group. A machine can be in several. */
+async function addToGroup(serverId: string, teamId: string): Promise<void> {
+  await db.execute(
+    'INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+    [serverId, teamId, Date.now()],
+  );
 }
 
 async function makeTeam(ownerId: string): Promise<string> {
@@ -105,7 +114,7 @@ describe('associating a machine with a team', () => {
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
       [teamId, colleague, Date.now()],
     );
-    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
+    await addToGroup(serverId, teamId);
 
     const roleFor = async (userId: string) =>
       (await resolveControlledMachineAccess(db, userId, serverId, Date.now()))?.access_role;
@@ -125,7 +134,7 @@ describe('associating a machine with a team', () => {
       [teamId, colleague, Date.now()],
     );
     const theirs = await installMachine(colleague);
-    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [theirs, teamId]);
+    await addToGroup(theirs, teamId);
 
     // Their own machine, reached as its owner rather than through the team.
     expect((await resolveControlledMachineAccess(db, colleague, theirs, Date.now()))?.access_role).toBe('owner');
@@ -143,11 +152,11 @@ describe('associating a machine with a team', () => {
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
-    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
+    await addToGroup(serverId, teamId);
     expect((await resolveControlledMachineAccess(db, colleague, serverId, Date.now()))?.access_role)
       .toBe('participant');
 
-    await db.execute('UPDATE servers SET team_id = NULL WHERE id = $1', [serverId]);
+    await db.execute('DELETE FROM machine_groups WHERE server_id = $1', [serverId]);
 
     expect(await resolveControlledMachineAccess(db, colleague, serverId, Date.now())).toBeNull();
     expect((await resolveControlledMachineAccess(db, owner, serverId, Date.now()))?.access_role).toBe('owner');
@@ -159,7 +168,7 @@ describe('associating a machine with a team', () => {
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
-    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
+    await addToGroup(serverId, teamId);
     expect((await resolveControlledMachineAccess(db, colleague, serverId, Date.now()))?.access_role)
       .toBe('participant');
 
@@ -203,7 +212,7 @@ describe('sharing one machine with one person', () => {
     // separate grants. Putting the machine in a team must not quietly withdraw
     // the individual one.
     const teamId = await makeTeam(owner);
-    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
+    await addToGroup(serverId, teamId);
     await share('participant');
 
     expect((await accessFor(colleague))?.access_role).toBe('participant');
@@ -225,7 +234,7 @@ describe('sharing one machine with one person', () => {
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
-    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
+    await addToGroup(serverId, teamId);
     await share('viewer');
 
     expect((await accessFor(colleague))?.access_role).toBe('viewer');
@@ -246,9 +255,194 @@ describe('sharing one machine with one person', () => {
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
       [teamId, colleague, Date.now()],
     );
-    await db.execute('UPDATE servers SET team_id = $2 WHERE id = $1', [serverId, teamId]);
+    await addToGroup(serverId, teamId);
 
     expect((await accessFor(colleague))?.access_role).toBe('participant');
     expect(await accessFor(stranger)).toBeNull();
+  });
+});
+
+describe('the server role a group confers', () => {
+  /** Put someone in a group at a role. */
+  const join = (teamId: string, userId: string, role: 'admin' | 'member') => db.execute(
+    'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4)',
+    [teamId, userId, role, Date.now()],
+  );
+
+  it('is owner for the installer, whatever the groups say', async () => {
+    const teamId = await makeTeam(colleague);
+    await addToGroup(serverId, teamId);
+    await join(teamId, owner, 'member');
+    // Being a plain member of a group holding your own machine does not
+    // demote you on it.
+    expect(await resolveServerRole(db, serverId, owner)).toBe('owner');
+  });
+
+  it('promotes whoever runs the group, and leaves plain members as members', async () => {
+    const teamId = await makeTeam(colleague);
+    await addToGroup(serverId, teamId);
+    const admin = await newUser();
+    const plain = await newUser();
+    await join(teamId, admin, 'admin');
+    await join(teamId, plain, 'member');
+
+    // The group's own owner runs the machines in it, but is not their owner:
+    // that word is reserved for whoever installed it, and it is the role that
+    // can revoke the machine outright.
+    expect(await resolveServerRole(db, serverId, colleague)).toBe('admin');
+    expect(await resolveServerRole(db, serverId, admin)).toBe('admin');
+    expect(await resolveServerRole(db, serverId, plain)).toBe('member');
+    expect(await resolveServerRole(db, serverId, stranger)).toBe('none');
+  });
+
+  it('takes the strongest role when the machine is in several groups', async () => {
+    // The same person can be a plain member of one group and run another, both
+    // holding this machine. Answering from whichever row the database happened
+    // to return first would make their access flip between page loads.
+    const weak = await makeTeam(owner);
+    const strong = await makeTeam(owner);
+    await addToGroup(serverId, weak);
+    await addToGroup(serverId, strong);
+    await join(weak, colleague, 'member');
+    await join(strong, colleague, 'admin');
+    expect(await resolveServerRole(db, serverId, colleague)).toBe('admin');
+
+    // And the reverse order of insertion gives the same answer.
+    const other = await installMachine(owner);
+    await addToGroup(other, strong);
+    await addToGroup(other, weak);
+    expect(await resolveServerRole(db, other, colleague)).toBe('admin');
+  });
+
+  it('drops back to none when the group loses the machine, the person, or itself', async () => {
+    const teamId = await makeTeam(owner);
+    await addToGroup(serverId, teamId);
+    await join(teamId, colleague, 'admin');
+    expect(await resolveServerRole(db, serverId, colleague)).toBe('admin');
+
+    await db.execute('DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2', [serverId, teamId]);
+    expect(await resolveServerRole(db, serverId, colleague)).toBe('none');
+
+    await addToGroup(serverId, teamId);
+    await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, colleague]);
+    expect(await resolveServerRole(db, serverId, colleague)).toBe('none');
+
+    await join(teamId, colleague, 'admin');
+    await db.execute('DELETE FROM teams WHERE id = $1', [teamId]);
+    // Deleting the group cascades the membership away rather than leaving the
+    // machine pointing at a group that no longer exists.
+    expect(await resolveServerRole(db, serverId, colleague)).toBe('none');
+  });
+});
+
+describe('a machine in several groups', () => {
+  it('is reachable through every group that holds it, independently', async () => {
+    // The shape the single column could not express at all: shared with ops AND
+    // with support, without either one displacing the other.
+    const ops = await makeTeam(owner);
+    const support = await makeTeam(owner);
+    const opsAdmin = await newUser();
+    const supportAdmin = await newUser();
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+      [ops, opsAdmin, Date.now()],
+    );
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+      [support, supportAdmin, Date.now()],
+    );
+    await addToGroup(serverId, ops);
+    await addToGroup(serverId, support);
+
+    const roleFor = async (userId: string) =>
+      (await resolveControlledMachineAccess(db, userId, serverId, Date.now()))?.access_role;
+    expect(await roleFor(opsAdmin)).toBe('participant');
+    expect(await roleFor(supportAdmin)).toBe('participant');
+    expect(await roleFor(stranger)).toBeUndefined();
+  });
+
+  it('appears once, not once per group', async () => {
+    // A join across memberships returns the machine per matching group. A list
+    // that repeats a machine is not a machine list, and a count taken off it
+    // would be wrong everywhere it is shown.
+    const ops = await makeTeam(owner);
+    const support = await makeTeam(owner);
+    const admin = await newUser();
+    for (const team of [ops, support]) {
+      await db.execute(
+        "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+        [team, admin, Date.now()],
+      );
+      await addToGroup(serverId, team);
+    }
+
+    const rows = await listAccessibleControlledMachines(db, admin, Date.now(), 50);
+    expect(rows.filter((row) => row.id === serverId)).toHaveLength(1);
+    // And it reports both groups it is in.
+    expect(rows.find((row) => row.id === serverId)?.team_ids?.sort()).toEqual([ops, support].sort());
+  });
+
+  it('keeps the other groups when it leaves one', async () => {
+    const ops = await makeTeam(owner);
+    const support = await makeTeam(owner);
+    const opsAdmin = await newUser();
+    const supportAdmin = await newUser();
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+      [ops, opsAdmin, Date.now()],
+    );
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+      [support, supportAdmin, Date.now()],
+    );
+    await addToGroup(serverId, ops);
+    await addToGroup(serverId, support);
+
+    await db.execute('DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2', [serverId, ops]);
+
+    const roleFor = async (userId: string) =>
+      (await resolveControlledMachineAccess(db, userId, serverId, Date.now()))?.access_role;
+    expect(await roleFor(opsAdmin), 'the group it left grants nothing').toBeUndefined();
+    expect(await roleFor(supportAdmin), 'the group it stayed in is untouched').toBe('participant');
+  });
+
+  it('loses a group membership when that group is deleted', async () => {
+    // machine_groups cascades on the group, so nothing dangles. The machine
+    // itself survives, which is the point of refusing to delete a non-empty
+    // group in the UI rather than in the database.
+    const ops = await makeTeam(owner);
+    const admin = await newUser();
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+      [ops, admin, Date.now()],
+    );
+    await addToGroup(serverId, ops);
+    expect((await resolveControlledMachineAccess(db, admin, serverId, Date.now()))?.access_role)
+      .toBe('participant');
+
+    await db.execute('DELETE FROM teams WHERE id = $1', [ops]);
+
+    expect(await resolveControlledMachineAccess(db, admin, serverId, Date.now())).toBeNull();
+    expect((await resolveControlledMachineAccess(db, owner, serverId, Date.now()))?.access_role)
+      .toBe('owner');
+    expect(await db.query('SELECT team_id FROM machine_groups WHERE server_id = $1', [serverId]))
+      .toEqual([]);
+  });
+
+  it('takes its group memberships with it when the machine is deleted', async () => {
+    const ops = await makeTeam(owner);
+    await addToGroup(serverId, ops);
+    await db.execute('DELETE FROM servers WHERE id = $1', [serverId]);
+    expect(await db.query('SELECT server_id FROM machine_groups WHERE team_id = $1', [ops])).toEqual([]);
+  });
+
+  it('counts as ungrouped only when it is in no group at all', async () => {
+    // The default machine view is "in no group". A machine in two groups must
+    // not fall into it just because neither is selected.
+    const ops = await makeTeam(owner);
+    await addToGroup(serverId, ops);
+    const row = (await listAccessibleControlledMachines(db, owner, Date.now(), 50))
+      .find((entry) => entry.id === serverId);
+    expect(row?.team_ids).toEqual([ops]);
   });
 });

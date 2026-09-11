@@ -3284,7 +3284,15 @@
     "team_error_self_add_denied": "You are already in this group.",
     "team_error_group_manage_denied": "You do not manage this group.",
     "team_error_desk_membership_required": "That person is not allowed in this group.",
-    "confirm_again": "Sure?"
+    "confirm_again": "Sure?",
+    "group_rename": "Rename",
+    "group_rename_placeholder": "New name for {{name}}",
+    "group_delete": "Delete group",
+    "group_delete_blocked": "Take all {{count}} machines out before this group can be deleted.",
+    "team_error_group_has_machines": "This group still has machines in it. Take them out first.",
+    "team_error_group_owner_required": "Only the group owner can delete it.",
+    "team_error_group_name_required": "Enter a name.",
+    "team_error_group_name_too_long": "That name is too long."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

@@ -27,21 +27,52 @@ export interface ControlledMachineAccessRow {
   host_server_id: string | null;
   /** Canonical physical-host identity for remote-desktop presentation/management. */
   remote_desktop_host_id: string | null;
-  /** The team this machine is shared with, if its owner put it in one. */
-  team_id: string | null;
-  team_name: string | null;
+  /** Every group this machine is in, as parallel id/name arrays. */
+  team_ids: string[] | null;
+  team_names: string[] | null;
 }
 
 export type ControlledMachineOperatorAccessRow = ControlledMachineAccessRow & {
   access_role: Extract<MachineAccessRole, 'owner' | 'participant'>;
 };
 
+/**
+ * Does this caller run any group this machine is in?
+ *
+ * EXISTS rather than a join: a machine can be in several groups, and joining
+ * would return it once per matching membership -- a list that repeats a machine
+ * is not a machine list, and the GROUP BY needed to undo that is one more place
+ * to get wrong.
+ */
+const MANAGES_A_GROUP_OF = `EXISTS (
+           SELECT 1 FROM machine_groups mg
+             JOIN team_members tm ON tm.team_id = mg.team_id
+            WHERE mg.server_id = s.id
+              AND tm.user_id = $1
+              AND tm.role IN ('owner', 'admin')
+              -- A short-circuit, not a guard: the owner is answered by the
+              -- first CASE arm and by the first term of every WHERE that uses
+              -- this, so removing it changes no result. Verified by mutation:
+              -- taking it out leaves all tests green, which is why it is
+              -- described as what it is.
+              AND s.user_id <> $1
+         )`;
+
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.node_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
          rdhe.host_id AS remote_desktop_host_id,
-         s.team_id, t.name AS team_name,
+         (
+           SELECT COALESCE(array_agg(g.team_id ORDER BY gt.name), '{}')
+             FROM machine_groups g JOIN teams gt ON gt.id = g.team_id
+            WHERE g.server_id = s.id
+         ) AS team_ids,
+         (
+           SELECT COALESCE(array_agg(gt.name ORDER BY gt.name), '{}')
+             FROM machine_groups g JOIN teams gt ON gt.id = g.team_id
+            WHERE g.server_id = s.id
+         ) AS team_names,
          CASE
            WHEN s.user_id = $1 THEN 'owner'
            -- An explicit per-machine grant wins over the team default, in both
@@ -49,13 +80,12 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
            -- deliberate downgrade to viewer is not silently undone by the
            -- grantee also being in the team.
            WHEN sh.role IS NOT NULL THEN sh.role
-           WHEN tm.user_id IS NOT NULL THEN 'participant'
+           WHEN ${MANAGES_A_GROUP_OF} THEN 'participant'
          END AS access_role,
          sh.expires_at AS access_expires_at
     FROM servers s
     LEFT JOIN remote_desktop_host_endpoints rdhe
       ON rdhe.server_id = s.id
-    LEFT JOIN teams t ON t.id = s.team_id
     -- Sharing one machine with one person, and sharing a group of machines with
     -- a team, are two separate grants. Either is sufficient on its own.
     --
@@ -71,23 +101,22 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
      AND sh.target_user_id = $1
      AND sh.revoked_at IS NULL
      AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-    -- The team path, and only for those who manage the team.
+    -- The group path, and only for those who manage the group.
     --
-    -- A team has three roles. An ordinary member manages the machines they
+    -- A machine can be in several groups, so this is a join through the
+    -- membership table rather than a single column: one matching group is
+    -- enough, and being in one group does not remove it from another.
+    --
+    -- A group has three roles. An ordinary member manages the machines they
     -- added themselves and nothing else -- they reach those as the owner, not
-    -- through the team -- while the owner and admins manage every machine in
-    -- it. So being in a team means your machines become manageable by the
-    -- people running it; it does not hand you everyone else's.
+    -- through the group -- while the owner and admins manage every machine in
+    -- it. So putting a machine in a group means the people running that group
+    -- can manage it; it does not hand you everyone else's.
     --
     -- Membership and role are read here rather than copied into a row, so a
-    -- demotion, a removal, or moving the machine out all take effect on the
+    -- demotion, a removal, or taking the machine out all take effect on the
     -- next request.
-    LEFT JOIN team_members tm
-      ON s.team_id IS NOT NULL
-     AND tm.team_id = s.team_id
-     AND tm.user_id = $1
-     AND tm.role IN ('owner', 'admin')
-     AND s.user_id <> $1`;
+`;
 
 /**
  * Resolve current DB-authoritative access to one controlled node.
@@ -107,7 +136,7 @@ export async function resolveControlledMachineAccess(
       WHERE s.id = $3
         AND s.node_role = $4
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR tm.user_id IS NOT NULL)
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${MANAGES_A_GROUP_OF})
       LIMIT 1`,
     [userId, now, serverId, NODE_ROLE.CONTROLLED],
   );
@@ -152,7 +181,7 @@ export async function resolveRemoteDesktopHostAccess(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.id = $3
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR tm.user_id IS NOT NULL)
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${MANAGES_A_GROUP_OF})
       LIMIT 1`,
     [userId, now, serverId],
   );
@@ -182,7 +211,7 @@ export async function listAccessibleControlledMachines(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.node_role = $3
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR tm.user_id IS NOT NULL)
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${MANAGES_A_GROUP_OF})
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,
     [userId, now, NODE_ROLE.CONTROLLED, limit],

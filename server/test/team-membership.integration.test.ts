@@ -138,3 +138,121 @@ describe('POST /api/team/:id/member', () => {
     expect(await members()).toHaveLength(1);
   });
 });
+
+describe('renaming and deleting a group', () => {
+  async function machineIn(group: string | null, ownerId: string): Promise<string> {
+    const id = `srv-${hex(8)}`;
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, node_id)
+       VALUES ($1, $2, 'm', 'h', 'offline', $3, 'controlled', $4)`,
+      [id, ownerId, Date.now(), String(Math.floor(1e9 + Math.random() * 8.9e9))],
+    );
+    if (group) {
+      await db.execute(
+        'INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1, $2, $3)',
+        [id, group, Date.now()],
+      );
+    }
+    return id;
+  }
+
+  it('renames a group, and refuses a blank or oversized name', async () => {
+    const app = buildApp();
+    const renamed = await app.request(`/api/team/${teamId}`, {
+      method: 'PATCH', headers: auth(ownerId), body: JSON.stringify({ name: '  运维组  ' }),
+    });
+    expect(renamed.status).toBe(200);
+    expect(await db.queryOne('SELECT name FROM teams WHERE id = $1', [teamId]))
+      .toEqual({ name: '运维组' });
+
+    for (const [body, code] of [
+      [{ name: '   ' }, 'group_name_required'],
+      [{}, 'group_name_required'],
+      [{ name: 'n'.repeat(121) }, 'group_name_too_long'],
+    ] as const) {
+      const bad = await app.request(`/api/team/${teamId}`, {
+        method: 'PATCH', headers: auth(ownerId), body: JSON.stringify(body),
+      });
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toMatchObject({ error: code });
+    }
+    // Nothing was applied by any refusal.
+    expect(await db.queryOne('SELECT name FROM teams WHERE id = $1', [teamId]))
+      .toEqual({ name: '运维组' });
+  });
+
+  it('refuses to delete a group that still holds a machine', async () => {
+    // A group being deleted is exactly when its machines silently lose the
+    // access it granted. Emptying it first makes that a decision rather than a
+    // side effect.
+    const app = buildApp();
+    const serverId = await machineIn(teamId, ownerId);
+
+    const refused = await app.request(`/api/team/${teamId}`, { method: 'DELETE', headers: auth(ownerId) });
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ error: 'group_has_machines', machineCount: 1 });
+    expect(await db.queryOne('SELECT id FROM teams WHERE id = $1', [teamId])).toEqual({ id: teamId });
+
+    // Take the machine out, and the same request now goes through.
+    await db.execute('DELETE FROM machine_groups WHERE server_id = $1', [serverId]);
+    const deleted = await app.request(`/api/team/${teamId}`, { method: 'DELETE', headers: auth(ownerId) });
+    expect(deleted.status).toBe(200);
+    expect(await db.queryOne('SELECT id FROM teams WHERE id = $1', [teamId])).toBeNull();
+    // The machine outlives the group it was in.
+    expect(await db.queryOne('SELECT id FROM servers WHERE id = $1', [serverId]))
+      .toEqual({ id: serverId });
+  });
+
+  it('counts only live machines, so a revoked one cannot block deletion forever', async () => {
+    const app = buildApp();
+    const serverId = await machineIn(teamId, ownerId);
+    await db.execute('UPDATE servers SET revoked_at = $2 WHERE id = $1', [serverId, Date.now()]);
+
+    const deleted = await app.request(`/api/team/${teamId}`, { method: 'DELETE', headers: auth(ownerId) });
+    expect(deleted.status).toBe(200);
+  });
+
+  it('lets an admin rename but never delete', async () => {
+    // Managing who is in a group and destroying the group are not the same act,
+    // and the second cannot be undone by the person it was taken from.
+    const app = buildApp();
+    const admin = await createUser(`admin-${hex(6)}`, `adm_${hex(4)}`);
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
+      [teamId, admin, Date.now()],
+    );
+
+    expect((await app.request(`/api/team/${teamId}`, {
+      method: 'PATCH', headers: auth(admin), body: JSON.stringify({ name: 'by admin' }),
+    })).status).toBe(200);
+
+    const refused = await app.request(`/api/team/${teamId}`, { method: 'DELETE', headers: auth(admin) });
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ error: 'group_owner_required' });
+    expect(await db.queryOne('SELECT id FROM teams WHERE id = $1', [teamId])).toEqual({ id: teamId });
+  });
+
+  it('refuses both to someone outside the group', async () => {
+    const app = buildApp();
+    const stranger = await createUser(`out-${hex(6)}`, `out_${hex(4)}`);
+    expect((await app.request(`/api/team/${teamId}`, {
+      method: 'PATCH', headers: auth(stranger), body: JSON.stringify({ name: 'theirs' }),
+    })).status).toBe(403);
+    expect((await app.request(`/api/team/${teamId}`, {
+      method: 'DELETE', headers: auth(stranger),
+    })).status).toBe(403);
+    expect(await db.queryOne('SELECT id FROM teams WHERE id = $1', [teamId])).toEqual({ id: teamId });
+  });
+
+  it('takes the members with it, since they cascade', async () => {
+    const app = buildApp();
+    const mate = await createUser(`mate-${hex(6)}`, `mate_${hex(4)}`);
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      [teamId, mate, Date.now()],
+    );
+
+    expect((await app.request(`/api/team/${teamId}`, { method: 'DELETE', headers: auth(ownerId) })).status).toBe(200);
+    expect(await db.query('SELECT user_id FROM team_members WHERE team_id = $1', [teamId])).toEqual([]);
+  });
+});

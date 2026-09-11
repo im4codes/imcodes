@@ -74,7 +74,9 @@ const createTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'desk-new', name: 'M
 const listTeams = vi.fn(async () => [] as { id: string; name: string; role: 'owner' | 'admin' | 'member' }[]);
 const getTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'team-1', name: 'Ops', myRole: 'owner' as const, members: [] as unknown[] }));
 const addTeamMember = vi.fn(async (..._a: unknown[]) => ({ ok: true as const }));
-const bindMachineToTeam = vi.fn(async (..._a: unknown[]) => {});
+const setMachineGroupMembership = vi.fn(async (..._a: unknown[]) => {});
+const renameTeam = vi.fn(async (..._a: unknown[]) => {});
+const deleteTeam = vi.fn(async (..._a: unknown[]) => {});
 
 const downloadControlledNodeExecutable = vi.fn(async () => ({
   version: 2 as const,
@@ -125,7 +127,9 @@ vi.mock('../src/api.js', async (importOriginal) => {
     listTeams: () => listTeams(),
     getTeam: (...a: unknown[]) => getTeam(...a),
     addTeamMember: (...a: unknown[]) => addTeamMember(...a),
-    bindMachineToTeam: (...a: unknown[]) => bindMachineToTeam(...a),
+    setMachineGroupMembership: (...a: unknown[]) => setMachineGroupMembership(...a),
+    renameTeam: (...a: unknown[]) => renameTeam(...a),
+    deleteTeam: (...a: unknown[]) => deleteTeam(...a),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
   };
@@ -168,7 +172,9 @@ beforeEach(() => {
   listTeams.mockResolvedValue([]);
   getTeam.mockClear();
   addTeamMember.mockClear();
-  bindMachineToTeam.mockClear();
+  setMachineGroupMembership.mockClear();
+  renameTeam.mockClear();
+  deleteTeam.mockClear();
   createTeam.mockResolvedValue({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const });
 });
 
@@ -1264,7 +1270,7 @@ describe('ControlledNodesPanel teams tab', () => {
       {
         serverId: 'srv-in', nodeId: '1234567890', refName: 'in', displayName: 'Already in',
         online: true, execEnabled: true, accessRole: 'owner' as const,
-        teamId: 'team-1', teamName: 'Ops',
+        teamIds: ['team-1'], teamNames: ['Ops'],
       },
       {
         serverId: 'srv-out', nodeId: '1234567891', refName: 'out', displayName: 'Not in',
@@ -1289,9 +1295,9 @@ describe('ControlledNodesPanel teams tab', () => {
     await act(async () => { fireEvent.input(pick, { target: { value: 'srv-out' } }); });
     const add = container.querySelector('[data-testid="controlled-nodes-machine-add"]') as HTMLButtonElement;
     await act(async () => { fireEvent.click(add); });
-    expect(bindMachineToTeam, 'one click only arms it').not.toHaveBeenCalled();
+    expect(setMachineGroupMembership, 'one click only arms it').not.toHaveBeenCalled();
     await act(async () => { fireEvent.click(add); });
-    expect(bindMachineToTeam).toHaveBeenCalledWith('srv-out', 'team-1');
+    expect(setMachineGroupMembership).toHaveBeenCalledWith('srv-out', 'team-1', true);
 
     // The panel disables its actions while one is in flight, so wait for the
     // add to finish rather than clicking into a disabled button and calling
@@ -1302,9 +1308,10 @@ describe('ControlledNodesPanel teams tab', () => {
       return el;
     });
     await confirmClick(removeIn);
-    // null, not '': the server rejects a blank group, so a malformed body can
-    // never silently unfile a machine.
-    expect(bindMachineToTeam).toHaveBeenLastCalledWith('srv-in', null);
+    // Names the group it is leaving and says so explicitly. A machine can be in
+    // several, so there is no "the" group to clear, and a body that omitted
+    // either half must not be able to change membership by default.
+    expect(setMachineGroupMembership).toHaveBeenLastCalledWith('srv-in', 'team-1', false);
   });
 
   it('says what went wrong instead of showing a status code', async () => {
@@ -1413,7 +1420,7 @@ describe('ControlledNodesPanel machine grouping', () => {
   const viaTeam = {
     serverId: 'srv-team', nodeId: '1234567891', refName: 'team', displayName: 'Team box',
     online: true, execEnabled: true, accessRole: 'participant' as const,
-    teamId: 'team-1', teamName: 'Ops',
+    teamIds: ['team-1'], teamNames: ['Ops'],
   };
 
   it('defaults to what is yours and shared with you, not the team s machines', async () => {
@@ -1436,6 +1443,45 @@ describe('ControlledNodesPanel machine grouping', () => {
     // Nothing is unreachable: All still shows both.
     expect(container.textContent).toContain('Mine');
     expect(container.textContent).toContain('Team box');
+  });
+
+  it('keeps your own machine on the default view after you file it in a group', async () => {
+    // Filing your own device in a group shares it; it does not put it away.
+    // It used to vanish from the list you land on, which reads as a lost
+    // device rather than a shared one.
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    // Still not the one reachable only through the group.
+    expect(container.textContent).not.toContain('Team box');
+
+    // And it is under its group as well, not instead.
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    expect(container.textContent).toContain('Mine');
+    expect(container.textContent).toContain('Team box');
+  });
+
+  it('puts a count on every group tab, matching what the tab opens', async () => {
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+
+    const countOf = (id: string): string | undefined => container
+      .querySelector(`[data-testid="controlled-nodes-group-${id}"] .controlled-nodes-team-chip-count`)
+      ?.textContent ?? undefined;
+    expect(countOf('direct'), 'your own grouped machine counts here too').toBe('1');
+    expect(countOf('team-1')).toBe('2');
+    expect(countOf('all')).toBe('2');
+
+    // The number has to agree with the list, or it is decoration.
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    expect(container.querySelectorAll('.controlled-nodes-machine-row')).toHaveLength(2);
   });
 
   it('shows no group filter at all when no machine is in a team', async () => {
@@ -1491,5 +1537,112 @@ describe('ControlledNodesPanel install instructions', () => {
     // The old rule. Reintroducing it puts the text back in the ribbon.
     expect(block.slice(0, 400)).not.toContain('grid-template-columns: 64px');
     expect(css).toContain('.controlled-nodes-usage-route {');
+  });
+});
+
+describe('ControlledNodesPanel group rename and delete', () => {
+  const openTeams = (container: HTMLElement) => act(() => {
+    (container.querySelector('[data-testid="controlled-nodes-tab-teams"]') as HTMLButtonElement).click();
+  });
+  const owned = (over: Record<string, unknown> = {}) => ({
+    serverId: 'srv-1', nodeId: '1234567890', refName: 'm', displayName: 'Mine',
+    online: true, execEnabled: true, accessRole: 'owner' as const, ...over,
+  });
+
+  it('renames a group, and will not send a blank name', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const input = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-group-rename"]') as HTMLInputElement | null;
+      if (!el) throw new Error('rename input not rendered');
+      return el;
+    });
+    const save = container.querySelector('[data-testid="controlled-nodes-group-rename-save"]') as HTMLButtonElement;
+    expect(save.disabled, 'an empty name is not a rename').toBe(true);
+
+    await act(async () => { fireEvent.input(input, { target: { value: '  运维组  ' } }); });
+    await act(async () => { fireEvent.click(save); });
+    expect(renameTeam).toHaveBeenCalledWith('team-1', '运维组');
+  });
+
+  it('will not offer delete while machines are still in the group, and says why', async () => {
+    // Disabled with the reason on it rather than clickable and then refused:
+    // the machines have to come out first, and that is something to be told
+    // before trying.
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [owned({ teamIds: ['team-1'], teamNames: ['Ops'] })];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="controlled-nodes-group-delete-blocked"]')).not.toBeNull();
+    });
+    expect(container.querySelector('[data-testid="controlled-nodes-group-delete"]')).toBeNull();
+    expect(deleteTeam).not.toHaveBeenCalled();
+  });
+
+  it('deletes an empty group, and asks once first', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [owned()];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const del = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-group-delete"]') as HTMLButtonElement | null;
+      if (!el) throw new Error('delete action not rendered');
+      return el;
+    });
+    await act(async () => { fireEvent.click(del); });
+    expect(deleteTeam, 'one click only arms it').not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(del); });
+    expect(deleteTeam).toHaveBeenCalledWith('team-1');
+  });
+
+  it('shows an admin rename but never delete, and a member neither', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'admin' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'admin', members: [] });
+    machines = [];
+    const { container: asAdmin } = render(<ControlledNodesPanel />);
+    openTeams(asAdmin);
+    await waitFor(() => {
+      expect(asAdmin.querySelector('[data-testid="controlled-nodes-group-rename"]')).not.toBeNull();
+    });
+    expect(asAdmin.querySelector('[data-testid="controlled-nodes-group-delete"]')).toBeNull();
+
+    cleanup();
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'member' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'member', members: [] });
+    const { container: asMember } = render(<ControlledNodesPanel />);
+    openTeams(asMember);
+    await waitFor(() => expect(asMember.textContent).toContain('controlled_nodes.team_machines'));
+    expect(asMember.querySelector('[data-testid="controlled-nodes-group-rename"]')).toBeNull();
+    expect(asMember.querySelector('[data-testid="controlled-nodes-group-delete"]')).toBeNull();
+  });
+
+  it('lists a machine under every group it is in', async () => {
+    listTeams.mockResolvedValue([
+      { id: 'team-1', name: 'Ops', role: 'owner' as const },
+      { id: 'team-2', name: 'Support', role: 'owner' as const },
+    ]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [owned({ teamIds: ['team-1', 'team-2'], teamNames: ['Ops', 'Support'] })];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    // It is offered a way OUT of the selected group, not a way in.
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-1"]')).not.toBeNull();
+    });
+    // And both chips carry a count of one for the same machine, because it
+    // really is in both.
+    expect(container.querySelector('[data-testid="controlled-nodes-team-chip-team-1"]')?.textContent).toContain('1');
+    expect(container.querySelector('[data-testid="controlled-nodes-team-chip-team-2"]')?.textContent).toContain('1');
+    expect(container.querySelector('[data-testid="controlled-nodes-machine-pick"]')).toBeNull();
   });
 });

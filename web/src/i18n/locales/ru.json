@@ -3283,7 +3283,15 @@
     "team_error_self_add_denied": "Вы уже в этой группе.",
     "team_error_group_manage_denied": "Вы не управляете этой группой.",
     "team_error_desk_membership_required": "Этого человека нельзя добавить.",
-    "confirm_again": "Точно?"
+    "confirm_again": "Точно?",
+    "group_rename": "Переименовать",
+    "group_rename_placeholder": "Новое имя для {{name}}",
+    "group_delete": "Удалить группу",
+    "group_delete_blocked": "Сначала уберите из группы все машины ({{count}}).",
+    "team_error_group_has_machines": "В группе ещё есть машины. Сначала уберите их.",
+    "team_error_group_owner_required": "Удалить группу может только владелец.",
+    "team_error_group_name_required": "Введите имя.",
+    "team_error_group_name_too_long": "Слишком длинное имя."
   },
   "peerAuditQuick": {
     "iconLabel": "Пир-аудит",

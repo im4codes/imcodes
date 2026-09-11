@@ -3,7 +3,9 @@ import { useTranslation } from 'react-i18next';
 import {
   ApiError,
   addTeamMember,
-  bindMachineToTeam,
+  deleteTeam,
+  renameTeam,
+  setMachineGroupMembership,
   createTeam,
   getTeam,
   listTeams,
@@ -14,6 +16,7 @@ import {
 } from '../api.js';
 import type { MachineListItem } from '../api/machines.js';
 import { ConfirmButton } from './ConfirmButton.js';
+import { machineIsInGroup } from '../machine-grouping.js';
 
 /**
  * Teams: make one, put people in it, put machines in it.
@@ -54,6 +57,10 @@ export function TeamManagementPanel({
       'self_add_denied',
       'group_manage_denied',
       'desk_membership_required',
+      'group_has_machines',
+      'group_owner_required',
+      'group_name_required',
+      'group_name_too_long',
     ].includes(code);
     setError(known
       ? t(`controlled_nodes.team_error_${code}`)
@@ -118,13 +125,30 @@ export function TeamManagementPanel({
 
   const canManage = detail?.myRole === 'owner' || detail?.myRole === 'admin';
   const isOwner = detail?.myRole === 'owner';
-  const groupMachines = machines.filter((machine) => machine.teamId === selectedId);
-  // Only your own machines can be filed. Putting someone else's into your group
-  // is not filing it, it is taking it.
+  const groupMachines = machines.filter((machine) => machineIsInGroup(machine, selectedId));
+  // Only your own machines can be filed, and only the ones not already here. A
+  // machine can be in several groups at once, so being in another one does not
+  // exclude it from this list.
   const addableMachines = machines.filter(
-    (machine) => machine.accessRole === 'owner' && machine.teamId !== selectedId,
+    (machine) => machine.accessRole === 'owner' && !machineIsInGroup(machine, selectedId),
   );
   const [machineToAdd, setMachineToAdd] = useState('');
+  const [renameTo, setRenameTo] = useState('');
+
+  const onRename = () => run(async () => {
+    const trimmed = renameTo.trim();
+    if (!trimmed || !selectedId) return;
+    await renameTeam(selectedId, trimmed);
+    setRenameTo('');
+    await loadTeams();
+  });
+
+  const onDelete = () => run(async () => {
+    if (!selectedId) return;
+    await deleteTeam(selectedId);
+    setSelectedId('');
+    await loadTeams();
+  });
   const memberLabel = (member: TeamDetail['members'][number]): string =>
     member.username || member.display_name || member.user_id;
 
@@ -172,13 +196,58 @@ export function TeamManagementPanel({
                   {/* The count is what makes one chip different from another
                       before you click it. */}
                   <span class="controlled-nodes-team-chip-count">
-                    {machines.filter((machine) => machine.teamId === team.id).length}
+                    {machines.filter((machine) => machineIsInGroup(machine, team.id)).length}
                   </span>
                 </button>
               ))}
             </div>
 
             {detail && (
+              <>
+              <div class="controlled-nodes-team-header">
+                {canManage && (
+                  <div class="controlled-nodes-team-create">
+                    <input
+                      class="controlled-nodes-input"
+                      type="text"
+                      data-testid="controlled-nodes-group-rename"
+                      value={renameTo}
+                      placeholder={t('controlled_nodes.group_rename_placeholder', { name: detail.name })}
+                      onInput={(event) => setRenameTo(event.currentTarget.value)}
+                      onKeyDown={(event) => { if (event.key === 'Enter') onRename(); }}
+                    />
+                    <button
+                      type="button"
+                      class="controlled-nodes-action-btn"
+                      data-testid="controlled-nodes-group-rename-save"
+                      disabled={busy || !renameTo.trim()}
+                      onClick={onRename}
+                    >{t('controlled_nodes.group_rename')}</button>
+                  </div>
+                )}
+                {/* Only the owner deletes, and only an empty group. Disabled
+                    with the reason on it rather than clickable and then
+                    refused: the machines have to come out first, and that is
+                    something to be told before trying, not after. */}
+                {isOwner && (
+                  groupMachines.length > 0
+                    ? (
+                      <p class="controlled-nodes-muted" data-testid="controlled-nodes-group-delete-blocked">
+                        {t('controlled_nodes.group_delete_blocked', { count: groupMachines.length })}
+                      </p>
+                    )
+                    : (
+                      <ConfirmButton
+                        className="controlled-nodes-danger-btn"
+                        testId="controlled-nodes-group-delete"
+                        disabled={busy}
+                        label={t('controlled_nodes.group_delete')}
+                        confirmLabel={t('controlled_nodes.confirm_again')}
+                        onConfirm={onDelete}
+                      />
+                    )
+                )}
+              </div>
               <div class="controlled-nodes-team-detail">
                 <div class="controlled-nodes-team-block">
                   <h4>{t('controlled_nodes.team_members')}</h4>
@@ -274,7 +343,7 @@ export function TeamManagementPanel({
                                 label={t('controlled_nodes.team_machine_remove')}
                                 confirmLabel={t('controlled_nodes.confirm_again')}
                                 onConfirm={() => void run(async () => {
-                                  await bindMachineToTeam(machine.serverId, null);
+                                  await setMachineGroupMembership(machine.serverId, selectedId, false);
                                   await onMachinesChanged();
                                 })}
                               />
@@ -298,7 +367,9 @@ export function TeamManagementPanel({
                         <option value="">{t('controlled_nodes.team_machine_pick')}</option>
                         {addableMachines.map((machine) => (
                           <option key={machine.serverId} value={machine.serverId}>
-                            {machine.teamName ? `${machine.displayName} · ${machine.teamName}` : machine.displayName}
+                            {(machine.teamNames ?? []).length > 0
+                              ? `${machine.displayName} · ${(machine.teamNames ?? []).join(', ')}`
+                              : machine.displayName}
                           </option>
                         ))}
                       </select>
@@ -312,7 +383,7 @@ export function TeamManagementPanel({
                         label={t('controlled_nodes.team_machine_add')}
                         confirmLabel={t('controlled_nodes.confirm_again')}
                         onConfirm={() => void run(async () => {
-                          await bindMachineToTeam(machineToAdd, selectedId);
+                          await setMachineGroupMembership(machineToAdd, selectedId, true);
                           setMachineToAdd('');
                           await onMachinesChanged();
                         })}
@@ -321,6 +392,7 @@ export function TeamManagementPanel({
                   )}
                 </div>
               </div>
+              </>
             )}
           </>
         )}

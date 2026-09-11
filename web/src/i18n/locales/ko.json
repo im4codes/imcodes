@@ -3283,7 +3283,15 @@
     "team_error_self_add_denied": "이미 이 그룹에 있습니다.",
     "team_error_group_manage_denied": "이 그룹을 관리할 권한이 없습니다.",
     "team_error_desk_membership_required": "그 사람은 이 그룹에 들어올 수 없습니다.",
-    "confirm_again": "확인?"
+    "confirm_again": "확인?",
+    "group_rename": "이름 바꾸기",
+    "group_rename_placeholder": "{{name}}의 새 이름",
+    "group_delete": "그룹 삭제",
+    "group_delete_blocked": "머신 {{count}}대를 모두 뺀 뒤에 삭제할 수 있습니다.",
+    "team_error_group_has_machines": "이 그룹에 아직 머신이 있습니다. 먼저 빼세요.",
+    "team_error_group_owner_required": "그룹 소유자만 삭제할 수 있습니다.",
+    "team_error_group_name_required": "이름을 입력하세요.",
+    "team_error_group_name_too_long": "이름이 너무 깁니다."
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

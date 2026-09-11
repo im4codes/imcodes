@@ -251,7 +251,7 @@ export type MachineListItem = MachineSummary & { nodeId: string; refName: string
 
 const MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
   'serverId', 'nodeId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs', 'accessRole',
-  'daemonVersion', 'updateAvailable', 'autoUnlockConfigured', 'teamId', 'teamName',
+  'daemonVersion', 'updateAvailable', 'autoUnlockConfigured', 'teamIds', 'teamNames',
 ]);
 
 /** Strict per-item validation: known keys only, controlled role, canonical OS (or absent). */
@@ -274,10 +274,11 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
   if (m.daemonVersion !== undefined && typeof m.daemonVersion !== 'string') return false;
   if (m.updateAvailable !== undefined && typeof m.updateAvailable !== 'boolean') return false;
   if (m.autoUnlockConfigured !== undefined && typeof m.autoUnlockConfigured !== 'boolean') return false;
-  // Which team the machine is shared with. Presentation only; access is always
+  // Which groups the machine is in. Presentation only; access is always
   // resolved server-side per request, never from anything this node was told.
-  if (m.teamId !== undefined && typeof m.teamId !== 'string') return false;
-  if (m.teamName !== undefined && typeof m.teamName !== 'string') return false;
+  const groupList = (value: unknown): boolean =>
+    value === undefined || (Array.isArray(value) && value.every((entry) => typeof entry === 'string'));
+  if (!groupList(m.teamIds) || !groupList(m.teamNames)) return false;
   return true;
 }
 

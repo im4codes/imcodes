@@ -6,6 +6,9 @@ import type { Database } from '../db/client.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 
+/** A group name is a label, never a paragraph. */
+const GROUP_NAME_MAX_CHARS = 120;
+
 export const teamRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
 // GET /api/team — list teams accessible to the authenticated user
@@ -150,6 +153,68 @@ teamRoutes.post('/:id/join', requireAuth(), async (c) => {
   }
 
   return c.json({ error: 'token required' }, 400);
+});
+
+// PATCH /api/team/:id — rename a group (owner/admin)
+teamRoutes.patch('/:id', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const teamId = c.req.param('id');
+  const body = await c.req.json<{ name?: string }>().catch(() => null);
+  const name = body?.name?.trim();
+  if (!name) return c.json({ error: 'group_name_required' }, 400);
+  if (name.length > GROUP_NAME_MAX_CHARS) return c.json({ error: 'group_name_too_long' }, 400);
+
+  const manager = await c.env.DB.queryOne<{ role: string }>(
+    "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')",
+    [teamId, userId],
+  );
+  if (!manager) return c.json({ error: 'group_manage_denied' }, 403);
+
+  const renamed = await c.env.DB.queryOne<{ id: string }>(
+    'UPDATE teams SET name = $2 WHERE id = $1 RETURNING id',
+    [teamId, name],
+  );
+  if (!renamed) return c.json({ error: 'not_found' }, 404);
+
+  await logAudit({ userId, action: 'team.rename', details: { teamId, name } }, c.env.DB);
+  return c.json({ ok: true, id: teamId, name });
+});
+
+// DELETE /api/team/:id — delete an empty group (owner only)
+//
+// Refused while any machine is still in it.
+//
+// Membership does cascade now, so nothing would dangle -- but a group being
+// deleted is exactly when its machines silently lose the access it granted, and
+// the owner is the only one who can tell whether that is intended. Emptying it
+// first makes that a decision rather than a side effect, one machine at a time.
+teamRoutes.delete('/:id', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const teamId = c.req.param('id');
+
+  // Owner only. An admin manages who is in a group; destroying the group is not
+  // the same act, and it cannot be undone by the person it was taken from.
+  const owner = await c.env.DB.queryOne<{ role: string }>(
+    "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role = 'owner'",
+    [teamId, userId],
+  );
+  if (!owner) return c.json({ error: 'group_owner_required' }, 403);
+
+  const machines = await c.env.DB.query<{ server_id: string }>(
+    `SELECT mg.server_id FROM machine_groups mg
+       JOIN servers s ON s.id = mg.server_id AND s.revoked_at IS NULL
+      WHERE mg.team_id = $1`,
+    [teamId],
+  );
+  if (machines.length > 0) {
+    return c.json({ error: 'group_has_machines', machineCount: machines.length }, 409);
+  }
+
+  // Members and invites carry ON DELETE CASCADE, so they go with it. Machines
+  // deliberately do not, which is what the check above exists to cover.
+  await c.env.DB.execute('DELETE FROM teams WHERE id = $1', [teamId]);
+  await logAudit({ userId, action: 'team.delete', details: { teamId } }, c.env.DB);
+  return c.json({ ok: true });
 });
 
 // POST /api/team/:id/member — add someone by username (owner/admin only)

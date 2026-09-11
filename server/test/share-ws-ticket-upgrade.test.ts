@@ -57,8 +57,8 @@ function makeDb(serverId: string, options: ShareDbOptions = {}): Database {
       if (normalized.includes('select exists (select 1 from sub_sessions where server_id = $1 and id = $2')) {
         return { exists: params[0] === serverId && existingSubSessions.has(String(params[1])) } as T;
       }
-      if (normalized.includes('select team_id, user_id from servers where id = $1')) {
-        return { team_id: null, user_id: 'member-user' } as T;
+      if (normalized.includes('select user_id from servers where id = $1')) {
+        return { user_id: 'member-user' } as T;
       }
       if (normalized.includes('select node_role from servers where id = $1 and revoked_at is null')) {
         return { node_role: 'full' } as T;

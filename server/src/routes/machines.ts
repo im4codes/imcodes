@@ -60,8 +60,8 @@ export const machinesRoutes = new Hono<{
 interface ControlledRow {
   id: string;
   node_id: string | null;
-  team_id: string | null;
-  team_name: string | null;
+  team_ids: string[] | null;
+  team_names: string[] | null;
   ref_name: string | null;
   display_name: string | null;
   status: string | null;
@@ -129,10 +129,16 @@ export async function listControlledMachines(
       ...(typeof r.remote_desktop_host_id === 'string' && r.remote_desktop_host_id
         ? { remoteDesktopHostId: r.remote_desktop_host_id }
         : {}),
-      // Which team this machine is shared with, so the owner can see and change
-      // it without a second round trip per machine.
-      ...(typeof r.team_id === 'string' && r.team_id
-        ? { teamId: r.team_id, ...(r.team_name ? { teamName: r.team_name } : {}) }
+      // Every group this machine is in, so the owner can see and change them
+      // without a round trip per machine. Omitted when it is in none, so "no
+      // groups" and "an empty group list" stay the same absent value.
+      ...(Array.isArray(r.team_ids) && r.team_ids.length > 0
+        ? {
+          teamIds: r.team_ids,
+          ...(Array.isArray(r.team_names) && r.team_names.length === r.team_ids.length
+            ? { teamNames: r.team_names }
+            : {}),
+        }
         : {}),
       ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
@@ -251,39 +257,40 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
 // distinction instead of carving an exception into the contract, and matches
 // the repository convention of `?serverId=` for new routes.
 //
-// This is the only way a controlled node acquires a Desk, and it is deliberately
-// explicit. Nothing infers a Desk from the owner's memberships: an owner in
-// exactly one team today may be in two tomorrow, so a "obvious default" would
-// silently decide an authorization boundary. Every ambiguous or unauthorized
-// shape below fails closed and leaves team_id untouched.
+// This is the only way a machine joins or leaves a group, and it is deliberately
+// explicit. Nothing infers a group from the owner's memberships: a "obvious
+// default" would silently decide who can reach the machine. Every ambiguous or
+// unauthorized shape below fails closed and changes no membership.
 machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.query('serverId')?.trim();
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const body = await c.req.json().catch(() => null);
-  // `null` means take the machine out of whatever team it is in. A key that is
-  // absent entirely is still rejected: removing a machine from a group is an
-  // action someone takes on purpose, not something a malformed body should do.
-  const parsed = z.object({ teamId: z.string().trim().min(1).nullable() }).safeParse(body);
+  // One group at a time, joined or left explicitly. A machine can be in several
+  // groups, so there is no "the" group to set: `{ teamId, member: false }` takes
+  // it out of that one and leaves the rest alone. Both keys are required --
+  // changing who can reach a machine is not something a malformed body should
+  // be able to do by omission.
+  const parsed = z.object({
+    teamId: z.string().trim().min(1),
+    member: z.boolean(),
+  }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body', reason: 'desk_required' }, 400);
-  const teamId = parsed.data.teamId;
+  const { teamId, member } = parsed.data;
 
-  // Only the machine's own owner may bind it, and only while it is live.
-  const machine = await c.env.DB.queryOne<{ team_id: string | null }>(
-    `SELECT team_id FROM servers
+  // Only the machine's own owner may file it, and only while it is live.
+  const machine = await c.env.DB.queryOne<{ id: string }>(
+    `SELECT id FROM servers
       WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
     [serverId, userId, NODE_ROLE.CONTROLLED],
   );
   if (!machine) return c.json({ error: 'not_found' }, 404);
 
-  // The owner must currently hold a managing role in the target Desk. An
-  // unknown Desk and a Desk the owner merely belongs to as a plain member are
-  // both refused here, and neither is distinguished in the response.
-  // Putting a machine INTO a team requires managing that team. Taking it out
+  // Putting a machine INTO a group requires managing that group. Taking it out
   // requires nothing beyond owning the machine, which is checked above --
-  // otherwise an owner removed from the team could never get their own machine
-  // back.
-  if (teamId !== null) {
+  // otherwise an owner removed from the group could never get their own machine
+  // back out of it.
+  if (member) {
     const membership = await c.env.DB.queryOne<{ role: string }>(
       `SELECT tm.role FROM team_members tm
          JOIN teams t ON t.id = tm.team_id
@@ -291,28 +298,26 @@ machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
       [teamId, userId],
     );
     if (!membership) return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
+    await c.env.DB.execute(
+      `INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1, $2, $3)
+       ON CONFLICT (server_id, team_id) DO NOTHING`,
+      [serverId, teamId, Date.now()],
+    );
+  } else {
+    await c.env.DB.execute(
+      'DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2',
+      [serverId, teamId],
+    );
   }
-
-  // Moving between teams is allowed and is a real move: the previous team's
-  // members lose access on their next request, because membership is read at
-  // admission rather than copied into a grant. Refusing it instead meant a
-  // machine filed under the wrong group could only be fixed by reinstalling.
-  const bound = await c.env.DB.queryOne<{ id: string }>(
-    `UPDATE servers SET team_id = $3
-      WHERE id = $1 AND user_id = $2 AND node_role = $4 AND revoked_at IS NULL
-      RETURNING id`,
-    [serverId, userId, teamId, NODE_ROLE.CONTROLLED],
-  );
-  if (!bound) return c.json({ error: 'not_found' }, 404);
 
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({
     userId,
-    action: 'machine.desk_bind',
+    action: member ? 'machine.group_add' : 'machine.group_remove',
     ip,
-    details: { serverId, teamId, previousTeamId: machine.team_id },
+    details: { serverId, teamId },
   }, c.env.DB).catch(() => {});
-  return c.json({ ok: true, teamId });
+  return c.json({ ok: true, teamId, member });
 });
 
 // POST /api/machines/:serverId/revoke — operator kill-switch (10.3).

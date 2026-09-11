@@ -268,8 +268,8 @@ export async function resolveServerRole(
   serverId: string,
   userId: string,
 ): Promise<ServerRole> {
-  const server = await db.queryOne<{ team_id: string | null; user_id: string }>(
-    'SELECT team_id, user_id FROM servers WHERE id = $1',
+  const server = await db.queryOne<{ user_id: string }>(
+    'SELECT user_id FROM servers WHERE id = $1',
     [serverId],
   );
 
@@ -278,17 +278,20 @@ export async function resolveServerRole(
   // Direct owner
   if (server.user_id === userId) return 'owner';
 
-  // Team membership
-  if (server.team_id) {
-    const member = await db.queryOne<{ role: string }>(
-      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
-      [server.team_id, userId],
-    );
-    if (member) {
-      if (member.role === 'owner') return 'admin'; // team owner → admin on server
-      if (member.role === 'admin') return 'admin';
-      return 'member';
-    }
+  // Through any group this machine is in. A machine can be in several, so the
+  // strongest role across all of them decides -- being a plain member of one
+  // group must not cancel out running another that holds the same machine.
+  const member = await db.queryOne<{ role: string }>(
+    `SELECT tm.role FROM machine_groups mg
+       JOIN team_members tm ON tm.team_id = mg.team_id
+      WHERE mg.server_id = $1 AND tm.user_id = $2
+      ORDER BY CASE tm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+      LIMIT 1`,
+    [serverId, userId],
+  );
+  if (member) {
+    if (member.role === 'owner' || member.role === 'admin') return 'admin';
+    return 'member';
   }
 
   return 'none';
