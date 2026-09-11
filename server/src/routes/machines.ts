@@ -19,7 +19,6 @@ import {
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
 import {
-  controlledDeskManagementFence,
   listAccessibleControlledMachines,
   resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
@@ -61,6 +60,8 @@ export const machinesRoutes = new Hono<{
 interface ControlledRow {
   id: string;
   node_id: string | null;
+  team_id: string | null;
+  team_name: string | null;
   ref_name: string | null;
   display_name: string | null;
   status: string | null;
@@ -127,6 +128,11 @@ export async function listControlledMachines(
       accessRole: r.access_role,
       ...(typeof r.remote_desktop_host_id === 'string' && r.remote_desktop_host_id
         ? { remoteDesktopHostId: r.remote_desktop_host_id }
+        : {}),
+      // Which team this machine is shared with, so the owner can see and change
+      // it without a second round trip per machine.
+      ...(typeof r.team_id === 'string' && r.team_id
+        ? { teamId: r.team_id, ...(r.team_name ? { teamName: r.team_name } : {}) }
         : {}),
       ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
@@ -255,17 +261,17 @@ machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
   const serverId = c.req.query('serverId')?.trim();
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const body = await c.req.json().catch(() => null);
-  const parsed = z.object({ teamId: z.string().trim().min(1) }).safeParse(body);
-  // A missing or blank Desk is rejected rather than defaulted.
+  // `null` means take the machine out of whatever team it is in. A key that is
+  // absent entirely is still rejected: removing a machine from a group is an
+  // action someone takes on purpose, not something a malformed body should do.
+  const parsed = z.object({ teamId: z.string().trim().min(1).nullable() }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body', reason: 'desk_required' }, 400);
   const teamId = parsed.data.teamId;
 
   // Only the machine's own owner may bind it, and only while it is live.
   const machine = await c.env.DB.queryOne<{ team_id: string | null }>(
     `SELECT team_id FROM servers
-      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL
-        -- Live Desk authority: a removed owner manages nothing (R5 audit P0).
-        AND ${controlledDeskManagementFence('servers', '$2')}`,
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
     [serverId, userId, NODE_ROLE.CONTROLLED],
   );
   if (!machine) return c.json({ error: 'not_found' }, 404);
@@ -273,29 +279,31 @@ machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
   // The owner must currently hold a managing role in the target Desk. An
   // unknown Desk and a Desk the owner merely belongs to as a plain member are
   // both refused here, and neither is distinguished in the response.
-  const membership = await c.env.DB.queryOne<{ role: string }>(
-    `SELECT tm.role FROM team_members tm
-       JOIN teams t ON t.id = tm.team_id
-      WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
-    [teamId, userId],
-  );
-  if (!membership) return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
-
-  // Rebinding is a move between authorization domains, never a silent update:
-  // it would strand grants made under the previous Desk. Same-Desk repeats stay
-  // idempotent so a retried install does not fail.
-  if (machine.team_id && machine.team_id !== teamId) {
-    return c.json({ error: 'conflict', reason: 'desk_already_bound' }, 409);
+  // Putting a machine INTO a team requires managing that team. Taking it out
+  // requires nothing beyond owning the machine, which is checked above --
+  // otherwise an owner removed from the team could never get their own machine
+  // back.
+  if (teamId !== null) {
+    const membership = await c.env.DB.queryOne<{ role: string }>(
+      `SELECT tm.role FROM team_members tm
+         JOIN teams t ON t.id = tm.team_id
+        WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
+      [teamId, userId],
+    );
+    if (!membership) return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
   }
 
+  // Moving between teams is allowed and is a real move: the previous team's
+  // members lose access on their next request, because membership is read at
+  // admission rather than copied into a grant. Refusing it instead meant a
+  // machine filed under the wrong group could only be fixed by reinstalling.
   const bound = await c.env.DB.queryOne<{ id: string }>(
     `UPDATE servers SET team_id = $3
       WHERE id = $1 AND user_id = $2 AND node_role = $4 AND revoked_at IS NULL
-        AND (team_id IS NULL OR team_id = $3)
       RETURNING id`,
     [serverId, userId, teamId, NODE_ROLE.CONTROLLED],
   );
-  if (!bound) return c.json({ error: 'conflict', reason: 'desk_already_bound' }, 409);
+  if (!bound) return c.json({ error: 'not_found' }, 404);
 
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({

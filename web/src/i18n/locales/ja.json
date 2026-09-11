@@ -3243,7 +3243,16 @@
     "desk_label": "AI Desk",
     "desk_choose": "Desk を選択…",
     "desk_selected": "この Desk に追加されます：{{desk}}",
-    "desk_required": "インストール前に、このコンピューターが参加する AI Desk を選択してください。"
+    "desk_required": "インストール前に、このコンピューターが参加する AI Desk を選択してください。",
+    "team_section_title": "チーム",
+    "team_section_hint": "チームは複数のマシンを他の人と共有するためのものです。インストールにも、1台を1人に共有するのにも必要ありません。",
+    "team_create_placeholder": "チーム名",
+    "team_create": "チームを作成",
+    "team_invite": "招待リンクをコピー",
+    "team_invite_copied": "招待リンクをコピーしました",
+    "team_invite_failed": "招待リンクをコピーできませんでした。",
+    "team_label": "チーム",
+    "team_none": "チームなし"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

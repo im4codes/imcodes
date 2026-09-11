@@ -71,6 +71,8 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
 const TEST_DESK = { id: 'desk-1', name: 'Ops Desk', role: 'owner' as const };
 const listMintableDesks = vi.fn(async () => [TEST_DESK]);
 const createTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const }));
+const createTeamInvite = vi.fn(async (..._a: unknown[]) => ({ token: 'invite-token', expiresAt: 0 }));
+const bindMachineToTeam = vi.fn(async (..._a: unknown[]) => {});
 
 const downloadControlledNodeExecutable = vi.fn(async () => ({
   version: 2 as const,
@@ -118,6 +120,8 @@ vi.mock('../src/api.js', async (importOriginal) => {
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
     listMintableDesks: () => listMintableDesks(),
     createTeam: (...a: unknown[]) => createTeam(...a),
+    createTeamInvite: (...a: unknown[]) => createTeamInvite(...a),
+    bindMachineToTeam: (...a: unknown[]) => bindMachineToTeam(...a),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
   };
@@ -156,6 +160,8 @@ function setViewportSize(width: number, height: number): void {
 beforeEach(() => {
   listMintableDesks.mockResolvedValue([TEST_DESK]);
   createTeam.mockClear();
+  createTeamInvite.mockClear();
+  bindMachineToTeam.mockClear();
   createTeam.mockResolvedValue({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const });
 });
 
@@ -1213,3 +1219,67 @@ describe('ControlledNodesPanel — copy install command', () => {
   });
 });
 
+
+describe('ControlledNodesPanel team sharing', () => {
+  it('files an owned machine under a team and takes it back out', async () => {
+    // The endpoint has existed since the feature was built and had no caller
+    // anywhere in the web app, so there was no way to share a group of machines
+    // at all.
+    listMintableDesks.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    machines = [{
+      serverId: 'srv-1', nodeId: '1234567890', refName: 'ops-1', displayName: 'Ops 1',
+      online: true, execEnabled: true, accessRole: 'owner' as const,
+    }];
+    const { container } = render(<ControlledNodesPanel />);
+    const select = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-machine-team-srv-1"]') as HTMLSelectElement | null;
+      if (!el) throw new Error('machine team select not rendered');
+      return el;
+    });
+    expect(select.value, 'a machine starts in no team').toBe('');
+
+    await act(async () => { fireEvent.input(select, { target: { value: 'team-1' } }); });
+    expect(bindMachineToTeam).toHaveBeenCalledWith('srv-1', 'team-1');
+
+    await act(async () => { fireEvent.input(select, { target: { value: '' } }); });
+    // null, not '': taking a machine out is its own instruction, and the server
+    // rejects a blank one so a malformed body cannot unfile a machine.
+    expect(bindMachineToTeam).toHaveBeenLastCalledWith('srv-1', null);
+  });
+
+  it('does not offer the team control on a machine someone else owns', async () => {
+    listMintableDesks.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    machines = [{
+      serverId: 'srv-2', nodeId: '1234567891', refName: 'shared', displayName: 'Shared',
+      online: true, execEnabled: true, accessRole: 'participant' as const, teamName: 'Ops',
+    }];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Shared'));
+    expect(container.querySelector('[data-testid="controlled-nodes-machine-team-srv-2"]')).toBeNull();
+  });
+
+  it('creates a team and copies an invite link for it', async () => {
+    listMintableDesks.mockResolvedValue([]);
+    const { container } = render(<ControlledNodesPanel />);
+    const input = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-team-name"]') as HTMLInputElement | null;
+      if (!el) throw new Error('team name input not rendered');
+      return el;
+    });
+    const create = container.querySelector('[data-testid="controlled-nodes-team-create"]') as HTMLButtonElement;
+    expect(create.disabled, 'an unnamed team is not creatable').toBe(true);
+
+    await act(async () => { fireEvent.input(input, { target: { value: 'Ops' } }); });
+    listMintableDesks.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    await act(async () => { fireEvent.click(create); });
+    expect(createTeam).toHaveBeenCalledWith('Ops');
+
+    const invite = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-team-invite-team-1"]') as HTMLButtonElement | null;
+      if (!el) throw new Error('invite action not rendered');
+      return el;
+    });
+    await act(async () => { fireEvent.click(invite); });
+    expect(createTeamInvite).toHaveBeenCalledWith('team-1', 'member');
+  });
+});

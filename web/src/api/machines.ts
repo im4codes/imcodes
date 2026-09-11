@@ -96,6 +96,12 @@ export interface MachineListItem {
    * steers here rather than opening a second session on the same desktop.
    */
   hostServerId?: string;
+  /**
+   * The team this machine is shared with, when its owner put it in one. Absent
+   * means the machine is the owner's alone -- which is how every machine starts.
+   */
+  teamId?: string;
+  teamName?: string;
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -381,6 +387,21 @@ export async function listAvailableExecutables(): Promise<ControlledNodeAvailabi
 export async function listAvailableExecutableOses(): Promise<string[]> {
   const { artifacts } = await listAvailableExecutables();
   return [...new Set(artifacts.map((a) => a.os))];
+}
+
+/**
+ * Put a machine in a team, or take it out of one.
+ *
+ * `null` removes it, which is the owner's alone to do: a machine belongs to
+ * whoever installed it, so losing team membership must never leave them unable
+ * to get it back.
+ */
+export async function bindMachineToTeam(serverId: string, teamId: string | null): Promise<void> {
+  await apiFetch(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ teamId }),
+  });
 }
 
 /** Mint a one-time download ticket (POST /api/enroll/v2/ticket). */

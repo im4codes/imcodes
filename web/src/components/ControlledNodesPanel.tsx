@@ -6,6 +6,10 @@ import {
   createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
+  bindMachineToTeam,
+  createTeam,
+  createTeamInvite,
+  listMintableDesks,
   revokeControlledNodeRemoteInstallLink,
 } from '../api.js';
 import {
@@ -22,6 +26,7 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
+import type { TeamSummary } from '../api.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { MACHINE_IDENTITY_UNAVAILABLE, normalizeMachineDisplayName } from '@shared/machine-reference.js';
@@ -133,6 +138,64 @@ export function ControlledNodesPanel({
 
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  // Teams this user can file a machine under. Only owner/admin memberships:
+  // the server refuses the rest, so offering them would be a button that fails.
+  const [teams, setTeams] = useState<TeamSummary[]>([]);
+  const [teamName, setTeamName] = useState('');
+  const [teamBusy, setTeamBusy] = useState(false);
+  const [teamError, setTeamError] = useState<string | null>(null);
+  const [invitedTeamId, setInvitedTeamId] = useState<string | null>(null);
+
+  const loadTeams = useCallback(async () => {
+    try {
+      setTeams(await listMintableDesks());
+    } catch {
+      setTeams([]);
+    }
+  }, []);
+
+  useEffect(() => { void loadTeams(); }, [loadTeams]);
+
+  const onCreateTeam = async () => {
+    const name = teamName.trim();
+    if (!name || teamBusy) return;
+    setTeamError(null);
+    setTeamBusy(true);
+    try {
+      await createTeam(name);
+      setTeamName('');
+      await loadTeams();
+    } catch (error) {
+      setTeamError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setTeamBusy(false);
+    }
+  };
+
+  const onInviteToTeam = async (team: TeamSummary) => {
+    setTeamError(null);
+    try {
+      const invite = await createTeamInvite(team.id, 'member');
+      const url = `${window.location.origin}/team/join/${encodeURIComponent(invite.token)}`;
+      copyToClipboard(url, () => {
+        setInvitedTeamId(team.id);
+        window.setTimeout(() => setInvitedTeamId((current) => (current === team.id ? null : current)), 2000);
+      }, () => setTeamError(t('controlled_nodes.team_invite_failed')));
+    } catch (error) {
+      setTeamError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const onMachineTeamChange = async (serverId: string, teamId: string) => {
+    setTeamError(null);
+    try {
+      await bindMachineToTeam(serverId, teamId || null);
+      await refetch();
+    } catch (error) {
+      setTeamError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const [linkingKey, setLinkingKey] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -773,6 +836,24 @@ export function ControlledNodesPanel({
                     )
                     : <span title={t('controlled_nodes.version_unknown')}>{t('controlled_nodes.version_unknown')}</span>}
                   <span>{t('controlled_nodes.access_role', { role: t(`share.role.${machineAccessRole(m)}`) })}</span>
+                  {machineAccessRole(m) === 'owner' && teams.length > 0 && (
+                    <label class="controlled-nodes-machine-team">
+                      {t('controlled_nodes.team_label')}
+                      <select
+                        data-testid={`controlled-nodes-machine-team-${m.serverId}`}
+                        value={m.teamId ?? ''}
+                        onInput={(event) => void onMachineTeamChange(m.serverId, event.currentTarget.value)}
+                      >
+                        <option value="">{t('controlled_nodes.team_none')}</option>
+                        {teams.map((team) => (
+                          <option key={team.id} value={team.id}>{team.name}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  {machineAccessRole(m) !== 'owner' && m.teamName && (
+                    <span class="controlled-nodes-machine-team-name">{m.teamName}</span>
+                  )}
                   {m.autoUnlockConfigured && (
                     <span
                       class="controlled-nodes-auto-unlock-badge"
@@ -829,6 +910,52 @@ export function ControlledNodesPanel({
       </section>
 
       <VerificationMachinesSection machines={machines} projectKey={projectKey} />
+
+      {/* Teams are how a set of machines is shared with other people. Nothing
+          here is required to install or to share one machine with one person --
+          those are separate, and neither goes through this. */}
+      <section class="controlled-nodes-section controlled-nodes-team-section">
+        <div class="controlled-nodes-section-heading">
+          <span class="controlled-nodes-section-index">02</span>
+          <h3>{t('controlled_nodes.team_section_title')}</h3>
+        </div>
+        <p class="controlled-nodes-muted">{t('controlled_nodes.team_section_hint')}</p>
+        <div class="controlled-nodes-team-create">
+          <input
+            type="text"
+            data-testid="controlled-nodes-team-name"
+            value={teamName}
+            placeholder={t('controlled_nodes.team_create_placeholder')}
+            onInput={(event) => setTeamName(event.currentTarget.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter') void onCreateTeam(); }}
+          />
+          <button
+            type="button"
+            data-testid="controlled-nodes-team-create"
+            disabled={teamBusy || !teamName.trim()}
+            onClick={() => void onCreateTeam()}
+          >{t('controlled_nodes.team_create')}</button>
+        </div>
+        {teamError && <p class="controlled-nodes-error" role="alert">{teamError}</p>}
+        {teams.length > 0 && (
+          <ul class="controlled-nodes-team-list">
+            {teams.map((team) => (
+              <li key={team.id}>
+                <span class="controlled-nodes-team-name">{team.name}</span>
+                <button
+                  type="button"
+                  data-testid={`controlled-nodes-team-invite-${team.id}`}
+                  onClick={() => void onInviteToTeam(team)}
+                >
+                  {t(invitedTeamId === team.id
+                    ? 'controlled_nodes.team_invite_copied'
+                    : 'controlled_nodes.team_invite')}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <section class="controlled-nodes-section controlled-nodes-download-section">
         <div class="controlled-nodes-section-heading">

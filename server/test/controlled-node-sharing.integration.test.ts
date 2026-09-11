@@ -163,7 +163,7 @@ async function joinDesk(teamId: string, userId: string, role = 'member') {
 }
 
 /** Bind through the authorized route, never by writing servers.team_id directly. */
-async function bindDesk(app: ReturnType<typeof buildApp>, actorId: string, serverId: string, teamId: string) {
+async function bindDesk(app: ReturnType<typeof buildApp>, actorId: string, serverId: string, teamId: string | null) {
   return app.request(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
     method: 'POST',
     headers: webAuth(actorId),
@@ -760,3 +760,75 @@ describe('controlled-node shared action admission', () => {
 // machine belongs to whoever installed it. Every combination of the two --
 // including the revocations that matter -- is specified in
 // machine-team-sharing.integration.test.ts.
+
+describe('putting a machine in a team, and taking it back out', () => {
+  it('moves between teams and out again, always at the owner s word', async () => {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    await createUser(db, ownerId);
+    const serverId = await controlledNode(ownerId);
+    const first = await createDesk(ownerId);
+    const second = await createDesk(ownerId);
+
+    expect((await bindDesk(app, ownerId, serverId, first)).status).toBe(200);
+    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
+      .toEqual({ team_id: first });
+
+    // Filing a machine under the wrong group used to be unfixable short of
+    // reinstalling it: rebinding answered 409 and there was no way out at all.
+    expect((await bindDesk(app, ownerId, serverId, second)).status).toBe(200);
+    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
+      .toEqual({ team_id: second });
+
+    expect((await bindDesk(app, ownerId, serverId, null)).status).toBe(200);
+    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
+      .toEqual({ team_id: null });
+  });
+
+  it('lets an owner removed from the team still take their machine back', async () => {
+    // Otherwise a team admin takes the machine hostage: remove the owner from
+    // the team and they can neither move it out nor manage its shares again.
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    const adminId = `admin-${hex(4)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, adminId)]);
+    const serverId = await controlledNode(ownerId);
+    const deskId = await createDesk(ownerId);
+    await joinDesk(deskId, adminId, 'admin');
+    expect((await bindDesk(app, ownerId, serverId, deskId)).status).toBe(200);
+
+    await db.execute('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [deskId, ownerId]);
+
+    expect((await bindDesk(app, ownerId, serverId, null)).status).toBe(200);
+    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
+      .toEqual({ team_id: null });
+  });
+
+  it('refuses a team the caller does not manage, and someone else s machine', async () => {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    const strangerId = `stranger-${hex(4)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, strangerId)]);
+    const serverId = await controlledNode(ownerId);
+    const foreignDesk = await createDesk(strangerId);
+    const ownDesk = await createDesk(ownerId);
+
+    // A team the owner is merely not in.
+    expect((await bindDesk(app, ownerId, serverId, foreignDesk)).status).toBe(403);
+    // A team that does not exist is refused rather than created.
+    expect((await bindDesk(app, ownerId, serverId, `desk-${hex(6)}`)).status).toBe(403);
+    // Someone else's machine, even into a team they do manage.
+    expect((await bindDesk(app, strangerId, serverId, foreignDesk)).status).toBe(404);
+    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
+      .toEqual({ team_id: null });
+
+    // And a blank body still does not silently unfile the machine.
+    expect((await bindDesk(app, ownerId, serverId, ownDesk)).status).toBe(200);
+    const malformed = await app.request(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
+      method: 'POST', headers: webAuth(ownerId), body: JSON.stringify({}),
+    });
+    expect(malformed.status).toBe(400);
+    expect(await db.queryOne('SELECT team_id FROM servers WHERE id = $1', [serverId]))
+      .toEqual({ team_id: ownDesk });
+  });
+});

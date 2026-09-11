@@ -27,6 +27,9 @@ export interface ControlledMachineAccessRow {
   host_server_id: string | null;
   /** Canonical physical-host identity for remote-desktop presentation/management. */
   remote_desktop_host_id: string | null;
+  /** The team this machine is shared with, if its owner put it in one. */
+  team_id: string | null;
+  team_name: string | null;
 }
 
 export type ControlledMachineOperatorAccessRow = ControlledMachineAccessRow & {
@@ -38,6 +41,7 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
          rdhe.host_id AS remote_desktop_host_id,
+         s.team_id, t.name AS team_name,
          CASE
            WHEN s.user_id = $1 THEN 'owner'
            -- An explicit per-machine grant wins over the team default, in both
@@ -51,6 +55,7 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
     FROM servers s
     LEFT JOIN remote_desktop_host_endpoints rdhe
       ON rdhe.server_id = s.id
+    LEFT JOIN teams t ON t.id = s.team_id
     -- Sharing one machine with one person, and sharing a group of machines with
     -- a team, are two separate grants. Either is sufficient on its own.
     --

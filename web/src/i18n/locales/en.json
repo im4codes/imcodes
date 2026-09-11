@@ -3244,7 +3244,16 @@
     "desk_label": "AI Desk",
     "desk_choose": "Choose a Desk…",
     "desk_selected": "Will be added to the Desk: {{desk}}",
-    "desk_required": "Choose which AI Desk this machine joins before installing."
+    "desk_required": "Choose which AI Desk this machine joins before installing.",
+    "team_section_title": "Teams",
+    "team_section_hint": "A team shares a set of machines with other people. Not needed to install, and not needed to share one machine with one person.",
+    "team_create_placeholder": "Team name",
+    "team_create": "Create team",
+    "team_invite": "Copy invite link",
+    "team_invite_copied": "Invite link copied",
+    "team_invite_failed": "Could not copy the invite link.",
+    "team_label": "Team",
+    "team_none": "Not in a team"
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

@@ -2,8 +2,6 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../env.js';
-import type { Database } from '../db/client.js';
-import { holdsControlledDeskAuthority } from '../share/machine-access.js';
 import { randomHex, signJwt } from '../security/crypto.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
@@ -162,17 +160,15 @@ async function requireShareManager(db: Env['DB'], serverId: string, userId: stri
   // personal root/SYSTEM-capable credential. Only its direct owner may grant,
   // change or revoke access to it.
   // A controlled node is a personal root/SYSTEM-capable credential, so only its
-  // direct owner manages grants -- AND only while they still hold authority in
-  // the Desk it is bound to. R5 audit P0: without the second half, an owner
-  // removed from the Desk could no longer see the machine yet could still
-  // create, change and revoke other people's access to it.
+  // direct owner manages grants. Sharing management stays OUTSIDE operator
+  // authority: a Participant must never be able to grant further access.
+  //
+  // There is deliberately no additional team test. It used to require the owner
+  // to still hold membership in the machine's team, which made a team admin
+  // able to take someone's machine hostage: remove the owner from the team and
+  // they can no longer grant, revoke, or move the machine out of it. A machine
+  // belongs to whoever installed it, and a team is a group they put it in.
   if (server.node_role === NODE_ROLE.CONTROLLED) {
-    // Sharing management stays OUTSIDE operator authority: a Participant must
-    // never be able to grant further access. Upstream pins that contract on the
-    // owner-only statement below, which is unchanged. The Desk fence is applied
-    // in addition, never instead: an owner removed from the machine's Desk also
-    // loses the ability to hand out access to it.
-    if (!await holdsControlledDeskAuthority(db as Database, serverId, userId)) return false;
     return server.user_id === userId;
   }
   const role = await resolveServerRole(db, serverId, userId);

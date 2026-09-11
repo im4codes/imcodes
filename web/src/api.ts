@@ -2175,6 +2175,12 @@ export async function updateSharedContextRuntimeConfig(serverId: string, config:
   });
 }
 
+/** Put a machine in a team, or take it out of one (`null`). */
+export async function bindMachineToTeam(serverId: string, teamId: string | null): Promise<void> {
+  const { bindMachineToTeam: bind } = await import('./api/machines.js');
+  return bind(serverId, teamId);
+}
+
 export async function createTeam(name: string): Promise<{ id: string; name: string; role: string }> {
   return apiFetch('/api/team', {
     method: 'POST',

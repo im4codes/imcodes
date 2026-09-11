@@ -3244,7 +3244,16 @@
     "desk_label": "AI Desk",
     "desk_choose": "请选择一个 Desk…",
     "desk_selected": "将加入这个 Desk：{{desk}}",
-    "desk_required": "安装前请先选择这台电脑要加入哪个 AI Desk。"
+    "desk_required": "安装前请先选择这台电脑要加入哪个 AI Desk。",
+    "team_section_title": "团队",
+    "team_section_hint": "团队用来把一批机器共享给其他人。安装不需要它,把单台机器共享给某个人也不需要它。",
+    "team_create_placeholder": "团队名称",
+    "team_create": "创建团队",
+    "team_invite": "复制邀请链接",
+    "team_invite_copied": "邀请链接已复制",
+    "team_invite_failed": "复制邀请链接失败。",
+    "team_label": "团队",
+    "team_none": "不在团队"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

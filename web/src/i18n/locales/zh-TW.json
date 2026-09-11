@@ -3244,7 +3244,16 @@
     "desk_label": "AI Desk",
     "desk_choose": "請選擇一個 Desk…",
     "desk_selected": "將加入這個 Desk：{{desk}}",
-    "desk_required": "安裝前請先選擇這台電腦要加入哪個 AI Desk。"
+    "desk_required": "安裝前請先選擇這台電腦要加入哪個 AI Desk。",
+    "team_section_title": "團隊",
+    "team_section_hint": "團隊用來把一批機器共享給其他人。安裝不需要它,把單台機器共享給某個人也不需要它。",
+    "team_create_placeholder": "團隊名稱",
+    "team_create": "建立團隊",
+    "team_invite": "複製邀請連結",
+    "team_invite_copied": "邀請連結已複製",
+    "team_invite_failed": "複製邀請連結失敗。",
+    "team_label": "團隊",
+    "team_none": "不在團隊"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",
