@@ -32,6 +32,7 @@ import type { ControlledNodeCredential } from './enrollment.js';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
   computerUseMaxTimeoutMs,
+  isReadOnlyComputerUseTool,
   validateComputerUseFrame,
   validateComputerUseResultFrame,
   type ComputerUseFrame,
@@ -50,11 +51,32 @@ import {
   windowsNamedPipeClientAclCommand,
 } from './windows-user-session.js';
 
+/**
+ * The request never reached the helper.
+ *
+ * Its own type because the difference between "not sent" and "sent, no answer"
+ * decides whether retrying is safe: only the first can be repeated without
+ * risking a second click.
+ */
+class ComputerUseSendFailure extends Error {
+  constructor(readonly cause: Error) {
+    super(cause.message);
+    this.name = 'ComputerUseSendFailure';
+  }
+}
+
 interface IpcRequestWire { id: string; request: ComputerUseFrame }
 interface IpcResultWire { id: string; result?: ComputerUseResultFrame; error?: string }
 interface IpcHelloWire { hello: typeof COMPUTER_USE_IPC_HELPER_HELLO }
 
 export const COMPUTER_USE_IPC_HELPER_HELLO = 'imcodes-computer-use-helper-v1' as const;
+
+/**
+ * How many passes `ensureStarted` makes before it reports failure: one to wait
+ * out an attempt already in flight, one to make its own, and a little room for
+ * a retired server closing in between.
+ */
+export const COMPUTER_USE_IPC_START_ATTEMPTS = 4;
 
 export function computerUseIpcDeadlineMs(frame: Pick<ComputerUseFrame, 'tool' | 'timeoutMs'>): number {
   return Math.min(
@@ -181,9 +203,39 @@ export class ComputerUseIpcHost {
   constructor(private readonly options: ComputerUseIpcHostOptions = {}) {}
 
   async call(frame: ComputerUseFrame): Promise<ComputerUseResultFrame> {
+    try {
+      return await this.send(frame);
+    } catch (err) {
+      if (!this.retryable(err, frame.tool)) throw err;
+      return await this.send(frame);
+    }
+  }
+
+  /**
+   * May this exact failure be sent again? Once, and only when repeating it is
+   * harmless.
+   *
+   * Two failures look identical to a caller and are not:
+   *
+   * - The write itself failed, so the helper never saw the request. A helper
+   *   that exited a moment ago leaves a socket that still looks alive until
+   *   the OS catches up, and this is the common case on a machine where the
+   *   helper was restarted. Always safe to resend.
+   * - The connection dropped with the request already sent. Whether the tool
+   *   ran is unknowable from here, so it depends on the tool: asking what
+   *   windows are open twice costs nothing, clicking twice is a different
+   *   click.
+   */
+  private retryable(err: unknown, tool: ComputerUseToolName): boolean {
+    if (err instanceof ComputerUseSendFailure) return true;
+    if (!isReadOnlyComputerUseTool(tool)) return false;
+    return err instanceof Error && err.message === 'computer_use_helper_disconnected';
+  }
+
+  private async send(frame: ComputerUseFrame): Promise<ComputerUseResultFrame> {
     await this.ensureStarted(frame.tool);
     const socket = this.socket;
-    if (!socket || socket.destroyed) throw new Error('computer_use_helper_not_connected');
+    if (!socket || socket.destroyed) throw new ComputerUseSendFailure(new Error('computer_use_helper_not_connected'));
     const id = randomBytes(12).toString('hex');
     const timeoutMs = computerUseIpcDeadlineMs(frame);
     return await new Promise<ComputerUseResultFrame>((resolve, reject) => {
@@ -197,7 +249,11 @@ export class ComputerUseIpcHost {
         if (!err) return;
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(err);
+        // The socket is gone; drop it so the retry starts a helper rather than
+        // writing into the same dead pipe.
+        if (this.socket === socket) this.socket = null;
+        socket.destroy();
+        reject(new ComputerUseSendFailure(err));
       });
     });
   }
@@ -215,70 +271,147 @@ export class ComputerUseIpcHost {
     this.readyPromise = null;
   }
 
+  /**
+   * Get a live helper connection, or fail saying so.
+   *
+   * A bounded loop, deliberately not recursion. This used to call itself when
+   * it woke up to a socket that was still dead, and there is a window where
+   * that never ends: `destroy()` marks a socket destroyed synchronously while
+   * its `close` event -- the thing that clears the readiness promise and
+   * relaunches -- is a macrotask. Land a call in that window and the old code
+   * awaited an already-resolved promise, found the socket still dead, and
+   * called itself again. Awaiting a resolved promise only yields to the
+   * microtask queue, so `close` could never run: the loop starved the entire
+   * event loop and then grew the stack until the daemon died of heap
+   * exhaustion. Every caller hung, not just this one, which is what "OCU times
+   * out" looked like from outside.
+   *
+   * So: each pass either waits for an attempt already in flight or makes one,
+   * and after a few passes it gives up with an error. An error is a thing a
+   * caller can report; an unbounded retry is a thing that takes the process
+   * with it.
+   */
   private async ensureStarted(tool: ComputerUseToolName): Promise<void> {
-    if (this.socket && !this.socket.destroyed) return;
-    if (this.readyPromise) {
-      await this.readyPromise;
+    for (let attempt = 0; attempt < COMPUTER_USE_IPC_START_ATTEMPTS; attempt++) {
       if (this.socket && !this.socket.destroyed) return;
-      return await this.ensureStarted(tool);
+      const inFlight = this.readyPromise;
+      if (inFlight) {
+        // Someone else is already connecting, or a retired server is still
+        // closing. Either way the next pass re-reads the state.
+        await inFlight;
+        continue;
+      }
+      await this.startHelper(tool);
     }
-    this.readyPromise = new Promise((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout>;
-      const server = net.createServer((socket) => {
-        this.acceptConnection(socket, () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-      this.server = server;
-      timer = setTimeout(() => {
-        server.close();
-        if (this.server === server) this.server = null;
-        this.readyPromise = null;
-        // Carry the launcher's own words when it left any. A bare timeout says
-        // only that nothing connected; it never says the helper was refused
-        // before it could exist.
-        reject(new Error(this.lastLaunchFailure
-          ? `computer_use_helper_connect_timeout: ${this.lastLaunchFailure}`
-          : 'computer_use_helper_connect_timeout'));
-      }, 15_000);
-      timer.unref?.();
-      server.once('error', (err) => {
-        clearTimeout(timer);
-        if (this.server === server) this.server = null;
-        this.readyPromise = null;
-        reject(err);
-      });
-      server.listen(this.path, () => {
-        void (async () => {
-          try {
-            const platform = this.options.platform ?? process.platform;
-            if (platform === 'win32') {
-              allowWindowsComputerUseHelperFiles();
-              await allowWindowsPipeClients(this.path);
-              launchWindowsUserSessionHelper(process.execPath, this.path, (detail) => {
-                this.lastLaunchFailure = detail;
-              });
-            } else if (platform === 'darwin') {
-              // The socket is visible in /tmp before runtime preparation and
-              // artifact download finish. Seal it root-only immediately, then
-              // transfer it to the exact console user once resolved.
-              await chmod(this.path, 0o600);
-              await this.launchMacosHelper(tool);
-            } else {
-              launchSameSessionHelper(process.execPath, this.path);
-            }
-          } catch (err) {
+    if (this.socket && !this.socket.destroyed) return;
+    throw new Error('computer_use_helper_not_connected');
+  }
+
+  /**
+   * Start one helper, published before it awaits anything.
+   *
+   * NOT `async`. An async function runs to its first `await` and only then
+   * returns, so anything this method does before publishing `readyPromise` is
+   * a window in which a second caller sees "nobody is connecting" and starts a
+   * helper of its own. Two servers then bind one path and the loser gets
+   * EADDRINUSE -- which on Windows is fatal, because the pipe name belongs to
+   * this process and no retry can free it. Found by three concurrent calls
+   * against a dead socket on a real node.
+   *
+   * So the in-flight promise is assigned in the same synchronous turn as the
+   * call, and everything slow -- closing the old server, binding, launching --
+   * happens inside it.
+   */
+  private startHelper(tool: ComputerUseToolName): Promise<void> {
+    // Every teardown path below clears the readiness promise, and each must
+    // clear *its own* attempt only: a slow failure from an abandoned attempt
+    // must not blank out the attempt that replaced it, which would leave the
+    // replacement running with nothing pointing at it.
+    const holder: { promise: Promise<void> | null } = { promise: null };
+    const clearReady = (): void => {
+      if (this.readyPromise === holder.promise) this.readyPromise = null;
+    };
+    const ready = (async () => {
+      // A previous attempt's server can still be listening on this path: its
+      // socket is dead, but the `close` event that retires the server has not
+      // run yet. Binding the same path again fails outright, so take the old
+      // one down first and wait for it.
+      await this.closeServer();
+      if (this.socket?.destroyed) this.socket = null;
+      await new Promise<void>((resolve, reject) => {
+        let timer: ReturnType<typeof setTimeout>;
+        const server = net.createServer((socket) => {
+          this.acceptConnection(socket, () => {
             clearTimeout(timer);
-            server.close();
-            if (this.server === server) this.server = null;
-            this.readyPromise = null;
-            reject(err instanceof Error ? err : new Error(String(err)));
-          }
-        })();
-      });
-    });
-    await this.readyPromise;
+            resolve();
+          });
+        });
+        this.server = server;
+        /**
+         * End this attempt.
+         *
+         * The server is *retired*, not merely closed and forgotten. `close()`
+         * only stops accepting; the path stays bound until the close completes.
+         * Dropping the reference here and rejecting used to leave the pipe
+         * half-closed with nothing holding it, and every later attempt then died
+         * on `EADDRINUSE` against a name only this process can use -- so a
+         * single failed start turned into OCU being unreachable until the daemon
+         * was restarted. Retiring parks the close where the next attempt waits
+         * for it.
+         */
+        const fail = (error: Error): void => {
+          clearTimeout(timer);
+          clearReady();
+          if (this.server === server) this.retireServer();
+          else void new Promise<void>((done) => server.close(() => done()));
+          reject(error);
+        };
+        timer = setTimeout(() => {
+          // Carry the launcher's own words when it left any. A bare timeout says
+          // only that nothing connected; it never says the helper was refused
+          // before it could exist.
+          fail(new Error(this.lastLaunchFailure
+            ? `computer_use_helper_connect_timeout: ${this.lastLaunchFailure}`
+            : 'computer_use_helper_connect_timeout'));
+        }, 15_000);
+        timer.unref?.();
+        server.once('error', (err) => {
+          fail(err instanceof Error ? err : new Error(String(err)));
+        });
+        server.listen(this.path, () => {
+          void (async () => {
+            try {
+              const platform = this.options.platform ?? process.platform;
+              if (platform === 'win32') {
+                allowWindowsComputerUseHelperFiles();
+                await allowWindowsPipeClients(this.path);
+                launchWindowsUserSessionHelper(this.options.execPath ?? process.execPath, this.path, (detail) => {
+                  this.lastLaunchFailure = detail;
+                });
+              } else if (platform === 'darwin') {
+                // The socket is visible in /tmp before runtime preparation and
+                // artifact download finish. Seal it root-only immediately, then
+                // transfer it to the exact console user once resolved.
+                await chmod(this.path, 0o600);
+                await this.launchMacosHelper(tool);
+              } else {
+                launchSameSessionHelper(this.options.execPath ?? process.execPath, this.path);
+              }
+            } catch (err) {
+              fail(err instanceof Error ? err : new Error(String(err)));
+            }
+          })();
+          });
+        });
+    })();
+    holder.promise = ready;
+    this.readyPromise = ready;
+    // Clearing it on success matters as much as clearing it on failure: a
+    // fulfilled promise left in place claims an attempt is in flight forever,
+    // and the next caller with a dead socket then waits on a result that has
+    // already happened instead of starting a helper.
+    void ready.then(clearReady, () => { /* every rejection path already cleared it. */ });
+    return ready;
   }
 
   private async launchMacosHelper(tool: ComputerUseToolName): Promise<void> {
@@ -410,15 +543,23 @@ export class ComputerUseIpcHost {
     });
   }
 
-  private retireServer(): void {
-    this.buffer = '';
+  /** Stop listening, and resolve only once the path is free to bind again. */
+  private async closeServer(): Promise<void> {
     const server = this.server;
     this.server = null;
-    if (!server) {
+    if (!server) return;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  private retireServer(): void {
+    this.buffer = '';
+    if (!this.server) {
       this.readyPromise = null;
       return;
     }
-    const closing = new Promise<void>((resolve) => server.close(() => resolve()));
+    // Parked in `readyPromise` so that a call arriving mid-teardown waits for
+    // the path to be free rather than racing the close and failing to bind.
+    const closing = this.closeServer();
     this.readyPromise = closing;
     void closing.finally(() => {
       if (this.readyPromise === closing) this.readyPromise = null;

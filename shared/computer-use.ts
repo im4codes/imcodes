@@ -28,6 +28,27 @@ export const COMPUTER_USE_TOOLS = [
 
 export type ComputerUseToolName = (typeof COMPUTER_USE_TOOLS)[number];
 
+/**
+ * Tools that only look. Re-running one of these changes nothing on the remote
+ * machine, so a request whose answer was lost can simply be asked again.
+ *
+ * Everything not listed here acts: a click, a keystroke, a shell command, a
+ * navigation. When the answer to one of those goes missing there is no way to
+ * tell from here whether it ran, and asking again risks doing it twice --
+ * which is worse than reporting that the answer went missing. The list is
+ * therefore an allowlist, so a tool added later is treated as acting until
+ * someone says otherwise.
+ */
+export const COMPUTER_USE_READ_ONLY_TOOLS = [
+  'list_apps',
+  'get_app_state',
+  'browser_snapshot',
+] as const satisfies readonly ComputerUseToolName[];
+
+export function isReadOnlyComputerUseTool(tool: ComputerUseToolName): boolean {
+  return (COMPUTER_USE_READ_ONLY_TOOLS as readonly string[]).includes(tool);
+}
+
 export const COMPUTER_USE_DOC_TOPICS = [
   'overview',
   'workflow',

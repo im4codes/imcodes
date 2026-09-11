@@ -288,6 +288,436 @@ describe('computer use IPC macOS GUI-session boundary', () => {
     }
   });
 
+  it('relaunches when the socket is dead but its close event has not landed yet', async () => {
+    // The window between `destroy()` (synchronous: `destroyed` is true at
+    // once) and the `close` event (a macrotask). In that window the readiness
+    // promise is still the RESOLVED one from the first connect, because
+    // nothing clears it on success -- so `ensureStarted` awaits an
+    // already-resolved promise, finds the socket still dead, and calls itself
+    // again. Awaiting a resolved promise only yields to the microtask queue,
+    // which means `close` can never run and the loop never ends: the daemon's
+    // whole event loop stops, and every caller -- not just this one -- hangs
+    // until something kills the process.
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-deadsocket-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node');
+    await mkdir(join(dir, 'computer-use-helper'));
+    await writeFile(execPath, 'node');
+    await writeFile(join(dir, 'computer-use-helper', 'open-computer-use.app.zip'), 'ocu-archive');
+    const user: MacosConsoleUser = {
+      name: 'desktop-user',
+      uid: 501,
+      gid: 20,
+      home: '/Users/desktop-user',
+      tempDir: '/private/tmp/user/',
+    };
+    const runtime: MacosComputerUseRuntime = {
+      helperExecutable: '/public/imcodes-helper',
+      openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    };
+    let responseCount = 0;
+    const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      let buffer = '';
+      socket.on('error', () => {});
+      socket.on('data', (chunk) => {
+        buffer += String(chunk);
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as {
+          id: string;
+          request: { correlationId: string; tool: 'list_apps' };
+        };
+        buffer = '';
+        responseCount++;
+        socket.write(`${JSON.stringify({
+          id: request.id,
+          result: {
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.request.correlationId,
+            ok: true,
+            tool: request.request.tool,
+            content: [{ type: 'text', text: `apps-${responseCount}` }],
+            durationMs: 1,
+          },
+        })}\n`);
+      });
+    });
+    const host = new ComputerUseIpcHost({
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath,
+      resolveMacosConsoleUser: async () => user,
+      prepareMacosComputerUseRuntime: async () => runtime,
+      authorizeMacosComputerUseSocket: async () => {},
+      runMacosComputerUseDoctor: async () => {},
+      launchMacosUserSessionHelper: launchHelper,
+    });
+
+    try {
+      const first = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-dead-1',
+        tool: 'list_apps',
+      });
+      expect(first.content[0]?.text).toBe('apps-1');
+
+      // Kill the socket and call in the SAME tick, with no sleep in between.
+      // A sleep here is what hides this: it lets `close` run first and takes
+      // the test through the recovery path that already works.
+      (host as unknown as { socket: { destroy(): void } }).socket.destroy();
+      const second = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-dead-2',
+        tool: 'list_apps',
+      });
+      expect(second.content[0]?.text).toBe('apps-2');
+      expect(launchHelper).toHaveBeenCalledTimes(2);
+    } finally {
+      host.close();
+    }
+  });
+
+  it('frees the path when a launch fails, so the next call can still bind', async () => {
+    // Found on a real Windows node: after one failed start, every later call
+    // died with EADDRINUSE on a pipe name only this process can use. Closing
+    // the server is not instant -- the path stays bound until the close
+    // completes -- so dropping the reference and rejecting left the path held
+    // by nothing. OCU was then unreachable until the daemon restarted, which
+    // is what "it has never worked" looked like from outside.
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-rebind-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node');
+    await mkdir(join(dir, 'computer-use-helper'));
+    await writeFile(execPath, 'node');
+    await writeFile(join(dir, 'computer-use-helper', 'open-computer-use.app.zip'), 'ocu-archive');
+    const user: MacosConsoleUser = {
+      name: 'desktop-user',
+      uid: 501,
+      gid: 20,
+      home: '/Users/desktop-user',
+      tempDir: '/private/tmp/user/',
+    };
+    const runtime: MacosComputerUseRuntime = {
+      helperExecutable: '/public/imcodes-helper',
+      openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    };
+    let failNext = true;
+    const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error('helper_launch_refused');
+      }
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      socket.on('error', () => {});
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += String(chunk);
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as {
+          id: string;
+          request: { correlationId: string; tool: 'list_apps' };
+        };
+        buffer = '';
+        socket.write(`${JSON.stringify({
+          id: request.id,
+          result: {
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.request.correlationId,
+            ok: true,
+            tool: request.request.tool,
+            content: [{ type: 'text', text: 'recovered' }],
+            durationMs: 1,
+          },
+        })}\n`);
+      });
+    });
+    const host = new ComputerUseIpcHost({
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath,
+      resolveMacosConsoleUser: async () => user,
+      prepareMacosComputerUseRuntime: async () => runtime,
+      authorizeMacosComputerUseSocket: async () => {},
+      runMacosComputerUseDoctor: async () => {},
+      launchMacosUserSessionHelper: launchHelper,
+    });
+
+    // The order of these three is the whole fix, and on a unix socket the
+    // race is usually won by luck -- the close finishes before the rebind and
+    // the test passes either way. So the ordering is recorded and asserted
+    // directly rather than inferred from the outcome.
+    const order: string[] = [];
+    const realListen = net.Server.prototype.listen;
+    const realClose = net.Server.prototype.close;
+    const listenSpy = vi.spyOn(net.Server.prototype, 'listen').mockImplementation(function listen(
+      this: net.Server,
+      ...args: Parameters<typeof realListen>
+    ) {
+      order.push('listen');
+      return realListen.apply(this, args);
+    } as typeof realListen);
+    const closeSpy = vi.spyOn(net.Server.prototype, 'close').mockImplementation(function close(
+      this: net.Server,
+      callback?: (err?: Error) => void,
+    ) {
+      order.push('close:start');
+      return realClose.call(this, (err?: Error) => {
+        order.push('close:done');
+        callback?.(err);
+      });
+    } as typeof realClose);
+
+    try {
+      await expect(host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-rebind-1',
+        tool: 'list_apps',
+      })).rejects.toThrow('helper_launch_refused');
+
+      // The failure has to be survivable. Asserted as the successful result
+      // rather than "not EADDRINUSE", because a different error here would
+      // still mean the node stays unreachable.
+      const second = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-rebind-2',
+        tool: 'list_apps',
+      });
+      expect(second.content[0]?.text).toBe('recovered');
+
+      // Nothing may bind the path again until the previous close has actually
+      // completed. On Windows it does not merely race -- the pipe name is
+      // per-process, so an early rebind fails outright and stays failed.
+      const secondListen = order.lastIndexOf('listen');
+      expect(order.slice(0, secondListen), order.join(' -> ')).toContain('close:done');
+    } finally {
+      listenSpy.mockRestore();
+      closeSpy.mockRestore();
+      host.close();
+    }
+  });
+
+  it('starts exactly one helper when several calls arrive against a dead socket', async () => {
+    // Found by three concurrent calls on a real Windows node. `startHelper`
+    // was `async`, so it returned at its first `await` and published the
+    // in-flight promise only afterwards -- a window in which the next caller
+    // saw "nobody is connecting" and started a second helper. Both bound the
+    // same path and the loser got EADDRINUSE, which on Windows is permanent:
+    // the pipe name belongs to this process, so no retry frees it.
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-concurrent-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node');
+    await mkdir(join(dir, 'computer-use-helper'));
+    await writeFile(execPath, 'node');
+    await writeFile(join(dir, 'computer-use-helper', 'open-computer-use.app.zip'), 'ocu-archive');
+    const user: MacosConsoleUser = {
+      name: 'desktop-user',
+      uid: 501,
+      gid: 20,
+      home: '/Users/desktop-user',
+      tempDir: '/private/tmp/user/',
+    };
+    const runtime: MacosComputerUseRuntime = {
+      helperExecutable: '/public/imcodes-helper',
+      openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    };
+    const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      socket.on('error', () => {});
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += String(chunk);
+        for (;;) {
+          const newline = buffer.indexOf('\n');
+          if (newline < 0) return;
+          const request = JSON.parse(buffer.slice(0, newline)) as {
+            id: string;
+            request: { correlationId: string; tool: 'list_apps' };
+          };
+          buffer = buffer.slice(newline + 1);
+          socket.write(`${JSON.stringify({
+            id: request.id,
+            result: {
+              type: DAEMON_MSG.COMPUTER_USE_RESULT,
+              correlationId: request.request.correlationId,
+              ok: true,
+              tool: request.request.tool,
+              content: [{ type: 'text', text: request.request.correlationId }],
+              durationMs: 1,
+            },
+          })}\n`);
+        }
+      });
+    });
+    const host = new ComputerUseIpcHost({
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath,
+      resolveMacosConsoleUser: async () => user,
+      prepareMacosComputerUseRuntime: async () => runtime,
+      authorizeMacosComputerUseSocket: async () => {},
+      runMacosComputerUseDoctor: async () => {},
+      launchMacosUserSessionHelper: launchHelper,
+    });
+
+    const frame = (id: string) => ({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId: id,
+      tool: 'list_apps' as const,
+    });
+
+    try {
+      // Cold, three at once: one helper between them.
+      const coldIds = ['corr-cold-1', 'corr-cold-2', 'corr-cold-3'];
+      const cold = await Promise.all(coldIds.map((id) => host.call(frame(id))));
+      expect(cold.map((result) => result.content[0]?.text)).toEqual(coldIds);
+      expect(launchHelper, 'one helper for three cold callers').toHaveBeenCalledTimes(1);
+
+      // And again in the window where the socket is dead but its close has not
+      // been delivered -- all three must share the one relaunch.
+      (host as unknown as { socket: { destroy(): void } }).socket.destroy();
+      const revivedIds = ['corr-revive-1', 'corr-revive-2', 'corr-revive-3'];
+      const revived = await Promise.all(revivedIds.map((id) => host.call(frame(id))));
+      expect(revived.map((result) => result.content[0]?.text)).toEqual(revivedIds);
+      expect(launchHelper, 'one relaunch, not one per caller').toHaveBeenCalledTimes(2);
+    } finally {
+      host.close();
+    }
+  });
+
+  it('retries a request that never left the process, and never one that did', async () => {
+    // Two different failures that look alike from the caller's seat:
+    //   write fails  -> the helper never saw it -> safe to send again
+    //   no answer    -> the helper may have done it -> NOT safe to send again
+    // Repeating a click because the answer went missing is worse than saying
+    // the answer went missing.
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-retry-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node');
+    await mkdir(join(dir, 'computer-use-helper'));
+    await writeFile(execPath, 'node');
+    await writeFile(join(dir, 'computer-use-helper', 'open-computer-use.app.zip'), 'ocu-archive');
+    const user: MacosConsoleUser = {
+      name: 'desktop-user', uid: 501, gid: 20, home: '/Users/desktop-user', tempDir: '/private/tmp/user/',
+    };
+    const runtime: MacosComputerUseRuntime = {
+      helperExecutable: '/public/imcodes-helper',
+      openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    };
+    // How many of the next requests to swallow: taken, then the helper dies
+    // without answering.
+    let dieForNextRequests = 0;
+    const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      socket.on('error', () => {});
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += String(chunk);
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as {
+          id: string;
+          request: { correlationId: string; tool: 'click' | 'list_apps' };
+        };
+        buffer = '';
+        if (dieForNextRequests > 0) {
+          // Took the request, then died. Whether the click happened is
+          // unknowable from here, which is the entire point.
+          dieForNextRequests--;
+          socket.destroy();
+          return;
+        }
+        socket.write(`${JSON.stringify({
+          id: request.id,
+          result: {
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.request.correlationId,
+            ok: true,
+            tool: request.request.tool,
+            content: [{ type: 'text', text: 'answered' }],
+            durationMs: 1,
+          },
+        })}\n`);
+      });
+    });
+    const host = new ComputerUseIpcHost({
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath,
+      resolveMacosConsoleUser: async () => user,
+      prepareMacosComputerUseRuntime: async () => runtime,
+      authorizeMacosComputerUseSocket: async () => {},
+      runMacosComputerUseDoctor: async () => {},
+      launchMacosUserSessionHelper: launchHelper,
+    });
+
+    try {
+      const first = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId: 'corr-retry-warm', tool: 'list_apps',
+      });
+      expect(first.content[0]?.text).toBe('answered');
+      expect(launchHelper).toHaveBeenCalledTimes(1);
+
+      // A write the OS refuses: exactly what a helper that exited a moment ago
+      // produces, because the socket still looks alive until it does not.
+      const live = (host as unknown as { socket: net.Socket }).socket;
+      const realWrite = live.write.bind(live);
+      let refused = false;
+      (live as unknown as { write: net.Socket['write'] }).write = ((
+        data: string,
+        callback?: (err?: Error) => void,
+      ) => {
+        if (refused) return realWrite(data, callback as never);
+        refused = true;
+        setImmediate(() => callback?.(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })));
+        return true;
+      }) as net.Socket['write'];
+
+      const retried = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId: 'corr-retry-epipe', tool: 'click',
+      });
+      expect(retried.content[0]?.text, 'a refused write is resent').toBe('answered');
+      expect(launchHelper, 'and the resend goes to a fresh helper').toHaveBeenCalledTimes(2);
+
+      // Now the other kind: the helper takes the request and dies. A click may
+      // already have landed, so it is reported, not repeated.
+      dieForNextRequests = 1;
+      const launchesBefore = launchHelper.mock.calls.length;
+      await expect(host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId: 'corr-retry-silent', tool: 'click',
+      })).rejects.toThrow('computer_use_helper_disconnected');
+      expect(launchHelper.mock.calls.length, 'a delivered click is never sent twice')
+        .toBe(launchesBefore);
+
+      // The same lost answer for a tool that only looks is simply asked again.
+      // This is the everyday case: the helper was killed or restarted, and
+      // asking which windows are open costs nothing to repeat.
+      dieForNextRequests = 1;
+      const beforeLook = launchHelper.mock.calls.length;
+      const looked = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId: 'corr-retry-readonly', tool: 'list_apps',
+      });
+      expect(looked.content[0]?.text, 'the lost look is asked again').toBe('answered');
+      expect(launchHelper.mock.calls.length, 'and a helper was started for the second ask')
+        .toBeGreaterThan(beforeLook);
+    } finally {
+      host.close();
+    }
+  });
+
   it('downloads the OCU sidecar on a fresh macOS installation before launching the user helper', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-download-test-'));
     dirs.push(dir);
