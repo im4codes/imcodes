@@ -145,7 +145,13 @@ const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
-const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 160_000;
+/**
+ * Exported so the truncation test follows this number instead of restating it.
+ * A test that hardcodes the cap stops testing truncation the moment the cap is
+ * raised past its fixture: the input is no longer over the limit, nothing is
+ * cut, and the assertion quietly becomes about nothing.
+ */
+export const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 180_000;
 // User + project + session identity contracts may total 140k characters. Keep
 // the default at the supported ceiling so stable IM.codes guidance, authored
 // context, and image-reporting remain intact instead of being silently cut.

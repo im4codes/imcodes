@@ -38,11 +38,16 @@ describe('session identity contracts', () => {
     expect(rendered).toContain('Platform system/developer instructions');
   });
 
-  it('enforces user 20k, project 40k, and session 80k character limits', () => {
+  it('enforces user 20k, project 60k, and session 100k character limits', () => {
+    // Pinned on purpose: these are product decisions, so a change should have
+    // to be made here too rather than slipping through as a side effect.
     expect(SESSION_IDENTITY_USER_MAX_CHARS).toBe(20_000);
-    expect(SESSION_IDENTITY_PROJECT_MAX_CHARS).toBe(40_000);
-    expect(SESSION_IDENTITY_SESSION_MAX_CHARS).toBe(80_000);
-    expect(SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES).toBe(320_003);
+    expect(SESSION_IDENTITY_PROJECT_MAX_CHARS).toBe(60_000);
+    expect(SESSION_IDENTITY_SESSION_MAX_CHARS).toBe(100_000);
+    // Derived, not restated: the file pre-read must track the session cap, and
+    // a second literal is how the two drift apart into a profile that validates
+    // but cannot be read back off disk.
+    expect(SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES).toBe(SESSION_IDENTITY_SESSION_MAX_CHARS * 4 + 3);
     expect(SESSION_IDENTITY_MAX_CHARS).toBe(SESSION_IDENTITY_SESSION_MAX_CHARS);
     for (const [scope, limit] of [
       [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_USER_MAX_CHARS],

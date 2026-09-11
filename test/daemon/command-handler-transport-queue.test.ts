@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1685,7 +1686,10 @@ describe('handleWebCommand transport queue behavior', () => {
       project: 'invalid identity startup',
       dir: '/proj',
       agentType: 'codex-sdk',
-      identityPrompt: 'x'.repeat(80_001),
+      // One past the session cap, from the constant: a literal here silently
+      // becomes an in-budget value the moment the cap is raised, and the test
+      // then asserts that a VALID identity is rejected.
+      identityPrompt: 'x'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1),
     }, serverLink as any);
     await flushAsync();
 

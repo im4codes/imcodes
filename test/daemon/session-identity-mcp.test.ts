@@ -6,6 +6,11 @@ import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
+import {
+  SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  SESSION_IDENTITY_SESSION_MAX_CHARS,
+  SESSION_IDENTITY_USER_MAX_CHARS,
+} from '../../shared/session-identity.js';
 import type { SessionIdentityProfile } from '../../shared/session-identity.js';
 
 const caller: McpRuntimeCaller = {
@@ -136,10 +141,13 @@ describe('session identity MCP tools', () => {
       setIdentityProfile,
     });
 
+    // One past each scope's own cap, taken from the constants. Literals here
+    // stop testing the boundary the moment a cap moves: they become an
+    // in-budget value that is expected to be rejected.
     for (const [identityScope, length] of [
-      ['user', 20_001],
-      ['project', 40_001],
-      ['session', 80_001],
+      ['user', SESSION_IDENTITY_USER_MAX_CHARS + 1],
+      ['project', SESSION_IDENTITY_PROJECT_MAX_CHARS + 1],
+      ['session', SESSION_IDENTITY_SESSION_MAX_CHARS + 1],
     ] as const) {
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
         identityScope,

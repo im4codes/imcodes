@@ -14,8 +14,8 @@ export const SESSION_IDENTITY_SCOPE_LIST = Object.freeze(
 ) as readonly SessionIdentityScope[];
 
 export const SESSION_IDENTITY_USER_MAX_CHARS = 20_000;
-export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 40_000;
-export const SESSION_IDENTITY_SESSION_MAX_CHARS = 80_000;
+export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 60_000;
+export const SESSION_IDENTITY_SESSION_MAX_CHARS = 100_000;
 /** Backward-compatible alias for the largest single profile (session scope). */
 export const SESSION_IDENTITY_MAX_CHARS = SESSION_IDENTITY_SESSION_MAX_CHARS;
 export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentityScope, number>> = Object.freeze({
@@ -25,8 +25,9 @@ export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentit
 });
 /**
  * Bounded pre-read size for a UTF-8 identity file. This is not a second user
- * content limit: every valid profile within the 80,000-code-point session cap
- * fits in at most four UTF-8 bytes per code point, plus an optional BOM.
+ * content limit: it is derived from the session cap so the two can never drift,
+ * because every valid profile fits in at most four UTF-8 bytes per code point,
+ * plus an optional BOM.
  */
 export const SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES = SESSION_IDENTITY_SESSION_MAX_CHARS * 4 + 3;
 export const SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS = 512;

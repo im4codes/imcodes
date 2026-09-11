@@ -278,7 +278,11 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   }),
 }));
 
-import { CodexSdkProvider, buildCodexMcpThreadConfig } from '../../src/agent/providers/codex-sdk.js';
+import {
+  CodexSdkProvider,
+  MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS,
+  buildCodexMcpThreadConfig,
+} from '../../src/agent/providers/codex-sdk.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
 import {
   PROVIDER_ERROR_CODES,
@@ -4605,7 +4609,9 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-context-max-cap', cwd: '/tmp/project' });
     const userMessage = 'keep the user request';
-    const systemText = `Identity contracts ${'i'.repeat(170_000)}`;
+    // Sized from the cap, not a literal, so this stays an over-limit input
+    // whatever the cap becomes.
+    const systemText = `Identity contracts ${'i'.repeat(MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS + 10_000)}`;
 
     await provider.send('route-context-max-cap', {
       userMessage,
@@ -4637,8 +4643,8 @@ describe('CodexSdkProvider', () => {
     const separator = `\n\n${userMessage}`;
     const contextText = inputText.slice(0, inputText.indexOf(separator));
     expect(inputText).toContain(userMessage);
-    expect(contextText).toHaveLength(160_000);
-    expect(contextText).toContain('to 160000 chars');
+    expect(contextText).toHaveLength(MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS);
+    expect(contextText).toContain(`to ${MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS} chars`);
   });
 
   it('maps normalized system context into the turn input text', async () => {
