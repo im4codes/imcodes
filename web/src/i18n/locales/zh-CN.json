@@ -3153,7 +3153,8 @@
       "status_unverified": "未验证",
       "status_verified": "已验证",
       "status_unreachable": "无法连接",
-      "status_unauthorized": "未授权"
+      "status_unauthorized": "未授权",
+      "purpose": "这个是干什么的：模型要说\"这个改动在 Windows / macOS / Linux 上没问题\",唯一诚实的做法是真的拿去那台机器上跑一遍。这里授权的机器,就是允许它用来做这件事的——跨平台真机验证,而不是靠推理断言\"应该可以\"。只有在真正需要时才会用到,授权按机器单独给、随时可撤。"
     },
     "short": "节点",
     "add_title": "添加机器",
@@ -3270,7 +3271,11 @@
     "usage_route_download": "用下载的文件",
     "usage_win_command": "开始菜单搜索「PowerShell」，在 Windows PowerShell 上点【右键 → 以管理员身份运行】——窗口标题栏必须显示「管理员」。直接打开的普通窗口会执行到一半报权限错误。然后粘贴命令、回车，等它跑完再关窗口。",
     "usage_mac_command": "打开「终端」(启动台 → 其他 → 终端，或 Spotlight 搜索 Terminal)，粘贴命令回车。因为用了 sudo 会要求输入你的登录密码，输入时屏幕上不会显示任何字符，这是正常的，输完直接回车。",
-    "usage_linux_command": "在终端里粘贴命令执行。它用 sudo，会提示输入密码。机器上没有 sudo 的话，切到 root 用户执行去掉 sudo 的同一条命令。"
+    "usage_linux_command": "在终端里粘贴命令执行。它用 sudo，会提示输入密码。机器上没有 sudo 的话，切到 root 用户执行去掉 sudo 的同一条命令。",
+    "tab_verification": "授权验证设备",
+    "group_filter_label": "机器分组",
+    "group_direct": "我的和单独共享",
+    "group_all": "全部"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

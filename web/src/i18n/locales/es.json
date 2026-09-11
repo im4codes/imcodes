@@ -3153,7 +3153,8 @@
       "status_unverified": "Sin verificar",
       "status_verified": "Verificado",
       "status_unreachable": "Inaccesible",
-      "status_unauthorized": "No autorizado"
+      "status_unauthorized": "No autorizado",
+      "purpose": "Para qué sirve: el agente solo puede afirmar que un cambio funciona en Windows, macOS o Linux si realmente lo ejecuta allí. Las máquinas autorizadas aquí son las que puede usar para eso: verificación en dispositivos reales de varias plataformas, en vez de razonar sobre lo que debería pasar. No se usa nada hasta que hace falta, y la autorización es por máquina y revocable."
     },
     "short": "Nodos",
     "add_title": "Añadir una máquina",
@@ -3270,7 +3271,11 @@
     "usage_route_download": "Con el archivo descargado",
     "usage_win_command": "Menú Inicio, escribe \"PowerShell\", haz CLIC DERECHO en Windows PowerShell y elige \"Ejecutar como administrador\" — la barra de título debe decir Administrador. Pegarlo en una ventana normal falla a medias con un error de acceso. Pega el comando, pulsa Enter y deja la ventana abierta hasta que termine.",
     "usage_mac_command": "Abre Terminal (Aplicaciones → Utilidades, o Spotlight \"Terminal\"), pega el comando y pulsa Enter. Pedirá tu contraseña por sudo; no se ve nada al escribirla, es normal. Pulsa Enter.",
-    "usage_linux_command": "Pega el comando en una terminal. Usa sudo, así que pedirá tu contraseña. Sin sudo, entra como root y ejecuta la misma línea sin sudo."
+    "usage_linux_command": "Pega el comando en una terminal. Usa sudo, así que pedirá tu contraseña. Sin sudo, entra como root y ejecuta la misma línea sin sudo.",
+    "tab_verification": "Dispositivos de verificación",
+    "group_filter_label": "Grupos de máquinas",
+    "group_direct": "Mías y compartidas conmigo",
+    "group_all": "Todas"
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

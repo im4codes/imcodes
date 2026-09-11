@@ -34,6 +34,13 @@ import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
 import { TeamManagementPanel } from './TeamManagementPanel.js';
+import {
+  MACHINE_GROUP_ALL,
+  MACHINE_GROUP_DIRECT,
+  machineGroupsOf,
+  machinesInGroup,
+} from '../machine-grouping.js';
+
 import { VerificationMachinesSection } from './VerificationMachinesSection.js';
 
 /**
@@ -137,7 +144,11 @@ export function ControlledNodesPanel({
   // Three things that were stacked on one scrolling page: the machines you can
   // reach, the groups you share them through, and how to add a new one. Three
   // separate tasks, so three tabs.
-  const [tab, setTab] = useState<'machines' | 'teams' | 'install'>('machines');
+  const [tab, setTab] = useState<'machines' | 'teams' | 'verification' | 'install'>('machines');
+  // Which slice of the machine list is on screen. Machines shared with you
+  // individually and machines reached through a team are different things, so
+  // they are not poured into one list you then have to read apart.
+  const [machineGroup, setMachineGroup] = useState<string>(MACHINE_GROUP_DIRECT);
 
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const [linkingKey, setLinkingKey] = useState<string | null>(null);
@@ -536,6 +547,9 @@ export function ControlledNodesPanel({
     { os: 'linux', commandKey: 'controlled_nodes.usage_linux_command', downloadKey: 'controlled_nodes.usage_linux_run' },
   ];
 
+  const machineTeams = machineGroupsOf(machines);
+  const visibleMachines = machinesInGroup(machines, machineGroup);
+
   const showEmptyCatalog = !availLoading && !availError && sortedTargets.length === 0;
   const onlineMachineCount = machines.filter((machine) => machine.online).length;
   const execEnabledMachineCount = machines.filter((machine) => machine.execEnabled).length;
@@ -692,7 +706,7 @@ export function ControlledNodesPanel({
       </header>
 
       <div class="controlled-nodes-tabs" role="tablist" aria-label={t('controlled_nodes.tabs_label')}>
-        {(['machines', 'teams', 'install'] as const).map((id) => (
+        {(['machines', 'teams', 'install', 'verification'] as const).map((id) => (
           <button
             key={id}
             type="button"
@@ -734,14 +748,33 @@ export function ControlledNodesPanel({
             {t('controlled_nodes.refresh_error')}
           </p>
         )}
-        {loaded && machines.length === 0 && (
+        {machineTeams.length > 0 && (
+          <div class="controlled-nodes-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
+            {[
+              { id: MACHINE_GROUP_DIRECT, label: t('controlled_nodes.group_direct') },
+              ...machineTeams.map(([id, label]) => ({ id, label })),
+              { id: MACHINE_GROUP_ALL, label: t('controlled_nodes.group_all') },
+            ].map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={machineGroup === id}
+                class={`controlled-nodes-team-chip${machineGroup === id ? ' is-active' : ''}`}
+                data-testid={`controlled-nodes-group-${id}`}
+                onClick={() => setMachineGroup(id)}
+              >{label}</button>
+            ))}
+          </div>
+        )}
+        {loaded && visibleMachines.length === 0 && (
           <div class="controlled-nodes-empty">
             <span class="controlled-nodes-empty-radar" aria-hidden="true"><i /></span>
             <p>{t('controlled_nodes.empty')}</p>
           </div>
         )}
         <ul class="controlled-nodes-machine-list">
-          {machines.map((m) => (
+          {visibleMachines.map((m) => (
             <li key={m.serverId} class={`controlled-nodes-machine-row ${m.online ? 'is-online' : 'is-offline'}`}>
               <span class="controlled-nodes-machine-rail" aria-hidden="true" />
               <div class="controlled-nodes-machine-info">
@@ -862,7 +895,7 @@ export function ControlledNodesPanel({
 
       )}
 
-      {tab === 'machines' && (
+      {tab === 'verification' && (
         <VerificationMachinesSection machines={machines} projectKey={projectKey} />
       )}
 

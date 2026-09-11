@@ -4,6 +4,12 @@ import { useTranslation } from 'react-i18next';
 import type { MachineListItem } from '../api/machines.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import {
+  MACHINE_GROUP_ALL,
+  MACHINE_GROUP_DIRECT,
+  machineGroupsOf,
+  machinesInGroup,
+} from '../machine-grouping.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
 interface ControlledNodeQuickMenuProps {
@@ -29,6 +35,9 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
   const { t } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
   const [open, setOpen] = useState(false);
+  const [group, setGroup] = useState<string>(MACHINE_GROUP_DIRECT);
+  const groups = machineGroupsOf(machines);
+  const visible = machinesInGroup(machines, group);
   const [position, setPosition] = useState<MenuPosition | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -103,8 +112,28 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
     >
       <div class="controlled-node-quick-menu-head">
         <span>{t('controlled_nodes.machines_title')}</span>
-        <span class="controlled-node-quick-count">{machines.length}</span>
+        <span class="controlled-node-quick-count">{visible.length}</span>
       </div>
+      {/* A team is a group you can share. Picking one here is the same act as
+          picking one in the machines tab, so it is the same control. */}
+      {groups.length > 0 && (
+        <div class="controlled-node-quick-groups" role="none">
+          {[
+            { id: MACHINE_GROUP_DIRECT, label: t('controlled_nodes.group_direct') },
+            ...groups.map(([id, label]) => ({ id, label })),
+            { id: MACHINE_GROUP_ALL, label: t('controlled_nodes.group_all') },
+          ].map(({ id, label }) => (
+            <button
+              key={id}
+              type="button"
+              role="none"
+              class={`controlled-nodes-team-chip${group === id ? ' is-active' : ''}`}
+              data-testid={`controlled-node-quick-group-${id}`}
+              onClick={() => setGroup(id)}
+            >{label}</button>
+          ))}
+        </div>
+      )}
       {onOpenRemoteDesktopWall && <button
         type="button"
         class="controlled-node-quick-wall"
@@ -115,12 +144,12 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
       {loaded && error && machines.length === 0 && (
         <div class="controlled-node-quick-state is-error">{t('controlled_nodes.refresh_error')}</div>
       )}
-      {loaded && machines.length === 0 && !error && (
+      {loaded && visible.length === 0 && !error && (
         <div class="controlled-node-quick-state">{t('controlled_nodes.empty')}</div>
       )}
-      {machines.length > 0 && (
+      {visible.length > 0 && (
         <ul class="controlled-node-quick-list">
-          {machines.map((machine) => {
+          {visible.map((machine) => {
             const available = canOpenRemoteDesktopMachine(machine);
             return (
               <li key={machine.serverId} class="controlled-node-quick-row" role="none">

@@ -3152,7 +3152,8 @@
       "status_unverified": "未検証",
       "status_verified": "検証済み",
       "status_unreachable": "到達不能",
-      "status_unauthorized": "未認可"
+      "status_unauthorized": "未認可",
+      "purpose": "これは何のためか: 「この変更は Windows / macOS / Linux で動く」と言えるのは、実際にそこで動かしたときだけです。ここで許可したマシンは、そのために使ってよいマシンです。推論で「動くはず」と述べる代わりに、複数プラットフォームの実機で検証します。必要になるまで使われず、許可はマシンごとで、いつでも取り消せます。"
     },
     "short": "ノード",
     "add_title": "マシンを追加",
@@ -3269,7 +3270,11 @@
     "usage_route_download": "ダウンロードしたファイルで",
     "usage_win_command": "スタートメニューで「PowerShell」を検索し、Windows PowerShell を【右クリック →「管理者として実行」】。タイトルバーに「管理者」と出ている必要があります。通常のウィンドウに貼ると途中でアクセスエラーになります。コマンドを貼って Enter、終わるまで閉じないでください。",
     "usage_mac_command": "ターミナルを開き(アプリケーション → ユーティリティ、または Spotlight で Terminal)、コマンドを貼って Enter。sudo のためログインパスワードを聞かれます。入力しても何も表示されませんが正常です。そのまま Enter。",
-    "usage_linux_command": "ターミナルにコマンドを貼って実行します。sudo を使うのでパスワードを聞かれます。sudo が無い場合は root でログインし、sudo を外した同じ行を実行してください。"
+    "usage_linux_command": "ターミナルにコマンドを貼って実行します。sudo を使うのでパスワードを聞かれます。sudo が無い場合は root でログインし、sudo を外した同じ行を実行してください。",
+    "tab_verification": "検証デバイス",
+    "group_filter_label": "マシングループ",
+    "group_direct": "自分のと個別共有",
+    "group_all": "すべて"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

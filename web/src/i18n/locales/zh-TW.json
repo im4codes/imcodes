@@ -3153,7 +3153,8 @@
       "status_unverified": "未驗證",
       "status_verified": "已驗證",
       "status_unreachable": "無法連線",
-      "status_unauthorized": "未授權"
+      "status_unauthorized": "未授權",
+      "purpose": "這個是做什麼的：模型要說「這個改動在 Windows / macOS / Linux 上沒問題」,唯一誠實的做法是真的拿去那台機器上跑一遍。這裡授權的機器,就是允許它用來做這件事的——跨平台真機驗證,而不是靠推理斷言「應該可以」。只有真正需要時才會用到,授權按機器單獨給、隨時可撤銷。"
     },
     "short": "節點",
     "add_title": "新增機器",
@@ -3270,7 +3271,11 @@
     "usage_route_download": "用下載的檔案",
     "usage_win_command": "開始功能表搜尋「PowerShell」，在 Windows PowerShell 上按【右鍵 → 以系統管理員身分執行】——視窗標題列必須顯示「系統管理員」。直接開啟的一般視窗會執行到一半出現權限錯誤。然後貼上指令、按 Enter，等它跑完再關視窗。",
     "usage_mac_command": "開啟「終端機」(launchpad → 其他 → 終端機，或用 Spotlight 搜尋 Terminal)，貼上指令按 Enter。因為用了 sudo 會要求輸入你的登入密碼，輸入時畫面不會顯示任何字元，這是正常的，輸完直接按 Enter。",
-    "usage_linux_command": "在終端機貼上指令執行。它用 sudo，會提示輸入密碼。機器上沒有 sudo 的話，切換到 root 使用者執行去掉 sudo 的同一行指令。"
+    "usage_linux_command": "在終端機貼上指令執行。它用 sudo，會提示輸入密碼。機器上沒有 sudo 的話，切換到 root 使用者執行去掉 sudo 的同一行指令。",
+    "tab_verification": "授權驗證裝置",
+    "group_filter_label": "機器分組",
+    "group_direct": "我的和單獨共享",
+    "group_all": "全部"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

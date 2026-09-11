@@ -1354,3 +1354,58 @@ describe('ControlledNodesPanel teams tab', () => {
     expect(container.querySelector('[data-testid="controlled-nodes-member-remove-u-mate"]')).toBeNull();
   });
 });
+
+describe('ControlledNodesPanel machine grouping', () => {
+  const mine = {
+    serverId: 'srv-mine', nodeId: '1234567890', refName: 'mine', displayName: 'Mine',
+    online: true, execEnabled: true, accessRole: 'owner' as const,
+  };
+  const viaTeam = {
+    serverId: 'srv-team', nodeId: '1234567891', refName: 'team', displayName: 'Team box',
+    online: true, execEnabled: true, accessRole: 'participant' as const,
+    teamId: 'team-1', teamName: 'Ops',
+  };
+
+  it('defaults to what is yours and shared with you, not the team s machines', async () => {
+    // Reached-through-a-team and shared-with-me-directly are different things.
+    // Pouring them into one list means reading it apart every time.
+    machines = [mine, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.textContent).not.toContain('Team box');
+
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    expect(container.textContent).toContain('Team box');
+    expect(container.textContent).not.toContain('Mine');
+
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-all"]') as HTMLButtonElement).click();
+    });
+    // Nothing is unreachable: All still shows both.
+    expect(container.textContent).toContain('Mine');
+    expect(container.textContent).toContain('Team box');
+  });
+
+  it('shows no group filter at all when no machine is in a team', async () => {
+    // A chooser with one choice is furniture.
+    machines = [mine];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.querySelector('.controlled-nodes-group-filter')).toBeNull();
+  });
+
+  it('keeps verification devices on their own tab, out of the machine list', async () => {
+    machines = [mine];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.textContent).not.toContain('controlled_nodes.verification.title');
+
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-tab-verification"]') as HTMLButtonElement).click();
+    });
+    expect(container.textContent).toContain('controlled_nodes.verification.title');
+    expect(container.textContent, 'the machine list is not on this tab').not.toContain('Mine');
+  });
+});

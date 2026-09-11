@@ -3785,6 +3785,42 @@ html.native-ios-mac .chat-dl-btn {
 
 .controlled-nodes-danger-btn:hover:not(:disabled) { border-color: rgba(251, 113, 133, 0.66); }
 
+/* The group filter sits above the list it filters and reuses the team chip,
+   because it is the same act: choosing which set you are looking at. */
+/* The purpose line is the first thing read on this tab, so it is not muted
+   grey like the mechanics below it. */
+.controlled-node-quick-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 6px 10px 2px;
+}
+
+.controlled-node-quick-groups .controlled-nodes-team-chip {
+  min-height: 26px;
+  padding: 3px 10px;
+  font-size: 10.5px;
+}
+
+.verification-machines-purpose {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(34, 211, 238, 0.22);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: rgba(8, 145, 178, 0.1);
+  color: #cbeafe;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.controlled-nodes-group-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
 .controlled-nodes-team-switch { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .controlled-nodes-team-chip {

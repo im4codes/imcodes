@@ -3152,7 +3152,8 @@
       "status_unverified": "미검증",
       "status_verified": "검증됨",
       "status_unreachable": "연결 불가",
-      "status_unauthorized": "승인되지 않음"
+      "status_unauthorized": "승인되지 않음",
+      "purpose": "무엇을 위한 것인가: 에이전트가 \"이 변경이 Windows / macOS / Linux에서 동작한다\"고 말할 수 있는 것은 실제로 거기서 실행해 봤을 때뿐입니다. 여기서 승인한 머신이 바로 그 용도로 쓸 수 있는 머신입니다 — 추론으로 \"될 것이다\"라고 하는 대신, 여러 플랫폼의 실제 장치에서 검증합니다. 필요할 때만 사용하며, 승인은 머신 단위이고 언제든 취소할 수 있습니다."
     },
     "short": "노드",
     "add_title": "머신 추가",
@@ -3269,7 +3270,11 @@
     "usage_route_download": "내려받은 파일로",
     "usage_win_command": "시작 메뉴에서 \"PowerShell\"을 검색한 뒤 Windows PowerShell을 【마우스 오른쪽 → \"관리자 권한으로 실행\"】 하세요. 제목 표시줄에 \"관리자\"가 보여야 합니다. 일반 창에 붙여넣으면 중간에 권한 오류가 납니다. 명령을 붙여넣고 Enter, 끝날 때까지 창을 닫지 마세요.",
     "usage_mac_command": "터미널을 열고(응용 프로그램 → 유틸리티, 또는 Spotlight에서 Terminal) 명령을 붙여넣고 Enter. sudo 때문에 로그인 암호를 묻습니다. 입력해도 아무것도 표시되지 않는 것이 정상입니다. 그대로 Enter.",
-    "usage_linux_command": "터미널에 명령을 붙여넣어 실행하세요. sudo를 사용하므로 암호를 묻습니다. sudo가 없으면 root로 로그인해 sudo를 뺀 같은 줄을 실행하세요."
+    "usage_linux_command": "터미널에 명령을 붙여넣어 실행하세요. sudo를 사용하므로 암호를 묻습니다. sudo가 없으면 root로 로그인해 sudo를 뺀 같은 줄을 실행하세요.",
+    "tab_verification": "검증 장치",
+    "group_filter_label": "머신 그룹",
+    "group_direct": "내 것과 개별 공유",
+    "group_all": "전체"
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

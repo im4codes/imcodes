@@ -143,7 +143,6 @@ export function VerificationMachinesSection({
     <section class="controlled-nodes-section verification-machines-section">
       <div class="controlled-nodes-machines-header">
         <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">02</span>
           <h3>{t('controlled_nodes.verification.title')}</h3>
         </div>
         <label>
@@ -154,6 +153,11 @@ export function VerificationMachinesSection({
           </select>
         </label>
       </div>
+      {/* What this is FOR, before how it works. Without it the page reads as
+          another machine list, and the reason to authorize anything here --
+          letting the agent prove a change on a real Windows/macOS/Linux box
+          instead of asserting it should work -- is never stated. */}
+      <p class="verification-machines-purpose">{t('controlled_nodes.verification.purpose')}</p>
       <p class="controlled-nodes-muted">{t('controlled_nodes.verification.help')}</p>
       {error && <p class="verification-machines-error" role="alert">{t('controlled_nodes.verification.error')}</p>}
       {loading ? <p class="controlled-nodes-muted">{t('common.loading')}</p> : (
