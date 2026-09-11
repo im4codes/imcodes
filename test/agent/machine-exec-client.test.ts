@@ -254,6 +254,18 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
     const tooMany = Array.from({ length: MACHINE_LIST_MAX_ITEMS + 1 }, (_v, i) => ({ ...items[0], serverId: `s${i}`, refName: `r${i}` }));
     await expect(listMachines({ ...opts, fetchImpl: list200(tooMany) })).rejects.toBeInstanceOf(MachineControlPlaneError);
   });
+  it('accepts hostServerId, the additive field that took the control plane down', async () => {
+    // A controlled node co-located with a daemon carries host_server_id, and the
+    // Server emits it as `hostServerId`. It was added to the machine DTO but
+    // never added to this allow-list nor to the Server's daemon-strip list, so
+    // every daemon rejected the WHOLE list -- `machine control plane: malformed`
+    // -- the moment any one machine had a canonical host. Presentation only:
+    // access is still resolved server-side per request.
+    const withHost = [{ ...items[0], hostServerId: 'daemon-server-id' }];
+    const r = await listMachines({ ...opts, fetchImpl: list200(withHost) });
+    expect(r.map((m) => m.serverId)).toEqual(['a']);
+  });
+
   it('only a valid empty {machines:[]} is a real empty account', async () => {
     expect(await listMachines({ ...opts, fetchImpl: list200([]) })).toEqual([]);
     await expect(listMachines({

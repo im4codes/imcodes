@@ -65,6 +65,55 @@ export const REMOTE_EXEC_MAX_CHUNK_BYTES = 64 * 1024;
 export const MACHINE_PRESENCE_STALENESS_MS = 90_000;
 /** Explicit maximum returned by list_machines / GET /api/machines. */
 export const MACHINE_LIST_MAX_ITEMS = 200;
+/**
+ * Every key a strict daemon accepts on a machine-list item.
+ *
+ * This lives in shared/ because BOTH ends depend on it and they used to depend
+ * on it separately: the daemon rejects the whole list on any unknown key, and
+ * the Server strips the keys daemons do not know before answering one. Those
+ * two lists were maintained by hand, drifted on `hostServerId`, and the control
+ * plane went down with `malformed` for every account owning a machine with a
+ * canonical host. One list, asserted by test, so the next additive field fails
+ * CI instead of production.
+ */
+/**
+ * The keys the Server actually SENDS to an authenticated daemon.
+ *
+ * `teamIds`/`teamNames` are deliberately NOT here. Group membership is browser
+ * presentation; no daemon reads it (`toSummary` maps nodeId/displayName/os/
+ * online/execEnabled/role and nothing else). Sending it took the control plane
+ * down: the multi-group change started emitting those keys, every daemon built
+ * before the matching allow-list entry rejected the WHOLE list as malformed,
+ * and an account lost control of every machine the moment ONE of them joined a
+ * group. Not sending it fixes every already-deployed daemon without upgrading
+ * any of them.
+ *
+ * Strictly smaller than the tolerated set above: a daemon is told nothing it
+ * does not act on, and every action is re-admitted against the DB anyway. The
+ * response is built by PICKING these, never by omitting known-unwanted ones --
+ * an omit list silently ships each new field to strict daemons the moment
+ * someone forgets to extend it, which is exactly how `hostServerId` took the
+ * control plane down.
+ */
+export const DAEMON_MACHINE_LIST_SENT_KEYS: readonly string[] = [
+  'serverId', 'nodeId', 'name', 'refName', 'displayName',
+  'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs',
+];
+
+/** Build the daemon-facing machine DTO by picking, so new fields cannot leak into it. */
+export function pickDaemonMachineListItem<T extends object>(machine: T): Partial<T> {
+  const source = machine as Record<string, unknown>;
+  const picked: Record<string, unknown> = {};
+  for (const key of DAEMON_MACHINE_LIST_SENT_KEYS) {
+    if (source[key] !== undefined) picked[key] = source[key];
+  }
+  return picked as Partial<T>;
+}
+
+export const DAEMON_MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
+  'serverId', 'nodeId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs',
+  'accessRole', 'daemonVersion', 'updateAvailable', 'autoUnlockConfigured', 'teamIds', 'teamNames', 'hostServerId',
+]);
 /** Envelope input bounds (server is the trust boundary; both ends validate). */
 export const REMOTE_EXEC_MAX_COMMAND_BYTES = 64 * 1024;
 export const REMOTE_EXEC_MAX_CWD_BYTES = 4096;

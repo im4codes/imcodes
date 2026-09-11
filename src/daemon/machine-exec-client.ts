@@ -33,6 +33,7 @@ import {
   type MachineExecHttpEnvelope,
   type MachineExecHttpReason,
   type MachineSummary,
+  DAEMON_MACHINE_LIST_ITEM_KEYS,
 } from '../../shared/remote-exec.js';
 import { isValidMachineName } from '../../shared/machine-reference.js';
 import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
@@ -249,16 +250,11 @@ export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteRes
 
 export type MachineListItem = MachineSummary & { nodeId: string; refName: string; displayName: string; execEnabled: boolean };
 
-const MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
-  'serverId', 'nodeId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs', 'accessRole',
-  'daemonVersion', 'updateAvailable', 'autoUnlockConfigured', 'teamIds', 'teamNames',
-]);
-
 /** Strict per-item validation: known keys only, controlled role, canonical OS (or absent). */
 function isValidMachineListItem(v: unknown): v is MachineListItem {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
   const m = v as Record<string, unknown>;
-  for (const key of Object.keys(m)) if (!MACHINE_LIST_ITEM_KEYS.has(key)) return false;
+  for (const key in m) if (!DAEMON_MACHINE_LIST_ITEM_KEYS.has(key)) return false;
   if (typeof m.serverId !== 'string' || m.serverId.length === 0
     || !isControlledNodeId(m.nodeId)
     || typeof m.name !== 'string' || m.name.length === 0
@@ -274,6 +270,11 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
   if (m.daemonVersion !== undefined && typeof m.daemonVersion !== 'string') return false;
   if (m.updateAvailable !== undefined && typeof m.updateAvailable !== 'boolean') return false;
   if (m.autoUnlockConfigured !== undefined && typeof m.autoUnlockConfigured !== 'boolean') return false;
+  // Which daemon owns this machine's desktop. Emitted once a controlled node has
+  // a canonical host; omitting it here rejected the WHOLE list and took the
+  // control plane down with `malformed`. Presentation only, like the fields
+  // above: access is re-resolved server-side on every request.
+  if (m.hostServerId !== undefined && (typeof m.hostServerId !== 'string' || m.hostServerId.length === 0)) return false;
   // Which groups the machine is in. Presentation only; access is always
   // resolved server-side per request, never from anything this node was told.
   const groupList = (value: unknown): boolean =>

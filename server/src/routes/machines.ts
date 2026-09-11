@@ -13,6 +13,7 @@ import {
   canonicalMachineOs,
   type MachineAccessRole,
   type MachineSummary,
+  pickDaemonMachineListItem,
 } from '../../../shared/remote-exec.js';
 import {
   MACHINE_REASONS,
@@ -92,6 +93,10 @@ export async function listControlledMachines(
   execEnabled: boolean;
   accessRole: MachineAccessRole;
   remoteDesktopHostId?: string;
+  // Declared because it is emitted. It was not, so the daemon-strip list below
+  // could omit it without a type error -- and every strict daemon then rejected
+  // the whole machine list as malformed.
+  hostServerId?: string;
 })[]; overLimit: boolean }> {
   const rows: ControlledRow[] = await listAccessibleControlledMachines(
     db,
@@ -199,15 +204,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   // callers do not need the display-only role because every action is admitted
   // again against the DB; preserve their legacy DTO during rolling upgrades.
   const responseMachines = authenticatedDaemon
-    ? machines.map(({
-      accessRole: _accessRole,
-      remoteDesktopHostId: _remoteDesktopHostId,
-      capabilities: _capabilities,
-      daemonVersion: _daemonVersion,
-      updateAvailable: _updateAvailable,
-      autoUnlockConfigured: _autoUnlockConfigured,
-      ...machine
-    }) => machine)
+    ? machines.map((machine) => pickDaemonMachineListItem(machine))
     : machines;
   return c.json({ machines: responseMachines });
 });
