@@ -45,6 +45,30 @@ const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRun
   }),
 }));
 
+const { truncatedTasksReads } = vi.hoisted(() => ({ truncatedTasksReads: { pending: 0 } }));
+
+/**
+ * Default pass-through. Armed only by `truncateNextTasksRead()`, so every other
+ * test in this file sees the real filesystem unchanged.
+ *
+ * This reproduces what a real agent does when it checks a task off: a
+ * non-atomic rewrite is briefly observable as an empty file by the
+ * orchestrator's own 20ms poll.
+ */
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readFile: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === 'string' && path.endsWith('tasks.md') && truncatedTasksReads.pending > 0) {
+        truncatedTasksReads.pending -= 1;
+        return '';
+      }
+      return (actual.readFile as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+    },
+  };
+});
+
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
   listSessions: listSessionsMock,
@@ -241,6 +265,10 @@ async function writeLatestImplementationMarker(overrides: Record<string, unknown
   await mkdir(dirname(markerPath), { recursive: true });
   await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
   return true;
+}
+
+function truncateNextTasksRead(count = 1): void {
+  truncatedTasksReads.pending = count;
 }
 
 async function emitDeckDemoIdle(): Promise<void> {
@@ -511,6 +539,9 @@ async function startFastImplementationAudit(requestId: string): Promise<MockP2pR
 
 describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   beforeEach(async () => {
+    // Disarm the tasks.md read seam. A test that arms more truncations than it
+    // consumes would otherwise leak them into every later test in this file.
+    truncatedTasksReads.pending = 0;
     projectDir = join(tmpdir(), `imcodes-auto-deliver-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     extraTempDirs = [];
     await makeChange('demo-change');
@@ -569,6 +600,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   });
 
   afterEach(async () => {
+    truncatedTasksReads.pending = 0;
     await clearOpenSpecAutoDeliverRunsForTests();
     clearAllResend();
     await rm(projectDir, { recursive: true, force: true });
@@ -1414,6 +1446,66 @@ exec "${realGit}" "$@"
 
     await waitForP2pStartCount(1);
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('survives a single truncated tasks.md read instead of terminalizing a live run', async () => {
+    // An agent checking a task off rewrites tasks.md non-atomically, so the
+    // orchestrator's own 20ms poll can read it empty. `readTaskStatsForRun`
+    // retried a THROWN read error but not a successful read of truncated
+    // content: that returned `total: 0`, which terminalizes the run as
+    // needs_human/tasks_missing_checkboxes and ends it for good.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-truncated-tasks-read',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    truncateNextTasksRead();
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForP2pStartCount(1);
+    const terminalized = serverLinkMock.send.mock.calls
+      .map((call) => call[0] as { projection?: { status?: string; lastMessage?: string } })
+      .some((msg) => msg?.projection?.lastMessage === 'tasks_missing_checkboxes');
+    expect(terminalized).toBe(false);
+  });
+
+  it('still terminalizes when tasks.md stays empty past the read retry budget', async () => {
+    // The transient-read allowance must not become a blanket exemption: a
+    // tasks.md that is genuinely emptied still has to stop the run.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-persistently-empty-tasks',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    truncateNextTasksRead(50);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) => (
+      (msg as { projection?: { lastMessage?: string } }).projection?.lastMessage === 'tasks_missing_checkboxes'
+    ), SEND_WAIT_MS);
+    expect(startP2pRunMock).not.toHaveBeenCalled();
   });
 
   it('advances implementation from a valid completion marker despite unchecked tasks and without waiting for idle', async () => {

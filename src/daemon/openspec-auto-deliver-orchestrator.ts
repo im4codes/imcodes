@@ -1180,15 +1180,30 @@ async function readTaskStatsForRun(run: AutoDeliverRun): Promise<OpenSpecAutoDel
   // tasks.md can be transiently unreadable/half-written while the agent is
   // checking tasks off; retry a few times before treating it as unreadable so a
   // momentary read race does not hard-fail the run.
+  //
+  // A truncated read does not throw, so the retry above never saw the worst
+  // case. `writeFile` truncates before it writes, and an agent checking a task
+  // off rewrites tasks.md exactly that way, so a poll landing inside the write
+  // parses an EMPTY file and reports `total: 0`. Callers read that as
+  // tasks_missing_checkboxes and terminalize the run -- permanently, for a
+  // file that was intact microseconds later. A run that has already observed
+  // checkboxes cannot legitimately lose every one of them, so treat that
+  // reading as transient too and put it on the same retry budget. A tasks.md
+  // that is genuinely empty still answers zero once the retries are spent.
+  const observedTasksBefore = run.taskStats.total > 0;
   let lastError: unknown;
+  let emptyStats: OpenSpecAutoDeliverTaskStats | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      return await readTaskStats(run.changeRoot);
+      const stats = await readTaskStats(run.changeRoot);
+      if (!observedTasksBefore || stats.total > 0) return stats;
+      emptyStats = stats;
     } catch (error) {
       lastError = error;
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200));
     }
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200));
   }
+  if (emptyStats) return emptyStats;
   throw lastError instanceof Error ? lastError : new Error('tasks_unreadable');
 }
 
