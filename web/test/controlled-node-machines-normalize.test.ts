@@ -300,3 +300,43 @@ describe('controlled-node ticket normalization', () => {
     expect(apiFetch).not.toHaveBeenCalled();
   });
 });
+
+describe('controlled-node group normalization', () => {
+  it('carries the group through, so a machine can be seen to be in one', async () => {
+    // normalizeMachine rebuilds the object field by field. These two were added
+    // to the server and to the type but not to that rebuild, so the UI never saw
+    // them: a group always looked empty, and a machine that had just been added
+    // to one still offered "Add", which reads as the button doing nothing.
+    apiFetch.mockResolvedValueOnce({
+      machines: [{
+        serverId: 'srv-1',
+        nodeId: CONTROLLED_NODE_ID_MIN,
+        online: true,
+        execEnabled: true,
+        teamId: 'team-1',
+        teamName: 'Ops',
+      }],
+    });
+    expect(await listControllableMachines()).toEqual([
+      expect.objectContaining({ teamId: 'team-1', teamName: 'Ops' }),
+    ]);
+  });
+
+  it('omits the group rather than inventing one when the server sends none', async () => {
+    apiFetch.mockResolvedValueOnce({
+      machines: [{
+        serverId: 'srv-2',
+        nodeId: CONTROLLED_NODE_ID_MIN,
+        online: true,
+        execEnabled: true,
+        teamId: '',
+        teamName: 42,
+      }],
+    });
+    const [machine] = await listControllableMachines();
+    // Absent, not empty-string: "in no group" and "in a group whose id is ''"
+    // must not be the same value downstream.
+    expect(machine).not.toHaveProperty('teamId');
+    expect(machine).not.toHaveProperty('teamName');
+  });
+});

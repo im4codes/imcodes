@@ -305,6 +305,12 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     ...(typeof raw.hostServerId === 'string' && raw.hostServerId
       ? { hostServerId: raw.hostServerId }
       : {}),
+    // The group this machine is in. This function rebuilds the object field by
+    // field, so anything not named here is dropped -- which is what happened to
+    // these two: the server sent them, the UI never saw them, so a machine
+    // never appeared to join a group and the Add button looked dead.
+    ...(typeof raw.teamId === 'string' && raw.teamId ? { teamId: raw.teamId } : {}),
+    ...(typeof raw.teamName === 'string' && raw.teamName ? { teamName: raw.teamName } : {}),
   };
 }
 

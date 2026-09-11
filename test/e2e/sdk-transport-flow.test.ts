@@ -1621,6 +1621,15 @@ describe('sdk transport flow e2e', () => {
     }, serverLink);
     await flushAsync();
     await waitForCondition(() => mocks.store.get(SESSION_CX)?.codexSessionId === 'thread-codex-e2e');
+    // The thread id arrives on thread.started, which PRECEDES every item this
+    // test then asserts. Waiting only for the id returns in the window before
+    // the turn has produced anything, and the assertions below read an empty
+    // timeline -- invisible on an idle machine, wide open on a loaded runner.
+    // Wait for the settled final message, which is the last thing the turn
+    // emits.
+    await waitForCondition(() => mocks.emitted.some((e) => e.session === SESSION_CX
+      && e.type === 'assistant.text'
+      && e.payload.streaming === false));
 
     const record = mocks.store.get(SESSION_CX);
     expect(record?.runtimeType).toBe('transport');
