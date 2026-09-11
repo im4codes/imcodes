@@ -1720,10 +1720,10 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       );
       if (!row) return { kind: 'denied' as const };
       if (row.revoked_at != null) return { kind: 'denied' as const };
-      // Tickets minted before Desk scope carry no Desk. They are denied, not
-      // downgraded: falling back to the personal/direct-share model is exactly
-      // the behaviour this boundary replaces.
-      if (!row.desk_team_id) return { kind: 'denied' as const };
+      // A ticket with no group is the normal case: a machine belongs to whoever
+      // installs it, and groups are a later, separate decision. Denying here
+      // rejected every freshly minted link with a 401 -- the mint stopped
+      // requiring a group, and this gate was left behind.
       if (!row.reusable && (row.expires_at == null || Number(row.expires_at) <= now)) {
         return { kind: 'denied' as const };
       }
@@ -1793,12 +1793,22 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       // install that already produced a node returns that same node and grants
       // nothing new, so it must keep working. Creating a NEW node is the act
       // that needs current authority.
-      const deskAuthority = await tx.queryOne<{ role: string }>(
-        `SELECT tm.role FROM team_members tm
-          WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
-        [row.desk_team_id, row.owner_user_id],
-      );
-      if (!deskAuthority) return { kind: 'denied' as const };
+      // Only when the ticket names a group. Between minting and redeeming, the
+      // minter may have been removed from it or downgraded out of a managing
+      // role, and a stale installer must not still file a new SYSTEM-capable
+      // node into a group its holder no longer administers.
+      //
+      // With no group there is nothing to re-check: the machine will belong to
+      // its owner alone. Running the query anyway matched no rows and denied
+      // every group-less install -- which is every install now.
+      if (row.desk_team_id) {
+        const deskAuthority = await tx.queryOne<{ role: string }>(
+          `SELECT tm.role FROM team_members tm
+            WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
+          [row.desk_team_id, row.owner_user_id],
+        );
+        if (!deskAuthority) return { kind: 'denied' as const };
+      }
 
       const serverId = randomHex(16);
       const { nodeId, displayName } = await insertControlledServer(

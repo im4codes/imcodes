@@ -2901,6 +2901,54 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
 });
 
 describe('controlled-node Desk scope at enrollment', () => {
+  it('mints a link with no group and REDEEMS it, end to end', async () => {
+    // The gap that shipped: the mint stopped requiring a group, but the redeem
+    // transaction still denied any ticket without one, so every freshly minted
+    // link answered 401 on the machine. The old tests checked that minting
+    // returned 200 and stored a NULL group -- neither of them ever redeemed,
+    // which is the half where the install actually happens.
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    const { ticket } = await mint.json() as { ticket: string };
+
+    const download = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(download.status).toBe(200);
+    const trailer = decodeEnrollmentTrailer(Buffer.from(await download.arrayBuffer()));
+
+    const redeem = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: trailer!.enrollToken,
+        installId: `inst-${hex(4)}`,
+        nodeTokenHash: sha256(hex(16)),
+        hostname: 'no-group-host',
+        os: 'linux',
+        arch: 'x64',
+      }),
+    });
+    expect(redeem.status, 'a link with no group must still install').toBe(200);
+
+    // And the machine it created belongs to its owner and to no group, which is
+    // the narrowest reachable state rather than a gap.
+    const created = await db.queryOne<{ user_id: string; team_id: string | null }>(
+      'SELECT user_id, team_id FROM servers WHERE user_id = $1 AND node_role = $2',
+      [userId, NODE_ROLE.CONTROLLED],
+    );
+    expect(created).toEqual({ user_id: userId, team_id: null });
+  });
+
   it('mints with no team, and refuses a team the caller does not manage', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -3141,7 +3189,12 @@ describe('controlled-node Desk scope at enrollment', () => {
     expect((await mintLink(deskOf(userId))).status).toBe(200);
   });
 
-  it('denies a Desk-less legacy ticket instead of creating an unbound machine', async () => {
+  it('still re-checks group authority at redeem, when the ticket names one', async () => {
+    // The half of the old Desk-scope rule that still holds. A ticket carrying a
+    // group is redeemed later, possibly much later: if the minter has since
+    // been removed from that group, a stale installer must not file a new
+    // SYSTEM-capable machine into it. What no longer holds is denying a ticket
+    // that names no group at all -- that is now every ordinary install.
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -3158,21 +3211,21 @@ describe('controlled-node Desk scope at enrollment', () => {
     );
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const enrollCode = decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
-    // Exactly the shape a ticket minted before this migration has on disk.
+
+    // The minter loses their managing role in the group after minting.
     await db.execute(
-      'UPDATE controlled_node_enrollments_v2 SET desk_team_id = NULL WHERE id = $1',
-      [enrollment!.id],
+      'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
+      [deskOf(userId), userId],
     );
 
     const redeem = await app.request('/api/enroll/v2/redeem', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         version: 2, enrollToken: enrollCode, installId: `inst-${hex(4)}`,
-        nodeTokenHash: sha256(hex(16)), hostname: 'legacy-host', os: 'linux', arch: 'x64',
+        nodeTokenHash: sha256(hex(16)), hostname: 'stale-host', os: 'linux', arch: 'x64',
       }),
     });
-    // Denied, and no machine exists to fall back to the old personal model.
-    expect(redeem.status).not.toBe(200);
+    expect(redeem.status).toBe(401);
     expect(await db.queryOne<{ count: number }>(
       `SELECT COUNT(*) AS count FROM servers WHERE user_id = $1 AND node_role = 'controlled'`,
       [userId],
