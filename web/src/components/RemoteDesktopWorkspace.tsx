@@ -15,6 +15,8 @@ import {
   type RemoteDesktopWorkspaceTabId,
 } from '../remote-desktop-workspace-state.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
+import { useFullscreen } from '../hooks/useFullscreen.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
 import './remote-desktop-workspace.css';
@@ -36,6 +38,12 @@ export interface RemoteDesktopWorkspaceProps {
   onReorderHost(hostKey: string, direction: -1 | 1): void;
   onCloseWorkspace(): void;
   wallHostKeys?: ReadonlySet<string>;
+  /**
+   * Whether a host may be torn off into its own browser window. Off by
+   * default, and off on mobile, where a popup either never opens or opens as a
+   * tab you cannot get back from.
+   */
+  allowStandaloneWindow?: boolean;
 }
 
 export function RemoteDesktopWorkspace({
@@ -53,8 +61,14 @@ export function RemoteDesktopWorkspace({
   onReorderHost,
   onCloseWorkspace,
   wallHostKeys = new Set(),
+  allowStandaloneWindow = false,
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
+  const workspaceRef = useRef<HTMLDivElement | null>(null);
+  // Fullscreen on the workspace, not on the active panel: the tab bar has to
+  // come with it, or fullscreen becomes a one-way door out of every other
+  // machine you had open.
+  const fullscreen = useFullscreen(workspaceRef);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerMachines, setPickerMachines] = useState<RemoteDesktopWorkspaceMachine[]>([]);
   const [pickerError, setPickerError] = useState(false);
@@ -99,6 +113,21 @@ export function RemoteDesktopWorkspace({
     onCloseWorkspace();
   }, [manager, onCloseWorkspace, state.orderedHostKeys, t, wallHostKeys]);
 
+  /**
+   * Move the active host into its own window.
+   *
+   * The tab closes here once the window is actually open. Leaving it would
+   * keep a second live session on the same machine, and the two would fight
+   * over control of it. If the popup was blocked, nothing is closed -- losing
+   * the session to a blocker you cannot see would be the worst of both.
+   */
+  const openActiveInWindow = useCallback(() => {
+    const hostKey = state.activeTabId;
+    const machine = state.hosts[hostKey]?.machine;
+    if (!machine) return;
+    if (openRemoteDesktopWindow(machine.serverId)) closeHost(hostKey);
+  }, [closeHost, state.activeTabId, state.hosts]);
+
   const selectHost = useCallback((machine: RemoteDesktopWorkspaceMachine) => {
     onOpenHost(machine);
     setPickerOpen(false);
@@ -135,7 +164,7 @@ export function RemoteDesktopWorkspace({
   };
 
   const content = (
-    <div class="remote-desktop-workspace" data-active-tab={state.activeTabId}>
+    <div class="remote-desktop-workspace" ref={workspaceRef} data-active-tab={state.activeTabId}>
       <div class="remote-desktop-workspace-tabbar">
         <div role="tablist" aria-label={t('remote_desktop.workspace_tabs')}>
           {hosts.map(({ hostKey, machine }) => (
@@ -170,6 +199,31 @@ export function RemoteDesktopWorkspace({
           onClick={() => setPickerOpen((current) => !current)}
         ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg></button>
         <div class="remote-desktop-workspace-actions">
+          {allowStandaloneWindow && hosts.length > 0 && (
+            <button
+              class="remote-desktop-workspace-chrome-button remote-desktop-workspace-open-window"
+              type="button"
+              onClick={openActiveInWindow}
+              aria-label={t('remote_desktop.workspace_open_new_window')}
+              title={t('remote_desktop.workspace_open_new_window')}
+            ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 4h5v5M16 4l-7 7M14 11v5H4V6h5" /></svg></button>
+          )}
+          {fullscreen.supported && (
+            <button
+              class="remote-desktop-workspace-chrome-button remote-desktop-workspace-fullscreen"
+              type="button"
+              aria-pressed={fullscreen.active}
+              onClick={() => { void fullscreen.toggle(); }}
+              aria-label={t(fullscreen.active
+                ? 'remote_desktop.workspace_exit_fullscreen'
+                : 'remote_desktop.workspace_fullscreen')}
+              title={t(fullscreen.active
+                ? 'remote_desktop.workspace_exit_fullscreen'
+                : 'remote_desktop.workspace_fullscreen')}
+            >{fullscreen.active
+              ? <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 3v5H3M12 17v-5h5" /></svg>
+              : <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8V4h4M16 12v4h-4M16 8V4h-4M4 12v4h4" /></svg>}</button>
+          )}
           {onMinimize && (
             <button
               class="remote-desktop-workspace-chrome-button"

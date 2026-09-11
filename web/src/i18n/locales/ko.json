@@ -3867,6 +3867,10 @@
       "try_again": "Try again",
       "generic_error": "The request could not be completed.",
       "remote_screen": "Remote desktop screen"
-    }
+    },
+    "exit_fullscreen": "전체 화면 종료",
+    "workspace_open_new_window": "이 컴퓨터를 새 창에서 열기",
+    "workspace_fullscreen": "전체 화면",
+    "workspace_exit_fullscreen": "전체 화면 종료"
   }
 }

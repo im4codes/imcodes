@@ -3868,6 +3868,10 @@
       "try_again": "重试",
       "generic_error": "无法完成请求。",
       "remote_screen": "远程桌面画面"
-    }
+    },
+    "exit_fullscreen": "退出全屏",
+    "workspace_open_new_window": "在新窗口打开这台机器",
+    "workspace_fullscreen": "全屏",
+    "workspace_exit_fullscreen": "退出全屏"
   }
 }

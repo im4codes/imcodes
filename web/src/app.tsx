@@ -7256,6 +7256,9 @@ export function App() {
           onFocus={() => bringDesktopWindowToFront(
             REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
           )}
+          // A popup on a phone either never opens or opens as a tab with no
+          // way back, so the tear-off action is desktop-only.
+          allowStandaloneWindow={!isMobile}
           onOpenHost={openRemoteDesktop}
           onActivateTab={(tabId) => setRemoteDesktopWorkspace((current) => (
             activateRemoteDesktopWorkspaceTab(current, tabId)

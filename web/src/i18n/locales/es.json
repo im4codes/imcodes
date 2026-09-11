@@ -3868,6 +3868,10 @@
       "try_again": "Try again",
       "generic_error": "The request could not be completed.",
       "remote_screen": "Remote desktop screen"
-    }
+    },
+    "exit_fullscreen": "Salir de pantalla completa",
+    "workspace_open_new_window": "Abrir esta máquina en una ventana nueva",
+    "workspace_fullscreen": "Pantalla completa",
+    "workspace_exit_fullscreen": "Salir de pantalla completa"
   }
 }

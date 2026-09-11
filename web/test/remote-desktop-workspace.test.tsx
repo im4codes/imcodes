@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ComponentChildren } from 'preact';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
@@ -17,6 +17,7 @@ import {
 } from '@shared/remote-desktop-platform.js';
 
 const api = vi.hoisted(() => ({
+  openRemoteDesktopWindow: vi.fn(),
   listControllableMachines: vi.fn(),
   getRemoteDesktopWall: vi.fn(),
   mutateRemoteDesktopWall: vi.fn(),
@@ -32,6 +33,10 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('../src/api/machines.js', () => ({
   listControllableMachines: api.listControllableMachines,
+}));
+
+vi.mock('../src/remote-desktop-window.js', () => ({
+  openRemoteDesktopWindow: api.openRemoteDesktopWindow,
 }));
 
 vi.mock('../src/api/remote-desktop-wall.js', () => ({
@@ -63,6 +68,7 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   ),
 }));
 
+import { installFullscreenStub, removeFullscreenStub } from './support/fullscreen-stub.js';
 import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
 import {
@@ -122,6 +128,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   window.confirm = originalConfirm;
+  removeFullscreenStub();
 });
 
 api.getRemoteDesktopWall.mockResolvedValue({ revision: 0, layout: 'grid', hostIds: [], hosts: [] });
@@ -386,5 +393,126 @@ describe('RemoteDesktopWorkspace', () => {
     expect(tablist?.nextElementSibling).toBe(add);
     expect(manager.stop).not.toHaveBeenCalled();
     expect(manager.stopAll).not.toHaveBeenCalled();
+  });
+
+  it('tears the active machine off into its own window, and only then drops the tab', () => {
+    // The button had stopped rendering anywhere: it lived behind `!embedded`
+    // inside the panel, and the workspace mounts every panel embedded.
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager, events } = setupManager();
+    const closeHost = vi.fn();
+    api.openRemoteDesktopWindow.mockReturnValue({} as Window);
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      allowStandaloneWindow
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={closeHost}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_open_new_window' }));
+    // The active tab is the one that moves -- B, not whichever was opened first.
+    expect(api.openRemoteDesktopWindow).toHaveBeenCalledWith('b');
+    expect(closeHost).toHaveBeenCalledWith('b');
+    // And the session here is stopped, so the machine is not being driven from
+    // two places at once.
+    expect(events).toEqual(['stop:b']);
+  });
+
+  it('keeps the tab when the popup was blocked', () => {
+    // Closing on a blocked popup would lose the session to something the
+    // person cannot even see happening.
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager, events } = setupManager();
+    const closeHost = vi.fn();
+    api.openRemoteDesktopWindow.mockReturnValue(null);
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      allowStandaloneWindow
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={closeHost}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_open_new_window' }));
+    expect(api.openRemoteDesktopWindow).toHaveBeenCalledWith('a');
+    expect(closeHost).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it('offers no tear-off where a popup cannot come back', () => {
+    // Mobile, where the default is off.
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_open_new_window' })).toBeNull();
+  });
+
+  it('puts the whole workspace fullscreen, tab bar included, and reports which way it is', async () => {
+    const fullscreen = installFullscreenStub();
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    const result = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    const button = screen.getByRole('button', { name: 'remote_desktop.workspace_fullscreen' });
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+    await act(async () => { fireEvent.click(button); });
+
+    // The workspace element, not the active panel: fullscreening the panel
+    // would take the tab bar away and strand every other machine you had open.
+    expect(fullscreen.requests).toEqual([result.container.querySelector('.remote-desktop-workspace')]);
+    const pressed = screen.getByRole('button', { name: 'remote_desktop.workspace_exit_fullscreen' });
+    expect(pressed.getAttribute('aria-pressed')).toBe('true');
+
+    // Esc is the usual way out, and the button has to follow it.
+    await act(async () => { fullscreen.setElement(null); });
+    expect(screen.getByRole('button', { name: 'remote_desktop.workspace_fullscreen' })
+      .getAttribute('aria-pressed')).toBe('false');
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace:fullscreen[\s\S]*height:\s*100vh/);
+  });
+
+  it('offers no fullscreen button in a browser that would refuse it', () => {
+    // An iframe without `allowfullscreen` reports `fullscreenEnabled: false`.
+    installFullscreenStub({ enabled: false });
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_fullscreen' })).toBeNull();
   });
 });

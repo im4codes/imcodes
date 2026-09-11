@@ -56,6 +56,7 @@ import { formatByteRate, formatByteSize } from '../util/byte-size.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
+import { useFullscreen } from '../hooks/useFullscreen.js';
 import {
   REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
   recordRemoteDesktopBrowserDiagnostic,
@@ -347,6 +348,10 @@ export function RemoteDesktopPanel({
   const lastFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  // Shared with the workspace chrome, so that Esc, a second fullscreen
+  // elsewhere on the page, and a browser that refuses outright all behave the
+  // same wherever the button appears.
+  const fullscreen = useFullscreen(panelRef);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
@@ -1697,10 +1702,6 @@ export function RemoteDesktopPanel({
     onClose();
   };
 
-  const toggleFullscreen = async () => {
-    if (document.fullscreenElement) await document.exitFullscreen();
-    else await panelRef.current?.requestFullscreen();
-  };
 
   const updateTransfer = (id: string, patch: Partial<RemoteDesktopTransferRow>) => {
     setTransfers((current) => current.map((row) => (
@@ -1998,7 +1999,13 @@ export function RemoteDesktopPanel({
           <div class="remote-desktop-view-switch" role="group" aria-label={t('remote_desktop.scale_label')}>
             <button type="button" aria-pressed={viewScale === 'fit'} onClick={() => setViewScale('fit')}>{t('remote_desktop.fit')}</button>
             <button type="button" aria-pressed={viewScale === 'actual'} onClick={() => setViewScale('actual')}>{t('remote_desktop.actual_size')}</button>
-            <button type="button" onClick={() => { void toggleFullscreen(); }}>{t('remote_desktop.fullscreen')}</button>
+            {fullscreen.supported && (
+              <button
+                type="button"
+                aria-pressed={fullscreen.active}
+                onClick={() => { void fullscreen.toggle(); }}
+              >{t(fullscreen.active ? 'remote_desktop.exit_fullscreen' : 'remote_desktop.fullscreen')}</button>
+            )}
           </div>
           <div class="remote-desktop-clipboard-switch" role="group" aria-label={t('remote_desktop.clipboard_label')}>
             <button

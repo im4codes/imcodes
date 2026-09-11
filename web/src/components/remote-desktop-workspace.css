@@ -12,6 +12,15 @@
   background: var(--chrome-bg);
 }
 
+/* Fullscreen takes the workspace out of its floating panel, so it has to say
+   its own size here -- inheriting `height: 100%` from a parent that is no
+   longer laying it out leaves it collapsed in the corner of a black screen. */
+.remote-desktop-workspace:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+}
+
 .remote-desktop-wall {
   display: flex;
   min-height: 0;

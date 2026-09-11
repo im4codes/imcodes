@@ -3868,6 +3868,10 @@
       "try_again": "重試",
       "generic_error": "無法完成要求。",
       "remote_screen": "遠端桌面畫面"
-    }
+    },
+    "exit_fullscreen": "退出全螢幕",
+    "workspace_open_new_window": "在新視窗開啟這台機器",
+    "workspace_fullscreen": "全螢幕",
+    "workspace_exit_fullscreen": "退出全螢幕"
   }
 }
