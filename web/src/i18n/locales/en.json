@@ -3283,7 +3283,8 @@
     "team_error_user_required": "Enter a username.",
     "team_error_self_add_denied": "You are already in this group.",
     "team_error_group_manage_denied": "You do not manage this group.",
-    "team_error_desk_membership_required": "That person is not allowed in this group."
+    "team_error_desk_membership_required": "That person is not allowed in this group.",
+    "confirm_again": "Sure?"
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

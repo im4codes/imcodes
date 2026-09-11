@@ -3282,7 +3282,8 @@
     "team_error_user_required": "ユーザー名を入力してください。",
     "team_error_self_add_denied": "すでにこのグループにいます。",
     "team_error_group_manage_denied": "このグループを管理できません。",
-    "team_error_desk_membership_required": "その人はこのグループに入れません。"
+    "team_error_desk_membership_required": "その人はこのグループに入れません。",
+    "confirm_again": "本当に?"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

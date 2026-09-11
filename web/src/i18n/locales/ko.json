@@ -3282,7 +3282,8 @@
     "team_error_user_required": "사용자 이름을 입력하세요.",
     "team_error_self_add_denied": "이미 이 그룹에 있습니다.",
     "team_error_group_manage_denied": "이 그룹을 관리할 권한이 없습니다.",
-    "team_error_desk_membership_required": "그 사람은 이 그룹에 들어올 수 없습니다."
+    "team_error_desk_membership_required": "그 사람은 이 그룹에 들어올 수 없습니다.",
+    "confirm_again": "확인?"
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

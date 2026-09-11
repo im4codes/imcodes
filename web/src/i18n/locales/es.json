@@ -3283,7 +3283,8 @@
     "team_error_user_required": "Escribe un nombre de usuario.",
     "team_error_self_add_denied": "Ya estás en este grupo.",
     "team_error_group_manage_denied": "No gestionas este grupo.",
-    "team_error_desk_membership_required": "Esa persona no puede entrar en este grupo."
+    "team_error_desk_membership_required": "Esa persona no puede entrar en este grupo.",
+    "confirm_again": "¿Seguro?"
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

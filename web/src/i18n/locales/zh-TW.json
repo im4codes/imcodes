@@ -3283,7 +3283,8 @@
     "team_error_user_required": "請輸入使用者名稱。",
     "team_error_self_add_denied": "你已經在這個群組裡了。",
     "team_error_group_manage_denied": "你沒有管理這個群組的權限。",
-    "team_error_desk_membership_required": "這個人不能加入該群組。"
+    "team_error_desk_membership_required": "這個人不能加入該群組。",
+    "confirm_again": "確認?"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

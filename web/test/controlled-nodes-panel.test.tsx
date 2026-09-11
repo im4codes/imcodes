@@ -1244,6 +1244,12 @@ describe('ControlledNodesPanel — copy install command', () => {
 
 
 describe('ControlledNodesPanel teams tab', () => {
+  /** These actions change who can reach a machine, so they ask again first. */
+  const confirmClick = async (el: HTMLButtonElement) => {
+    await act(async () => { fireEvent.click(el); });
+    await act(async () => { fireEvent.click(el); });
+  };
+
   const openTeams = (container: HTMLElement) => act(() => {
     (container.querySelector('[data-testid="controlled-nodes-tab-teams"]') as HTMLButtonElement).click();
   });
@@ -1281,9 +1287,10 @@ describe('ControlledNodesPanel teams tab', () => {
     expect(container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-out"]')).toBeNull();
 
     await act(async () => { fireEvent.input(pick, { target: { value: 'srv-out' } }); });
-    await act(async () => {
-      fireEvent.click(container.querySelector('[data-testid="controlled-nodes-machine-add"]') as HTMLButtonElement);
-    });
+    const add = container.querySelector('[data-testid="controlled-nodes-machine-add"]') as HTMLButtonElement;
+    await act(async () => { fireEvent.click(add); });
+    expect(bindMachineToTeam, 'one click only arms it').not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(add); });
     expect(bindMachineToTeam).toHaveBeenCalledWith('srv-out', 'team-1');
 
     // The panel disables its actions while one is in flight, so wait for the
@@ -1294,7 +1301,7 @@ describe('ControlledNodesPanel teams tab', () => {
       if (!el || el.disabled) throw new Error('remove action still busy');
       return el;
     });
-    await act(async () => { fireEvent.click(removeIn); });
+    await confirmClick(removeIn);
     // null, not '': the server rejects a blank group, so a malformed body can
     // never silently unfile a machine.
     expect(bindMachineToTeam).toHaveBeenLastCalledWith('srv-in', null);
@@ -1317,9 +1324,7 @@ describe('ControlledNodesPanel teams tab', () => {
       return el;
     });
     await act(async () => { fireEvent.input(input, { target: { value: 'ghost' } }); });
-    await act(async () => {
-      fireEvent.click(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
-    });
+    await confirmClick(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
 
     await waitFor(() => {
       expect(container.textContent).toContain('controlled_nodes.team_error_user_not_found');
@@ -1354,9 +1359,7 @@ describe('ControlledNodesPanel teams tab', () => {
       return el;
     });
     await act(async () => { fireEvent.input(input, { target: { value: 'alice' } }); });
-    await act(async () => {
-      fireEvent.click(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
-    });
+    await confirmClick(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
     expect(addTeamMember).toHaveBeenCalledWith('team-1', 'alice');
   });
 

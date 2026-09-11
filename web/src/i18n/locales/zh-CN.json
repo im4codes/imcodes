@@ -3283,7 +3283,8 @@
     "team_error_user_required": "请输入用户名。",
     "team_error_self_add_denied": "你已经在这个分组里了。",
     "team_error_group_manage_denied": "你没有管理这个分组的权限。",
-    "team_error_desk_membership_required": "这个人不能加入该分组。"
+    "team_error_desk_membership_required": "这个人不能加入该分组。",
+    "confirm_again": "确认?"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

@@ -13,6 +13,7 @@ import {
   type TeamSummary,
 } from '../api.js';
 import type { MachineListItem } from '../api/machines.js';
+import { ConfirmButton } from './ConfirmButton.js';
 
 /**
  * Teams: make one, put people in it, put machines in it.
@@ -192,13 +193,17 @@ export function TeamManagementPanel({
                         onInput={(event) => setMemberInput(event.currentTarget.value)}
                         onKeyDown={(event) => { if (event.key === 'Enter') onAddMember(); }}
                       />
-                      <button
-                        type="button"
-                        class="controlled-nodes-action-btn"
-                        data-testid="controlled-nodes-member-add"
+                      {/* Adding someone hands them every machine in the group,
+                          so it asks once before it does that. */}
+                      <ConfirmButton
+                        className="controlled-nodes-action-btn"
+                        confirmClassName="controlled-nodes-action-btn"
+                        testId="controlled-nodes-member-add"
                         disabled={busy || !memberInput.trim()}
-                        onClick={onAddMember}
-                      >{t('controlled_nodes.team_member_add')}</button>
+                        label={t('controlled_nodes.team_member_add')}
+                        confirmLabel={t('controlled_nodes.confirm_again')}
+                        onConfirm={onAddMember}
+                      />
                     </div>
                   )}
                   <ul class="controlled-nodes-team-list">
@@ -229,15 +234,17 @@ export function TeamManagementPanel({
                           <span class="controlled-nodes-role-tag">{t(`controlled_nodes.team_role_${member.role}`)}</span>
                         )}
                         {canManage && member.role !== 'owner' && (
-                          <button
-                            type="button"
-                            class="controlled-nodes-danger-btn"
-                            data-testid={`controlled-nodes-member-remove-${member.user_id}`}
-                            onClick={() => void run(async () => {
+                          <ConfirmButton
+                            className="controlled-nodes-danger-btn"
+                            testId={`controlled-nodes-member-remove-${member.user_id}`}
+                            disabled={busy}
+                            label={t('controlled_nodes.team_member_remove')}
+                            confirmLabel={t('controlled_nodes.confirm_again')}
+                            onConfirm={() => void run(async () => {
                               await removeTeamMember(selectedId, member.user_id);
                               await loadDetail(selectedId);
                             })}
-                          >{t('controlled_nodes.team_member_remove')}</button>
+                          />
                         )}
                       </li>
                     ))}
@@ -260,16 +267,17 @@ export function TeamManagementPanel({
                           <li key={machine.serverId}>
                             <span class="controlled-nodes-team-name">{machine.displayName}</span>
                             {machine.accessRole === 'owner' ? (
-                              <button
-                                type="button"
-                                class="controlled-nodes-danger-btn"
-                                data-testid={`controlled-nodes-team-machine-remove-${machine.serverId}`}
+                              <ConfirmButton
+                                className="controlled-nodes-danger-btn"
+                                testId={`controlled-nodes-team-machine-remove-${machine.serverId}`}
                                 disabled={busy}
-                                onClick={() => void run(async () => {
+                                label={t('controlled_nodes.team_machine_remove')}
+                                confirmLabel={t('controlled_nodes.confirm_again')}
+                                onConfirm={() => void run(async () => {
                                   await bindMachineToTeam(machine.serverId, null);
                                   await onMachinesChanged();
                                 })}
-                              >{t('controlled_nodes.team_machine_remove')}</button>
+                              />
                             ) : (
                               <span class="controlled-nodes-role-tag">{t('controlled_nodes.team_machine_not_yours')}</span>
                             )}
@@ -294,17 +302,21 @@ export function TeamManagementPanel({
                           </option>
                         ))}
                       </select>
-                      <button
-                        type="button"
-                        class="controlled-nodes-action-btn"
-                        data-testid="controlled-nodes-machine-add"
+                      {/* Filing a machine hands it to everyone running the
+                          group, so it asks once too. */}
+                      <ConfirmButton
+                        className="controlled-nodes-action-btn"
+                        confirmClassName="controlled-nodes-action-btn"
+                        testId="controlled-nodes-machine-add"
                         disabled={busy || !machineToAdd}
-                        onClick={() => void run(async () => {
+                        label={t('controlled_nodes.team_machine_add')}
+                        confirmLabel={t('controlled_nodes.confirm_again')}
+                        onConfirm={() => void run(async () => {
                           await bindMachineToTeam(machineToAdd, selectedId);
                           setMachineToAdd('');
                           await onMachinesChanged();
                         })}
-                      >{t('controlled_nodes.team_machine_add')}</button>
+                      />
                     </div>
                   )}
                 </div>

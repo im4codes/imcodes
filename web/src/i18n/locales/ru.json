@@ -3282,7 +3282,8 @@
     "team_error_user_required": "Введите имя пользователя.",
     "team_error_self_add_denied": "Вы уже в этой группе.",
     "team_error_group_manage_denied": "Вы не управляете этой группой.",
-    "team_error_desk_membership_required": "Этого человека нельзя добавить."
+    "team_error_desk_membership_required": "Этого человека нельзя добавить.",
+    "confirm_again": "Точно?"
   },
   "peerAuditQuick": {
     "iconLabel": "Пир-аудит",
