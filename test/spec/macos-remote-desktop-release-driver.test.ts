@@ -133,28 +133,35 @@ describe('macOS remote-desktop release driver', () => {
     // "build tool reported failure" before reading a byte of output -- and it
     // did so after the components had been compiled, signed and notarized,
     // which is a long way to travel for a missing field.
-    const ok = commandResult('/bin/echo', ['hello']);
-    expect(ok.status).toBe(0);
-    expect(ok.stdout).toContain('hello');
-
-    // And BOTH streams. The guards read output that exists only on stderr:
-    // `codesign --display --verbose=4` prints Identifier, TeamIdentifier and
-    // the CodeDirectory flags there and leaves stdout empty. An adapter
-    // returning stdout alone reported a correctly hardened binary as "not
-    // signed with the Hardened Runtime" -- it had discarded the stream that
-    // said so, and the release build got as far as notarizing four components
-    // before saying it.
-    const display = commandResult('/usr/bin/codesign', ['--display', '--verbose=4', '/bin/ls']);
-    expect(display.status).toBe(0);
-    expect(display.stderr).toContain('CodeDirectory');
-
-    // A non-zero exit is returned, not thrown, so the guard that asked can say
+    // One command that writes to both streams and exits non-zero, so all
+    // three properties are asserted at once -- and on any Unix, because this
+    // suite also runs on Linux where codesign does not exist.
+    const both = commandResult('/bin/sh', ['-c', 'echo out; echo err >&2; exit 3']);
+    expect(both.stdout.trim()).toBe('out');
+    expect(both.stderr.trim()).toBe('err');
+    // Returned, not thrown, so the guard that asked is the one that names
     // which check failed rather than the adapter deciding for it.
-    const failed = commandResult('/usr/bin/false', []);
-    expect(failed.status).not.toBe(0);
-    expect(typeof failed.stdout).toBe('string');
-    expect(typeof failed.stderr).toBe('string');
+    expect(both.status).toBe(3);
+
+    const ok = commandResult('/bin/sh', ['-c', 'exit 0']);
+    expect(ok.status).toBe(0);
   });
+
+  it.runIf(process.platform === 'darwin')(
+    'reads the signing details codesign prints only to stderr',
+    () => {
+      // The real motivation, and macOS-only: `codesign --display --verbose=4`
+      // puts Identifier, TeamIdentifier and the CodeDirectory flags on stderr
+      // and leaves stdout empty. An adapter returning stdout alone reported a
+      // correctly hardened binary as "not signed with the Hardened Runtime" --
+      // it had discarded the stream that said so, and the release build got as
+      // far as notarizing four components before saying it.
+      const display = commandResult('/usr/bin/codesign', ['--display', '--verbose=4', '/bin/ls']);
+      expect(display.status).toBe(0);
+      expect(display.stderr).toContain('CodeDirectory');
+      expect(display.stdout).toBe('');
+    },
+  );
 
   it('builds the requirement codesign actually emits for Developer ID', () => {
     // Checked against a real Developer ID signature rather than against
