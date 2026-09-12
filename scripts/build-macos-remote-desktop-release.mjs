@@ -137,6 +137,31 @@ export function notarizeComponents(input, dependencies = {}) {
 }
 
 /**
+ * Run a verification tool and report what it did, including its exit status.
+ *
+ * `commandText` refuses a result without a numeric `status` -- and an adapter
+ * that returned only stdout and stderr made `status` undefined, so every guard
+ * failed identically with "build tool reported failure" before reading a byte
+ * of output. A non-zero exit is returned rather than thrown so the guard that
+ * asked can say which check failed and on what.
+ */
+export function commandResult(tool, args) {
+  try {
+    return {
+      stdout: run(tool, args, { stdio: ['ignore', 'pipe', 'pipe'] }),
+      stderr: '',
+      status: 0,
+    };
+  } catch (error) {
+    return {
+      stdout: String(error?.stdout ?? ''),
+      stderr: String(error?.stderr ?? error?.message ?? ''),
+      status: typeof error?.status === 'number' ? error.status : 1,
+    };
+  }
+}
+
+/**
  * Everything the daemon checks on a user's Mac, run here instead.
  *
  * Returned measurements are what the manifest describes, so the file that is
@@ -148,10 +173,7 @@ export async function verifyComponents(plan, artifactRoot, dependencies = {}) {
     const executablePath = join(artifactRoot, component.fileName);
     measured[component.kind] = await verifyBuiltMacosRemoteDesktopComponent(
       plan, component, executablePath, {
-        run: dependencies.run ?? (async (tool, args) => ({
-          stdout: run(tool, args, { stdio: ['ignore', 'pipe', 'pipe'] }),
-          stderr: '',
-        })),
+        run: dependencies.run ?? commandResult,
         readFile: dependencies.readFile ?? ((path) => readFile(path)),
       },
     );

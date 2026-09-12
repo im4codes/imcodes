@@ -6,6 +6,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   buildMacosRemoteDesktopRelease,
+  commandResult,
   compileComponents,
   notarizeComponents,
   signComponent,
@@ -123,6 +124,24 @@ describe('macOS remote-desktop release driver', () => {
       result.plan.components.map((component: { entitlementsFile: string }) => component.entitlementsFile),
     );
     expect(entitlements.size).toBe(MACOS_REMOTE_DESKTOP_BUILD_COMPONENT_ORDER.length);
+  });
+
+  it('reports an exit status with every command it runs', () => {
+    // `commandText` refuses a result without a numeric `status`. An adapter
+    // returning only stdout and stderr left it undefined, so every guard threw
+    // "build tool reported failure" before reading a byte of output -- and it
+    // did so after the components had been compiled, signed and notarized,
+    // which is a long way to travel for a missing field.
+    const ok = commandResult('/bin/echo', ['hello']);
+    expect(ok.status).toBe(0);
+    expect(ok.stdout).toContain('hello');
+
+    // A non-zero exit is returned, not thrown, so the guard that asked can say
+    // which check failed rather than the adapter deciding for it.
+    const failed = commandResult('/usr/bin/false', []);
+    expect(failed.status).not.toBe(0);
+    expect(typeof failed.stdout).toBe('string');
+    expect(typeof failed.stderr).toBe('string');
   });
 
   it('hands codesign an absolute entitlements path', async () => {
