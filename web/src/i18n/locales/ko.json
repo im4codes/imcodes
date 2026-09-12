@@ -3871,6 +3871,10 @@
     "exit_fullscreen": "전체 화면 종료",
     "workspace_open_new_window": "이 컴퓨터를 새 창에서 열기",
     "workspace_fullscreen": "전체 화면",
-    "workspace_exit_fullscreen": "전체 화면 종료"
+    "workspace_exit_fullscreen": "전체 화면 종료",
+    "request_permission": "권한 요청",
+    "requesting_permission": "해당 Mac에 요청 중…",
+    "request_permission_failed": "해당 Mac에서 대화상자를 표시하지 못했습니다.",
+    "request_permission_hint": "해당 Mac에서 권한 대화상자를 엽니다. 그 앞에 있는 사람이 응답해야 합니다."
   }
 }

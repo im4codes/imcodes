@@ -15,6 +15,15 @@ import {
 
 export const MACOS_REMOTE_DESKTOP_READINESS_MODE = Object.freeze({
   UNAVAILABLE: 'unavailable',
+  /**
+   * Everything is in place except the one grant only the person at the machine
+   * can give. Distinct from UNAVAILABLE because the two need opposite things
+   * from the operator: one is "this machine cannot do remote control", the
+   * other is "click allow on that Mac". Collapsing them -- which is what
+   * advertising nothing did -- leaves a machine that is one dialog away from
+   * working looking permanently unsupported.
+   */
+  PERMISSION_REQUIRED: 'permission_required',
   VIEW: 'view',
   CONTROL: 'control',
 } as const);
@@ -58,10 +67,27 @@ export function resolveMacosRemoteDesktopRuntimeProfile(
 ): MacosRemoteDesktopRuntimeProfile {
   if (!input.artifactVerified
     || !input.activeUserQualified
-    || !input.screenRecording
     || !input.encoder
     || !input.disclosure) {
     return EMPTY_PROFILE;
+  }
+
+  // Screen recording is the one input a machine cannot grant itself, so its
+  // absence is reported rather than hidden. The advertised set deliberately
+  // carries NO capture capability: that is what makes it unlaunchable, and it
+  // is exactly the shape the web resolver reads as "screen recording
+  // required". Without it the node advertised nothing at all and the browser
+  // could not tell a Mac awaiting one click from a Mac that will never work.
+  if (!input.screenRecording) {
+    return Object.freeze({
+      mode: MACOS_REMOTE_DESKTOP_READINESS_MODE.PERMISSION_REQUIRED,
+      sessionCapabilities: Object.freeze([
+        REMOTE_DESKTOP_SESSION_CAPABILITY,
+        REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+        REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      ]),
+      adapterCapabilities: Object.freeze([REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY]),
+    });
   }
 
   const control = input.accessibility;

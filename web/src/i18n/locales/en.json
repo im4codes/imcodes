@@ -3872,6 +3872,10 @@
     "exit_fullscreen": "Exit full screen",
     "workspace_open_new_window": "Open this machine in a new window",
     "workspace_fullscreen": "Full screen",
-    "workspace_exit_fullscreen": "Exit full screen"
+    "workspace_exit_fullscreen": "Exit full screen",
+    "request_permission": "Grant access",
+    "requesting_permission": "Asking that Mac…",
+    "request_permission_failed": "Could not raise the prompt on that Mac.",
+    "request_permission_hint": "Opens the permission dialog on that Mac. Someone at the machine has to answer it."
   }
 }

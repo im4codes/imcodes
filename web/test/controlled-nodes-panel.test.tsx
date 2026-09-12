@@ -1040,9 +1040,18 @@ describe('ControlledNodesPanel (12.3)', () => {
     const legacy = rows.find((row) => row.textContent?.includes('Legacy Ready'))!;
     expect(missing.querySelector('[data-readiness="screen_recording_required"]')).not.toBeNull();
     expect(missing.textContent).toContain('remote_desktop.macos_screen_recording_guidance');
-    expect(missing.querySelector('.controlled-nodes-remote-desktop')).toBeNull();
+    // Not openable -- but no longer silent either. The machine is one grant
+    // away, so it offers to ask for it rather than showing nothing, which read
+    // as "this Mac will never do remote desktop".
+    const permission = missing.querySelector('.controlled-nodes-remote-desktop.is-permission-required');
+    expect(permission).not.toBeNull();
+    expect(permission!.textContent).toBe('remote_desktop.request_permission');
+    expect(missing.querySelector(
+      '.controlled-nodes-remote-desktop:not(.is-permission-required)',
+    )).toBeNull();
     expect(legacy.querySelector('.remote-desktop-readiness')).toBeNull();
     expect(legacy.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(legacy.querySelector('.is-permission-required')).toBeNull();
   });
 
   it('keeps one Share entry and opens Owner invitations inside that dialog without connecting', async () => {

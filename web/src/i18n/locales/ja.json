@@ -3871,6 +3871,10 @@
     "exit_fullscreen": "全画面を終了",
     "workspace_open_new_window": "このマシンを新しいウィンドウで開く",
     "workspace_fullscreen": "全画面",
-    "workspace_exit_fullscreen": "全画面を終了"
+    "workspace_exit_fullscreen": "全画面を終了",
+    "request_permission": "アクセスを許可",
+    "requesting_permission": "その Mac に要求中…",
+    "request_permission_failed": "その Mac でダイアログを表示できませんでした。",
+    "request_permission_hint": "その Mac で許可ダイアログを開きます。実機の前にいる人が応答する必要があります。"
   }
 }

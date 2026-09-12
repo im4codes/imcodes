@@ -6,6 +6,7 @@ import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
   REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_PERMISSION_MSG,
 } from '../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_CAPABILITIES } from '../../shared/controlled-node-capabilities.js';
 import { createControlledNodeRuntime } from '../../src/node/runtime.js';
@@ -106,6 +107,41 @@ describe('macOS remote-desktop install wiring', () => {
       socket.open();
       expect(authCapabilities(socket)).not.toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
     }
+  });
+
+  it('asks the machine to raise its own permission prompt', async () => {
+    // The grant cannot be made remotely: macOS shows that dialog only to a
+    // responsible signed application in the console user's session, and only a
+    // person can answer it. All the node can do is ask.
+    const socket = new MockSocket();
+    const requestPermissions = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      requestMacosRemoteDesktopPermissions: requestPermissions,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_PERMISSION_MSG.REQUEST }));
+    await vi.waitFor(() => expect(requestPermissions).toHaveBeenCalledOnce());
+  });
+
+  it('refuses a permission request carrying caller-controlled fields', async () => {
+    const socket = new MockSocket();
+    const requestPermissions = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      requestMacosRemoteDesktopPermissions: requestPermissions,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_PERMISSION_MSG.REQUEST,
+      executable: '/tmp/anything',
+    }));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    expect(requestPermissions).not.toHaveBeenCalled();
   });
 
   it('is a capability the server will actually relay', async () => {

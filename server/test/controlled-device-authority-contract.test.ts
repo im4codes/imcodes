@@ -24,6 +24,7 @@ const MACHINE_ACTION_PATHS = [
   '/:serverId/auto-unlock',
   '/:serverId/display-name',
   '/:serverId/exec-enabled',
+  '/:serverId/remote-desktop-permissions',
   '/:serverId/remote-desktop-worker',
   '/:serverId/revoke',
 ] as const;

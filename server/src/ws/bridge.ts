@@ -178,7 +178,9 @@ import { isRemoteDesktopFeatureEnabled } from '../../../shared/remote-desktop-fe
 import { resolveRemoteDesktopSessionProfile } from '../../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
+  REMOTE_DESKTOP_PERMISSION_MSG,
 } from '../../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_OS_WIN, isControlledNodeOs, type ControlledNodeOs } from '../../../shared/controlled-node-artifacts.js';
 import {
@@ -9196,13 +9198,36 @@ export class WsBridge {
   tryInstallControlledNodeRemoteDesktopWorker(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
     if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    // Either platform's install offer. Checking only the Windows capability
+    // refused the request from a macOS node that had just advertised it could
+    // install -- the browser showed the button, the node was ready to act, and
+    // the relay in between dropped it.
     if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
-      || !this.hasDaemonCapability(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)) return 'offline';
+      || !(this.hasDaemonCapability(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+        || this.hasDaemonCapability(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY))) return 'offline';
     try {
       this.daemonWs.send(JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
       return 'sent';
     } catch (err) {
       logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop worker repair');
+      return 'send_failed';
+    }
+  }
+
+  /**
+   * Ask a node to raise its own permission dialog. Never queued or replayed:
+   * a prompt that appears minutes later, on a machine nobody is watching, is
+   * worse than none -- the person who asked for it has gone.
+   */
+  tryRequestControlledNodeRemoteDesktopPermissions(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) return 'offline';
+    try {
+      this.daemonWs.send(JSON.stringify({ type: REMOTE_DESKTOP_PERMISSION_MSG.REQUEST }));
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop permissions');
       return 'send_failed';
     }
   }

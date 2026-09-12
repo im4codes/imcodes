@@ -78,6 +78,7 @@ import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-featu
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_PERMISSION_MSG,
   REMOTE_DESKTOP_INSTALL_MSG,
 } from '../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
@@ -248,6 +249,8 @@ export interface ControlledNodeRuntimeOptions {
    * release's component set and promotes it.
    */
   installMacosRemoteDesktopComponents?: () => Promise<boolean>;
+  /** Injected for the same reason: raising a real TCC prompt needs a real Mac. */
+  requestMacosRemoteDesktopPermissions?: () => Promise<boolean>;
   onAuthenticated?: () => void | Promise<void>;
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
@@ -847,6 +850,23 @@ export function createControlledNodeRuntime(
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
         const reply = await computerUseWorker.handle(message);
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
+      if (message.type === REMOTE_DESKTOP_PERMISSION_MSG.REQUEST) {
+        // No caller-controlled fields, for the same reason the install request
+        // has none: there is exactly one thing to ask for, and a parameterised
+        // version is a way to make a controlled node launch something chosen
+        // from a browser.
+        if (Object.keys(message).length !== 1) return;
+        const request = options.requestMacosRemoteDesktopPermissions
+          ?? options.macosRemoteDesktopWorker?.requestPermissions;
+        if (request) {
+          void Promise.resolve(request()).then((asked) => {
+            if (asked) logger.info('asked the machine to raise its remote-desktop permission prompt');
+          }, (error) => {
+            logger.warn({ err: error }, 'could not raise the remote-desktop permission prompt');
+          });
+        }
         return;
       }
       if (message.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST) {

@@ -997,6 +997,35 @@ export function createMacosRemoteDesktopProductionDependencies(
         return UNAVAILABLE_READINESS;
       }
     },
+    /**
+     * Put the machine's own permission dialog on screen.
+     *
+     * The prompt is raised by the signed worker running as the console user,
+     * which is the only principal macOS will attribute the grant to -- a
+     * background daemon asking gets nothing, silently. Nothing here decides
+     * whether the grant was given: the answer arrives as a readiness change
+     * the next time readiness is read.
+     */
+    async requestPermissions(): Promise<boolean> {
+      const artifact = await selectArtifact(storeRoot, 'current', { runtime: { platform, arch } })
+        ?? await selectArtifact(storeRoot, 'lastKnownGood', { runtime: { platform, arch } });
+      if (!artifact) return false;
+      try {
+        const user = await resolveUser();
+        await assertMacosRemoteDesktopStoreTrusted(storeRoot, artifact.releaseName, {
+          runtime: { platform, arch },
+        });
+        await executeNativeCommand(
+          user,
+          artifact.components.worker,
+          [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.requestPermissions],
+        );
+        return true;
+      } catch (error) {
+        dependencies.onBackgroundError?.(error);
+        return false;
+      }
+    },
     async inspectGraphicalReadiness(
       artifact: VerifiedMacosRemoteDesktopArtifact,
       authority: MacosRemoteDesktopGraphicalSessionAuthority,

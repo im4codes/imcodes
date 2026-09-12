@@ -35,7 +35,6 @@ describe('macOS remote-desktop runtime readiness', () => {
   it.each([
     'artifactVerified',
     'activeUserQualified',
-    'screenRecording',
     'encoder',
     'disclosure',
   ] as const)('advertises nothing when %s is unavailable', (field) => {
@@ -48,6 +47,35 @@ describe('macOS remote-desktop runtime readiness', () => {
       sessionCapabilities: [],
       adapterCapabilities: [],
     });
+  });
+
+  it('says screen recording is missing instead of saying nothing', () => {
+    // Screen recording is the one input a machine cannot grant itself, and it
+    // is reported so the operator can be told to go click allow. Advertising
+    // nothing made a Mac one dialog away from working indistinguishable from
+    // one that will never work.
+    //
+    // The set carries no capture capability, which is what keeps it
+    // unlaunchable -- and is exactly the shape the browser reads as "screen
+    // recording required".
+    const profile = resolveMacosRemoteDesktopRuntimeProfile({ ...READY, screenRecording: false });
+    expect(profile.mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.PERMISSION_REQUIRED);
+    expect([...profile.sessionCapabilities, ...profile.adapterCapabilities])
+      .not.toContain(REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT);
+    expect(resolveRemoteDesktopSessionProfile([
+      ...profile.sessionCapabilities,
+      ...profile.adapterCapabilities,
+    ])).toBeNull();
+  });
+
+  it('does not offer to ask when the components are not even there', () => {
+    // Absent components are not a permission problem. Offering "grant access"
+    // for them sends the operator to a dialog that cannot help.
+    for (const field of ['artifactVerified', 'activeUserQualified', 'encoder', 'disclosure'] as const) {
+      expect(resolveMacosRemoteDesktopRuntimeProfile({
+        ...READY, screenRecording: false, [field]: false,
+      }).mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE);
+    }
   });
 
   it('advertises a valid View-only profile without Accessibility', () => {

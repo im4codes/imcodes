@@ -28,6 +28,26 @@ export const REMOTE_DESKTOP_INSTALLABLE_CAPABILITY = 'remote.desktop.windows.ins
  */
 export const REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY = 'remote.desktop.macos.installable.v1' as const;
 
+/**
+ * Browser → node: ask the machine to put its permission dialog on screen.
+ *
+ * Separate from the install request because it asks for something different:
+ * the components are already there, and what is missing is a grant only the
+ * person sitting at that Mac can give. macOS will not let a background service
+ * grant itself screen recording, and it will not show the dialog unless a
+ * responsible, signed application asks for it -- so the node cannot simply
+ * "enable" this, and the browser cannot do anything except ask the machine to
+ * ask.
+ *
+ * Like the install request it carries no fields. There is exactly one thing to
+ * request, and a parameterised version would be a way to make a controlled
+ * node launch something chosen elsewhere.
+ */
+export const REMOTE_DESKTOP_PERMISSION_MSG = {
+  /** Browser → node: request the local TCC prompt. */
+  REQUEST: 'remote_desktop.permission_request',
+} as const;
+
 export const REMOTE_DESKTOP_INSTALL_MSG = {
   /** Browser → daemon: fetch and install the worker bundle. */
   REQUEST: 'remote_desktop.worker_install',

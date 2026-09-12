@@ -3872,6 +3872,10 @@
     "exit_fullscreen": "退出全屏",
     "workspace_open_new_window": "在新窗口打开这台机器",
     "workspace_fullscreen": "全屏",
-    "workspace_exit_fullscreen": "退出全屏"
+    "workspace_exit_fullscreen": "退出全屏",
+    "request_permission": "申请权限",
+    "requesting_permission": "正在请求该 Mac…",
+    "request_permission_failed": "无法在该 Mac 上弹出授权窗口。",
+    "request_permission_hint": "会在那台 Mac 上弹出授权窗口，需要有人在机器前点击允许。"
   }
 }

@@ -127,6 +127,13 @@ export interface MacosRemoteDesktopWorkerHostOptions {
    * fabricated username, HOME or TMPDIR.
    */
   resolveGraphicalSessionAuthority?(): Promise<MacosRemoteDesktopGraphicalSessionAuthority>;
+  /**
+   * Asks the machine to raise its own permission dialog, and reports only
+   * whether the ASK was dispatched. Deliberately not a readiness answer: the
+   * person at the keyboard decides, and the outcome shows up as a readiness
+   * change whenever readiness is next read.
+   */
+  requestPermissions?(): Promise<boolean>;
   /** Reads effective TCC/encoder/disclosure readiness without prompting or OS inference. */
   inspectReadiness(
     artifact: VerifiedMacosRemoteDesktopArtifact,
