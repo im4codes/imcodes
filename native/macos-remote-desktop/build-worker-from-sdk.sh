@@ -135,6 +135,19 @@ SDK_FLAGS+=( "-I$SCRIPT_DIR" "-I$COMMON_DIR" "-I$REPOSITORY_ROOT/native" )
 SDK_FLAGS+=( "-I$SDK_ROOT/include/third_party/jsoncpp/source/include" )
 SDK_FLAGS+=( "--target=$TARGET_TRIPLE" "-isysroot" "$SYSROOT" )
 
+# The deployment target has to be on the LINK line as well, not only when
+# compiling. Without it the linker writes LC_BUILD_VERSION from its own default
+# -- the host SDK -- and the component announces `minos 26.0`: a binary that
+# refuses to launch on every macOS older than the build machine's, which is
+# almost every machine this ships to. Taken from the SDK's recorded flags so
+# the objects and the load command can never disagree.
+DEPLOYMENT_TARGET_FLAG=""
+for flag in "${SDK_FLAGS[@]}"; do
+  case "$flag" in -mmacos-version-min=*) DEPLOYMENT_TARGET_FLAG="$flag" ;; esac
+done
+[[ -n "$DEPLOYMENT_TARGET_FLAG" ]] \
+  || { echo 'SDK compile configuration records no -mmacos-version-min' >&2; exit 1; }
+
 # --- Objective-C ARC ----------------------------------------------------------
 # Which sources need ARC is read out of BUILD.gn rather than restated here.
 # The two must agree exactly: a file compiled without ARC that expects it fails
@@ -249,7 +262,7 @@ link_component() {
   needs_arc "$main_source" && main_rsp="$ARC_RESPONSE_FILE"
   "$CLANG" --driver-mode=g++ "@$main_rsp" -c "$SCRIPT_DIR/$main_source" -o "$main_object"
   "$CLANG" --driver-mode=g++ \
-    "--target=$TARGET_TRIPLE" -isysroot "$SYSROOT" \
+    "--target=$TARGET_TRIPLE" -isysroot "$SYSROOT" "$DEPLOYMENT_TARGET_FLAG" \
     -fuse-ld=lld -B "$SDK_ROOT/toolchain/bin" -nostdlib++ \
     "$main_object" "$SHARED_ARCHIVE" \
     "$SDK_ROOT/lib/libwebrtc.a" \
@@ -264,6 +277,13 @@ link_component() {
   described="$(lipo -info "$ARTIFACT_ROOT/$output")"
   [[ "$described" == *"is architecture: $MACHO_ARCH" ]] \
     || { echo "linked $output is not thin $MACHO_ARCH: $described" >&2; exit 1; }
+  # Read back from the Mach-O, because the flag being on the command line is
+  # not evidence the load command carries it.
+  local expected_minos="${DEPLOYMENT_TARGET_FLAG#-mmacos-version-min=}"
+  local actual_minos
+  actual_minos="$(otool -l "$ARTIFACT_ROOT/$output" | awk '/^ *minos /{print $2; exit}')"
+  [[ "$actual_minos" == "$expected_minos" ]] \
+    || { echo "linked $output announces minos $actual_minos, expected $expected_minos" >&2; exit 1; }
   echo "component=$ARTIFACT_ROOT/$output"
 }
 

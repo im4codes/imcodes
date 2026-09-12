@@ -82,6 +82,28 @@ describe('macOS remote-desktop consumer', () => {
     expect(consumer).toContain('lipo -info');
   });
 
+  it('puts the deployment target on the link line and reads it back', () => {
+    // Compiling with `-mmacos-version-min` is not enough. Without it when
+    // LINKING, the linker writes LC_BUILD_VERSION from its own default -- the
+    // host SDK -- and the component announces `minos 26.0`: a binary that
+    // refuses to launch on every macOS older than the build machine's. It
+    // builds, it runs on the builder, and it is broken for almost everyone.
+    // Specifically on the link invocation, not merely defined somewhere: the
+    // whole defect is that it was present when compiling and absent when
+    // linking.
+    expect(consumer).toMatch(
+      /-isysroot "\$SYSROOT" "\$DEPLOYMENT_TARGET_FLAG"[\s\S]{0,80}-fuse-ld=lld/u,
+    );
+    expect(consumer).toContain('-mmacos-version-min');
+    // Taken from the SDK's recorded flags, so the objects and the load command
+    // cannot disagree, and never hardcoded here.
+    expect(consumer).not.toMatch(/-mmacos-version-min=\d/u);
+    // And read back out of the Mach-O: a flag on the command line is not
+    // evidence that the load command carries it.
+    expect(consumer).toContain('otool -l');
+    expect(consumer).toContain('announces minos');
+  });
+
   it('keeps the aiDesk agent and the build spike out of the components', () => {
     // The agent is the app bundle's entry point and links none of this; the
     // spike is a probe. Compiling either into the shared archive would put a
