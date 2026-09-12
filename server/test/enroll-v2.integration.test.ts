@@ -43,6 +43,7 @@ import {
   EXPECTED_USER_ID_HEADER,
 } from '../../shared/http-header-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
+import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
 import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
@@ -241,7 +242,12 @@ async function writeMacosRemoteDesktopRelease(
       teamId,
       bundles: Object.fromEntries(REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map((kind) => [kind, {
         bundleIdentifier: bundleIdentifiers[kind],
-        designatedRequirement: `identifier "${bundleIdentifiers[kind]}" and anchor apple generic and certificate leaf[subject.OU] = "${teamId}"`,
+        // Built, not spelled. This fixture hand-wrote the requirement and got
+        // two things wrong at once: it quoted a team ID that codesign leaves
+        // bare, and it omitted the two Developer ID marker OIDs entirely -- so
+        // it described a signature no component could ever carry, and the
+        // manifest was refused with a 503 that named nothing.
+        designatedRequirement: appleDesignatedRequirement(bundleIdentifiers[kind], teamId),
         hardenedRuntime: true,
       }])),
     },
