@@ -11,6 +11,9 @@ import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-d
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { SUPERVISION_CONTRACT_IDS } from '../../shared/supervision-config.js';
 import { REAL_DEVICE_TESTING_SYSTEM_GUIDANCE } from '../../shared/transport-runtime-prompts.js';
+import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machine.js';
+import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -722,7 +725,16 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('full absolute filesystem path');
       expect(systemText).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
       expect(systemText).toContain('perform it before audit');
-      expect(systemText).toContain('ask the user for the specific authorization needed');
+      // Discovery comes BEFORE asking. The guidance used to go straight from
+      // "use controlled nodes" to "ask the user", with no way to learn which
+      // machines were already authorized for this user and project -- so the
+      // verification machines configured for exactly this went unused.
+      expect(systemText).toContain(`call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST}`);
+      expect(systemText.indexOf(VERIFICATION_MACHINE_MCP_TOOLS.LIST))
+        .toBeLessThan(systemText.indexOf('ask the user for that specific authorization'));
+      // Both kinds the list can return, each with the tool that reaches it.
+      expect(systemText).toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+      expect(systemText).toContain(ALIAS_MCP_TOOLS.RESOLVE);
       expect(systemText).toContain(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
       expect(systemText).toContain('the user\'s latest explicit instruction is authoritative');
       expect(systemText).toContain('This does not override platform system/developer instructions');
