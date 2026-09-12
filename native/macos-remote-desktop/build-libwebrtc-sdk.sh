@@ -228,7 +228,8 @@ GN_ARGS="$GN_ARGS mac_deployment_target=\"$MINIMUM_MACOS_VERSION\""
     "$OVERLAY_RELATIVE:imcodes_macos_libwebrtc_sdk" \
     "$OVERLAY_RELATIVE:imcodes_macos_libwebrtc_test_sdk" \
     "buildtools/third_party/libc++:libc++" \
-    "buildtools/third_party/libc++abi:libc++abi" )
+    "buildtools/third_party/libc++abi:libc++abi" \
+    "third_party/jsoncpp" )
 
 # --- collect ------------------------------------------------------------------
 # The payload is upstream's OWN archive, not the wrapper target above.
@@ -288,6 +289,20 @@ rm -f "$LIBCXX_RUNTIME"
 [[ "$(head -c 8 "$LIBCXX_RUNTIME")" == '!<arch>' ]] \
   || { echo 'libc++ runtime archive is thin and would not survive the trip out of the build directory' >&2; exit 1; }
 
+# The one dependency the components link that libwebrtc.a does not contain.
+# `//:webrtc` does not depend on jsoncpp, so its objects are in neither archive
+# and nothing in this graph would build it unless it is named: the components
+# reach it through //native/remote-desktop-common, and without it a consumer
+# link ends in a page of undefined Json::Value symbols.
+# Upstream declares it `source_set("jsoncpp")`, which emits object files and no
+# archive at all, so there is never one to copy -- it is always assembled here.
+JSONCPP_OBJECTS=( "$BUILD_DIR"/obj/third_party/jsoncpp/jsoncpp/*.o )
+[[ ${#JSONCPP_OBJECTS[@]} -ge 3 && -f "${JSONCPP_OBJECTS[0]}" ]] \
+  || { echo "pinned jsoncpp object set is incomplete (${#JSONCPP_OBJECTS[@]} objects)" >&2; exit 1; }
+rm -f "$ARTIFACT_ROOT/lib/libjsoncpp.a"
+"$WEBRTC_ROOT/third_party/llvm-build/Release+Asserts/bin/llvm-ar" crs \
+  "$ARTIFACT_ROOT/lib/libjsoncpp.a" "${JSONCPP_OBJECTS[@]}"
+
 TEST_ARCHIVE="$BUILD_DIR/obj/$OVERLAY_RELATIVE/libimcodes_macos_libwebrtc_test_sdk.a"
 [[ -f "$TEST_ARCHIVE" ]] || { echo "test archive missing: $TEST_ARCHIVE" >&2; exit 1; }
 install -m 0644 "$TEST_ARCHIVE" "$ARTIFACT_ROOT/lib/libimcodes_macos_libwebrtc_test_sdk.a"
@@ -301,6 +316,7 @@ case "$TARGET_CPU" in
   x64) EXPECTED_MACHO_ARCH="x86_64" ;;
 esac
 for staged in "$ARTIFACT_ROOT/lib/libwebrtc.a" "$LIBCXX_RUNTIME" \
+  "$ARTIFACT_ROOT/lib/libjsoncpp.a" \
   "$ARTIFACT_ROOT/lib/libimcodes_macos_libwebrtc_test_sdk.a"; do
   STAGED_ARCH="$(lipo -info "$staged" 2>&1)"
   [[ "$STAGED_ARCH" == "Non-fat file: $staged is architecture: $EXPECTED_MACHO_ARCH" ]] \

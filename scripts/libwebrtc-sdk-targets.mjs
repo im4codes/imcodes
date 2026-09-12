@@ -93,6 +93,10 @@ const MACOS_REQUIRED_FILES = [
   // libc++.a is a thin archive pointing into the build directory, so this one
   // is re-archived from the objects.
   'lib/libimcodes_macos_libcxx_runtime_sdk.a',
+  // Linked by the components through //native/remote-desktop-common and
+  // contained in neither libwebrtc.a nor the runtime archive, because
+  // `//:webrtc` does not depend on it.
+  'lib/libjsoncpp.a',
   'lib/libimcodes_macos_libwebrtc_test_sdk.a',
   // The objects were compiled against Chromium's bundled libc++, which lives in
   // the `std::__Cr` inline namespace. A consumer using Apple clang and the
