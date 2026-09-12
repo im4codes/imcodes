@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  macosBootstrapSocketDirectoryRefusal,
   MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR,
   MACOS_REMOTE_DESKTOP_BOOTSTRAP_MESSAGE,
   MACOS_REMOTE_DESKTOP_BOOTSTRAP_VERSION,
@@ -403,3 +404,29 @@ function exchange(socketPath: string, value: unknown): Promise<string> {
     });
   });
 }
+
+describe('macOS bootstrap socket directory trust', () => {
+  const dir = (overrides: Partial<{ uid: number; gid: number; mode: number; symlink: boolean; directory: boolean }> = {}) => ({
+    uid: overrides.uid ?? 0,
+    gid: overrides.gid ?? 0,
+    mode: overrides.mode ?? 0o40755,
+    isDirectory: () => overrides.directory ?? true,
+    isSymbolicLink: () => overrides.symlink ?? false,
+  });
+
+  it('accepts the ownership a real Mac actually produces', () => {
+    // /private/var/run is root:daemon, so a directory created inside it is
+    // gid 1. Requiring gid 0 refused this on every real machine and the
+    // listener never started.
+    expect(macosBootstrapSocketDirectoryRefusal(dir({ gid: 1 }))).toBeNull();
+    expect(macosBootstrapSocketDirectoryRefusal(dir({ gid: 0 }))).toBeNull();
+  });
+
+  it('still refuses anything another principal could write or swap', () => {
+    expect(macosBootstrapSocketDirectoryRefusal(dir({ uid: 501 }))).toBe('socket_directory_untrusted');
+    expect(macosBootstrapSocketDirectoryRefusal(dir({ mode: 0o40775 }))).toBe('socket_directory_untrusted');
+    expect(macosBootstrapSocketDirectoryRefusal(dir({ mode: 0o40757 }))).toBe('socket_directory_untrusted');
+    expect(macosBootstrapSocketDirectoryRefusal(dir({ symlink: true }))).toBe('socket_directory_not_directory');
+    expect(macosBootstrapSocketDirectoryRefusal(dir({ directory: false }))).toBe('socket_directory_not_directory');
+  });
+});

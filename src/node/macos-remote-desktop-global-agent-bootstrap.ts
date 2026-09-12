@@ -86,8 +86,17 @@ interface ActiveInstance {
   readonly grant: MacosRemoteDesktopBootstrapGrant;
 }
 
-function fail(code: string): never {
-  throw new Error(code);
+/**
+ * Throw a bootstrap error, optionally naming WHICH check refused.
+ *
+ * One code is shared by several distinct checks. Without the detail, a
+ * production log showed `macos_remote_desktop_bootstrap_invalid_launch` every
+ * five minutes and gave no way to tell a stale socket from a live one from a
+ * wrongly owned directory -- the difference between a race and a check that can
+ * never pass. The code stays first so anything matching on it still matches.
+ */
+function fail(code: string, detail?: string): never {
+  throw new Error(detail ? `${code}:${detail}` : code);
 }
 
 function isPositiveUint32(value: unknown): value is number {
@@ -337,21 +346,47 @@ export interface MacosRemoteDesktopGlobalAgentBootstrapListenerOptions {
   onBackgroundError?(error: unknown): void;
 }
 
+/**
+ * Why the bootstrap socket's directory cannot be trusted, or null if it can.
+ *
+ * Pure, so the rule can be tested without root. The check it replaces lived
+ * inside a function hard-wired to the production path under /var/run, which no
+ * test could reach -- and it demanded gid 0, which on macOS is never true for a
+ * directory created in root:daemon /var/run. It failed on every real Mac and
+ * nothing in the suite could see it.
+ */
+export function macosBootstrapSocketDirectoryRefusal(stats: {
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+  uid: number;
+  mode: number;
+}): string | null {
+  if (!stats.isDirectory() || stats.isSymbolicLink()) return 'socket_directory_not_directory';
+  // Owner and writability are what matter. The group is not: a group without
+  // the write bit grants nothing.
+  if (stats.uid !== 0 || (stats.mode & 0o022) !== 0) return 'socket_directory_untrusted';
+  return null;
+}
+
 async function prepareProductionSocketPath(path: string): Promise<void> {
   if (path !== MACOS_REMOTE_DESKTOP_BOOTSTRAP_SOCKET_PATH || !isAbsolute(path)) {
-    fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH);
+    fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH, 'socket_path_unexpected');
   }
   const directory = dirname(path);
   await mkdir(directory, { recursive: true, mode: 0o755 });
   const stats = await lstat(directory);
-  if (!stats.isDirectory() || stats.isSymbolicLink()
-    || stats.uid !== 0 || stats.gid !== 0 || (stats.mode & 0o022) !== 0) {
-    fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH);
-  }
+  // Root-owned and writable by nobody else. The GROUP is deliberately not
+  // required to be 0: macOS's /var/run is root:daemon, and a directory created
+  // inside it inherits that group, so demanding gid 0 made this check fail on
+  // every real Mac -- the listener never started and remote desktop could not
+  // come up at all. A group with no write bit grants nothing, which is the
+  // property this check exists to enforce.
+  const refusal = macosBootstrapSocketDirectoryRefusal(stats);
+  if (refusal) fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH, refusal);
   try {
     const existing = await lstat(path);
     if (!existing.isSocket() || existing.isSymbolicLink()) {
-      fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH);
+      fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH, 'socket_path_not_socket');
     }
     const active = await new Promise<boolean>((resolve) => {
       const probe = net.createConnection({ path });
@@ -373,11 +408,11 @@ async function prepareProductionSocketPath(path: string): Promise<void> {
         finish(error.code !== 'ECONNREFUSED' && error.code !== 'ENOENT');
       });
     });
-    if (active) fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH);
+    if (active) fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH, 'socket_already_listening');
     const current = await lstat(path);
     if (!current.isSocket() || current.isSymbolicLink()
       || current.dev !== existing.dev || current.ino !== existing.ino) {
-      fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH);
+      fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH, 'socket_replaced_during_probe');
     }
     await unlink(path);
   } catch (error) {
@@ -393,7 +428,7 @@ async function secureProductionSocketPath(path: string): Promise<void> {
   const stats = await lstat(path);
   if (!stats.isSocket() || stats.isSymbolicLink()
     || stats.uid !== 0 || stats.gid !== 0 || (stats.mode & 0o7777) !== 0o666) {
-    fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH);
+    fail(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.INVALID_LAUNCH, 'socket_not_secured');
   }
 }
 
