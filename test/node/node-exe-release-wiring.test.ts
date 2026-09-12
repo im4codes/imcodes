@@ -252,6 +252,57 @@ describe('controlled-node executable release wiring', () => {
     expect(sdkPublishScript).not.toContain("'-Command'");
   });
 
+  it('builds the macOS remote-desktop components into the image, and proves they are there', () => {
+    const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+
+    // The gap this closes: every remote-desktop build step in this job was
+    // guarded `if: runner.os == 'Windows'`, so the image shipped a macOS node
+    // that self-upgrades and then finds nothing to fetch -- the server answers
+    // `remote_desktop_worker_not_built` and macOS remote desktop is simply
+    // unavailable.
+    const componentBuild = workflow.indexOf(
+      'name: Build, sign and notarize the macOS remote-desktop components',
+    );
+    expect(componentBuild).toBeGreaterThan(-1);
+    // Bounded at the NEXT step, not by a character count. A fixed-length
+    // window ran past the end of this step and matched the platform guard of
+    // the one after it, so flipping this step back to Windows -- the exact
+    // regression being guarded -- still passed.
+    const nextStep = workflow.indexOf('\n      - name:', componentBuild);
+    expect(nextStep).toBeGreaterThan(componentBuild);
+    const buildStep = workflow.slice(componentBuild, nextStep);
+    expect(buildStep).toContain("if: runner.os == 'macOS'");
+    expect(buildStep).toContain('scripts/build-macos-remote-desktop-release.mjs');
+    // Both architectures, from the shell loop that drives them -- not a
+    // per-arch assertion, because the workflow spells `$arch` once and lets
+    // the loop supply the values.
+    expect(buildStep).toContain('for arch in arm64 x64; do');
+    expect(buildStep).toContain('native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json');
+    expect(buildStep).toContain('--artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch"');
+
+    // Built from the PUBLISHED, locked SDK. Rebuilding it here would take
+    // hours and would not be the SDK the lock names.
+    expect(buildStep).toContain('scripts/install-libwebrtc-sdk.mjs');
+    expect(buildStep).toContain('scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock');
+
+    // And the image assembly must CHECK for them. This verifier defaults to
+    // the Windows target when none is named, so the missing macOS sets were
+    // never a failure -- naming every target is what makes their absence one.
+    const imageVerify = workflow.indexOf(
+      'name: Verify remote-desktop worker artifacts for every target',
+    );
+    expect(imageVerify).toBeGreaterThan(-1);
+    const nextVerifyStep = workflow.indexOf('\n      - name:', imageVerify);
+    expect(nextVerifyStep).toBeGreaterThan(imageVerify);
+    const verifyStep = workflow.slice(imageVerify, nextVerifyStep);
+    expect(verifyStep).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64');
+    expect(verifyStep).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"');
+
+    // The upload has to carry them, or the Docker job downloads a set that
+    // never left the build runner.
+    expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
+  });
+
   it('exposes the embedded runtime version without bootstrapping or installing', () => {
     const entry = readFileSync('src/node/index.ts', 'utf8');
     expect(entry).toContain("process.argv[2] === '--version'");
