@@ -233,9 +233,23 @@ jobs:
             imcodes-remote-desktop-disclosure \
             imcodes-virtual-display-helper; do
             test -x "$component"
-            output="$(./"$component" --imcodes-ci-probe 2>&1 | head -1)"
-            test -n "$output"
-            echo "$component -> $output"
+            # A usage error is the CORRECT answer to a nonsense argument: these
+            # exit 64 (EX_USAGE) and name the invocation they did not
+            # understand. What is being distinguished here is a process that
+            # ran from one that could not -- 126 and 127 are the shell's codes
+            # for "cannot execute", which is what a wrong-architecture binary
+            # or a missing dynamic library produces.
+            set +e
+            output="$(./"$component" --imcodes-ci-probe 2>&1)"
+            status=$?
+            set -e
+            if [ "$status" -ge 126 ] && [ "$status" -le 127 ]; then
+              echo "$component could not be executed (exit $status)" >&2
+              exit 1
+            fi
+            first="$(printf '%s\n' "$output" | head -1)"
+            test -n "$first"
+            echo "$component -> $first (exit $status)"
           done
 
   # ── Windows unit tests (WezTerm backend) ──────────────────────────────────
