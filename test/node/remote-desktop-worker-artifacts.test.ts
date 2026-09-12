@@ -9,6 +9,8 @@ import {
   PINNED_DEPOT_TOOLS_REVISION,
   PINNED_LIBWEBRTC_REVISION,
   REMOTE_DESKTOP_MACOS_TEAM_ID as PACKAGING_REMOTE_DESKTOP_MACOS_TEAM_ID,
+  REMOTE_DESKTOP_PROTOCOL_VERSION as PACKAGING_REMOTE_DESKTOP_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_WORKER_IPC_VERSION as PACKAGING_REMOTE_DESKTOP_WORKER_IPC_VERSION,
   REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME,
   REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME,
   REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME,
@@ -29,7 +31,9 @@ import {
   type RemoteDesktopMacosArchitecture,
   type RemoteDesktopMacosWorkerManifest,
   REMOTE_DESKTOP_MACOS_TEAM_ID,
+  REMOTE_DESKTOP_WORKER_IPC_VERSION,
 } from '../../shared/remote-desktop-worker.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 
 const dirs: string[] = [];
 const WORKER_VERSION = '2026.8.1234';
@@ -317,6 +321,12 @@ describe('remote desktop worker release artifact verifier', () => {
     expect(validateSharedWorkerReleaseManifest(manifest, target)).not.toBeNull();
     expect(manifest.codeSignature.teamId).toBe(REMOTE_DESKTOP_MACOS_TEAM_ID);
     expect(PACKAGING_REMOTE_DESKTOP_MACOS_TEAM_ID).toBe(REMOTE_DESKTOP_MACOS_TEAM_ID);
+    // The packaging module mirrors these because it must be importable from a
+    // plain `node scripts/...` run, where the TypeScript originals are not.
+    // A drift here would put a protocol version in the manifest that the
+    // daemon reading it does not accept.
+    expect(PACKAGING_REMOTE_DESKTOP_PROTOCOL_VERSION).toBe(REMOTE_DESKTOP_PROTOCOL_VERSION);
+    expect(PACKAGING_REMOTE_DESKTOP_WORKER_IPC_VERSION).toBe(REMOTE_DESKTOP_WORKER_IPC_VERSION);
   });
 
   it('moves the runtime and plain-Node packaging trust roots together from one JSON source', async () => {

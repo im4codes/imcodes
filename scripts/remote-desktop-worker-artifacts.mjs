@@ -17,6 +17,12 @@ export const REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX = '.manifest.json';
 export const REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION = 4;
 export const REMOTE_DESKTOP_MACOS_WORKER_ARTIFACT_KIND = 'macos-component-set';
 export const REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME = 'imcodes-remote-desktop.manifest.json';
+// Mirrored from shared/remote-desktop.ts and shared/remote-desktop-worker.ts,
+// which are TypeScript and therefore unreachable from a plain `node scripts/…`
+// invocation. `test/node/remote-desktop-worker-artifacts.test.ts` asserts each
+// of these equals its shared original, the same way the team ID already is.
+export const REMOTE_DESKTOP_PROTOCOL_VERSION = 2;
+export const REMOTE_DESKTOP_WORKER_IPC_VERSION = 1;
 export const REMOTE_DESKTOP_MACOS_WORKER_FILENAME = 'imcodes-remote-desktop-worker';
 export const REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME = 'imcodes-remote-desktop-launch-agent';
 export const REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME = 'imcodes-remote-desktop-disclosure';
