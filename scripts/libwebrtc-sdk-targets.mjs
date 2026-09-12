@@ -40,12 +40,33 @@ const MACOS_SOURCE_INPUTS = [
   'native/macos-remote-desktop/libwebrtc-sdk.gni',
   'native/macos-remote-desktop/sdk_anchor.cc',
   'native/macos-remote-desktop/build-libwebrtc-sdk.sh',
-  // TODO(macos-sdk-notices): the macOS SDK notices generator belongs here, as
-  // the Windows list ends with its own generator. This is the ONLY place it has
-  // to be added. Nothing macOS has been published yet, so appending it is still
-  // free; once a macos-* release exists, appending changes the fingerprint and
-  // forces a full rebuild.
+  // The notices the SDK ships are as much part of its identity as its objects:
+  // a change to how they are derived must produce a different SDK, exactly as
+  // the Windows list ends with its own generator.
+  'scripts/generate-macos-libwebrtc-notices.py',
 ];
+
+/**
+ * The GN target inventory the macOS SDK's THIRD_PARTY_NOTICES.webrtc.md must
+ * declare, compared byte-for-byte against the generator's own
+ * `",".join(sorted(...))`.
+ *
+ * One label, because the SDK's payload is one artifact: `obj/libwebrtc.a`, the
+ * archive `//:webrtc` produces. The producer's overlay target only pulls that
+ * label into the graph -- GN does not re-expand a `complete_static_lib`
+ * dependency, so the overlay's own archive is an anchor object and nothing
+ * else, and describing it would certify an empty closure.
+ *
+ * Deliberately NOT the four product executable labels: those belong to the
+ * product build's notices, and reusing them here would claim the SDK ships
+ * IM.codes executables it does not contain.
+ *
+ * The toolchain the SDK also redistributes -- clang, ld64.lld, llvm-ar,
+ * llvm-strip, libclang_rt.osx.a and the bundled libc++ headers -- has no GN
+ * edge at all and is covered by the generator's required-redistributed set,
+ * not by this list.
+ */
+const MACOS_SDK_LIBWEBRTC_NOTICE_TARGETS = ['//:webrtc'];
 
 const MACOS_REQUIRED_TOP_LEVEL_ENTRIES = [
   'THIRD_PARTY_NOTICES.webrtc.md',
@@ -57,12 +78,28 @@ const MACOS_REQUIRED_TOP_LEVEL_ENTRIES = [
 ];
 
 const MACOS_REQUIRED_FILES = [
-  'lib/libimcodes_macos_libwebrtc_sdk.a',
+  // Upstream's own `//:webrtc` archive, not the overlay wrapper's. GN does not
+  // re-expand a `complete_static_lib` dependency, so the wrapper archive holds
+  // one anchor object and two kilobytes -- it stages and publishes perfectly
+  // and links against nothing.
+  'lib/libwebrtc.a',
   'lib/libimcodes_macos_libwebrtc_test_sdk.a',
-  // TODO(macos-sdk-layout): the collect section of
-  // native/macos-remote-desktop/build-libwebrtc-sdk.sh does not export a
-  // toolchain yet. The remaining required files (the pinned clang/libc++ pieces
-  // the consumer links against) are added HERE once that section lands.
+  // The objects were compiled against Chromium's bundled libc++, which lives in
+  // the `std::__Cr` inline namespace. A consumer using Apple clang and the
+  // system libc++ mangles every name differently and matches no symbol in the
+  // archive, so the compiler and its headers travel with the objects.
+  // One real binary per name. `clang++` and `lld-link` are only symlinks that
+  // change clang's and lld's argv[0]; staging them would duplicate 185MB into
+  // an archive CI downloads on every cache miss. C++ is driven with
+  // `clang --driver-mode=g++`, and `ld64.lld` is lld's Mach-O driver, which
+  // must carry that exact name for `-fuse-ld=lld` to find it.
+  'toolchain/bin/clang',
+  'toolchain/bin/ld64.lld',
+  'toolchain/bin/llvm-ar',
+  'toolchain/bin/llvm-strip',
+  'toolchain/lib/libclang_rt.osx.a',
+  'include/buildtools/third_party/libc++/__config_site',
+  'include/third_party/libc++/src/include/__config',
 ];
 
 /**
@@ -109,6 +146,7 @@ function defineTarget({
   toolchainKeys,
   buildArgs,
   noticesFormat,
+  noticeTargets = null,
   releaseTitlePrefix,
 }) {
   const releaseTagPrefix = `libwebrtc-sdk-${id}`;
@@ -134,6 +172,9 @@ function defineTarget({
     toolchainKeys: Object.freeze([...toolchainKeys]),
     buildArgs,
     noticesFormat,
+    // Only the inventory-header format carries a target list; the Windows
+    // notices are plain sections and have none to compare.
+    noticeTargets: noticeTargets === null ? null : Object.freeze([...noticeTargets]),
     releaseTag: (sourceSha256, archiveSha256) =>
       `${releaseTagPrefix}-${sourceSha256.slice(0, 16)}-${archiveSha256.slice(0, 16)}`,
     releaseTitle: (sourceSha256) => `${releaseTitlePrefix} ${sourceSha256.slice(0, 16)}`,
@@ -182,9 +223,10 @@ const TARGETS = Object.freeze({
     sourceInputs: MACOS_SOURCE_INPUTS,
     requiredTopLevelEntries: MACOS_REQUIRED_TOP_LEVEL_ENTRIES,
     requiredFiles: MACOS_REQUIRED_FILES,
-    toolchainKeys: ['xcode', 'macosSdk', 'clang'],
+    toolchainKeys: ['xcode', 'macosSdk', 'clang', 'hostArch'],
     buildArgs: macosBuildArgs('arm64'),
     noticesFormat: 'macos-inventory',
+    noticeTargets: MACOS_SDK_LIBWEBRTC_NOTICE_TARGETS,
     releaseTitlePrefix: 'Pinned macOS arm64 libwebrtc SDK',
   }),
   'macos-x64': defineTarget({
@@ -196,9 +238,10 @@ const TARGETS = Object.freeze({
     sourceInputs: MACOS_SOURCE_INPUTS,
     requiredTopLevelEntries: MACOS_REQUIRED_TOP_LEVEL_ENTRIES,
     requiredFiles: MACOS_REQUIRED_FILES,
-    toolchainKeys: ['xcode', 'macosSdk', 'clang'],
+    toolchainKeys: ['xcode', 'macosSdk', 'clang', 'hostArch'],
     buildArgs: macosBuildArgs('x64'),
     noticesFormat: 'macos-inventory',
+    noticeTargets: MACOS_SDK_LIBWEBRTC_NOTICE_TARGETS,
     releaseTitlePrefix: 'Pinned macOS x64 libwebrtc SDK',
   }),
 });

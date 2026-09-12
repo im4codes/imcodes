@@ -20,7 +20,9 @@ from typing import Dict, List, Optional, Set
 
 
 NOTICE_VERSION = 1
-EXPECTED_TARGETS = frozenset(
+# The four shipped product executables. Their closures are what a user actually
+# receives when they install the remote-desktop components.
+PRODUCT_TARGETS = frozenset(
     {
         "//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_worker",
         "//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_launch_agent",
@@ -35,6 +37,45 @@ EXPECTED_TARGETS = frozenset(
         "//third_party/imcodes_macos_remote_desktop:imcodes_virtual_display_helper",
     }
 )
+# The immutable SDK ships upstream's OWN archive, `obj/libwebrtc.a`, which is
+# the artifact `//:webrtc` produces. The producer's overlay target exists only
+# to pull that label into the graph, so describing the overlay would report the
+# anchor object's (empty) closure rather than the payload's. `//:webrtc` IS the
+# payload, so it is the whole GN-derived target set.
+#
+# This closure is a strict SUBSET of the product closure above -- every macOS
+# product component declares `deps = [ "//:webrtc" ]` -- so SDK mode can never
+# encounter a third-party tree the already-gated product path does not.
+SDK_TARGETS = frozenset({"//:webrtc"})
+TARGET_SETS = {"product": PRODUCT_TARGETS, "sdk": SDK_TARGETS}
+DEFAULT_TARGET_SET = "product"
+
+# Files the SDK redistributes that no GN edge in `//:webrtc` accounts for,
+# mirroring the Windows SDK generator's REQUIRED_REDISTRIBUTED_LIBRARIES for
+# exactly the same reason: a license obligation follows the bytes in the
+# archive, not the shape of the build graph that produced them.
+#
+#   llvm-toolchain  toolchain/bin/{clang,ld64.lld,llvm-ar,llvm-strip}
+#   compiler-rt     toolchain/lib/libclang_rt.osx.a
+#   libc++          include/third_party/libc++/ and
+#                   include/buildtools/third_party/libc++/
+#   googletest      lib/libimcodes_macos_libwebrtc_test_sdk.a plus the staged
+#                   //testing/gmock, //testing/gtest and third_party/googletest
+#                   headers. `//:webrtc` is not testonly and never reaches them.
+SDK_REDISTRIBUTED_LIBRARIES = frozenset(
+    {"compiler-rt", "googletest", "libc++", "llvm-toolchain"}
+)
+# The pinned upstream mapping describes trees WebRTC links, not binaries a
+# redistributor exports, so two of the four need a local mapping. Clang, lld and
+# the llvm-* utilities are LLVM-project binaries covered by the same
+# Apache-2.0-with-LLVM-exceptions text the checkout's compiler-rt copy carries;
+# this is the identical mapping the Windows SDK generator already uses.
+SDK_EXPLICIT_LICENSES = {
+    "googletest": ["third_party/googletest/src/LICENSE"],
+    "llvm-toolchain": ["third_party/compiler-rt/src/LICENSE.TXT"],
+}
+REQUIRED_LIBRARIES = {"product": frozenset(), "sdk": SDK_REDISTRIBUTED_LIBRARIES}
+EXPLICIT_LICENSES = {"product": {}, "sdk": SDK_EXPLICIT_LICENSES}
 PROJECT_OWNED_TREES = frozenset(
     {"imcodes_macos_remote_desktop", "remote-desktop-common"}
 )
@@ -62,6 +103,26 @@ def read_upstream_mapping(webrtc_root: Path) -> Dict[str, List[str]]:
                 break
             return value
     raise RuntimeError("pinned WebRTC license mapping is missing")
+
+
+def resolve_target_set(name: str) -> frozenset:
+    """Map a target-set name onto its fixed label set, refusing anything else.
+
+    Fail-closed on purpose: an unrecognised name must never degrade into
+    "generate notices for whatever was passed". The only two inventories this
+    generator is allowed to certify are the four product executables and the
+    SDK's `//:webrtc` payload.
+    """
+    expected = TARGET_SETS.get(name)
+    if expected is None:
+        raise RuntimeError(
+            "unknown macOS notice target set: "
+            + repr(name)
+            + " (expected one of "
+            + ", ".join(sorted(TARGET_SETS))
+            + ")"
+        )
+    return expected
 
 
 def dependency_labels(gn: Path, build_directory: Path, target: str) -> Set[str]:
@@ -165,13 +226,13 @@ def atomic_write(path: Path, text: str) -> None:
             os.unlink(temporary)
 
 
-def parse_notices(path: Path) -> tuple:
+def parse_notices(path: Path, expected: frozenset) -> tuple:
     text = path.read_text(encoding="utf-8")
     inventory = INVENTORY.match(text)
     if inventory is None:
         raise RuntimeError(f"invalid macOS notice inventory: {path}")
     targets = inventory.group(2).split(",")
-    if targets != sorted(EXPECTED_TARGETS):
+    if targets != sorted(expected):
         raise RuntimeError(f"macOS notice target mismatch: {path}")
     libraries = inventory.group(3).split(",")
     if not libraries or libraries[0] != "webrtc" or len(set(libraries)) != len(libraries):
@@ -195,13 +256,13 @@ def parse_notices(path: Path) -> tuple:
     return inventory.group(1), sections
 
 
-def merge_notices(inputs: List[Path], output: Path) -> None:
+def merge_notices(inputs: List[Path], output: Path, expected: frozenset) -> None:
     if len(inputs) < 2:
         raise RuntimeError("at least two architecture notice files are required")
     revision: Optional[str] = None
     merged: Dict[str, str] = {}
     for path in inputs:
-        current_revision, sections = parse_notices(path.resolve(strict=True))
+        current_revision, sections = parse_notices(path.resolve(strict=True), expected)
         if revision is None:
             revision = current_revision
         elif revision != current_revision:
@@ -217,7 +278,7 @@ def merge_notices(inputs: List[Path], output: Path) -> None:
     lines = [
         "<!-- imcodes-macos-libwebrtc-notices-v1",
         f"libwebrtcRevision={revision}",
-        "targets=" + ",".join(sorted(EXPECTED_TARGETS)),
+        "targets=" + ",".join(sorted(expected)),
         "libraries=" + ",".join(libraries),
         "-->",
         "",
@@ -234,23 +295,30 @@ def main() -> None:
     parser.add_argument("--gn")
     parser.add_argument("--revision")
     parser.add_argument("--target", action="append")
+    parser.add_argument("--target-set", default=DEFAULT_TARGET_SET)
     parser.add_argument("--merge-input", action="append")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     output = Path(args.output).resolve()
+    expected = resolve_target_set(args.target_set)
     if args.merge_input:
         if any((args.webrtc_root, args.build_directory, args.gn, args.revision, args.target)):
             raise RuntimeError("merge mode does not accept GN graph arguments")
-        merge_notices([Path(path) for path in args.merge_input], output)
+        merge_notices([Path(path) for path in args.merge_input], output, expected)
         return
 
     if not all((args.webrtc_root, args.build_directory, args.gn, args.revision, args.target)):
         raise RuntimeError("GN graph mode requires checkout, build, pin, target, and gn")
 
     targets = args.target
-    if len(targets) != len(EXPECTED_TARGETS) or set(targets) != EXPECTED_TARGETS:
-        raise RuntimeError("all three fixed macOS executable targets are required once")
+    if len(targets) != len(expected) or set(targets) != expected:
+        raise RuntimeError(
+            "the "
+            + args.target_set
+            + " macOS notice target set requires exactly these targets, once "
+            "each: " + ", ".join(sorted(expected))
+        )
     if not re.fullmatch(r"[0-9a-f]{40}", args.revision):
         raise RuntimeError("invalid libwebrtc revision")
 
@@ -258,9 +326,21 @@ def main() -> None:
     build_directory = Path(args.build_directory).resolve(strict=True)
     gn = Path(args.gn).resolve(strict=True)
     mapping = read_upstream_mapping(webrtc_root)
+    mapping.update(EXPLICIT_LICENSES[args.target_set])
     libraries = collect_libraries(gn, build_directory, targets)
     if not libraries:
         raise RuntimeError("macOS target graph contains no third-party libraries")
+    required = REQUIRED_LIBRARIES[args.target_set]
+    # An empty mapping entry is dropped silently by the renderer, which for a
+    # tree we actually redistribute would under-report rather than fail. Refuse
+    # before anything is written.
+    unmapped = sorted(library for library in required if not mapping.get(library))
+    if unmapped:
+        raise RuntimeError(
+            "redistributed macOS SDK component has no license mapping: "
+            + ", ".join(unmapped)
+        )
+    libraries |= set(required)
     atomic_write(
         output,
         render_notices(

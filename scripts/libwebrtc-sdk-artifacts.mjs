@@ -103,8 +103,19 @@ export const MACOS_LIBWEBRTC_NOTICE_TARGETS = Object.freeze([
   '//third_party/imcodes_macos_remote_desktop:imcodes_virtual_display_helper',
 ]);
 
-/** Validate the fail-closed inventory emitted from the pinned macOS GN graph. */
-export function validateMacosLibwebrtcNotices(text, expectedRevision) {
+/**
+ * Validate the fail-closed inventory emitted from the pinned macOS GN graph.
+ *
+ * `expectedTargets` defaults to the product executables, because that is what
+ * every caller predating the SDK producer means. The SDK stages notices for a
+ * different graph entirely -- `//:webrtc` -- and passes its own list, which the
+ * registry owns as per-target contract data.
+ */
+export function validateMacosLibwebrtcNotices(
+  text,
+  expectedRevision,
+  expectedTargets = MACOS_LIBWEBRTC_NOTICE_TARGETS,
+) {
   if (typeof text !== 'string' || text.length === 0 || text.length > 16 * 1024 * 1024) {
     throw new Error('invalid macOS libwebrtc notices');
   }
@@ -113,7 +124,10 @@ export function validateMacosLibwebrtcNotices(text, expectedRevision) {
   if (expectedRevision !== undefined && inventory[1] !== expectedRevision) {
     throw new Error('macOS libwebrtc notices revision mismatch');
   }
-  if (inventory[2] !== MACOS_LIBWEBRTC_NOTICE_TARGETS.join(',')) {
+  if (!Array.isArray(expectedTargets) || expectedTargets.length === 0) {
+    throw new Error('macOS libwebrtc notices have no expected target inventory');
+  }
+  if (inventory[2] !== expectedTargets.join(',')) {
     throw new Error('macOS libwebrtc notices target inventory mismatch');
   }
   const libraries = inventory[3].split(',');
@@ -142,7 +156,7 @@ export function validateMacosLibwebrtcNotices(text, expectedRevision) {
 /** Validate the notices shipped inside one target's staging directory. */
 function validateStagedNotices(target, text) {
   return target.noticesFormat === 'macos-inventory'
-    ? validateMacosLibwebrtcNotices(text, PINNED_LIBWEBRTC_REVISION)
+    ? validateMacosLibwebrtcNotices(text, PINNED_LIBWEBRTC_REVISION, target.noticeTargets)
     : validateLibwebrtcSdkNotices(text);
 }
 

@@ -9,6 +9,11 @@
 # narrower set would link here and fail at the first upstream symbol nobody
 # listed. Apple frameworks supply capture and H.264; libwebrtc remains the sole
 # implementation of ICE, DTLS-SRTP, RTP/RTCP, pacing and congestion control.
+#
+# `//:webrtc` limits its own visibility to `//:default` and
+# `//:webrtc_lib_link_test`, so the producer widens that list in the checkout's
+# root BUILD.gn for the duration of the build and restores it afterwards --
+# the same transient seam the product build already opens for the same reason.
 imcodes_macos_remote_desktop_deps = [ "//:webrtc" ]
 
 # No defines. The Windows list exists to tame windows.h; macOS needs none, and
