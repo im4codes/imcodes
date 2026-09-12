@@ -214,6 +214,13 @@ export function importSigningIdentity(input) {
  * inferred, because the distinction decides whether a release can be verified
  * offline.
  */
+export function macosArtifactCanBeSubmittedDirectly(artifactPath) {
+  if (typeof artifactPath !== 'string' || artifactPath.length === 0) {
+    throw new Error('notarization submission requires an artifact path');
+  }
+  return /\.(zip|pkg|dmg)$/iu.test(artifactPath.replace(/\/+$/u, ''));
+}
+
 export function macosArtifactSupportsStapling(artifactPath) {
   if (typeof artifactPath !== 'string' || artifactPath.length === 0) {
     throw new Error('stapling support requires an artifact path');
@@ -262,43 +269,60 @@ export function buildUnstapledNotarizationRecord(input) {
  * the executable, whose notarization Apple now records against its own hash.
  */
 export function notarizeExecutable(input) {
-  const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
+  const { artifactPath } = input;
   if (macosArtifactSupportsStapling(artifactPath)) {
     throw new Error(`${artifactPath} is a staplable format; use notarizeAndStaple`);
   }
-  const uploadPath = `${artifactPath}.notarize.zip`;
+  const submission = submitForNotarization(input);
+  const ticketSha256 = createHash('sha256').update(readFileSync(artifactPath)).digest('hex');
+  return buildUnstapledNotarizationRecord({ submission, ticketSha256, artifactPath });
+}
+
+/**
+ * Send one artifact to Apple and wait for the verdict.
+ *
+ * Two different format questions get confused easily, and they have different
+ * answers. What may be SUBMITTED is a .zip, .pkg or .dmg; what may be STAPLED
+ * is a .app, .pkg or .dmg. An application bundle sits on one side of each --
+ * it has to be zipped to be sent, and the ticket then goes onto the bundle,
+ * never onto the zip, which is thrown away. Submitting a .app directly is
+ * rejected outright: "must be a zip archive (.zip), flat installer package
+ * (.pkg), or UDIF disk image (.dmg)".
+ */
+function submitForNotarization(input) {
+  const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
+  const direct = macosArtifactCanBeSubmittedDirectly(artifactPath);
+  const uploadPath = direct ? artifactPath : `${artifactPath}.notarize.zip`;
   try {
-    run(MACOS_RELEASE_SIGNING_TOOLS.ditto, ['-c', '-k', '--keepParent', artifactPath, uploadPath]);
-    const submitted = run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
+    if (!direct) {
+      // `--keepParent` so the archive contains the bundle, not its contents.
+      run(MACOS_RELEASE_SIGNING_TOOLS.ditto, ['-c', '-k', '--keepParent', artifactPath, uploadPath]);
+    }
+    return parseNotarizationSubmission(run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
       'notarytool', 'submit', uploadPath,
       '--key', apiKeyPath,
       '--key-id', apiKeyId,
       '--issuer', apiIssuer,
       '--wait',
       '--output-format', 'json',
-    ]);
-    const submission = parseNotarizationSubmission(submitted);
-    const ticketSha256 = createHash('sha256').update(readFileSync(artifactPath)).digest('hex');
-    return buildUnstapledNotarizationRecord({ submission, ticketSha256, artifactPath });
+    ]));
   } finally {
-    rmSync(uploadPath, { force: true });
+    if (!direct) rmSync(uploadPath, { force: true });
   }
 }
 
 export function notarizeAndStaple(input) {
-  const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
-  const submitted = run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
-    'notarytool', 'submit', artifactPath,
-    '--key', apiKeyPath,
-    '--key-id', apiKeyId,
-    '--issuer', apiIssuer,
-    '--wait',
-    '--output-format', 'json',
-  ]);
-  const submission = parseNotarizationSubmission(submitted);
+  const { artifactPath } = input;
+  const submission = submitForNotarization(input);
+  // Stapled onto the artifact itself, which for an app is the bundle and not
+  // the archive it travelled in.
   run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'staple', artifactPath]);
   run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'validate', artifactPath]);
-  const ticketSha256 = createHash('sha256').update(readFileSync(artifactPath)).digest('hex');
+  const ticketSha256 = createHash('sha256')
+    .update(readFileSync(macosArtifactCanBeSubmittedDirectly(artifactPath)
+      ? artifactPath
+      : join(artifactPath, 'Contents', 'Info.plist')))
+    .digest('hex');
   return buildNotarizationRecord({ submission, ticketSha256, stapled: true, stapleValidated: true });
 }
 

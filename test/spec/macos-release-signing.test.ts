@@ -1,8 +1,10 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   assertSigningMaterialRemoved,
   buildNotarizationRecord,
   buildUnstapledNotarizationRecord,
+  macosArtifactCanBeSubmittedDirectly,
   macosArtifactSupportsStapling,
   parseNotarizationSubmission,
   selectDeveloperIdSigningIdentity,
@@ -188,5 +190,41 @@ describe('artifacts that cannot carry a notarization ticket', () => {
       ticketSha256: 'NOTAHASH',
       artifactPath: '/build/imcodes-node-macos',
     })).toThrow(/sha256/u);
+  });
+});
+
+describe('what may be submitted versus what may be stapled', () => {
+  // These are two different questions with two different answers, and
+  // conflating them is not theoretical: submitting a .app directly is how CI
+  // failed, with "must be a zip archive (.zip), flat installer package (.pkg),
+  // or UDIF disk image (.dmg)". A local test that zipped the bundle by hand
+  // before submitting never exercised the code that does not.
+  it('accepts only containers for submission', () => {
+    expect(macosArtifactCanBeSubmittedDirectly('/build/aiDesk.dmg')).toBe(true);
+    expect(macosArtifactCanBeSubmittedDirectly('/build/aiDesk.pkg')).toBe(true);
+    expect(macosArtifactCanBeSubmittedDirectly('/build/aiDesk.zip')).toBe(true);
+    // The two that must be packed first.
+    expect(macosArtifactCanBeSubmittedDirectly('/build/aiDesk.app')).toBe(false);
+    expect(macosArtifactCanBeSubmittedDirectly('/build/imcodes-node-macos')).toBe(false);
+  });
+
+  it('disagrees with the stapling rule exactly where it should', () => {
+    // A .app can hold a ticket but cannot be sent; a .zip can be sent but
+    // cannot hold one. Any implementation that uses one rule for both is
+    // wrong for both of these.
+    expect(macosArtifactSupportsStapling('/build/aiDesk.app')).toBe(true);
+    expect(macosArtifactCanBeSubmittedDirectly('/build/aiDesk.app')).toBe(false);
+
+    expect(macosArtifactSupportsStapling('/build/aiDesk.zip')).toBe(false);
+    expect(macosArtifactCanBeSubmittedDirectly('/build/aiDesk.zip')).toBe(true);
+  });
+
+  it('packs a bundle for submission and staples the bundle, never the archive', () => {
+    // The archive is a transport detail that gets deleted; a ticket stapled to
+    // it would be thrown away with it.
+    const source = readFileSync('scripts/macos-release-signing.mjs', 'utf8');
+    expect(source).toContain("'-c', '-k', '--keepParent'");
+    expect(source).toContain("run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'staple', artifactPath])");
+    expect(source).toContain('rmSync(uploadPath, { force: true })');
   });
 });
