@@ -430,6 +430,27 @@ export function macosRemoteDesktopBuildPlanSha256(plan) {
 }
 
 /**
+ * Where two requirement strings diverge, without printing the Team ID.
+ *
+ * CI masks that value, and a masked line cannot be compared against an
+ * unmasked expectation by eye -- which is how a mismatch here stayed opaque
+ * across a release build. Redacting it on BOTH sides, ourselves, makes the two
+ * comparable and leaks nothing that was not already in the repository.
+ */
+function describeRequirementMismatch(expected, actual, teamId) {
+  const redact = (text) => text.split(teamId).join('<TEAM>');
+  const left = redact(expected);
+  // `codesign -d -r-` labels the line; the comparison is a substring test, so
+  // the label is irrelevant to the check but would put every diff at index 0.
+  const right = redact(actual).replace(/^designated\s*=>\s*/u, '');
+  let index = 0;
+  while (index < left.length && index < right.length && left[index] === right[index]) index += 1;
+  return `diverges at ${index} (expected ${left.length} chars, got ${right.length})`
+    + `\n  expected: ${left}`
+    + `\n  actual:   ${right}`;
+}
+
+/**
  * The line a guard was looking at, so a refusal carries its evidence.
  *
  * A bare "is not signed with the Hardened Runtime" is indistinguishable from
@@ -502,7 +523,12 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
     ['--display', '-r-', executablePath],
   ));
   if (!requirement.includes(component.designatedRequirement)) {
-    throw new Error(`component ${component.kind} has an unexpected designated requirement: ${firstLine(requirement, 'designated')}`);
+    throw new Error(
+      `component ${component.kind} has an unexpected designated requirement: `
+      + describeRequirementMismatch(
+        component.designatedRequirement, firstLine(requirement, 'designated'), plan.teamId,
+      ),
+    );
   }
 
   const assessment = commandText(await run(
