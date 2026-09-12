@@ -193,6 +193,21 @@ describe('macOS libwebrtc SDK producer', () => {
     expect(producer).toContain('xcrun --show-sdk-version failed');
   });
 
+  it('compiles against the same macOS floor the product declares', () => {
+    // 12.3 is chosen for Intel: it is ScreenCaptureKit's actual platform floor,
+    // and it keeps Intel Macs stuck on Monterey eligible without a second
+    // legacy implementation. The value is declared in code-identity.json and
+    // restated in the producer, and the two governing Intel support must not
+    // drift -- the SDK would compile for one floor while the product promised
+    // another, and every component's LC_BUILD_VERSION comes from the SDK side.
+    const identity = JSON.parse(
+      readFileSync('native/macos-remote-desktop/code-identity.json', 'utf8'),
+    ) as { minimumMacosVersion: string };
+    const declared = producer.match(/^MINIMUM_MACOS_VERSION="([^"]+)"$/mu);
+    expect(declared).not.toBeNull();
+    expect(declared?.[1]).toBe(identity.minimumMacosVersion);
+  });
+
   it('compiles against the floor the product declares, not the host default', () => {
     // Objects built for a newer deployment target assume runtime the product
     // promises to work without. This is the one build argument whose drift
