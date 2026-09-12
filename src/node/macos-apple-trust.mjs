@@ -53,6 +53,22 @@ export const MACOS_APPLE_TRUST_ERROR = Object.freeze({
 });
 
 /**
+ * Quote a requirement literal exactly as codesign does.
+ *
+ * Bare only when the WHOLE literal is a letter followed by letters and digits.
+ * An underscore, a hyphen, a leading digit or a dot quotes it -- so every
+ * bundle identifier is quoted and only a team ID is ever bare. Established by
+ * reading `codesign -d -r-` back off a probe signed with a real Developer ID
+ * certificate; see shared/macos-code-requirement.ts for the observed table.
+ */
+export function macosCodeRequirementLiteral(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error('code requirement literal requires a value');
+  }
+  return /^[A-Za-z][A-Za-z0-9]*$/u.test(value) ? value : `"${value}"`;
+}
+
+/**
  * Whether a notarization ticket can be attached to this artifact at all.
  *
  * Apple: "Although tickets are created for standalone binaries, it's not

@@ -528,9 +528,27 @@ static void ShapeCeilingsAreEnforcedOnTheSerializePath() {
 static void TheCanonicalRequirementTextIsPinned() {
   const std::string requirement =
       rd::CanonicalDesignatedRequirement("cc.example.helper", "ABCDE12345");
+  // The identifier is quoted -- it contains dots, and codesign leaves a
+  // literal bare only when the whole of it is a letter followed by letters and
+  // digits. The team ID is in that class, so it is NOT quoted. That asymmetry
+  // is the whole rule, and it was read back off a real signature.
   assert(requirement ==
-         "identifier \"cc.example.helper\" and anchor apple generic "
-         "and certificate leaf[subject.OU] = \"ABCDE12345\"");
+         "identifier \"cc.example.helper\" and anchor apple generic"
+         " and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */"
+         " and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */"
+         " and certificate leaf[subject.OU] = ABCDE12345");
+
+  // The shipped identifiers are all in the other class -- they carry hyphens,
+  // which quote the whole literal. Pinned separately because a rule inferred
+  // from one sample is how this text came to be wrong in the first place: the
+  // single sample used had a digit-initial team ID, so everything was quoted,
+  // and the release guard then rejected every correctly signed component.
+  assert(rd::CanonicalDesignatedRequirement("cc.imcodes.node.virtual-display-helper",
+                                            "M675E26Q67") ==
+         "identifier \"cc.imcodes.node.virtual-display-helper\" and anchor apple generic"
+         " and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */"
+         " and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */"
+         " and certificate leaf[subject.OU] = M675E26Q67");
 
   // Each clause is separately load-bearing, so each is separately named.
   assert(requirement.find("anchor apple generic") != std::string::npos);

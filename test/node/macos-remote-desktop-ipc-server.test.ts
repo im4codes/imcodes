@@ -45,7 +45,7 @@ const DESIGNATED_REQUIREMENT = [
   // sit between the anchor and the team clause in the real requirement.
   'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
   'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
-  `and certificate leaf[subject.OU] = "${TEAM_ID}"`,
+  `and certificate leaf[subject.OU] = ${TEAM_ID}`,
 ].join(' ');
 const REQUEST_ID = 'request_123456789';
 const SESSION_ID = 'session_123456789';

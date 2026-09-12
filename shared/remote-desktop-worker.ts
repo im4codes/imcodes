@@ -1,6 +1,7 @@
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from './remote-desktop.js';
 import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from './remote-desktop-qualification.js';
 import macosIdentity from './remote-desktop-macos-identity.json' with { type: 'json' };
+import { appleDesignatedRequirement } from './macos-code-requirement.js';
 
 export const REMOTE_DESKTOP_WORKER_IPC_VERSION = 1 as const;
 // Nodes already deployed with remote-desktop protocol v1 request upgrade
@@ -353,14 +354,7 @@ function validAppleDesignatedRequirement(
   bundleIdentifier: string,
   teamId: string,
 ): value is string {
-  // Exactly what codesign emits for a Developer ID Application certificate:
-  // the two marker extensions sit between the anchor and the team clause,
-  // and they are what distinguishes a Developer ID leaf from an Apple
-  // Development one issued to the same team.
-  return value === `identifier "${bundleIdentifier}" and anchor apple generic`
-    + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
-    + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
-    + ` and certificate leaf[subject.OU] = "${teamId}"`;
+  return value === appleDesignatedRequirement(bundleIdentifier, teamId);
 }
 
 function validateMacosCodeIdentity(value: unknown): value is RemoteDesktopMacosCodeIdentity {

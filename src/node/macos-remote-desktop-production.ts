@@ -56,6 +56,7 @@ import {
   type MacosRemoteDesktopResponsibleCommandOptions,
   type MacosRemoteDesktopResponsibleCommandResult,
 } from './macos-remote-desktop-responsible-spawn.js';
+import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
 
 const COMMAND_TIMEOUT_MS = 5_000;
 const COMMAND_MAX_BUFFER_BYTES = 16 * 1024;
@@ -233,17 +234,10 @@ export function createMacosRemoteDesktopProductionGlobalBootstrapListener(
 ): MacosRemoteDesktopGlobalAgentBootstrapListener {
   const identity = options.artifact.manifest.codeSignature.bundles.launchAgent;
   const component = options.artifact.components.launchAgent;
-  const expectedRequirement = [
-    `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}"`,
-    'and anchor apple generic',
-    // The two markers codesign emits for a Developer ID Application leaf.
-    // They sit between the anchor and the team clause in the requirement it
-    // derives, and without them an Apple Development certificate from the
-    // same team satisfies this.
-    'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
-    'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
-    `and certificate leaf[subject.OU] = "${REMOTE_DESKTOP_MACOS_TEAM_ID}"`,
-  ].join(' ');
+  const expectedRequirement = appleDesignatedRequirement(
+    MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
+    REMOTE_DESKTOP_MACOS_TEAM_ID,
+  );
   if (options.artifact.manifest.codeSignature.teamId !== REMOTE_DESKTOP_MACOS_TEAM_ID
     || identity.bundleIdentifier !== MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier
     || identity.designatedRequirement !== expectedRequirement

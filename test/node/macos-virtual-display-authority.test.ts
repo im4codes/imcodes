@@ -11,7 +11,7 @@ import {
 } from '../../shared/macos-virtual-display-authority.js';
 
 const REQUIREMENT = 'identifier "cc.imcodes.node.virtual-display-helper" and anchor apple generic '
-  + `and certificate leaf[subject.OU] = "${REMOTE_DESKTOP_MACOS_TEAM_ID}"`;
+  + `and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${REMOTE_DESKTOP_MACOS_TEAM_ID}`;
 
 function artifact(
   overrides: Partial<MacosVirtualDisplayAuthorityArtifact> = {},
@@ -70,7 +70,7 @@ describe('macOS virtual-display complete-set authority', () => {
     // rejected solely because the team is not the one the product ships under.
     for (const foreign of ['ABCDE12345', 'ZZZZZ99999']) {
       const requirement = 'identifier "cc.imcodes.node.virtual-display-helper" '
-        + `and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${foreign}"`;
+        + `and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${foreign}`;
       const forged = artifact({}, {}, { designatedRequirement: requirement });
       (forged.manifest.codeSignature as { teamId: string }).teamId = foreign;
       expect(

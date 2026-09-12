@@ -31,6 +31,7 @@ import {
   type MacosVirtualDisplayProxyReply,
   type MacosVirtualDisplayProxyRequest,
 } from './macos-virtual-display-proxy.js';
+import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
 
 export const MACOS_REMOTE_DESKTOP_IPC_MESSAGE = Object.freeze({
   HELLO: 'remote_desktop.macos_ipc.hello',
@@ -270,7 +271,9 @@ function equalSecret(left: string, right: string): boolean {
 }
 
 function validateExpectedCodeIdentity(value: MacosRemoteDesktopExpectedCodeIdentity): void {
-  const canonicalRequirement = `identifier "${value.bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${value.teamId}"`;
+  const canonicalRequirement = appleDesignatedRequirement(
+    value.bundleIdentifier, value.teamId,
+  );
   if (value.bundleIdentifier !== MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier
     || !APPLE_TEAM_ID_RE.test(value.teamId)
     || canonicalRequirement.length > MAX_DESIGNATED_REQUIREMENT_BYTES

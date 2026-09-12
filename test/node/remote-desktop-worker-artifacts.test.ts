@@ -105,7 +105,7 @@ async function writeWindowsArtifact(overrides: Record<string, unknown> = {}) {
 }
 
 function designatedRequirement(bundleIdentifier: string, teamId = TEAM_ID): string {
-  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${teamId}"`;
+  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${teamId}`;
 }
 
 function macosManifest(
@@ -305,7 +305,7 @@ describe('remote desktop worker release artifact verifier', () => {
             Object.entries(manifest.codeSignature.bundles).map(([kind, bundle]) => [kind, {
               ...bundle,
               designatedRequirement: `identifier "${bundle.bundleIdentifier}" and anchor apple `
-                + `generic and certificate leaf[subject.OU] = "${foreign}"`,
+                + `generic and certificate leaf[subject.OU] = ${foreign}`,
             }]),
           ),
         },

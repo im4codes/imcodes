@@ -22,6 +22,7 @@ import {
   macosUserSessionLaunchctlArgs,
   type MacosUserSession,
 } from './user-session-launcher.js';
+import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
 
 const MACOS_OPEN_PATH = '/usr/bin/open';
 const MACOS_CODESIGN_PATH = '/usr/bin/codesign';
@@ -31,17 +32,10 @@ const COMMAND_ERROR_FILE = 'stderr';
 export const MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH =
   join('/Library/Application Support/aidesk', MACOS_AIDESK_APP_NAME);
 
-export const MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_REQUIREMENT = [
-  `identifier "${MACOS_AIDESK_BUNDLE_ID}"`,
-  'and anchor apple generic',
-  // The two markers codesign emits for a Developer ID Application leaf.
-  // They sit between the anchor and the team clause in the requirement it
-  // derives, and without them an Apple Development certificate from the
-  // same team satisfies this.
-  'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
-  'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
-  `and certificate leaf[subject.OU] = "${MACOS_AIDESK_TEAM_ID}"`,
-].join(' ');
+export const MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_REQUIREMENT = appleDesignatedRequirement(
+  MACOS_AIDESK_BUNDLE_ID,
+  MACOS_AIDESK_TEAM_ID,
+);
 
 export interface MacosRemoteDesktopResponsibleCommandResult {
   stdout: string;

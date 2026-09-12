@@ -39,7 +39,10 @@ import {
   REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION,
 } from './remote-desktop-worker-artifacts.mjs';
 import { validateMacosLibwebrtcNotices } from './libwebrtc-sdk-artifacts.mjs';
-import { macosArtifactCanCarryNotarizationTicket } from '../src/node/macos-apple-trust.mjs';
+import {
+  macosArtifactCanCarryNotarizationTicket,
+  macosCodeRequirementLiteral,
+} from '../src/node/macos-apple-trust.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = resolve(SCRIPT_DIR, '..');
@@ -166,10 +169,14 @@ export function macosRemoteDesktopDesignatedRequirement(bundleIdentifier, teamId
   if (typeof teamId !== 'string' || !TEAM_ID_RE.test(teamId)) {
     throw new Error('invalid Apple Team ID');
   }
-  return `identifier "${bundleIdentifier}" and anchor apple generic`
+  // Quoted only where the requirement language requires it. A team ID
+  // beginning with a letter is printed bare by codesign and one beginning with
+  // a digit is quoted, so hardcoding either form produces a string that never
+  // matches half the teams that exist.
+  return `identifier ${macosCodeRequirementLiteral(bundleIdentifier)} and anchor apple generic`
     + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
     + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
-    + ` and certificate leaf[subject.OU] = "${teamId}"`;
+    + ` and certificate leaf[subject.OU] = ${macosCodeRequirementLiteral(teamId)}`;
 }
 
 /**

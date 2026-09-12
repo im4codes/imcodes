@@ -60,3 +60,7 @@ export declare function assertExactComponentSetEntries(
     options: { withFileTypes: true },
   ) => Promise<Array<{ name: string; isFile(): boolean; isSymbolicLink(): boolean }>>,
 ): Promise<void>;
+
+export declare function macosArtifactCanCarryNotarizationTicket(artifactPath: string): boolean;
+
+export declare function macosCodeRequirementLiteral(value: string): string;

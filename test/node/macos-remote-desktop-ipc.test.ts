@@ -47,7 +47,7 @@ const DESIGNATED_REQUIREMENT = [
   // sit between the anchor and the team clause in the real requirement.
   'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
   'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
-  `and certificate leaf[subject.OU] = "${TEAM_ID}"`,
+  `and certificate leaf[subject.OU] = ${TEAM_ID}`,
 ].join(' ');
 const REQUEST_ID = 'request_123456789';
 const SESSION_ID = 'session_123456789';
@@ -217,10 +217,15 @@ describe('macOS remote-desktop authenticated local IPC contract', () => {
   it('requires the configured designated requirement to bind the exact bundle and Team ID', () => {
     for (const designatedRequirement of [
       'anchor apple generic',
-      `identifier "cc.attacker.agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${TEAM_ID}"`,
-      `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "ZZZZZ99999"`,
+      `identifier "cc.attacker.agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${TEAM_ID}`,
+      `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ZZZZZ99999`,
       `${DESIGNATED_REQUIREMENT} or identifier "cc.attacker.agent"`,
-      DESIGNATED_REQUIREMENT.replace(`"${TEAM_ID}"`, TEAM_ID),
+      // Quoting the team ID. codesign leaves a literal bare when every
+      // dot-separated segment is letter-initial and alphanumeric, and this
+      // team ID is, so the quoted spelling is NOT what any signature
+      // carries -- accepting it would accept a requirement no component can
+      // satisfy, which is how a release once failed every signed binary.
+      DESIGNATED_REQUIREMENT.replace(`= ${TEAM_ID}`, `= "${TEAM_ID}"`),
     ]) {
       expect(() => new MacosRemoteDesktopIpcAuthorityHost({
         user: USER,

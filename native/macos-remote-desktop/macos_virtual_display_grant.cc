@@ -1,4 +1,5 @@
 #include "macos_virtual_display_grant.h"
+#include "macos_code_requirement.h"
 
 #include <cstdio>
 #include <string_view>
@@ -173,9 +174,7 @@ std::string CanonicalDesignatedRequirement(const std::string& bundle_identifier,
                                            const std::string& team_id) {
   if (!IsBundleIdentifier(bundle_identifier) || !IsTeamId(team_id))
     return std::string();
-  return "identifier \"" + bundle_identifier +
-         "\" and anchor apple generic and certificate leaf[subject.OU] = \"" +
-         team_id + "\"";
+  return AppleDesignatedRequirement(bundle_identifier, team_id);
 }
 
 bool VirtualDisplayGrant::ShapeValid() const noexcept {

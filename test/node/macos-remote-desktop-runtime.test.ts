@@ -38,7 +38,7 @@ const USER = {
 } as const;
 const TEAM_ID = 'ABCDE12345';
 const BUNDLE_ID = 'cc.imcodes.node.remote-desktop-agent';
-const REQUIREMENT = `identifier "${BUNDLE_ID}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${TEAM_ID}"`;
+const REQUIREMENT = `identifier "${BUNDLE_ID}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${TEAM_ID}`;
 
 class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
   readyState = 0;
