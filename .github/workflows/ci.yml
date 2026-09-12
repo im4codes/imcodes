@@ -1196,9 +1196,18 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
             imcodes-node-linux imcodes-node-macos imcodes-node.exe
+          # Every target, named. This verifier defaults to the WINDOWS target
+          # when none is given, so this final gate -- the last check before the
+          # image ships -- passed on an image containing no macOS component set
+          # at all.
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/remote-desktop-worker-artifacts.mjs verify \
-            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}"
+            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" win32 x64
+          for arch in arm64 x64; do
+            docker run --rm --entrypoint node imcodes-smoke:test \
+              scripts/remote-desktop-worker-artifacts.mjs verify \
+              /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" darwin "$arch"
+          done
 
       - name: Build and push (cache hit — only pushes layers)
         id: build_push

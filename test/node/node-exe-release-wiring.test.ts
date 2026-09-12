@@ -298,6 +298,15 @@ describe('controlled-node executable release wiring', () => {
     expect(verifyStep).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64');
     expect(verifyStep).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"');
 
+    // And the image ITSELF must be checked, which is a separate gate from the
+    // directory the image is built from -- and the one that actually proves
+    // the components shipped. It defaulted to the Windows target too.
+    const smoke = workflow.indexOf('/app/controlled-node-executables');
+    expect(smoke).toBeGreaterThan(-1);
+    const smokeStep = workflow.slice(smoke, workflow.indexOf('\n      - name:', smoke));
+    expect(smokeStep).toContain('"${{ needs.release_version.outputs.app_version }}" win32 x64');
+    expect(smokeStep).toContain('"${{ needs.release_version.outputs.app_version }}" darwin "$arch"');
+
     // The upload has to carry them, or the Docker job downloads a set that
     // never left the build runner.
     expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
