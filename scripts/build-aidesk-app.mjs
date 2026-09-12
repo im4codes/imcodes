@@ -36,6 +36,18 @@ export const AIDESK_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
  */
 export const AIDESK_HELPERS_DIR = 'Helpers';
 
+/**
+ * Where the licence of the bundled third-party helper is kept.
+ *
+ * Open Computer Use is MIT, which permits everything done here -- copying,
+ * modifying, redistributing, re-signing under our own certificate -- on one
+ * condition: its copyright and permission notice travel with every copy. The
+ * upstream .app carries no licence file of its own, so shipping only the
+ * executable would drop the notice entirely. This puts it back, inside the
+ * bundle that contains the binary rather than in a document somewhere else.
+ */
+export const AIDESK_THIRD_PARTY_LICENSE = 'LICENSE-open-computer-use.txt';
+
 /** Architectures the shipped app must run on, as one Universal 2 binary. */
 export const AIDESK_ARCHITECTURES = Object.freeze(['arm64', 'x86_64']);
 
@@ -99,6 +111,23 @@ export function aideskSigningOrder(bundlePath) {
     join(bundlePath, 'Contents', 'MacOS', AIDESK_MAIN_EXECUTABLE),
     bundlePath,
   ]);
+}
+
+/**
+ * Copy the bundled helper's licence in beside it.
+ *
+ * Read from the pinned package rather than transcribed here, so the notice is
+ * always the one that belongs to the exact version being shipped.
+ */
+export function copyComputerUseLicense(outPath) {
+  const source = join(root, 'node_modules', 'open-computer-use', 'LICENSE');
+  if (!existsSync(source)) {
+    throw new Error(
+      `open-computer-use LICENSE not found at ${source}; its MIT notice must ship with the binary`,
+    );
+  }
+  mkdirSync(dirname(outPath), { recursive: true });
+  cpSync(source, outPath);
 }
 
 /** Compile the agent for one architecture. */
@@ -289,6 +318,7 @@ export function buildAideskApp(input) {
   buildAideskAgent(join(macos, AIDESK_MAIN_EXECUTABLE));
   // Into Helpers, which is where the dispatcher looks.
   extractComputerUseExecutable(computerUseArchive, join(helpers, AIDESK_COMPUTER_USE_EXECUTABLE));
+  copyComputerUseLicense(join(bundlePath, 'Contents', 'Resources', AIDESK_THIRD_PARTY_LICENSE));
   signAideskApp(bundlePath);
   return bundlePath;
 }

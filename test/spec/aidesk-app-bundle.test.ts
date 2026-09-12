@@ -6,6 +6,7 @@ import {
   AIDESK_ARCHITECTURES,
   AIDESK_BUNDLE_ID,
   AIDESK_COMPUTER_USE_EXECUTABLE,
+  AIDESK_THIRD_PARTY_LICENSE,
   AIDESK_MAIN_EXECUTABLE,
   aideskSigningOrder,
   buildAideskInfoPlist,
@@ -115,6 +116,28 @@ describe('aiDesk application bundle', () => {
     expect(source).toContain("'--deep'");
     // A developer with no release identity must still get a runnable app.
     expect(source).toContain("args.push('--sign', '-')");
+  });
+
+  it('ships the bundled helper licence with the binary it covers', () => {
+    // Open Computer Use is MIT, which allows everything done here -- copying,
+    // re-signing under our certificate, redistributing -- on the single
+    // condition that its copyright and permission notice accompany every copy.
+    // The upstream .app carries no licence file, so extracting just the
+    // executable would drop the notice; this is what puts it back.
+    const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');
+    expect(AIDESK_THIRD_PARTY_LICENSE).toBe('LICENSE-open-computer-use.txt');
+    expect(source).toContain("join(root, 'node_modules', 'open-computer-use', 'LICENSE')");
+    // Read from the pinned package, never transcribed, so the notice always
+    // belongs to the exact version being shipped.
+    expect(source).not.toContain('MIT License\\n\\nCopyright');
+    // And refused loudly rather than shipped without it.
+    expect(source).toMatch(/must ship with the binary/u);
+  });
+
+  it('credits the upstream project where a reader will look', () => {
+    const readme = readFileSync('README.md', 'utf8');
+    expect(readme).toContain('open-codex-computer-use');
+    expect(readme).toContain('MIT');
   });
 
   it('expects the team the runtime verifier demands', () => {
