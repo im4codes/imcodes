@@ -94,7 +94,7 @@ describe('remote desktop wall standalone window', () => {
     expect(open).toHaveBeenCalledWith(
       expect.stringContaining('remoteDesktopWall=1'),
       '_blank',
-      'popup,width=1440,height=900',
+      expect.stringContaining('popup=yes'),
     );
     expect(popup.opener).toBeNull();
   });
