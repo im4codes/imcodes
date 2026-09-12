@@ -410,6 +410,18 @@ export function macosRemoteDesktopBuildPlanSha256(plan) {
   return sha256(canonical);
 }
 
+/**
+ * The line a guard was looking at, so a refusal carries its evidence.
+ *
+ * A bare "is not signed with the Hardened Runtime" is indistinguishable from
+ * "the output that would have said so was never read" -- which is exactly what
+ * it turned out to mean, two release builds in a row.
+ */
+function firstLine(output, marker) {
+  const line = output.split(/\r?\n/u).find((entry) => entry.includes(marker));
+  return line === undefined ? `no ${marker} line in output` : line.trim();
+}
+
 function commandText(result) {
   if (!isRecord(result) || typeof result.stdout !== 'string' || typeof result.stderr !== 'string') {
     throw new Error('invalid command result');
@@ -456,7 +468,7 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
     ['--display', '--verbose=4', executablePath],
   ));
   if (!/^CodeDirectory .* flags=0x[0-9a-f]+\([^)]*\bruntime\b[^)]*\)/imu.test(display)) {
-    throw new Error(`component ${component.kind} is not signed with the Hardened Runtime`);
+    throw new Error(`component ${component.kind} is not signed with the Hardened Runtime: ${firstLine(display, 'CodeDirectory')}`);
   }
   if (!new RegExp(`^Identifier=${component.bundleIdentifier.replace(/[.]/gu, '\\.')}$`, 'mu').test(display)) {
     throw new Error(`component ${component.kind} has the wrong signing identifier`);
@@ -471,7 +483,7 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
     ['--display', '-r-', executablePath],
   ));
   if (!requirement.includes(component.designatedRequirement)) {
-    throw new Error(`component ${component.kind} has an unexpected designated requirement`);
+    throw new Error(`component ${component.kind} has an unexpected designated requirement: ${firstLine(requirement, 'designated')}`);
   }
 
   const assessment = commandText(await run(
@@ -479,7 +491,7 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
     ['--assess', '--type', 'execute', '-vv', executablePath],
   ));
   if (!/\bsource=Notarized Developer ID\b/u.test(assessment)) {
-    throw new Error(`component ${component.kind} is not assessed as a notarized Developer ID binary`);
+    throw new Error(`component ${component.kind} is not assessed as a notarized Developer ID binary: ${assessment.trim().split(/\r?\n/u).slice(0, 3).join(' | ')}`);
   }
 
   // Only where a ticket can exist. These components are bare Mach-O
