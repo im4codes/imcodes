@@ -25,11 +25,20 @@ import {
 } from '../../shared/controlled-node-service.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import {
+  REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES,
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET_MAX_BYTES,
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES,
+  REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME,
+  decodeRemoteDesktopMacosComponentSetPrefix,
+  remoteDesktopMacosComponentSetFilename,
   validateRemoteDesktopWorkerManifest,
+  validateRemoteDesktopWorkerReleaseManifest,
+  type RemoteDesktopMacosArchitecture,
 } from '../../shared/remote-desktop-worker.js';
 import {
   WINDOWS_POWERSHELL_SECURITY_MODULE_PREFLIGHT,
@@ -658,6 +667,139 @@ export async function downloadControlledNodeComputerUseHelper(input: {
  * has no controlled-node role to claim.
  */
 export type ArtifactDownloadCredential = Pick<ControlledNodeCredential, 'serverId' | 'token' | 'serverUrl'>;
+
+/**
+ * Fetch and unpack the macOS remote-desktop component set.
+ *
+ * The macOS components ship as ONE asset rather than four, because they are
+ * only ever valid together: the manifest binds every component's digest, and a
+ * set assembled from two releases would satisfy each file's own check while
+ * pairing a worker with a launch agent that never spoke to it. The wire format
+ * is `[magic][manifest length][manifest][components in canonical order]`, and
+ * the same `shared/` helpers that wrote it read it back here.
+ *
+ * The unpacked directory is left containing EXACTLY the manifest and the
+ * components it names -- the downloader's own sidecar and the archive itself
+ * are removed -- because that is what the artifact store admits. Anything else
+ * beside signed artifacts is a file nothing describes or verifies.
+ *
+ * Verification is deliberately NOT done here. This function produces a staging
+ * directory; `verifyMacosRemoteDesktopArtifact` is what decides whether it may
+ * be promoted, and it runs the same Apple checks the daemon runs on a user's
+ * Mac.
+ */
+export async function downloadControlledNodeMacosRemoteDesktopComponentSet(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  dir: string;
+  fetchImpl: typeof fetch;
+  expectedVersion?: string;
+  onProgress?: (phase: ControlledNodeArtifactDownloadPhase) => Promise<void>;
+}): Promise<{ componentDirectory: string; manifestPath: string } | undefined> {
+  if (input.target.os !== CONTROLLED_NODE_OS_MAC) return undefined;
+  const arch = input.target.arch;
+  if (arch !== 'arm64' && arch !== 'x64') return undefined;
+  const componentDirectory = join(input.dir, 'remote-desktop-worker', `darwin-${arch}`);
+  await mkdir(componentDirectory, { recursive: true });
+  const setFilename = remoteDesktopMacosComponentSetFilename(arch as RemoteDesktopMacosArchitecture);
+  const download = await downloadArtifact({
+    credential: input.credential,
+    target: input.target,
+    dir: componentDirectory,
+    fetchImpl: input.fetchImpl,
+    asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET,
+    expectedFileName: setFilename,
+    expectedVersion: input.expectedVersion,
+    fileMode: 0o644,
+    onProgress: input.onProgress,
+  });
+  const handle = await open(download.artifactPath, 'r');
+  try {
+    if (download.sizeBytes > REMOTE_DESKTOP_MACOS_COMPONENT_SET_MAX_BYTES) {
+      throw new Error('remote_desktop_macos_component_set_too_large');
+    }
+    const prefix = Buffer.alloc(REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES);
+    const prefixRead = await handle.read(prefix, 0, prefix.length, 0);
+    if (prefixRead.bytesRead !== prefix.length) {
+      throw new Error('remote_desktop_macos_component_set_truncated');
+    }
+    const decoded = decodeRemoteDesktopMacosComponentSetPrefix(
+      new Uint8Array(prefix.buffer, prefix.byteOffset, prefix.byteLength),
+    );
+    if (!decoded) throw new Error('remote_desktop_macos_component_set_prefix_invalid');
+    const manifestBytes = Buffer.alloc(decoded.manifestSize);
+    const manifestRead = await handle.read(
+      manifestBytes, 0, manifestBytes.length, REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES,
+    );
+    if (manifestRead.bytesRead !== manifestBytes.length
+      || manifestBytes.length > REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES) {
+      throw new Error('remote_desktop_macos_component_set_truncated');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(manifestBytes.toString('utf8'));
+    } catch {
+      throw new Error('remote_desktop_macos_component_set_manifest_invalid');
+    }
+    // Validated WITHOUT the expected target, then compared explicitly. Passing
+    // the target in makes the validator reject a mismatched architecture
+    // itself, which collapses "this archive is corrupt" and "the server sent
+    // the wrong slice" into one answer -- and the second is the one worth
+    // naming, because it is not the node's fault and not fixable by retrying.
+    const manifest = validateRemoteDesktopWorkerReleaseManifest(parsed);
+    // Named, not a bare "invalid". A manifest this size has dozens of ways to
+    // be wrong and the difference between "the server sent another
+    // architecture" and "the archive is corrupt" decides what to do next.
+    if (!manifest) throw new Error('remote_desktop_macos_component_set_manifest_rejected');
+    if (manifest.os !== 'darwin' || manifest.arch !== arch) {
+      throw new Error(`remote_desktop_macos_component_set_target_mismatch_${manifest.os}_${manifest.arch}`);
+    }
+    if (input.expectedVersion !== undefined && manifest.workerVersion !== input.expectedVersion) {
+      throw new Error('remote_desktop_macos_component_set_version_mismatch');
+    }
+    // Sizes are taken from the manifest, and the total must account for the
+    // whole file. A short last component would otherwise be written happily
+    // and only fail later, as a digest mismatch that names the component
+    // rather than the transfer.
+    let offset = REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES + manifestBytes.length;
+    for (const kind of REMOTE_DESKTOP_MACOS_COMPONENT_ORDER) {
+      const descriptor = manifest.components[kind];
+      const target = join(componentDirectory, descriptor.fileName);
+      // Copied through a fixed buffer rather than read whole: the worker alone
+      // is tens of megabytes and this runs in a memory-constrained node.
+      const out = await open(target, 'w', 0o755);
+      try {
+        const buffer = Buffer.alloc(Math.min(1024 * 1024, descriptor.size));
+        let copied = 0;
+        while (copied < descriptor.size) {
+          const want = Math.min(buffer.length, descriptor.size - copied);
+          const read = await handle.read(buffer, 0, want, offset + copied);
+          if (read.bytesRead !== want) {
+            throw new Error('remote_desktop_macos_component_set_truncated');
+          }
+          await out.write(buffer, 0, want);
+          copied += want;
+        }
+      } finally {
+        await out.close();
+      }
+      offset += descriptor.size;
+    }
+    if (offset !== download.sizeBytes) {
+      throw new Error('remote_desktop_macos_component_set_size_mismatch');
+    }
+    const manifestPath = join(componentDirectory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME);
+    await writeFile(manifestPath, manifestBytes, { mode: 0o644 });
+    return { componentDirectory, manifestPath };
+  } finally {
+    await handle.close().catch(() => {});
+    // The archive and the downloader's sidecar are not part of the set the
+    // store admits, and a release directory that contains anything but the
+    // manifest and its components is refused outright.
+    await rm(download.artifactPath, { force: true }).catch(() => {});
+    await rm(download.manifestPath, { force: true }).catch(() => {});
+  }
+}
 
 export async function downloadControlledNodeRemoteDesktopWorker(input: {
   credential: ArtifactDownloadCredential;
