@@ -1,4 +1,8 @@
 import WebSocket from 'ws';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
@@ -10,7 +14,12 @@ import {
 } from '../transport/authenticated-websocket.js';
 import { MachineExecWorker } from './machine-exec-worker.js';
 import { ComputerUseWorker } from './computer-use-worker.js';
-import { startControlledNodeSelfUpgrade } from './self-upgrade.js';
+import {
+  downloadControlledNodeMacosRemoteDesktopComponentSet,
+  startControlledNodeSelfUpgrade,
+} from './self-upgrade.js';
+import { promoteMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
+import { defaultMacosRemoteDesktopArtifactStoreRoot } from './macos-remote-desktop-production.js';
 import type { ControlledNodeCredential } from './enrollment.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -68,6 +77,8 @@ import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_PERMISSION_MSG,
   REMOTE_DESKTOP_INSTALL_MSG,
 } from '../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
@@ -232,6 +243,14 @@ class FinalizingAuthenticatedWebSocketClient extends AuthenticatedWebSocketClien
 }
 
 export interface ControlledNodeRuntimeOptions {
+  /**
+   * Injected so the install path can be exercised without a server, a notary
+   * and four signed binaries. The default implementation downloads this
+   * release's component set and promotes it.
+   */
+  installMacosRemoteDesktopComponents?: () => Promise<boolean>;
+  /** Injected for the same reason: raising a real TCC prompt needs a real Mac. */
+  requestMacosRemoteDesktopPermissions?: () => Promise<boolean>;
   onAuthenticated?: () => void | Promise<void>;
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
@@ -266,6 +285,7 @@ export interface ControlledNodeRuntimeOptions {
 }
 
 const REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS = 5 * 60_000;
+const MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS = 5 * 60_000;
 export const CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS = 60_000;
 // Server-side version convergence is deliberately scheduled five seconds after
 // authentication. Wait through that window before attempting a same-version
@@ -418,6 +438,18 @@ export function createControlledNodeRuntime(
     && arch === 'x64'
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
+  // macOS advertises the same intent under its own name and installs by a
+  // different mechanism: the components are published into a store with
+  // rollback and a last-known-good selector, so nothing replaces the running
+  // executable and the process does not restart. Recomputed rather than
+  // captured, because a successful install must stop offering itself without
+  // waiting for a reconnect.
+  const macosRemoteDesktopComponentsInstallable = (): boolean => platform === 'darwin'
+    && (arch === 'arm64' || arch === 'x64')
+    && remoteDesktopFeatureEnabled
+    && !remoteDesktopWorkerAvailable;
+  let macosRemoteDesktopInstallInFlight = false;
+  let macosRemoteDesktopInstallNextAttemptAt = 0;
   let upgradeInFlight = false;
   let upgradeHandoffDeadlineAt: number | null = null;
   const armUpgradeHandoffWatchdog = (): void => {
@@ -551,6 +583,70 @@ export function createControlledNodeRuntime(
       authenticationPersistenceInFlight = false;
     });
   };
+  /**
+   * Fetch this release's macOS component set and publish it.
+   *
+   * Unlike the Windows repair below, nothing restarts: the components live in
+   * their own store and the running executable is untouched. Promotion is
+   * transactional -- it verifies the staged set with the same Apple checks the
+   * daemon applies on a user's Mac, and a failure leaves the previous
+   * selectors exactly as they were.
+   *
+   * The staging directory is temporary and removed either way. A half-written
+   * set left beside the store is a set some later code might mistake for a
+   * release.
+   */
+  const installMacosRemoteDesktopComponents = async (force = false): Promise<boolean> => {
+    if (macosRemoteDesktopInstallInFlight || !macosRemoteDesktopComponentsInstallable()) return false;
+    // A failed automatic attempt waits before trying again. Without this every
+    // reconnect re-downloads, and a server that cannot serve the set turns a
+    // flapping link into a request loop. An explicit click ignores the delay:
+    // the person asking has new information the node does not.
+    const now = options.now?.() ?? Date.now();
+    if (!force && now < macosRemoteDesktopInstallNextAttemptAt) return false;
+    macosRemoteDesktopInstallNextAttemptAt = now + MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS;
+    macosRemoteDesktopInstallInFlight = true;
+    const install = options.installMacosRemoteDesktopComponents ?? (async () => {
+      const componentArch = arch === 'arm64' ? 'arm64' : 'x64';
+      const staging = await mkdtemp(join(tmpdir(), 'imcodes-macos-rd-install-'));
+      try {
+        const downloaded = await downloadControlledNodeMacosRemoteDesktopComponentSet({
+          credential,
+          target: { os: CONTROLLED_NODE_OS_MAC, arch: componentArch },
+          dir: staging,
+          fetchImpl: fetch,
+          expectedVersion: DAEMON_VERSION,
+        });
+        if (!downloaded) return false;
+        await promoteMacosRemoteDesktopArtifact({
+          artifactDirectory: downloaded.componentDirectory,
+          manifestPath: downloaded.manifestPath,
+          storeRoot: defaultMacosRemoteDesktopArtifactStoreRoot(componentArch),
+          expectedWorkerVersion: DAEMON_VERSION,
+        });
+        return true;
+      } finally {
+        await rm(staging, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+    try {
+      const installed = await install();
+      if (installed) {
+        // Re-read what is on disk rather than assuming the install implies
+        // readiness: the components still have to pass the adapter's own
+        // availability check, and screen recording may not be granted yet.
+        refreshRemoteDesktopCapabilityState();
+        refreshAuthCapabilities();
+        logger.info('installed the macOS remote-desktop component set');
+      }
+      return installed;
+    } catch (error) {
+      logger.warn({ err: error }, 'macOS remote-desktop component install failed');
+      return false;
+    } finally {
+      macosRemoteDesktopInstallInFlight = false;
+    }
+  };
   const repairMissingRemoteDesktopWorker = (force = false) => {
     if (!missingRemoteDesktopWorkerCanRepair || upgradeInFlight) return false;
     const now = options.now?.() ?? Date.now();
@@ -606,6 +702,12 @@ export function createControlledNodeRuntime(
     serverId: credential.serverId,
     token: credential.token,
     daemonVersion: DAEMON_VERSION,
+    // The architecture this process is ACTUALLY running as, which the row
+    // recorded at enrollment may not be. The macOS executable is universal,
+    // so enrollment recorded whichever slice ran the installer -- under
+    // Rosetta that is `x64` on an Apple Silicon Mac, and nothing corrected it
+    // afterwards, leaving the machine mislabelled everywhere it was shown.
+    runtimeArch: arch,
     capabilities: [],
   };
   const refreshAuthCapabilities = (): void => {
@@ -624,6 +726,9 @@ export function createControlledNodeRuntime(
         ]
         : []),
       ...(missingRemoteDesktopWorkerCanRepair ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] : []),
+      ...(macosRemoteDesktopComponentsInstallable()
+        ? [REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY]
+        : []),
       ...advertisedAdapterCapabilities,
       ...(defaultShieldedRouteAvailable
         ? [REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY]
@@ -689,6 +794,11 @@ export function createControlledNodeRuntime(
             + REMOTE_DESKTOP_WORKER_REPAIR_AUTH_GRACE_MS;
         }
         repairMissingRemoteDesktopWorker();
+        // macOS installs itself. The components are part of this release, the
+        // node already knows it has none, and making a human click a button to
+        // fetch them is asking them to do what the node can do unprompted. The
+        // manual request remains as a retry for when this fails.
+        void installMacosRemoteDesktopComponents();
         try {
           void Promise.resolve(options.onHeartbeatAck?.()).then(async () => {
             if (legacyUpgradeRescueCleanupStarted) return;
@@ -762,10 +872,42 @@ export function createControlledNodeRuntime(
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
         return;
       }
+      if (message.type === REMOTE_DESKTOP_PERMISSION_MSG.REQUEST) {
+        // No caller-controlled fields, for the same reason the install request
+        // has none: there is exactly one thing to ask for, and a parameterised
+        // version is a way to make a controlled node launch something chosen
+        // from a browser.
+        if (Object.keys(message).length !== 1) return;
+        const request = options.requestMacosRemoteDesktopPermissions
+          ?? options.macosRemoteDesktopWorker?.requestPermissions;
+        if (!request) {
+          logger.warn('no macOS remote-desktop adapter to raise a permission prompt');
+          return;
+        }
+        void Promise.resolve(request()).then((asked) => {
+          // BOTH outcomes are logged. Only logging success meant a refusal --
+          // including "the components exist but cannot be executed" -- left no
+          // trace at all, which is exactly how this went unexplained while the
+          // operator clicked the button again.
+          if (asked) {
+            logger.info('asked the machine to raise its remote-desktop permission prompt');
+          } else {
+            logger.warn('the macOS adapter declined to raise the permission prompt');
+          }
+        }, (error) => {
+          logger.warn({ err: error }, 'could not raise the remote-desktop permission prompt');
+        });
+        return;
+      }
       if (message.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST) {
         // The request deliberately has no caller-controlled fields. Exactness
         // prevents this from becoming a generic upgrade endpoint.
-        if (Object.keys(message).length === 1) repairMissingRemoteDesktopWorker(true);
+        if (Object.keys(message).length !== 1) return;
+        if (macosRemoteDesktopComponentsInstallable()) {
+          void installMacosRemoteDesktopComponents(true);
+          return;
+        }
+        repairMissingRemoteDesktopWorker(true);
         return;
       }
       if (message.type === REMOTE_DESKTOP_PRIVACY_MSG.BEGIN

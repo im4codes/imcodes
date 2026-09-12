@@ -1402,9 +1402,22 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     && server.node_role !== NODE_ROLE.CONTROLLED) {
     return c.json({ error: 'forbidden' }, 403);
   }
+  // The OS is checked; the enrolled ARCH deliberately is not.
+  //
+  // The macOS controlled-node executable is universal, so the arch recorded at
+  // enrollment is `process.arch` of whichever slice happened to run the
+  // installer -- under Rosetta that is `x64` on an Apple Silicon Mac, and it is
+  // never corrected afterwards. Gating component downloads on it therefore
+  // barred a machine from the only components it can actually run, permanently
+  // and on the basis of something that is not a property of the machine at all.
+  //
+  // Nothing is lost by trusting the request: the node knows its own CPU when it
+  // asks, the manifest inside the set names its architecture, and the node
+  // rejects a set whose manifest or binaries do not match what it asked for.
+  // The worst a wrong request can achieve is a set its own verification
+  // refuses to install.
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
-    && ((server.os !== null && server.os !== CONTROLLED_NODE_OS_MAC)
-      || (server.arch !== null && server.arch !== requestedMacosComponentArch))) {
+    && server.os !== null && server.os !== CONTROLLED_NODE_OS_MAC) {
     return c.json({ error: 'forbidden' }, 403);
   }
   if ((server.os && server.arch

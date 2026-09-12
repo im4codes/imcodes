@@ -29,6 +29,7 @@ import {
   runMacosUserSessionCommand,
   type MacosUserSession,
 } from './user-session-launcher.js';
+import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
 
 export const MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_ENVIRONMENT = Object.freeze({
   // Which session launchd loaded this agent into, and the kernel audit session
@@ -332,17 +333,10 @@ function validateArtifact(
   // the bar it would then be measured against, so a self-consistent foreign
   // team passed. This boundary also accepts an already-typed artifact object,
   // which TypeScript cannot prove came from verification.
-  const expectedRequirement = [
-    `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}"`,
-    'and anchor apple generic',
-    // The two markers codesign emits for a Developer ID Application leaf.
-    // They sit between the anchor and the team clause in the requirement it
-    // derives, and without them an Apple Development certificate from the
-    // same team satisfies this.
-    'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
-    'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
-    `and certificate leaf[subject.OU] = "${REMOTE_DESKTOP_MACOS_TEAM_ID}"`,
-  ].join(' ');
+  const expectedRequirement = appleDesignatedRequirement(
+    MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
+    REMOTE_DESKTOP_MACOS_TEAM_ID,
+  );
   if (manifest.os !== 'darwin'
     || manifest.codeSignature.teamId !== REMOTE_DESKTOP_MACOS_TEAM_ID
     || launchAgentIdentity.bundleIdentifier

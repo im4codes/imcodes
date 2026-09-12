@@ -47,6 +47,7 @@ export const MACOS_VIRTUAL_DISPLAY_AUTHORITY_ERROR = Object.freeze({
 } as const);
 
 import { REMOTE_DESKTOP_MACOS_TEAM_ID } from './remote-desktop-worker.js';
+import { appleDesignatedRequirement } from './macos-code-requirement.js';
 
 const SHA256_RE = /^[0-9a-f]{64}$/u;
 const RELEASE_RE = /^[A-Za-z0-9._-]{1,96}$/u;
@@ -93,8 +94,10 @@ export function canonicalDesignatedRequirement(
   // sides. `anchor apple generic` is what demands an Apple-issued chain --
   // without it a self-signed binary with the right identifier and OU satisfies
   // the requirement.
-  return `identifier "${bundleIdentifier}" and anchor apple generic `
-    + `and certificate leaf[subject.OU] = "${teamId}"`;
+  // The Developer ID markers are part of this string. They were missing, so
+  // this function and the worker-manifest validator demanded two different
+  // spellings of the SAME manifest field and no manifest could satisfy both.
+  return appleDesignatedRequirement(bundleIdentifier, teamId);
 }
 
 /** Printable ASCII only, measured in BYTES, not code points. */

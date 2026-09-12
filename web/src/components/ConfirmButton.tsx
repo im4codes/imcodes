@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 
 /** How long an armed button waits before giving up and disarming itself. */
 export const CONFIRM_BUTTON_TIMEOUT_MS = 4000;
@@ -15,11 +15,10 @@ export const CONFIRM_BUTTON_TIMEOUT_MS = 4000;
  * a trap: you come back to the screen, click what looks like a normal button,
  * and it fires immediately.
  *
- * Deliberately NOT disarmed on blur. That would be a nicety on top of the
- * timeout, and it could not be exercised in this test environment -- the click
- * path updates state there but the blur path never reaches the handler. An
- * untestable safeguard is worse than one less safeguard, because only the first
- * kind can rot without anyone noticing.
+ * It disarms on an explicit outside click/tap or Escape rather than blur.
+ * Blur also fires while keyboard users move focus for unrelated reasons and is
+ * not a reliable expression of cancellation; pointer/Escape are deterministic
+ * in both the browser and the component tests.
  */
 export function ConfirmButton({
   label,
@@ -30,6 +29,7 @@ export function ConfirmButton({
   disabled = false,
   testId,
   timeoutMs = CONFIRM_BUTTON_TIMEOUT_MS,
+  resetKey,
   style,
   confirmStyle,
 }: {
@@ -41,17 +41,23 @@ export function ConfirmButton({
   disabled?: boolean;
   testId?: string;
   timeoutMs?: number;
+  /** Any change invalidates a confirmation that was armed for older context. */
+  resetKey?: string | number;
   style?: preact.JSX.CSSProperties;
   confirmStyle?: preact.JSX.CSSProperties;
 }): preact.JSX.Element {
   const [armed, setArmed] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const armedRef = useRef(false);
+  armedRef.current = armed;
 
   const disarm = (): void => {
     if (timer.current !== null) {
       clearTimeout(timer.current);
       timer.current = null;
     }
+    armedRef.current = false;
     setArmed(false);
   };
 
@@ -65,8 +71,36 @@ export function ConfirmButton({
   // back armed when it is re-enabled.
   useEffect(() => { if (disabled) disarm(); }, [disabled]);
 
+  // A confirmation belongs to the exact action context in which it was
+  // armed. Callers use this for target or content changes that would otherwise
+  // turn the second click into approval of a different action.
+  useLayoutEffect(() => { if (armed) disarm(); }, [resetKey]);
+
+  useLayoutEffect(() => {
+    const onOutsideClick = (event: MouseEvent): void => {
+      if (!armedRef.current) return;
+      if (!buttonRef.current?.contains(event.target as Node)) disarm();
+    };
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (!armedRef.current || event.key !== 'Escape') return;
+      // While armed, this control owns Escape. Letting the event reach a parent
+      // shortcut can cancel/append the very queue action the user is trying to
+      // back out of.
+      event.preventDefault();
+      event.stopPropagation();
+      disarm();
+    };
+    document.addEventListener('click', onOutsideClick, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('click', onOutsideClick, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, []);
+
   return (
     <button
+      ref={buttonRef}
       type="button"
       class={`${armed ? confirmClassName : className} ${armed ? 'is-armed' : ''}`.trim()}
       data-testid={testId}
@@ -81,10 +115,12 @@ export function ConfirmButton({
         // to a disabled button. Guarding here rather than trusting the
         // attribute keeps "disabled" meaning the same thing everywhere.
         if (disabled) return;
-        if (!armed) {
+        if (!armedRef.current) {
+          armedRef.current = true;
           setArmed(true);
           timer.current = setTimeout(() => {
             timer.current = null;
+            armedRef.current = false;
             setArmed(false);
           }, timeoutMs);
           return;

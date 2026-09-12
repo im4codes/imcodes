@@ -503,8 +503,9 @@ describe('macOS virtual-display authority', () => {
     // against its own idea of the format would let them agree on nothing.
     const cli = await grantCli();
 
-    const requirement = 'identifier "cc.imcodes.node.virtual-display-helper" and anchor '
-      + `apple generic and certificate leaf[subject.OU] = "${REMOTE_DESKTOP_MACOS_TEAM_ID}"`;
+    const requirement = canonicalDesignatedRequirement(
+      'cc.imcodes.node.virtual-display-helper', REMOTE_DESKTOP_MACOS_TEAM_ID,
+    );
     const authority = buildMacosVirtualDisplayAuthority({
       setSha256: 'd'.repeat(64),
       releaseName: `sha256-${'d'.repeat(64)}`,
@@ -732,7 +733,7 @@ describe('macOS virtual-display authority', () => {
     // TEXT therefore has to be asserted outright, in both languages, against
     // the same literal.
     const expected = 'identifier "cc.example.helper" and anchor apple generic '
-      + 'and certificate leaf[subject.OU] = "ABCDE12345"';
+      + 'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ABCDE12345';
     expect(canonicalDesignatedRequirement('cc.example.helper', 'ABCDE12345'))
       .toBe(expected);
 

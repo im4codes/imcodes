@@ -27,10 +27,18 @@ macos::MacosExpectedPeerIdentity Expected(uid_t uid) {
       .uid = uid,
       .bundle_identifier = kBundleIdentifier,
       .team_id = kTeamId,
+      // Spelled out rather than built with AppleDesignatedRequirement: this
+      // literal IS the golden text, and a test that asked the implementation
+      // what it expects would agree with any drift in it. Note the bundle
+      // identifier is quoted (hyphens) while the team is not (it begins with a
+      // letter and is otherwise alphanumeric) -- that asymmetry is exactly
+      // what codesign emits and exactly what was once got wrong.
       .designated_requirement =
-          std::string("identifier \"") + kBundleIdentifier +
-          "\" and anchor apple generic and certificate leaf[subject.OU] = \"" +
-          kTeamId + "\"",
+          "identifier \"cc.imcodes.node.remote-desktop-agent\""
+          " and anchor apple generic"
+          " and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */"
+          " and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */"
+          " and certificate leaf[subject.OU] = ABCDE12345",
   };
 }
 

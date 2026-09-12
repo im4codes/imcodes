@@ -670,6 +670,7 @@ describe('controlled-node shared action admission', () => {
       'POST /:serverId/auto-unlock',
       'POST /:serverId/display-name',
       'POST /:serverId/exec-enabled',
+      'POST /:serverId/remote-desktop-permissions',
       'POST /:serverId/remote-desktop-worker',
       'POST /:serverId/revoke',
     ]);

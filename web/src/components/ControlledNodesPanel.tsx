@@ -12,6 +12,7 @@ import {
   artifactSelectionKey,
   buildControlledNodeDownloadTargets,
   installMachineRemoteDesktopWorker,
+  requestMachineRemoteDesktopPermissions,
   listAvailableExecutables,
   renameMachine,
   revokeMachine,
@@ -22,7 +23,11 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_WEB_READINESS,
+  resolveRemoteDesktopWebReadiness,
+} from '../remote-desktop-profile.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { MACHINE_IDENTITY_UNAVAILABLE, normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { formatByteSize } from '../util/byte-size.js';
@@ -53,11 +58,29 @@ function canConfigureAutoUnlock(machine: MachineListItem): boolean {
     && Boolean(machine.capabilities?.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY));
 }
 
+/**
+ * The machine has its components and is waiting on the one grant only a person
+ * at it can give. Distinct from "cannot do remote desktop": the two need
+ * opposite things from the operator.
+ */
+function needsRemoteDesktopPermission(machine: MachineListItem): boolean {
+  return machine.online
+    && machine.execEnabled
+    && machineAccessRole(machine) === 'owner'
+    && resolveRemoteDesktopWebReadiness(machine.capabilities).kind
+      === REMOTE_DESKTOP_WEB_READINESS.SCREEN_RECORDING_REQUIRED;
+}
+
 function canInstallRemoteDesktopWorker(machine: MachineListItem): boolean {
   return machineAccessRole(machine) === 'owner'
     && machine.online
     && !machine.updateAvailable
-    && Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY))
+    // Either platform's "needs one download first" signal. They are separate
+    // wire values because the Windows one says `windows` in its name and the
+    // two installs are different operations, but to this button they mean the
+    // same thing.
+    && (Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY))
+      || Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY)))
     && !machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY);
 }
 
@@ -471,6 +494,26 @@ export function ControlledNodesPanel({
     setBusyServerId(null);
   };
 
+  /**
+   * Ask the machine to put its permission dialog on screen.
+   *
+   * Presence is not refreshed afterwards on purpose: nothing has changed yet.
+   * The dialog is now waiting for a person at that Mac, and the capability
+   * this button is gated on flips only after they answer -- which the ordinary
+   * presence poll will pick up.
+   */
+  const onRequestRemoteDesktopPermissions = async (serverId: string) => {
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await requestMachineRemoteDesktopPermissions(serverId);
+    } catch {
+      setActionError(t('remote_desktop.request_permission_failed'));
+    } finally {
+      setBusyServerId(null);
+    }
+  };
+
   const startAutoUnlock = (serverId: string) => {
     setActionError(null);
     setAutoUnlockServerId(serverId);
@@ -860,13 +903,28 @@ export function ControlledNodesPanel({
               </div>
               <div class={`controlled-nodes-machine-actions ${mobileActions ? `is-mobile is-${machineAccessRole(m)}` : 'is-desktop'}`}>
                 {!mobileActions && renderInstallAction(m, false)}
-                {canOpenRemoteDesktopMachine(m) && (
+                {canOpenRemoteDesktopMachine(m) ? (
                   <button
                     type="button"
                     class="controlled-nodes-remote-desktop"
                     onClick={() => onOpenRemoteDesktop?.(m)}
                   >
                     {t('remote_desktop.open')}
+                  </button>
+                ) : needsRemoteDesktopPermission(m) && (
+                  // One grant away, not unsupported. Showing nothing here is
+                  // what made a machine that needs a single click look like a
+                  // machine that will never work.
+                  <button
+                    type="button"
+                    class="controlled-nodes-remote-desktop is-permission-required"
+                    disabled={busyServerId === m.serverId}
+                    title={t('remote_desktop.request_permission_hint')}
+                    onClick={() => { void onRequestRemoteDesktopPermissions(m.serverId); }}
+                  >
+                    {busyServerId === m.serverId
+                      ? t('remote_desktop.requesting_permission')
+                      : t('remote_desktop.request_permission')}
                   </button>
                 )}
                 {mobileActions && machineAccessRole(m) === 'owner' ? (

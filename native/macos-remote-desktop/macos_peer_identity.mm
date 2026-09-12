@@ -1,4 +1,5 @@
 #include "macos_peer_identity.h"
+#include "macos_code_requirement.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
@@ -102,11 +103,16 @@ bool IsExpectedIdentityValid(const MacosExpectedPeerIdentity &expected) {
       expected.designated_requirement.find('\0') != std::string::npos) {
     return false;
   }
-  const std::string canonical_requirement =
-      "identifier \"" + expected.bundle_identifier +
-      "\" and anchor apple generic and certificate leaf[subject.OU] = \"" +
-      expected.team_id + "\"";
-  return expected.designated_requirement == canonical_requirement;
+  // The two Developer ID marker OIDs are part of the canonical text and were
+  // missing here: codesign puts them between the anchor and the team clause,
+  // and the TypeScript side has required them since an Apple Development
+  // certificate from the same team was found to satisfy the shorter form. A
+  // validator that still demanded the shorter string rejected every identity
+  // the daemon actually builds, as kInvalidArgument -- an error naming the
+  // caller rather than the stale constant here.
+  return expected.designated_requirement ==
+         AppleDesignatedRequirement(expected.bundle_identifier,
+                                    expected.team_id);
 }
 
 bool SameKernelPeer(const MacosKernelPeerIdentity &left,

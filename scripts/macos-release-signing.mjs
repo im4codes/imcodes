@@ -290,6 +290,16 @@ export function notarizeExecutable(input) {
  * rejected outright: "must be a zip archive (.zip), flat installer package
  * (.pkg), or UDIF disk image (.dmg)".
  */
+/**
+ * Failures that are about the network rather than about the artifact.
+ *
+ * Matched on notarytool's own wording. Anything else -- an authentication
+ * failure, a malformed archive, a rejection -- is reported immediately,
+ * because retrying it only delays the same answer.
+ */
+const NOTARIZATION_TRANSPORT_FAILURE =
+  /HTTPClientError\.(?:connectTimeout|connectionLost|deadlineExceeded)|NSURLErrorDomain|The request timed out|Could not connect to the server|connection was lost/iu;
+
 function submitForNotarization(input) {
   const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
   const direct = macosArtifactCanBeSubmittedDirectly(artifactPath);
@@ -299,14 +309,36 @@ function submitForNotarization(input) {
       // `--keepParent` so the archive contains the bundle, not its contents.
       run(MACOS_RELEASE_SIGNING_TOOLS.ditto, ['-c', '-k', '--keepParent', artifactPath, uploadPath]);
     }
-    return parseNotarizationSubmission(run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
-      'notarytool', 'submit', uploadPath,
-      '--key', apiKeyPath,
-      '--key-id', apiKeyId,
-      '--issuer', apiIssuer,
-      '--wait',
-      '--output-format', 'json',
-    ]));
+    // Retried, because the submission crosses the public internet and a single
+    // TCP connect timeout otherwise destroys a release that has already spent
+    // minutes compiling. Observed exactly that: `HTTPClientError.connectTimeout`
+    // on the second of four components, with the same upload succeeding three
+    // times in a row immediately afterwards.
+    //
+    // Bounded and narrow on purpose. Only a TRANSPORT failure is retried: a
+    // rejection by Apple is a verdict about the artifact and repeating it would
+    // turn a clear "Invalid" into a slow one. And `submit --wait` is safe to
+    // repeat -- each attempt is an independent submission with its own id, so a
+    // retry cannot corrupt a submission that did in fact arrive.
+    const attempts = input.submissionAttempts ?? 3;
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return parseNotarizationSubmission(run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
+          'notarytool', 'submit', uploadPath,
+          '--key', apiKeyPath,
+          '--key-id', apiKeyId,
+          '--issuer', apiIssuer,
+          '--wait',
+          '--output-format', 'json',
+        ]));
+      } catch (error) {
+        const text = `${error?.stderr ?? ''}${error?.stdout ?? ''}${error?.message ?? ''}`;
+        if (attempt === attempts || !NOTARIZATION_TRANSPORT_FAILURE.test(text)) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
   } finally {
     if (!direct) rmSync(uploadPath, { force: true });
   }

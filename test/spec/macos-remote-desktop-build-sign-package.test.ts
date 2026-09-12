@@ -60,7 +60,9 @@ interface FakeToolOverrides {
   identifier?: string;
   teamIdentifier?: string;
   designatedRequirement?: string;
-  assessment?: string;
+  // A function when the test needs the answer to CHANGE between calls, which
+  // is the whole point of the polling path.
+  assessment?: string | (() => string);
   staple?: string;
   verifyStatus?: number;
 }
@@ -103,7 +105,23 @@ function fakeTools(component: { bundleIdentifier: string }, overrides: FakeToolO
       ].join('\n'));
     }
     if (executable === MACOS_REMOTE_DESKTOP_BUILD_TOOLS.spctl) {
-      return ok(overrides.assessment ?? '/tmp/component: accepted\nsource=Notarized Developer ID\n');
+      // What Gatekeeper ACTUALLY prints for a notarized standalone Mach-O:
+      // it never says `source=Notarized Developer ID` for one -- that wording
+      // is for bundles. It stops at "does not seem to be an app", which it
+      // reaches only after the signature and the notarization check out, and
+      // it prints no `source=` line at all. Every un-notarized variant does
+      // print one. Copied from the tool, not composed.
+      //
+      // A bundle gets the OTHER wording, so the stub answers by format rather
+      // than with one string: a test that hands the guard an .app must see
+      // what Gatekeeper would actually say about an .app.
+      const assessedPath = String(args[args.length - 1] ?? '/tmp/component');
+      const override = typeof overrides.assessment === 'function'
+        ? overrides.assessment()
+        : overrides.assessment;
+      return ok(override ?? (/\.(?:app|dmg|pkg)$/iu.test(assessedPath)
+        ? `${assessedPath}: accepted\nsource=Notarized Developer ID\n`
+        : `${assessedPath}: rejected (the code is valid but does not seem to be an app)\n`));
     }
     if (executable === MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun) {
       return ok(overrides.staple ?? 'Processing: /tmp/component\nThe validate action worked!\n');
@@ -131,8 +149,16 @@ async function verifyWith(
   return verifyBuiltMacosRemoteDesktopComponent(plan, component, executablePath, {
     ...fakeTools(component, overrides),
     readFile: async () => payload,
+    // Injected so the polling cases run instantly. A real wait would make this
+    // suite take twelve minutes to prove one branch.
+    sleep: async (ms: number) => { sleeps.push(ms); },
+    log: (line: string) => { logs.push(line); },
   });
 }
+
+/** Every wait the guard asked for, so "it retried" is asserted, not assumed. */
+let sleeps: number[] = [];
+let logs: string[] = [];
 
 describe('macOS remote-desktop deterministic build plan', () => {
   it('emits a machine-independent plan so two hosts with one checkout agree', async () => {
@@ -250,7 +276,7 @@ describe('macOS remote-desktop code identity', () => {
         `identifier "${component.bundleIdentifier}" and anchor apple generic`
         + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
         + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
-        + ` and certificate leaf[subject.OU] = "${TEAM_ID}"`,
+        + ` and certificate leaf[subject.OU] = ${TEAM_ID}`,
       );
     }
   });
@@ -406,9 +432,11 @@ describe('macOS remote-desktop post-build guards', () => {
     // Deliberately not xcrun/stapler. These components are bare Mach-O
     // executables and Apple provides no way to attach a ticket to one, so
     // there is nothing for `stapler validate` to read -- demanding it demanded
-    // something unobtainable. `spctl` above remains the substantive check:
-    // nothing makes Gatekeeper report a Notarized Developer ID for a binary
-    // Apple did not notarize.
+    // something unobtainable. `spctl` above remains the substantive check --
+    // though not by the wording once assumed: Gatekeeper never reports
+    // "Notarized Developer ID" for a standalone executable. It prints no
+    // `source=` line for one it accepts, and always prints one naming the
+    // refusal for one it does not.
     expect(executed).not.toContain(MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun);
     // Every tool must be invoked by absolute path, never resolved via PATH.
     for (const call of tools.calls) expect(call.executable.startsWith('/')).toBe(true);
@@ -444,9 +472,60 @@ describe('macOS remote-desktop post-build guards', () => {
   });
 
   it('rejects an unnotarized assessment', async () => {
+    // Exactly what spctl prints for a Developer ID binary that was signed but
+    // never notarized. The refusal has to key on THIS, because it is the only
+    // thing that distinguishes it from the notarized case at the tool's output.
+    await expect(verifyWith({
+      assessment: '/tmp/component: rejected\nsource=Unnotarized Developer ID\n',
+    })).rejects.toThrow(/not assessed by Gatekeeper as notarized/);
+  });
+
+  it('waits for a ticket Gatekeeper has not seen yet, then accepts', async () => {
+    // Gatekeeper's answer for a freshly notarized UNSTAPLED binary is
+    // eventually consistent. Measured delays ran from zero to several minutes,
+    // so sampling it once failed at random -- this build passed arm64 and
+    // failed x64 on artifacts Apple had already accepted.
+    sleeps = [];
+    logs = [];
+    let calls = 0;
+    await expect(verifyWith({
+      assessment: () => {
+        calls += 1;
+        return calls < 3
+          ? '/tmp/component: rejected\nsource=Unnotarized Developer ID\norigin=Developer ID Application: Someone (ABCDE12345)\n'
+          : '/tmp/component: rejected (the code is valid but does not seem to be an app)\n';
+      },
+    })).resolves.toBeDefined();
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([15_000, 15_000]);
+    // And it says so, because a silent multi-minute wait reads as a hang.
+    expect(logs).toEqual([
+      "waiting for Gatekeeper to see worker's notarization (15s of 720s)",
+      "waiting for Gatekeeper to see worker's notarization (30s of 720s)",
+    ]);
+  });
+
+  it('does not wait for a refusal that will never become a ticket', async () => {
+    // An unsigned or foreign binary is a defect, not a propagation delay. It
+    // must fail at once rather than after the whole budget.
+    for (const assessment of [
+      '/tmp/component: rejected\nsource=no usable signature\n',
+      // Developer ID wording without an origin line: not the shape a pending
+      // ticket produces.
+      '/tmp/component: rejected\nsource=Unnotarized Developer ID\n',
+      '/tmp/component: rejected\norigin=Apple Development: Someone (ABCDE12345)\n',
+    ]) {
+      sleeps = [];
+      await expect(verifyWith({ assessment }))
+        .rejects.toThrow(/not assessed by Gatekeeper as notarized/);
+      expect(sleeps).toEqual([]);
+    }
+  });
+
+  it('rejects an assessment that is accepted but not notarized', async () => {
     await expect(verifyWith({
       assessment: '/tmp/component: accepted\nsource=Developer ID\n',
-    })).rejects.toThrow(/notarized Developer ID/);
+    })).rejects.toThrow(/not assessed by Gatekeeper as notarized/);
   });
 
   it('still demands a stapled ticket from a format that can carry one', async () => {
@@ -461,8 +540,12 @@ describe('macOS remote-desktop post-build guards', () => {
     )).rejects.toThrow(/stapled notarization ticket/);
   });
 
-  it('rejects a failing codesign verification', async () => {
-    await expect(verifyWith({ verifyStatus: 1 })).rejects.toThrow(/build tool reported failure/);
+  it('rejects a failing codesign verification, naming the tool and its output', async () => {
+    // The tool and what it printed, not "build tool reported failure". A local
+    // release run ended in a stack trace into the command wrapper with nothing
+    // to act on, which is how CI became the debugger.
+    await expect(verifyWith({ verifyStatus: 1 }))
+      .rejects.toThrow(/codesign --verify exited 1: /u);
   });
 
   it('rejects an empty component', async () => {

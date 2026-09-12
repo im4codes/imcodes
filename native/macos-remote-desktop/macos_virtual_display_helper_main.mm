@@ -27,8 +27,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "macos_virtual_display_adapter.h"
 #include "macos_virtual_display_helper_binding.h"
@@ -631,6 +633,40 @@ class HelperState {
   std::uint32_t display_id_ = 0;
 };
 
+/**
+ * A never-destroyed static, without a heap allocation the leak checker has to
+ * be told about.
+ *
+ * Both statics below outlive `main`'s scope on purpose: the block that reads
+ * them is owned by a dispatch source on a run loop that this process does not
+ * leave, so their storage must stay valid for as long as the process does. As
+ * plain `static` objects they also acquired EXIT-TIME destructors, which run
+ * during teardown in an order nothing controls -- while a run loop callback
+ * may still be touching them. That is what `-Wexit-time-destructors` is for,
+ * and the flag was reaching the compiler mangled, so it never said so.
+ *
+ * Storage is a static buffer rather than `new`, so nothing is reported as
+ * leaked and the object is trivially reachable for its whole lifetime.
+ */
+template <typename T>
+class NoDestructor {
+ public:
+  template <typename... Args>
+  explicit NoDestructor(Args&&... args) {
+    new (storage_) T(std::forward<Args>(args)...);
+  }
+  NoDestructor(const NoDestructor&) = delete;
+  NoDestructor& operator=(const NoDestructor&) = delete;
+  ~NoDestructor() = default;
+
+  T& operator*() { return *get(); }
+  T* operator->() { return get(); }
+  T* get() { return reinterpret_cast<T*>(storage_); }
+
+ private:
+  alignas(T) unsigned char storage_[sizeof(T)];
+};
+
 }  // namespace
 
 int main(int argc, const char* argv[]) {
@@ -729,7 +765,9 @@ int main(int argc, const char* argv[]) {
 
   ::signal(SIGPIPE, SIG_IGN);
 
-  static HelperState state(std::move(seam), std::move(binding), decision);
+  static NoDestructor<HelperState> state_storage(std::move(seam), std::move(binding),
+                                                decision);
+  HelperState& state = *state_storage;
 
   // Ready handshake. Emitted only after the binding was accepted AND the
   // SkyLight seam resolved, so a supervisor that sees "ready" knows the helper
@@ -759,7 +797,8 @@ int main(int argc, const char* argv[]) {
     std::fprintf(stderr, "aidesk_virtual_display_helper_no_reader\n");
     return EX_OSERR;
   }
-  static std::string pending;
+  static NoDestructor<std::string> pending_storage;
+  std::string& pending = *pending_storage;
   static bool peer_gone = false;
   dispatch_source_set_event_handler(reader, ^{
     char buffer[512];

@@ -1902,11 +1902,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           // behind it. Providers that do not report backgroundWorkCount get
           // `background === 0`, which reduces to the original expression — their
           // blocking/idle behaviour is bit-for-bit unchanged.
-          const background = Math.max(0, providerSnapshot.backgroundWorkCount ?? 0);
-          const total = providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0;
-          backgroundWorkCount = Math.min(total, background);
-          const turnWork = Math.max(0, total - background);
-          if (turnWork > 0 || background === 0) {
+          const providerWork = this.providerWorkBreakdown(providerSnapshot);
+          backgroundWorkCount = providerWork.backgroundWorkCount;
+          const turnWork = providerWork.turnWorkCount;
+          if (turnWork > 0 || providerWork.reportedBackgroundWorkCount === 0) {
             add(evaluation.reason, Math.max(1, turnWork || providerSnapshot.activeToolCount || 0));
           }
           // Background work still surfaces its busy reasons so the UI can show
@@ -1924,6 +1923,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
+    };
+  }
+
+  private providerWorkBreakdown(snapshot: ProviderActiveWorkSnapshot): {
+    reportedBackgroundWorkCount: number;
+    backgroundWorkCount: number;
+    turnWorkCount: number;
+  } {
+    const total = snapshot.activeWorkCount || snapshot.activeToolCount || 0;
+    const reportedBackgroundWorkCount = Math.max(0, snapshot.backgroundWorkCount ?? 0);
+    const backgroundWorkCount = Math.min(total, reportedBackgroundWorkCount);
+    return {
+      reportedBackgroundWorkCount,
+      backgroundWorkCount,
+      turnWorkCount: Math.max(0, total - backgroundWorkCount),
     };
   }
 
@@ -2154,7 +2168,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         : {}),
     };
 
-    if (this.hasActiveTurnWork()) {
+    const activity = this.getActivitySnapshot();
+    if (activity.blockingWorkCount > 0) {
       if (metadata?.queuePlacement === 'front') {
         this._pendingMessages.unshift(entry);
       } else {
@@ -2195,10 +2210,20 @@ export class TransportSessionRuntime implements SessionRuntime {
         logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
       }
       this._pendingVersion++;
-      if (entry.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
-        && this._activeDispatchProviderAccepted
-        && this._activeDispatchId !== null) {
-        this.scheduleActiveAppendFlush(this._activeDispatchId);
+      if (entry.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
+        if (this._activeDispatchId !== null) {
+          if (this._activeDispatchProviderAccepted) {
+            this.scheduleActiveAppendFlush(this._activeDispatchId);
+          }
+        } else if (this.providerSnapshotHasAppendableTurn(activity.providerSnapshot)) {
+          // A provider-owned query may legitimately outlive the daemon's
+          // tracked dispatch (Claude tool/subagent work is the field case).
+          // The active-work snapshot is the authority that made send() queue;
+          // use the same durable reservation + native admission path as the
+          // manual Append button instead of leaving the row waiting for a
+          // dispatch id that will never reappear.
+          this.scheduleActiveAppendFlush(null);
+        }
       }
       return 'queued';
     }
@@ -3662,24 +3687,89 @@ export class TransportSessionRuntime implements SessionRuntime {
       });
   }
 
-  private scheduleActiveAppendFlush(dispatchId: number): void {
-    if (this._activeDispatchId !== dispatchId || !this._activeDispatchProviderAccepted) return;
-    if (this._activeAppendFlush) return;
+  private providerSnapshotHasAppendableTurn(snapshot: ProviderActiveWorkSnapshot | null): boolean {
+    if (!snapshot) return false;
+    const expectedGeneration = this._activityGeneration > 0
+      ? this.currentActivityGeneration()
+      : undefined;
+    const evaluation = evaluateProviderSnapshot(snapshot, expectedGeneration);
+    if (!evaluation.blocking || this.shouldIgnoreZeroWorkProviderSnapshot(snapshot, evaluation.state)) {
+      return false;
+    }
+    return this.providerWorkBreakdown(snapshot).turnWorkCount > 0;
+  }
+
+  private ownsActiveAppendFlush(dispatchId: number | null): boolean {
+    return dispatchId === null
+      ? this._activeDispatchId === null
+        && !this.hasInFlightDispatchWork()
+        && this._recoverableRetryTimer === null
+        && this._recoverableRetryEntryIds.length === 0
+        && this._sdkTurnLostRecoveryAttempt === null
+      : this._activeDispatchId === dispatchId && this._activeDispatchProviderAccepted;
+  }
+
+  /**
+   * Owner of the flush currently in `_activeAppendFlush`, and the single
+   * transition request that arrived while that flush still held it.
+   *
+   * A native admission can outlive the dispatch that started it. When it does,
+   * the running flush is owned by a dispatch id that is no longer authoritative,
+   * so it exits without draining -- and a request that arrived meanwhile used to
+   * be dropped for the sole reason that a flush was in flight. The append then
+   * sat in BOTH the runtime list and the durable queue forever while the
+   * provider was still working: not a lost race, silence.
+   *
+   * Deterministic rule: only a request for a DIFFERENT owner is retained (the
+   * running loop re-finds entries for its own owner by itself), the newest such
+   * request wins because an older one is superseded by definition, it is
+   * consumed exactly once, and it only starts if `ownsActiveAppendFlush` still
+   * holds at consume time -- so a request whose generation, dispatch or queue
+   * authority has moved on is discarded rather than started. Nothing reschedules
+   * from provider activity alone, which is what would spin on a stale or
+   * unsupported admission.
+   */
+  private _activeAppendFlushOwner: number | null | undefined = undefined;
+  private _pendingAppendFlushTransition: { dispatchId: number | null } | null = null;
+
+  private scheduleActiveAppendFlush(dispatchId: number | null): void {
+    if (!this.ownsActiveAppendFlush(dispatchId)) return;
+    if (this._activeAppendFlush) {
+      // Same owner needs nothing: that loop re-reads the pending list itself.
+      if (this._activeAppendFlushOwner !== dispatchId) {
+        this._pendingAppendFlushTransition = { dispatchId };
+      }
+      return;
+    }
     const flush = this.flushAcceptedProviderActiveAppends(dispatchId);
     this._activeAppendFlush = flush;
+    this._activeAppendFlushOwner = dispatchId;
     void flush.catch((err) => {
       logger.warn(
         { err, sessionKey: this.sessionKey, dispatchId },
         'transport accepted-provider active append flush failed; retaining durable FIFO fallback',
       );
     }).finally(() => {
-      if (this._activeAppendFlush === flush) this._activeAppendFlush = null;
+      if (this._activeAppendFlush !== flush) return;
+      this._activeAppendFlush = null;
+      this._activeAppendFlushOwner = undefined;
+      const pending = this._pendingAppendFlushTransition;
+      // Cleared BEFORE dispatching it, so a request that is no longer
+      // authoritative is discarded here rather than retried on the next
+      // completion. The authority re-check itself lives in exactly one place --
+      // the `ownsActiveAppendFlush` guard at the top of the method below -- so a
+      // request whose generation, dispatch or queue authority has moved on
+      // simply does not start. Re-checking here as well compiles and passes but
+      // is dead weight: a mutant that deletes it changes no observable
+      // behaviour, which is the definition of a safeguard that can rot unseen.
+      this._pendingAppendFlushTransition = null;
+      if (pending) this.scheduleActiveAppendFlush(pending.dispatchId);
     });
   }
 
-  private async flushAcceptedProviderActiveAppends(dispatchId: number): Promise<void> {
+  private async flushAcceptedProviderActiveAppends(dispatchId: number | null): Promise<void> {
     for (;;) {
-      if (this._activeDispatchId !== dispatchId || !this._activeDispatchProviderAccepted) return;
+      if (!this.ownsActiveAppendFlush(dispatchId)) return;
       const entry = this._pendingMessages.find(
         (candidate) => candidate.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       );

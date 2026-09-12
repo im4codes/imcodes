@@ -68,7 +68,7 @@ function sha256(bytes: Buffer): string {
 }
 
 function designatedRequirement(bundleIdentifier: string, teamId = TEAM_ID): string {
-  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${teamId}"`;
+  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${teamId}`;
 }
 
 function notarization(seed: string) {
@@ -210,7 +210,12 @@ function trustedExecutor(
       ].join('\n'));
     }
     if (executable === MACOS_REMOTE_DESKTOP_APPLE_TOOLS.spctl) {
-      return result(`${kind}:spctl`, `${path}: accepted\nsource=Notarized Developer ID\n`);
+      // The wording for a standalone executable, which is what every
+      // component is. The bundle wording was unsatisfiable here.
+      return result(
+        `${kind}:spctl`,
+        `${path}: rejected (the code is valid but does not seem to be an app)\n`,
+      );
     }
     if (executable === MACOS_REMOTE_DESKTOP_APPLE_TOOLS.xcrun) {
       return result(`${kind}:stapler`, 'The validate action worked!\n');
@@ -510,6 +515,41 @@ describe('macOS remote-desktop multi-component artifact adapter', () => {
     expect(await selectMacosRemoteDesktopArtifact(candidate.storeRoot, 'lastKnownGood', deps)).toBeNull();
   });
 
+  it('makes the store traversable, and repairs one that already is not', async () => {
+    // The components must be executed AS THE CONSOLE USER -- that is the only
+    // principal macOS attributes a TCC grant to. A root-only (0700) store made
+    // every one of them unrunnable by that user, so the worker could not start
+    // and the permission prompt could not be raised, both failing with a bare
+    // "Permission denied" from a path nobody was looking at.
+    const first = await fixture('arm64', '2026.8.4100');
+    const deps = dependencies(trustedExecutor().execute);
+    const installed = await promoteMacosRemoteDesktopArtifact({
+      ...first,
+      storeRoot: first.storeRoot,
+      expectedWorkerVersion: first.manifest.workerVersion,
+    }, deps);
+
+    const traversable = async (path: string) => ((await lstat(path)).mode & 0o055) === 0o055;
+    expect(await traversable(first.storeRoot)).toBe(true);
+    expect(await traversable(join(first.storeRoot, 'releases'))).toBe(true);
+    expect(await traversable(installed.artifactDirectory)).toBe(true);
+    // Still not writable by anyone else -- that is the invariant the store
+    // actually depends on, and it is unchanged.
+    expect((await lstat(installed.artifactDirectory)).mode & 0o022).toBe(0);
+
+    // A machine installed before the mode was corrected. Promotion returns
+    // early for a release that already exists, so nothing would ever revisit
+    // it: reading the release is what has to repair it.
+    await chmod(installed.artifactDirectory, 0o700);
+    await chmod(join(first.storeRoot, 'releases'), 0o700);
+    await chmod(first.storeRoot, 0o700);
+    const selected = await selectMacosRemoteDesktopArtifact(first.storeRoot, 'current', deps);
+    expect(selected).not.toBeNull();
+    expect(await traversable(first.storeRoot)).toBe(true);
+    expect(await traversable(join(first.storeRoot, 'releases'))).toBe(true);
+    expect(await traversable(selected!.artifactDirectory)).toBe(true);
+  });
+
   it('refuses a pre-existing store that anyone but the owner can write', async () => {
     // The daemon that opens this store runs as root. `mkdir` with a mode is a
     // NO-OP on a path that already exists, so a store pre-created by an
@@ -569,8 +609,15 @@ describe('macOS remote-desktop multi-component artifact adapter', () => {
       ...fresh,
       storeRoot: fresh.storeRoot,
     }, deps);
-    expect((await lstat(fresh.storeRoot)).mode & 0o777).toBe(0o700);
-    expect((await lstat(join(fresh.storeRoot, 'releases'))).mode & 0o777).toBe(0o700);
+    // Traversable, not root-only. The components have to be executed AS THE
+    // CONSOLE USER -- the only principal macOS attributes a TCC grant to -- and
+    // 0700 made every one of them unrunnable by that user. What the store
+    // actually depends on is that nobody else can WRITE it, which is asserted
+    // separately and is unchanged.
+    expect((await lstat(fresh.storeRoot)).mode & 0o777).toBe(0o755);
+    expect((await lstat(join(fresh.storeRoot, 'releases'))).mode & 0o777).toBe(0o755);
+    expect((await lstat(fresh.storeRoot)).mode & 0o022).toBe(0);
+    expect((await lstat(join(fresh.storeRoot, 'releases'))).mode & 0o022).toBe(0);
 
     // Restart behaviour: a second promote onto the store this code created must
     // still be accepted, or the guard would brick every upgrade after the first.

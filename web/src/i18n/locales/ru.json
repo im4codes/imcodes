@@ -547,6 +547,7 @@
     "transport_send_queued_count": "В очереди: {{count}}",
     "transport_queue_append": "Добавить",
     "transport_queue_append_all": "Добавить все",
+    "transport_queue_append_all_confirm": "Подтвердить добавление всех?",
     "transport_queue_append_failed": "Не удалось добавить сообщение; оно осталось в очереди.",
     "stop_appended_queue": "Сообщения из очереди добавлены; сессия продолжает работу.",
     "send_placeholder": "Отправить в {{name}}…",
@@ -3871,6 +3872,10 @@
     "exit_fullscreen": "Выйти из полноэкранного режима",
     "workspace_open_new_window": "Открыть эту машину в новом окне",
     "workspace_fullscreen": "Полный экран",
-    "workspace_exit_fullscreen": "Выйти из полноэкранного режима"
+    "workspace_exit_fullscreen": "Выйти из полноэкранного режима",
+    "request_permission": "Запросить доступ",
+    "requesting_permission": "Запрос к этому Mac…",
+    "request_permission_failed": "Не удалось показать диалог на этом Mac.",
+    "request_permission_hint": "Откроет диалог разрешений на этом Mac. Ответить на него должен человек за компьютером."
   }
 }

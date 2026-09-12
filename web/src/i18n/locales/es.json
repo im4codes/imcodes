@@ -547,6 +547,7 @@
     "transport_send_queued_count": "{{count}} en cola",
     "transport_queue_append": "Añadir",
     "transport_queue_append_all": "Añadir todo",
+    "transport_queue_append_all_confirm": "¿Confirmar añadir todo?",
     "transport_queue_append_failed": "No se pudo añadir el mensaje; sigue en la cola.",
     "stop_appended_queue": "Los mensajes en cola se añadieron; la sesión sigue en ejecución.",
     "send_placeholder": "Enviar a {{name}}…",
@@ -3872,6 +3873,10 @@
     "exit_fullscreen": "Salir de pantalla completa",
     "workspace_open_new_window": "Abrir esta máquina en una ventana nueva",
     "workspace_fullscreen": "Pantalla completa",
-    "workspace_exit_fullscreen": "Salir de pantalla completa"
+    "workspace_exit_fullscreen": "Salir de pantalla completa",
+    "request_permission": "Conceder acceso",
+    "requesting_permission": "Solicitando a ese Mac…",
+    "request_permission_failed": "No se pudo mostrar el diálogo en ese Mac.",
+    "request_permission_hint": "Abre el diálogo de permisos en ese Mac. Alguien debe responderlo desde el equipo."
   }
 }

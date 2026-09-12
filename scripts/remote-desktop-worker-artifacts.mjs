@@ -80,13 +80,30 @@ function validPositiveSize(value) {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
+/**
+ * A value as the code-requirement language writes it.
+ *
+ * A fourth copy of a rule that also lives in shared/macos-code-requirement.ts,
+ * src/node/macos-apple-trust.mjs and macos_code_requirement.h. It is copied
+ * rather than imported because `shared/` is copied into the Docker image on
+ * its own and must not depend on `src/`, and this file must load as plain
+ * .mjs on a build machine with no TypeScript. Exported so
+ * test/node/macos-code-requirement-agreement.test.ts can hold all four to the
+ * same table of cases.
+ */
+export function remoteDesktopCodeRequirementLiteral(value) {
+  return /^[A-Za-z][A-Za-z0-9]*$/u.test(value) ? value : `"${value}"`;
+}
+
+const codeRequirementLiteral = remoteDesktopCodeRequirementLiteral;
+
 function validAppleDesignatedRequirement(value, bundleIdentifier, teamId) {
   // Exactly what codesign emits for a Developer ID Application certificate:
   // the two marker extensions sit between the anchor and the team clause.
-  return value === `identifier "${bundleIdentifier}" and anchor apple generic`
+  return value === `identifier ${codeRequirementLiteral(bundleIdentifier)} and anchor apple generic`
     + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
     + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
-    + ` and certificate leaf[subject.OU] = "${teamId}"`;
+    + ` and certificate leaf[subject.OU] = ${codeRequirementLiteral(teamId)}`;
 }
 
 function validMacosCodeSignature(value) {

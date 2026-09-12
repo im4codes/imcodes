@@ -9,7 +9,10 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
 } from './machine-direct-file-transfer-capabilities.js';
 import { REMOTE_DESKTOP_CAPABILITY } from './remote-desktop.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from './remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
+} from './remote-desktop-install.js';
 import {
   REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
   REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
@@ -31,6 +34,7 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   // Advertised per OS adapter, never inferred from the platform: a host
   // without local consent cannot serve attended links, and one without the
   // signed shell / capture privacy pair stays manageable from another device

@@ -1,3 +1,4 @@
+import { resolveRemoteDesktopSessionProfile } from '../../shared/remote-desktop-platform.js';
 import { once } from 'node:events';
 import net from 'node:net';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
@@ -82,7 +83,7 @@ async function trustedStore(releaseName: string): Promise<string> {
 }
 
 function artifact(setSha256 = 'a'.repeat(64)): VerifiedMacosRemoteDesktopArtifact {
-  const requirement = 'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"';
+  const requirement = 'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = M675E26Q67';
   return {
     artifactDirectory: '/verified/release',
     manifestPath: '/verified/release/imcodes-remote-desktop.manifest.json',
@@ -95,7 +96,7 @@ function artifact(setSha256 = 'a'.repeat(64)): VerifiedMacosRemoteDesktopArtifac
         size: 1,
         sha256: 'e'.repeat(64),
         bundleIdentifier: 'cc.imcodes.node.remote-desktop-worker',
-        designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"',
+        designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = M675E26Q67',
       },
       disclosure: {} as never,
       launchAgent: {
@@ -361,7 +362,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
             bundleIdentifier: 'cc.imcodes.node.remote-desktop-agent',
             teamId: 'M675E26Q67',
             designatedRequirement:
-              'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"',
+              'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = M675E26Q67',
           }),
         };
       }) as never,
@@ -428,7 +429,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
           bundleIdentifier: 'cc.imcodes.node.remote-desktop-agent',
           teamId: 'M675E26Q67',
           designatedRequirement:
-            'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"',
+            'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = M675E26Q67',
         }),
       })) as never,
       createLaunch,
@@ -675,12 +676,23 @@ describe('stock macOS remote-desktop production dependency factory', () => {
   });
 
   it('keeps denied capture and unavailable disclosure fail closed', async () => {
+    // Denied screen recording is now REPORTED rather than hidden, because it
+    // is the one input the machine cannot grant itself and the operator needs
+    // to be told to go click allow. That is not a relaxation: the advertised
+    // set carries no capture capability, so it resolves to no session profile
+    // and nothing can be opened with it -- which is what the assertion below
+    // pins, and what `unavailable` used to stand in for.
     const deniedCapture = await readyHarness(snapshot({ screenRecording: false }));
-    expect(resolveMacosRemoteDesktopRuntimeProfile({
+    const denied = resolveMacosRemoteDesktopRuntimeProfile({
       artifactVerified: true,
       activeUserQualified: true,
       ...deniedCapture.readiness,
-    }).mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE);
+    });
+    expect(denied.mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.PERMISSION_REQUIRED);
+    expect(resolveRemoteDesktopSessionProfile([
+      ...denied.sessionCapabilities,
+      ...denied.adapterCapabilities,
+    ])).toBeNull();
 
     const noDisclosure = await readyHarness(snapshot({ disclosure: false }));
     expect(resolveMacosRemoteDesktopRuntimeProfile({
@@ -768,11 +780,22 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     ] as const;
     for (const [label, override] of gates) {
       const value = await readyHarness(snapshot(override));
-      expect(resolveMacosRemoteDesktopRuntimeProfile({
+      const profile = resolveMacosRemoteDesktopRuntimeProfile({
         artifactVerified: true,
         activeUserQualified: true,
         ...value.readiness,
-      }).mode, label).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE);
+      });
+      // What every gate must produce is an UNLAUNCHABLE profile. The mode is
+      // how that is explained to an operator, and denied screen recording now
+      // explains itself differently -- but no gate may yield something a
+      // session can be opened with.
+      expect(resolveRemoteDesktopSessionProfile([
+        ...profile.sessionCapabilities,
+        ...profile.adapterCapabilities,
+      ]), label).toBeNull();
+      expect(profile.mode, label).toBe(override === gates[0][1]
+        ? MACOS_REMOTE_DESKTOP_READINESS_MODE.PERMISSION_REQUIRED
+        : MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE);
     }
 
     // Only with every gate satisfied -- including cleanup capability, which a

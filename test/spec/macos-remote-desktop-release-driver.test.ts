@@ -183,7 +183,7 @@ describe('macOS remote-desktop release driver', () => {
       'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic'
       + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
       + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
-      + ` and certificate leaf[subject.OU] = "${TEAM_ID}"`,
+      + ` and certificate leaf[subject.OU] = ${TEAM_ID}`,
     );
     // And the same text the shared runtime validator demands, since the
     // manifest carries it across that boundary.

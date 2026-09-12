@@ -4,11 +4,12 @@
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <map>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <utility>
 #include <vector>
@@ -48,29 +49,64 @@ std::optional<CGKeyCode> MapKey(std::string_view code) {
   // These are the stable virtual key codes published by HIToolbox Events.h.
   // Keeping the table here avoids exposing Carbon/CGEvent types through the
   // adapter header and mirrors the browser's physical KeyboardEvent.code.
-  static const std::map<std::string_view, CGKeyCode> kNamedKeys = {
-      {"Backspace", 51},      {"Tab", 48},
-      {"Enter", 36},          {"Escape", 53},
-      {"Space", 49},          {"Delete", 117},
-      {"Insert", 114},        {"Home", 115},
-      {"End", 119},           {"PageUp", 116},
-      {"PageDown", 121},      {"ArrowUp", 126},
-      {"ArrowDown", 125},     {"ArrowLeft", 123},
-      {"ArrowRight", 124},    {"ShiftLeft", 56},
-      {"ShiftRight", 60},     {"ControlLeft", 59},
-      {"ControlRight", 62},   {"AltLeft", 58},
-      {"AltRight", 61},       {"MetaLeft", 55},
-      {"MetaRight", 54},      {"CapsLock", 57},
-      {"NumLock", 71},        {"Semicolon", 41},
-      {"Equal", 24},          {"Comma", 43},
-      {"Minus", 27},          {"Period", 47},
-      {"Slash", 44},          {"Backquote", 50},
-      {"BracketLeft", 33},    {"Backslash", 42},
-      {"BracketRight", 30},   {"Quote", 39},
-      {"NumpadAdd", 69},      {"NumpadSubtract", 78},
-      {"NumpadMultiply", 67}, {"NumpadDivide", 75},
-      {"NumpadDecimal", 65},  {"NumpadEnter", 76},
-  };
+  // A constexpr table rather than a function-local `static const std::map`.
+  //
+  // That map had a non-trivial destructor, so it was an exit-time destructor:
+  // it runs during process teardown, in an order nothing controls, after
+  // threads that may still touch it have not necessarily stopped. Chromium
+  // bans the construct outright and the build asks for `-Werror
+  // -Wexit-time-destructors` -- but that flag was being swallowed by a
+  // malformed plugin argument in the SDK's recorded flags, so nothing said so.
+  //
+  // Sorted, and the sorting is asserted at compile time rather than trusted,
+  // because the binary search below silently returns the wrong key code for an
+  // out-of-order entry instead of failing.
+  static constexpr std::array<std::pair<std::string_view, CGKeyCode>, 42> kNamedKeys = {{
+      {"AltLeft", 58},
+      {"AltRight", 61},
+      {"ArrowDown", 125},
+      {"ArrowLeft", 123},
+      {"ArrowRight", 124},
+      {"ArrowUp", 126},
+      {"Backquote", 50},
+      {"Backslash", 42},
+      {"Backspace", 51},
+      {"BracketLeft", 33},
+      {"BracketRight", 30},
+      {"CapsLock", 57},
+      {"Comma", 43},
+      {"ControlLeft", 59},
+      {"ControlRight", 62},
+      {"Delete", 117},
+      {"End", 119},
+      {"Enter", 36},
+      {"Equal", 24},
+      {"Escape", 53},
+      {"Home", 115},
+      {"Insert", 114},
+      {"MetaLeft", 55},
+      {"MetaRight", 54},
+      {"Minus", 27},
+      {"NumLock", 71},
+      {"NumpadAdd", 69},
+      {"NumpadDecimal", 65},
+      {"NumpadDivide", 75},
+      {"NumpadEnter", 76},
+      {"NumpadMultiply", 67},
+      {"NumpadSubtract", 78},
+      {"PageDown", 121},
+      {"PageUp", 116},
+      {"Period", 47},
+      {"Quote", 39},
+      {"Semicolon", 41},
+      {"ShiftLeft", 56},
+      {"ShiftRight", 60},
+      {"Slash", 44},
+      {"Space", 49},
+      {"Tab", 48},
+  }};
+  static_assert(std::ranges::is_sorted(kNamedKeys, {}, &std::pair<std::string_view, CGKeyCode>::first),
+                "kNamedKeys must be sorted for the binary search below");
   static constexpr CGKeyCode kLetterCodes[] = {
       0,  11, 8,  2,  14, 3, 5,  4,  34, 38, 40, 37, 46,
       45, 31, 35, 12, 15, 1, 17, 32, 9,  13, 7,  16, 6,
@@ -108,9 +144,11 @@ std::optional<CGKeyCode> MapKey(std::string_view code) {
       return kFunctionCodes[number - 1];
   }
 
-  const auto found = kNamedKeys.find(code);
-  return found == kNamedKeys.end() ? std::nullopt
-                                   : std::optional<CGKeyCode>(found->second);
+  const auto found = std::ranges::lower_bound(
+      kNamedKeys, code, {}, &std::pair<std::string_view, CGKeyCode>::first);
+  return found == kNamedKeys.end() || found->first != code
+             ? std::nullopt
+             : std::optional<CGKeyCode>(found->second);
 }
 
 struct MouseMapping {

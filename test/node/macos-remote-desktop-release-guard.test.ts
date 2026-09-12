@@ -79,7 +79,7 @@ function macosNotices(libraries = ['webrtc', 'abseil-cpp']): string {
 }
 
 function designatedRequirement(bundleIdentifier: string, teamId = TEAM_ID): string {
-  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${teamId}"`;
+  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${teamId}`;
 }
 
 function identity(teamId = TEAM_ID): RemoteDesktopMacosCodeIdentity {
@@ -234,7 +234,12 @@ function appleEvidence(
     if (operation === 'spctl') {
       return options.rejected
         ? { stdout: '', stderr: `${fileName}: rejected\nsource=Unnotarized Developer ID\n` }
-        : { stdout: '', stderr: `${fileName}: accepted\nsource=Notarized Developer ID\n` };
+        : {
+          stdout: '',
+          // A notarized standalone executable: Gatekeeper prints no `source=`
+          // line, because it got past everything that would have produced one.
+          stderr: `${fileName}: rejected (the code is valid but does not seem to be an app)\n`,
+        };
     }
     if (operation === 'stapler') {
       // Retained so an artifact format that CAN carry a ticket still has a

@@ -44,7 +44,7 @@ import {
   cancelPendingAutoUnlock,
   registerPendingAutoUnlock,
 } from '../ws/auto-unlock-registry.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
 import { backfillCanonicalHosts } from '../services/remote-desktop-host-identity.js';
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
@@ -460,6 +460,42 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   return c.json({ ok: true, autoUnlockConfigured: result.configured });
 });
 
+// POST /api/machines/:serverId/remote-desktop-permissions — ask the machine to
+// raise its own screen-recording prompt.
+//
+// The grant itself is never made here and cannot be: macOS shows that dialog
+// only to a responsible signed application running in the console user's
+// session, and only a human can answer it. All this endpoint does is ask the
+// node to put it on screen.
+machinesRoutes.post('/:serverId/remote-desktop-permissions', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const owned = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  if (!owned) return c.json({ error: 'not_found' }, 404);
+  const now = Date.now();
+  // Presence is load-bearing rather than cosmetic: the dialog appears on the
+  // machine, so asking an offline one produces nothing an operator can see.
+  if (owned.status !== 'online'
+    || typeof owned.last_heartbeat_at !== 'number'
+    || now - owned.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  const bridge = WsBridge.get(serverId);
+  if (bridge.tryRequestControlledNodeRemoteDesktopPermissions(
+    bridge.daemonConnectionGeneration(),
+  ) !== 'sent') {
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  logAudit({
+    userId,
+    action: 'machine.remote_desktop_permission_request',
+    ip: (c.get('clientIp' as never) as string) ?? 'unknown',
+    details: { serverId },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true }, 202);
+});
+
 // POST /api/machines/:serverId/remote-desktop-worker — operator quick repair.
 machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -468,10 +504,14 @@ machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c)
   const owned = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
-  if (canonicalMachineOs(owned.os) !== 'win'
-    || !capabilities.ok
-    || !capabilities.value.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
-    || capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
+  // Whichever platform advertised that it can install. The OS was checked
+  // here as well as the capability, which made the capability redundant on
+  // Windows and made every other platform unreachable -- a macOS node that
+  // advertised it could install was refused by the layer above it.
+  const installable = capabilities.ok
+    && (capabilities.value.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+      || capabilities.value.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY));
+  if (!installable || capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
     return c.json({ error: 'remote_desktop_worker_not_installable' }, 409);
   }
   if (isImcodesVersionOutdated(owned.daemon_version, process.env.APP_VERSION)) {

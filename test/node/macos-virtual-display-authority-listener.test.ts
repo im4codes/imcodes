@@ -105,7 +105,7 @@ function peer(overrides: Partial<VerifiedPeer> = {}): VerifiedPeer {
     bundleIdentifier: 'cc.imcodes.node.remote-desktop-launch-agent',
     teamId: 'ABCDE12345',
     designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-launch-agent"'
-      + ' and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "ABCDE12345"',
+      + ' and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ABCDE12345',
     ...overrides,
   };
 }

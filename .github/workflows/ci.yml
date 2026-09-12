@@ -879,6 +879,76 @@ jobs:
           DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
           node scripts/macos-release-signing.mjs notarize "$DMG"
           xcrun stapler validate "$DMG"
+      # The macOS remote-desktop components. Without this the image ships a
+      # macOS node that can self-upgrade but has no components to fetch: the
+      # server answers `remote_desktop_worker_not_built` and macOS remote
+      # desktop is simply unavailable, with nothing in CI saying so -- the
+      # artifact verifier below defaults to the WINDOWS target, so a missing
+      # macOS set was never a failure.
+      #
+      # Built from the published, locked SDKs rather than a checkout: the SDK
+      # is immutable and takes hours to reproduce, so a release build downloads
+      # it instead of rebuilding it.
+      # The SDK archives are immutable and named by their own digest, so the
+      # cache key is the lock files themselves. Without this every run on dev
+      # pulls ~470MB twice from release assets -- which is both slow and the
+      # step most likely to fail on a transient network error.
+      - name: Restore the locked macOS libwebrtc SDK archives
+        if: runner.os == 'macOS'
+        id: macos_libwebrtc_sdk_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/libwebrtc-sdk-archives
+          key: imcodes-libwebrtc-macos-${{ hashFiles('native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json', 'native/macos-remote-desktop/libwebrtc-sdk-x64.lock.json') }}-v1
+      - name: Build, sign and notarize the macOS remote-desktop components
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # IMCODES_MACOS_SIGNING_IDENTITY and IMCODES_MACOS_NOTARY_KEY_PATH
+          # are already in the environment from the signing-identity and notary
+          # key steps above.
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            lock="native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json"
+            tag="$(node -p "require('./$lock').releaseTag")"
+            asset="$(node -p "require('./$lock').assetName")"
+            repository="$(node -p "require('./$lock').repository")"
+            download="$RUNNER_TEMP/libwebrtc-sdk-archives"
+            sdk="$RUNNER_TEMP/libwebrtc-sdk-$arch"
+            mkdir -p "$download"
+            # Downloaded only on a cache miss. The installer verifies the
+            # archive against the lock's digest either way, so a cached file is
+            # never trusted for being cached.
+            if [ ! -f "$download/$asset" ]; then
+              gh release download "$tag" --repo "$repository" --pattern "$asset" \
+                --dir "$download" --clobber
+            fi
+            node scripts/install-libwebrtc-sdk.mjs --target "macos-$arch" \
+              "$download/$asset" "$sdk"
+            node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+              --target "macos-$arch" "$lock" "$sdk"
+            node scripts/build-macos-remote-desktop-release.mjs \
+              --arch "$arch" \
+              --sdk-root "$sdk" \
+              --artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch" \
+              --worker-version "$IMCODES_BUILD_VERSION" \
+              --jobs 3
+            # The EXTRACTED tree only: ~850MB each, and the runner still has
+            # packaging and upload to do. The archive stays for the cache.
+            rm -rf "$sdk"
+          done
+      - name: Verify the macOS remote-desktop component sets
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            node scripts/remote-desktop-worker-artifacts.mjs verify \
+              dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
+          done
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -1027,12 +1097,23 @@ jobs:
           node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts
           imcodes-node-linux imcodes-node-macos imcodes-node.exe
 
-      - name: Verify remote-desktop worker artifact
+      # EVERY target the image is supposed to serve, not just the default one.
+      # This verifier defaults to the Windows target when none is named, so a
+      # macOS component set could be -- and was -- absent from the image while
+      # this step passed. The server then answers
+      # `remote_desktop_worker_not_built` to a macOS node that upgraded itself
+      # expecting to find one.
+      - name: Verify remote-desktop worker artifacts for every target
         env:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
-        run: >-
-          node scripts/remote-desktop-worker-artifacts.mjs verify
-          server/controlled-node-artifacts "$IMCODES_BUILD_VERSION"
+        run: |
+          set -euo pipefail
+          node scripts/remote-desktop-worker-artifacts.mjs verify \
+            server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64
+          for arch in arm64 x64; do
+            node scripts/remote-desktop-worker-artifacts.mjs verify \
+              server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"
+          done
 
       - name: Get build timestamp
         id: ts
@@ -1115,9 +1196,18 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
             imcodes-node-linux imcodes-node-macos imcodes-node.exe
+          # Every target, named. This verifier defaults to the WINDOWS target
+          # when none is given, so this final gate -- the last check before the
+          # image ships -- passed on an image containing no macOS component set
+          # at all.
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/remote-desktop-worker-artifacts.mjs verify \
-            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}"
+            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" win32 x64
+          for arch in arm64 x64; do
+            docker run --rm --entrypoint node imcodes-smoke:test \
+              scripts/remote-desktop-worker-artifacts.mjs verify \
+              /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" darwin "$arch"
+          done
 
       - name: Build and push (cache hit — only pushes layers)
         id: build_push

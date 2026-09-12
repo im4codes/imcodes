@@ -363,6 +363,19 @@ export async function installMachineRemoteDesktopWorker(serverId: string): Promi
   });
 }
 
+/**
+ * Ask an online controlled node to raise its own permission dialog.
+ *
+ * Nothing is granted here and nothing can be: macOS shows that dialog only to
+ * a responsible signed application in the console user's session, and only a
+ * human can answer it. This asks the machine to ask.
+ */
+export async function requestMachineRemoteDesktopPermissions(serverId: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/remote-desktop-permissions`, {
+    method: 'POST',
+  });
+}
+
 /** Rename a controlled machine's render-only display name. */
 /**
  * Store or clear the node's Windows sign-in secret. Write-only: the value is
