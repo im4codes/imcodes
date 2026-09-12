@@ -70,9 +70,13 @@ export declare function macosGatekeeperAssessmentIsNotarized(
   artifactPath: string,
 ): boolean;
 
-export declare const MACOS_APPLE_VERDICT_TOOLS: readonly string[];
+export declare function macosAppleCommandIsVerdict(
+  executable: string,
+  args: readonly string[] | undefined,
+): boolean;
 
 export declare function macosAppleCommandFailed(
   error: unknown,
   executable: string,
+  args: readonly string[] | undefined,
 ): boolean;

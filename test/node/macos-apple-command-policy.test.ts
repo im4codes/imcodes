@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MACOS_APPLE_TOOLS,
-  MACOS_APPLE_VERDICT_TOOLS,
   macosAppleCommandFailed,
+  macosAppleCommandIsVerdict,
   macosGatekeeperAssessmentIsNotarized,
 } from '../../src/node/macos-apple-trust.mjs';
 
@@ -18,37 +18,50 @@ import {
 describe('macOS Apple command policy', () => {
   const exitStatus = (code: number) => Object.assign(new Error('exited'), { code });
 
-  it('treats a verdict tool exit status as an answer, not a failure', () => {
+  it('treats a verdict invocation exit status as an answer, not a failure', () => {
     // spctl exits 3 to say "rejected". That is the result of the assessment,
     // and the check that reads it never ran while this threw.
-    expect(macosAppleCommandFailed(exitStatus(3), MACOS_APPLE_TOOLS.spctl)).toBe(false);
-    expect(macosAppleCommandFailed(exitStatus(1), MACOS_APPLE_TOOLS.xcrun)).toBe(false);
+    expect(macosAppleCommandFailed(
+      exitStatus(3), MACOS_APPLE_TOOLS.spctl, ['--assess', '--type', 'execute', '/tmp/x'],
+    )).toBe(false);
+    expect(macosAppleCommandFailed(
+      exitStatus(1), MACOS_APPLE_TOOLS.xcrun, ['stapler', 'validate', '/tmp/x'],
+    )).toBe(false);
   });
 
   it('keeps a non-zero exit fatal for every other tool', () => {
     // A failing `codesign --verify` means the signature is invalid. Swallowing
     // it would turn a broken artifact into an accepted one.
-    expect(macosAppleCommandFailed(exitStatus(1), MACOS_APPLE_TOOLS.codesign)).toBe(true);
-    expect(macosAppleCommandFailed(exitStatus(1), MACOS_APPLE_TOOLS.lipo)).toBe(true);
+    expect(macosAppleCommandFailed(exitStatus(1), MACOS_APPLE_TOOLS.codesign, ['--verify'])).toBe(true);
+    expect(macosAppleCommandFailed(exitStatus(1), MACOS_APPLE_TOOLS.lipo, ['-archs'])).toBe(true);
   });
 
-  it('keeps a spawn failure or timeout fatal even for a verdict tool', () => {
+  it('does not extend the exemption to other subcommands of the same launcher', () => {
+    // `xcrun` is a launcher, not a tool. Only `xcrun stapler` answers with its
+    // exit status; admitting every `xcrun` would silently swallow the failure
+    // of a future `xcrun notarytool` -- the exact mistake this undoes.
+    expect(macosAppleCommandIsVerdict(MACOS_APPLE_TOOLS.xcrun, ['stapler', 'validate'])).toBe(true);
+    expect(macosAppleCommandIsVerdict(MACOS_APPLE_TOOLS.xcrun, ['notarytool', 'submit'])).toBe(false);
+    expect(macosAppleCommandIsVerdict(MACOS_APPLE_TOOLS.spctl, ['--status'])).toBe(false);
+    expect(macosAppleCommandIsVerdict(MACOS_APPLE_TOOLS.xcrun, undefined)).toBe(false);
+    expect(macosAppleCommandFailed(
+      exitStatus(1), MACOS_APPLE_TOOLS.xcrun, ['notarytool', 'submit'],
+    )).toBe(true);
+  });
+
+  it('keeps a spawn failure or timeout fatal even for a verdict invocation', () => {
     // With no process there is no verdict. A missing binary reports a STRING
     // code, and a timeout reports a signal -- reading either as "rejected but
     // fine" would accept an artifact nothing assessed.
     expect(macosAppleCommandFailed(
-      Object.assign(new Error('not found'), { code: 'ENOENT' }), MACOS_APPLE_TOOLS.spctl,
+      Object.assign(new Error('not found'), { code: 'ENOENT' }),
+      MACOS_APPLE_TOOLS.spctl, ['--assess'],
     )).toBe(true);
     expect(macosAppleCommandFailed(
       Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }),
-      MACOS_APPLE_TOOLS.spctl,
+      MACOS_APPLE_TOOLS.spctl, ['--assess'],
     )).toBe(true);
-    expect(macosAppleCommandFailed(null, MACOS_APPLE_TOOLS.spctl)).toBe(false);
-  });
-
-  it('names exactly the tools whose exit status is a verdict', () => {
-    expect([...MACOS_APPLE_VERDICT_TOOLS].sort())
-      .toEqual([MACOS_APPLE_TOOLS.spctl, MACOS_APPLE_TOOLS.xcrun].sort());
+    expect(macosAppleCommandFailed(null, MACOS_APPLE_TOOLS.spctl, ['--assess'])).toBe(false);
   });
 
   /**

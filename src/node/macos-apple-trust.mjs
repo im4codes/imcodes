@@ -49,7 +49,7 @@ export const MACOS_APPLE_TOOLS = Object.freeze({
 });
 
 /**
- * Tools whose non-zero exit is an ANSWER, not a malfunction.
+ * Invocations whose non-zero exit is an ANSWER, not a malfunction.
  *
  * `spctl --assess` exits 3 to say "rejected" and `stapler validate` exits
  * non-zero to say "no ticket" -- in both cases the text they print is the
@@ -58,14 +58,27 @@ export const MACOS_APPLE_TOOLS = Object.freeze({
  * daemon rejected its own correctly notarized components with spctl's output
  * as the error message and no check ever ran.
  *
- * Everything absent from this set keeps failing loudly: a non-zero `codesign
+ * Keyed on the SUBCOMMAND, not just the binary. `xcrun` is a launcher: it is
+ * only `xcrun stapler` whose exit status is an answer, and admitting every
+ * `xcrun` would silently swallow the failure of, say, a future `xcrun
+ * notarytool` -- the exact class of mistake this whole function exists to
+ * undo.
+ *
+ * Everything absent from this list keeps failing loudly: a non-zero `codesign
  * --verify` means the signature is invalid, and swallowing that would turn a
  * broken artifact into an accepted one.
  */
-export const MACOS_APPLE_VERDICT_TOOLS = Object.freeze([
-  MACOS_APPLE_TOOLS.spctl,
-  MACOS_APPLE_TOOLS.xcrun,
+const MACOS_APPLE_VERDICT_INVOCATIONS = Object.freeze([
+  { executable: MACOS_APPLE_TOOLS.spctl, subcommand: '--assess' },
+  { executable: MACOS_APPLE_TOOLS.xcrun, subcommand: 'stapler' },
 ]);
+
+export function macosAppleCommandIsVerdict(executable, args) {
+  const first = Array.isArray(args) ? args[0] : undefined;
+  return MACOS_APPLE_VERDICT_INVOCATIONS.some(
+    (entry) => entry.executable === executable && entry.subcommand === first,
+  );
+}
 
 /**
  * Whether an execFile error from an Apple tool is a real failure.
@@ -81,11 +94,11 @@ export const MACOS_APPLE_VERDICT_TOOLS = Object.freeze([
  * `killed: true` with a signal. Distinguishing them by TYPE rather than by
  * presence is what keeps a missing binary from being read as a rejection.
  */
-export function macosAppleCommandFailed(error, executable) {
+export function macosAppleCommandFailed(error, executable, args) {
   if (!error) return false;
   if (error.killed === true || error.signal) return true;
   if (typeof error.code !== 'number') return true;
-  return !MACOS_APPLE_VERDICT_TOOLS.includes(executable);
+  return !macosAppleCommandIsVerdict(executable, args);
 }
 
 export const MACOS_APPLE_TRUST_ERROR = Object.freeze({

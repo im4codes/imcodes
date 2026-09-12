@@ -143,7 +143,7 @@ function defaultExecute(
       // before the notarization check could read it -- with spctl's own text
       // as the error -- and every correctly notarized component was refused on
       // the user's Mac.
-      if (macosAppleCommandFailed(error, executable)) {
+      if (macosAppleCommandFailed(error, executable, args)) {
         reject(new Error(String(stderr || stdout || (error?.message ?? 'command failed')).trim()));
         return;
       }
