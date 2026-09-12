@@ -10078,6 +10078,19 @@ button.quick-agent-delegation-preset.active {
   background: #050b13;
 }
 
+/* Its own browser window: fill it completely from the first paint. The panel
+   normally gets its size from the floating window around it, which a standalone
+   window does not have -- without this it collapses to content height in the
+   corner of a black page. */
+.remote-desktop-panel.is-standalone {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+}
+
 .remote-desktop-standalone-status {
   min-height: 100%;
   display: grid;

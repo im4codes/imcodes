@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
+import { installClipboardStub, removeClipboardStub } from './support/clipboard-stub.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
@@ -1206,18 +1207,7 @@ describe('ControlledNodesPanel — copy install command', () => {
     // not another.
     //
     // This clipboard refuses exactly what iOS refuses.
-    let gestureOver = false;
-    const written: string[] = [];
-    class FakeClipboardItem {
-      constructor(readonly items: Record<string, Promise<Blob>>) {}
-    }
-    const write = vi.fn(async (items: FakeClipboardItem[]) => {
-      if (gestureOver) throw new Error('NotAllowedError');
-      written.push(await (await items[0]!.items['text/plain'])!.text());
-    });
-    const writeText = vi.fn(async () => { throw new Error('NotAllowedError'); });
-    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { write, writeText } });
-    vi.stubGlobal('ClipboardItem', FakeClipboardItem);
+    const clipboard = installClipboardStub({ activationExpired: true });
     try {
       const { container } = renderInstallTab();
       const btn = await waitFor(() => {
@@ -1229,26 +1219,24 @@ describe('ControlledNodesPanel — copy install command', () => {
       });
       fireEvent.click(btn);
       // Everything from here on counts as after the tap.
-      gestureOver = true;
+      clipboard.endGesture();
 
       await waitFor(() =>
         expect(btn.textContent).toContain('controlled_nodes.copy_install_command_copied'));
-      expect(written).toEqual([
+      expect(clipboard.written).toEqual([
         (await createControlledNodeInstallCommand.mock.results[0]!.value).command,
       ]);
       expect(container.textContent)
         .not.toContain('controlled_nodes.copy_install_command_clipboard_error');
     } finally {
-      vi.unstubAllGlobals();
+      removeClipboardStub();
     }
   });
 
   it('still blames the mint, not the clipboard, when minting is what failed', async () => {
     // Telling someone to check a permission they have, because a server call
     // failed, is the same bug wearing a different hat.
-    const write = vi.fn(async () => {});
-    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { write, writeText: vi.fn() } });
-    vi.stubGlobal('ClipboardItem', class { constructor(readonly items: unknown) {} });
+    installClipboardStub();
     createControlledNodeInstallCommand.mockRejectedValueOnce(new Error('nope'));
     try {
       const { container } = renderInstallTab();
@@ -1265,7 +1253,7 @@ describe('ControlledNodesPanel — copy install command', () => {
       expect(container.textContent)
         .not.toContain('controlled_nodes.copy_install_command_clipboard_error');
     } finally {
-      vi.unstubAllGlobals();
+      removeClipboardStub();
     }
   });
 

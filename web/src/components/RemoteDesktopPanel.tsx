@@ -1943,7 +1943,7 @@ export function RemoteDesktopPanel({
   const panelBody = (
       <div
         ref={panelRef}
-        class={`remote-desktop-panel ${snapshot.route === 'direct' ? 'is-direct' : ''}`.trim()}
+        class={`remote-desktop-panel${snapshot.route === 'direct' ? ' is-direct' : ''}${standalone ? ' is-standalone' : ''}`}
         role={embedded ? 'tabpanel' : 'dialog'}
         aria-modal="false"
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
@@ -2090,11 +2090,14 @@ export function RemoteDesktopPanel({
                   }}
                 >↗</button>
               )}
-              <DesktopWindowMaximizeButton
-                maximized={desktopMaximized}
-                class="subsession-minimize-btn remote-desktop-maximize"
-                onClick={() => setDesktopMaximized((current) => !current)}
-              />
+              {/* Nothing to maximise into when the window IS the panel. */}
+              {!standalone && (
+                <DesktopWindowMaximizeButton
+                  maximized={desktopMaximized}
+                  class="subsession-minimize-btn remote-desktop-maximize"
+                  onClick={() => setDesktopMaximized((current) => !current)}
+                />
+              )}
               <button
                 type="button"
                 class="subsession-close-btn remote-desktop-stop"
@@ -2837,6 +2840,12 @@ export function RemoteDesktopPanel({
   );
 
   if (embedded) return panelBody;
+
+  // A window of its own is already the right size. Wrapping it in a draggable
+  // 1200x760 panel meant every tear-off opened small inside an empty window and
+  // had to be maximised by hand -- and a floating panel that fills its own
+  // window can only be moved off its own edges.
+  if (standalone) return panelBody;
 
   return (
     <FloatingPanel

@@ -1,4 +1,7 @@
 /** @vitest-environment jsdom */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { act, cleanup, render } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -303,6 +306,7 @@ async function renderPanel(
     allowStandaloneWindow?: boolean;
     onClose?: () => void;
     connectionManager?: RemoteDesktopConnectionManager;
+    standalone?: boolean;
   } = {},
 ) {
   const result = render(<RemoteDesktopPanel
@@ -319,6 +323,7 @@ async function renderPanel(
     ws={ws as never}
     onClose={panelProps.onClose ?? vi.fn()}
     allowStandaloneWindow={panelProps.allowStandaloneWindow}
+    standalone={panelProps.standalone}
     connectionManager={panelProps.connectionManager}
   />);
   await act(async () => { await Promise.resolve(); });
@@ -1945,5 +1950,47 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(container.textContent).toContain('remote_desktop.failed');
     await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
     expect(clientHooks).toHaveLength(1);
+  });
+});
+
+describe('RemoteDesktopPanel in a window of its own', () => {
+  const styles = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'),
+    'utf8',
+  );
+
+  it('fills the window immediately instead of opening a panel to maximise', async () => {
+    // Tearing a machine off into its own window used to land a draggable
+    // 1200x760 panel inside an otherwise empty window: every tear-off began
+    // with the same manual maximise, and the panel could only be dragged off
+    // its own edges.
+    const { container } = await renderPanel(undefined, undefined, { standalone: true });
+
+    const panel = container.querySelector('.remote-desktop-panel');
+    expect(panel).not.toBeNull();
+    expect(panel!.classList.contains('is-standalone')).toBe(true);
+    // No floating window wrapper, and therefore nothing to drag or resize.
+    expect(container.querySelector('.remote-desktop-floating-shell')).toBeNull();
+
+    // The class has to carry real sizing, or it is a hook onto nothing.
+    const rule = styles.match(/\.remote-desktop-panel\.is-standalone\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(rule).toMatch(/width:\s*100%/);
+    expect(rule).toMatch(/height:\s*100%/);
+  });
+
+  it('offers no maximise control, because the window is already the panel', async () => {
+    const { container } = await renderPanel(undefined, undefined, { standalone: true });
+    expect(container.querySelector('.remote-desktop-maximize')).toBeNull();
+    // Closing still has to be reachable -- it is what shuts the window.
+    expect(container.querySelector('.remote-desktop-stop')).not.toBeNull();
+  });
+
+  it('keeps the floating panel and its maximise control when sharing a screen', async () => {
+    // The docked panel is unchanged: it is one window among several, so it
+    // still needs somewhere to maximise into.
+    const { container } = await renderPanel();
+    const panel = container.querySelector('.remote-desktop-panel');
+    expect(panel!.classList.contains('is-standalone')).toBe(false);
+    expect(container.querySelector('.remote-desktop-maximize')).not.toBeNull();
   });
 });
