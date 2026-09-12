@@ -6,9 +6,13 @@ import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  LIBWEBRTC_SDK_LOCK_FILENAME,
+  extractTargetOption,
   verifyLibwebrtcSdkLock,
 } from './libwebrtc-sdk-artifacts.mjs';
+import {
+  DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+  libwebrtcSdkTarget,
+} from './libwebrtc-sdk-targets.mjs';
 
 const COMMIT_RE = /^[a-f0-9]{40}$/;
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -23,7 +27,10 @@ function defaultRun(command, args, options = {}) {
 }
 
 export function parsePromotionArguments(args) {
-  const [lockArgument, archiveArgument, builtCommit, branch = 'dev'] = args;
+  // `--target` is a flag rather than a positional so every existing invocation
+  // -- workflow, wrapper and test -- keeps the argument shape it already uses.
+  const { targetId, positional } = extractTargetOption(args);
+  const [lockArgument, archiveArgument, builtCommit, branch = 'dev'] = positional;
   if (!lockArgument || !archiveArgument || !COMMIT_RE.test(builtCommit ?? '')) {
     throw new Error('usage: promote-libwebrtc-sdk.mjs <lock> <archive> <built-commit> [branch]');
   }
@@ -32,6 +39,7 @@ export function parsePromotionArguments(args) {
     throw new Error('invalid SDK promotion branch');
   }
   return {
+    targetId,
     lockPath: resolve(lockArgument),
     archivePath: resolve(archiveArgument),
     builtCommit,
@@ -53,14 +61,19 @@ export async function promoteLibwebrtcSdk(options, overrides = {}) {
     ...overrides,
   };
   const { lockPath, archivePath, builtCommit, branch } = options;
-  const lock = await dependencies.verifyLock(lockPath, archivePath);
+  const target = libwebrtcSdkTarget(options.targetId ?? DEFAULT_LIBWEBRTC_SDK_TARGET_ID);
+  const lock = await dependencies.verifyLock(lockPath, archivePath, undefined, target.id);
   if (lock.sourceCommit !== builtCommit) {
     throw new Error('SDK lock commit does not match the workflow commit');
   }
 
+  // `--target` is omitted for the default target so the command line the
+  // Windows producer has always run stays exactly as it is; a non-default
+  // target is the only thing that has to say which one it is.
+  const targetArguments = target.id === DEFAULT_LIBWEBRTC_SDK_TARGET_ID ? [] : ['--target', target.id];
   const computeSourceSha256 = (root) => dependencies.run(
     process.execPath,
-    [join(root, 'scripts/libwebrtc-sdk-artifacts.mjs'), 'fingerprint'],
+    [join(root, 'scripts/libwebrtc-sdk-artifacts.mjs'), 'fingerprint', ...targetArguments],
     { cwd: root },
   );
   const builtSource = computeSourceSha256(dependencies.repositoryRoot);
@@ -91,7 +104,7 @@ export async function promoteLibwebrtcSdk(options, overrides = {}) {
         '--dir', verifyRoot,
         '--clobber',
       ]);
-      await dependencies.verifyLock(lockPath, join(verifyRoot, lock.assetName));
+      await dependencies.verifyLock(lockPath, join(verifyRoot, lock.assetName), undefined, target.id);
     } finally {
       await dependencies.remove(verifyRoot, { recursive: true, force: true });
     }
@@ -101,7 +114,7 @@ export async function promoteLibwebrtcSdk(options, overrides = {}) {
         'release', 'create', lock.releaseTag,
         archivePath,
         '--repo', lock.repository,
-        '--title', `Pinned Windows libwebrtc SDK ${lock.sourceSha256.slice(0, 16)}`,
+        '--title', target.releaseTitle(lock.sourceSha256),
         '--notes', `Immutable dependency SDK for libwebrtc ${lock.libwebrtcRevision}.`,
       ]);
     } catch {
@@ -118,7 +131,7 @@ export async function promoteLibwebrtcSdk(options, overrides = {}) {
           '--dir', verifyRoot,
           '--clobber',
         ]);
-        await dependencies.verifyLock(lockPath, join(verifyRoot, lock.assetName));
+        await dependencies.verifyLock(lockPath, join(verifyRoot, lock.assetName), undefined, target.id);
       } finally {
         await dependencies.remove(verifyRoot, { recursive: true, force: true });
       }
@@ -141,7 +154,7 @@ export async function promoteLibwebrtcSdk(options, overrides = {}) {
       if (currentSource !== lock.sourceSha256) {
         throw new Error('SDK inputs changed while the SDK was building; refusing to advance the lock');
       }
-      const relativeLockPath = `native/windows-remote-desktop/${LIBWEBRTC_SDK_LOCK_FILENAME}`;
+      const relativeLockPath = target.lockRelativePath;
       const destination = join(worktree, ...relativeLockPath.split('/'));
       const current = await dependencies.readText(destination).catch(() => '');
       const next = await dependencies.readText(lockPath);
@@ -149,7 +162,7 @@ export async function promoteLibwebrtcSdk(options, overrides = {}) {
         promoted = true;
         continue;
       }
-      await dependencies.makeDirectory(join(worktree, 'native', 'windows-remote-desktop'), {
+      await dependencies.makeDirectory(join(worktree, ...relativeLockPath.split('/').slice(0, -1)), {
         recursive: true,
       });
       await dependencies.copy(lockPath, destination);

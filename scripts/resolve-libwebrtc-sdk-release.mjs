@@ -6,15 +6,18 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import {
-  LIBWEBRTC_SDK_LOCK_FILENAME,
   computeLibwebrtcSdkSourceSha256,
   validateLibwebrtcSdkLock,
   verifyLibwebrtcSdkLock,
 } from './libwebrtc-sdk-artifacts.mjs';
+import {
+  DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+  LIBWEBRTC_SDK_TARGET_IDS,
+  libwebrtcSdkTarget,
+} from './libwebrtc-sdk-targets.mjs';
 
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const defaultRelativeLockPath = `native/windows-remote-desktop/${LIBWEBRTC_SDK_LOCK_FILENAME}`;
 const DEFAULT_POLL_INTERVAL_MS = 15_000;
 // The first automatic SDK producer is allowed up to 240 minutes. Consumers
 // start in the same push workflow fan-out, so their bounded bootstrap wait must
@@ -26,9 +29,12 @@ export function parseArguments(argv) {
   let lockArgument;
   let waitSeconds = 0;
   let branch = 'dev';
+  let targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === '--wait-seconds') {
+    if (argument === '--target') {
+      targetId = libwebrtcSdkTarget(argv[index += 1]).id;
+    } else if (argument === '--wait-seconds') {
       const raw = argv[index += 1];
       if (!/^\d+$/.test(raw ?? '')) throw new Error('--wait-seconds requires a non-negative integer');
       waitSeconds = Number(raw);
@@ -42,14 +48,19 @@ export function parseArguments(argv) {
         throw new Error('--branch is invalid');
       }
     } else if (argument?.startsWith('-') || lockArgument !== undefined) {
-      throw new Error('usage: resolve-libwebrtc-sdk-release.mjs [lock] [--wait-seconds N] [--branch dev]');
+      throw new Error(
+        'usage: resolve-libwebrtc-sdk-release.mjs [lock] [--wait-seconds N] [--branch dev] '
+        + `[--target ${LIBWEBRTC_SDK_TARGET_IDS.join('|')}]`,
+      );
     } else {
       lockArgument = argument;
     }
   }
+  const relativeLockPath = lockArgument ?? libwebrtcSdkTarget(targetId).lockRelativePath;
   return {
-    lockPath: resolve(repositoryRoot, lockArgument ?? defaultRelativeLockPath),
-    lockRepositoryPath: lockArgument ?? defaultRelativeLockPath,
+    targetId,
+    lockPath: resolve(repositoryRoot, relativeLockPath),
+    lockRepositoryPath: relativeLockPath,
     waitSeconds,
     branch,
   };
@@ -57,19 +68,28 @@ export function parseArguments(argv) {
 
 const delay = (milliseconds) => new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 
-async function readRemoteLock(branch, repositoryPath, expectedSourceSha256) {
+async function readRemoteLock(branch, repositoryPath, expectedSourceSha256, targetId) {
   await execFileAsync('git', ['fetch', '--quiet', 'origin', branch], { cwd: repositoryRoot });
   const { stdout } = await execFileAsync(
     'git', ['show', `origin/${branch}:${repositoryPath}`],
     { cwd: repositoryRoot, maxBuffer: 1024 * 1024 },
   );
-  return validateLibwebrtcSdkLock(JSON.parse(stdout), expectedSourceSha256);
+  return validateLibwebrtcSdkLock(JSON.parse(stdout), expectedSourceSha256, targetId);
 }
 
 export async function resolveLibwebrtcSdkLock(options, dependencies = {}) {
-  const verifyLocalLock = dependencies.verifyLocalLock ?? verifyLibwebrtcSdkLock;
-  const computeSourceSha256 = dependencies.computeSourceSha256 ?? computeLibwebrtcSdkSourceSha256;
-  const fetchRemoteLock = dependencies.fetchRemoteLock ?? readRemoteLock;
+  // The target is bound into the default implementations rather than pushed
+  // through the injected ones, so an injected dependency keeps exactly the
+  // call signature it had before targets existed.
+  const targetId = libwebrtcSdkTarget(options.targetId ?? DEFAULT_LIBWEBRTC_SDK_TARGET_ID).id;
+  const verifyLocalLock = dependencies.verifyLocalLock
+    ?? ((lockPath) => verifyLibwebrtcSdkLock(lockPath, undefined, undefined, targetId));
+  const computeSourceSha256 = dependencies.computeSourceSha256
+    ?? (() => computeLibwebrtcSdkSourceSha256(targetId));
+  const fetchRemoteLock = dependencies.fetchRemoteLock
+    ?? ((branch, repositoryPath, expectedSourceSha256) => (
+      readRemoteLock(branch, repositoryPath, expectedSourceSha256, targetId)
+    ));
   const writeResolvedLock = dependencies.writeResolvedLock
     ?? ((lockPath, lock) => writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8'));
   const wait = dependencies.delay ?? delay;

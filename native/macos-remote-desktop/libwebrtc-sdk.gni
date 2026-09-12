@@ -1,0 +1,17 @@
+# Dependency-only variables shared by the product checkout and the immutable
+# SDK producer. GN imports may define variables but not instantiate targets, so
+# the SDK targets live in sdk.BUILD.gn while product targets stay in BUILD.gn --
+# an ordinary worker change must never invalidate the fixed SDK.
+#
+# macOS depends on the root `//:webrtc` target rather than the curated label
+# list Windows uses, because that is what the product already links: the macOS
+# components declare `deps = [ "//:webrtc" ]`, and an SDK assembled from a
+# narrower set would link here and fail at the first upstream symbol nobody
+# listed. Apple frameworks supply capture and H.264; libwebrtc remains the sole
+# implementation of ICE, DTLS-SRTP, RTP/RTCP, pacing and congestion control.
+imcodes_macos_remote_desktop_deps = [ "//:webrtc" ]
+
+# No defines. The Windows list exists to tame windows.h; macOS needs none, and
+# an invented one would change the SDK's compile configuration away from the
+# product's.
+imcodes_macos_remote_desktop_defines = []

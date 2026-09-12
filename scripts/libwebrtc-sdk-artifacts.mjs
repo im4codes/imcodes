@@ -6,49 +6,28 @@ import { basename, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+  LIBWEBRTC_SDK_TARGET_IDS,
+  libwebrtcSdkTarget,
+} from './libwebrtc-sdk-targets.mjs';
+import {
   PINNED_DEPOT_TOOLS_REVISION,
   PINNED_LIBWEBRTC_REVISION,
 } from './remote-desktop-worker-artifacts.mjs';
 
+export { DEFAULT_LIBWEBRTC_SDK_TARGET_ID, LIBWEBRTC_SDK_TARGET_IDS, libwebrtcSdkTarget };
+
+const defaultTarget = libwebrtcSdkTarget(DEFAULT_LIBWEBRTC_SDK_TARGET_ID);
+
 export const LIBWEBRTC_SDK_MANIFEST_FILENAME = 'imcodes-libwebrtc-sdk.manifest.json';
-export const LIBWEBRTC_SDK_ARCHIVE_FILENAME = 'imcodes-libwebrtc-sdk-windows-x64.zip';
-export const LIBWEBRTC_SDK_LOCK_FILENAME = 'libwebrtc-sdk.lock.json';
+// Kept for the call sites that predate the target registry. Both are the
+// default (Windows) target's values, derived rather than restated.
+export const LIBWEBRTC_SDK_ARCHIVE_FILENAME = defaultTarget.archiveFilename;
+export const LIBWEBRTC_SDK_LOCK_FILENAME = defaultTarget.lockFilename;
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const COMMIT_RE = /^[a-f0-9]{40}$/;
-const RELEASE_TAG_RE = /^libwebrtc-sdk-windows-x64-[a-f0-9]{16}-[a-f0-9]{16}$/;
 const repositoryRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const SOURCE_INPUTS = Object.freeze([
-  'shared/remote-desktop-native-pins.json',
-  'native/windows-remote-desktop/sdk.BUILD.gn',
-  'native/windows-remote-desktop/libwebrtc-sdk.gni',
-  'native/windows-remote-desktop/sdk_anchor.cc',
-  'native/windows-remote-desktop/load-native-pins.ps1',
-  'native/windows-remote-desktop/initialize-hermetic-windows-git.ps1',
-  'native/windows-remote-desktop/invoke-native-logged.ps1',
-  'native/windows-remote-desktop/build-libwebrtc-sdk.ps1',
-  'native/windows-remote-desktop/generate-libwebrtc-sdk-notices.py',
-]);
-const REQUIRED_TOP_LEVEL_ENTRIES = Object.freeze([
-  'THIRD_PARTY_NOTICES.webrtc.md',
-  'gen',
-  'include',
-  'lib',
-  'sdk-build.json',
-  'toolchain',
-]);
-const REQUIRED_FILES = Object.freeze([
-  'lib/imcodes_libwebrtc_sdk.lib',
-  'lib/imcodes_libwebrtc_test_sdk.lib',
-  'lib/imcodes_libcxx_runtime_sdk.lib',
-  'toolchain/manifest/as_invoker.manifest',
-  'toolchain/manifest/common_controls.manifest',
-  'toolchain/manifest/compatibility.manifest',
-  'toolchain/bin/clang-cl.exe',
-  'toolchain/bin/lld-link.exe',
-  'toolchain/bin/llvm-ml.exe',
-  'toolchain/lib/clang_rt.builtins-x86_64.lib',
-]);
 export const REQUIRED_LIBWEBRTC_SDK_NOTICE_SECTIONS = Object.freeze([
   'compiler-rt',
   'googletest',
@@ -160,9 +139,17 @@ export function validateMacosLibwebrtcNotices(text, expectedRevision) {
   return text;
 }
 
-export async function computeLibwebrtcSdkSourceSha256() {
+/** Validate the notices shipped inside one target's staging directory. */
+function validateStagedNotices(target, text) {
+  return target.noticesFormat === 'macos-inventory'
+    ? validateMacosLibwebrtcNotices(text, PINNED_LIBWEBRTC_REVISION)
+    : validateLibwebrtcSdkNotices(text);
+}
+
+export async function computeLibwebrtcSdkSourceSha256(targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID) {
+  const target = libwebrtcSdkTarget(targetId);
   const hash = createHash('sha256');
-  for (const input of SOURCE_INPUTS) {
+  for (const input of target.sourceInputs) {
     const path = resolve(repositoryRoot, input);
     await regularFile(path);
     const original = await readFile(path);
@@ -176,35 +163,40 @@ export async function computeLibwebrtcSdkSourceSha256() {
   return hash.digest('hex');
 }
 
-function validateBuildMetadata(value) {
+function validateBuildMetadata(value, target) {
   if (!isRecord(value)
     || !exactKeys(value, [
       'manifestVersion', 'os', 'arch', 'libwebrtcRevision', 'depotToolsRevision',
       'buildArgs', 'toolchain',
     ])
     || value.manifestVersion !== 1
-    || value.os !== 'win32'
-    || value.arch !== 'x64'
+    || value.os !== target.manifestOs
+    || value.arch !== target.manifestArch
     || value.libwebrtcRevision !== PINNED_LIBWEBRTC_REVISION
     || value.depotToolsRevision !== PINNED_DEPOT_TOOLS_REVISION
     || typeof value.buildArgs !== 'string' || value.buildArgs.length === 0 || value.buildArgs.length > 4096
     || !isRecord(value.toolchain)
-    || !exactKeys(value.toolchain, ['msvc', 'windowsSdk', 'clang'])
+    || !exactKeys(value.toolchain, target.toolchainKeys)
     || !Object.values(value.toolchain).every((entry) => typeof entry === 'string' && entry.length > 0 && entry.length <= 128)) {
     throw new Error('invalid libwebrtc SDK build metadata');
   }
   return value;
 }
 
-export function validateLibwebrtcSdkManifest(value, expectedSourceSha256) {
+export function validateLibwebrtcSdkManifest(
+  value,
+  expectedSourceSha256,
+  targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+) {
+  const target = libwebrtcSdkTarget(targetId);
   if (!isRecord(value)
     || !exactKeys(value, [
       'manifestVersion', 'os', 'arch', 'sourceSha256', 'sourceCommit',
       'libwebrtcRevision', 'depotToolsRevision', 'buildArgs', 'toolchain', 'files',
     ])
     || value.manifestVersion !== 2
-    || value.os !== 'win32'
-    || value.arch !== 'x64'
+    || value.os !== target.manifestOs
+    || value.arch !== target.manifestArch
     || typeof value.sourceSha256 !== 'string' || !SHA256_RE.test(value.sourceSha256)
     || (expectedSourceSha256 !== undefined && value.sourceSha256 !== expectedSourceSha256)
     || typeof value.sourceCommit !== 'string' || !COMMIT_RE.test(value.sourceCommit)
@@ -212,9 +204,9 @@ export function validateLibwebrtcSdkManifest(value, expectedSourceSha256) {
     || value.depotToolsRevision !== PINNED_DEPOT_TOOLS_REVISION
     || typeof value.buildArgs !== 'string' || value.buildArgs.length === 0 || value.buildArgs.length > 4096
     || !isRecord(value.toolchain)
-    || !exactKeys(value.toolchain, ['msvc', 'windowsSdk', 'clang'])
+    || !exactKeys(value.toolchain, target.toolchainKeys)
     || !Object.values(value.toolchain).every((entry) => typeof entry === 'string' && entry.length > 0 && entry.length <= 128)
-    || !Array.isArray(value.files) || value.files.length < REQUIRED_FILES.length
+    || !Array.isArray(value.files) || value.files.length < target.requiredFiles.length
     || value.files.length > 100_000) {
     throw new Error('invalid libwebrtc SDK manifest');
   }
@@ -233,13 +225,18 @@ export function validateLibwebrtcSdkManifest(value, expectedSourceSha256) {
     }
     seen.add(file.path);
   }
-  if (REQUIRED_FILES.some((path) => !seen.has(path))) {
+  if (target.requiredFiles.some((path) => !seen.has(path))) {
     throw new Error('libwebrtc SDK manifest is missing a required file');
   }
   return value;
 }
 
-export function validateLibwebrtcSdkLock(value, expectedSourceSha256) {
+export function validateLibwebrtcSdkLock(
+  value,
+  expectedSourceSha256,
+  targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+) {
+  const target = libwebrtcSdkTarget(targetId);
   if (!isRecord(value)
     || !exactKeys(value, [
       'manifestVersion', 'repository', 'releaseTag', 'assetName', 'sha256',
@@ -248,8 +245,8 @@ export function validateLibwebrtcSdkLock(value, expectedSourceSha256) {
     ])
     || value.manifestVersion !== 2
     || value.repository !== 'im4codes/imcodes'
-    || typeof value.releaseTag !== 'string' || !RELEASE_TAG_RE.test(value.releaseTag)
-    || value.assetName !== LIBWEBRTC_SDK_ARCHIVE_FILENAME
+    || typeof value.releaseTag !== 'string' || !target.releaseTagPattern.test(value.releaseTag)
+    || value.assetName !== target.archiveFilename
     || typeof value.sha256 !== 'string' || !SHA256_RE.test(value.sha256)
     || typeof value.sourceSha256 !== 'string' || !SHA256_RE.test(value.sourceSha256)
     || (expectedSourceSha256 !== undefined && value.sourceSha256 !== expectedSourceSha256)
@@ -258,11 +255,11 @@ export function validateLibwebrtcSdkLock(value, expectedSourceSha256) {
     || value.depotToolsRevision !== PINNED_DEPOT_TOOLS_REVISION
     || typeof value.sdkManifestSha256 !== 'string' || !SHA256_RE.test(value.sdkManifestSha256)
     || !isRecord(value.toolchain)
-    || !exactKeys(value.toolchain, ['msvc', 'windowsSdk', 'clang'])
+    || !exactKeys(value.toolchain, target.toolchainKeys)
     || !Object.values(value.toolchain).every((entry) => typeof entry === 'string' && entry.length > 0 && entry.length <= 128)) {
     throw new Error('invalid libwebrtc SDK lock');
   }
-  if (value.releaseTag !== `libwebrtc-sdk-windows-x64-${value.sourceSha256.slice(0, 16)}-${value.sha256.slice(0, 16)}`) {
+  if (value.releaseTag !== target.releaseTag(value.sourceSha256, value.sha256)) {
     throw new Error('libwebrtc SDK release tag does not match its fingerprints');
   }
   return value;
@@ -290,28 +287,33 @@ async function collectSdkFiles(directory) {
   return files.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
-export async function createLibwebrtcSdkManifest(sdkDirectory, sourceCommit) {
+export async function createLibwebrtcSdkManifest(
+  sdkDirectory,
+  sourceCommit,
+  targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+) {
+  const target = libwebrtcSdkTarget(targetId);
   if (!COMMIT_RE.test(sourceCommit)) throw new Error('source commit must be a full lowercase Git SHA');
   const entries = await readdir(sdkDirectory, { withFileTypes: true });
   const actualTopLevel = entries
     .map((entry) => entry.name)
     .filter((name) => name !== LIBWEBRTC_SDK_MANIFEST_FILENAME)
     .sort();
-  if (JSON.stringify(actualTopLevel) !== JSON.stringify([...REQUIRED_TOP_LEVEL_ENTRIES].sort())) {
+  if (JSON.stringify(actualTopLevel) !== JSON.stringify([...target.requiredTopLevelEntries].sort())) {
     throw new Error('libwebrtc SDK staging directory has unexpected top-level entries');
   }
   const metadataPath = join(sdkDirectory, 'sdk-build.json');
-  const metadata = validateBuildMetadata(JSON.parse(await readFile(metadataPath, 'utf8')));
-  if (metadata.buildArgs !== 'target_os=\\"win\\" target_cpu=\\"x64\\" is_debug=false is_component_build=false rtc_include_tests=true rtc_build_examples=false rtc_enable_protobuf=false use_rtti=false') {
+  const metadata = validateBuildMetadata(JSON.parse(await readFile(metadataPath, 'utf8')), target);
+  if (metadata.buildArgs !== target.buildArgs) {
     throw new Error('libwebrtc SDK build arguments do not match the pinned contract');
   }
   const files = (await collectSdkFiles(sdkDirectory))
     .filter((file) => file.path !== LIBWEBRTC_SDK_MANIFEST_FILENAME);
   const manifest = {
     manifestVersion: 2,
-    os: 'win32',
-    arch: 'x64',
-    sourceSha256: await computeLibwebrtcSdkSourceSha256(),
+    os: target.manifestOs,
+    arch: target.manifestArch,
+    sourceSha256: await computeLibwebrtcSdkSourceSha256(target.id),
     sourceCommit,
     libwebrtcRevision: PINNED_LIBWEBRTC_REVISION,
     depotToolsRevision: PINNED_DEPOT_TOOLS_REVISION,
@@ -324,12 +326,16 @@ export async function createLibwebrtcSdkManifest(sdkDirectory, sourceCommit) {
     `${JSON.stringify(manifest, null, 2)}\n`,
     'utf8',
   );
-  return verifyLibwebrtcSdkDirectory(sdkDirectory);
+  return verifyLibwebrtcSdkDirectory(sdkDirectory, target.id);
 }
 
-export async function verifyLibwebrtcSdkDirectory(directory) {
+export async function verifyLibwebrtcSdkDirectory(
+  directory,
+  targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+) {
+  const target = libwebrtcSdkTarget(targetId);
   const entries = await readdir(directory, { withFileTypes: true });
-  const expected = [...REQUIRED_TOP_LEVEL_ENTRIES, LIBWEBRTC_SDK_MANIFEST_FILENAME].sort();
+  const expected = [...target.requiredTopLevelEntries, LIBWEBRTC_SDK_MANIFEST_FILENAME].sort();
   if (JSON.stringify(entries.map((entry) => entry.name).sort()) !== JSON.stringify(expected)) {
     throw new Error('libwebrtc SDK contains unexpected top-level entries');
   }
@@ -340,11 +346,12 @@ export async function verifyLibwebrtcSdkDirectory(directory) {
   }
   const manifest = validateLibwebrtcSdkManifest(
     JSON.parse(await readFile(manifestPath, 'utf8')),
-    await computeLibwebrtcSdkSourceSha256(),
+    await computeLibwebrtcSdkSourceSha256(target.id),
+    target.id,
   );
   const noticesPath = join(directory, 'THIRD_PARTY_NOTICES.webrtc.md');
   await regularFile(noticesPath);
-  validateLibwebrtcSdkNotices(await readFile(noticesPath, 'utf8'));
+  validateStagedNotices(target, await readFile(noticesPath, 'utf8'));
   const actualFiles = await collectSdkFiles(directory);
   const withoutManifest = actualFiles.filter((file) => file.path !== LIBWEBRTC_SDK_MANIFEST_FILENAME);
   if (JSON.stringify(withoutManifest) !== JSON.stringify(manifest.files)) {
@@ -353,18 +360,24 @@ export async function verifyLibwebrtcSdkDirectory(directory) {
   return { manifest, manifestPath };
 }
 
-export async function createLibwebrtcSdkLock(archivePath, sdkDirectory, outputPath) {
-  if (basename(archivePath) !== LIBWEBRTC_SDK_ARCHIVE_FILENAME) {
-    throw new Error(`SDK archive must be named ${LIBWEBRTC_SDK_ARCHIVE_FILENAME}`);
+export async function createLibwebrtcSdkLock(
+  archivePath,
+  sdkDirectory,
+  outputPath,
+  targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+) {
+  const target = libwebrtcSdkTarget(targetId);
+  if (basename(archivePath) !== target.archiveFilename) {
+    throw new Error(`SDK archive must be named ${target.archiveFilename}`);
   }
   await regularFile(archivePath);
-  const sdk = await verifyLibwebrtcSdkDirectory(sdkDirectory);
+  const sdk = await verifyLibwebrtcSdkDirectory(sdkDirectory, target.id);
   const archiveSha256 = await sha256File(archivePath);
   const lock = {
     manifestVersion: 2,
     repository: 'im4codes/imcodes',
-    releaseTag: `libwebrtc-sdk-windows-x64-${sdk.manifest.sourceSha256.slice(0, 16)}-${archiveSha256.slice(0, 16)}`,
-    assetName: LIBWEBRTC_SDK_ARCHIVE_FILENAME,
+    releaseTag: target.releaseTag(sdk.manifest.sourceSha256, archiveSha256),
+    assetName: target.archiveFilename,
     sha256: archiveSha256,
     sourceSha256: sdk.manifest.sourceSha256,
     sourceCommit: sdk.manifest.sourceCommit,
@@ -373,15 +386,22 @@ export async function createLibwebrtcSdkLock(archivePath, sdkDirectory, outputPa
     sdkManifestSha256: await sha256File(sdk.manifestPath),
     toolchain: { ...sdk.manifest.toolchain },
   };
-  validateLibwebrtcSdkLock(lock, sdk.manifest.sourceSha256);
+  validateLibwebrtcSdkLock(lock, sdk.manifest.sourceSha256, target.id);
   await writeFile(outputPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
   return lock;
 }
 
-export async function verifyLibwebrtcSdkLock(lockPath, archivePath, sdkDirectory) {
+export async function verifyLibwebrtcSdkLock(
+  lockPath,
+  archivePath,
+  sdkDirectory,
+  targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
+) {
+  const target = libwebrtcSdkTarget(targetId);
   const lock = validateLibwebrtcSdkLock(
     JSON.parse(await readFile(lockPath, 'utf8')),
-    await computeLibwebrtcSdkSourceSha256(),
+    await computeLibwebrtcSdkSourceSha256(target.id),
+    target.id,
   );
   if (archivePath !== undefined) {
     await regularFile(archivePath);
@@ -390,7 +410,7 @@ export async function verifyLibwebrtcSdkLock(lockPath, archivePath, sdkDirectory
     }
   }
   if (sdkDirectory !== undefined) {
-    const sdk = await verifyLibwebrtcSdkDirectory(sdkDirectory);
+    const sdk = await verifyLibwebrtcSdkDirectory(sdkDirectory, target.id);
     if (sdk.manifest.sourceSha256 !== lock.sourceSha256
       || sdk.manifest.sourceCommit !== lock.sourceCommit
       || await sha256File(sdk.manifestPath) !== lock.sdkManifestSha256
@@ -401,27 +421,47 @@ export async function verifyLibwebrtcSdkLock(lockPath, archivePath, sdkDirectory
   return lock;
 }
 
+/**
+ * Pull `--target <id>` out of an argument vector, leaving the positional shape
+ * every existing caller and workflow already passes exactly as it was.
+ */
+export function extractTargetOption(argv) {
+  const positional = [];
+  let targetId = DEFAULT_LIBWEBRTC_SDK_TARGET_ID;
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === '--target') {
+      targetId = argv[index += 1];
+      if (targetId === undefined) throw new Error('--target requires a target id');
+    } else {
+      positional.push(argv[index]);
+    }
+  }
+  return { targetId: libwebrtcSdkTarget(targetId).id, positional };
+}
+
 async function main() {
-  const [, , command, ...args] = process.argv;
+  const [, , command, ...rest] = process.argv;
+  const { targetId, positional: args } = extractTargetOption(rest);
   if (command === 'fingerprint' && args.length === 0) {
-    process.stdout.write(`${await computeLibwebrtcSdkSourceSha256()}\n`);
+    process.stdout.write(`${await computeLibwebrtcSdkSourceSha256(targetId)}\n`);
   } else if (command === 'create-manifest' && args.length === 2) {
-    await createLibwebrtcSdkManifest(args[0], args[1]);
+    await createLibwebrtcSdkManifest(args[0], args[1], targetId);
   } else if (command === 'verify' && args.length === 1) {
-    const result = await verifyLibwebrtcSdkDirectory(args[0]);
+    const result = await verifyLibwebrtcSdkDirectory(args[0], targetId);
     process.stdout.write(`verified ${result.manifest.sourceSha256}\n`);
   } else if (command === 'create-lock' && args.length === 3) {
-    process.stdout.write(`${JSON.stringify(await createLibwebrtcSdkLock(args[0], args[1], args[2]))}\n`);
+    process.stdout.write(`${JSON.stringify(await createLibwebrtcSdkLock(args[0], args[1], args[2], targetId))}\n`);
   } else if (command === 'verify-lock' && args.length >= 1 && args.length <= 3) {
-    process.stdout.write(`${JSON.stringify(await verifyLibwebrtcSdkLock(args[0], args[1], args[2]))}\n`);
+    process.stdout.write(`${JSON.stringify(await verifyLibwebrtcSdkLock(args[0], args[1], args[2], targetId))}\n`);
   } else if (command === 'verify-sdk-lock' && args.length === 2) {
-    process.stdout.write(`${JSON.stringify(await verifyLibwebrtcSdkLock(args[0], undefined, args[1]))}\n`);
+    process.stdout.write(`${JSON.stringify(await verifyLibwebrtcSdkLock(args[0], undefined, args[1], targetId))}\n`);
   } else {
     throw new Error(
       'usage: libwebrtc-sdk-artifacts.mjs '
       + '<fingerprint|create-manifest <sdk-dir> <commit>|verify <sdk-dir>|'
       + 'create-lock <archive> <sdk-dir> <lock>|verify-lock <lock> [archive] [sdk-dir]|'
-      + 'verify-sdk-lock <lock> <sdk-dir>>',
+      + 'verify-sdk-lock <lock> <sdk-dir>> '
+      + `[--target ${LIBWEBRTC_SDK_TARGET_IDS.join('|')}]`,
     );
   }
 }
