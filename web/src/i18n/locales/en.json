@@ -547,6 +547,7 @@
     "transport_send_queued_count": "{{count}} queued",
     "transport_queue_append": "Append",
     "transport_queue_append_all": "Append all",
+    "transport_queue_append_all_confirm": "Confirm append all?",
     "transport_queue_append_failed": "Could not append the message; it remains queued.",
     "stop_appended_queue": "Queued messages appended; the session is still running.",
     "send_placeholder": "Send to {{name}}…",

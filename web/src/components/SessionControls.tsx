@@ -17,6 +17,7 @@ import {
 } from '../quick-commands.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
+import { ConfirmButton } from './ConfirmButton.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
@@ -1487,6 +1488,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const appendableQueuedTransportEntries = canSharedSessionSend
     ? queuedTransportEntries.filter((entry) => entry.status !== 'failed')
     : [];
+  const appendAllConfirmationScope = JSON.stringify({
+    serverId: serverId ?? '',
+    sessionName: activeSession?.name ?? '',
+    subSessionId: subSessionId ?? '',
+    queueEpoch: activeSession?.queueEpoch ?? '',
+    queueAuthorityId: activeSession?.queueAuthorityId ?? '',
+    version: incomingQueuedTransportVersion ?? null,
+    entries: appendableQueuedTransportEntries.map((entry) => ({
+      clientMessageId: entry.clientMessageId,
+      text: entry.text,
+      status: entry.status ?? 'queued',
+    })),
+  });
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
     ? queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId) ?? null
@@ -7271,13 +7285,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="controls-queued-hint" role="status" aria-live="polite">
             <div class="controls-queued-header">
               {appendableQueuedTransportEntries.length > 0 && (
-                <button
-                  type="button"
-                  class="controls-queued-toggle"
-                  onClick={() => handleQueuedMessagesAppend(appendableQueuedTransportEntries)}
-                >
-                  {t('session.transport_queue_append_all')}
-                </button>
+                <ConfirmButton
+                  className="controls-queued-toggle"
+                  confirmClassName="controls-queued-toggle"
+                  label={t('session.transport_queue_append_all')}
+                  confirmLabel={t('session.transport_queue_append_all_confirm')}
+                  onConfirm={() => handleQueuedMessagesAppend(appendableQueuedTransportEntries)}
+                  resetKey={appendAllConfirmationScope}
+                  testId="transport-queue-append-all"
+                />
               )}
               <div>{t('session.transport_send_queued')}</div>
               <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>

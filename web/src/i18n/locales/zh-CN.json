@@ -547,6 +547,7 @@
     "transport_send_queued_count": "{{count}} 条队列",
     "transport_queue_append": "追加",
     "transport_queue_append_all": "全部追加",
+    "transport_queue_append_all_confirm": "确认全部追加？",
     "transport_queue_append_failed": "追加失败，消息仍保留在队列中。",
     "stop_appended_queue": "已追加队列消息，本次未停止会话。",
     "send_placeholder": "发送到 {{name}}…",
