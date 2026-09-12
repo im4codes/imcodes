@@ -1645,6 +1645,33 @@ export class TransportSessionRuntime implements SessionRuntime {
     return true;
   }
 
+  /**
+   * Durably record provider acceptance for the entries of a direct dispatch.
+   *
+   * Best effort and non-fatal: the turn HAS been accepted by the provider, so a
+   * bookkeeping failure must not fail the send. A missing record only makes a
+   * later reader conservative, which is the safe direction.
+   */
+  private recordDirectDispatchDelivery(dispatchId: number): void {
+    if (this._activeDispatchId !== dispatchId) return;
+    for (const entry of this._activeDispatchEntries) {
+      try {
+        getTransportQueueStore().recordDirectDelivery(
+          this.sessionKey,
+          entry.clientMessageId,
+          undefined,
+          undefined,
+          this.queueRecipient ?? null,
+        );
+      } catch (err) {
+        logger.warn(
+          { err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId },
+          'runtime: direct delivery record failed; delivery itself was accepted',
+        );
+      }
+    }
+  }
+
   private drainPendingIfNoActiveTurn(reason: string): boolean {
     if (this._sending || this._activeTurn) return false;
     if (this._activeDispatchEntries.length > 0) {
@@ -3469,6 +3496,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       // recoverable-retry streak so a later failure starts with a full budget.
       if (this._activeDispatchId === dispatchId) {
         this._activeDispatchProviderAccepted = true;
+        // A direct dispatch never passed through the durable queue, so nothing
+        // else records that it arrived. Without this, "has this message been
+        // delivered?" is unanswerable for the ordinary idle send, and a caller
+        // that must not re-send has no way to tell an accepted message from one
+        // that died with the runtime.
+        this.recordDirectDispatchDelivery(dispatchId);
         this.scheduleActiveAppendFlush(dispatchId);
       }
       this._recoverableDispatchRetries = 0;

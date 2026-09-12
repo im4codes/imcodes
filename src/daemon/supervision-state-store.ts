@@ -194,7 +194,45 @@ export interface SupervisionModeControlDeliveryKey {
 }
 
 export interface PersistedSupervisionModeControlDelivery extends SupervisionModeControlDeliveryKey {
+  /**
+   * The mode the user actually set: authoritative, whether or not it has been
+   * delivered yet. Storing only what was delivered meant a change that could
+   * not be sent left no trace to retry from, so enabling supervision while the
+   * Brain runtime was unavailable was simply lost.
+   */
   mode: SessionSupervisionSnapshot['mode'];
+  /**
+   * The last mode a delivery was AUTHORITATIVELY confirmed for; undefined while
+   * pending. `runtime.send()` returning is not that confirmation: it means the
+   * runtime admitted the turn, while provider acceptance happens later and
+   * asynchronously, so marking delivery there claimed a delivery a crash could
+   * still lose.
+   */
+  deliveredMode?: SessionSupervisionSnapshot['mode'];
+  /**
+   * The exact client message id this authority last handed the transport, kept
+   * so a restart can ask the durable queue whether THAT message was delivered
+   * instead of guessing from a mode comparison.
+   */
+  deliveryMessageId?: string;
+  /**
+   * The queue epoch that message was handed over under. A delivery record only
+   * exists within its own epoch, so an epoch change is positive evidence the
+   * message can never be confirmed and must be re-sent.
+   */
+  deliveryQueueEpoch?: string;
+  /**
+   * The Brain RUNTIME incarnation the message was handed to. A direct dispatch
+   * lives in that runtime's memory until the provider accepts it, so a rebuilt
+   * runtime with no acceptance record is positive evidence the message died.
+   */
+  deliveryRuntimeEpoch?: string;
+  /**
+   * Monotonic per authority, bumped on every real change. A delivery may only
+   * mark itself delivered while this is still the sequence it started from, so
+   * a slow OFF cannot report success over a newer ON and overwrite it.
+   */
+  sequence?: number;
   enabledEver: boolean;
   updatedAt: number;
 }
@@ -265,6 +303,11 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
           brain_session_name TEXT NOT NULL,
           brain_session_instance_id TEXT NOT NULL,
           mode TEXT NOT NULL,
+          delivered_mode TEXT,
+          delivery_message_id TEXT,
+          delivery_queue_epoch TEXT,
+          delivery_runtime_epoch TEXT,
+          sequence INTEGER NOT NULL DEFAULT 0,
           enabled_ever INTEGER NOT NULL CHECK (enabled_ever IN (0, 1)),
           updated_at INTEGER NOT NULL,
           PRIMARY KEY (
@@ -273,6 +316,31 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
           )
         );
       `);
+      // Additive migration: `CREATE TABLE IF NOT EXISTS` leaves an existing
+      // table untouched, so a store written before delivery became two-phase
+      // has neither column and every read would fail.
+      const modeControlColumns = new Set(
+        (db.prepare('PRAGMA table_info(supervision_mode_control_deliveries)').all() as Array<{ name?: unknown }>)
+          .map((column) => String(column.name ?? '')),
+      );
+      if (!modeControlColumns.has('delivered_mode')) {
+        db.exec('ALTER TABLE supervision_mode_control_deliveries ADD COLUMN delivered_mode TEXT');
+        // Rows written by the previous shape recorded only successful
+        // deliveries, so their mode is also what was delivered.
+        db.exec('UPDATE supervision_mode_control_deliveries SET delivered_mode = mode WHERE delivered_mode IS NULL');
+      }
+      if (!modeControlColumns.has('delivery_message_id')) {
+        db.exec('ALTER TABLE supervision_mode_control_deliveries ADD COLUMN delivery_message_id TEXT');
+      }
+      if (!modeControlColumns.has('delivery_queue_epoch')) {
+        db.exec('ALTER TABLE supervision_mode_control_deliveries ADD COLUMN delivery_queue_epoch TEXT');
+      }
+      if (!modeControlColumns.has('delivery_runtime_epoch')) {
+        db.exec('ALTER TABLE supervision_mode_control_deliveries ADD COLUMN delivery_runtime_epoch TEXT');
+      }
+      if (!modeControlColumns.has('sequence')) {
+        db.exec('ALTER TABLE supervision_mode_control_deliveries ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0');
+      }
     } catch (error) {
       if (ownsDb) {
         try {
@@ -356,7 +424,11 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
   getModeControlDelivery(input: SupervisionModeControlDeliveryKey): PersistedSupervisionModeControlDelivery | undefined {
     if (this.#closed) return undefined;
     const row = this.#db.prepare(`
-      SELECT mode, enabled_ever AS enabledEver, updated_at AS updatedAt
+      SELECT mode, delivered_mode AS deliveredMode,
+             delivery_message_id AS deliveryMessageId,
+             delivery_queue_epoch AS deliveryQueueEpoch,
+             delivery_runtime_epoch AS deliveryRuntimeEpoch, sequence,
+             enabled_ever AS enabledEver, updated_at AS updatedAt
       FROM supervision_mode_control_deliveries
       WHERE source_session_name = ? AND source_session_instance_id = ?
         AND brain_session_name = ? AND brain_session_instance_id = ?
@@ -365,13 +437,32 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
       input.sourceSessionInstanceId,
       input.brainSessionName,
       input.brainSessionInstanceId,
-    ) as { mode?: unknown; enabledEver?: unknown; updatedAt?: unknown } | undefined;
+    ) as {
+      mode?: unknown; deliveredMode?: unknown; deliveryMessageId?: unknown;
+      deliveryQueueEpoch?: unknown; deliveryRuntimeEpoch?: unknown; sequence?: unknown;
+      enabledEver?: unknown; updatedAt?: unknown;
+    } | undefined;
     if (!row || !Object.values(SUPERVISION_MODE).includes(row.mode as SessionSupervisionSnapshot['mode'])) {
       return undefined;
     }
+    const deliveredMode = Object.values(SUPERVISION_MODE)
+      .includes(row.deliveredMode as SessionSupervisionSnapshot['mode'])
+      ? row.deliveredMode as SessionSupervisionSnapshot['mode']
+      : undefined;
     return {
       ...input,
       mode: row.mode as SessionSupervisionSnapshot['mode'],
+      ...(deliveredMode ? { deliveredMode } : {}),
+      ...(typeof row.deliveryMessageId === 'string' && row.deliveryMessageId
+        ? { deliveryMessageId: row.deliveryMessageId }
+        : {}),
+      ...(typeof row.deliveryQueueEpoch === 'string' && row.deliveryQueueEpoch
+        ? { deliveryQueueEpoch: row.deliveryQueueEpoch }
+        : {}),
+      ...(typeof row.deliveryRuntimeEpoch === 'string' && row.deliveryRuntimeEpoch
+        ? { deliveryRuntimeEpoch: row.deliveryRuntimeEpoch }
+        : {}),
+      sequence: Number.isFinite(Number(row.sequence)) ? Number(row.sequence) : 0,
       enabledEver: row.enabledEver === 1,
       updatedAt: Number(row.updatedAt),
     };
@@ -383,21 +474,36 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
       INSERT INTO supervision_mode_control_deliveries (
         source_session_name, source_session_instance_id,
         brain_session_name, brain_session_instance_id,
-        mode, enabled_ever, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        mode, delivered_mode, delivery_message_id, delivery_queue_epoch,
+        delivery_runtime_epoch, sequence, enabled_ever, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (
         source_session_name, source_session_instance_id,
         brain_session_name, brain_session_instance_id
       ) DO UPDATE SET
         mode = excluded.mode,
+        delivered_mode = excluded.delivered_mode,
+        delivery_message_id = excluded.delivery_message_id,
+        delivery_queue_epoch = excluded.delivery_queue_epoch,
+        delivery_runtime_epoch = excluded.delivery_runtime_epoch,
+        sequence = excluded.sequence,
         enabled_ever = excluded.enabled_ever,
         updated_at = excluded.updated_at
+      WHERE excluded.sequence >= supervision_mode_control_deliveries.sequence
     `).run(
       delivery.sourceSessionName,
       delivery.sourceSessionInstanceId,
       delivery.brainSessionName,
       delivery.brainSessionInstanceId,
       delivery.mode,
+      delivery.deliveredMode ?? null,
+      delivery.deliveryMessageId ?? null,
+      delivery.deliveryQueueEpoch ?? null,
+      delivery.deliveryRuntimeEpoch ?? null,
+      // A caller that does not track ordering writes at sequence 0, which the
+      // guard above lets establish a fresh row but never let it clobber one
+      // that a sequenced writer has already advanced.
+      delivery.sequence ?? 0,
       delivery.enabledEver ? 1 : 0,
       delivery.updatedAt,
     );
@@ -2158,6 +2264,41 @@ export class SupervisionTaskRegistry {
       this.#db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /**
+   * Every session a LIVE auditor assignment is currently bound to.
+   *
+   * Automatic audit routing keeps an in-memory claim on the auditor it picked,
+   * to bridge the lag before that session reports busy. That claim is a cache,
+   * not a fact: it dies with the process and a timer can outlive the lag it
+   * exists to cover. The fact is right here -- an auditor assignment bound to
+   * one exact session and one exact attempt -- and it is durable, so routing
+   * can rebuild its exclusions from this instead of trusting its own memory.
+   *
+   * Liveness reuses the same terminal set the rest of this store treats as
+   * "this assignment is done", rather than inventing a second notion of
+   * finished that could drift from it.
+   */
+  listActiveAuditTargets(): Array<{ sessionName: string; attemptId: string }> {
+    if (this.#closed) return [];
+    const terminal = [...HOUSEKEEPING_ASSIGNMENT_TERMINAL];
+    const rows = this.#db.prepare(`
+      SELECT session_name AS sessionName, audit_attempt_id AS attemptId
+      FROM supervision_task_assignments
+      WHERE role = 'auditor'
+        AND audit_attempt_id IS NOT NULL
+        AND audit_attempt_id <> ''
+        AND status NOT IN (${terminal.map(() => '?').join(', ')})
+      ORDER BY session_name ASC, updated_at ASC
+    `).all(...terminal) as Array<{ sessionName?: unknown; attemptId?: unknown }>;
+    const claims: Array<{ sessionName: string; attemptId: string }> = [];
+    for (const row of rows) {
+      const sessionName = typeof row.sessionName === 'string' ? row.sessionName.trim() : '';
+      const attemptId = typeof row.attemptId === 'string' ? row.attemptId.trim() : '';
+      if (sessionName && attemptId) claims.push({ sessionName, attemptId });
+    }
+    return claims;
   }
 
   listAuditReceipts(taskId: string): PersistedSupervisionAuditReceipt[] {

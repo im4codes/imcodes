@@ -46,6 +46,11 @@ import {
   resetDelegationReplyStoreForTests,
 } from '../../src/daemon/delegation-reply-store.js';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
+import {
+  __auditTargetReservationsForTests,
+  __resetAuditTargetReservationsForTests,
+  AUDIT_TARGET_RESERVATION_TTL_MS,
+} from '../../src/daemon/supervision-audit-target-reservations.js';
 import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
 
 const require = createRequire(import.meta.url);
@@ -135,6 +140,8 @@ function makeReadyTask(options: {
   revision?: string;
   auditPolicy?: 'auto_allow_degraded' | 'auto_strict_cross_vendor';
   registry?: SupervisionTaskRegistry;
+  /** Which session holds the implementer assignment this audit is about. */
+  implementerSession?: string;
 } = {}) {
   const registry = options.registry ?? new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
   const taskId = options.taskId ?? 'auto-audit-task';
@@ -157,7 +164,7 @@ function makeReadyTask(options: {
   const worker = registry.createAssignment({
     taskId,
     role: 'implementer',
-    identity: identity('deck_alpha_worker'),
+    identity: identity(options.implementerSession ?? 'deck_alpha_worker'),
     auditRevision: revision,
     scopeFiles: ['src/exact.ts'],
   });
@@ -212,6 +219,9 @@ beforeEach(() => {
   resetTransportQueueStoreForTests();
   resetDelegationReplyStoreForTests();
   clearSendIdempotencyCacheForTests();
+  // Auditor claims live for the daemon's lifetime by design, so one test's
+  // claim would otherwise keep a peer out of the next test's ready pool.
+  __resetAuditTargetReservationsForTests();
 });
 
 describe('automatic supervision audit materialization', () => {
@@ -5289,5 +5299,453 @@ describe('audit redelivery when the policy is already persisted (tsk_bzp shape)'
       error: 'task auditPolicy must be bound by a task continuation before audit dispatch',
     });
     expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_strict_cross_vendor');
+  });
+});
+
+describe('automatic audit fan-out across ready auditors', () => {
+  const acceptingDispatch = () => {
+    let seq = 0;
+    return vi.fn(async (_caller: unknown, input: { target?: string }) => {
+      seq += 1;
+      return {
+        status: 'accepted' as const,
+        assignmentId: `asg_auto_${seq}`,
+        messageId: `msg_${seq}`,
+        target: input.target,
+      };
+    });
+  };
+
+  /** Every target this dispatch was actually asked to send to. */
+  const targetsOf = (dispatch: ReturnType<typeof acceptingDispatch>) => dispatch.mock.calls
+    .map((call) => (call[1] as { target?: string }).target);
+
+  it('gives two different tasks two different ready auditors', async () => {
+    // The reported failure: separate audits all chose the same ready peer,
+    // because availability had not moved by the time the second one looked.
+    // Three of four then queued behind one session while peers sat idle.
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const first = session('deck_alpha_aud_a', 'w2', 'claude-code-sdk', 'anthropic');
+    const second = session('deck_alpha_aud_b', 'w3', 'claude-code-sdk', 'anthropic');
+    const sessions = [brain, worker, first, second];
+    const dispatch = acceptingDispatch();
+
+    const one = makeReadyTask({ taskId: 'tsk_one', revision: 'rev-one', auditPolicy: 'auto_strict_cross_vendor' });
+    const two = makeReadyTask({ taskId: 'tsk_two', revision: 'rev-two', auditPolicy: 'auto_strict_cross_vendor' });
+    const deps = (registry: unknown) => ({
+      registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(first, second),
+      dispatch,
+    });
+
+    // Dispatched without letting either settle first: the listing still says
+    // both peers are ready when the second route looks.
+    await Promise.all([
+      dispatchReadyAudit('tsk_one', deps(one.registry) as never),
+      dispatchReadyAudit('tsk_two', deps(two.registry) as never),
+    ]);
+
+    const chosen = targetsOf(dispatch).filter(Boolean);
+    expect(chosen).toHaveLength(2);
+    expect(new Set(chosen).size, 'both audits piled onto one ready auditor').toBe(2);
+  });
+
+  it('keeps a same-task continuation on its own session even when that session is busy', async () => {
+    // Continuing a task is not a routing decision. It must append to the exact
+    // session that already holds the assignment, and a busy one queues rather
+    // than handing the work to a different peer.
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const busyOwner = { ...session('deck_alpha_aud_a', 'w2', 'claude-code-sdk', 'anthropic'), state: 'running' as const };
+    const idlePeer = session('deck_alpha_aud_b', 'w3', 'claude-code-sdk', 'anthropic');
+    const { registry, taskId, revision } = makeReadyTask({ taskId: 'tsk_same', revision: 'rev-same', auditPolicy: 'auto_strict_cross_vendor' });
+    const attemptId = automaticAttempt(taskId, revision);
+    expect(registry.createAssignment({
+      assignmentId: 'asg_existing_auditor',
+      taskId,
+      role: 'auditor',
+      required: true,
+      identity: identity(busyOwner.name),
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    const dispatch = acceptingDispatch();
+
+    await dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => [brain, worker, busyOwner, idlePeer],
+      listTargets: listTargetRecords(busyOwner, idlePeer),
+      dispatch,
+    } as never);
+
+    // The idle peer is RIGHT THERE and must still not be used.
+    expect(targetsOf(dispatch)).toEqual([busyOwner.name]);
+  });
+
+  it('releases a claimed auditor when the dispatch fails', async () => {
+    // A refused dispatch routed nothing, so it may not keep a ready peer out
+    // of the pool: failing the audit closed must not also fail capacity closed.
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const only = session('deck_alpha_aud_a', 'w2', 'claude-code-sdk', 'anthropic');
+    const sessions = [brain, worker, only];
+    const failing = vi.fn(async () => ({ status: 'error' as const, error: 'transport refused' }));
+    const one = makeReadyTask({ taskId: 'tsk_fail', revision: 'rev-fail', auditPolicy: 'auto_strict_cross_vendor' });
+
+    await dispatchReadyAudit('tsk_fail', {
+      registry: one.registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(only),
+      dispatch: failing,
+    } as never);
+    expect(__auditTargetReservationsForTests(), 'a failed dispatch kept holding its auditor')
+      .toEqual([]);
+
+    // And the next task can still have it.
+    const dispatch = acceptingDispatch();
+    const two = makeReadyTask({ taskId: 'tsk_after', revision: 'rev-after', auditPolicy: 'auto_strict_cross_vendor' });
+    await dispatchReadyAudit('tsk_after', {
+      registry: two.registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(only),
+      dispatch,
+    } as never);
+    expect(targetsOf(dispatch)).toEqual([only.name]);
+  });
+
+  it('hands a claimed auditor back once it stops reporting ready', async () => {
+    // Release is structural, not event-driven: a claim only bridges the lag in
+    // the availability signal. When the audit finishes or is cancelled the
+    // session reports ready again and is immediately selectable -- which also
+    // means a lost terminal event cannot strand it.
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_aud_a', 'w2', 'claude-code-sdk', 'anthropic');
+    const dispatch = acceptingDispatch();
+    const one = makeReadyTask({ taskId: 'tsk_hold', revision: 'rev-hold', auditPolicy: 'auto_strict_cross_vendor' });
+    await dispatchReadyAudit('tsk_hold', {
+      registry: one.registry,
+      listSessions: () => [brain, worker, auditor],
+      listTargets: listTargetRecords(auditor),
+      dispatch,
+    } as never);
+    expect(__auditTargetReservationsForTests().map((item) => item.target)).toEqual([auditor.name]);
+
+    // The auditor is now busy with that audit, so the listing excludes it from
+    // the ready set and the claim is redundant.
+    const busy = { ...auditor, state: 'running' as const };
+    const two = makeReadyTask({ taskId: 'tsk_next', revision: 'rev-next', auditPolicy: 'auto_strict_cross_vendor' });
+    await dispatchReadyAudit('tsk_next', {
+      registry: two.registry,
+      listSessions: () => [brain, worker, busy],
+      listTargets: listTargetRecords(busy),
+      dispatch,
+    } as never);
+    expect(__auditTargetReservationsForTests(), 'the claim outlived the ready signal')
+      .toEqual([]);
+  });
+
+  /**
+   * One pool, one shared registry, and dispatch that refuses to spawn.
+   *
+   * The refusal matters: it is what forces the routing order to be OBSERVABLE.
+   * A route with a ready peer sends once, with a target; a route without one
+   * must try the pool first and only then fall back, so the sequence of
+   * attempts says which branch was taken -- which is the only way to tell a
+   * legitimate FIFO fallback from having handed out a claimed auditor twice.
+   */
+  function spawnRefusingDispatch() {
+    const attempts: Array<{ target?: string; autoProvision: boolean }> = [];
+    let seq = 0;
+    const dispatch = vi.fn(async (
+      _caller: unknown,
+      input: { target?: string; task?: { autoProvision?: boolean } },
+    ) => {
+      const autoProvision = input.task?.autoProvision === true;
+      attempts.push({ target: input.target, autoProvision });
+      if (autoProvision) {
+        return {
+          status: 'error' as const,
+          error: 'no capacity',
+          provisioning: { failureReason: 'max_spawned' as const },
+        };
+      }
+      seq += 1;
+      return {
+        status: 'accepted' as const,
+        assignmentId: `asg_auto_${seq}`,
+        messageId: `msg_${seq}`,
+        target: input.target,
+      };
+    });
+    return { dispatch, attempts };
+  }
+
+  it('does not release one task\'s auditor just because another task may not use it', async () => {
+    // The exact three-task race. Task B's implementer IS task A's auditor, so
+    // B's candidate pool cannot contain that session at all. Pruning claims
+    // against B's own filtered pool therefore read "not ready" and handed A's
+    // live claim back -- and task C, which CAN see it, took it straight away.
+    const brain = session('deck_alpha_brain', 'brain');
+    const implA = session('deck_alpha_w_a', 'w1');
+    const implC = session('deck_alpha_w_c', 'w4');
+    const audS = session('deck_alpha_aud_s', 'w2', 'claude-code-sdk', 'anthropic');
+    const audT = session('deck_alpha_aud_t', 'w3', 'claude-code-sdk', 'anthropic');
+    // Cross-vendor for task B, whose implementer is itself an anthropic peer.
+    const audU = session('deck_alpha_aud_u', 'w5');
+    const sessions = [brain, implA, implC, audS, audT, audU];
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const { dispatch, attempts } = spawnRefusingDispatch();
+    const deps = {
+      registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(audS, audT, audU),
+      dispatch,
+    };
+
+    for (const [taskId, revision, implementerSession] of [
+      ['tsk_a', 'rev-a', implA.name],
+      // Task B is implemented BY the session task A is auditing with.
+      ['tsk_b', 'rev-b', audS.name],
+      ['tsk_c', 'rev-c', implC.name],
+    ] as const) {
+      makeReadyTask({
+        taskId, revision, registry, implementerSession,
+        auditPolicy: 'auto_strict_cross_vendor',
+      });
+    }
+
+    await dispatchReadyAudit('tsk_a', deps as never);
+    await dispatchReadyAudit('tsk_b', deps as never);
+    // A took the first cross-vendor peer; B, which may not use its own
+    // implementer, took the only peer that is cross-vendor for it.
+    expect(attempts.map((attempt) => attempt.target)).toEqual([audS.name, audU.name]);
+    // The claim B could not even consider must still be A's.
+    expect(
+      __auditTargetReservationsForTests().find((item) => item.target === audS.name)?.ownerKey,
+      'task B released an auditor it was never allowed to route to',
+    ).toBe(automaticAttempt('tsk_a', 'rev-a'));
+
+    // C can see audS and would take it first by name. It must get the peer
+    // that is actually free instead of the one already auditing for A.
+    await dispatchReadyAudit('tsk_c', deps as never);
+    expect(attempts.slice(2), 'a live claim was handed to a second audit')
+      .toEqual([{ target: audT.name, autoProvision: false }]);
+  });
+
+  it('queues onto a claimed ready auditor rather than blocking the audit', async () => {
+    // A ready peer that another route has claimed was in NEITHER pool: not
+    // selectable as ready, and missing from the busy fallback. So once every
+    // ready peer was claimed, the one auto-provision attempt refusing for
+    // capacity left nothing at all and the audit blocked -- even though that
+    // peer is exactly a queueable transport, which is what the durable FIFO
+    // fallback is for.
+    const brain = session('deck_alpha_brain', 'brain');
+    const implA = session('deck_alpha_w_a', 'w1');
+    const implC = session('deck_alpha_w_c', 'w4');
+    const only = session('deck_alpha_aud_s', 'w2', 'claude-code-sdk', 'anthropic');
+    const sessions = [brain, implA, implC, only];
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const { dispatch, attempts } = spawnRefusingDispatch();
+    const deps = {
+      registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(only),
+      dispatch,
+    };
+    makeReadyTask({
+      taskId: 'tsk_a', revision: 'rev-a', registry,
+      implementerSession: implA.name, auditPolicy: 'auto_strict_cross_vendor',
+    });
+    makeReadyTask({
+      taskId: 'tsk_c', revision: 'rev-c', registry,
+      implementerSession: implC.name, auditPolicy: 'auto_strict_cross_vendor',
+    });
+
+    await dispatchReadyAudit('tsk_a', deps as never);
+    expect(attempts).toEqual([{ target: only.name, autoProvision: false }]);
+
+    const outcome = await dispatchReadyAudit('tsk_c', deps as never);
+    // Order intact: ready first, then one spawn attempt, and only then FIFO.
+    expect(attempts.slice(1)).toEqual([
+      { target: undefined, autoProvision: true },
+      { target: only.name, autoProvision: false },
+    ]);
+    expect(outcome.status, 'a fully-claimed pool blocked instead of queueing')
+      .not.toBe('blocked');
+  });
+
+  /**
+   * Record what an ACCEPTED dispatch durably records in production: an auditor
+   * assignment bound to one exact session and one exact attempt. The dispatch
+   * these tests use is a mock, so it writes nothing on its own.
+   */
+  function recordAcceptedAuditor(
+    registry: SupervisionTaskRegistry,
+    input: { assignmentId: string; taskId: string; revision: string; target: string },
+  ): void {
+    expect(registry.createAssignment({
+      assignmentId: input.assignmentId,
+      taskId: input.taskId,
+      role: 'auditor',
+      required: true,
+      identity: identity(input.target),
+      auditAttemptId: automaticAttempt(input.taskId, input.revision),
+      auditRevision: input.revision,
+    })).toMatchObject({ ok: true });
+  }
+
+  it.each([
+    ['a daemon restart drops every in-memory claim', 'restart' as const],
+    ['the readiness signal lags for longer than the claim TTL', 'stale_ready' as const],
+  ])('keeps a live audit\'s auditor out of the ready pool when %s', async (_label, kind) => {
+    // A claim is a cache of a durable fact -- an auditor assignment bound to a
+    // session. Treating the cache as the fact meant a restart forgot it, and a
+    // TTL expired it while the readiness signal it exists to bridge was still
+    // lagging. Both hand the same auditor to a second audit.
+    const brain = session('deck_alpha_brain', 'brain');
+    const implA = session('deck_alpha_w_a', 'w1');
+    const implC = session('deck_alpha_w_c', 'w4');
+    const audS = session('deck_alpha_aud_s', 'w2', 'claude-code-sdk', 'anthropic');
+    const audT = session('deck_alpha_aud_t', 'w3', 'claude-code-sdk', 'anthropic');
+    const sessions = [brain, implA, implC, audS, audT];
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const { dispatch, attempts } = spawnRefusingDispatch();
+    const base = 1_700_000_000_000;
+    let now = base;
+    const deps = {
+      registry,
+      listSessions: () => sessions,
+      // The peer STILL reports ready: that lag is the whole problem.
+      listTargets: listTargetRecords(audS, audT),
+      dispatch,
+      now: () => now,
+    };
+
+    makeReadyTask({
+      taskId: 'tsk_a', revision: 'rev-a', registry,
+      implementerSession: implA.name, auditPolicy: 'auto_strict_cross_vendor',
+    });
+    makeReadyTask({
+      taskId: 'tsk_c', revision: 'rev-c', registry,
+      implementerSession: implC.name, auditPolicy: 'auto_strict_cross_vendor',
+    });
+
+    await dispatchReadyAudit('tsk_a', deps as never);
+    expect(attempts.map((attempt) => attempt.target)).toEqual([audS.name]);
+    recordAcceptedAuditor(registry, {
+      assignmentId: 'asg_auditor_a', taskId: 'tsk_a', revision: 'rev-a', target: audS.name,
+    });
+
+    if (kind === 'restart') {
+      // A new process starts with nothing in memory.
+      __resetAuditTargetReservationsForTests();
+      expect(__auditTargetReservationsForTests()).toEqual([]);
+    } else {
+      // Long past the TTL, with the listing still insisting the peer is ready.
+      now = base + AUDIT_TARGET_RESERVATION_TTL_MS * 5;
+    }
+
+    await dispatchReadyAudit('tsk_c', deps as never);
+    // Rebuilt from the durable assignment, not from this process's memory.
+    expect(
+      __auditTargetReservationsForTests().find((item) => item.target === audS.name)?.ownerKey,
+      'the live audit lost its auditor claim',
+    ).toBe(automaticAttempt('tsk_a', 'rev-a'));
+    expect(attempts.slice(1), 'a busy auditor was handed a second concurrent audit')
+      .toEqual([{ target: audT.name, autoProvision: false }]);
+  });
+
+  it('gives the auditor back as soon as its assignment stops being live', async () => {
+    // The other half of reconstructing claims from the durable record: a claim
+    // that outlives its audit is an invented capacity cap. When the assignment
+    // leaves the live set the session is free again, with no terminal event
+    // and no timer needed.
+    const brain = session('deck_alpha_brain', 'brain');
+    const implA = session('deck_alpha_w_a', 'w1');
+    const implB = session('deck_alpha_w_b', 'w5');
+    const implC = session('deck_alpha_w_c', 'w4');
+    const only = session('deck_alpha_aud_s', 'w2', 'claude-code-sdk', 'anthropic');
+    const sessions = [brain, implA, implB, implC, only];
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const { dispatch, attempts } = spawnRefusingDispatch();
+    const deps = {
+      registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(only),
+      dispatch,
+    };
+    for (const [taskId, revision, implementerSession] of [
+      ['tsk_a', 'rev-a', implA.name],
+      ['tsk_b', 'rev-b', implB.name],
+      ['tsk_c', 'rev-c', implC.name],
+    ] as const) {
+      makeReadyTask({
+        taskId, revision, registry, implementerSession,
+        auditPolicy: 'auto_strict_cross_vendor',
+      });
+    }
+
+    await dispatchReadyAudit('tsk_a', deps as never);
+    recordAcceptedAuditor(registry, {
+      assignmentId: 'asg_auditor_a', taskId: 'tsk_a', revision: 'rev-a', target: only.name,
+    });
+    expect(registry.listActiveAuditTargets()).toEqual([
+      { sessionName: only.name, attemptId: automaticAttempt('tsk_a', 'rev-a') },
+    ]);
+
+    // A second route confirms the claim against the durable record. It finds
+    // the only peer taken and queues, which is the correct outcome here.
+    await dispatchReadyAudit('tsk_b', deps as never);
+    expect(attempts.slice(1)).toEqual([
+      { target: undefined, autoProvision: true },
+      { target: only.name, autoProvision: false },
+    ]);
+
+    // That audit is called off, so nothing is auditing on that session.
+    expect(registry.applyTaskIntent({
+      taskId: 'tsk_a', assignmentId: 'asg_auditor_a', intent: 'cancel', toStatus: 'cancelled',
+    })).toMatchObject({ ok: true });
+    expect(registry.listActiveAuditTargets()).toEqual([]);
+
+    await dispatchReadyAudit('tsk_c', deps as never);
+    expect(attempts.slice(3), 'a cancelled audit kept holding its auditor')
+      .toEqual([{ target: only.name, autoProvision: false }]);
+  });
+
+  it('queues onto a busy auditor only after ready and auto-provision are exhausted', async () => {
+    // Ordering, stated as the sequence of attempts rather than as prose: with
+    // no ready peer the pool gets one spawn attempt, and the busy peer is the
+    // durable-FIFO fallback only after that attempt refuses for capacity.
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const busy = { ...session('deck_alpha_aud_a', 'w2', 'claude-code-sdk', 'anthropic'), state: 'running' as const };
+    const attempts: Array<{ target?: string; autoProvision?: boolean }> = [];
+    const dispatch = vi.fn(async (_caller: unknown, input: { target?: string; task?: { autoProvision?: boolean } }) => {
+      attempts.push({ target: input.target, autoProvision: input.task?.autoProvision });
+      if (attempts.length === 1) {
+        return {
+          status: 'error' as const,
+          error: 'no capacity',
+          provisioning: { failureReason: 'max_spawned' as const },
+        };
+      }
+      return { status: 'accepted' as const, assignmentId: 'asg_busy', messageId: 'msg_busy' };
+    });
+    const { registry } = makeReadyTask({ taskId: 'tsk_order', revision: 'rev-order', auditPolicy: 'auto_strict_cross_vendor' });
+
+    await dispatchReadyAudit('tsk_order', {
+      registry,
+      listSessions: () => [brain, worker, busy],
+      listTargets: listTargetRecords(busy),
+      dispatch,
+    } as never);
+
+    expect(attempts).toEqual([
+      { target: undefined, autoProvision: true },
+      { target: busy.name, autoProvision: undefined },
+    ]);
   });
 });

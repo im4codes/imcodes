@@ -60,13 +60,41 @@ describe('supervision prompt custom-instructions merge', () => {
         default: {
           route: 'imcodes_supervision_visible_subsession',
           sequence: ['send_list_targets', 'task_assignment', 'send_message'],
-          eligible: { availability: 'ready', replyCapable: true },
+          eligible: { availability: ['ready', 'busy_queueable'], replyCapable: true, prefer: 'ready' },
+          selectBy: ['availability', 'limitGroup', 'replyCapable', 'executionPool', 'providerFamily', 'auditPolicy'],
           mainWindow: 'coordinate_not_implement',
           forbid: ['provider_native_spawn', 'provider_native_collaboration'],
         },
+        // Continuing a task and starting one are different routing questions;
+        // collapsing them piled separate audits onto a single ready peer.
+        fanout: {
+          sameTask: 'append_exact_existing_session_even_when_busy',
+          newTask: 'distinct_ready_target_per_task_while_any_remain',
+          order: ['ready_distinct', 'allowed_auto_provision', 'busy_durable_fifo'],
+          reserve: 'atomic_on_selection',
+          busyFifo: 'only_after_ready_and_auto_provision_exhausted',
+          allBusyQueueable: {
+            is: 'delegable',
+            route: 'imcodes_send_message_durable_fifo',
+            brain: 'waiting',
+            isNot: ['capability_unavailable', 'delegation_exception'],
+            forbid: ['main_window_execution', 'provider_native_spawn', 'provider_native_collaboration'],
+          },
+          noGlobalAgentCap: true,
+        },
+        // The prohibition only lifts when IM.codes delegation is genuinely
+        // unavailable, and taking the host route is a recorded degradation.
+        // Busy targets and a saturated pool are scheduling facts about WHEN
+        // work runs, not evidence that this project cannot delegate at all.
+        fallback: {
+          when: 'imcodes_delegation_capability_genuinely_unavailable',
+          notWhen: ['pool_concurrency_saturated', 'targets_busy', 'host_subagent_slot_limit'],
+          then: 'host_provider_native_collaboration',
+          record: 'degraded_with_reason',
+        },
         exceptions: [
           'explicit_user_main_window_execution',
-          'no_eligible_ready_reply_capable_subsession',
+          'no_reply_capable_subsession_ready_or_queueable',
           'nondelegable_brain_identity_same_object_coordination_or_recovery',
           'pure_read_only_localization_or_immediate_safe_containment',
         ],
@@ -403,6 +431,88 @@ describe('Brain work-delegation contract placement and budget', () => {
       .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     expect(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE)
       .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+  });
+
+  it('makes IM.codes delegation the route and the host route a recorded degradation', () => {
+    // The rule the contract has to carry, stated as three separately checkable
+    // things: IM.codes is the route, selection is made from the authoritative
+    // target fields, and the host route is reachable only when IM.codes
+    // delegation is genuinely unavailable -- never because the work is merely
+    // queued behind a busy pool.
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract(locale)) as {
+        default: { route: string; sequence: string[]; selectBy: string[]; forbid: string[] };
+        fallback: { when: string; notWhen: string[]; then: string; record: string };
+      };
+      expect(contract.default.route).toBe('imcodes_supervision_visible_subsession');
+      expect(contract.default.sequence).toEqual(['send_list_targets', 'task_assignment', 'send_message']);
+      expect(contract.default.selectBy).toEqual([
+        'availability', 'limitGroup', 'replyCapable', 'executionPool', 'providerFamily', 'auditPolicy',
+      ]);
+      expect(contract.default.forbid).toContain('provider_native_collaboration');
+      expect(contract.fallback.when).toBe('imcodes_delegation_capability_genuinely_unavailable');
+      expect(contract.fallback.record).toBe('degraded_with_reason');
+      // A saturated pool or a host subagent ceiling schedules work later; it
+      // does not make this project undelegable, and must not be read that way.
+      // Fan-out: same task continues where it is, new work spreads across
+      // distinct ready peers, and busy queueing is the last resort -- with no
+      // invented global agent cap anywhere in the ordering.
+      const fanout = (contract as unknown as { fanout: Record<string, unknown> }).fanout;
+      expect(fanout.sameTask).toBe('append_exact_existing_session_even_when_busy');
+      expect(fanout.newTask).toBe('distinct_ready_target_per_task_while_any_remain');
+      expect(fanout.order).toEqual(['ready_distinct', 'allowed_auto_provision', 'busy_durable_fifo']);
+      expect(fanout.reserve).toBe('atomic_on_selection');
+      expect(fanout.noGlobalAgentCap).toBe(true);
+      expect(contract.fallback.notWhen).toEqual([
+        'pool_concurrency_saturated', 'targets_busy', 'host_subagent_slot_limit',
+      ]);
+    }
+  });
+
+  it('treats every peer being busy as a queue, never as nothing to delegate to', () => {
+    // The load-bearing case. `eligible.availability: 'ready'` plus an exception
+    // named for the absence of a READY peer meant a project whose peers were
+    // all busy-but-queueable satisfied the exception and dropped out of
+    // IM.codes entirely -- into main-window or provider-native execution --
+    // even though every one of those peers could have taken the message.
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      const contract = JSON.parse(buildBrainSupervisedWorkDelegationContract(locale)) as {
+        default: { eligible: { availability: string[]; prefer: string } };
+        exceptions: string[];
+        fanout: { allBusyQueueable: Record<string, unknown> };
+      };
+      // Busy-queueable is eligible; ready is only preferred.
+      expect(contract.default.eligible.availability).toEqual(['ready', 'busy_queueable']);
+      expect(contract.default.eligible.prefer).toBe('ready');
+      // No exception may be phrased so that a queueable peer fails to satisfy it.
+      expect(contract.exceptions).not.toContain('no_eligible_ready_reply_capable_subsession');
+      for (const exception of contract.exceptions) {
+        expect(exception, 'an exception still turns on READY alone').not.toMatch(/ready(?!_or_queueable)/u);
+      }
+      const allBusy = contract.fanout.allBusyQueueable;
+      expect(allBusy.is).toBe('delegable');
+      expect(allBusy.route).toBe('imcodes_send_message_durable_fifo');
+      expect(allBusy.brain).toBe('waiting');
+      expect(allBusy.isNot).toEqual(['capability_unavailable', 'delegation_exception']);
+      expect(allBusy.forbid).toEqual([
+        'main_window_execution', 'provider_native_spawn', 'provider_native_collaboration',
+      ]);
+    }
+  });
+
+  it('puts that rule in front of a Brain without restating it in the preamble', () => {
+    // Reaching the model is what matters, and the placement is deliberate: the
+    // preamble carries the contract ID and the full contract is delivered with
+    // the turn. Asserting only the builder would pass even if nothing ever
+    // handed it to a session.
+    const execution = buildSupervisionExecutionPreamble('en');
+    expect(execution).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(execution).not.toContain('imcodes_delegation_capability_genuinely_unavailable');
+    // `contractRef`, not `contractId`: referencing and carrying are kept
+    // mechanically distinguishable, which is what makes the assertion above
+    // ("not restated here") meaningful rather than accidental.
+    const ref = JSON.parse(buildBrainWorkDelegationContractRef()) as { contractRef: string };
+    expect(ref.contractRef).toBe(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
   it('leaves real headroom under the existing preamble budgets', () => {

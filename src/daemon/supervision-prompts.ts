@@ -231,13 +231,55 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
     default: {
       route: 'imcodes_supervision_visible_subsession',
       sequence: ['send_list_targets', 'task_assignment', 'send_message'],
-      eligible: { availability: 'ready', replyCapable: true },
+      // Ready is a PREFERENCE, not the definition of eligible. A busy
+      // reply-capable transport is already an eligible candidate that queues,
+      // and saying otherwise here made "everything is busy" read as "there is
+      // nothing to delegate to".
+      eligible: { availability: ['ready', 'busy_queueable'], replyCapable: true, prefer: 'ready' },
+      selectBy: ['availability', 'limitGroup', 'replyCapable', 'executionPool', 'providerFamily', 'auditPolicy'],
       mainWindow: 'coordinate_not_implement',
       forbid: ['provider_native_spawn', 'provider_native_collaboration'],
     },
+    // The forbid above is absolute until IM.codes delegation is genuinely
+    // unavailable -- not merely inconvenient. Saturated pool concurrency or a
+    // host subagent slot ceiling is a scheduling bound on WHEN work runs, and
+    // reading it as "this project cannot delegate" silently relocates the work
+    // outside the supervised, auditable route. Taking the fallback is a
+    // degradation and has to be recorded as one.
+    // Which SESSION a send goes to, which is a different question from whether
+    // IM.codes is the route at all. Continuing an existing task and starting a
+    // new one pull in opposite directions, and collapsing them is what piled
+    // four separate audits onto one ready peer while others sat idle.
+    fanout: {
+      sameTask: 'append_exact_existing_session_even_when_busy',
+      newTask: 'distinct_ready_target_per_task_while_any_remain',
+      order: ['ready_distinct', 'allowed_auto_provision', 'busy_durable_fifo'],
+      reserve: 'atomic_on_selection',
+      busyFifo: 'only_after_ready_and_auto_provision_exhausted',
+      // The case the exception used to swallow, stated as its own rule so it
+      // cannot be reasoned away: everything busy is a QUEUE, not an absence.
+      allBusyQueueable: {
+        is: 'delegable',
+        route: 'imcodes_send_message_durable_fifo',
+        brain: 'waiting',
+        isNot: ['capability_unavailable', 'delegation_exception'],
+        forbid: ['main_window_execution', 'provider_native_spawn', 'provider_native_collaboration'],
+      },
+      noGlobalAgentCap: true,
+    },
+    fallback: {
+      when: 'imcodes_delegation_capability_genuinely_unavailable',
+      notWhen: ['pool_concurrency_saturated', 'targets_busy', 'host_subagent_slot_limit'],
+      then: 'host_provider_native_collaboration',
+      record: 'degraded_with_reason',
+    },
     exceptions: [
       'explicit_user_main_window_execution',
-      'no_eligible_ready_reply_capable_subsession',
+      // Narrowed deliberately: the old form named only READY, so a project
+      // whose peers were all busy-but-queueable fell through this exception
+      // into main-window or provider-native execution instead of queueing.
+      // There is no exception while anything can still take the message.
+      'no_reply_capable_subsession_ready_or_queueable',
       'nondelegable_brain_identity_same_object_coordination_or_recovery',
       'pure_read_only_localization_or_immediate_safe_containment',
     ],

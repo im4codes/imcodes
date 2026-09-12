@@ -30,6 +30,7 @@ import {
 import { createSendDispatchId, createSendMessageId } from '../../shared/send-message-id.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
 const mockStartP2pRun = vi.fn();
 const mockCancelP2pRun = vi.fn();
@@ -43,11 +44,36 @@ const mockSupervisionDecide = vi.fn(async () => ({ decision: 'complete', reason:
 let mockTransportRuntimeWorking = false;
 /** Simulates a process-agent session that has no transport runtime at all. */
 let mockBrainRuntimeMissing = false;
+/**
+ * Models the production send contract, not just its signature.
+ *
+ * The real runtime dispatches directly when idle and records provider
+ * acceptance durably once the provider takes the turn. A bare `vi.fn()` models
+ * neither, so a test using it cannot tell an accepted notification from one
+ * that died with the runtime -- which is exactly the distinction the delivery
+ * boundary now turns on.
+ */
+const acceptDirectSend = (clientMessageId?: unknown): 'sent' => {
+  const id = typeof clientMessageId === 'string' ? clientMessageId.trim() : '';
+  if (id) {
+    try {
+      getTransportQueueStore().recordDirectDelivery('deck_supervision_brain', id);
+    } catch {
+      // A store the test never seeded simply records nothing, which is the
+      // same conservative answer production gives for an unknown session.
+    }
+  }
+  return 'sent';
+};
+
 const mockTransportRuntime = {
-  send: vi.fn(),
+  send: vi.fn((_message?: unknown, clientMessageId?: unknown) => acceptDirectSend(clientMessageId)),
   pendingCount: 0,
   pendingMessages: [],
-  pendingEntries: [],
+  // Real, mutable, and typed: what the runtime is holding in memory is the
+  // only thing that separates "the durable enqueue failed but this process can
+  // still deliver it" from "the enqueue was refused and nothing holds it".
+  pendingEntries: [] as Array<{ clientMessageId: string }>,
   getDiagnosticSnapshot: vi.fn(() => ({
     status: mockTransportRuntimeWorking ? 'running' : 'idle',
     sending: mockTransportRuntimeWorking,
@@ -7211,5 +7237,465 @@ describe('SupervisionAutomation', () => {
 
     // Unknown failures keep the existing terminal behaviour.
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  }, 30_000);
+});
+
+describe('auto-audit mode control delivery', () => {
+  // Mode control is production behaviour: the legacy automatic-peer-audit
+  // compatibility switch disables it wholesale, so it must be off here.
+  beforeEach(() => {
+    supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
+    mockTransportRuntime.pendingEntries.splice(0);
+  });
+
+  afterEach(() => {
+    supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(true);
+    mockTransportRuntime.pendingEntries.splice(0);
+  });
+
+  const modeControlPrompts = () => mockTransportRuntime.send.mock.calls
+    .map((call) => String(call[0]))
+    .filter((prompt) => prompt.includes(`[Contract: ${SUPERVISION_CONTRACT_IDS.AUTO_AUDIT_MODE_CONTROL}]`));
+
+  const offSnapshot = () => normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF });
+
+  /**
+   * What setting the mode actually does: the session's stored config becomes
+   * the new authority, and automation is told. Calling only `applySnapshotUpdate`
+   * leaves the record disagreeing with the update, so any reconnect would
+   * re-derive the OLD mode and the test would be describing a state the
+   * product never reaches.
+   */
+  function setSupervision(snapshot: ReturnType<typeof normalizeSessionSupervisionSnapshot>): void {
+    const brain = getSession('deck_supervision_brain');
+    if (!brain) throw new Error('brain session missing');
+    upsertSession({ ...brain, transportConfig: { supervision: snapshot }, updatedAt: Date.now() });
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', snapshot);
+  }
+
+  /** Spend this Brain identity's one reconnect sweep. */
+  async function spendReconnectSweep(): Promise<void> {
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 40); });
+    mockTransportRuntime.send.mockClear();
+  }
+
+  /**
+   * Seed, let the startup delivery settle, then revoke. That leaves the
+   * authority in the state the report describes: supervision has been on, is
+   * now off, and the next thing the user does is turn it back on.
+   */
+  async function settleThenDisable(snapshot: ReturnType<typeof normalizeSessionSupervisionSnapshot>) {
+    supervisionAutomation.init();
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    setSupervision(offSnapshot());
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(2), { timeout: 2_000 });
+    mockTransportRuntime.send.mockClear();
+  }
+
+  it('delivers RE-ENABLING immediately, and says nothing when it is set again', async () => {
+    // The reported defect: turning supervision back on produced no control
+    // message while turning it off did. Enabling is the change Brain most
+    // needs to hear -- it is the one that starts costing audits.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    expect(modeControlPrompts()[0]).toContain(`supervisionMode=${SUPERVISION_MODE.SUPERVISED_AUDIT}`);
+    expect(modeControlPrompts()[0]).toContain('autoAudit=enabled');
+
+    // Idempotent: the same authoritative mode, set again, is not news.
+    setSupervision(snapshot);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts()).toHaveLength(1);
+  }, 30_000);
+
+  it('redelivers the CURRENT state after a change that could not be sent', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+
+    // Spend this Brain identity's one reconnect sweep FIRST. That sweep was the
+    // only retry the delivery had, and it fires at most once per identity, so
+    // everything after it had exactly one chance to be sent.
+    await spendReconnectSweep();
+
+    // Brain is offline exactly when the user re-enables supervision. Recording
+    // only successful deliveries left this change no trace at all, so no later
+    // reconnect could discover it had been missed.
+    mockBrainRuntimeMissing = true;
+    setSupervision(snapshot);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts()).toHaveLength(0);
+
+    mockBrainRuntimeMissing = false;
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    expect(modeControlPrompts()[0]).toContain('autoAudit=enabled');
+  }, 30_000);
+
+  it('redelivers after the send itself throws, without rolling the change back', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+    // Same exhaustion first: after this, a failed send has no second chance.
+    await spendReconnectSweep();
+    mockTransportRuntime.send.mockImplementationOnce(() => { throw new Error('transport refused'); });
+
+    setSupervision(snapshot);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    // The transport recorded the attempt and then threw, so Brain never got it.
+    expect(modeControlPrompts()).toHaveLength(1);
+
+    // Rolling the change back on failure discarded it; it must instead stay
+    // pending, so the next reconnect delivers the current state again.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(2), { timeout: 2_000 });
+    expect(modeControlPrompts()[1]).toContain('autoAudit=enabled');
+  }, 30_000);
+
+  it('delivers only the CURRENT mode when several changes could not be sent', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+    await spendReconnectSweep();
+
+    // ON then OFF then ON again, none deliverable. What Brain must eventually
+    // be told is the state that is actually in force -- not a replay.
+    mockBrainRuntimeMissing = true;
+    setSupervision(snapshot);
+    setSupervision(offSnapshot());
+    setSupervision(snapshot);
+    mockBrainRuntimeMissing = false;
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts().length).toBeGreaterThan(0), { timeout: 2_000 });
+    for (const prompt of modeControlPrompts()) {
+      expect(prompt, 'a superseded mode was delivered as the current one')
+        .toContain('autoAudit=enabled');
+    }
+  }, 30_000);
+
+  it('sends once when the send itself synchronously emits the running edge', async () => {
+    // The production ordering, not a stubbed one. `runtime.send` starts the
+    // turn, which sets status synchronously, which makes the session manager
+    // emit `session.state=running` synchronously, which the timeline delivers
+    // to handlers synchronously -- re-entering the mode-control flush while the
+    // row it is about to mark delivered is still pending. The pending row makes
+    // the same-mode early return false, so one real ON/OFF transition enqueued
+    // a SECOND control message. Timeline text dedupe hides the duplicate card;
+    // it does not deduplicate the provider queue.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+
+    let reentered = 0;
+    mockTransportRuntime.send.mockImplementationOnce((...args: unknown[]) => {
+      reentered += 1;
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      return 'sent';
+    });
+
+    setSupervision(snapshot);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+
+    expect(reentered, 'the synchronous running edge was never exercised').toBe(1);
+    expect(modeControlPrompts(), 'one transition reached the provider queue twice')
+      .toHaveLength(1);
+    // And the deterministic id means even a retry is the SAME message, so the
+    // transport's own durable record can recognise it.
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[1]))
+      .toMatch(/^supervision-mode-control:deck_supervision_brain:[^:]+:\d+$/u);
+  }, 30_000);
+
+  it('confirms a pending delivery from the queue record instead of resending it', async () => {
+    // The crash case. `runtime.send()` returning `sent` is runtime admission,
+    // not provider acceptance, so the row stays pending. If the daemon dies
+    // after the provider DID accept, the reconnect must recognise that from
+    // the transport's own delivery record and not send a second control.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    const handedOver = String(mockTransportRuntime.send.mock.calls.at(-1)?.[1]);
+
+    // The provider accepted it: the queue records THIS exact message delivered.
+    const queue = getTransportQueueStore();
+    queue.enqueue({ sessionName: 'deck_supervision_brain', text: 'x', clientMessageId: handedOver });
+    queue.finalizeSent('deck_supervision_brain', handedOver);
+    expect(queue.hasDeliveryTombstone('deck_supervision_brain', handedOver)).toBe(true);
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts(), 'a confirmed delivery was sent again').toHaveLength(1);
+  }, 30_000);
+
+  it('resends when the epoch it was handed over under is gone', async () => {
+    // The other half of the same crash: the provider never accepted, and the
+    // queue epoch has since rotated, so the delivery record can NEVER appear.
+    // That is positive evidence of loss -- the one thing that justifies
+    // another message, as opposed to merely lacking a confirmation.
+    const snapshot = await seedSession('supervised_audit');
+    const queue = getTransportQueueStore();
+    // Establish an epoch so the hand-over is recorded against a real one.
+    queue.enqueue({ sessionName: 'deck_supervision_brain', text: 'seed', clientMessageId: 'seed-1' });
+    await settleThenDisable(snapshot);
+
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    const before = queue.currentQueueEpoch('deck_supervision_brain');
+    expect(before, 'the hand-over epoch was never established').toBeTruthy();
+
+    // A restart that discards the queue mints a new epoch.
+    queue.discardSessionQueueState('deck_supervision_brain');
+    queue.enqueue({ sessionName: 'deck_supervision_brain', text: 'after', clientMessageId: 'seed-2' });
+    expect(queue.currentQueueEpoch('deck_supervision_brain')).not.toBe(before);
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(2), { timeout: 2_000 });
+    expect(modeControlPrompts()[1]).toContain('autoAudit=enabled');
+  }, 30_000);
+
+  /** Model a daemon restart: the runtime that held a direct dispatch is gone. */
+  function rebuildBrainRuntime(tag: string): void {
+    const brain = getSession('deck_supervision_brain');
+    if (!brain) throw new Error('brain session missing');
+    upsertSession({ ...brain, runtimeEpoch: `rebuilt-${tag}`, updatedAt: Date.now() });
+  }
+
+  it.each([
+    ['a queue that has never seen this session', false],
+    ['a pre-existing queue epoch that the restart leaves unchanged', true],
+  ])('redelivers exactly once after a crash before acceptance, with %s', async (_label, seedEpoch) => {
+    // The crash the whole boundary exists for. A direct dispatch lives only in
+    // the runtime's memory until the provider accepts it, so if that runtime is
+    // rebuilt first the message is gone -- and an ordinary restart does NOT
+    // rotate the durable queue epoch, so the epoch alone cannot see the loss.
+    const snapshot = await seedSession('supervised_audit');
+    const queue = getTransportQueueStore();
+    if (seedEpoch) {
+      queue.enqueue({ sessionName: 'deck_supervision_brain', text: 'seed', clientMessageId: 'seed-1' });
+    }
+    await settleThenDisable(snapshot);
+    const epochBefore = queue.currentQueueEpoch('deck_supervision_brain');
+
+    // Hand over WITHOUT the provider ever accepting it.
+    mockTransportRuntime.send.mockImplementationOnce(() => 'sent');
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+
+    rebuildBrainRuntime('after-crash');
+    // The restart preserves the queue epoch; only the runtime changed.
+    if (seedEpoch) expect(queue.currentQueueEpoch('deck_supervision_brain')).toBe(epochBefore);
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(2), { timeout: 2_000 });
+    expect(modeControlPrompts()[1]).toContain('autoAudit=enabled');
+
+    // EXACTLY once: the redelivery was accepted, so further churn is silent.
+    for (const tag of ['again-1', 'again-2']) {
+      rebuildBrainRuntime(tag);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    }
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts(), 'an accepted control was redelivered again').toHaveLength(2);
+  }, 30_000);
+
+  it('keeps an accepted control deduplicated across repeated restarts', async () => {
+    // The counterpart contract: once the provider has taken it, no amount of
+    // runtime churn may send it again. Without a durable acceptance record an
+    // accepted message and a lost one look identical after a restart.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    const accepted = String(mockTransportRuntime.send.mock.calls.at(-1)?.[1]);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_supervision_brain', accepted))
+      .toBe(true);
+
+    for (const tag of ['r1', 'r2', 'r3']) {
+      rebuildBrainRuntime(tag);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    }
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts()).toHaveLength(1);
+  }, 30_000);
+
+  it('accepts a slow acceptance that lands after the reconnect, without sending a third', async () => {
+    // A late acceptance for the FIRST hand-over arriving after the redelivery
+    // must not resurrect it as a new delivery, and must not stop the mode from
+    // settling: the record is keyed by the exact message id, so a stale one
+    // confirms a message nobody is waiting on any more.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+
+    mockTransportRuntime.send.mockImplementationOnce(() => 'sent');
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    const stale = String(mockTransportRuntime.send.mock.calls.at(-1)?.[1]);
+
+    rebuildBrainRuntime('slow-callback');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(2), { timeout: 2_000 });
+
+    // The old runtime's acceptance finally lands, for the superseded id.
+    getTransportQueueStore().recordDirectDelivery('deck_supervision_brain', stale);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts(), 'a stale acceptance produced another send').toHaveLength(2);
+  }, 30_000);
+
+  /**
+   * A busy runtime takes the pending path and answers `queued`. It says the
+   * same word for a durable enqueue, for one that THREW, and for one refused
+   * because that id was already cancelled -- so the word alone cannot mean
+   * "this survives a crash".
+   */
+  function queuedWithoutDurableRow(runtimeKeepsItInMemory: boolean): void {
+    mockTransportRuntime.send.mockImplementationOnce((_message?: unknown, clientMessageId?: unknown) => {
+      if (runtimeKeepsItInMemory && typeof clientMessageId === 'string') {
+        // The SQLite enqueue threw; the runtime preserved its own copy.
+        mockTransportRuntime.pendingEntries.push({ clientMessageId });
+      }
+      return 'queued';
+    });
+  }
+
+  it('redelivers a queued admission the durable queue never accepted', async () => {
+    // The enqueue failed, so the notification exists only in this process. It
+    // must NOT be recorded as delivered: while the runtime lives it may still
+    // carry it, but once that runtime is gone the message went with it and the
+    // same-mode guard would otherwise suppress the resend forever.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+    // Let the revocation be CONFIRMED first. Otherwise the row still carries
+    // the previously delivered ON, and re-enabling would look already
+    // delivered before the hand-over under test is even made.
+    await spendReconnectSweep();
+
+    queuedWithoutDurableRow(true);
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    const handedOver = String(mockTransportRuntime.send.mock.calls.at(-1)?.[1]);
+    expect(
+      getTransportQueueStore().hasDurableQueueAdmission('deck_supervision_brain', handedOver),
+      'the test did not actually model a failed durable enqueue',
+    ).toBe(false);
+
+    // Still held in memory by a live runtime: nothing is lost yet, so resending
+    // here would be rebroadcasting on the absence of a confirmation.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts(), 'a live in-memory hand-over was resent').toHaveLength(1);
+
+    // The runtime is rebuilt; its memory-only copy died with it.
+    mockTransportRuntime.pendingEntries.splice(0);
+    rebuildBrainRuntime('after-failed-enqueue');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(2), { timeout: 2_000 });
+    expect(modeControlPrompts()[1]).toContain('autoAudit=enabled');
+
+    // EXACTLY once: that redelivery was accepted, so further churn is silent.
+    for (const tag of ['again-1', 'again-2']) {
+      rebuildBrainRuntime(tag);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    }
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts()).toHaveLength(2);
+  }, 30_000);
+
+  it('redelivers a queued admission that was refused as already cancelled', async () => {
+    // The other `queued` that carries nothing: the durable enqueue was refused
+    // because that id had been cancelled, which ALSO removes the runtime's own
+    // copy. Nothing holds it, so there is no hand-over to wait on and no
+    // restart is needed to know that -- the very next flush must resend.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+    // Let the revocation be CONFIRMED first. Otherwise the row still carries
+    // the previously delivered ON, and re-enabling would look already
+    // delivered before the hand-over under test is even made.
+    await spendReconnectSweep();
+
+    queuedWithoutDurableRow(false);
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    expect(mockTransportRuntime.pendingEntries, 'the test did not model a cancelled admission')
+      .toHaveLength(0);
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(2), { timeout: 2_000 });
+    expect(modeControlPrompts()[1]).toContain('autoAudit=enabled');
+
+    // And exactly once: the resend was accepted and is not repeated.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts()).toHaveLength(2);
+  }, 30_000);
+
+  it('treats a real durable queue row as the hand-over it claims to be', async () => {
+    // The preserved contract. A genuine durable enqueue outlives this process,
+    // so it IS an authoritative hand-over and no amount of runtime churn may
+    // send the same control again.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+    // Let the revocation be CONFIRMED first. Otherwise the row still carries
+    // the previously delivered ON, and re-enabling would look already
+    // delivered before the hand-over under test is even made.
+    await spendReconnectSweep();
+
+    mockTransportRuntime.send.mockImplementationOnce((_message?: unknown, clientMessageId?: unknown) => {
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_supervision_brain',
+        text: 'mode control',
+        clientMessageId: String(clientMessageId),
+      });
+      return 'queued';
+    });
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    const queued = String(mockTransportRuntime.send.mock.calls.at(-1)?.[1]);
+    expect(getTransportQueueStore().hasDurableQueueAdmission('deck_supervision_brain', queued))
+      .toBe(true);
+
+    for (const tag of ['q1', 'q2', 'q3']) {
+      rebuildBrainRuntime(tag);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    }
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+    expect(modeControlPrompts(), 'a durably queued control was sent again').toHaveLength(1);
+  }, 30_000);
+
+  it('never touches audit lifecycle when it delivers a mode change', async () => {
+    // Mode control is a NOTIFICATION. If it could start, cancel or replay an
+    // audit, every reconnect that flushed a pending change would move real
+    // supervision state as a side effect of telling Brain about it.
+    const snapshot = await seedSession('supervised_audit');
+    await settleThenDisable(snapshot);
+    mockStartP2pRun.mockClear();
+    mockCancelP2pRun.mockClear();
+
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    // Flush again over several reconnects; still no lifecycle movement.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
+
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
+    expect(mockCancelP2pRun).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(modeControlPrompts()[0])
+      .toContain('must not create, cancel, replay, or duplicate any audit lifecycle');
   }, 30_000);
 });

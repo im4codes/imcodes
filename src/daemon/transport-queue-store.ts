@@ -961,12 +961,100 @@ export class TransportQueueStore {
    * re-queued message after a reset. The epoch defaults to the session's current
    * one, which is what every caller means.
    */
+  /**
+   * The queue epoch this session is CURRENTLY on, without minting one.
+   *
+   * `ensureQueueMeta` creates an epoch as a side effect, which a caller asking
+   * "which epoch are we on?" must not do. A delivery record is only meaningful
+   * within its own epoch, so a caller comparing epochs needs this exact read.
+   */
+  currentQueueEpoch(sessionNameInput: string): string | undefined {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const row = this.db.prepare(
+      'SELECT queue_epoch AS queueEpoch FROM queue_meta WHERE session_name = ?',
+    ).get(sessionName) as { queueEpoch?: string } | undefined;
+    return row?.queueEpoch?.trim() || undefined;
+  }
+
+  /**
+   * Record that a DIRECT dispatch reached the provider.
+   *
+   * `finalizeSent` writes a delivery record only for a message this queue
+   * actually held, because its row count is the authorization answer. A direct
+   * send has no such row by definition, so acceptance of the most common
+   * delivery path left no durable trace at all — and anything asking "did this
+   * message get there?" could only ever answer "not yet".
+   *
+   * This writes the same record for the same reason, keyed by the same epoch,
+   * so one question has one answer regardless of which path carried it. It
+   * mints no queue state and is idempotent: a replayed or late acceptance for
+   * an id already recorded changes nothing.
+   */
+  recordDirectDelivery(
+    sessionNameInput: string,
+    clientMessageIdInput: string,
+    deliveryFrameId: string = randomUUID(),
+    now = Date.now(),
+    recipient?: QueueRecipientIdentity | null,
+  ): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const clientMessageId = clientMessageIdInput.trim();
+    if (!clientMessageId) return false;
+    // Establishing the epoch here is correct because this is a WRITE: it is the
+    // moment this session first has something durable to say about delivery.
+    // Refusing to mint would make acceptance unrecordable for a Brain that has
+    // never queued a message -- which is the common case for an idle session,
+    // and exactly the one where a direct send needs an acceptance record most.
+    //
+    // The recipient is carried through deliberately: minting the row without
+    // one leaves an identity-less queue that a later recipient-bound operation
+    // reads as a mismatch, turning a delivery record into a queue corruption.
+    const { queueEpoch } = this.ensureMeta(sessionName, now, recipient);
+    this.db.prepare(`
+      INSERT OR IGNORE INTO queue_delivery_tombstones (
+        session_name, queue_epoch, client_message_id, delivery_frame_id, created_at,
+        recipient_session_instance_id, recipient_runtime_epoch
+      ) VALUES (?, ?, ?, ?, ?, (
+        SELECT recipient_session_instance_id FROM queue_meta WHERE session_name = ?
+      ), (
+        SELECT recipient_runtime_epoch FROM queue_meta WHERE session_name = ?
+      ))
+    `).run(sessionName, queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName);
+    return true;
+  }
+
+  /**
+   * Does the durable queue itself still hold this exact message?
+   *
+   * `TransportSessionRuntime.send()` answers `queued` for anything it put on
+   * the pending path, but that disposition is coarser than it looks: it is also
+   * what comes back when the SQLite enqueue THREW (leaving the message in
+   * process memory only) and when the enqueue was refused because the message
+   * was already cancelled (leaving it nowhere at all). A caller that needs
+   * "this will still be delivered after a crash" cannot get that from the
+   * return value, so it asks the durable record directly.
+   *
+   * Only `queued` and `handoff_inflight` qualify. An in-flight handoff is still
+   * owned by the queue -- restart restores it to `queued` rather than losing it
+   * -- while every other status is terminal for delivery purposes.
+   */
+  hasDurableQueueAdmission(sessionNameInput: string, clientMessageIdInput: string): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const clientMessageId = clientMessageIdInput.trim();
+    if (!clientMessageId) return false;
+    const row = this.db.prepare(`
+      SELECT 1 FROM queue_entries
+      WHERE session_name = ? AND client_message_id = ?
+        AND status IN ('queued', 'handoff_inflight')
+      LIMIT 1
+    `).get(sessionName, clientMessageId);
+    return !!row;
+  }
+
   hasDeliveryTombstone(sessionNameInput: string, clientMessageIdInput: string, queueEpochInput?: string): boolean {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
-    const queueEpoch = queueEpochInput?.trim() || (this.db.prepare(
-      'SELECT queue_epoch AS queueEpoch FROM queue_meta WHERE session_name = ?',
-    ).get(sessionName) as { queueEpoch?: string } | undefined)?.queueEpoch;
+    const queueEpoch = queueEpochInput?.trim() || this.currentQueueEpoch(sessionName);
     if (!queueEpoch) return false;
     const row = this.db.prepare(`
       SELECT 1 FROM queue_delivery_tombstones

@@ -9,6 +9,7 @@ import {
   validateAutomaticAuditTransportRoute,
 } from '../../src/daemon/peer-audit-candidates.js';
 import { DELEGATION_AVAILABILITY } from '../../shared/delegation-availability.js';
+import { SUPERVISION_DELEGATION_ELIGIBILITY_POLICY } from '../../shared/supervision-config.js';
 
 function session(name: string, patch: Partial<SessionRecord> = {}): SessionRecord {
   const isMain = name.endsWith('_brain');
@@ -237,6 +238,47 @@ describe('peer-audit candidate authority', () => {
       targetName: process.name,
       allSessions: all,
     })).toMatchObject({ ok: false, refusal: 'target_ineligible' });
+  });
+
+  it('refuses every runtime type the declared automatic-audit policy forbids', () => {
+    // The contract states `forbidRuntimeTypes` and the router implements its
+    // own filter; nothing tied the two together, so the published policy could
+    // drift away from what automatic audit actually accepts. An agent reading
+    // the contract would then be told a rule the daemon does not enforce.
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    for (const runtimeType of SUPERVISION_DELEGATION_ELIGIBILITY_POLICY.automaticAudit.forbidRuntimeTypes) {
+      const forbidden = session('deck_sub_forbidden', {
+        parentSession: main.name,
+        runtimeType,
+        agentType: 'claude-code',
+      });
+      expect(validateAutomaticAuditTransportRoute({
+        auditedSessionName: audited.name,
+        targetName: forbidden.name,
+        allSessions: [main, audited, forbidden],
+      }), `automatic audit accepted a ${runtimeType} runtime`).toMatchObject({ ok: false });
+    }
+  });
+
+  it('refuses a Brain or an execution clone as an automatic audit target', () => {
+    // Both are session TYPES that must never be routed automatic audit work: a
+    // Brain is the coordinator being audited through, and a clone has no
+    // independent identity to audit with.
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    const clone = session('deck_sub_clone', {
+      parentSession: main.name,
+      executionCloneMetadata: { kind: EXECUTION_CLONE_KIND, parentRunId: 'run-1', parentStage: 'generic_execution' },
+    } as Partial<SessionRecord>);
+    const all = [main, audited, clone];
+    for (const targetName of [main.name, clone.name]) {
+      expect(validateAutomaticAuditTransportRoute({
+        auditedSessionName: audited.name,
+        targetName,
+        allSessions: all,
+      })).toMatchObject({ ok: false });
+    }
   });
 
   it('keeps automatic transport authority exact, live, direct-child, and non-self', () => {

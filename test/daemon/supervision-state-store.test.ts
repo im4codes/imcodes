@@ -150,7 +150,8 @@ describe('SupervisionStateStore', () => {
       beforeRestart.close();
 
       const afterRestart = new SupervisionStateStore({ dbPath });
-      expect(afterRestart.getModeControlDelivery(authority)).toEqual(authority);
+      // A writer that does not track ordering lands at sequence 0.
+      expect(afterRestart.getModeControlDelivery(authority)).toEqual({ ...authority, sequence: 0 });
       afterRestart.upsertModeControlDelivery({
         ...authority,
         mode: SUPERVISION_MODE.OFF,
@@ -162,12 +163,51 @@ describe('SupervisionStateStore', () => {
       expect(afterRevoke.getModeControlDelivery(authority)).toEqual({
         ...authority,
         mode: SUPERVISION_MODE.OFF,
+        sequence: 0,
         updatedAt: 2_000,
       });
       afterRevoke.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('refuses a mode-control write that is older than the one already stored', () => {
+    // Delivery is not instantaneous, so two writes for the same authority can
+    // arrive out of order: a slow revocation finishing after the enable that
+    // superseded it would otherwise report itself as the current state and
+    // leave Brain believing supervision is off while it is on.
+    const store = new SupervisionStateStore({ database: new DatabaseSync(':memory:') });
+    const authority = {
+      sourceSessionName: 'deck_sub_impl',
+      sourceSessionInstanceId: 'source-stable-instance',
+      brainSessionName: 'deck_supervision_brain',
+      brainSessionInstanceId: 'brain-stable-instance',
+      enabledEver: true,
+    };
+    store.upsertModeControlDelivery({
+      ...authority, mode: SUPERVISION_MODE.SUPERVISED_AUDIT, sequence: 7, updatedAt: 2_000,
+    });
+    store.upsertModeControlDelivery({
+      ...authority, mode: SUPERVISION_MODE.OFF, sequence: 6, updatedAt: 3_000,
+    });
+    expect(store.getModeControlDelivery(authority)).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      sequence: 7,
+    });
+    // The same sequence is a legitimate follow-up write for the SAME change --
+    // that is how a delivery marks itself delivered.
+    store.upsertModeControlDelivery({
+      ...authority,
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      deliveredMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      sequence: 7,
+      updatedAt: 4_000,
+    });
+    expect(store.getModeControlDelivery(authority)).toMatchObject({
+      deliveredMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    });
+    store.close();
   });
 
   it('round-trips exact main/auditor identities and original deadlines', () => {

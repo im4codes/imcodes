@@ -22,6 +22,8 @@ import {
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
+import type { PersistedSupervisionModeControlDelivery } from './supervision-state-store.js';
 import { readTailLines, timelineStore } from './timeline-store.js';
 import type { TimelineEvent } from './timeline-event.js';
 import {
@@ -972,7 +974,6 @@ class SupervisionAutomation {
   private implementationBlockerEscalationsInFlight = new Set<string>();
   private implementationWatchdogTimer?: NodeJS.Timeout;
   /** Stable Brain identities whose initial/restore mode sweep already ran. */
-  private autoAuditModeSweptBrainAuthorities = new Set<string>();
 
   private implementationWatchdogRunning = false;
 
@@ -993,7 +994,6 @@ class SupervisionAutomation {
   __setAutomaticPeerAuditCompatibilityForTests(enabled: boolean): void {
     if (process.env.NODE_ENV !== 'test') return;
     this.automaticPeerAuditCompatibilityForTests = enabled;
-    this.autoAuditModeSweptBrainAuthorities.clear();
     this.stateStore.clearModeControlDeliveries();
   }
 
@@ -1122,7 +1122,7 @@ class SupervisionAutomation {
     this.implementationWatchdogTimer.unref?.();
     // A runtime may already be live when lifecycle wiring finishes. The normal
     // session.state running/idle path below covers later restores/reconnects.
-    queueMicrotask(() => this.syncAllProjectBrainModeStates());
+    queueMicrotask(() => this.flushAllProjectBrainModeStates());
   }
 
   private resolveProjectBrain(source: SessionRecord): SessionRecord | undefined {
@@ -1156,30 +1156,75 @@ class SupervisionAutomation {
       brainSessionName: brain.name,
       brainSessionInstanceId,
     };
+    const authorityKey = [
+      authority.sourceSessionName, authority.sourceSessionInstanceId,
+      authority.brainSessionName, authority.brainSessionInstanceId,
+    ].join('\u0000');
+    if (this.modeControlInFlight.has(authorityKey)) return;
     const previous = this.stateStore.getModeControlDelivery(authority);
-    if (previous?.mode === mode) return;
+    // Nothing to do only when the authoritative mode is ALREADY DELIVERED.
+    // Comparing against the recorded mode alone treated "we wrote it down" as
+    // "the Brain has it", so a change that could not be sent was never retried.
+    if (previous?.mode === mode) {
+      if (previous.deliveredMode === mode) return;
+      // Same mode, not yet confirmed. Ask the transport what became of the
+      // exact message we handed it, rather than inferring from our own record.
+      const handover = this.modeControlHandoverState(brain, previous);
+      if (handover === 'delivered') {
+        this.stateStore.upsertModeControlDelivery({
+          ...previous, deliveredMode: mode, updatedAt: Date.now(),
+        });
+        return;
+      }
+      // Still owned by the transport. Resending on the mere ABSENCE of a
+      // confirmation is what turned every reconnect into a rebroadcast; only
+      // positive evidence of loss justifies another message.
+      if (handover === 'in_flight') return;
+    }
     // OFF is a revocation, not an initialization signal. Emitting it before
     // this authority has ever enabled supervision creates a fresh control
     // message on every new Brain/runtime instance without changing state.
     if (mode === SUPERVISION_MODE.OFF && previous?.enabledEver !== true) return;
 
+    const changed = previous?.mode !== mode;
+    // A real change takes the next sequence; a retry of an undelivered change
+    // keeps its own, so the retry cannot outrank a newer mode set meanwhile.
+    const sequence = changed ? (previous?.sequence ?? 0) + 1 : previous?.sequence ?? 1;
     const prompt = buildAutoAuditModeControlPrompt({
       projectName: source.projectName,
       sourceSessionName,
       mode,
     });
-    const clientMessageId = `supervision-mode-control:${sourceSessionName}:${randomUUID()}`;
+    // Deterministic, not random. The transport's own durable record is keyed by
+    // this id, so a retry of the SAME logical change must reuse it -- otherwise
+    // every retry is a new message to the provider and the durable queue can
+    // never tell us whether Brain already received this one.
+    const clientMessageId = [
+      'supervision-mode-control', sourceSessionName, brainSessionInstanceId, String(sequence),
+    ].join(':');
+    // Recorded BEFORE the hand-over: an epoch read afterwards could already be
+    // the new one, which would make a genuinely lost message look in-flight.
+    const handoverQueueEpoch = (() => {
+      try { return getTransportQueueStore().currentQueueEpoch(brain.name); } catch { return undefined; }
+    })();
+    const handoverRuntimeEpoch = brain.runtimeEpoch?.trim();
     const nextAuthority = {
       ...authority,
       mode,
+      ...(previous?.deliveredMode ? { deliveredMode: previous.deliveredMode } : {}),
+      deliveryMessageId: clientMessageId,
+      ...(handoverQueueEpoch ? { deliveryQueueEpoch: handoverQueueEpoch } : {}),
+      ...(handoverRuntimeEpoch ? { deliveryRuntimeEpoch: handoverRuntimeEpoch } : {}),
+      sequence,
       enabledEver: previous?.enabledEver === true || mode === SUPERVISION_MODE.SUPERVISED_AUDIT,
       updatedAt: Date.now(),
     };
+    this.modeControlInFlight.add(authorityKey);
     try {
-      // Reserve the stable delivery authority before exposing the message. A
-      // re-entrant lifecycle edge or store reopen therefore observes the new
-      // mode and cannot broadcast it twice. Synchronous send failure restores
-      // the prior authority so the next legitimate sweep/change can retry.
+      // Record the AUTHORITATIVE mode before attempting delivery, and record it
+      // as still undelivered. A failed send therefore leaves a pending change
+      // to retry from rather than being rolled back into oblivion, which is
+      // what lost an enable whenever the Brain runtime was not reachable.
       this.stateStore.upsertModeControlDelivery(nextAuthority);
       timelineEmitter.emit(
         brain.name,
@@ -1196,20 +1241,173 @@ class SupervisionAutomation {
         },
         { source: 'daemon', confidence: 'high', eventId: clientMessageId },
       );
-      runtime.send(prompt, clientMessageId, undefined, undefined, {
+      const admission = runtime.send(prompt, clientMessageId, undefined, undefined, {
         timelineCommitted: true,
         deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       });
+      // NEITHER disposition is evidence of delivery on its own.
+      //
+      // `sent` means the RUNTIME admitted the turn, not that the provider
+      // accepted it: the dispatch does its context work and only later awaits
+      // the provider. Claiming delivery here let a crash in that window leave
+      // SQLite asserting a delivery Brain never received, and the reconnect
+      // then suppressed the resend because mode already equalled deliveredMode.
+      //
+      // `queued` looks stronger but is just as coarse. The runtime returns it
+      // for everything it put on the pending path -- including when the SQLite
+      // enqueue THREW, leaving the message in process memory alone, and when
+      // the enqueue was refused because that id was already cancelled, leaving
+      // it nowhere at all. Treating the word as durability marked both of those
+      // delivered, and the same-mode guard then suppressed the reconnect resend
+      // for a notification nothing would ever carry.
+      //
+      // So ask the durable record what it actually holds, rather than trusting
+      // a disposition to mean more than it says.
+      //
+      // Either way this write is claimed only for the change we actually sent:
+      // a newer mode has already moved the sequence past ours, so the store
+      // drops it and a slow OFF can never report delivered over a newer ON.
+      if (admission === 'queued') {
+        const custody = this.modeControlQueuedCustody(brain, runtime, clientMessageId, handoverQueueEpoch);
+        if (custody === 'durable') {
+          this.stateStore.upsertModeControlDelivery({
+            ...nextAuthority,
+            deliveredMode: mode,
+            updatedAt: Date.now(),
+          });
+        } else if (custody === 'dropped') {
+          // Nothing holds it: not the queue, not the runtime. There is no
+          // hand-over to wait on, so clearing it marks the change LOST and the
+          // next flush resends -- exactly as a thrown send does below.
+          this.stateStore.upsertModeControlDelivery({
+            ...authority,
+            mode,
+            ...(previous?.deliveredMode ? { deliveredMode: previous.deliveredMode } : {}),
+            sequence,
+            enabledEver: nextAuthority.enabledEver,
+            updatedAt: Date.now(),
+          });
+        }
+        // `runtime_local` keeps the recorded hand-over: this runtime really is
+        // holding the message and may still deliver it, so it stays in-flight
+        // while the runtime lives and becomes lost the moment it is rebuilt.
+      }
     } catch (error) {
-      if (previous) this.stateStore.upsertModeControlDelivery(previous);
-      else this.stateStore.deleteModeControlDelivery(authority);
+      // A throw means the transport never took the message, so there is no
+      // hand-over to wait on. Clearing the hand-over marks it unambiguously
+      // LOST rather than in-flight, which is what lets the next reconnect
+      // resend instead of waiting forever for a confirmation that cannot come.
+      this.stateStore.upsertModeControlDelivery({
+        ...authority,
+        mode,
+        ...(previous?.deliveredMode ? { deliveredMode: previous.deliveredMode } : {}),
+        sequence,
+        enabledEver: nextAuthority.enabledEver,
+        updatedAt: Date.now(),
+      });
+      // The authoritative mode itself is deliberately NOT rolled back: it
+      // stands and stays pending, so the next reconnect delivers current state.
       logger.warn({
         project: source.projectName,
         sourceSession: sourceSessionName,
         brainSession: brain.name,
         err: error,
       }, 'Supervision auto-audit mode control delivery failed');
+    } finally {
+      this.modeControlInFlight.delete(authorityKey);
     }
+  }
+
+  /**
+   * Who is actually holding a message the runtime called `queued`?
+   *
+   *   durable        the transport queue has the row (or has already recorded
+   *                  delivering it), so it outlives this process;
+   *   runtime_local  the durable enqueue failed and the message exists only in
+   *                  this runtime's memory -- deliverable, but not across a
+   *                  restart;
+   *   dropped        neither holds it. The enqueue was refused as cancelled,
+   *                  which also removes the runtime's own copy, so nothing will
+   *                  ever carry it.
+   *
+   * The runtime's pending list is exact at this point: `send()` returned
+   * synchronously and nothing has awaited since, so no drain can have run in
+   * between. A question we cannot answer resolves to `runtime_local`, the one
+   * outcome that neither claims delivery nor resends on a guess.
+   */
+  private modeControlQueuedCustody(
+    brain: SessionRecord,
+    runtime: { pendingEntries: Array<{ clientMessageId: string }> },
+    clientMessageId: string,
+    handoverQueueEpoch: string | undefined,
+  ): 'durable' | 'runtime_local' | 'dropped' {
+    try {
+      const queue = getTransportQueueStore();
+      if (queue.hasDurableQueueAdmission(brain.name, clientMessageId)) return 'durable';
+      if (queue.hasDeliveryTombstone(brain.name, clientMessageId, handoverQueueEpoch)) return 'durable';
+    } catch {
+      // A queue we cannot interrogate has not told us anything either way.
+      return 'runtime_local';
+    }
+    try {
+      return runtime.pendingEntries.some((entry) => entry.clientMessageId === clientMessageId)
+        ? 'runtime_local'
+        : 'dropped';
+    } catch {
+      return 'runtime_local';
+    }
+  }
+
+  /**
+   * What became of the exact control message this authority handed over?
+   *
+   * `runtime.send()` returning is not an answer: `sent` means the runtime
+   * admitted the turn, while the provider accepts it later and asynchronously.
+   * The transport's own delivery record is the authoritative boundary, and it
+   * is scoped to a queue epoch -- which is what makes "lost" decidable rather
+   * than merely unconfirmed:
+   *
+   *   delivered  the queue recorded THIS message as delivered;
+   *   lost       the epoch it was handed over under is gone, so that record can
+   *              never appear and the message is unrecoverable;
+   *   in_flight  same epoch, no record yet -- the transport still owns it.
+   *
+   * Only `lost` may resend. Treating `in_flight` as a reason to resend is what
+   * turned every reconnect into a rebroadcast.
+   */
+  private modeControlHandoverState(
+    brain: SessionRecord,
+    previous: PersistedSupervisionModeControlDelivery,
+  ): 'delivered' | 'lost' | 'in_flight' {
+    // Nothing was ever handed over, so there is nothing to wait on.
+    if (!previous.deliveryMessageId) return 'lost';
+    try {
+      const queue = getTransportQueueStore();
+      // The transport now records acceptance for a DIRECT dispatch as well as
+      // for a queued one, so this answer is real for the ordinary idle send
+      // rather than perpetually absent. It is checked first because it is the
+      // only evidence that settles the question in the positive.
+      if (queue.hasDeliveryTombstone(
+        brain.name, previous.deliveryMessageId, previous.deliveryQueueEpoch,
+      )) return 'delivered';
+      const currentQueueEpoch = queue.currentQueueEpoch(brain.name);
+      // A rotated queue epoch scopes that record out of existence.
+      if (previous.deliveryQueueEpoch && currentQueueEpoch
+        && currentQueueEpoch !== previous.deliveryQueueEpoch) return 'lost';
+    } catch {
+      // A queue we cannot interrogate has not told us anything either way.
+    }
+    // No acceptance record, and the runtime that held it has been rebuilt: a
+    // direct dispatch lives only in that runtime's memory, so it died with it.
+    // This is decidable ONLY because acceptance is now recorded -- without it,
+    // an accepted message and a lost one look identical after a restart, and
+    // treating both as lost rebroadcasts on every ordinary reconnect.
+    const runtimeEpoch = brain.runtimeEpoch?.trim();
+    if (previous.deliveryRuntimeEpoch && runtimeEpoch
+      && runtimeEpoch !== previous.deliveryRuntimeEpoch) return 'lost';
+    // Handed over before this daemon recorded which runtime owned it: there is
+    // no way to tell, so do not resend on an unknown.
+    return 'in_flight';
   }
 
   private syncProjectBrainModeStates(brainSessionName: string): void {
@@ -1221,21 +1419,37 @@ class SupervisionAutomation {
     this.syncAutoAuditModeState(brain.name, snapshot);
   }
 
-  private sweepProjectBrainModeStatesOnce(brainSessionName: string): void {
+  /**
+   * Authorities with a control delivery in progress RIGHT NOW.
+   *
+   * `runtime.send()` is not a leaf call: it starts the turn, which sets the
+   * session status synchronously, which makes the session manager emit
+   * `session.state=running` synchronously, which the timeline delivers to
+   * handlers synchronously -- re-entering this very method while the row it is
+   * about to mark delivered is still pending. The pending row makes the
+   * same-mode early return false, so a single ON/OFF transition enqueued a
+   * SECOND control message before the first had finished. Timeline text dedupe
+   * hides the duplicate card; it does not deduplicate the provider queue.
+   */
+  private modeControlInFlight = new Set<string>();
+
+  private flushProjectBrainModeState(brainSessionName: string): void {
     const brain = getSession(brainSessionName);
     if (!brain || brain.role !== 'brain' || brain.state === 'stopped') return;
     const brainSessionInstanceId = brain.sessionInstanceId?.trim();
     if (!brainSessionInstanceId || !getTransportRuntime(brain.name)) return;
-    const authority = `${brain.name}:${brainSessionInstanceId}`;
-    if (this.autoAuditModeSweptBrainAuthorities.has(authority)) return;
-    this.autoAuditModeSweptBrainAuthorities.add(authority);
+    // Every reconnect is a chance to flush a pending change, so this is no
+    // longer gated to one sweep per Brain identity. Idempotence now comes from
+    // the authority itself -- a mode already delivered produces no message --
+    // rather than from refusing to look again, which is what made an enable
+    // that missed its runtime unrecoverable for the life of that Brain.
     this.syncProjectBrainModeStates(brainSessionName);
   }
 
-  private syncAllProjectBrainModeStates(): void {
+  private flushAllProjectBrainModeStates(): void {
     for (const session of listSessions()) {
       if (session.role === 'brain' && session.state !== 'stopped') {
-        this.sweepProjectBrainModeStatesOnce(session.name);
+        this.flushProjectBrainModeState(session.name);
       }
     }
   }
@@ -2295,7 +2509,6 @@ class SupervisionAutomation {
     this.recentTaskCandidates.clear();
     this.latestAssistantTexts.clear();
     this.implementationBlockerEscalationsInFlight.clear();
-    this.autoAuditModeSweptBrainAuthorities.clear();
     this.restorePersistedWaitStates();
   }
 
@@ -3121,7 +3334,7 @@ class SupervisionAutomation {
       // The stable SQLite authority plus one sweep per Brain identity keeps
       // ordinary idle/running transitions from becoming broadcast triggers.
       if (state === 'running' || state === 'idle') {
-        this.sweepProjectBrainModeStatesOnce(event.sessionId);
+        this.flushProjectBrainModeState(event.sessionId);
       }
       if (state === 'idle' && !run) {
         const candidate = this.recentTaskCandidates.get(event.sessionId);

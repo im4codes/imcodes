@@ -11,6 +11,12 @@ import {
   type SendMessageId,
 } from '../../shared/send-message-id.js';
 import { IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG } from '../../shared/imcodes-send.js';
+import {
+  isAuditTargetReservedByOther,
+  reconcileAuditTargetReservations,
+  releaseAuditTarget,
+  reserveAuditTarget,
+} from './supervision-audit-target-reservations.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import {
   MEMORY_MCP_CAPS,
@@ -2939,11 +2945,22 @@ interface AutomaticAuditTransportTargets {
   busy?: string;
 }
 
+/**
+ * Choose an auditor AND claim it, in one synchronous step.
+ *
+ * Selecting and then awaiting a dispatch is what let four audits in the same
+ * tick all pick the same ready peer: the listing's availability had not moved
+ * yet, so every route read the same `new_work` and queued behind one session
+ * while other ready peers idled. Claiming inside the selection closes that
+ * window without inventing any capacity rule -- the claim only bridges the lag
+ * in the real availability signal.
+ */
 function eligibleAutomaticAuditTransportTargets(
   brain: SessionRecord,
   audited: PersistedSupervisionTaskAssignment,
   allowSameFamily: boolean,
   deps: ReadyAuditDispatchDeps,
+  reservationOwnerKey: string,
 ): AutomaticAuditTransportTargets {
   const sessions = (deps.listSessions ?? listSessions)();
   const auditedSession = sessions.find(
@@ -2979,9 +2996,56 @@ function eligibleAutomaticAuditTransportTargets(
     items.find((item) => item.providerFamily !== auditedFamily)?.target
     ?? (allowSameFamily ? items.find((item) => item.providerFamily === auditedFamily)?.target : undefined)
   );
+  const now = deps.now?.() ?? Date.now();
+  const readyItems = eligible.filter((item) => item.dispatchMode === 'new_work');
+  // Reconciled against the COMPLETE live-ready pool, deliberately NOT against
+  // `readyItems`. This route's candidate set has already dropped its own
+  // audited session and every peer it may not use, and releasing a claim just
+  // because THIS route cannot consider that peer released other routes' claims:
+  // a session reserved as task A's auditor, skipped by task B for being B's own
+  // implementer, was handed back by B and then picked again by task C.
+  const liveReadyTargets = new Set(
+    listed.items.filter((item) => item.dispatchMode === 'new_work').map((item) => item.target),
+  );
+  // The durable record of which sessions are auditing, so the claims survive a
+  // restart and an active one is never dropped by a timer alone.
+  const authoritativeClaims = (() => {
+    try {
+      return (deps.registry ?? getSupervisionTaskRegistry()).listActiveAuditTargets()
+        .map((claim) => ({ target: claim.sessionName, ownerKey: claim.attemptId }));
+    } catch {
+      // Unknown, which must not be read as "nothing is auditing".
+      return undefined;
+    }
+  })();
+  reconcileAuditTargetReservations({
+    now,
+    readyTargets: liveReadyTargets,
+    ...(authoritativeClaims ? { authoritativeClaims } : {}),
+  });
+  const reservedByOther = (item: { target: string }): boolean => (
+    isAuditTargetReservedByOther(item.target, reservationOwnerKey, now)
+  );
+  const ready = pick(readyItems.filter((item) => !reservedByOther(item)));
+  // Claimed before this function returns, with no await in between, so a
+  // concurrent route observes it as taken and moves to a different peer.
+  if (ready) reserveAuditTarget(ready, reservationOwnerKey, now);
   return {
-    ready: pick(eligible.filter((item) => item.dispatchMode === 'new_work')),
-    busy: pick(eligible.filter((item) => item.dispatchMode === 'queue_only')),
+    ready,
+    // Busy is the durable-FIFO fallback of last resort and is deliberately not
+    // claimed: queueing is exactly what it is for.
+    //
+    // A ready peer claimed by another route belongs in this pool too. It is
+    // about to be busy -- that is what the claim means -- so sending to it
+    // queues on the same durable FIFO as an already-busy peer. Leaving it out
+    // of BOTH pools is what made a fully-claimed pool look like no pool at all,
+    // blocking the audit after the one auto-provision attempt refused instead
+    // of falling back. Genuinely busy peers come first so the ordering stays
+    // deterministic and prefers the target whose availability is already known.
+    busy: pick([
+      ...eligible.filter((item) => item.dispatchMode === 'queue_only'),
+      ...readyItems.filter((item) => reservedByOther(item)),
+    ]),
   };
 }
 
@@ -3487,6 +3551,7 @@ export async function dispatchReadyAudit(
       implementer,
       task.auditPolicy === 'auto_allow_degraded',
       deps,
+      attemptId,
     );
   const caller = {
     userId: brain.name,
@@ -3530,6 +3595,9 @@ export async function dispatchReadyAudit(
     result = await dispatch(caller, buildInput(candidates.busy));
   }
   if (result.status !== 'accepted' || !result.assignmentId) {
+    // Nothing was routed, so nothing may keep holding a ready peer out of the
+    // pool. Failing closed on the audit must not also fail closed on capacity.
+    releaseAuditTarget(attemptId);
     const reason = result.status === 'error' ? result.error : `automatic audit dispatch ${result.status}`;
     if (reason.includes('no_selected_config')) {
       registry.recordAutomaticAuditRoutingBlocker({
