@@ -512,6 +512,36 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
  * Assemble the strict v3 manifest. Returned, never written here, so the caller
  * (and the release guard) decides publication.
  */
+/**
+ * The notarization record as observed, in exactly one of its two legal shapes.
+ *
+ * A ticket can be attached to a bundle or a container and not to a standalone
+ * binary, so "unstapled" is a real outcome rather than a failure -- but it has
+ * to be stated, with its reason, so that it cannot be confused with a record
+ * that simply omitted the claim.
+ */
+function notarizationEvidence(kind, notarization) {
+  const base = {
+    status: 'accepted',
+    submissionId: notarization.submissionId,
+    ticketSha256: notarization.ticketSha256,
+  };
+  if (notarization.stapled === true && notarization.stapleValidated === true) {
+    return { ...base, stapled: true, stapleValidated: true };
+  }
+  if (notarization.stapled === false
+    && notarization.stapleValidated === false
+    && notarization.unstapledReason === 'artifact_format_cannot_carry_a_ticket') {
+    return {
+      ...base,
+      stapled: false,
+      stapleValidated: false,
+      unstapledReason: 'artifact_format_cannot_carry_a_ticket',
+    };
+  }
+  throw new Error(`notarization evidence for ${kind} states neither a stapled ticket nor why it has none`);
+}
+
 export function buildMacosRemoteDesktopManifest(plan, measured, evidence, toolchain, protocol) {
   const components = {};
   for (const component of plan.components) {
@@ -527,13 +557,11 @@ export function buildMacosRemoteDesktopManifest(plan, measured, evidence, toolch
       fileName: component.fileName,
       size: measurement.size,
       sha256: measurement.sha256,
-      notarization: {
-        status: 'accepted',
-        submissionId: notarization.submissionId,
-        ticketSha256: notarization.ticketSha256,
-        stapled: true,
-        stapleValidated: true,
-      },
+      // Carried through from the observed record, never asserted. Hardcoding
+      // `stapled: true` here would have produced a manifest claiming a ticket
+      // attached to a bare Mach-O executable -- something Apple provides no
+      // way to do -- and the verifier would rightly refuse the result.
+      notarization: notarizationEvidence(component.kind, notarization),
     };
   }
   const bundles = {};

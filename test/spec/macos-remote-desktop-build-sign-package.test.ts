@@ -470,7 +470,16 @@ describe('macOS remote-desktop manifest emission', () => {
   it('emits a manifest the shared strict validator accepts', async () => {
     const plan = await planFixture();
     const measured: Record<string, { size: number; sha256: string }> = {};
-    const evidence: Record<string, { submissionId: string; ticketSha256: string }> = {};
+    // The evidence carries the observed staple outcome; the builder no longer
+    // assumes one. These components are bare Mach-O executables, so the honest
+    // record is "notarized, not stapled", with the reason named.
+    const evidence: Record<string, {
+      submissionId: string;
+      ticketSha256: string;
+      stapled: false;
+      stapleValidated: false;
+      unstapledReason: 'artifact_format_cannot_carry_a_ticket';
+    }> = {};
     for (const component of plan.components) {
       const bytes = componentBytes(component.kind);
       measured[component.kind] = {
@@ -480,6 +489,9 @@ describe('macOS remote-desktop manifest emission', () => {
       evidence[component.kind] = {
         submissionId: '3e6a1c2d-9f4b-4a7c-8d1e-5b6c7d8e9f01',
         ticketSha256: createHash('sha256').update(`ticket:${component.kind}`).digest('hex'),
+        stapled: false,
+        stapleValidated: false,
+        unstapledReason: 'artifact_format_cannot_carry_a_ticket',
       };
     }
     const manifest = buildMacosRemoteDesktopManifest(plan, measured, evidence, TOOLCHAIN, {
@@ -492,6 +504,35 @@ describe('macOS remote-desktop manifest emission', () => {
     );
     expect(validated).not.toBeNull();
     expect(validated?.os).toBe('darwin');
+    // And it says so, rather than quietly carrying a claim nobody observed.
+    expect(validated?.components.worker.notarization).toMatchObject({
+      stapled: false,
+      unstapledReason: 'artifact_format_cannot_carry_a_ticket',
+    });
+  });
+
+  it('refuses evidence that states neither a staple nor why there is none', async () => {
+    // The builder used to assert `stapled: true` for every component. Silence
+    // from the caller must now be an error, not an assumption -- otherwise a
+    // manifest can claim a ticket that was never attached and never observed.
+    const plan = await planFixture();
+    const measured: Record<string, { size: number; sha256: string }> = {};
+    const evidence: Record<string, Record<string, unknown>> = {};
+    for (const component of plan.components) {
+      const bytes = componentBytes(component.kind);
+      measured[component.kind] = {
+        size: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      };
+      evidence[component.kind] = {
+        submissionId: '3e6a1c2d-9f4b-4a7c-8d1e-5b6c7d8e9f01',
+        ticketSha256: createHash('sha256').update(`ticket:${component.kind}`).digest('hex'),
+      };
+    }
+    expect(() => buildMacosRemoteDesktopManifest(plan, measured, evidence, TOOLCHAIN, {
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+    })).toThrow(/states neither a stapled ticket nor why it has none/);
   });
 
   it('refuses to emit a manifest with missing notarization evidence', async () => {
