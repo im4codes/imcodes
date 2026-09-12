@@ -64,3 +64,15 @@ export declare function assertExactComponentSetEntries(
 export declare function macosArtifactCanCarryNotarizationTicket(artifactPath: string): boolean;
 
 export declare function macosCodeRequirementLiteral(value: string): string;
+
+export declare function macosGatekeeperAssessmentIsNotarized(
+  assessment: string,
+  artifactPath: string,
+): boolean;
+
+export declare const MACOS_APPLE_VERDICT_TOOLS: readonly string[];
+
+export declare function macosAppleCommandFailed(
+  error: unknown,
+  executable: string,
+): boolean;

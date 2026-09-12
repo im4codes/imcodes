@@ -108,9 +108,48 @@ CLANG="$SDK_ROOT/toolchain/bin/clang"
 LLVM_AR="$SDK_ROOT/toolchain/bin/llvm-ar"
 
 # --- flags, verbatim from the SDK ---------------------------------------------
+#
+# Verbatim with ONE removal, and it is not cosmetic. The recorded flags carry
+# Chromium's unsafe-buffers clang plugin:
+#
+#   -Xclang -add-plugin -Xclang unsafe-buffers
+#   -Xclang -plugin-arg-unsafe-buffers -Xclang <paths file>
+#
+# The paths file is a source-tree path that the SDK does not ship, so it was
+# dropped when the flags were recorded -- leaving `-plugin-arg-unsafe-buffers`
+# with no argument. clang does not diagnose that: the plugin simply eats the
+# NEXT flag as its argument. Every translation unit printed
+#
+#   [unsafe-buffers] Failed to load paths from file '-Wexit-time-destructors'
+#
+# and `-Wexit-time-destructors` was silently never applied. A warning switch
+# disappearing without a word is the same failure mode as the `-isysroot` whose
+# argument was once filtered away, so the plugin is removed as a unit rather
+# than patched around.
 read_flags() { python3 -c '
 import json, sys
-print("\n".join(json.load(open(sys.argv[1]))[sys.argv[2]]))' "$COMPILE_FLAGS" "$1"; }
+
+PLUGIN = ["-Xclang", "-add-plugin", "-Xclang", "unsafe-buffers",
+          "-Xclang", "-plugin-arg-unsafe-buffers", "-Xclang"]
+
+def strip_unsafe_buffers_plugin(flags):
+    try:
+        start = next(
+            index for index in range(len(flags) - len(PLUGIN) + 1)
+            if flags[index:index + len(PLUGIN)] == PLUGIN)
+    except StopIteration:
+        # Shape changed. Refuse rather than guess: if the SDK ever records the
+        # plugin WITH its paths file, the trailing "-Xclang" belongs to that
+        # file and removing seven entries would eat a real flag.
+        if "-plugin-arg-unsafe-buffers" in flags:
+            sys.exit("unsafe-buffers plugin flags are not in the expected shape")
+        return flags
+    return flags[:start] + flags[start + len(PLUGIN):]
+
+values = json.load(open(sys.argv[1]))[sys.argv[2]]
+if sys.argv[2] == "compileFlags":
+    values = strip_unsafe_buffers_plugin(values)
+print("\n".join(values))' "$COMPILE_FLAGS" "$1"; }
 
 SDK_FLAGS=()
 while IFS= read -r flag; do [[ -n "$flag" ]] && SDK_FLAGS+=("$flag"); done < <(read_flags compileFlags)

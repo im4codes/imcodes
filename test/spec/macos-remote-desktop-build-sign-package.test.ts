@@ -103,7 +103,20 @@ function fakeTools(component: { bundleIdentifier: string }, overrides: FakeToolO
       ].join('\n'));
     }
     if (executable === MACOS_REMOTE_DESKTOP_BUILD_TOOLS.spctl) {
-      return ok(overrides.assessment ?? '/tmp/component: accepted\nsource=Notarized Developer ID\n');
+      // What Gatekeeper ACTUALLY prints for a notarized standalone Mach-O:
+      // it never says `source=Notarized Developer ID` for one -- that wording
+      // is for bundles. It stops at "does not seem to be an app", which it
+      // reaches only after the signature and the notarization check out, and
+      // it prints no `source=` line at all. Every un-notarized variant does
+      // print one. Copied from the tool, not composed.
+      //
+      // A bundle gets the OTHER wording, so the stub answers by format rather
+      // than with one string: a test that hands the guard an .app must see
+      // what Gatekeeper would actually say about an .app.
+      const assessedPath = String(args[args.length - 1] ?? '/tmp/component');
+      return ok(overrides.assessment ?? (/\.(?:app|dmg|pkg)$/iu.test(assessedPath)
+        ? `${assessedPath}: accepted\nsource=Notarized Developer ID\n`
+        : `${assessedPath}: rejected (the code is valid but does not seem to be an app)\n`));
     }
     if (executable === MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun) {
       return ok(overrides.staple ?? 'Processing: /tmp/component\nThe validate action worked!\n');
@@ -444,9 +457,18 @@ describe('macOS remote-desktop post-build guards', () => {
   });
 
   it('rejects an unnotarized assessment', async () => {
+    // Exactly what spctl prints for a Developer ID binary that was signed but
+    // never notarized. The refusal has to key on THIS, because it is the only
+    // thing that distinguishes it from the notarized case at the tool's output.
+    await expect(verifyWith({
+      assessment: '/tmp/component: rejected\nsource=Unnotarized Developer ID\n',
+    })).rejects.toThrow(/not assessed by Gatekeeper as notarized/);
+  });
+
+  it('rejects an assessment that is accepted but not notarized', async () => {
     await expect(verifyWith({
       assessment: '/tmp/component: accepted\nsource=Developer ID\n',
-    })).rejects.toThrow(/notarized Developer ID/);
+    })).rejects.toThrow(/not assessed by Gatekeeper as notarized/);
   });
 
   it('still demands a stapled ticket from a format that can carry one', async () => {
@@ -461,8 +483,12 @@ describe('macOS remote-desktop post-build guards', () => {
     )).rejects.toThrow(/stapled notarization ticket/);
   });
 
-  it('rejects a failing codesign verification', async () => {
-    await expect(verifyWith({ verifyStatus: 1 })).rejects.toThrow(/build tool reported failure/);
+  it('rejects a failing codesign verification, naming the tool and its output', async () => {
+    // The tool and what it printed, not "build tool reported failure". A local
+    // release run ended in a stack trace into the command wrapper with nothing
+    // to act on, which is how CI became the debugger.
+    await expect(verifyWith({ verifyStatus: 1 }))
+      .rejects.toThrow(/codesign --verify exited 1: /u);
   });
 
   it('rejects an empty component', async () => {

@@ -210,7 +210,12 @@ function trustedExecutor(
       ].join('\n'));
     }
     if (executable === MACOS_REMOTE_DESKTOP_APPLE_TOOLS.spctl) {
-      return result(`${kind}:spctl`, `${path}: accepted\nsource=Notarized Developer ID\n`);
+      // The wording for a standalone executable, which is what every
+      // component is. The bundle wording was unsatisfiable here.
+      return result(
+        `${kind}:spctl`,
+        `${path}: rejected (the code is valid but does not seem to be an app)\n`,
+      );
     }
     if (executable === MACOS_REMOTE_DESKTOP_APPLE_TOOLS.xcrun) {
       return result(`${kind}:stapler`, 'The validate action worked!\n');

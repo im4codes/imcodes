@@ -42,6 +42,7 @@ import { validateMacosLibwebrtcNotices } from './libwebrtc-sdk-artifacts.mjs';
 import {
   macosArtifactCanCarryNotarizationTicket,
   macosCodeRequirementLiteral,
+  macosGatekeeperAssessmentIsNotarized,
 } from '../src/node/macos-apple-trust.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -469,12 +470,31 @@ function firstLine(output, marker) {
   return line === undefined ? `no ${marker} line in output` : line.trim();
 }
 
-function commandText(result) {
+/**
+ * Both streams of a tool that was supposed to succeed, or a refusal that says
+ * which tool and what it printed.
+ *
+ * "build tool reported failure" named neither, so a local release run ended
+ * with a stack trace into this function and nothing to act on -- the same
+ * blindness that turned CI into the debugger.
+ *
+ * `verdictTool` is for the tools whose non-zero exit IS the answer rather than
+ * a malfunction: `spctl --assess` exits non-zero to say "rejected", and
+ * `stapler validate` to say "no ticket". Aborting on their status threw before
+ * the guard that would have reported the verdict could read it, so the
+ * informative message those guards carry was unreachable.
+ */
+function commandText(result, tool = 'a build tool', verdictTool = false) {
   if (!isRecord(result) || typeof result.stdout !== 'string' || typeof result.stderr !== 'string') {
-    throw new Error('invalid command result');
+    throw new Error(`invalid command result from ${tool}`);
   }
-  if (result.status !== 0) throw new Error('build tool reported failure');
-  return `${result.stdout}\n${result.stderr}`;
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (result.status !== 0 && !verdictTool) {
+    throw new Error(
+      `${tool} exited ${result.status}: ${output.trim().split(/\r?\n/u).slice(0, 4).join(' | ') || '(no output)'}`,
+    );
+  }
+  return output;
 }
 
 /**
@@ -489,7 +509,7 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
   const archs = commandText(await run(
     MACOS_REMOTE_DESKTOP_BUILD_TOOLS.lipo,
     ['-archs', executablePath],
-  )).trim().split(/\s+/u).filter(Boolean);
+  ), 'lipo -archs').trim().split(/\s+/u).filter(Boolean);
   if (archs.length !== 1 || archs[0] !== plan.machoArchitecture) {
     // A fat binary is rejected here because verifyMacosRemoteDesktopArtifact
     // requires exactly one architecture at runtime.
@@ -499,7 +519,7 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
   const loadCommands = commandText(await run(
     MACOS_REMOTE_DESKTOP_BUILD_TOOLS.otool,
     ['-l', executablePath],
-  ));
+  ), 'otool -l');
   const minos = new RegExp(`minos\\s+${plan.minimumMacosVersion.replace(/\./gu, '\\.')}(?:\\s|$)`, 'mu');
   if (!minos.test(loadCommands)) {
     throw new Error(`component ${component.kind} does not encode macOS ${plan.minimumMacosVersion} as its minimum OS`);
@@ -508,12 +528,12 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
   commandText(await run(
     MACOS_REMOTE_DESKTOP_BUILD_TOOLS.codesign,
     ['--verify', '--strict', '--deep', '--verbose=2', executablePath],
-  ));
+  ), 'codesign --verify');
 
   const display = commandText(await run(
     MACOS_REMOTE_DESKTOP_BUILD_TOOLS.codesign,
     ['--display', '--verbose=4', executablePath],
-  ));
+  ), 'codesign --display');
   if (!/^CodeDirectory .* flags=0x[0-9a-f]+\([^)]*\bruntime\b[^)]*\)/imu.test(display)) {
     throw new Error(`component ${component.kind} is not signed with the Hardened Runtime: ${firstLine(display, 'CodeDirectory')}`);
   }
@@ -528,7 +548,7 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
   const requirement = commandText(await run(
     MACOS_REMOTE_DESKTOP_BUILD_TOOLS.codesign,
     ['--display', '-r-', executablePath],
-  ));
+  ), 'codesign --display -r-');
   if (!requirement.includes(component.designatedRequirement)) {
     throw new Error(
       `component ${component.kind} has an unexpected designated requirement: `
@@ -541,9 +561,9 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
   const assessment = commandText(await run(
     MACOS_REMOTE_DESKTOP_BUILD_TOOLS.spctl,
     ['--assess', '--type', 'execute', '-vv', executablePath],
-  ));
-  if (!/\bsource=Notarized Developer ID\b/u.test(assessment)) {
-    throw new Error(`component ${component.kind} is not assessed as a notarized Developer ID binary: ${assessment.trim().split(/\r?\n/u).slice(0, 3).join(' | ')}`);
+  ), 'spctl --assess', true);
+  if (!macosGatekeeperAssessmentIsNotarized(assessment, executablePath)) {
+    throw new Error(`component ${component.kind} is not assessed by Gatekeeper as notarized: ${assessment.trim().split(/\r?\n/u).slice(0, 3).join(' | ')}`);
   }
 
   // Only where a ticket can exist. These components are bare Mach-O
@@ -557,7 +577,7 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
     const staple = commandText(await run(
       MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun,
       ['stapler', 'validate', executablePath],
-    ));
+    ), 'stapler validate', true);
     if (!/The validate action worked!/u.test(staple)) {
       throw new Error(`component ${component.kind} has no stapled notarization ticket`);
     }
@@ -606,6 +626,33 @@ function notarizationEvidence(kind, notarization) {
   throw new Error(`notarization evidence for ${kind} states neither a stapled ticket nor why it has none`);
 }
 
+/**
+ * The three toolchain fields the manifest contract names, and only those.
+ *
+ * The SDK's own `sdk-build.json` records a FOURTH -- `hostArch`, the machine
+ * that produced the SDK. Passing that record through whole produced a manifest
+ * the runtime validator refused outright, because it checks the toolchain with
+ * exact keys: a property of the SDK's build machine is not a property of the
+ * components, and the manifest already states the target architecture.
+ *
+ * Projected explicitly rather than deleted, so the next field the SDK records
+ * cannot break a release again -- and so a MISSING field is named here instead
+ * of surfacing as a flat "manifest invalid" after everything has been built,
+ * signed and notarized.
+ */
+function manifestToolchain(toolchain) {
+  if (!isRecord(toolchain)) throw new Error('the SDK recorded no toolchain');
+  const projected = {};
+  for (const field of ['xcode', 'macosSdk', 'clang']) {
+    const value = toolchain[field];
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`the SDK toolchain record is missing ${field}`);
+    }
+    projected[field] = value;
+  }
+  return projected;
+}
+
 export function buildMacosRemoteDesktopManifest(plan, measured, evidence, toolchain, protocol) {
   const components = {};
   for (const component of plan.components) {
@@ -648,7 +695,7 @@ export function buildMacosRemoteDesktopManifest(plan, measured, evidence, toolch
     libwebrtcRevision: plan.libwebrtcRevision,
     minimumOsVersion: plan.minimumMacosVersion,
     codeSignature: { teamId: plan.teamId, bundles },
-    toolchain,
+    toolchain: manifestToolchain(toolchain),
   };
 }
 
@@ -673,7 +720,7 @@ export async function assertPinnedCheckout(webrtcRoot, depotToolsRoot, dependenc
     const actual = commandText(await run(
       MACOS_REMOTE_DESKTOP_BUILD_TOOLS.git,
       ['-C', root, 'rev-parse', 'HEAD'],
-    )).trim().split(/\s+/u)[0];
+    ), `git -C ${root} rev-parse HEAD`).trim().split(/\s+/u)[0];
     if (actual !== expected) {
       throw new Error(`${label} revision mismatch: ${actual} (expected ${expected})`);
     }

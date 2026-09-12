@@ -99,6 +99,57 @@ describe('macOS CGEvent input adapter', () => {
     }
   }, 30_000);
 
+  it('maps every named key to the virtual key code Apple publishes', async () => {
+    if (process.platform !== 'darwin') return;
+
+    // The fake-backend tests above pass key NAMES through and never reach the
+    // translation table, so every one of them would pass with it empty -- the
+    // only named key any of them mentions is "KeyA", which the letter branch
+    // resolves. The table stopped being a `std::map` (it had an exit-time
+    // destructor) and became a sorted array searched by binary search, where a
+    // mistyped or out-of-order entry returns the WRONG code rather than
+    // failing. So it is exercised directly.
+    const directory = mkdtempSync(resolve(tmpdir(), 'imcodes-macos-keymap-'));
+    const executable = resolve(directory, 'macos-keymap-test');
+    try {
+      const compile = await runXcrun([
+        'clang++',
+        '-std=c++20',
+        '-fobjc-arc',
+        '-fblocks',
+        '-Wall',
+        '-Wextra',
+        '-Werror',
+        '-Wunguarded-availability-new',
+        '-fsanitize=address,undefined',
+        '-fno-omit-frame-pointer',
+        '-mmacosx-version-min=12.3',
+        '-I', ROOT,
+        '-I', resolve(ROOT, 'native/macos-remote-desktop'),
+        '-I', resolve(ROOT, 'native/remote-desktop-common'),
+        resolve(ROOT, 'test/spec/macos-remote-desktop-keymap-test.mm'),
+        resolve(ROOT, 'native/remote-desktop-common/input_ledger.cc'),
+        resolve(ROOT, 'native/remote-desktop-common/value_types.cc'),
+        '-framework', 'ApplicationServices',
+        '-framework', 'Foundation',
+        '-o', executable,
+      ]);
+      expect(compile.status, `${compile.stdout}\n${compile.stderr}`).toBe(0);
+
+      const run = await runNative(executable, [], {
+        env: {
+          ...process.env,
+          ASAN_OPTIONS: 'detect_leaks=0:abort_on_error=1',
+          UBSAN_OPTIONS: 'halt_on_error=1:print_stacktrace=1',
+        },
+      });
+      expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
+      expect(run.stdout).toContain('macos key map ok');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('runs the ledger/topology/stuck-input fake under ASan and UBSan', async () => {
     if (process.platform !== 'darwin') return;
 

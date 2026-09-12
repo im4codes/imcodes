@@ -24,6 +24,7 @@ import {
 } from '../../shared/remote-desktop-worker.js';
 import {
   MACOS_APPLE_TOOLS,
+  macosAppleCommandFailed,
   verifyMacosAppleTrust,
 } from './macos-apple-trust.mjs';
 
@@ -137,8 +138,13 @@ function defaultExecute(
       timeout: COMMAND_TIMEOUT_MS,
       maxBuffer: COMMAND_MAX_BUFFER_BYTES,
     }, (error, stdout, stderr) => {
-      if (error) {
-        reject(new Error(String(stderr || stdout || error.message).trim()));
+      // A non-zero exit from spctl or stapler is the verdict the caller asked
+      // for, so its output is returned rather than thrown. Rejecting it threw
+      // before the notarization check could read it -- with spctl's own text
+      // as the error -- and every correctly notarized component was refused on
+      // the user's Mac.
+      if (macosAppleCommandFailed(error, executable)) {
+        reject(new Error(String(stderr || stdout || (error?.message ?? 'command failed')).trim()));
         return;
       }
       resolveResult({ stdout: String(stdout), stderr: String(stderr) });

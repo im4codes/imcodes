@@ -18,7 +18,10 @@
  *   * `codesign --verify --strict` -- the signature actually validates.
  *   * `codesign -d`      -- identifier, team, AND the hardened-runtime flag.
  *   * `codesign -d -r-`  -- the designated requirement matches exactly.
- *   * `spctl --assess`   -- Gatekeeper accepts it as a Notarized Developer ID.
+ *   * `spctl --assess`   -- Gatekeeper finds nothing wrong with the signature
+ *                           or the notarization. What it PRINTS depends on the
+ *                           artifact's format; see
+ *                           `macosGatekeeperAssessmentIsNotarized`.
  *   * `stapler validate` -- the ticket is actually stapled to THIS file, for
  *                           the artifact formats that can carry one.
  *
@@ -26,8 +29,9 @@
  * standalone binaries but cannot be attached to them. The shipped components
  * are bare Mach-O executables, so demanding a stapled ticket from them demands
  * something that cannot exist -- and `spctl` remains the substantive check
- * either way, because nothing can make Gatekeeper report "Notarized Developer
- * ID" for a binary Apple did not notarize. What is genuinely lost is offline
+ * either way, because an un-notarized binary is reported differently -- with a
+ * `source=` line naming the refusal -- and no such line appears for one Apple
+ * did notarize. What is genuinely lost is offline
  * verification: an unstapled binary is assessed against Apple's service, so a
  * machine with no network cannot start one.
  *
@@ -43,6 +47,46 @@ export const MACOS_APPLE_TOOLS = Object.freeze({
   spctl: '/usr/sbin/spctl',
   xcrun: '/usr/bin/xcrun',
 });
+
+/**
+ * Tools whose non-zero exit is an ANSWER, not a malfunction.
+ *
+ * `spctl --assess` exits 3 to say "rejected" and `stapler validate` exits
+ * non-zero to say "no ticket" -- in both cases the text they print is the
+ * verdict the caller asked for. A command runner that treats every non-zero
+ * exit as a failure throws before the check that would have read it, so the
+ * daemon rejected its own correctly notarized components with spctl's output
+ * as the error message and no check ever ran.
+ *
+ * Everything absent from this set keeps failing loudly: a non-zero `codesign
+ * --verify` means the signature is invalid, and swallowing that would turn a
+ * broken artifact into an accepted one.
+ */
+export const MACOS_APPLE_VERDICT_TOOLS = Object.freeze([
+  MACOS_APPLE_TOOLS.spctl,
+  MACOS_APPLE_TOOLS.xcrun,
+]);
+
+/**
+ * Whether an execFile error from an Apple tool is a real failure.
+ *
+ * A non-zero EXIT from a verdict tool is not: `spctl --assess` exits 3 to say
+ * "rejected", and that text is the answer the caller wanted. Anything that is
+ * not an exit status -- a spawn failure, a timeout, a buffer overrun -- stays
+ * fatal for every tool, including the verdict ones, because then there is no
+ * verdict to read.
+ *
+ * Node reports an exit status as a numeric `code` on the error; a spawn
+ * failure carries a string code such as 'ENOENT', and a timeout carries
+ * `killed: true` with a signal. Distinguishing them by TYPE rather than by
+ * presence is what keeps a missing binary from being read as a rejection.
+ */
+export function macosAppleCommandFailed(error, executable) {
+  if (!error) return false;
+  if (error.killed === true || error.signal) return true;
+  if (typeof error.code !== 'number') return true;
+  return !MACOS_APPLE_VERDICT_TOOLS.includes(executable);
+}
 
 export const MACOS_APPLE_TRUST_ERROR = Object.freeze({
   ARCHITECTURE_MISMATCH: 'macos_apple_trust_architecture_mismatch',
@@ -84,6 +128,46 @@ export function macosArtifactCanCarryNotarizationTicket(artifactPath) {
     throw new Error('notarization ticket support requires an artifact path');
   }
   return /\.(app|dmg|pkg)$/iu.test(artifactPath.replace(/\/+$/u, ''));
+}
+
+/**
+ * Whether Gatekeeper's assessment says this artifact is notarized.
+ *
+ * Not one string, because Gatekeeper answers differently depending on what it
+ * was handed, and the difference is not cosmetic. Read off the tool itself,
+ * with one Developer ID certificate and one binary, changing only whether it
+ * had been through the notary service:
+ *
+ *   Developer ID, notarized    rejected (the code is valid but does not seem
+ *                              to be an app)          <- no source= line
+ *   Developer ID, NOT notarized
+ *                              rejected
+ *                              source=Unnotarized Developer ID
+ *   Apple Development          rejected
+ *                              origin=Apple Development: ...
+ *   ad-hoc signed              rejected
+ *   unsigned                   rejected
+ *                              source=no usable signature
+ *
+ * `source=Notarized Developer ID` is emitted for BUNDLES. A standalone Mach-O
+ * executable never gets it: Gatekeeper stops at "does not seem to be an app",
+ * which it reaches only after finding nothing wrong with the signature or the
+ * notarization. Requiring the bundle wording of a bare executable was
+ * unsatisfiable -- the daemon would have refused its own correctly notarized
+ * components on a user's Mac, and the release guard refused to publish them.
+ *
+ * The standalone form is still substantive: every un-notarized variant above
+ * is distinguishable from it, and each carries a `source=` line explaining the
+ * refusal, so the absence of one is the assertion.
+ */
+export function macosGatekeeperAssessmentIsNotarized(assessment, artifactPath) {
+  if (typeof assessment !== 'string') return false;
+  if (macosArtifactCanCarryNotarizationTicket(artifactPath)) {
+    return /(?:^|\n).*:\s*accepted\s*(?:\n|$)/iu.test(assessment)
+      && /(?:^|\n)source=Notarized Developer ID\s*(?:\n|$)/u.test(assessment);
+  }
+  return /the code is valid but does not seem to be an app/iu.test(assessment)
+    && !/(?:^|\n)source=/u.test(assessment);
 }
 
 export function appleCommandOutput(result) {
@@ -141,8 +225,7 @@ export async function verifyMacosAppleTrust(
   const assessment = appleCommandOutput(await execute(
     MACOS_APPLE_TOOLS.spctl, ['--assess', '--type', 'execute', '--verbose=4', executablePath],
   ));
-  if (!/(?:^|\n).*:\s*accepted\s*(?:\n|$)/iu.test(assessment)
-    || !/(?:^|\n)source=Notarized Developer ID\s*(?:\n|$)/u.test(assessment)
+  if (!macosGatekeeperAssessmentIsNotarized(assessment, executablePath)
     || notarization?.status !== 'accepted') {
     throw new Error(MACOS_APPLE_TRUST_ERROR.NOTARIZATION_REJECTED);
   }

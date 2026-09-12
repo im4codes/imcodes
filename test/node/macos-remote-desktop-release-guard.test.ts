@@ -234,7 +234,12 @@ function appleEvidence(
     if (operation === 'spctl') {
       return options.rejected
         ? { stdout: '', stderr: `${fileName}: rejected\nsource=Unnotarized Developer ID\n` }
-        : { stdout: '', stderr: `${fileName}: accepted\nsource=Notarized Developer ID\n` };
+        : {
+          stdout: '',
+          // A notarized standalone executable: Gatekeeper prints no `source=`
+          // line, because it got past everything that would have produced one.
+          stderr: `${fileName}: rejected (the code is valid but does not seem to be an app)\n`,
+        };
     }
     if (operation === 'stapler') {
       // Retained so an artifact format that CAN carry a ticket still has a
