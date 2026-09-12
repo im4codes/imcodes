@@ -166,6 +166,21 @@ void PrepareMacosPermissionResponsibleApplication() noexcept {
   PrepareResponsibleApplication(false);
 }
 
+AiDeskProductHelper SelectAiDeskProductHelper(
+    int argc,
+    const char* const argv[]) noexcept {
+  if (argc < 2 || argv == nullptr || argv[1] == nullptr)
+    return AiDeskProductHelper::kComputerUse;
+  const std::string_view first(argv[1]);
+  if (first == kAiDeskLaunchAgentArgument)
+    return AiDeskProductHelper::kRemoteDesktopLaunchAgent;
+  if (first.rfind("--imcodes-", 0) == 0 ||
+      first.rfind("--macos-remote-desktop-", 0) == 0) {
+    return AiDeskProductHelper::kRemoteDesktopWorker;
+  }
+  return AiDeskProductHelper::kComputerUse;
+}
+
 bool IsLocalOnboardingAppLaunch(int argc, const char* const argv[]) noexcept {
   if (argc < 1 || argc > 2 || argv == nullptr)
     return false;

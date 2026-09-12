@@ -133,6 +133,21 @@ jobs:
           set -euo pipefail
           codesign --verify --strict --verbose=2 dist-node-exe/imcodes-node-macos
           ./dist-node-exe/imcodes-node-macos --version
+      - name: Build and notarize the aiDesk application bundle
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # One signed bundle holding every helper that needs a permission, so
+          # macOS attributes Screen Recording and Accessibility to the app the
+          # person chose rather than to whatever launched a helper. Unlike the
+          # bare executable this one CAN carry its notarization ticket, so it
+          # verifies with no network.
+          APP="$(node scripts/build-aidesk-app.mjs dist-node-exe)"
+          node scripts/macos-release-signing.mjs notarize "$APP"
+          xcrun stapler validate "$APP"
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -219,6 +234,7 @@ jobs:
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
             dist-node-exe/computer-use-helper/**
+            dist-node-exe/aiDesk.to by IM.codes.app/**
             dist-node-exe/remote-desktop-worker/**
           if-no-files-found: error
           retention-days: 30

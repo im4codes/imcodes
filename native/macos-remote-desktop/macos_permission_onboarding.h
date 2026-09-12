@@ -12,11 +12,24 @@ inline constexpr char kMacosRemoteDesktopWorkerBundleIdentifier[] =
 inline constexpr char kAiDeskMainExecutableName[] = "aidesk-agent";
 inline constexpr char kAiDeskComputerUseHelperName[] = "OpenComputerUse";
 
+// The argument that marks a launch-agent start. Declared here, with the
+// dispatch that reads it, so the product has one definition of the string
+// instead of a copy per executable kept in step by comment.
+inline constexpr char kAiDeskLaunchAgentArgument[] =
+    "--macos-remote-desktop-launch-agent";
+
 enum class AiDeskProductHelper {
   kComputerUse,
   kRemoteDesktopWorker,
   kRemoteDesktopLaunchAgent,
 };
+
+// Which helper a command line asks for. Computer Use is the default because
+// that is what an unadorned launch means; the remote-desktop helpers announce
+// themselves with their own flags.
+[[nodiscard]] AiDeskProductHelper SelectAiDeskProductHelper(
+    int argc,
+    const char* const argv[]) noexcept;
 
 // True when the current executable is running from the exact signed worker
 // application bundle, irrespective of its command-line mode.

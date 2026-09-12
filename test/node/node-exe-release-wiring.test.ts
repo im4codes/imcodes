@@ -488,4 +488,24 @@ describe('controlled-node executable release wiring', () => {
     // `plutil -lint` accepts them -- so the failure lands at signing time.
     expect(entitlements).not.toContain('<!--');
   });
+
+  it('builds, notarizes and staples the aiDesk bundle, and ships it', () => {
+    // The bundle is what macOS attributes permissions to, and unlike the bare
+    // executable it can carry its own notarization ticket -- so an unstapled
+    // one that shipped would silently need the network on first launch.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      const build = workflow.indexOf('node scripts/build-aidesk-app.mjs dist-node-exe');
+      const notarize = workflow.indexOf('macos-release-signing.mjs notarize "$APP"');
+      const validate = workflow.indexOf('xcrun stapler validate "$APP"');
+      const upload = workflow.indexOf('dist-node-exe/aiDesk.to by IM.codes.app/**');
+
+      expect([build, notarize, validate, upload].every((at) => at >= 0), file).toBe(true);
+      expect(build, file).toBeLessThan(notarize);
+      // Validating is the only step that proves the ticket actually attached;
+      // `stapler staple` reports failure in ways a successful-looking run can
+      // hide.
+      expect(notarize, file).toBeLessThan(validate);
+    }
+  });
 });

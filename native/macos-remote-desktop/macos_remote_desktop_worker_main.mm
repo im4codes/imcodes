@@ -81,7 +81,8 @@ namespace {
 namespace rd = imcodes::remote_desktop;
 namespace macos = imcodes::remote_desktop::macos;
 
-constexpr char kLaunchAgentArgument[] = "--macos-remote-desktop-launch-agent";
+// One definition, in the header that also owns the dispatch reading it.
+constexpr const char* kLaunchAgentArgument = macos::kAiDeskLaunchAgentArgument;
 constexpr std::size_t kReadChunkBytes = 8 * 1024;
 // Matches MACOS_VIRTUAL_DISPLAY_PROXY_TIMEOUT_MS on the daemon side. A silent
 // agent is a false answer, so the wait is bounded on both ends.
@@ -2362,18 +2363,9 @@ int main(int argc, const char* argv[]) {
 
   const bool local_onboarding = macos::IsLocalOnboardingAppLaunch(argc, argv);
   if (macos::IsAiDeskProductMainExecutable() && !local_onboarding) {
-    macos::AiDeskProductHelper helper =
-        macos::AiDeskProductHelper::kComputerUse;
-    if (argc >= 2 && argv != nullptr && argv[1] != nullptr) {
-      const std::string_view first(argv[1]);
-      if (first == kLaunchAgentArgument) {
-        helper = macos::AiDeskProductHelper::kRemoteDesktopLaunchAgent;
-      } else if (first.rfind("--imcodes-", 0) == 0 ||
-                 first.rfind("--macos-remote-desktop-", 0) == 0) {
-        helper = macos::AiDeskProductHelper::kRemoteDesktopWorker;
-      }
-    }
-    (void)macos::ExecAiDeskProductHelper(helper, argc, argv);
+    // The same rule the bundle's main executable applies, from one definition.
+    (void)macos::ExecAiDeskProductHelper(
+        macos::SelectAiDeskProductHelper(argc, argv), argc, argv);
     std::cerr << "aidesk_product_helper_exec_failed\n";
     return EX_UNAVAILABLE;
   }
