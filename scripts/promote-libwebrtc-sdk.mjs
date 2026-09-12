@@ -13,6 +13,7 @@ import {
   DEFAULT_LIBWEBRTC_SDK_TARGET_ID,
   libwebrtcSdkTarget,
 } from './libwebrtc-sdk-targets.mjs';
+import { isModuleEntry } from './module-entry.mjs';
 
 const COMMIT_RE = /^[a-f0-9]{40}$/;
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -200,6 +201,6 @@ async function main() {
   process.stdout.write(`promoted ${result.archiveName} as ${result.releaseTag}\n`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isModuleEntry(import.meta.url)) {
   await main();
 }

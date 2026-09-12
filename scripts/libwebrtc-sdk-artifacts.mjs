@@ -14,6 +14,7 @@ import {
   PINNED_DEPOT_TOOLS_REVISION,
   PINNED_LIBWEBRTC_REVISION,
 } from './remote-desktop-worker-artifacts.mjs';
+import { isModuleEntry } from './module-entry.mjs';
 
 export { DEFAULT_LIBWEBRTC_SDK_TARGET_ID, LIBWEBRTC_SDK_TARGET_IDS, libwebrtcSdkTarget };
 
@@ -480,7 +481,7 @@ async function main() {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+if (isModuleEntry(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(1);

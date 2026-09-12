@@ -12,6 +12,7 @@ import {
   extractTargetOption,
 } from './libwebrtc-sdk-artifacts.mjs';
 import { libwebrtcSdkTarget } from './libwebrtc-sdk-targets.mjs';
+import { isModuleEntry } from './module-entry.mjs';
 
 const scriptsDirectory = dirname(fileURLToPath(import.meta.url));
 
@@ -158,6 +159,6 @@ async function main() {
   process.exitCode = 0;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isModuleEntry(import.meta.url)) {
   await main();
 }

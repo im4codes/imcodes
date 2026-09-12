@@ -15,6 +15,7 @@ import {
   LIBWEBRTC_SDK_TARGET_IDS,
   libwebrtcSdkTarget,
 } from './libwebrtc-sdk-targets.mjs';
+import { isModuleEntry } from './module-entry.mjs';
 
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -139,7 +140,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+if (isModuleEntry(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(1);
