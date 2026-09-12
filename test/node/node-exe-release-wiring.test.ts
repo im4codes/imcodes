@@ -508,4 +508,23 @@ describe('controlled-node executable release wiring', () => {
       expect(notarize, file).toBeLessThan(validate);
     }
   });
+
+  it('wraps the app in a stapled disk image, built after the app is stapled', () => {
+    // Order matters for a reason a user feels: the image is built from the app
+    // as it stands, so an app stapled afterwards would ship inside an image
+    // holding an unstapled copy -- and dragging it out would need the network.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      const stapleApp = workflow.indexOf('xcrun stapler validate "$APP"');
+      const buildDmg = workflow.indexOf('node scripts/build-aidesk-app.mjs dmg dist-node-exe');
+      const notarizeDmg = workflow.indexOf('macos-release-signing.mjs notarize "$DMG"');
+      const validateDmg = workflow.indexOf('xcrun stapler validate "$DMG"');
+      const upload = workflow.indexOf('dist-node-exe/*.dmg');
+
+      expect([stapleApp, buildDmg, notarizeDmg, validateDmg, upload].every((at) => at >= 0), file).toBe(true);
+      expect(stapleApp, file).toBeLessThan(buildDmg);
+      expect(buildDmg, file).toBeLessThan(notarizeDmg);
+      expect(notarizeDmg, file).toBeLessThan(validateDmg);
+    }
+  });
 });

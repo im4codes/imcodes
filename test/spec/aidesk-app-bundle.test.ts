@@ -10,6 +10,7 @@ import {
   aideskSigningOrder,
   buildAideskInfoPlist,
 } from '../../scripts/build-aidesk-app.mjs';
+import { macosArtifactSupportsStapling } from '../../scripts/macos-release-signing.mjs';
 
 import {
   MACOS_AIDESK_APP_NAME,
@@ -104,5 +105,46 @@ describe('aiDesk application bundle', () => {
     // `verifyMacosComputerUseAppBundle` accepts the bundle only when the
     // signature names this team and a Developer ID authority.
     expect(MACOS_AIDESK_TEAM_ID).toBe('M675E26Q67');
+  });
+});
+
+/**
+ * The disk image is what the download button hands out. Everything asserted
+ * here is a property a user would experience directly: whether the window can
+ * be dragged from, and whether a first launch needs the network.
+ */
+describe('aiDesk disk image', () => {
+  const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');
+
+  it('is a format that can carry its notarization ticket', () => {
+    // UDZO is a UDIF image, which `stapler` accepts. A sparse or raw image
+    // would notarize and then refuse the ticket, and the failure would be a
+    // first launch that needs the network -- invisible until someone is
+    // offline.
+    expect(source).toContain("'-format', 'UDZO'");
+    expect(macosArtifactSupportsStapling('/build/aiDesk.to-2026.9.1.dmg')).toBe(true);
+  });
+
+  it('gives the window something to drag into', () => {
+    // Without the symlink the image is a puzzle: a lone app icon and nowhere
+    // obvious to put it.
+    expect(source).toContain("'/Applications'");
+  });
+
+  it('copies the app verbatim rather than resolving its symlinks', () => {
+    // Dereferencing a symlink inside a signed bundle rewrites its contents,
+    // and the seal then describes a bundle that no longer exists.
+    expect(source).toContain('verbatimSymlinks: true');
+  });
+
+  it('signs the image itself, not only the app inside it', () => {
+    // So a tampered download is refused before anything is mounted, rather
+    // than at the moment the app is first launched.
+    expect(source).toContain('export function signAideskDmg');
+    expect(source).toContain('must be a SHA-1 fingerprint');
+  });
+
+  it('refuses to build an image around an app that is not there', () => {
+    expect(source).toMatch(/app bundle not found/u);
   });
 });

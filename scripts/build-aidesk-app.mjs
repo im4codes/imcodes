@@ -184,6 +184,62 @@ export function signAideskApp(bundlePath, options = {}) {
   sh('/usr/bin/codesign', ['--verify', '--deep', '--strict', '--verbose=2', bundlePath]);
 }
 
+/**
+ * The disk image the download button hands out.
+ *
+ * A .dmg rather than a .pkg: both can carry a notarization ticket, but a
+ * package runs an installer wizard and a disk image is the drag-to-Applications
+ * gesture every Mac user already knows. And rather than the bare executable,
+ * because Apple documents that a standalone binary cannot be stapled -- this
+ * can, so a first launch needs no network.
+ *
+ * The symlink is what makes the window a drag target instead of a puzzle.
+ */
+export function buildAideskDmg(input) {
+  const { appPath, outPath, volumeName = 'aiDesk.to by IM.codes' } = input;
+  if (!existsSync(appPath)) throw new Error(`app bundle not found: ${appPath}`);
+  const staging = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-dmg-'));
+  try {
+    cpSync(appPath, join(staging, AIDESK_APP_NAME), { recursive: true, verbatimSymlinks: true });
+    sh('/bin/ln', ['-s', '/Applications', join(staging, 'Applications')]);
+    rmSync(outPath, { force: true });
+    mkdirSync(dirname(outPath), { recursive: true });
+    // UDZO is a UDIF image, which is the format `stapler` accepts; a raw or
+    // sparse image would notarize and then refuse the ticket.
+    sh('/usr/bin/hdiutil', [
+      'create',
+      '-volname', volumeName,
+      '-srcfolder', staging,
+      '-ov',
+      '-format', 'UDZO',
+      outPath,
+    ]);
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+  return outPath;
+}
+
+/**
+ * Sign the disk image itself.
+ *
+ * Signing the image as well as the app it carries means a tampered download is
+ * rejected before anything is mounted, rather than at the moment the app is
+ * launched.
+ */
+export function signAideskDmg(dmgPath, options = {}) {
+  const identity = options.identity ?? process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim() ?? '';
+  if (!identity) {
+    sh('/usr/bin/codesign', ['--force', '--sign', '-', dmgPath]);
+    return;
+  }
+  if (!/^[A-F0-9]{40}$/iu.test(identity)) {
+    throw new Error('IMCODES_MACOS_SIGNING_IDENTITY must be a SHA-1 fingerprint');
+  }
+  sh('/usr/bin/codesign', ['--force', '--timestamp', '--sign', identity, dmgPath]);
+  sh('/usr/bin/codesign', ['--verify', '--strict', '--verbose=2', dmgPath]);
+}
+
 export function buildAideskApp(input) {
   const { outDir, computerUseArchive, version, minimumSystemVersion = '12.3' } = input;
   const bundlePath = join(outDir, AIDESK_APP_NAME);
@@ -201,10 +257,23 @@ export function buildAideskApp(input) {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('build-aidesk-app.mjs')) {
-  const outDir = process.argv[2] ?? join(root, 'dist-node-exe');
-  const archive = process.argv[3]
-    ?? join(root, 'dist-node-exe', 'computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip');
+  const mode = process.argv[2] === 'dmg' ? 'dmg' : 'app';
+  const args = process.argv.slice(mode === 'dmg' ? 3 : 2);
+  const outDir = args[0] ?? join(root, 'dist-node-exe');
   const version = process.env.IMCODES_BUILD_VERSION ?? '0.0.0';
-  const built = buildAideskApp({ outDir, computerUseArchive: archive, version });
-  process.stdout.write(`${built}\n`);
+  if (mode === 'dmg') {
+    // Built from the app as it stands, which by this point carries its own
+    // stapled ticket -- so the app keeps verifying offline after being dragged
+    // out of the image.
+    const appPath = join(outDir, AIDESK_APP_NAME);
+    const dmgPath = join(outDir, `aiDesk.to-${version}.dmg`);
+    buildAideskDmg({ appPath, outPath: dmgPath });
+    signAideskDmg(dmgPath);
+    process.stdout.write(`${dmgPath}\n`);
+  } else {
+    const archive = args[1]
+      ?? join(root, 'dist-node-exe', 'computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip');
+    const built = buildAideskApp({ outDir, computerUseArchive: archive, version });
+    process.stdout.write(`${built}\n`);
+  }
 }

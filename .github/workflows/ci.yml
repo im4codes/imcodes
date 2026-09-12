@@ -778,6 +778,20 @@ jobs:
           APP="$(node scripts/build-aidesk-app.mjs dist-node-exe)"
           node scripts/macos-release-signing.mjs notarize "$APP"
           xcrun stapler validate "$APP"
+      - name: Build, sign and notarize the aiDesk disk image
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # Built from the app as it now stands, which already carries its own
+          # stapled ticket -- so the app keeps verifying offline after being
+          # dragged out of the image. A disk image rather than a package: both
+          # can be stapled, but one is a drag and the other is a wizard.
+          DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
+          node scripts/macos-release-signing.mjs notarize "$DMG"
+          xcrun stapler validate "$DMG"
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -866,6 +880,7 @@ jobs:
             dist-node-exe/${{ matrix.artifact }}.manifest.json
             dist-node-exe/computer-use-helper/**
             dist-node-exe/aiDesk.to by IM.codes.app/**
+            dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
           if-no-files-found: error
           retention-days: 30
