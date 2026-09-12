@@ -170,11 +170,18 @@ jobs:
       # thin -- the build plan sets universalBinary = false and the runtime
       # verifier rejects a fat Mach-O -- and both SDKs carry an arm64
       # toolchain, so this must run on an Apple silicon runner.
-      - name: Build macOS remote-desktop components from the pinned SDK
+      - name: Build, sign and notarize the macOS remote-desktop components
         if: runner.os == 'macOS'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # IMCODES_MACOS_SIGNING_IDENTITY and IMCODES_MACOS_NOTARY_KEY_PATH
+          # are already in the job environment, written by the import and
+          # notary-key steps above; these are the two the driver additionally
+          # needs, under the same names macos-release-signing.mjs uses.
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
         run: |
           set -euo pipefail
           for arch in arm64 x64; do
@@ -191,10 +198,15 @@ jobs:
               "$download/$asset" "$sdk"
             node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
               --target "macos-$arch" "$lock" "$sdk"
-            bash native/macos-remote-desktop/build-worker-from-sdk.sh \
+            # The driver, not the build script: it also signs each component
+            # with its own entitlements, notarizes each one, runs the guards the
+            # daemon applies on a user's Mac, and writes the manifest.
+            node scripts/build-macos-remote-desktop-release.mjs \
+              --arch "$arch" \
               --sdk-root "$sdk" \
               --artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch" \
-              --target-cpu "$arch" --jobs 3
+              --worker-version "$IMCODES_BUILD_VERSION" \
+              --jobs 3
             # Reclaimed immediately: two extracted SDKs are ~1.7GB, and the
             # runner still has the signing and packaging steps to do.
             rm -rf "$download" "$sdk"
@@ -249,6 +261,18 @@ jobs:
             RunNativeTests = $true
           }
           & .\native\windows-remote-desktop\build-worker-from-sdk.ps1 @buildArguments
+      - name: Verify the produced macOS remote-desktop component sets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Per architecture and as a SET: the per-component guards already ran
+          # inside the driver, but this is what checks the manifest describes
+          # exactly the files present, at the version this build claims.
+          for arch in arm64 x64; do
+            node scripts/remote-desktop-worker-artifacts.mjs verify \
+              dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
+          done
       - name: Verify production remote-desktop worker artifact
         if: runner.os == 'Windows'
         run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}"

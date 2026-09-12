@@ -96,14 +96,18 @@ export function signComponent(component, executablePath, dependencies = {}) {
     repositoryRoot, 'native', 'macos-remote-desktop', component.entitlementsFile,
   );
   const [tool, ...args] = component.codesign;
-  execute(tool, [
-    ...args.map((argument) => (
-      // The plan carries the repository-relative entitlements path so that the
-      // plan hash is the same on any machine; the executor is what resolves it.
-      argument === component.entitlements ? entitlementsPath : argument
-    )),
-    executablePath,
-  ]);
+  // Matched against `entitlementsFile`, the repository-relative PATH. The
+  // plan's `entitlements` field is the parsed plist -- an object -- so
+  // comparing against it never matches and codesign is handed a relative path
+  // that resolves only when the process happens to be running inside
+  // native/macos-remote-desktop.
+  const resolved = args.map((argument) => (
+    argument === component.entitlementsFile ? entitlementsPath : argument
+  ));
+  if (!resolved.includes(entitlementsPath)) {
+    throw new Error(`codesign arguments for ${component.kind} carry no entitlements path to resolve`);
+  }
+  execute(tool, [...resolved, executablePath]);
 }
 
 /**
@@ -221,6 +225,19 @@ export async function buildMacosRemoteDesktopRelease(input, dependencies = {}) {
   return { plan, manifest, artifactRoot };
 }
 
+/**
+ * Named up front rather than discovered as an undefined deep inside notarytool.
+ *
+ * A missing credential otherwise surfaces as an Apple-side rejection minutes
+ * into a release build, with a message about the submission rather than about
+ * the variable nobody set.
+ */
+function requireEnv(name) {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
 async function main() {
   const [, , ...argv] = process.argv;
   const options = {};
@@ -234,11 +251,8 @@ async function main() {
     }
     options[key] = argv[index + 1];
   }
-  const teamId = process.env.IMCODES_MACOS_TEAM_ID?.trim();
-  const signingIdentity = process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim();
-  if (!teamId || !signingIdentity) {
-    throw new Error('IMCODES_MACOS_TEAM_ID and IMCODES_MACOS_SIGNING_IDENTITY are required');
-  }
+  const teamId = requireEnv('IMCODES_MACOS_TEAM_ID');
+  const signingIdentity = requireEnv('IMCODES_MACOS_SIGNING_IDENTITY');
   const result = await buildMacosRemoteDesktopRelease({
     arch: options.arch,
     sdkRoot: options['sdk-root'],
@@ -247,10 +261,12 @@ async function main() {
     jobs: options.jobs === undefined ? undefined : Number(options.jobs),
     teamId,
     signingIdentity,
+    // The same three names `macos-release-signing.mjs` already requires, so one
+    // set of secrets serves the app bundle and the components.
     notaryCredentials: {
-      apiKeyPath: process.env.IMCODES_MACOS_NOTARY_KEY_PATH,
-      apiKeyId: process.env.IMCODES_MACOS_NOTARY_KEY_ID,
-      apiIssuer: process.env.IMCODES_MACOS_NOTARY_ISSUER_ID,
+      apiKeyPath: requireEnv('IMCODES_MACOS_NOTARY_KEY_PATH'),
+      apiKeyId: requireEnv('IMCODES_MACOS_NOTARY_KEY_ID'),
+      apiIssuer: requireEnv('IMCODES_MACOS_NOTARY_ISSUER'),
     },
     toolchain: JSON.parse(readFileSync(join(resolve(options['sdk-root']), 'sdk-build.json'), 'utf8')).toolchain,
   });

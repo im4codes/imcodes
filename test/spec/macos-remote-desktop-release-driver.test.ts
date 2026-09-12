@@ -8,9 +8,11 @@ import {
   buildMacosRemoteDesktopRelease,
   compileComponents,
   notarizeComponents,
+  signComponent,
 } from '../../scripts/build-macos-remote-desktop-release.mjs';
 import {
   MACOS_REMOTE_DESKTOP_BUILD_COMPONENT_ORDER,
+  buildMacosRemoteDesktopBuildPlan,
 } from '../../scripts/macos-remote-desktop-build.mjs';
 import {
   REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
@@ -121,6 +123,26 @@ describe('macOS remote-desktop release driver', () => {
       result.plan.components.map((component: { entitlementsFile: string }) => component.entitlementsFile),
     );
     expect(entitlements.size).toBe(MACOS_REMOTE_DESKTOP_BUILD_COMPONENT_ORDER.length);
+  });
+
+  it('hands codesign an absolute entitlements path', async () => {
+    // The plan's `entitlements` field is the PARSED plist, an object; the path
+    // is `entitlementsFile`. Substituting against the wrong one silently left
+    // codesign a relative path that resolves only when the process happens to
+    // be running inside native/macos-remote-desktop -- so it worked from one
+    // directory and signed with no entitlements from anywhere else.
+    const plan = await buildMacosRemoteDesktopBuildPlan({
+      arch: 'arm64', teamId: TEAM_ID, signingIdentity: SIGNING_IDENTITY, workerVersion: WORKER_VERSION,
+    });
+    for (const component of plan.components) {
+      const args: string[] = [];
+      signComponent(component, '/release/component', {
+        run: (_tool: string, given: string[]) => { args.push(...given); },
+      });
+      const value = args[args.indexOf('--entitlements') + 1];
+      expect(value.startsWith('/')).toBe(true);
+      expect(value.endsWith(component.entitlementsFile)).toBe(true);
+    }
   });
 
   it('emits a manifest the shared strict validator accepts', async () => {
