@@ -547,6 +547,7 @@
     "transport_send_queued_count": "{{count}} 件キュー中",
     "transport_queue_append": "追加",
     "transport_queue_append_all": "すべて追加",
+    "transport_queue_append_all_confirm": "すべて追加しますか？",
     "transport_queue_append_failed": "メッセージを追加できませんでした。キューには残っています。",
     "stop_appended_queue": "キューのメッセージを追加しました。セッションは実行中です。",
     "send_placeholder": "{{name}} へ送信…",

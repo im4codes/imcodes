@@ -44,6 +44,7 @@ import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
 } from '../../shared/agent-delegation.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -768,6 +769,466 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
     expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content))
       .toEqual(['A', 'B', 'C']);
+  });
+
+  it('auto-appends through provider-native active work after the tracked dispatch has settled', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const appended = vi.fn();
+    runtime.onActiveAppend = appended;
+
+    runtime.send('foreground work', 'foreground-provider-owned');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.sending).toBe(false);
+    expect((runtime as unknown as { _activeDispatchId: number | null })._activeDispatchId).toBeNull();
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: {
+        scope: 'session',
+        sessionName: 'deck_test_brain',
+        generation: 1,
+      },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append automatically', 'auto-append-provider-owned', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'auto-append-provider-owned',
+      text: 'append automatically',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(appended).toHaveBeenCalledWith(
+      [expect.objectContaining({ clientMessageId: 'auto-append-provider-owned' })],
+      expect.objectContaining({ pendingMessageEntries: [] }),
+    );
+  });
+
+  it('does not auto-append ahead of an entry waiting on a recoverable retry', async () => {
+    // The null-dispatch auto-append path fires while `_activeDispatchId` is
+    // null, and a pending recoverable retry is exactly that state: A already
+    // left send() and is scheduled to go again, so it owns the head of the
+    // queue. Native-appending B there would deliver it to the provider before
+    // A's retry, which is an ordering violation the durable queue cannot undo.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'fetch failed',
+      recoverable: true,
+    });
+
+    expect(runtime.send('first message', 'retry-head-A')).toBe('sent');
+    await flushDispatch();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'retry-head-A', text: 'first message' },
+    ]);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append behind the retry', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation, 'B must not jump the retrying head').not.toHaveBeenCalled();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['retry-head-A', 'append-B']);
+  });
+
+  it('does not auto-append while an sdk_turn_lost recovery owns the queue head', async () => {
+    // FIFO integrity for the turn-lost mode: B must stay durably queued and
+    // must not be natively delivered while A is being replayed.
+    //
+    // Honest scope: this is a regression guard, NOT proof that the
+    // `_sdkTurnLostRecoveryAttempt === null` clause is load-bearing. A probe
+    // showed this scenario never reaches the null-dispatch append branch at all
+    // (the replay keeps a tracked dispatch id), so removing that clause leaves
+    // this test green. It still catches a future change that made the branch
+    // reachable here and fired it.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(sdkTurnLostError())
+      .mockImplementationOnce(() => new Promise(() => {}));
+
+    expect(runtime.send('lost turn head', 'turn-lost-A')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append behind the lost turn', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['append-B']);
+  });
+
+  it('does not auto-append while a dispatch is still in flight without an id', async () => {
+    // FIFO integrity while A's provider send is unsettled: B must stay queued.
+    //
+    // Honest scope: also a regression guard rather than proof. The probe showed
+    // an unsettled send keeps a tracked dispatch id, so the null-dispatch branch
+    // is not entered and the `hasInFlightDispatchWork()` clause is never the
+    // sole blocker in any scenario I could construct.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise(() => {}));
+
+    expect(runtime.send('unsettled head', 'inflight-A')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append behind the unsettled head', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['append-B']);
+  });
+
+  it('reschedules the owner transition when a deferred admission outlives its dispatch', async () => {
+    // P1. The exact audited sequence:
+    //   1. dispatch A is provider-accepted;
+    //   2. append B starts the flush owned by A's non-null dispatchId and its
+    //      native admission has not resolved;
+    //   3. A completes while the provider snapshot still reports foreground work;
+    //   4. append C queues and asks for a null-dispatch flush, which used to
+    //      return for the sole reason that `_activeAppendFlush` was non-null;
+    //   5. B's admission resolves, the old flush sees it no longer owns A, exits
+    //      and clears the handle;
+    //   6. nothing rescheduled, so C stayed in the runtime AND the durable queue
+    //      forever even though the provider was still working.
+    // A dropped request is not a retry that lost a race -- it is silence.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    const admissions: string[] = [];
+    let releaseB: (() => void) | null = null;
+    mock.provider.notifyActiveDelegation = vi.fn(async (_sid: string, payload: { notificationId: string }) => {
+      admissions.push(payload.notificationId);
+      if (payload.notificationId === 'append-B') {
+        await new Promise<void>((resolve) => { releaseB = resolve; });
+      }
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    }) as never;
+
+    const providerForeground = () => ({
+      status: 'current' as const,
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    });
+
+    // (1) A is dispatched and provider-accepted.
+    runtime.send('dispatch A', 'dispatch-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(providerForeground);
+
+    // (2) B queues and owns the flush under A's dispatch id; its admission hangs.
+    expect(runtime.send('append B', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+    expect(admissions, 'B must be in flight before A settles').toEqual(['append-B']);
+    expect(releaseB).not.toBeNull();
+
+    // (3) A completes; the provider is still working, so the runtime keeps queueing.
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect((runtime as unknown as { _activeDispatchId: number | null })._activeDispatchId).toBeNull();
+
+    // (4) C arrives and requests the null-dispatch flush while B still holds it.
+    expect(runtime.send('append C', 'append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    // (5) B resolves; the old flush exits and must hand the turn to C.
+    releaseB?.();
+    await flushDispatch();
+    await flushDispatch();
+
+    expect(admissions, 'B then C, each admitted exactly once, in order')
+      .toEqual(['append-B', 'append-C']);
+    expect(runtime.pendingEntries, 'C must not be stranded in the runtime').toEqual([]);
+    expect(
+      getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries,
+      'C must not be stranded in the durable queue',
+    ).toEqual([]);
+  });
+
+  it('discards a pending transition whose owner lost authority before the handoff', async () => {
+    // Reverse edge of the same mechanism. The retained request must be a
+    // request, not a promise: if the provider stops reporting foreground work
+    // before the old flush hands over, C must not be admitted.
+    //
+    // Honest scope: this pins the BEHAVIOUR, not the authority gate. Authority
+    // is enforced three times over -- the `ownsActiveAppendFlush` guard at the
+    // top of `scheduleActiveAppendFlush`, the same check at the head of the
+    // flush loop, and the append operation's own refusal once foreground work
+    // is gone -- and a mutant that deletes the first two together still leaves
+    // this test green. It is a regression guard for the outcome, and it is the
+    // reason the redundant re-check that once sat in the flush's `finally` was
+    // removed rather than kept as an untested safeguard.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    const admissions: string[] = [];
+    let releaseB: (() => void) | null = null;
+    mock.provider.notifyActiveDelegation = vi.fn(async (_sid: string, payload: { notificationId: string }) => {
+      admissions.push(payload.notificationId);
+      if (payload.notificationId === 'append-B') {
+        await new Promise<void>((resolve) => { releaseB = resolve; });
+      }
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    }) as never;
+    const foreground = vi.fn(() => ({
+      status: 'current' as const,
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    runtime.send('dispatch A', 'dispatch-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = foreground;
+    expect(runtime.send('append B', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.send('append C', 'append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    // Provider foreground work ends before B hands over, so C's owner is gone.
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current' as const,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    releaseB?.();
+    await flushDispatch();
+    await flushDispatch();
+
+    expect(admissions, 'C must not be admitted once its owner stopped being authoritative')
+      .toEqual(['append-B']);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['append-C']);
+  });
+
+  it.each([
+    ['unsupported', AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED],
+    ['stale', AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE],
+  ])('does not spin a pending transition when the handed-over admission is %s', async (_label, admission) => {
+    // The pending transition must fire at most once per blocked request. If a
+    // non-delivered admission could re-arm it, every rejection would schedule
+    // the next attempt and the runtime would spin against the provider.
+    //
+    // Honest scope: also behavioural. Nothing re-arms the request -- only an
+    // explicit `scheduleActiveAppendFlush` call does -- so moving the clear
+    // after the dispatch still cannot spin, and that mutant leaves this green.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    const admissions: string[] = [];
+    let releaseB: (() => void) | null = null;
+    mock.provider.notifyActiveDelegation = vi.fn(async (_sid: string, payload: { notificationId: string }) => {
+      admissions.push(payload.notificationId);
+      if (payload.notificationId === 'append-B') {
+        await new Promise<void>((resolve) => { releaseB = resolve; });
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+      }
+      return admission;
+    }) as never;
+    const foreground = () => ({
+      status: 'current' as const,
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    });
+
+    runtime.send('dispatch A', 'dispatch-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(foreground);
+    runtime.send('append B', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    });
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    runtime.send('append C', 'append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    });
+    await flushDispatch();
+    releaseB?.();
+    for (let i = 0; i < 5; i++) await flushDispatch();
+
+    expect(admissions.filter((id) => id === 'append-C'), 'C is attempted once, never retried in a loop')
+      .toHaveLength(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['append-C']);
+  });
+
+  it('leaves a handoff-leased entry out of the auto-append flush without losing it', async () => {
+    // The sixth failure mode. A row under a handoff lease may already be
+    // executing at the provider, so auto-append must neither deliver it again
+    // nor drop it: the durable row stays exactly once, still leased.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+
+    runtime.send('foreground work', 'foreground-handoff');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    // Provider-native work must already be visible, otherwise send() dispatches
+    // directly and there is no queued row to lease.
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(runtime.send('leased append', 'handoff-append', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+    getTransportQueueStore().markHandoffInFlight('deck_test_brain', ['handoff-append']);
+
+    expect(runtime.send('second leased append', 'handoff-append-2', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    const rows = getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries
+      .map((entry) => entry.clientMessageId);
+    expect(rows, 'no duplication and no loss under a handoff lease')
+      .toEqual([...new Set(rows)]);
+    expect(rows).toContain('handoff-append');
+  });
+
+  it.each([
+    ['stale', AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE],
+    ['unsupported', AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED],
+  ])('retains exact durable FIFO when a provider-owned auto-append returns %s', async (_label, admission) => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(admission);
+    runtime.send('foreground work', 'foreground-provider-rejection');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('B', 'auto-append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    expect(runtime.send('C', 'auto-append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'auto-append-B', text: 'B' },
+      { clientMessageId: 'auto-append-C', text: 'C' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['auto-append-B', 'auto-append-C']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-B')).toBe(false);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-C')).toBe(false);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+  });
+
+  it('retains exact durable FIFO when a provider-owned auto-append throws', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockRejectedValue(new Error('provider write failed'));
+    runtime.send('foreground work', 'foreground-provider-failure');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('B', 'auto-append-throw-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    expect(runtime.send('C', 'auto-append-throw-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'auto-append-throw-B', text: 'B' },
+      { clientMessageId: 'auto-append-throw-C', text: 'C' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['auto-append-throw-B', 'auto-append-throw-C']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-throw-B')).toBe(false);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-throw-C')).toBe(false);
   });
 
   it('fails an unsupported external MCP append without falling back to the FIFO', async () => {

@@ -415,6 +415,11 @@ const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabiliti
   };
 };
 
+function confirmAppendAll(): void {
+  fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+  fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all_confirm' }));
+}
+
 /** Helpers accept either path (regular `sendSessionCommand` or the urgent
  *  variant `sendSessionCommandUrgent`) — caller's choice depends on whether
  *  `text` is `/stop` (urgent) or anything else (regular). Tests that need
@@ -5000,14 +5005,113 @@ afterEach(() => {
     expect(appendAll.parentElement?.firstElementChild).toBe(appendAll);
     fireEvent.click(appendAll);
 
+    expect(ws.send, 'the first click only arms the inline confirmation').not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session.append_queued_messages' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all_confirm' }));
+
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'session.append_queued_messages',
       sessionName: 'qwen-session',
       clientMessageIds: ['msg-1', 'msg-2'],
       commandId: expect.any(String),
     }));
+    expect(ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'session.append_queued_messages'
+    ))).toHaveLength(1);
     expect(screen.queryByText('first append')).toBeNull();
     expect(screen.queryByText('second append')).toBeNull();
+  });
+
+  it('cancels an armed Append all when its context changes', () => {
+    const ws = makeWs();
+    const controls = (sessionName: string, entries: SessionInfo['transportPendingMessageEntries'], subSessionId?: string) => (
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: sessionName,
+          state: 'running',
+          transportPendingMessageEntries: entries,
+          transportPendingMessageVersion: entries?.length ?? 0,
+        })}
+        subSessionId={subSessionId}
+        quickData={makeQuickData() as any}
+      />
+    );
+    const view = render(controls('qwen-session', [
+      { clientMessageId: 'msg-1', text: 'first append' },
+      { clientMessageId: 'msg-2', text: 'second append' },
+    ]));
+    const arm = (): void => {
+      fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+      expect(screen.getByRole('button', { name: 'transport_queue_append_all_confirm' })).toBeDefined();
+    };
+    const expectNotSent = (): void => {
+      expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: 'session.append_queued_messages',
+      }));
+    };
+
+    arm();
+    fireEvent.click(document.body);
+    expect(screen.getByRole('button', { name: 'transport_queue_append_all' })).toBeDefined();
+
+    arm();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.getByRole('button', { name: 'transport_queue_append_all' })).toBeDefined();
+
+    arm();
+    view.rerender(controls('qwen-session', [
+      { clientMessageId: 'msg-1', text: 'first append' },
+      { clientMessageId: 'msg-2', text: 'second append' },
+      { clientMessageId: 'msg-3', text: 'new queue content' },
+    ]));
+    expect(screen.getByRole('button', { name: 'transport_queue_append_all' })).toBeDefined();
+
+    arm();
+    view.rerender(controls('qwen-session', [
+      { clientMessageId: 'msg-1', text: 'first append' },
+      { clientMessageId: 'msg-2', text: 'second append' },
+      { clientMessageId: 'msg-3', text: 'new queue content' },
+    ], 'sub-2'));
+    expect(screen.getByRole('button', { name: 'transport_queue_append_all' })).toBeDefined();
+
+    arm();
+    view.rerender(controls('other-session', [
+      { clientMessageId: 'msg-1', text: 'first append' },
+    ], 'sub-2'));
+    expect(screen.getByRole('button', { name: 'transport_queue_append_all' })).toBeDefined();
+    expectNotSent();
+  });
+
+  it('cancels an armed Append all when the server changes under it', () => {
+    // serverId is part of the confirmation scope but was the one context change
+    // the cancel test never varied. Confirming into a different server would
+    // append this queue on a machine the user never looked at.
+    const ws = makeWs();
+    const controls = (serverId: string) => (
+      <SessionControls
+        ws={ws as any}
+        serverId={serverId}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          state: 'running',
+          transportPendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'first append' }],
+          transportPendingMessageVersion: 1,
+        })}
+        quickData={makeQuickData() as any}
+      />
+    );
+    const view = render(controls('server-a'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    expect(screen.getByRole('button', { name: 'transport_queue_append_all_confirm' })).toBeDefined();
+
+    view.rerender(controls('server-b'));
+    expect(screen.getByRole('button', { name: 'transport_queue_append_all' })).toBeDefined();
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+    }));
   });
 
   it('uses Stop to append the queue first and shows that the session is still running', () => {
@@ -5762,7 +5866,7 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    confirmAppendAll();
     const append = ws.send.mock.calls.find(([payload]) => (
       payload?.type === 'session.append_queued_messages'
     ))?.[0] as { commandId: string };
@@ -5895,7 +5999,7 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    confirmAppendAll();
     const append = ws.send.mock.calls.find(([payload]) => (
       payload?.type === 'session.append_queued_messages'
     ))?.[0] as { commandId: string };
@@ -6119,7 +6223,7 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    confirmAppendAll();
     const append = ws.send.mock.calls.find(([payload]) => (
       payload?.type === 'session.append_queued_messages'
     ))?.[0] as { commandId: string };
@@ -6169,7 +6273,7 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    confirmAppendAll();
     const append = ws.send.mock.calls.find(([payload]) => (
       payload?.type === 'session.append_queued_messages'
     ))?.[0] as { commandId: string };
@@ -6219,7 +6323,7 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    confirmAppendAll();
     const append = ws.send.mock.calls.find(([payload]) => (
       payload?.type === 'session.append_queued_messages'
     ))?.[0] as { commandId: string };
@@ -6262,7 +6366,7 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    confirmAppendAll();
     const append = ws.send.mock.calls.find(([payload]) => (
       payload?.type === 'session.append_queued_messages'
     ))?.[0] as { commandId: string };
