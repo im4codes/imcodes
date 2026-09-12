@@ -303,6 +303,27 @@ async function main() {
     : `computer-use-helper/${platform}-${arch}/open-computer-use${isWin ? '.exe' : ''}`;
   const helperPath = join(buildDir, ...helperRelativePath.split('/'));
 
+  // On macOS the helper archive carries our own application bundle rather than
+  // the upstream one, so that permissions are granted to `to.aidesk.app` once
+  // instead of to a bundle signed by someone else. It is built HERE, before the
+  // manifest is written, because the manifest records the archive's hash: swap
+  // the archive afterwards and every consumer rejects the set as tampered with.
+  //
+  // Only when a release identity is present. An ad-hoc bundle is refused by the
+  // runtime's own verifier, so a local build keeps the upstream archive that
+  // actually works instead of a replacement that cannot.
+  if (platform === 'darwin' && process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim()) {
+    const { buildAideskApp, publishAideskHelperSidecar, AIDESK_APP_NAME } =
+      await import('./build-aidesk-app.mjs');
+    const appPath = buildAideskApp({
+      outDir: buildDir,
+      computerUseArchive: helperPath,
+      version: buildVersion,
+    });
+    publishAideskHelperSidecar({ appPath, sidecarPath: helperPath });
+    console.log(`✅ published ${AIDESK_APP_NAME} as the Computer Use helper archive`);
+  }
+
   const manifestPath = `${outPath}${NODE_EXE_MANIFEST_SUFFIX}`;
   const manifest = await createNodeExeManifest({
     artifactPath: outPath,

@@ -145,14 +145,12 @@ jobs:
           # person chose rather than to whatever launched a helper. Unlike the
           # bare executable this one CAN carry its notarization ticket, so it
           # verifies with no network.
-          APP="$(node scripts/build-aidesk-app.mjs dist-node-exe)"
+          # Built during `build:node-exe`, before the manifest recorded the
+          # helper archive's hash -- swapping the archive afterwards makes
+          # every consumer reject the set as tampered with.
+          APP="dist-node-exe/aiDesk.to by IM.codes.app"
           node scripts/macos-release-signing.mjs notarize "$APP"
           xcrun stapler validate "$APP"
-          # Publish the stapled bundle as the helper archive the daemon already
-          # downloads. This is what moves the permission grant from the
-          # upstream Open Computer Use bundle, signed by someone else, onto
-          # ours -- the daemon extracts this and launches aidesk-agent from it.
-          node scripts/build-aidesk-app.mjs sidecar dist-node-exe
       - name: Build, sign and notarize the aiDesk disk image
         if: runner.os == 'macOS'
         env:

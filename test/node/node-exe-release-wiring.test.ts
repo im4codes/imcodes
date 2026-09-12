@@ -495,7 +495,7 @@ describe('controlled-node executable release wiring', () => {
     // one that shipped would silently need the network on first launch.
     for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
       const workflow = readFileSync(file, 'utf8');
-      const build = workflow.indexOf('node scripts/build-aidesk-app.mjs dist-node-exe');
+      const build = workflow.indexOf('run: npm run build:node-exe');
       const notarize = workflow.indexOf('macos-release-signing.mjs notarize "$APP"');
       const validate = workflow.indexOf('xcrun stapler validate "$APP"');
       // Uploaded only inside containers that keep permissions -- see the
@@ -530,24 +530,6 @@ describe('controlled-node executable release wiring', () => {
     }
   });
 
-  it('publishes the stapled bundle as the helper the daemon downloads', () => {
-    // Without this the bundle is only a build artifact: the daemon keeps
-    // installing the upstream Open Computer Use app, and macOS keeps
-    // attributing Screen Recording and Accessibility to a bundle signed by
-    // someone else. Publishing it is what makes one authorisation ours.
-    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
-      const workflow = readFileSync(file, 'utf8');
-      const stapleApp = workflow.indexOf('xcrun stapler validate "$APP"');
-      const sidecar = workflow.indexOf('build-aidesk-app.mjs sidecar dist-node-exe');
-      const buildDmg = workflow.indexOf('build-aidesk-app.mjs dmg dist-node-exe');
-
-      expect([stapleApp, sidecar, buildDmg].every((at) => at >= 0), file).toBe(true);
-      // After stapling, so the archived copy carries its own ticket.
-      expect(stapleApp, file).toBeLessThan(sidecar);
-      expect(sidecar, file).toBeLessThan(buildDmg);
-    }
-  });
-
   it('never uploads the bundle as a bare directory', () => {
     // Measured on a Mac, not assumed: GitHub artifacts normalise every file to
     // 644, so an app uploaded as a directory comes back with its executables
@@ -559,7 +541,40 @@ describe('controlled-node executable release wiring', () => {
       const workflow = readFileSync(file, 'utf8');
       expect(workflow, file).not.toContain('dist-node-exe/aiDesk.to by IM.codes.app/**');
       expect(workflow, file).toContain('dist-node-exe/*.dmg');
-      expect(workflow, file).toContain('build-aidesk-app.mjs sidecar dist-node-exe');
+      // The archive that carries it is produced by the build, not by a step
+      // here -- see the manifest-ordering test below.
+      expect(workflow, file).toContain('dist-node-exe/computer-use-helper/**');
     }
+  });
+
+  it('builds the helper archive before the manifest records its hash', () => {
+    // The manifest records the archive's size and sha256. Replacing the
+    // archive afterwards makes every consumer reject the whole artifact set as
+    // tampered with -- which is exactly how CI failed, with a message about
+    // the helper being "missing or empty" while the file sat there intact.
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    const publish = build.indexOf('publishAideskHelperSidecar');
+    const manifest = build.indexOf('await createNodeExeManifest(');
+    expect(publish, 'the bundle is published during the build').toBeGreaterThanOrEqual(0);
+    expect(publish).toBeLessThan(manifest);
+
+    // And CI must not put it back afterwards.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      expect(workflow, file).not.toContain('build-aidesk-app.mjs sidecar');
+    }
+  });
+
+  it('leaves a local build with the upstream archive that actually works', () => {
+    // Without a release identity the bundle is ad-hoc signed, and the runtime's
+    // own verifier requires a Developer ID authority -- so replacing the
+    // archive on a developer machine would hand the daemon a helper it refuses.
+    // Better the upstream one, which works.
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    expect(build).toContain("process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim()");
+    const guard = build.indexOf("if (platform === 'darwin' && process.env.IMCODES_MACOS_SIGNING_IDENTITY");
+    const publish = build.indexOf('publishAideskHelperSidecar');
+    expect(guard, 'the replacement is guarded').toBeGreaterThanOrEqual(0);
+    expect(guard).toBeLessThan(publish);
   });
 });
