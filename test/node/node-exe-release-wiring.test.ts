@@ -527,4 +527,22 @@ describe('controlled-node executable release wiring', () => {
       expect(notarizeDmg, file).toBeLessThan(validateDmg);
     }
   });
+
+  it('publishes the stapled bundle as the helper the daemon downloads', () => {
+    // Without this the bundle is only a build artifact: the daemon keeps
+    // installing the upstream Open Computer Use app, and macOS keeps
+    // attributing Screen Recording and Accessibility to a bundle signed by
+    // someone else. Publishing it is what makes one authorisation ours.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      const stapleApp = workflow.indexOf('xcrun stapler validate "$APP"');
+      const sidecar = workflow.indexOf('build-aidesk-app.mjs sidecar dist-node-exe');
+      const buildDmg = workflow.indexOf('build-aidesk-app.mjs dmg dist-node-exe');
+
+      expect([stapleApp, sidecar, buildDmg].every((at) => at >= 0), file).toBe(true);
+      // After stapling, so the archived copy carries its own ticket.
+      expect(stapleApp, file).toBeLessThan(sidecar);
+      expect(sidecar, file).toBeLessThan(buildDmg);
+    }
+  });
 });

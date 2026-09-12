@@ -195,6 +195,31 @@ export function signAideskApp(bundlePath, options = {}) {
  *
  * The symlink is what makes the window a drag target instead of a puzzle.
  */
+/**
+ * Publish the bundle as the helper sidecar the daemon already downloads.
+ *
+ * This is what turns the bundle from a build artifact into the thing that
+ * actually holds the permissions. The daemon fetches this archive, extracts it
+ * into its runtime root, and launches `Contents/MacOS/aidesk-agent` from it --
+ * so from then on macOS attributes Screen Recording and Accessibility to
+ * `to.aidesk.app` rather than to the upstream Open Computer Use bundle signed
+ * by someone else entirely.
+ *
+ * Written over the same path the upstream archive used, because every consumer
+ * -- the artifact catalogue, the upgrade download, the runtime's archive
+ * validator -- already accepts either bundle by name.
+ */
+export function publishAideskHelperSidecar(input) {
+  const { appPath, sidecarPath } = input;
+  if (!existsSync(appPath)) throw new Error(`app bundle not found: ${appPath}`);
+  mkdirSync(dirname(sidecarPath), { recursive: true });
+  rmSync(sidecarPath, { force: true });
+  // `--keepParent` so the archive root is the bundle itself, which is what the
+  // runtime's entry validator requires.
+  sh('/usr/bin/ditto', ['-c', '-k', '--keepParent', appPath, sidecarPath]);
+  return sidecarPath;
+}
+
 export function buildAideskDmg(input) {
   const { appPath, outPath, volumeName = 'aiDesk.to by IM.codes' } = input;
   if (!existsSync(appPath)) throw new Error(`app bundle not found: ${appPath}`);
@@ -257,11 +282,19 @@ export function buildAideskApp(input) {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('build-aidesk-app.mjs')) {
-  const mode = process.argv[2] === 'dmg' ? 'dmg' : 'app';
-  const args = process.argv.slice(mode === 'dmg' ? 3 : 2);
+  const known = new Set(['dmg', 'sidecar']);
+  const mode = known.has(process.argv[2]) ? process.argv[2] : 'app';
+  const args = process.argv.slice(mode === 'app' ? 2 : 3);
   const outDir = args[0] ?? join(root, 'dist-node-exe');
   const version = process.env.IMCODES_BUILD_VERSION ?? '0.0.0';
-  if (mode === 'dmg') {
+  if (mode === 'sidecar') {
+    // Run after the app is stapled, so the archived copy carries its ticket.
+    const written = publishAideskHelperSidecar({
+      appPath: join(outDir, AIDESK_APP_NAME),
+      sidecarPath: join(outDir, 'computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip'),
+    });
+    process.stdout.write(`${written}\n`);
+  } else if (mode === 'dmg') {
     // Built from the app as it stands, which by this point carries its own
     // stapled ticket -- so the app keeps verifying offline after being dragged
     // out of the image.
