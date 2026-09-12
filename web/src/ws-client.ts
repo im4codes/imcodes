@@ -191,7 +191,24 @@ export type ServerMessage =
   | TimelineHistoryResponseMessage
   | TimelinePageResponseMessage
   | TimelineDetailResponseMessage
-  | { type: typeof MSG_COMMAND_ACK; commandId: string; status: string; session: string; error?: string; activeDispatchId?: string | null }
+  // command.ack is the only reliable, replayable frame in this closure. A
+  // not-found append answers with the recipient-gated queue authority attached
+  // HERE, not on a best-effort timeline event that may never arrive, so these
+  // fields are part of the ack contract rather than unknown extras.
+  | {
+    type: typeof MSG_COMMAND_ACK;
+    commandId: string;
+    status: string;
+    session: string;
+    error?: string;
+    activeDispatchId?: string | null;
+    queueEpoch?: string;
+    queueAuthorityId?: string;
+    pendingMessageVersion?: number;
+    pendingMessageEntries?: unknown;
+    failedMessageEntries?: unknown;
+    queueReconcilesCommandId?: string;
+  }
   | { type: typeof PEER_AUDIT_MESSAGES.CANDIDATES; commandId: string; ok: boolean; list?: import('../../shared/peer-audit.js').PeerAuditCandidateList; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.QUICK_RESULT; commandId: string; ok: boolean; attemptId?: string; resultEventId?: string; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.CANCEL_RESULT; commandId: string; ok: boolean; error?: string }

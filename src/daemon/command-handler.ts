@@ -5273,9 +5273,12 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
         typeof value === 'string' && value.trim() ? [value.trim()] : []
       )))]
     : [];
-  const reject = (error: string): void => {
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
-    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
+  // `extras` ride the RELIABLE ack: emitCommandAckReliable persists them in the
+  // ack outbox and replays them verbatim, so a browser that never received the
+  // best-effort timeline broadcast can still reconcile from the ack alone.
+  const reject = (error: string, extras: Record<string, unknown> = {}): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error, ...extras });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error, ...extras });
   };
   if (!sessionName || clientMessageIds.length === 0 || clientMessageIds.length > TRANSPORT_QUEUE_APPEND_MAX_ENTRIES) {
     reject('Invalid queued message selection');
@@ -5334,15 +5337,35 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
               : 'Queued message not found';
       if (result.status === 'not_found') {
         // A bounded ownership recovery may have retired a pre-session ghost.
-        // Publish the now-authoritative recipient-gated snapshot before the
-        // error ack so the browser removes the stale card instead of restoring
-        // it from optimistic local state.
+        // The browser must be able to retire the stale card instead of
+        // restoring it from optimistic local state -- and it must be able to do
+        // so from the ONE frame this closure delivers reliably.
+        //
+        // The timeline broadcast below is kept so other subscribers of this
+        // session still converge, but correctness no longer depends on its
+        // delivery or its ordering: the same recipient-gated authority is
+        // attached to the reliable, replayable ack. `queueSnapshot` and
+        // `pendingCount` are deliberately left off the ack -- the former would
+        // duplicate the whole projection into every persisted outbox record,
+        // and the latter is a legacy live-queue field the wire validator
+        // rejects. The browser reduces the flat fields it already knows.
         const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
         timelineEmitter.emit(sessionName, 'session.state', {
           state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
           ...queuePayload,
           queueReconcilesCommandId: commandId,
         }, { source: 'daemon', confidence: 'high' });
+        reject(error, {
+          queueEpoch: queuePayload.queueEpoch,
+          queueAuthorityId: queuePayload.queueAuthorityId,
+          pendingMessageVersion: queuePayload.pendingMessageVersion,
+          pendingMessageEntries: queuePayload.pendingMessageEntries,
+          failedMessageEntries: queuePayload.failedMessageEntries,
+          queueReconcilesCommandId: commandId,
+          ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
+          ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
+        });
+        return;
       }
       reject(error);
       return;

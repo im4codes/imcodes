@@ -5262,6 +5262,45 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('carries the whole recipient-gated queue authority on the not-found ack itself', async () => {
+    // The snapshot used to travel ONLY on a best-effort timeline session.state.
+    // command.ack is the reliable, replayable frame, so a browser that loses the
+    // timeline event must still be able to retire the ghost card from the ack
+    // alone. Assert the authority is on the ack, not merely broadcast beside it.
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'not_found' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      // The ghost shape: the runtime still lists the row, the canonical SQLite
+      // queue does not. Listing it also keeps waitForSelectedSessionSends from
+      // polling its bounded window, so the assertion stays deterministic.
+      pendingEntries: [{ clientMessageId: 'ghost-only-in-browser', text: 'ghost card' }],
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['ghost-only-in-browser'],
+      commandId: 'cmd-ack-carries-authority',
+    }, serverLink as any);
+    await flushAsync();
+
+    const snapshot = getTransportQueueStore().readSnapshot('deck_transport_brain');
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-ack-carries-authority',
+      status: 'error',
+      error: 'Queued message not found',
+      queueEpoch: snapshot.queueEpoch,
+      queueAuthorityId: snapshot.queueAuthorityId,
+      pendingMessageVersion: snapshot.pendingMessageVersion,
+      pendingMessageEntries: [],
+      failedMessageEntries: [],
+      queueReconcilesCommandId: 'cmd-ack-carries-authority',
+    }));
+  });
+
   it('appends a displayed canonical row immediately across a stranded same-instance queue epoch', async () => {
     const createdAt = Date.now() - 10_000;
     const canonical = { sessionInstanceId: 'append-stable-instance', runtimeEpoch: 'append-current-epoch' };

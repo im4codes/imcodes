@@ -5688,6 +5688,561 @@ afterEach(() => {
     expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
   });
 
+  it('does not resurrect an absent card when ONLY the not-found ack arrives', async () => {
+    // The field shape: the queue text was not in transport-queue.sqlite and the
+    // daemon reported totalPendingCount=0, yet the card was still on screen and
+    // clicking append answered "Queued message not found" and put the ghost
+    // back. The authoritative snapshot travelled on a best-effort timeline
+    // frame; only the ack is reliable/replayable. Drop the timeline frame and
+    // the reconciliation signal is gone, so rollback restores the ghost.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'ghost-append-id', text: 'ghost append card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+    expect(append.commandId).toBeTruthy();
+
+    act(() => {
+      // No timeline.event at all. The ack alone carries the authority.
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 8,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('ghost append card')).toBeNull());
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+  });
+
+  it('keeps the real survivor when ONLY the not-found ack arrives for a partly missing append', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'ghost-id', text: 'ghost card' },
+            { clientMessageId: 'survivor-id', text: 'survivor card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 8,
+        pendingMessageEntries: [
+          {
+            clientMessageId: 'survivor-id',
+            text: 'survivor card',
+            status: 'queued',
+            placement: 'normal',
+            ordinal: 0,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        ],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+    expect(screen.queryByText('survivor card')).not.toBeNull();
+  });
+
+  it('does not restore a pre-click ghost when newer authority landed before a delayed not-found ack', async () => {
+    // P1. Click at v7, so the rollback holds a pre-click queue that still lists
+    // the ghost. A newer authoritative v9 snapshot then lands WITHOUT
+    // queueReconcilesCommandId -- an ordinary broadcast, correct and accepted.
+    // The not-found ack finally arrives carrying v8: its snapshot is rightly
+    // rejected as stale, which means it is not treated as reconciliation, and
+    // the error rollback then restored the v7 ghost on top of v9 -- stamping it
+    // with v9's version so it looked authoritative. Authority that moved on
+    // after the click supersedes the rollback.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'ghost-id', text: 'ghost card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'newer-authority-v9-empty',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 9,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 9,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        },
+      });
+    });
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 8,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+  });
+
+  it('keeps the newer authority survivor exactly once when a delayed not-found ack is stale', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'ghost-id', text: 'ghost card' },
+            { clientMessageId: 'survivor-id', text: 'survivor card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'newer-authority-v9-survivor',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 9,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 9,
+            pendingMessageEntries: [
+              {
+                clientMessageId: 'survivor-id',
+                text: 'survivor card',
+                status: 'queued',
+                placement: 'normal',
+                ordinal: 0,
+                createdAt: 1,
+                updatedAt: 1,
+              },
+            ],
+            failedMessageEntries: [],
+          },
+        },
+      });
+    });
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 8,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+    expect(screen.getAllByText('survivor card')).toHaveLength(1);
+  });
+
+  it('supersedes the append rollback when the newer authority arrived via session_list', async () => {
+    // The audit named session_list alongside session.state as a carrier of
+    // uncorrelated authority. Supersession must not depend on which frame
+    // carried the snapshot, so assert the same P1 ordering through session_list.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'ghost-id', text: 'ghost card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'qwen-session',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 9,
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+        }],
+      });
+    });
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 8,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+  });
+
+  it('does not restore a pre-click ghost across an accepted queue reset to a new epoch', async () => {
+    // A runtime recreate resets the queue to a fresh epoch/authority. That
+    // snapshot IS accepted because it declares a recognized resetReason, and a
+    // not-found ack still in flight from the old epoch must not reinstate
+    // anything the reset retired.
+    //
+    // Honest scope: this is a regression guard, NOT proof of the supersession
+    // rule. It also passes on the pre-fix implementation, because the accepted
+    // reset already clears the optimistic layer by itself. The two cases that
+    // do discriminate are the v9 empty and v9 survivor tests above.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'ghost-id', text: 'ghost card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'accepted-queue-reset',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 8,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            queueEpoch: 'queue-epoch-2',
+            queueAuthorityId: 'queue-authority-2',
+            pendingMessageVersion: 0,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+            resetReason: 'runtime_recreated',
+          },
+        },
+      });
+    });
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 8,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+  });
+
+  it('fails closed on a stale pendingMessageVersion instead of clearing valid cards', async () => {
+    // Version 6 is older than the rendered 7: a late or replayed ack must not roll the queue backwards.
+    //
+    // Discriminating shape: the rejected snapshot OMITS `kept-card-id`. If the
+    // epoch/authority/version gate were bypassed and the snapshot applied, that
+    // card would be retired by authority it has no right to exercise.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'appended-card-id', text: 'appended card' },
+            { clientMessageId: 'kept-card-id', text: 'kept card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 6,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('kept card')).not.toBeNull());
+  });
+
+  it('fails closed on a cross-epoch ack snapshot with no recognized reset', async () => {
+    // A different epoch reusing the same authority id is unexplained history, not newer truth.
+    //
+    // Discriminating shape: the rejected snapshot OMITS `kept-card-id`. If the
+    // epoch/authority/version gate were bypassed and the snapshot applied, that
+    // card would be retired by authority it has no right to exercise.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'appended-card-id', text: 'appended card' },
+            { clientMessageId: 'kept-card-id', text: 'kept card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+        queueEpoch: 'queue-epoch-2',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 9,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('kept card')).not.toBeNull());
+  });
+
+  it('fails closed when the ack authority id does not match the rendered queue', async () => {
+    // Same epoch, different authority means two writers for one queue, so neither may clear the other's cards.
+    //
+    // Discriminating shape: the rejected snapshot OMITS `kept-card-id`. If the
+    // epoch/authority/version gate were bypassed and the snapshot applied, that
+    // card would be retired by authority it has no right to exercise.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'appended-card-id', text: 'appended card' },
+            { clientMessageId: 'kept-card-id', text: 'kept card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append_all' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        queueReconcilesCommandId: append.commandId,
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-2',
+        pendingMessageVersion: 9,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText('kept card')).not.toBeNull());
+  });
+
   it('keeps only the authoritative survivor when a multi-append selection is partly missing', async () => {
     const ws = makeWs();
     render(

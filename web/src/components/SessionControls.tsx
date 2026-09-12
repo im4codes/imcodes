@@ -1257,11 +1257,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [optimisticallyRemovedQueuedIds, setOptimisticallyRemovedQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
   const reconciledMissingAppendCommandIdsRef = useRef<Set<string>>(new Set());
+  /**
+   * How many authoritative queue snapshots this session has ACCEPTED.
+   *
+   * Append rollback restores the pre-click queue, which is the right answer only
+   * while the click is still the newest thing that happened. Comparing queue
+   * epoch/authority/version at rollback time cannot express that: an accepted
+   * reset moves to a NEW epoch with version 0, which is not "newer" by any
+   * ordering on versions. A monotonic count of accepted snapshots says exactly
+   * what matters -- "authority has answered since you clicked" -- for an empty
+   * snapshot, a partial one, a version bump and a reset alike.
+   */
+  const acceptedQueueSnapshotSeqRef = useRef(0);
   const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
   const queuedMutationRollbackRef = useRef<Map<string,
     | { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }
-    | { type: 'append'; entries: LocalQueuedTransportEntry[]; queue: LocalQueuedTransportEntry[] }
+    // `acceptedSnapshotSeq` is the accepted-snapshot count as it stood when the
+    // click was made. Without it the rollback cannot tell "nothing happened
+    // since" from "authority already answered", and a delayed error ack
+    // restored a pre-click queue on top of newer truth.
+    | {
+      type: 'append';
+      entries: LocalQueuedTransportEntry[];
+      queue: LocalQueuedTransportEntry[];
+      acceptedSnapshotSeq: number;
+    }
   >>(new Map());
   // Command ids that have reached the timeline (a `user.message` event) and are
   // therefore NO LONGER queued — the timeline is the authoritative truth for
@@ -2352,6 +2373,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         } else {
           lastRealtimeEmptyQueueSnapshotRef.current = null;
         }
+        acceptedQueueSnapshotSeqRef.current += 1;
         return true;
       };
       const removeLocalQueuedEntry = (commandId: string, text?: string) => {
@@ -2404,6 +2426,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== sessionName) return;
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
+        // Authority BEFORE rollback. The daemon also broadcasts this snapshot on
+        // a timeline session.state for other subscribers, but that frame is
+        // best-effort: when it was the only carrier, losing it meant the append
+        // rollback restored a card the canonical queue no longer had, and the
+        // next click answered "Queued message not found" again. The ack is the
+        // reliable, replayable frame, so the snapshot it carries is applied here
+        // first and the rollback then runs against post-reconciliation state.
+        //
+        // `applyRealtimeQueueSnapshot` is the SAME gate the timeline path uses:
+        // it returns false for a foreign session, a payload with no snapshot, or
+        // any epoch/authority/stale-version violation, so a rejected snapshot
+        // can never clear a still-valid card.
+        const ackReconcilesCommandId = typeof msg.queueReconcilesCommandId === 'string'
+          ? msg.queueReconcilesCommandId.trim()
+          : '';
+        if (applyRealtimeQueueSnapshot(msg as unknown as Record<string, unknown>, sessionName)
+          && ackReconcilesCommandId
+          && queuedMutationRollbackRef.current.get(ackReconcilesCommandId)?.type === 'append') {
+          reconciledMissingAppendCommandIdsRef.current.add(ackReconcilesCommandId);
+          // The optimistic post-append array is obsolete the moment the queue
+          // authority answers, and an EMPTY one hard-overrides the snapshot
+          // rather than merging with it, so leaving it in place hid a survivor
+          // the authority still listed. Dropping it lets the snapshot alone
+          // decide: the missing card stays gone, the real one stays visible.
+          setOptimisticQueuedEntries(null);
+        }
         if (msg.status === 'error' || msg.status === 'conflict') {
           if (rollback) {
             if (rollback.type === 'undo') {
@@ -2421,11 +2469,56 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 for (const id of rollbackIds) next.delete(id);
                 return next;
               });
-              // The daemon sends an authoritative queue snapshot before a
-              // not-found append ack. If that snapshot arrived after this
-              // mutation started, it is newer authority than the optimistic
-              // pre-click queue and must not be overwritten by rollback.
-              if (!reconciledMissingAppendCommandIdsRef.current.delete(msg.commandId)) {
+              // Rollback restores the PRE-CLICK queue, which is only the right
+              // answer while the click is still the newest thing that happened.
+              // Two ways it stops being that:
+              //
+              //  - this ack carried a snapshot that reconciled this exact
+              //    commandId (marked above), or
+              //  - any authoritative snapshot was accepted AFTER the click,
+              //    carrying no queueReconcilesCommandId of its own.
+              //
+              // The second case is how a ghost came back: click at v7, an
+              // ordinary v9 snapshot retires the ghost, then a delayed/replayed
+              // not-found ack arrives at v8. The ack snapshot is correctly
+              // rejected as stale -- so it is NOT reconciliation -- and the
+              // rollback then reinstated the v7 ghost over v9 and stamped it
+              // with v9's version, which made it look authoritative.
+              //
+              // Comparing against the authority captured at click time settles
+              // it without trusting the late ack's own version. A normal
+              // provider error with no newer authority still rolls back.
+              // Supersession is scoped to the ABSENT case, and deliberately so.
+              //
+              // A newer authoritative snapshot may legitimately omit a selected
+              // row merely because this append reserved it. When admission then
+              // fails for a provider reason, that row still exists and rollback
+              // must put it back ahead of whatever arrived meanwhile -- an
+              // existing contract, pinned by the ordering test above. So
+              // "authority answered since the click" cannot supersede on its own.
+              //
+              // `queueReconcilesCommandId` is the discriminator: the daemon
+              // attaches it only on the not_found branch, i.e. only when it has
+              // established the selected rows are ABSENT, never for a provider
+              // error. Combined with an accepted post-click snapshot it says
+              // exactly what is needed -- the rows are gone AND newer truth is
+              // already on screen -- so the pre-click queue must not return.
+              //
+              // Only the DECLARATION is taken from the ack here, never its queue
+              // contents: a delayed or replayed not-found ack can be stale (its
+              // own snapshot rightly rejected), yet it remains truthful about a
+              // commandId this client issued. The displayed queue still comes
+              // from the snapshot that was actually accepted.
+              const appendSuperseded = reconciledMissingAppendCommandIdsRef.current.delete(msg.commandId)
+                || (ackReconcilesCommandId === msg.commandId
+                  && acceptedQueueSnapshotSeqRef.current > rollback.acceptedSnapshotSeq);
+              if (appendSuperseded) {
+                // The optimistic post-append array is obsolete, and an EMPTY one
+                // hard-overrides the authoritative snapshot instead of merging
+                // with it, which would hide a survivor the authority still lists.
+                setOptimisticQueuedEntries(null);
+              }
+              if (!appendSuperseded) {
                 const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
                 const restoreAppendQueue = (source: LocalQueuedTransportEntry[]) => [
                   ...rollback.queue,
@@ -4222,6 +4315,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       type: 'append',
       entries: appendable.map((entry) => ({ ...entry, status: 'queued' })),
       queue: queuedTransportEntries.map((entry) => ({ ...entry })),
+      acceptedSnapshotSeq: acceptedQueueSnapshotSeqRef.current,
     });
     const appendIds = new Set(appendable.map((entry) => entry.clientMessageId));
     setOptimisticQueuedEntries((prev) => {
