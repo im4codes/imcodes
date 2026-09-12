@@ -419,9 +419,11 @@ describe('macOS remote-desktop post-build guards', () => {
     // Deliberately not xcrun/stapler. These components are bare Mach-O
     // executables and Apple provides no way to attach a ticket to one, so
     // there is nothing for `stapler validate` to read -- demanding it demanded
-    // something unobtainable. `spctl` above remains the substantive check:
-    // nothing makes Gatekeeper report a Notarized Developer ID for a binary
-    // Apple did not notarize.
+    // something unobtainable. `spctl` above remains the substantive check --
+    // though not by the wording once assumed: Gatekeeper never reports
+    // "Notarized Developer ID" for a standalone executable. It prints no
+    // `source=` line for one it accepts, and always prints one naming the
+    // refusal for one it does not.
     expect(executed).not.toContain(MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun);
     // Every tool must be invoked by absolute path, never resolved via PATH.
     for (const call of tools.calls) expect(call.executable.startsWith('/')).toBe(true);

@@ -570,9 +570,12 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
   // executables, and Apple creates tickets for standalone binaries without
   // providing any way to attach one -- so requiring a staple here required
   // something unobtainable, and the components could never have passed their
-  // own runtime trust check. `spctl` above is the substantive check regardless:
-  // nothing makes Gatekeeper report a Notarized Developer ID for a binary
-  // Apple did not notarize.
+  // own runtime trust check. `spctl` above is the substantive check regardless,
+  // but not by the wording this comment used to claim: Gatekeeper never
+  // reports "Notarized Developer ID" for a standalone executable at all. It
+  // reports that the code is valid but is not an app, and prints no `source=`
+  // line -- whereas an un-notarized binary always prints one naming the
+  // refusal. The absence is the evidence.
   if (macosArtifactCanCarryNotarizationTicket(executablePath)) {
     const staple = commandText(await run(
       MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun,
