@@ -74,6 +74,10 @@ const MACOS_REQUIRED_TOP_LEVEL_ENTRIES = [
   'include',
   'lib',
   'sdk-build.json',
+  // The exact flags a consumer must compile with. Omitting one does not fail
+  // to link -- it segfaults inside a constructor, because the define that was
+  // missed changed a struct layout.
+  'sdk-compile-flags.json',
   'toolchain',
 ];
 
@@ -83,6 +87,12 @@ const MACOS_REQUIRED_FILES = [
   // one anchor object and two kilobytes -- it stages and publishes perfectly
   // and links against nothing.
   'lib/libwebrtc.a',
+  // libwebrtc.a does not contain the C++ runtime it was compiled against:
+  // libc++ is linked at the final link step, never archived, so without this
+  // every std::__Cr:: symbol is undefined at a consumer's link. The build's own
+  // libc++.a is a thin archive pointing into the build directory, so this one
+  // is re-archived from the objects.
+  'lib/libimcodes_macos_libcxx_runtime_sdk.a',
   'lib/libimcodes_macos_libwebrtc_test_sdk.a',
   // The objects were compiled against Chromium's bundled libc++, which lives in
   // the `std::__Cr` inline namespace. A consumer using Apple clang and the

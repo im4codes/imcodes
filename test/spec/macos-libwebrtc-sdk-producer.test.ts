@@ -118,6 +118,60 @@ describe('macOS libwebrtc SDK producer', () => {
     expect(producer).toMatch(/"\$directory" != "\/" && "\$directory" == \/\*/u);
   });
 
+  it('ships the C++ runtime the objects were compiled against, as a real archive', () => {
+    // libwebrtc.a does not contain libc++: it is linked at the final link
+    // step, never archived. Without this every std::__Cr:: symbol -- each
+    // std::string method, operator new, __cxa_guard_acquire -- is undefined at
+    // a consumer's link, and the system libc++ cannot stand in because those
+    // names only exist in Chromium's __Cr inline namespace.
+    expect(producer).toContain('libimcodes_macos_libcxx_runtime_sdk.a');
+    // The build's own libc++.a is `!<thin>`: a 174KB index of paths into the
+    // build directory. Copying it would stage and publish something that
+    // references object files which never travel with it.
+    expect(producer).toContain('llvm-ar');
+    expect(producer).toContain("== '!<arch>'");
+    // An unmatched glob expands to the pattern itself, which would archive one
+    // nonexistent path instead of failing.
+    expect(producer).toMatch(/-f "\$\{LIBCXX_OBJECTS\[0\]\}"/u);
+    // And the runtime must be built for the TARGET toolchain. Nothing here
+    // links a final binary, so libc++ is never compiled unless asked for by
+    // name -- and on an arm64 host building arm64 the omission is invisible,
+    // because the host tools' own objects are already the right architecture.
+    expect(producer).toContain('buildtools/third_party/libc++:libc++');
+    expect(producer).toContain('buildtools/third_party/libc++abi:libc++abi');
+  });
+
+  it('ships the compile configuration instead of making consumers guess it', () => {
+    // Guessing it does not fail to link. A hand-assembled define set compiled
+    // cleanly, linked with zero undefined symbols, and segfaulted inside a
+    // WebRTC constructor, because one omitted define changed a struct layout.
+    // The anchor target exists so GN records this; nothing else in the SDK
+    // carries it.
+    expect(producer).toContain('sdk-compile-flags.json');
+    expect(producer).toContain('imcodes_macos_libwebrtc_sdk.ninja');
+    expect(producer).toContain("'defines', 'include_dirs', 'cflags', 'cflags_cc'");
+  });
+
+  it('drops -isysroot together with the path that follows it', () => {
+    // They are two tokens. Removing the flag in one pass and its argument in
+    // another leaves the path behind as a bare argument, and clang then reads
+    // `sdk/xcode_links/MacOSX26.5.sdk` as a source file it cannot open -- which
+    // is exactly what the first version did. The macOS SDK is deliberately not
+    // carried: it comes from the consumer's own Xcode.
+    expect(producer).toContain('DROP_WITH_ARGUMENT');
+    expect(producer).toContain('xcode_links');
+    // A second pass over the same list is the shape of the bug.
+    expect(producer).not.toMatch(/abi_flags = \[flag for flag in abi_flags/u);
+  });
+
+  it('refuses a staged archive that is fat or the wrong architecture', () => {
+    // The components must be thin; and a cross-compile that quietly staged the
+    // host's libc++ would produce an archive that links nowhere.
+    expect(producer).toContain('EXPECTED_MACHO_ARCH');
+    expect(producer).toContain('staged archive is not thin');
+    expect(producer).toMatch(/x64\) EXPECTED_MACHO_ARCH="x86_64"/u);
+  });
+
   it('records the architecture of the compiler it ships, not of the target', () => {
     // Both SDKs are produced on Apple silicon, so the x64 SDK contains an
     // arm64 clang that cross-compiles. That is correct, and it is unusable on

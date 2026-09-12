@@ -217,9 +217,18 @@ GN_ARGS="$GN_ARGS mac_deployment_target=\"$MINIMUM_MACOS_VERSION\""
 # upstream //api/... label keeps its normal meaning and no edit to WebRTC's own
 # root BUILD.gn is needed.
 ( cd "$WEBRTC_ROOT" && gn gen "$BUILD_DIR" "--args=$GN_ARGS" "--root-target=//$OVERLAY_RELATIVE" )
+# libc++ and libc++abi are named explicitly. Nothing in this graph links a
+# final binary, and the C++ runtime is only pulled in at a final link, so
+# without asking for them their objects are never compiled for the TARGET
+# toolchain. On an arm64 host building arm64 that goes unnoticed -- the host
+# toolchain is the target toolchain, and the objects the host tools needed are
+# already the right architecture. Cross-compiling x64 is where it shows: the
+# only libc++ objects present were arm64 ones under clang_arm64/.
 ( cd "$WEBRTC_ROOT" && autoninja -C "$BUILD_DIR" -j "$JOBS" \
     "$OVERLAY_RELATIVE:imcodes_macos_libwebrtc_sdk" \
-    "$OVERLAY_RELATIVE:imcodes_macos_libwebrtc_test_sdk" )
+    "$OVERLAY_RELATIVE:imcodes_macos_libwebrtc_test_sdk" \
+    "buildtools/third_party/libc++:libc++" \
+    "buildtools/third_party/libc++abi:libc++abi" )
 
 # --- collect ------------------------------------------------------------------
 # The payload is upstream's OWN archive, not the wrapper target above.
@@ -247,9 +256,56 @@ MINIMUM_ARCHIVE_BYTES=$((100 * 1024 * 1024))
 }
 install -m 0644 "$WEBRTC_ARCHIVE" "$ARTIFACT_ROOT/lib/libwebrtc.a"
 
+# The C++ runtime the objects were compiled against.
+#
+# libwebrtc.a does NOT contain it. libc++ is linked in at the final link step,
+# not archived into a static library, so every std::__Cr:: symbol -- every
+# std::string method, operator new, __cxa_guard_acquire -- is undefined until
+# this archive is on the link line. A consumer cannot substitute the system
+# libc++ either: these objects live in the __Cr inline namespace and nothing in
+# /usr/lib defines those names.
+#
+# The build's own libc++.a cannot simply be copied: it is a thin archive
+# (`!<thin>`, 174KB) holding paths into the build directory, so it references
+# object files that do not travel with it. The objects are re-archived here
+# into a real one, which is what the Windows producer does with lib.exe for
+# exactly the same reason.
+LIBCXX_OBJECTS=( "$BUILD_DIR"/obj/buildtools/third_party/libc++/libc++/*.o )
+LIBCXXABI_OBJECTS=( "$BUILD_DIR"/obj/buildtools/third_party/libc++abi/libc++abi/*.o )
+# A glob that matches nothing expands to the pattern itself, which would
+# produce an archive of one nonexistent file rather than an error.
+[[ ${#LIBCXX_OBJECTS[@]} -ge 40 && -f "${LIBCXX_OBJECTS[0]}" ]] \
+  || { echo "pinned libc++ object set is incomplete (${#LIBCXX_OBJECTS[@]} objects)" >&2; exit 1; }
+[[ ${#LIBCXXABI_OBJECTS[@]} -ge 10 && -f "${LIBCXXABI_OBJECTS[0]}" ]] \
+  || { echo "pinned libc++abi object set is incomplete (${#LIBCXXABI_OBJECTS[@]} objects)" >&2; exit 1; }
+LIBCXX_RUNTIME="$ARTIFACT_ROOT/lib/libimcodes_macos_libcxx_runtime_sdk.a"
+rm -f "$LIBCXX_RUNTIME"
+"$WEBRTC_ROOT/third_party/llvm-build/Release+Asserts/bin/llvm-ar" crs "$LIBCXX_RUNTIME" \
+  "${LIBCXX_OBJECTS[@]}" "${LIBCXXABI_OBJECTS[@]}"
+[[ -s "$LIBCXX_RUNTIME" ]] || { echo 'libc++ runtime archive was not produced' >&2; exit 1; }
+# Refuse the thin form explicitly: it would stage and publish and then fail at
+# a consumer's link with every runtime symbol undefined.
+[[ "$(head -c 8 "$LIBCXX_RUNTIME")" == '!<arch>' ]] \
+  || { echo 'libc++ runtime archive is thin and would not survive the trip out of the build directory' >&2; exit 1; }
+
 TEST_ARCHIVE="$BUILD_DIR/obj/$OVERLAY_RELATIVE/libimcodes_macos_libwebrtc_test_sdk.a"
 [[ -f "$TEST_ARCHIVE" ]] || { echo "test archive missing: $TEST_ARCHIVE" >&2; exit 1; }
 install -m 0644 "$TEST_ARCHIVE" "$ARTIFACT_ROOT/lib/libimcodes_macos_libwebrtc_test_sdk.a"
+
+# Every shipped archive must be thin-in-the-Mach-O-sense: one architecture,
+# and the one that was asked for. A fat archive fails the runtime verifier,
+# and a thin archive of the WRONG architecture links nowhere -- which is
+# exactly what staging the host's libc++ during a cross-compile would produce.
+case "$TARGET_CPU" in
+  arm64) EXPECTED_MACHO_ARCH="arm64" ;;
+  x64) EXPECTED_MACHO_ARCH="x86_64" ;;
+esac
+for staged in "$ARTIFACT_ROOT/lib/libwebrtc.a" "$LIBCXX_RUNTIME" \
+  "$ARTIFACT_ROOT/lib/libimcodes_macos_libwebrtc_test_sdk.a"; do
+  STAGED_ARCH="$(lipo -info "$staged" 2>&1)"
+  [[ "$STAGED_ARCH" == "Non-fat file: $staged is architecture: $EXPECTED_MACHO_ARCH" ]] \
+    || { echo "staged archive is not thin $EXPECTED_MACHO_ARCH: $STAGED_ARCH" >&2; exit 1; }
+done
 
 # --- headers ------------------------------------------------------------------
 # Taken from the same checkout that produced the objects, so the two can never
@@ -275,7 +331,8 @@ for header_root in api call common_audio common_video logging media modules net 
   third_party/jsoncpp third_party/libyuv/include third_party/perfetto/include; do
   copy_headers "$header_root" with-extensions
 done
-for header_root in buildtools/third_party/libc++ third_party/libc++/src/include; do
+for header_root in buildtools/third_party/libc++ third_party/libc++/src/include \
+  third_party/libc++abi/src/include; do
   copy_headers "$header_root" extensionless
 done
 
@@ -349,6 +406,113 @@ install -m 0644 "$LLVM_ROOT/lib/clang/$CLANG_MAJOR/lib/darwin/libclang_rt.osx.a"
 # Uniform modes, so the archive digest describes the tree and not the umask
 # of whichever account happened to run the build.
 find "$ARTIFACT_ROOT" -type f ! -path "$ARTIFACT_ROOT/toolchain/bin/*" -exec chmod 0644 {} +
+
+# --- consumer compile configuration ---------------------------------------
+# The exact flags a translation unit must be compiled with to link against
+# these objects, taken from the anchor target's own ninja file. This is the
+# reason the anchor exists: GN records the full configuration for it, and that
+# configuration is the SDK's real interface.
+#
+# Getting this wrong does not fail to link. A consumer that guessed a define
+# set compiled cleanly, linked with no undefined symbols, and segfaulted
+# inside a WebRTC constructor -- because a define it omitted changed a struct
+# layout. Shipping the flags is what makes that unguessable thing knowable.
+ANCHOR_NINJA="$BUILD_DIR/obj/$OVERLAY_RELATIVE/imcodes_macos_libwebrtc_sdk.ninja"
+[[ -f "$ANCHOR_NINJA" ]] || { echo "anchor ninja file missing: $ANCHOR_NINJA" >&2; exit 1; }
+
+python3 - "$ANCHOR_NINJA" "$ARTIFACT_ROOT/sdk-compile-flags.json" <<'FLAGS'
+import json, shlex, sys
+
+ninja_path, output_path = sys.argv[1:3]
+
+values = {}
+with open(ninja_path, encoding='utf-8') as handle:
+    for line in handle:
+        for key in ('defines', 'include_dirs', 'cflags', 'cflags_cc'):
+            prefix = f'{key} = '
+            if line.startswith(prefix) and key not in values:
+                values[key] = shlex.split(line[len(prefix):].strip())
+for key in ('defines', 'include_dirs', 'cflags', 'cflags_cc'):
+    if key not in values:
+        raise SystemExit(f'anchor ninja file has no {key} line')
+
+def sdk_relative(path):
+    """Rewrite a build-directory-relative include into an SDK-relative one.
+
+    ninja runs from the build directory, so `../..` is the checkout root --
+    which is what was staged into `include/` -- and `gen` is the generated
+    header tree staged into `gen/`.
+    """
+    if path == '../..':
+        return 'include'
+    if path.startswith('../../'):
+        return 'include/' + path[len('../../'):]
+    if path == 'gen':
+        return 'gen'
+    if path.startswith('gen/'):
+        return path
+    raise SystemExit(f'include path does not resolve inside the SDK: {path}')
+
+includes, system_includes = [], []
+pending = None
+for token in values['include_dirs']:
+    if token.startswith('-I'):
+        includes.append(sdk_relative(token[2:]))
+    elif token.startswith('-isystem'):
+        system_includes.append(sdk_relative(token[len('-isystem'):]))
+    else:
+        raise SystemExit(f'unexpected include_dirs token: {token}')
+
+# cflags_cc carries the libc++ system includes, glued to -isystem with no
+# space, alongside the language flags.
+language_flags = []
+for token in values['cflags_cc']:
+    if token.startswith('-isystem'):
+        system_includes.append(sdk_relative(token[len('-isystem'):]))
+    else:
+        language_flags.append(token)
+
+# Flags naming a path in the build directory describe a tree the consumer does
+# not have; they are diagnostics, not ABI. Everything else is kept verbatim,
+# because deciding which of the rest "matters" is exactly the guess that
+# produced a segfault.
+def travels(flag):
+    return not any(part in flag for part in (
+        '../', 'unsafe_buffers_paths', 'clang-crashreports', 'xcode_links',
+    ))
+
+# One pass, because -isysroot and its path are two tokens: dropping the flag
+# in an earlier pass leaves the path behind as a bare argument, and clang then
+# reads it as a source file it cannot find. The macOS SDK is deliberately not
+# carried -- it comes from the consumer's own Xcode, which is why
+# sdk-build.json records the version this was built against.
+DROP_WITH_ARGUMENT = {'-isysroot'}
+filtered = []
+skip_next = False
+for flag in values['cflags']:
+    if skip_next:
+        skip_next = False
+        continue
+    if flag in DROP_WITH_ARGUMENT:
+        skip_next = True
+        continue
+    if not travels(flag):
+        continue
+    filtered.append(flag)
+
+with open(output_path, 'w', encoding='utf-8') as handle:
+    json.dump({
+        'schemaVersion': 1,
+        'defines': values['defines'],
+        'includeDirs': includes,
+        'systemIncludeDirs': system_includes,
+        'compileFlags': filtered,
+        'cxxFlags': language_flags,
+    }, handle, indent=2)
+FLAGS
+chmod 0644 "$ARTIFACT_ROOT/sdk-compile-flags.json"
+[[ -s "$ARTIFACT_ROOT/sdk-compile-flags.json" ]] \
+  || { echo 'consumer compile configuration was not produced' >&2; exit 1; }
 
 # --- third-party notices ------------------------------------------------------
 # Generated here, not restated: the inventory comes from the same generated GN
