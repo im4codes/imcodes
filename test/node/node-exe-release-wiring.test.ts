@@ -498,7 +498,9 @@ describe('controlled-node executable release wiring', () => {
       const build = workflow.indexOf('node scripts/build-aidesk-app.mjs dist-node-exe');
       const notarize = workflow.indexOf('macos-release-signing.mjs notarize "$APP"');
       const validate = workflow.indexOf('xcrun stapler validate "$APP"');
-      const upload = workflow.indexOf('dist-node-exe/aiDesk.to by IM.codes.app/**');
+      // Uploaded only inside containers that keep permissions -- see the
+      // test below for why the bare directory must not be one of them.
+      const upload = workflow.indexOf('dist-node-exe/*.dmg');
 
       expect([build, notarize, validate, upload].every((at) => at >= 0), file).toBe(true);
       expect(build, file).toBeLessThan(notarize);
@@ -543,6 +545,21 @@ describe('controlled-node executable release wiring', () => {
       // After stapling, so the archived copy carries its own ticket.
       expect(stapleApp, file).toBeLessThan(sidecar);
       expect(sidecar, file).toBeLessThan(buildDmg);
+    }
+  });
+
+  it('never uploads the bundle as a bare directory', () => {
+    // Measured on a Mac, not assumed: GitHub artifacts normalise every file to
+    // 644, so an app uploaded as a directory comes back with its executables
+    // stripped of `+x` and dies with "permission denied". The signature
+    // survives, which makes the corpse look healthy. It travels inside the
+    // sidecar archive and the disk image instead, both of which keep the
+    // permission bits.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      expect(workflow, file).not.toContain('dist-node-exe/aiDesk.to by IM.codes.app/**');
+      expect(workflow, file).toContain('dist-node-exe/*.dmg');
+      expect(workflow, file).toContain('build-aidesk-app.mjs sidecar dist-node-exe');
     }
   });
 });

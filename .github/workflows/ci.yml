@@ -884,7 +884,6 @@ jobs:
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
             dist-node-exe/computer-use-helper/**
-            dist-node-exe/aiDesk.to by IM.codes.app/**
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
           if-no-files-found: error
