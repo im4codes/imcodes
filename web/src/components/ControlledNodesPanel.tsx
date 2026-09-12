@@ -635,7 +635,7 @@ export function ControlledNodesPanel({
           <>
             <button
               type="button"
-              class="share-revoke-btn"
+              class="share-revoke-btn controlled-nodes-share"
               disabled={busyServerId === machine.serverId}
               onClick={() => {
                 closeAfterAction();

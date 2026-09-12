@@ -132,13 +132,96 @@ html { position: fixed; }
   align-items: stretch;
 }
 .verification-machine-ssh-form input,
-.verification-machines-section select {
+.verification-machines-section select,
+.verification-machine-alias {
   min-height: 36px;
-  border: 1px solid rgba(71, 85, 105, .65);
+  border: 1px solid rgba(94, 165, 214, 0.32);
   border-radius: 7px;
   color: #dbeafe;
-  background: rgba(15, 23, 42, .82);
+  background: rgba(8, 20, 34, 0.9);
   padding: 6px 10px;
+  font: 500 13px/1.2 var(--imcodes-app-font-family);
+  box-shadow: inset 0 1px 0 rgba(214, 240, 255, 0.03);
+  transition: border-color 0.16s, box-shadow 0.16s;
+}
+/* Every field in this section was a bare browser control: a white, rounded
+   system text box and grey pill buttons, on a dark tech panel. They are drawn
+   here in the same language as the device list above them. */
+.verification-machine-ssh-form input:focus,
+.verification-machines-section select:focus,
+.verification-machine-alias:focus {
+  outline: none;
+  border-color: rgba(103, 232, 249, 0.72);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.14);
+}
+.verification-machines-section select { appearance: none; padding-right: 26px;
+  background-image: linear-gradient(45deg, transparent 50%, #67e8f9 50%),
+    linear-gradient(135deg, #67e8f9 50%, transparent 50%);
+  background-position: calc(100% - 14px) 52%, calc(100% - 9px) 52%;
+  background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+.verification-machines-scope {
+  display: inline-flex; align-items: center; gap: 8px;
+  color: #8fb3cc; font-size: 12px; white-space: nowrap;
+}
+.verification-machine-alias { flex: 1 1 auto; min-width: 0; max-width: 260px; font-weight: 600; }
+.verification-machine-meta { gap: 6px 8px; }
+/* Sized to the metadata line it sits in, not to the page's main fields. At
+   full size it was the largest thing on the card, beside 11px identifiers. */
+.verification-machine-meta select { min-height: 28px; padding: 3px 24px 3px 8px; font-size: 12px; }
+.verification-machine-id {
+  overflow: hidden; max-width: 22ch; color: #5f7d93;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.verification-machine-kind {
+  padding: 2px 7px; border: 1px solid rgba(167, 139, 250, 0.36); border-radius: 5px;
+  background: rgba(76, 29, 149, 0.22); color: #c4b5fd;
+  font: 700 10px/1.4 var(--imcodes-app-font-family); letter-spacing: 0.04em;
+}
+.verification-machine-status.is-verified {
+  border-color: rgba(52, 211, 153, 0.4); background: rgba(6, 78, 59, 0.34); color: #6ee7b7;
+}
+.verification-machine-status.is-unverified {
+  border-color: rgba(251, 191, 36, 0.36); background: rgba(120, 53, 15, 0.26); color: #fcd34d;
+}
+.verification-machine-status.is-unreachable,
+.verification-machine-status.is-unauthorized {
+  border-color: rgba(248, 113, 113, 0.38); background: rgba(127, 29, 29, 0.26); color: #fca5a5;
+}
+.verification-machine-actions { display: flex; gap: 8px; }
+.verification-machine-save,
+.verification-machine-delete,
+.verification-machine-add {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  min-height: 34px; padding: 6px 14px; border-radius: 7px;
+  font: 600 12px/1 var(--imcodes-app-font-family); cursor: pointer;
+  transition: border-color 0.16s, background 0.16s, box-shadow 0.16s;
+}
+.verification-machine-save {
+  border: 1px solid rgba(34, 211, 238, 0.42); color: #bff7ff;
+  background: linear-gradient(135deg, rgba(8, 47, 69, 0.9), rgba(7, 29, 48, 0.94));
+}
+.verification-machine-save:hover:not(:disabled) { border-color: #67e8f9; box-shadow: 0 0 16px rgba(34, 211, 238, 0.16); }
+.verification-machine-delete {
+  border: 1px solid rgba(248, 113, 113, 0.35); color: #fecaca; background: rgba(127, 29, 29, 0.2);
+}
+.verification-machine-delete:hover:not(:disabled) { border-color: rgba(248, 113, 113, 0.65); background: rgba(127, 29, 29, 0.34); }
+.verification-machine-add {
+  margin-top: 12px; border: 1px dashed rgba(34, 211, 238, 0.45); color: #67e8f9;
+  background: rgba(8, 145, 178, 0.08);
+}
+.verification-machine-add:hover { border-style: solid; background: rgba(8, 145, 178, 0.18); }
+.verification-machine-add[aria-expanded="true"] { border-style: solid; border-color: rgba(103, 232, 249, 0.72); }
+.verification-machine-save:disabled,
+.verification-machine-delete:disabled { cursor: wait; opacity: 0.5; }
+@media (max-width: 640px) {
+  .verification-machine-alias { max-width: none; }
+  .verification-machine-actions { width: 100%; }
+  .verification-machine-actions > button { flex: 1 1 0; }
+  .verification-machine-add { width: 100%; }
+  .verification-machines-section .controlled-nodes-machines-header > .verification-machines-scope {
+    width: 100%; justify-content: space-between;
+  }
 }
 /* Global: all fixed full-screen overlays respect iOS safe area (status bar/notch) */
 .dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay { padding-top: var(--sat); }
@@ -3468,6 +3551,18 @@ html.native-ios-mac .chat-dl-btn {
 }
 .controlled-nodes-rename-save,
 .controlled-nodes-rename-cancel,
+/* Share opens a dialog; it is not destructive. It reuses the shared
+   .share-revoke-btn class, whose red belongs to Revoke, so it read as a danger
+   action sitting right beside the one that really is. */
+.controlled-nodes-share.share-revoke-btn {
+  border-color: rgba(94, 165, 214, 0.32);
+  background: rgba(14, 35, 55, 0.72);
+  color: #cfeaff;
+}
+.controlled-nodes-share.share-revoke-btn:hover:not(:disabled) {
+  border-color: rgba(103, 232, 249, 0.55);
+  background: rgba(8, 145, 178, 0.18);
+}
 .controlled-nodes-rename {
   display: inline-grid;
   place-items: center;
@@ -4305,6 +4400,13 @@ html.native-ios-mac .chat-dl-btn {
     gap: 12px;
     padding: 13px 12px 12px 16px;
   }
+  /* The title and two buttons do not fit one phone-width row, so each label
+     wrapped onto two lines. Title gets its own row; the buttons share the
+     next one and keep their labels on a single line. */
+  .controlled-nodes-machines-header { flex-wrap: wrap; row-gap: 10px; }
+  .controlled-nodes-machines-header .controlled-nodes-section-heading { flex: 1 1 100%; }
+  .controlled-nodes-machines-actions { width: 100%; }
+  .controlled-nodes-machines-actions > button { flex: 1 1 0; min-width: 0; white-space: nowrap; }
   .controlled-nodes-machine-actions { justify-content: stretch; }
   .controlled-nodes-machine-actions button { min-height: 36px; }
   .controlled-nodes-machine-actions.is-mobile.is-owner {
@@ -4335,6 +4437,11 @@ html.native-ios-mac .chat-dl-btn {
     white-space: nowrap;
   }
   .controlled-nodes-mobile-menu-trigger {
+    /* Always the right-hand column. On a card with no primary action it
+       otherwise dropped into the wide left column and sat alone at the left
+       edge, looking like a stray control rather than the card's menu. */
+    grid-column: 2;
+    justify-self: end;
     display: inline-grid;
     place-items: center;
     width: 42px;
@@ -4375,8 +4482,12 @@ html.native-ios-mac .chat-dl-btn {
     gap: 8px;
   }
   .controlled-nodes-mobile-menu-panel .controlled-nodes-mobile-action-label { display: inline; }
+  /* Switch and label side by side, left-aligned like every other item in the
+     menu. space-between pushed the label to the far edge, leaving the switch
+     stranded on the left with nothing next to it. */
   .controlled-nodes-mobile-menu-panel > .controlled-nodes-exec-toggle {
-    justify-content: space-between;
+    justify-content: flex-start;
+    gap: 10px;
   }
   .controlled-nodes-mobile-menu-panel > .controlled-nodes-auto-unlock-form {
     display: grid;

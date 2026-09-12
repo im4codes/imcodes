@@ -145,7 +145,7 @@ export function VerificationMachinesSection({
         <div class="controlled-nodes-section-heading">
           <h3>{t('controlled_nodes.verification.title')}</h3>
         </div>
-        <label>
+        <label class="verification-machines-scope">
           <span>{t('controlled_nodes.verification.scope')}</span>
           <select value={scope} onChange={(event) => setScope((event.target as HTMLSelectElement).value as VerificationMachineScope)}>
             {projectKey && <option value={VERIFICATION_MACHINE_SCOPES.PROJECT}>{t('controlled_nodes.verification.project_scope')}</option>}
@@ -167,37 +167,61 @@ export function VerificationMachinesSection({
               <div class="controlled-nodes-machine-info">
                 <div class="controlled-nodes-machine-heading">
                   <input
+                    class="verification-machine-alias"
                     aria-label={t('controlled_nodes.verification.alias')}
                     value={aliasEdits[profile.id] ?? profile.alias}
                     onInput={(event) => setAliasEdits((current) => ({
                       ...current, [profile.id]: (event.target as HTMLInputElement).value,
                     }))}
                   />
-                  <span class="controlled-nodes-status">{t(`controlled_nodes.verification.status_${profile.lastVerificationStatus}`)}</span>
+                  <span
+                    class={`controlled-nodes-status verification-machine-status is-${profile.lastVerificationStatus}`}
+                  >{t(`controlled_nodes.verification.status_${profile.lastVerificationStatus}`)}</span>
                 </div>
-                <div class="controlled-nodes-machine-meta">
-                  <code>{profile.target}</code>
-                  <span>{t(`controlled_nodes.verification.kind_${profile.kind}`)}</span>
+                <div class="controlled-nodes-machine-meta verification-machine-meta">
+                  <code class="verification-machine-id">{profile.target}</code>
+                  <span class="verification-machine-kind">{t(`controlled_nodes.verification.kind_${profile.kind}`)}</span>
                   <select value={scopeEdits[profile.id] ?? profile.scope} onChange={(event) => setScopeEdits((current) => ({
                     ...current, [profile.id]: (event.target as HTMLSelectElement).value as VerificationMachineScope,
                   }))}>
                     {projectKey && <option value={VERIFICATION_MACHINE_SCOPES.PROJECT}>{t('controlled_nodes.verification.project_scope')}</option>}
                     <option value={VERIFICATION_MACHINE_SCOPES.USER}>{t('controlled_nodes.verification.user_scope')}</option>
                   </select>
-                  <code>{profile.id}</code>
+                  <code class="verification-machine-id">{profile.id}</code>
                 </div>
               </div>
-              <button type="button" disabled={busyTarget === profile.id} onClick={() => { void updateProfile(profile); }}>
-                {t('common.save')}
-              </button>
-              <button type="button" disabled={busyTarget === profile.id} onClick={() => { void remove(profile); }}>
-                {t('common.delete')}
-              </button>
+              {/* Side by side, and styled by what they do. As bare browser
+                  buttons they rendered as two full-width grey pills of equal
+                  weight, so Delete looked no different from Save. */}
+              <div class="verification-machine-actions">
+                <button
+                  type="button"
+                  class="verification-machine-save"
+                  disabled={busyTarget === profile.id}
+                  onClick={() => { void updateProfile(profile); }}
+                >
+                  {t('common.save')}
+                </button>
+                <button
+                  type="button"
+                  class="verification-machine-delete"
+                  disabled={busyTarget === profile.id}
+                  onClick={() => { void remove(profile); }}
+                >
+                  {t('common.delete')}
+                </button>
+              </div>
             </li>
           ))}
         </ul>
       )}
-      <button type="button" onClick={() => setPickerOpen((current) => !current)} aria-expanded={pickerOpen}>
+      <button
+        type="button"
+        class="verification-machine-add"
+        onClick={() => setPickerOpen((current) => !current)}
+        aria-expanded={pickerOpen}
+      >
+        <span aria-hidden="true">＋</span>
         {t('quick_input.verification_add')}
       </button>
       {pickerOpen && <div class="verification-machine-node-actions">
