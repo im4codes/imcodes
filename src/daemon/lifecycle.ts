@@ -24,7 +24,7 @@ import { supervisionAutomation } from './supervision-automation.js';
 import { peerAuditService } from './peer-audit-service.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
-import { startHookServer, drainQueue } from './hook-server.js';
+import { closeHookServer, drainQueue, startHookServer } from './hook-server.js';
 import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
@@ -1326,6 +1326,10 @@ export async function startup(): Promise<DaemonContext> {
     // hook accept legacy daemon-local namespaces without trusting a
     // child-provided server id or waiting for capability authority hydration.
     memoryMcpServerId: serverId || undefined,
+    // The daemon owns this listener for the whole process lifetime, so an
+    // unexpected loss must self-heal (rebind + republish authority) instead of
+    // leaving the machine with no hook endpoint until a full daemon restart.
+    rebindOnListenerLoss: true,
   });
   hookServer = hookResult.server;
   // Rewrite all CC hook scripts with the actual port (may differ from last run)
@@ -1665,9 +1669,10 @@ async function performShutdown(exitCode: number): Promise<void> {
       const { disconnectAll } = await import('../agent/provider-registry.js');
       await disconnectAll();
       if (hookServer) {
-        await new Promise<void>((resolve, reject) => {
-          hookServer!.close((error) => error ? reject(error) : resolve());
-        });
+        // MUST go through closeHookServer: a bare close() now looks like an
+        // unexpected listener loss and would arm the hook server's rebind path
+        // in the middle of shutdown.
+        await closeHookServer(hookServer);
         hookServer = null;
       }
       await cgroupValidationProbes?.stopPhase('mcp');

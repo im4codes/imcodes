@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createIdempotentShutdown, installMcpStdioLifecycle,
   IMCODES_MCP_PARENT_PID_ENV, MCP_PROCESS_START_PARENT_PID } from './mcp-stdio-lifecycle.js';
 import http from 'http';
-import { resolveLiveHookPort } from './hook-port.js';
+import { HookAuthorityUnavailableError, resolveHookAuthority, resolveLiveHookPort } from './hook-port.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import {
   MemoryMcpCallerEnvError,
@@ -86,6 +86,10 @@ export interface MemoryMcpServerCatalogOptions {
 /** Narrow daemon-bridge seams used to make transient hook outages deterministic in tests. */
 export interface MemoryMcpDaemonBridgeDeps {
   resolveHookPort?: typeof resolveLiveHookPort;
+  /** Owner-verified hook resolution. Preferred over `resolveHookPort` wherever
+   *  the failure must be ATTRIBUTED (hook missing vs. stale vs. unreadable)
+   *  rather than collapsed into a single falsy port. */
+  resolveHookAuthority?: typeof resolveHookAuthority;
   enqueueTransportResend?: typeof enqueueDurableResend;
   now?: () => number;
 }
@@ -209,11 +213,15 @@ async function observeDaemonTaskAdmission(
     return null;
   }
   try {
-    const port = await resolveLiveHookPort();
-    if (!port) {
-      recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.UNAVAILABLE, 'no_hook_port');
+    // Report WHICH endpoint-authority failure occurred; the old generic
+    // 'no_hook_port' detail could not distinguish "daemon never published" from
+    // "record points at a dead/foreign owner".
+    const authority = await resolveHookAuthority();
+    if (!authority.ok) {
+      recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.UNAVAILABLE, authority.reason);
       return null;
     }
+    const port = authority.port;
     const response = await postHookSend(
       port,
       {
@@ -441,6 +449,19 @@ export function mergeDefaultToolDeps(
   bridgeDeps: MemoryMcpDaemonBridgeDeps = {},
 ): MemoryMcpToolDeps {
   const resolveHookPort = bridgeDeps.resolveHookPort ?? resolveLiveHookPort;
+  const resolveAuthority = bridgeDeps.resolveHookAuthority ?? resolveHookAuthority;
+  /** Resolve the hook endpoint or throw the ACCURATE endpoint-authority error.
+   *
+   *  This replaces `if (!port) throw new Error('daemon_memory_worker_unavailable')`.
+   *  That line is why a stale `~/.imcodes/hook-port` (file 51915, live daemon
+   *  51941) was reported as a memory/context worker outage: the memory worker
+   *  was healthy the whole time and only the endpoint record had drifted. The
+   *  taxonomy now says which of the two actually failed. */
+  const requireHookPort = async (operation: string): Promise<number> => {
+    const resolution = await resolveAuthority();
+    if (resolution.ok) return resolution.port;
+    throw new HookAuthorityUnavailableError(resolution.reason, operation, resolution.detail);
+  };
   const enqueueTransportResend = bridgeDeps.enqueueTransportResend ?? enqueueDurableResend;
   const now = bridgeDeps.now ?? Date.now;
   const usesDefaultCapabilityService = !toolDeps.capabilityService && Boolean(caller.serverId);
@@ -451,8 +472,7 @@ export function mergeDefaultToolDeps(
     invokeDaemonMemoryTool: toolDeps.invokeDaemonMemoryTool
       ?? (resourceOwner && caller.sessionName
         ? async (name: MemoryMcpDaemonToolName, input?: unknown) => {
-            const port = await resolveLiveHookPort();
-            if (!port) throw new Error('daemon_memory_worker_unavailable');
+            const port = await requireHookPort(MEMORY_MCP_DAEMON_RPC_PATH);
             const response = await postHookSend(port, {
               sessionInstanceId: resourceOwner.sessionInstanceId,
               runtimeEpoch: resourceOwner.runtimeEpoch,
@@ -525,8 +545,7 @@ export function mergeDefaultToolDeps(
       resourceOwner,
       loadSharedMachineAuthority: resourceOwner && caller.sessionName
         ? async () => {
-            const port = await resolveLiveHookPort();
-            if (!port) throw new Error('shared_machine_authority_hook_unavailable');
+            const port = await requireHookPort(SHARED_MACHINE_AUTHORITY_HOOK_PATH);
             const response = await postHookSend(port, {
               sessionInstanceId: resourceOwner.sessionInstanceId,
               runtimeEpoch: resourceOwner.runtimeEpoch,

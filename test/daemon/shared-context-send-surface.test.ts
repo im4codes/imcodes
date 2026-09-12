@@ -159,7 +159,7 @@ function postSend(port: number, body: Record<string, unknown>): Promise<{ status
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
-      hostname: '127.0.0.1',
+      agent: false, hostname: '127.0.0.1',
       port,
       path: '/send',
       method: 'POST',

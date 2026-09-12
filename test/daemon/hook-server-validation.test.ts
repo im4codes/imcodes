@@ -41,7 +41,7 @@ import { MEMORY_MCP_DAEMON_RPC_PATH } from '../../shared/memory-mcp-daemon-rpc.j
 function postNotify(port: number, body: Record<string, unknown>): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
-    const req = http.request({ hostname: '127.0.0.1', port, path: '/notify', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': data.length } }, (res) => {
+    const req = http.request({ agent: false, hostname: '127.0.0.1', port, path: '/notify', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': data.length } }, (res) => {
       let body = '';
       res.on('data', (chunk) => { body += chunk; });
       res.on('end', () => resolve({ status: res.statusCode!, body }));
@@ -60,7 +60,7 @@ function postCapabilityIdentity(
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
-      hostname: '127.0.0.1', port, path: '/capability-identity', method: 'POST',
+      agent: false, hostname: '127.0.0.1', port, path: '/capability-identity', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'x-imcodes-session': sessionName },
     }, (res) => {
       let response = '';
@@ -80,7 +80,7 @@ function postResourceAdmission(
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
-      hostname: '127.0.0.1', port, path: '/resource-admission', method: 'POST',
+      agent: false, hostname: '127.0.0.1', port, path: '/resource-admission', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'x-imcodes-session': sessionName },
     }, (res) => {
       let response = '';
@@ -100,7 +100,7 @@ function postMemoryMcpDaemonTool(
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
-      hostname: '127.0.0.1', port, path: MEMORY_MCP_DAEMON_RPC_PATH, method: 'POST',
+      agent: false, hostname: '127.0.0.1', port, path: MEMORY_MCP_DAEMON_RPC_PATH, method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'x-imcodes-session': sessionName },
     }, (res) => {
       let response = '';
@@ -124,8 +124,8 @@ describe('Hook server — session validation', () => {
     port = result.port;
   });
 
-  afterEach(() => {
-    server.close();
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     clearCapabilityAuthorizationKeys('owner-1', 'server-1');
     clearCapabilityAuthorizationKeys('owner-2', 'server-1');
   });

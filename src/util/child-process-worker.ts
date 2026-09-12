@@ -10,6 +10,10 @@ export interface ChildProcessWorkerHandle {
   on(event: 'exit', listener: (code: number) => void): this;
   postMessage(message: unknown): void;
   terminate(): Promise<number>;
+  /** Unconditional SIGKILL. `terminate()` sends SIGTERM and only resolves on
+   *  `exit`, so a child wedged inside a blocking call (e.g. SQLite) never
+   *  confirms; the owner needs an escalation that cannot be ignored. */
+  forceKill(): void;
 }
 
 class ForkedWorkerHandle implements ChildProcessWorkerHandle {
@@ -51,6 +55,15 @@ class ForkedWorkerHandle implements ChildProcessWorkerHandle {
       this.child.once('exit', (code) => resolve(code ?? 1));
       this.child.kill('SIGTERM');
     });
+  }
+
+  forceKill(): void {
+    if (this.child.exitCode !== null) return;
+    try {
+      this.child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
   }
 }
 

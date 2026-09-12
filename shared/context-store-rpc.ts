@@ -271,9 +271,84 @@ export const CONTEXT_STORE_RPC_ERROR = {
    *  failure policy forbids a main-thread in-process fallback — R3 mutations and
    *  R5 reads reject with this; R4 background callers convert it to requeue/backoff */
   unavailable: 'context_store_unavailable',
+  /** the request WAS dispatched into the worker and then the worker died / the
+   *  RPC timed out, so the op MAY or MAY NOT have been applied. Only raised for
+   *  ops in `CONTEXT_STORE_UNSAFE_RETRY_OPS`, where a blind retry could duplicate
+   *  an append or double-consume a lease. Callers MUST NOT auto-retry this. */
+  indeterminate: 'context_store_indeterminate',
 } as const;
 export type ContextStoreRpcErrorCode =
   (typeof CONTEXT_STORE_RPC_ERROR)[keyof typeof CONTEXT_STORE_RPC_ERROR];
+
+/** Retry safety class for an op whose in-flight outcome became UNKNOWN (the
+ *  worker died, or the RPC timed out, AFTER the request was already dispatched).
+ *  - `safeRetry`   - reads and idempotent writes: replaying is harmless.
+ *  - `unsafeRetry` - appends without a natural key, lease/claim/consume ops, and
+ *    multi-statement commit bundles: replaying can duplicate a row, double-count
+ *    a counter, or re-consume a lease. */
+export const CONTEXT_STORE_OP_RETRY_CLASS = {
+  safeRetry: 'safe_retry',
+  unsafeRetry: 'unsafe_retry',
+} as const;
+export type ContextStoreOpRetryClass =
+  (typeof CONTEXT_STORE_OP_RETRY_CLASS)[keyof typeof CONTEXT_STORE_OP_RETRY_CLASS];
+
+/** Ops whose in-flight outcome MUST NOT be blindly retried (see
+ *  `CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry`). Everything else in the allowlist
+ *  is `safeRetry`. A Foundation test asserts every entry here is a real op, so a
+ *  typo cannot silently downgrade an op to `safeRetry`. */
+export const CONTEXT_STORE_UNSAFE_RETRY_OPS = [
+  // appends with no natural key - a replay inserts a duplicate row
+  'recordContextEvent',
+  'enqueueContextJob',
+  'insertProjectionSources',
+  'addPinnedNote',
+  'recordCompressionRun',
+  'recordTurnUsage',
+  'recordMemoryHits',
+  'ingestContextEvent',
+  // lease / claim / consume - a replay double-consumes or re-leases
+  'claimContextJob',
+  'updateContextJob',
+  'selectTurnUsageSyncBatch',
+  'recordTurnUsageSyncResults',
+  'recordTurnUsageSyncRequestFailure',
+  'runArchiveBackfillBatch',
+  'archiveEventsForMaterialization',
+  'pruneArchiveIfDue',
+  // multi-statement commit bundle - a partial apply must be reconciled, not replayed
+  'commitMaterialization',
+] as const;
+const UNSAFE_RETRY_SET: ReadonlySet<string> = new Set(CONTEXT_STORE_UNSAFE_RETRY_OPS);
+
+/** Retry class for `op`. Unknown/unlisted names are treated as `unsafeRetry`
+ *  (fail closed): an unclassified op is assumed side-effecting. */
+export function contextStoreOpRetryClass(op: string): ContextStoreOpRetryClass {
+  if (UNSAFE_RETRY_SET.has(op)) return CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry;
+  if (RPC_OP_SET.has(op)) return CONTEXT_STORE_OP_RETRY_CLASS.safeRetry;
+  return CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry;
+}
+
+/** Observable health state of the context-store worker. Exposed by the client so
+ *  the daemon can log and report self-recovery instead of only surfacing errors. */
+export const CONTEXT_STORE_WORKER_HEALTH = {
+  /** never started (tests / CLI / before `start()`) */
+  idle: 'idle',
+  /** a generation is spawned but has not completed the ready handshake */
+  starting: 'starting',
+  /** ready handshake done - the ONLY state that accepts dispatch */
+  ready: 'ready',
+  /** no live generation; a rebuild is scheduled after the remaining backoff */
+  backoff: 'backoff',
+  /** no live generation and a rebuild is due now */
+  unhealthy: 'unhealthy',
+  /** a previous generation is being retired and has NOT confirmed exit yet; no
+   *  new generation may be created in this state (single-owner invariant) */
+  retiring: 'retiring',
+  disposed: 'disposed',
+} as const;
+export type ContextStoreWorkerHealth =
+  (typeof CONTEXT_STORE_WORKER_HEALTH)[keyof typeof CONTEXT_STORE_WORKER_HEALTH];
 
 /** Per-RPC timeout tiers in milliseconds (see spec "Async client reliability").
  *  R1 is the front-of-turn read ceiling, capped against the live transport
@@ -304,14 +379,50 @@ export const CONTEXT_STORE_RPC_BACKPRESSURE = {
 export const CONTEXT_STORE_RPC_SELF_HEAL = {
   /** consecutive timeouts before the watchdog respawns the worker */
   consecutiveTimeoutsBeforeRespawn: 3,
-  /** cooldown (ms) between timeout-driven respawns */
+  /** CAP (ms) of the timeout-domain exponential backoff. Historically a flat
+   *  cooldown; kept as the cap so a persistently sick worker still converges to
+   *  one respawn per minute. */
   respawnCooldownMs: 60_000,
+  /** base backoff (ms) for the FIRST timeout-driven respawn; each further
+   *  consecutive timeout respawn doubles it, capped at `respawnCooldownMs`.
+   *  A flat 60s FIRST delay turned a single transient hang into a 60s hard
+   *  outage with zero recovery attempts - the exact field symptom. */
+  timeoutBackoffBaseMs: 1_000,
   /** base backoff (ms) for the SECOND+ consecutive warmup/crash respawn failure
    *  (the FIRST failure retries immediately to preserve transient fast-recovery). */
   warmupBackoffBaseMs: 500,
+  /** HARD upper bound for a retiring generation to confirm graceful exit before
+   *  the owner escalates to SIGKILL. No new generation may spawn while a
+   *  retirement is unconfirmed, so this directly bounds the outage. */
+  terminateConfirmMs: 5_000,
+  /** bounded window to confirm exit AFTER the force kill. If even this elapses
+   *  the client stays unavailable / fail-closed rather than risk two DB owners. */
+  forceKillConfirmMs: 5_000,
   /** cap (ms) for the warmup/crash exponential backoff. */
   warmupBackoffMaxMs: 60_000,
 } as const;
+
+/**
+ * Bounded exponential backoff, overflow-safe.
+ *
+ * `attempt` is 1-based: attempt 1 waits `baseMs`, attempt 2 waits `2*baseMs`,
+ * and so on, clamped to `capMs`.
+ *
+ * MUST NOT be implemented with a bitwise shift. `base << n` coerces to a SIGNED
+ * 32-bit integer, so with base 1000 the product wraps negative at n = 22
+ * (`1000 << 22 === -100663296`). A negative delay survives `Math.min`, is then
+ * clamped to 0 by the remaining-delay calculation, and switches the throttle OFF
+ * - the exact opposite of a cap - letting a persistently failing worker enter
+ * immediate respawn churn. Float multiplication cannot wrap, and an overflow to
+ * `Infinity` collapses onto the cap, which is the intended behaviour.
+ */
+export function boundedExponentialBackoffMs(baseMs: number, attempt: number, capMs: number): number {
+  if (!Number.isFinite(baseMs) || baseMs <= 0) return 0;
+  if (!Number.isFinite(attempt) || attempt <= 0) return 0;
+  if (!Number.isFinite(capMs) || capMs <= 0) return 0;
+  const scaled = baseMs * 2 ** (attempt - 1);
+  return Math.min(Number.isFinite(scaled) ? scaled : capMs, capMs);
+}
 
 /** Reason a worker generation became unavailable. Keeps the timeout-respawn
  *  cooldown and the warmup/crash backoff independent, and ensures an intentional

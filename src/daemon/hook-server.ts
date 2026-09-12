@@ -14,8 +14,6 @@
  * All hook scripts and plugins read this value at write time.
  */
 import http from 'http';
-import { promises as fs } from 'fs';
-import { dirname } from 'path';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
@@ -24,7 +22,21 @@ import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
 import { dispatchHookSend } from './send-tool.js';
-import { DEFAULT_HOOK_PORT, HOOK_PORT_FILE } from './hook-port.js';
+import {
+  DEFAULT_HOOK_PORT,
+  HOOK_BIND_RETRY_SPAN,
+  HOOK_REBIND_RETRY,
+  publishHookAuthority,
+  readSavedHookPort,
+} from './hook-port.js';
+import { boundedExponentialBackoffMs } from '../../shared/context-store-rpc.js';
+import {
+  HOOK_AUTHORITY_ERROR,
+  HOOK_AUTHORITY_RECORD_VERSION,
+  HOOK_IDENTITY_HOOK_PATH,
+  type HookIdentityResponse,
+} from '../../shared/hook-authority.js';
+import { currentDaemonProcessIdentity } from './instance-lock.js';
 import {
   containsLegacyAuditControlMarker,
   PEER_AUDIT_REPLY_ERRORS,
@@ -135,19 +147,106 @@ const rateLimiter = new Map<string, number[]>();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async function loadSavedPort(): Promise<number> {
+/** Preferred bind port: the last published record, else the default. Reading is
+ *  delegated to `hook-port.ts` so there is exactly ONE parser for the record
+ *  (the previous private copy here diverged - it fell back to
+ *  `DEFAULT_HOOK_PORT` where the shared reader returns null, and it accepted
+ *  `parseInt` prefixes like "51915abc"). */
+function loadPreferredPort(home?: string): number {
+  return (home === undefined ? readSavedHookPort() : readSavedHookPort(home)) ?? DEFAULT_HOOK_PORT;
+}
+
+/** Identity of the daemon generation that owns this hook endpoint. Captured
+ *  ONCE so a republish after a rebind keeps the same owner and is therefore not
+ *  fenced against itself. */
+const hookOwnerIdentity = currentDaemonProcessIdentity();
+
+/** Determinate outcome of a publish attempt. */
+export interface PublishAttempt {
+  published: boolean;
+  reason?: string;
+  error?: unknown;
+}
+
+/**
+ * Publish (or republish) the endpoint record, fenced against a different live
+ * owner.
+ *
+ * Returns a DETERMINATE result. It previously swallowed both refusal and write
+ * errors and resolved `void`, so callers could not tell a successful
+ * publication from a refused or failed one - which let the rebind path report
+ * "rebound and republished authority" while clients stayed routed by stale or
+ * never-written authority. A refusal is still not fatal at startup (the server
+ * is already serving), but it MUST be reported, not inferred.
+ */
+async function publishAuthority(port: number, context: string, home?: string): Promise<PublishAttempt> {
   try {
-    const raw = await fs.readFile(HOOK_PORT_FILE, 'utf-8');
-    const p = parseInt(raw.trim(), 10);
-    return Number.isFinite(p) && p > 1024 && p < 65536 ? p : DEFAULT_HOOK_PORT;
-  } catch {
-    return DEFAULT_HOOK_PORT;
+    const result = await publishHookAuthority(port, {
+      owner: hookOwnerIdentity,
+      ...(home === undefined ? {} : { home, allowGlobalWriteInTests: true }),
+    });
+    if (result.published) {
+      logger.info({ port, context, pid: hookOwnerIdentity.pid }, 'Hook server: published endpoint authority');
+      return { published: true };
+    }
+    logger.warn(
+      { port, context, reason: result.reason, heldBy: result.heldBy },
+      'Hook server: endpoint authority publish refused (another live owner holds the record)',
+    );
+    return { published: false, ...(result.reason === undefined ? {} : { reason: result.reason }) };
+  } catch (err) {
+    // A write failure must not take a healthy listener down, but it also must
+    // not be reported as success.
+    logger.warn({ err, port, context }, 'Hook server: endpoint authority publish failed');
+    return { published: false, reason: 'publish_write_failed', error: err };
   }
 }
 
-async function savePort(port: number): Promise<void> {
-  await fs.mkdir(dirname(HOOK_PORT_FILE), { recursive: true });
-  await fs.writeFile(HOOK_PORT_FILE, String(port));
+/** Raised when startup could not converge: a listener was bound but the
+ *  owner-fenced authority could not be published within the bounded retry. The
+ *  listener is closed before this escapes, so no live-but-undiscoverable
+ *  endpoint is ever left behind. */
+export class HookStartupPublishError extends Error {
+  readonly port: number;
+  readonly reason: string;
+  readonly attempts: number;
+  constructor(port: number, reason: string, attempts: number) {
+    super(
+      `hook server could not publish authority for port ${port} after ${attempts} attempt(s): ${reason}`,
+    );
+    this.name = 'HookStartupPublishError';
+    this.port = port;
+    this.reason = reason;
+    this.attempts = attempts;
+  }
+}
+
+/** Raised when a rebind bound a listener but could not publish the authority.
+ *  Carried through the bounded retry so the endpoint is never reported as
+ *  recovered while clients are still routed by the old record. */
+class HookRebindPublishError extends Error {
+  readonly port: number;
+  readonly reason: string;
+  readonly cause?: unknown;
+  constructor(port: number, reason: string, cause?: unknown) {
+    super(`hook authority publish failed after rebinding port ${port}: ${reason}`);
+    this.name = 'HookRebindPublishError';
+    this.port = port;
+    this.reason = reason;
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
+/** Servers whose close was REQUESTED by the daemon. */
+const intentionallyClosing = new WeakSet<http.Server>();
+
+/** Close the hook server and await it. Daemon shutdown MUST use this so the
+ *  self-healing rebind is not armed in the middle of teardown. */
+export function closeHookServer(server: http.Server): Promise<void> {
+  intentionallyClosing.add(server);
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
 }
 
 function tryBind(server: http.Server, port: number): Promise<void> {
@@ -634,6 +733,32 @@ function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 export interface HookServerOptions {
+  /** State directory for the endpoint authority pair (`hook-port` +
+   *  `hook-authority.json`). Production leaves this unset and uses
+   *  `IMCODES_HOME`/`~/.imcodes`.
+   *
+   *  Tests MUST set it to a temp directory: this is the injection seam whose
+   *  absence let eight suites publish over the machine-global record. Setting it
+   *  also authorises the write, so the publisher's test-runtime guard does not
+   *  suppress a deliberately sandboxed publish. */
+  authorityHome?: string;
+  /** Rebind + republish the endpoint when the listener is lost without a
+   *  `closeHookServer()` request. The daemon sets this; holders that manage the
+   *  server's lifetime themselves (tests, embedders) leave it off so a plain
+   *  `close()` stays a plain close. */
+  rebindOnListenerLoss?: boolean;
+  /** Overrides for the bounded rebind retry (see `HOOK_REBIND_RETRY`). */
+  rebindRetry?: { maxAttempts?: number; baseDelayMs?: number; capDelayMs?: number };
+  /** Test seam performing the owner-fenced authority publication. Injected so a
+   *  transient publish failure can be reproduced deterministically: `fs` is an
+   *  ESM namespace and cannot be spied on, and a chmod race is timing-dependent.
+   *  Production leaves it unset. */
+  publishRecord?: (port: number, context: string, home?: string) => Promise<PublishAttempt>;
+  /** Test seam performing the actual `listen`. Injected so the bounded rebind
+   *  retry can be driven deterministically instead of racing the OS for ports;
+   *  a real `EADDRINUSE` sequence is otherwise impossible to reproduce reliably.
+   *  MUST reject with `code: 'EADDRINUSE'` to mean "try the next port". */
+  bindListener?: (server: http.Server, port: number) => Promise<void>;
   /** Test seam; production lazily binds the daemon-local memory handlers. */
   invokeMemoryMcpTool?: (
     caller: McpRuntimeCaller,
@@ -659,7 +784,7 @@ export async function startHookServer(
   onHook: HookCallback,
   options: HookServerOptions = {},
 ): Promise<{ server: http.Server; port: number }> {
-  const preferredPort = await loadSavedPort();
+  const preferredPort = loadPreferredPort(options.authorityHome);
 
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') {
@@ -669,6 +794,23 @@ export async function startHookServer(
     }
 
     const url = req.url;
+
+    // Owner verification. Unauthenticated on purpose: every local client (the
+    // stdio MCP child, `imcodes send`, the peer-audit CLI) must be able to ask
+    // "who owns this port?" BEFORE it has any session/server credential. The
+    // payload is loopback-only and carries no secret - just the process
+    // identity already written to the on-disk record.
+    if (url === HOOK_IDENTITY_HOOK_PATH) {
+      const identity: HookIdentityResponse = {
+        version: HOOK_AUTHORITY_RECORD_VERSION,
+        port: activeHookPort,
+        pid: hookOwnerIdentity.pid,
+        startToken: hookOwnerIdentity.startToken,
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(identity));
+      return;
+    }
 
     if (url === MEMORY_MCP_DAEMON_RPC_PATH) {
       const senderHeader = req.headers['x-imcodes-session'];
@@ -1181,24 +1323,194 @@ export async function startHookServer(
     res.end();
   });
 
-  // Try preferred port first, then increment on conflict
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const port = preferredPort + attempt;
-    try {
-      await tryBind(server, port);
-      activeHookPort = port;
-      await savePort(port);
-      if (port !== preferredPort) {
-        logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port (saved)');
-      } else {
-        logger.info({ port }, 'Hook server listening');
+  const bind = options.bindListener ?? tryBind;
+  /** Single publication entry point for BOTH startup and rebind, so the seam and
+   *  the production path cannot diverge. */
+  const publishVia = (target: number, context: string): Promise<PublishAttempt> => (
+    options.publishRecord
+      ? options.publishRecord(target, context, options.authorityHome)
+      : publishAuthority(target, context, options.authorityHome)
+  );
+  const bindWithin = async (from: number): Promise<number> => {
+    for (let attempt = 0; attempt < HOOK_BIND_RETRY_SPAN; attempt++) {
+      const port = from + attempt;
+      try {
+        await bind(server, port);
+        activeHookPort = port;
+        return port;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
+        logger.debug({ port }, 'Hook server: port in use, trying next');
       }
-      return { server, port };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
-      logger.debug({ port }, 'Hook server: port in use, trying next');
     }
+    throw new Error(
+      `Hook server: could not bind to any port in range ${from}-${from + HOOK_BIND_RETRY_SPAN - 1}`,
+    );
+  };
+
+  // A listener that dies after a successful bind used to leave the daemon with
+  // NO hook endpoint and a record pointing at a dead port, recoverable only by
+  // restarting the whole daemon. Rebind + republish in place instead.
+  const rebindRetry = {
+    maxAttempts: options.rebindRetry?.maxAttempts ?? HOOK_REBIND_RETRY.maxAttempts,
+    baseDelayMs: options.rebindRetry?.baseDelayMs ?? HOOK_REBIND_RETRY.baseDelayMs,
+    capDelayMs: options.rebindRetry?.capDelayMs ?? HOOK_REBIND_RETRY.capDelayMs,
+  };
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+
+  /** Close the listener if it is up. Re-entry is already blocked by
+   *  `rebinding`, so the `'close'` this emits is ignored. */
+  const releaseListener = async (): Promise<void> => {
+    if (!server.listening) return;
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  };
+
+  const rebindOnce = async (cause: string): Promise<number> => {
+    // An `'error'` event does NOT imply the handle was released, and `listen()`
+    // on a still-listening server throws ERR_SERVER_ALREADY_LISTEN - which is
+    // not EADDRINUSE, so `bindWithin` rethrows and the whole recovery aborts.
+    // Release the handle first.
+    await releaseListener();
+    const port = await bindWithin(loadPreferredPort(options.authorityHome));
+    // Recovery is NOT complete until the authority is actually published:
+    // clients route by the record, so a bound listener with a stale or
+    // unwritten record leaves them pointed at the dead endpoint. Throwing keeps
+    // the bounded retry running over BOTH steps.
+    const attempt = await publishVia(port, `rebind:${cause}`);
+    if (!attempt.published && attempt.reason !== HOOK_AUTHORITY_ERROR.publishSuppressedForTests) {
+      // ROLL BACK THIS ATTEMPT'S LISTENER before failing.
+      //
+      // Previously only the NEXT `rebindOnce` closed it, so intermediate
+      // attempts were cleaned up by accident and the FINAL failure left a live
+      // listener bound to a port no client could discover - the listener /
+      // authority split this work exists to eliminate, needing an unrelated
+      // future close or a daemon restart to heal. An attempt that cannot
+      // publish must leave nothing serving.
+      await releaseListener();
+      throw new HookRebindPublishError(port, attempt.reason ?? 'unknown', attempt.error);
+    }
+    return port;
+  };
+
+  let rebinding = false;
+  const handleUnexpectedLoss = (cause: string, err?: unknown): void => {
+    if (intentionallyClosing.has(server) || rebinding) return;
+    if (!options.rebindOnListenerLoss) return;
+    rebinding = true;
+    logger.warn({ err, cause, port: activeHookPort }, 'Hook server: listener lost, rebinding');
+    void (async () => {
+      try {
+        for (let attempt = 1; attempt <= rebindRetry.maxAttempts; attempt += 1) {
+          try {
+            const port = await rebindOnce(cause);
+            logger.info({ port, cause, attempt }, 'Hook server: rebound and republished authority');
+            return;
+          } catch (rebindError) {
+            if (attempt >= rebindRetry.maxAttempts) {
+              // Belt and braces: `rebindOnce` already rolls back its own
+              // listener, but the invariant asserted by the regression is
+              // "after exhaustion nothing is serving", so enforce it here too
+              // rather than relying on every failure path remembering.
+              await releaseListener();
+              logger.error(
+                { err: rebindError, cause, attempts: attempt, listening: server.listening },
+                'Hook server: rebind failed; hook endpoint is down',
+              );
+              return;
+            }
+            // Every candidate in the bind window can be momentarily occupied,
+            // so back off and try the whole window again rather than declaring
+            // the endpoint permanently dead.
+            const delay = boundedExponentialBackoffMs(
+              rebindRetry.baseDelayMs,
+              attempt,
+              rebindRetry.capDelayMs,
+            );
+            logger.warn(
+              { err: rebindError, cause, attempt, delay },
+              'Hook server: rebind attempt failed, retrying',
+            );
+            await sleep(delay);
+          }
+        }
+      } finally {
+        rebinding = false;
+      }
+    })();
+  };
+  // Attached only AFTER the initial bind resolves, so `tryBind`'s one-shot
+  // error handler still owns EADDRINUSE during discovery.
+  //
+  // The 'close' arm is why this is OPT-IN. A first cut tried to infer intent by
+  // wrapping `server.close()`; that broke callers which close the server
+  // directly (the daemon test suites) - the listener rebound mid-teardown and
+  // in-flight requests died with ECONNRESET. Rather than guess, the daemon
+  // declares that it wants self-healing and anyone holding the handle for their
+  // own lifecycle (tests, embedders) keeps plain close() semantics.
+  const armLossHandlers = (): void => {
+    server.on('error', (err) => handleUnexpectedLoss('error', err));
+    server.on('close', () => handleUnexpectedLoss('close'));
+  };
+
+  const port = await bindWithin(preferredPort);
+  if (port !== preferredPort) {
+    logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port');
+  } else {
+    logger.info({ port }, 'Hook server listening');
   }
 
-  throw new Error(`Hook server: could not bind to any port in range ${preferredPort}–${preferredPort + 19}`);
+  // ── Startup is ONE bounded convergence transaction: bind AND owner-fenced
+  // publish, or nothing.
+  //
+  // This result used to be discarded, and the rebind handler only fires on a
+  // later `error`/`close`. So a single startup write failure or fence refusal
+  // left a LIVE listener paired with a stale or missing authority record -
+  // permanently, until an unrelated listener loss or a daemon restart. That is
+  // exactly the reported live-51941 / stale-51915 split, reached without any
+  // subsequent failure. A started hook server must never be undiscoverable.
+  let published: PublishAttempt = { published: false, reason: 'not_attempted' };
+  for (let attempt = 1; attempt <= rebindRetry.maxAttempts; attempt += 1) {
+    published = await publishVia(port, 'start');
+    if (published.published) break;
+    // `publishSuppressedForTests` means publication was DELIBERATELY skipped by
+    // the containment guard, not that it failed: the caller is an in-process
+    // test runner that must never write the machine-global record. Retrying or
+    // failing the start would be wrong - there is nothing to converge on.
+    if (published.reason === HOOK_AUTHORITY_ERROR.publishSuppressedForTests) {
+      logger.debug({ port }, 'Hook server: authority publication suppressed for a test runtime');
+      break;
+    }
+    if (attempt >= rebindRetry.maxAttempts) break;
+    const delay = boundedExponentialBackoffMs(
+      rebindRetry.baseDelayMs,
+      attempt,
+      rebindRetry.capDelayMs,
+    );
+    logger.warn(
+      { port, attempt, delay, reason: published.reason },
+      'Hook server: startup authority publish failed, retrying',
+    );
+    await sleep(delay);
+  }
+
+  if (!published.published
+    && published.reason !== HOOK_AUTHORITY_ERROR.publishSuppressedForTests) {
+    // Fail closed: tear the listener down so nothing is serving an endpoint no
+    // client can discover, then fail the start.
+    logger.error(
+      { port, reason: published.reason, attempts: rebindRetry.maxAttempts },
+      'Hook server: startup authority publish exhausted; closing listener and failing start',
+    );
+    await closeHookServer(server).catch(() => {});
+    throw new HookStartupPublishError(port, published.reason ?? 'unknown', rebindRetry.maxAttempts);
+  }
+
+  armLossHandlers();
+  return { server, port };
 }
