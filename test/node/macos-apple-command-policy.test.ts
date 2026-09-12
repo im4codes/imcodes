@@ -5,6 +5,7 @@ import {
   macosAppleCommandFailed,
   macosAppleCommandIsVerdict,
   macosGatekeeperAssessmentIsNotarized,
+  macosGatekeeperAssessmentIsPendingNotarization,
 } from '../../src/node/macos-apple-trust.mjs';
 
 /**
@@ -89,6 +90,31 @@ describe('macOS Apple command policy', () => {
         `${standalone}: rejected\norigin=Apple Development: Someone (ABCDE12345)\n`,
       ]) {
         expect(macosGatekeeperAssessmentIsNotarized(assessment, standalone)).toBe(false);
+      }
+    });
+
+    it('separates a ticket that has not propagated from one that never will', () => {
+      // Measured, by re-signing a binary so it needed a new ticket and polling
+      // after `notarytool` returned Accepted: the verdict flipped after zero
+      // seconds in one run, thirty-two in another, and somewhere past three
+      // and a half minutes in a third. The build waits for exactly this
+      // wording and nothing else.
+      expect(macosGatekeeperAssessmentIsPendingNotarization(
+        `${standalone}: rejected\nsource=Unnotarized Developer ID\norigin=Developer ID Application: Lei Sun (M675E26Q67)\n`,
+      )).toBe(true);
+
+      for (const assessment of [
+        // No Developer ID leaf: waiting cannot turn this into one.
+        `${standalone}: rejected\nsource=no usable signature\n`,
+        `${standalone}: rejected\norigin=Apple Development: Someone (ABCDE12345)\n`,
+        // The wording without the origin line is not the shape a pending
+        // ticket produces, and treating it as one would spend the whole budget
+        // on an artifact that is simply wrong.
+        `${standalone}: rejected\nsource=Unnotarized Developer ID\n`,
+        // Already notarized: nothing to wait for.
+        `${standalone}: rejected (the code is valid but does not seem to be an app)\n`,
+      ]) {
+        expect(macosGatekeeperAssessmentIsPendingNotarization(assessment)).toBe(false);
       }
     });
 

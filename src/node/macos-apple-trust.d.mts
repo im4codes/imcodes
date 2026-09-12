@@ -80,3 +80,7 @@ export declare function macosAppleCommandFailed(
   executable: string,
   args: readonly string[] | undefined,
 ): boolean;
+
+export declare function macosGatekeeperAssessmentIsPendingNotarization(
+  assessment: string,
+): boolean;

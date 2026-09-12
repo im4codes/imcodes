@@ -183,6 +183,33 @@ export function macosGatekeeperAssessmentIsNotarized(assessment, artifactPath) {
     && !/(?:^|\n)source=/u.test(assessment);
 }
 
+/**
+ * Whether Gatekeeper's refusal is "I have not seen the ticket yet".
+ *
+ * The verdict for a freshly notarized, UNSTAPLED binary is eventually
+ * consistent: Gatekeeper has to ask Apple, and the answer is not available the
+ * instant `notarytool` returns Accepted. Measured on one machine, with the
+ * same certificate, by re-signing a binary (new cdhash, so a new ticket) and
+ * polling after each submission completed:
+ *
+ *   immediately                    one sample
+ *   32 seconds                     one sample
+ *   between 211 seconds and ~10m   one sample
+ *
+ * A build that samples this once therefore fails at random -- which is what it
+ * did, on the second architecture of a release whose first had passed.
+ *
+ * Narrow on purpose. This is the ONE refusal a propagation delay produces:
+ * the chain is Apple's and the leaf is a Developer ID, and only the ticket is
+ * missing. `source=no usable signature`, a missing origin, or any other
+ * wording is a real defect and must fail at once rather than after a timeout.
+ */
+export function macosGatekeeperAssessmentIsPendingNotarization(assessment) {
+  if (typeof assessment !== 'string') return false;
+  return /(?:^|\n)source=Unnotarized Developer ID\s*(?:\n|$)/u.test(assessment)
+    && /(?:^|\n)origin=Developer ID Application:/u.test(assessment);
+}
+
 export function appleCommandOutput(result) {
   return `${result?.stdout ?? ''}\n${result?.stderr ?? ''}`;
 }

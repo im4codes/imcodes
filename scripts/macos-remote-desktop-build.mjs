@@ -43,7 +43,15 @@ import {
   macosArtifactCanCarryNotarizationTicket,
   macosCodeRequirementLiteral,
   macosGatekeeperAssessmentIsNotarized,
+  macosGatekeeperAssessmentIsPendingNotarization,
 } from '../src/node/macos-apple-trust.mjs';
+
+// Sized from measurement, not from taste: the longest observed wait for a
+// ticket to become visible was between 211 seconds and roughly ten minutes, so
+// a budget under that would reintroduce the same random failure. It is spent
+// only when Apple is actually behind -- the common case polls zero times.
+const GATEKEEPER_ASSESSMENT_TIMEOUT_MS = 12 * 60 * 1000;
+const GATEKEEPER_ASSESSMENT_POLL_MS = 15 * 1000;
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = resolve(SCRIPT_DIR, '..');
@@ -558,10 +566,38 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
     );
   }
 
-  const assessment = commandText(await run(
+  // Polled, not sampled. Gatekeeper's answer for a freshly notarized
+  // UNSTAPLED binary is eventually consistent -- it has to ask Apple, and the
+  // ticket is not visible the instant `notarytool` returns Accepted. Measured
+  // delays on one machine ranged from zero to several minutes, so a single
+  // sample fails at random: this build passed the first architecture and
+  // failed the second, on artifacts Apple had accepted moments earlier.
+  //
+  // Only the "ticket not visible yet" refusal is waited on. Every other
+  // wording is a real defect and fails immediately rather than after a
+  // timeout.
+  const assess = async () => commandText(await run(
     MACOS_REMOTE_DESKTOP_BUILD_TOOLS.spctl,
     ['--assess', '--type', 'execute', '-vv', executablePath],
   ), 'spctl --assess', true);
+  const sleep = dependencies.sleep ?? ((ms) => new Promise((done) => { setTimeout(done, ms); }));
+  let assessment = await assess();
+  for (let waited = 0;
+    waited < GATEKEEPER_ASSESSMENT_TIMEOUT_MS
+    && !macosGatekeeperAssessmentIsNotarized(assessment, executablePath)
+    && macosGatekeeperAssessmentIsPendingNotarization(assessment);
+    waited += GATEKEEPER_ASSESSMENT_POLL_MS) {
+    // Said out loud. A step that silently waits minutes is indistinguishable
+    // from a hung one in a CI log, and the next person to read it should see
+    // that the build is waiting on Apple rather than stuck.
+    (dependencies.log ?? ((line) => process.stderr.write(`${line}\n`)))(
+      `waiting for Gatekeeper to see ${component.kind}'s notarization `
+      + `(${(waited + GATEKEEPER_ASSESSMENT_POLL_MS) / 1000}s of `
+      + `${GATEKEEPER_ASSESSMENT_TIMEOUT_MS / 1000}s)`,
+    );
+    await sleep(GATEKEEPER_ASSESSMENT_POLL_MS);
+    assessment = await assess();
+  }
   if (!macosGatekeeperAssessmentIsNotarized(assessment, executablePath)) {
     throw new Error(`component ${component.kind} is not assessed by Gatekeeper as notarized: ${assessment.trim().split(/\r?\n/u).slice(0, 3).join(' | ')}`);
   }

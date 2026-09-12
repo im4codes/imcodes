@@ -60,7 +60,9 @@ interface FakeToolOverrides {
   identifier?: string;
   teamIdentifier?: string;
   designatedRequirement?: string;
-  assessment?: string;
+  // A function when the test needs the answer to CHANGE between calls, which
+  // is the whole point of the polling path.
+  assessment?: string | (() => string);
   staple?: string;
   verifyStatus?: number;
 }
@@ -114,7 +116,10 @@ function fakeTools(component: { bundleIdentifier: string }, overrides: FakeToolO
       // than with one string: a test that hands the guard an .app must see
       // what Gatekeeper would actually say about an .app.
       const assessedPath = String(args[args.length - 1] ?? '/tmp/component');
-      return ok(overrides.assessment ?? (/\.(?:app|dmg|pkg)$/iu.test(assessedPath)
+      const override = typeof overrides.assessment === 'function'
+        ? overrides.assessment()
+        : overrides.assessment;
+      return ok(override ?? (/\.(?:app|dmg|pkg)$/iu.test(assessedPath)
         ? `${assessedPath}: accepted\nsource=Notarized Developer ID\n`
         : `${assessedPath}: rejected (the code is valid but does not seem to be an app)\n`));
     }
@@ -144,8 +149,16 @@ async function verifyWith(
   return verifyBuiltMacosRemoteDesktopComponent(plan, component, executablePath, {
     ...fakeTools(component, overrides),
     readFile: async () => payload,
+    // Injected so the polling cases run instantly. A real wait would make this
+    // suite take twelve minutes to prove one branch.
+    sleep: async (ms: number) => { sleeps.push(ms); },
+    log: (line: string) => { logs.push(line); },
   });
 }
+
+/** Every wait the guard asked for, so "it retried" is asserted, not assumed. */
+let sleeps: number[] = [];
+let logs: string[] = [];
 
 describe('macOS remote-desktop deterministic build plan', () => {
   it('emits a machine-independent plan so two hosts with one checkout agree', async () => {
@@ -465,6 +478,48 @@ describe('macOS remote-desktop post-build guards', () => {
     await expect(verifyWith({
       assessment: '/tmp/component: rejected\nsource=Unnotarized Developer ID\n',
     })).rejects.toThrow(/not assessed by Gatekeeper as notarized/);
+  });
+
+  it('waits for a ticket Gatekeeper has not seen yet, then accepts', async () => {
+    // Gatekeeper's answer for a freshly notarized UNSTAPLED binary is
+    // eventually consistent. Measured delays ran from zero to several minutes,
+    // so sampling it once failed at random -- this build passed arm64 and
+    // failed x64 on artifacts Apple had already accepted.
+    sleeps = [];
+    logs = [];
+    let calls = 0;
+    await expect(verifyWith({
+      assessment: () => {
+        calls += 1;
+        return calls < 3
+          ? '/tmp/component: rejected\nsource=Unnotarized Developer ID\norigin=Developer ID Application: Someone (ABCDE12345)\n'
+          : '/tmp/component: rejected (the code is valid but does not seem to be an app)\n';
+      },
+    })).resolves.toBeDefined();
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([15_000, 15_000]);
+    // And it says so, because a silent multi-minute wait reads as a hang.
+    expect(logs).toEqual([
+      "waiting for Gatekeeper to see worker's notarization (15s of 720s)",
+      "waiting for Gatekeeper to see worker's notarization (30s of 720s)",
+    ]);
+  });
+
+  it('does not wait for a refusal that will never become a ticket', async () => {
+    // An unsigned or foreign binary is a defect, not a propagation delay. It
+    // must fail at once rather than after the whole budget.
+    for (const assessment of [
+      '/tmp/component: rejected\nsource=no usable signature\n',
+      // Developer ID wording without an origin line: not the shape a pending
+      // ticket produces.
+      '/tmp/component: rejected\nsource=Unnotarized Developer ID\n',
+      '/tmp/component: rejected\norigin=Apple Development: Someone (ABCDE12345)\n',
+    ]) {
+      sleeps = [];
+      await expect(verifyWith({ assessment }))
+        .rejects.toThrow(/not assessed by Gatekeeper as notarized/);
+      expect(sleeps).toEqual([]);
+    }
   });
 
   it('rejects an assessment that is accepted but not notarized', async () => {
