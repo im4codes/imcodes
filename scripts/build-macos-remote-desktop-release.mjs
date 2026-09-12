@@ -16,7 +16,7 @@
  * CI secret, and a driver that could not be exercised without one would be a
  * driver nobody runs until release day.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -137,28 +137,27 @@ export function notarizeComponents(input, dependencies = {}) {
 }
 
 /**
- * Run a verification tool and report what it did, including its exit status.
+ * Run a verification tool and report BOTH streams plus its exit status.
  *
- * `commandText` refuses a result without a numeric `status` -- and an adapter
- * that returned only stdout and stderr made `status` undefined, so every guard
- * failed identically with "build tool reported failure" before reading a byte
- * of output. A non-zero exit is returned rather than thrown so the guard that
- * asked can say which check failed and on what.
+ * `spawnSync`, not `execFileSync`, because the guards read output that only
+ * exists on stderr: `codesign --display --verbose=4` prints Identifier,
+ * TeamIdentifier and the CodeDirectory flags there and leaves stdout empty.
+ * An adapter returning stdout alone therefore reported a correctly hardened
+ * binary as "not signed with the Hardened Runtime" -- it had simply discarded
+ * the stream that said so.
+ *
+ * `commandText` also refuses a result with no numeric `status`. A non-zero
+ * exit is returned rather than thrown, so the guard that asked is the one that
+ * names which check failed.
  */
 export function commandResult(tool, args) {
-  try {
-    return {
-      stdout: run(tool, args, { stdio: ['ignore', 'pipe', 'pipe'] }),
-      stderr: '',
-      status: 0,
-    };
-  } catch (error) {
-    return {
-      stdout: String(error?.stdout ?? ''),
-      stderr: String(error?.stderr ?? error?.message ?? ''),
-      status: typeof error?.status === 'number' ? error.status : 1,
-    };
-  }
+  const result = spawnSync(tool, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  if (result.error) throw result.error;
+  return {
+    stdout: String(result.stdout ?? ''),
+    stderr: String(result.stderr ?? ''),
+    status: typeof result.status === 'number' ? result.status : 1,
+  };
 }
 
 /**

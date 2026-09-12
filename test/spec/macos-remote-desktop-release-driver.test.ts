@@ -136,6 +136,17 @@ describe('macOS remote-desktop release driver', () => {
     expect(ok.status).toBe(0);
     expect(ok.stdout).toContain('hello');
 
+    // And BOTH streams. The guards read output that exists only on stderr:
+    // `codesign --display --verbose=4` prints Identifier, TeamIdentifier and
+    // the CodeDirectory flags there and leaves stdout empty. An adapter
+    // returning stdout alone reported a correctly hardened binary as "not
+    // signed with the Hardened Runtime" -- it had discarded the stream that
+    // said so, and the release build got as far as notarizing four components
+    // before saying it.
+    const display = commandResult('/usr/bin/codesign', ['--display', '--verbose=4', '/bin/ls']);
+    expect(display.status).toBe(0);
+    expect(display.stderr).toContain('CodeDirectory');
+
     // A non-zero exit is returned, not thrown, so the guard that asked can say
     // which check failed rather than the adapter deciding for it.
     const failed = commandResult('/usr/bin/false', []);
