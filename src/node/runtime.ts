@@ -693,6 +693,12 @@ export function createControlledNodeRuntime(
     serverId: credential.serverId,
     token: credential.token,
     daemonVersion: DAEMON_VERSION,
+    // The architecture this process is ACTUALLY running as, which the row
+    // recorded at enrollment may not be. The macOS executable is universal,
+    // so enrollment recorded whichever slice ran the installer -- under
+    // Rosetta that is `x64` on an Apple Silicon Mac, and nothing corrected it
+    // afterwards, leaving the machine mislabelled everywhere it was shown.
+    runtimeArch: arch,
     capabilities: [],
   };
   const refreshAuthCapabilities = (): void => {

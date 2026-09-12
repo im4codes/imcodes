@@ -2559,6 +2559,58 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(await revoked.text()).toBe(await unknown.text());
   });
 
+  it('serves the components a Mac asks for even when it enrolled as the other architecture', async () => {
+    // The exact failure this was written for. The macOS controlled-node
+    // executable is universal, so the arch recorded at enrollment is
+    // `process.arch` of whichever slice ran the installer -- under Rosetta
+    // that is `x64` on an Apple Silicon Mac, and nothing ever corrects it.
+    //
+    // Gating the component download on that value barred an M3 machine from
+    // the only components it can run, permanently, on the basis of something
+    // that is not a property of the machine: it is a property of how the
+    // installer happened to launch months earlier. The node knows its own CPU
+    // when it asks, and the set it receives names its architecture and is
+    // refused by the node's own verification if it does not match.
+    const app = buildApp();
+    await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
+    await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal', FAKE_BINARY);
+    const release = await writeMacosRemoteDesktopRelease('arm64');
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'apple-silicon-enrolled-under-rosetta', $3, 'online', $4, $5, TRUE, 'mac', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+    const response = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${serverId}&os=mac&arch=arm64`
+      + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          'X-Server-Id': serverId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+    );
+    expect(response.status).toBe(200);
+    const archive = Buffer.from(await response.arrayBuffer());
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME))
+      .toBe(remoteDesktopMacosComponentSetFilename('arm64'));
+    // And it is the arm64 set, not a differently-named copy of something else.
+    const decoded = decodeRemoteDesktopMacosComponentSetPrefix(
+      archive.subarray(0, REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES),
+    );
+    expect(decoded).not.toBeNull();
+    expect(archive.subarray(
+      REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES,
+      REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES + decoded!.manifestSize,
+    )).toEqual(release.manifestBytes);
+  });
+
   it('streams one exact authenticated macOS component set and rejects revocation, cross-arch, and mixed releases', async () => {
     const app = buildApp();
     await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
@@ -2610,9 +2662,12 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     }
     expect(offset).toBe(archive.length);
 
+    // Asking for the architecture this release did not build is answered
+    // "not built", not "forbidden". The enrolled arch is NOT consulted -- see
+    // the Rosetta case below for why it cannot be.
     const crossArch = await app.request(requestPath('x64'), { headers });
-    expect(crossArch.status).toBe(403);
-    await crossArch.arrayBuffer();
+    expect(crossArch.status).toBe(503);
+    expect(await crossArch.json()).toMatchObject({ error: 'remote_desktop_worker_not_built' });
 
     await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), serverId]);
     const revoked = await app.request(requestPath('arm64'), { headers });

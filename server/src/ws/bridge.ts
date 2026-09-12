@@ -182,7 +182,12 @@ import {
   REMOTE_DESKTOP_INSTALL_MSG,
   REMOTE_DESKTOP_PERMISSION_MSG,
 } from '../../../shared/remote-desktop-install.js';
-import { CONTROLLED_NODE_OS_WIN, isControlledNodeOs, type ControlledNodeOs } from '../../../shared/controlled-node-artifacts.js';
+import {
+  CONTROLLED_NODE_OS_WIN,
+  isControlledNodeArch,
+  isControlledNodeOs,
+  type ControlledNodeOs,
+} from '../../../shared/controlled-node-artifacts.js';
 import {
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION,
@@ -4507,6 +4512,12 @@ export class WsBridge {
           this.serverId,
           this.daemonVersion,
           this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
+          // Validated before it is stored: this column is read by artifact
+          // selection, and an unrecognised value is worse than the stale one
+          // it would replace.
+          typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
+            ? msg.runtimeArch
+            : null,
         ).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );

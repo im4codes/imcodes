@@ -447,14 +447,20 @@ export async function updateServerHeartbeat(
   id: string,
   daemonVersion?: string | null,
   controlledCapabilities?: readonly string[],
+  runtimeArch?: string | null,
 ): Promise<void> {
+  // COALESCE, so an older node that does not report one keeps whatever the row
+  // already holds rather than having it erased.
   if (controlledCapabilities !== undefined) {
     await db.execute(
       `UPDATE servers
           SET last_heartbeat_at = $1, status = $2, daemon_version = COALESCE($3, daemon_version),
-              controlled_capabilities = $4::jsonb
+              controlled_capabilities = $4::jsonb, arch = COALESCE($6, arch)
         WHERE id = $5`,
-      [Date.now(), 'online', daemonVersion ?? null, JSON.stringify(controlledCapabilities), id],
+      [
+        Date.now(), 'online', daemonVersion ?? null,
+        JSON.stringify(controlledCapabilities), id, runtimeArch ?? null,
+      ],
     );
   } else if (daemonVersion) {
     await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4', [Date.now(), 'online', daemonVersion, id]);
