@@ -144,6 +144,48 @@ describe('macOS remote-desktop install wiring', () => {
     expect(requestPermissions).not.toHaveBeenCalled();
   });
 
+  it('installs without being asked, once connected', async () => {
+    // The node knows it has no components and which release it belongs to.
+    // Making a person click a button to fetch them asks them to do what the
+    // node can do unprompted.
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: install,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
+  it('does not re-download on every reconnect after a failure', async () => {
+    // A server that cannot serve the set would otherwise turn a flapping link
+    // into a request loop.
+    let now = 1_000_000;
+    const socket = new MockSocket();
+    const install = vi.fn(async () => false);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      now: () => now,
+      installMacosRemoteDesktopComponents: install,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    expect(install).toHaveBeenCalledOnce();
+
+    // An explicit click ignores the delay: whoever pressed it knows something
+    // the node does not.
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledTimes(2));
+  });
+
   it('is a capability the server will actually relay', async () => {
     // A capability missing from the shared allowlist is dropped before it
     // reaches a browser, so advertising it would change nothing at all.

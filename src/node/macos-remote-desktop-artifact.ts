@@ -229,6 +229,26 @@ async function requireTrustedStoreDirectory(
  * empty store for a caller that asked what was already installed -- so a
  * missing store is ENOENT-shaped and reported as "not a directory", not made.
  */
+/**
+ * Bring an ALREADY-TRUSTED directory to the traversable mode, and say nothing
+ * if it cannot.
+ *
+ * Only ever called after `requireTrustedStoreDirectory`, so this never widens
+ * a directory whose owner or writability was rejected. A failure is swallowed
+ * because it is not fatal to the read in progress: a store on a read-only
+ * volume, or one owned by root while this daemon is not, still serves what it
+ * already holds.
+ */
+async function normalizeTrustedStoreDirectoryMode(path: string): Promise<void> {
+  try {
+    const stat = await lstat(path);
+    if ((stat.mode & 0o777) === STORE_DIRECTORY_MODE) return;
+    await chmod(path, STORE_DIRECTORY_MODE);
+  } catch {
+    // Left as found.
+  }
+}
+
 async function requireTrustedStoreForRead(
   storeRoot: string,
   expectedUid: number | undefined,
@@ -236,6 +256,11 @@ async function requireTrustedStoreForRead(
   await requireTrustedStoreDirectory(storeRoot, 'store', expectedUid);
   await requireTrustedStoreDirectory(
     join(storeRoot, RELEASES_DIRECTORY), 'releases', expectedUid);
+  // Both parents, not only the release below them. A traversable release
+  // inside a root-only store is still unreachable by the console user, so
+  // repairing one without the others fixes nothing.
+  await normalizeTrustedStoreDirectoryMode(storeRoot);
+  await normalizeTrustedStoreDirectoryMode(join(storeRoot, RELEASES_DIRECTORY));
 }
 
 async function sha256File(path: string): Promise<string> {
@@ -408,15 +433,40 @@ async function syncDirectoryWhereSupported(path: string): Promise<void> {
   }
 }
 
+/**
+ * Root-owned and unwritable by anyone else, but TRAVERSABLE.
+ *
+ * These directories were created 0700, which is stricter than the trust
+ * invariant needs and broke the one thing the store exists for: the components
+ * must be executed AS THE CONSOLE USER, because that is the only principal
+ * macOS attributes a TCC grant to. A root-only directory made every component
+ * unrunnable by that user -- the worker could not be launched and the
+ * permission prompt could not be raised, both failing with a bare
+ * "Permission denied" from a path nobody was looking at.
+ *
+ * 0755 keeps exactly what `requireTrustedStoreDirectory` enforces: not
+ * group- or world-writable, and root-owned. Nothing about tamper resistance
+ * changes; only the ability to walk in and run what is already verified.
+ *
+ * chmod is explicit because `mkdir(..., { mode })` sets a mode only when it
+ * CREATES the directory -- a store that already exists at 0700 would otherwise
+ * stay broken forever. It runs after the trust check, so a directory this
+ * daemon should not touch is rejected before its mode is changed.
+ */
+const STORE_DIRECTORY_MODE = 0o755;
+
+
 async function ensureStore(
   storeRoot: string,
   expectedUid: number | undefined,
 ): Promise<string> {
-  await mkdir(storeRoot, { recursive: true, mode: 0o700 });
+  await mkdir(storeRoot, { recursive: true, mode: STORE_DIRECTORY_MODE });
   await requireTrustedStoreDirectory(storeRoot, 'store', expectedUid);
+  await normalizeTrustedStoreDirectoryMode(storeRoot);
   const releasesDirectory = join(storeRoot, RELEASES_DIRECTORY);
-  await mkdir(releasesDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(releasesDirectory, { recursive: true, mode: STORE_DIRECTORY_MODE });
   await requireTrustedStoreDirectory(releasesDirectory, 'releases', expectedUid);
+  await normalizeTrustedStoreDirectoryMode(releasesDirectory);
   return releasesDirectory;
 }
 
@@ -507,6 +557,15 @@ async function verifyRelease(
   // The release directory itself, not just its parents. A world-writable
   // release is a swappable component set no matter how safe the store above it.
   await requireTrustedStoreDirectory(artifactDirectory, 'release', expectedUid);
+  // Repaired in place, every time a release is read.
+  //
+  // A release published before this mode was corrected sits at 0700 forever:
+  // promotion returns early when the directory already exists, so nothing ever
+  // revisits it, and the components inside stay unrunnable by the console user
+  // -- the only principal allowed to run them. Machines already installed
+  // would have needed a manual fix or a reinstall. Doing it here means every
+  // path that hands out an executable normalises what it is about to hand out.
+  await normalizeTrustedStoreDirectoryMode(artifactDirectory);
   const verified = await verifyMacosRemoteDesktopArtifact({
     artifactDirectory,
     manifestPath: join(artifactDirectory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME),
@@ -576,7 +635,10 @@ async function stageRelease(
 
   const stagingDirectory = await mkdtemp(join(releasesDirectory, '.staging-'));
   try {
-    await chmod(stagingDirectory, 0o700);
+    // Published at the same mode the store uses: this directory BECOMES the
+    // release, and a 0700 release is one the console user cannot execute out
+    // of. `mkdtemp` creates it 0700, so this is not cosmetic.
+    await chmod(stagingDirectory, STORE_DIRECTORY_MODE);
     for (const kind of COMPONENT_KINDS) {
       const component = candidate.components[kind];
       const stagedPath = join(stagingDirectory, component.fileName);

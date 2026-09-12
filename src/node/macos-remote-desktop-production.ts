@@ -1009,7 +1009,13 @@ export function createMacosRemoteDesktopProductionDependencies(
     async requestPermissions(): Promise<boolean> {
       const artifact = await selectArtifact(storeRoot, 'current', { runtime: { platform, arch } })
         ?? await selectArtifact(storeRoot, 'lastKnownGood', { runtime: { platform, arch } });
-      if (!artifact) return false;
+      // Reported, not returned bare. A silent `false` is how this failed
+      // invisibly: the prompt never appeared, the operator clicked again, and
+      // nothing anywhere said the components could not even be executed.
+      if (!artifact) {
+        dependencies.onBackgroundError?.(new Error('macos_remote_desktop_permission_no_verified_artifact'));
+        return false;
+      }
       try {
         const user = await resolveUser();
         await assertMacosRemoteDesktopStoreTrusted(storeRoot, artifact.releaseName, {

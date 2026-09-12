@@ -285,6 +285,7 @@ export interface ControlledNodeRuntimeOptions {
 }
 
 const REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS = 5 * 60_000;
+const MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS = 5 * 60_000;
 export const CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS = 60_000;
 // Server-side version convergence is deliberately scheduled five seconds after
 // authentication. Wait through that window before attempting a same-version
@@ -448,6 +449,7 @@ export function createControlledNodeRuntime(
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
   let macosRemoteDesktopInstallInFlight = false;
+  let macosRemoteDesktopInstallNextAttemptAt = 0;
   let upgradeInFlight = false;
   let upgradeHandoffDeadlineAt: number | null = null;
   const armUpgradeHandoffWatchdog = (): void => {
@@ -594,8 +596,15 @@ export function createControlledNodeRuntime(
    * set left beside the store is a set some later code might mistake for a
    * release.
    */
-  const installMacosRemoteDesktopComponents = async (): Promise<boolean> => {
+  const installMacosRemoteDesktopComponents = async (force = false): Promise<boolean> => {
     if (macosRemoteDesktopInstallInFlight || !macosRemoteDesktopComponentsInstallable()) return false;
+    // A failed automatic attempt waits before trying again. Without this every
+    // reconnect re-downloads, and a server that cannot serve the set turns a
+    // flapping link into a request loop. An explicit click ignores the delay:
+    // the person asking has new information the node does not.
+    const now = options.now?.() ?? Date.now();
+    if (!force && now < macosRemoteDesktopInstallNextAttemptAt) return false;
+    macosRemoteDesktopInstallNextAttemptAt = now + MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS;
     macosRemoteDesktopInstallInFlight = true;
     const install = options.installMacosRemoteDesktopComponents ?? (async () => {
       const componentArch = arch === 'arm64' ? 'arm64' : 'x64';
@@ -785,6 +794,11 @@ export function createControlledNodeRuntime(
             + REMOTE_DESKTOP_WORKER_REPAIR_AUTH_GRACE_MS;
         }
         repairMissingRemoteDesktopWorker();
+        // macOS installs itself. The components are part of this release, the
+        // node already knows it has none, and making a human click a button to
+        // fetch them is asking them to do what the node can do unprompted. The
+        // manual request remains as a retry for when this fails.
+        void installMacosRemoteDesktopComponents();
         try {
           void Promise.resolve(options.onHeartbeatAck?.()).then(async () => {
             if (legacyUpgradeRescueCleanupStarted) return;
@@ -866,13 +880,23 @@ export function createControlledNodeRuntime(
         if (Object.keys(message).length !== 1) return;
         const request = options.requestMacosRemoteDesktopPermissions
           ?? options.macosRemoteDesktopWorker?.requestPermissions;
-        if (request) {
-          void Promise.resolve(request()).then((asked) => {
-            if (asked) logger.info('asked the machine to raise its remote-desktop permission prompt');
-          }, (error) => {
-            logger.warn({ err: error }, 'could not raise the remote-desktop permission prompt');
-          });
+        if (!request) {
+          logger.warn('no macOS remote-desktop adapter to raise a permission prompt');
+          return;
         }
+        void Promise.resolve(request()).then((asked) => {
+          // BOTH outcomes are logged. Only logging success meant a refusal --
+          // including "the components exist but cannot be executed" -- left no
+          // trace at all, which is exactly how this went unexplained while the
+          // operator clicked the button again.
+          if (asked) {
+            logger.info('asked the machine to raise its remote-desktop permission prompt');
+          } else {
+            logger.warn('the macOS adapter declined to raise the permission prompt');
+          }
+        }, (error) => {
+          logger.warn({ err: error }, 'could not raise the remote-desktop permission prompt');
+        });
         return;
       }
       if (message.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST) {
@@ -880,7 +904,7 @@ export function createControlledNodeRuntime(
         // prevents this from becoming a generic upgrade endpoint.
         if (Object.keys(message).length !== 1) return;
         if (macosRemoteDesktopComponentsInstallable()) {
-          void installMacosRemoteDesktopComponents();
+          void installMacosRemoteDesktopComponents(true);
           return;
         }
         repairMissingRemoteDesktopWorker(true);
