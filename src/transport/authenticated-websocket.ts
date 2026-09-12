@@ -60,6 +60,25 @@ export class AuthenticatedWebSocketClient {
     this.options.onClose?.();
   }
 
+  /**
+   * End the current socket generation and connect a fresh one.
+   *
+   * For state that is only ever sent when a connection authenticates. The
+   * server reads a node's capabilities from its auth frame and nowhere else,
+   * so a change after connecting -- components just installed, a permission
+   * just granted -- is invisible until the next connection. Without a way to
+   * start one, the browser kept showing the old state no matter how often the
+   * operator pressed the button that had already worked.
+   *
+   * Goes through the ordinary loss path rather than `stop()`: that runs the
+   * same once-only finalisation and reconnect a network drop would, instead of
+   * the permanent shutdown `stop()` performs.
+   */
+  reconnect(): void {
+    if (this.stopped || !this.socket) return;
+    this.failSocket(this.socket);
+  }
+
   send(message: unknown): boolean {
     if (!this.socket || this.socket.readyState !== 1) return false;
     this.socket.send(JSON.stringify(message));

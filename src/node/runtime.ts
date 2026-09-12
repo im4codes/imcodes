@@ -632,12 +632,22 @@ export function createControlledNodeRuntime(
     try {
       const installed = await install();
       if (installed) {
-        // Re-read what is on disk rather than assuming the install implies
-        // readiness: the components still have to pass the adapter's own
-        // availability check, and screen recording may not be granted yet.
-        refreshRemoteDesktopCapabilityState();
-        refreshAuthCapabilities();
         logger.info('installed the macOS remote-desktop component set');
+        // START what was just installed. The adapter's startup runs once,
+        // before the socket connects -- on a machine installing for the first
+        // time that is exactly when there is nothing to start, so it failed,
+        // and nothing ever ran it again. The components then sat verified in
+        // the store while the node kept reporting them missing and fetching
+        // them again every retry window, with the button in the browser
+        // unchanged no matter how often it was pressed.
+        try {
+          await remoteDesktopWorkerStartup?.();
+        } catch (error) {
+          logger.warn({ err: error }, 'installed macOS remote-desktop components did not start');
+        }
+        // Re-read rather than assume: starting does not imply readiness, and
+        // screen recording may not be granted yet.
+        republishCapabilitiesIfChanged();
       }
       return installed;
     } catch (error) {
@@ -735,9 +745,27 @@ export function createControlledNodeRuntime(
         : []),
     ];
   };
-  onMacosRemoteDesktopProfileChanged = () => {
+  /**
+   * What the CURRENT connection authenticated with. Capabilities reach the
+   * server only in the auth frame, so anything that changes them afterwards
+   * has to start a new connection or it is never seen.
+   */
+  let authenticatedCapabilities = '';
+  const republishCapabilitiesIfChanged = (): void => {
     refreshRemoteDesktopCapabilityState();
     refreshAuthCapabilities();
+    // Only on a real change. A readiness poll that finds nothing new must not
+    // cost a reconnect, and the reconnect itself re-samples and records the
+    // new set, so this cannot loop.
+    if (JSON.stringify(authFrame.capabilities) === authenticatedCapabilities) return;
+    client.reconnect();
+  };
+  onMacosRemoteDesktopProfileChanged = () => {
+    // A permission granted at the machine surfaces here, through the
+    // adapter's readiness poll. Refreshing only the local frame meant the grant
+    // was invisible to the server -- and so to the browser -- until something
+    // else happened to reconnect.
+    republishCapabilitiesIfChanged();
   };
   refreshAuthCapabilities();
   const clientOptions: AuthenticatedWebSocketOptions = {
@@ -752,6 +780,7 @@ export function createControlledNodeRuntime(
       refreshRemoteDesktopCapabilityState();
       ensureSignedShellController();
       refreshAuthCapabilities();
+      authenticatedCapabilities = JSON.stringify(authFrame.capabilities);
       return createSocket(url);
     },
     onOpen: () => {

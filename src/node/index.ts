@@ -9,6 +9,7 @@ import {
   resolveRemoteDesktopAccountShellArtifact,
 } from './remote-desktop-signed-shell-host.js';
 import { DAEMON_VERSION } from '../util/version.js';
+import logger from '../util/logger.js';
 import {
   controlledNodeHealthLeasePath,
   createControlledNodeHealthLeasePublisher,
@@ -233,7 +234,16 @@ async function main(): Promise<void> {
   const signedShellArtifact = resolveRemoteDesktopAccountShellArtifact();
   const macosRemoteDesktopWorker = process.platform === 'darwin'
     && (process.arch === 'arm64' || process.arch === 'x64')
-    ? createMacosRemoteDesktopProductionDependencies()
+    ? createMacosRemoteDesktopProductionDependencies({
+      // Every failure inside the macOS adapter is reported through this, and it
+      // was not wired: the adapter could fail to start, fail to find its
+      // components, or fail to raise a permission prompt, and not one line
+      // reached the log. That silence is why a button that did nothing looked
+      // like a button nobody had pressed.
+      onBackgroundError: (error) => {
+        logger.warn({ err: error }, 'macOS remote-desktop adapter error');
+      },
+    })
     : undefined;
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
     macosRemoteDesktopWorker,
