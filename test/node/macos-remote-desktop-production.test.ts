@@ -82,7 +82,7 @@ async function trustedStore(releaseName: string): Promise<string> {
 }
 
 function artifact(setSha256 = 'a'.repeat(64)): VerifiedMacosRemoteDesktopArtifact {
-  const requirement = 'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate leaf[subject.OU] = "M675E26Q67"';
+  const requirement = 'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"';
   return {
     artifactDirectory: '/verified/release',
     manifestPath: '/verified/release/imcodes-remote-desktop.manifest.json',
@@ -95,7 +95,7 @@ function artifact(setSha256 = 'a'.repeat(64)): VerifiedMacosRemoteDesktopArtifac
         size: 1,
         sha256: 'e'.repeat(64),
         bundleIdentifier: 'cc.imcodes.node.remote-desktop-worker',
-        designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate leaf[subject.OU] = "M675E26Q67"',
+        designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"',
       },
       disclosure: {} as never,
       launchAgent: {
@@ -361,7 +361,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
             bundleIdentifier: 'cc.imcodes.node.remote-desktop-agent',
             teamId: 'M675E26Q67',
             designatedRequirement:
-              'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate leaf[subject.OU] = "M675E26Q67"',
+              'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"',
           }),
         };
       }) as never,
@@ -428,7 +428,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
           bundleIdentifier: 'cc.imcodes.node.remote-desktop-agent',
           teamId: 'M675E26Q67',
           designatedRequirement:
-            'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate leaf[subject.OU] = "M675E26Q67"',
+            'identifier "cc.imcodes.node.remote-desktop-agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"',
         }),
       })) as never,
       createLaunch,

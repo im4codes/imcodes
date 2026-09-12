@@ -17,7 +17,7 @@ const BUNDLE_ID = 'cc.imcodes.node.remote-desktop-agent';
 const EXPECTED = Object.freeze({
   bundleIdentifier: BUNDLE_ID,
   teamId: REMOTE_DESKTOP_MACOS_TEAM_ID,
-  designatedRequirement: `identifier "${BUNDLE_ID}" and anchor apple generic and certificate leaf[subject.OU] = "${REMOTE_DESKTOP_MACOS_TEAM_ID}"`,
+  designatedRequirement: `identifier "${BUNDLE_ID}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${REMOTE_DESKTOP_MACOS_TEAM_ID}"`,
 });
 
 /**
@@ -180,7 +180,7 @@ describe.skipIf(process.platform !== 'darwin')('macOS native peer verifier bridg
         expectedCodeIdentity: {
           bundleIdentifier: BUNDLE_ID,
           teamId,
-          designatedRequirement: `identifier "${BUNDLE_ID}" and anchor apple generic and certificate leaf[subject.OU] = "${teamId}"`,
+          designatedRequirement: `identifier "${BUNDLE_ID}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${teamId}"`,
         },
       }), teamId).toThrow('macos_remote_desktop_native_peer_verification_failed');
     }
@@ -199,7 +199,7 @@ describe.skipIf(process.platform !== 'darwin')('macOS native peer verifier bridg
       // case: only an explicit comparison catches a lying verifier.
       ['wrong team', emits(peerPayload({
         teamId: 'ABCDE12345',
-        designatedRequirement: `identifier "${BUNDLE_ID}" and anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345"`,
+        designatedRequirement: `identifier "${BUNDLE_ID}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "ABCDE12345"`,
       }))],
       ['wrong bundle identifier', emits(peerPayload({ bundleIdentifier: 'cc.imcodes.node.somebody-else' }))],
       ['wrong designated requirement', emits(peerPayload({ designatedRequirement: `${EXPECTED.designatedRequirement} or anchor trusted` }))],

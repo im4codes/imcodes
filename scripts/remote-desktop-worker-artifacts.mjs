@@ -81,7 +81,12 @@ function validPositiveSize(value) {
 }
 
 function validAppleDesignatedRequirement(value, bundleIdentifier, teamId) {
-  return value === `identifier "${bundleIdentifier}" and anchor apple generic and certificate leaf[subject.OU] = "${teamId}"`;
+  // Exactly what codesign emits for a Developer ID Application certificate:
+  // the two marker extensions sit between the anchor and the team clause.
+  return value === `identifier "${bundleIdentifier}" and anchor apple generic`
+    + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
+    + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
+    + ` and certificate leaf[subject.OU] = "${teamId}"`;
 }
 
 function validMacosCodeSignature(value) {

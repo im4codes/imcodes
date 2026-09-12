@@ -239,9 +239,18 @@ describe('macOS remote-desktop code identity', () => {
   it('emits the exact designated requirement string the shared validator compares', async () => {
     const plan = await planFixture();
     for (const component of plan.components) {
+      // The requirement codesign derives from a Developer ID Application
+      // certificate, written out in full. The two marker extensions sit
+      // between the anchor and the team clause: a string naming only
+      // identifier, anchor and team is not a substring of what codesign
+      // prints, so the producer's comparison matched no Developer-ID-signed
+      // binary at all -- for three release builds, each discovered only after
+      // four components had been compiled, signed and notarized.
       expect(component.designatedRequirement).toBe(
-        `identifier "${component.bundleIdentifier}" and anchor apple generic `
-        + `and certificate leaf[subject.OU] = "${TEAM_ID}"`,
+        `identifier "${component.bundleIdentifier}" and anchor apple generic`
+        + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
+        + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
+        + ` and certificate leaf[subject.OU] = "${TEAM_ID}"`,
       );
     }
   });

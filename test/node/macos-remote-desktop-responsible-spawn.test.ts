@@ -42,7 +42,7 @@ async function fixture(): Promise<{
       size: bytes.length,
       sha256: createHash('sha256').update(bytes).digest('hex'),
       bundleIdentifier: 'cc.imcodes.node.remote-desktop-worker',
-      designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate leaf[subject.OU] = "M675E26Q67"',
+      designatedRequirement: 'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "M675E26Q67"',
     },
     user: {
       name: 'desktop-user',

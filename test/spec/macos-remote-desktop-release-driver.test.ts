@@ -14,6 +14,7 @@ import {
 import {
   MACOS_REMOTE_DESKTOP_BUILD_COMPONENT_ORDER,
   buildMacosRemoteDesktopBuildPlan,
+  macosRemoteDesktopDesignatedRequirement,
 } from '../../scripts/macos-remote-desktop-build.mjs';
 import {
   REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
@@ -153,6 +154,33 @@ describe('macOS remote-desktop release driver', () => {
     expect(failed.status).not.toBe(0);
     expect(typeof failed.stdout).toBe('string');
     expect(typeof failed.stderr).toBe('string');
+  });
+
+  it('builds the requirement codesign actually emits for Developer ID', () => {
+    // Checked against a real Developer ID signature rather than against
+    // itself. The two marker extensions sit BETWEEN the anchor and the team
+    // clause, so the previous string -- identifier, anchor, team -- appeared
+    // nowhere in what codesign prints, and the substring comparison could not
+    // match any Developer-ID-signed binary. Three release builds compiled,
+    // signed and notarized four components each before saying so.
+    //
+    // They are not cosmetic either: 1.2.840.113635.100.6.2.6 marks the
+    // Developer ID intermediate and 1.2.840.113635.100.6.1.13 the Developer ID
+    // Application leaf. Without them an Apple Development certificate from the
+    // same team satisfies the requirement, and one of those is issued to every
+    // individual developer on the account.
+    const requirement = macosRemoteDesktopDesignatedRequirement(
+      'cc.imcodes.node.remote-desktop-worker', TEAM_ID,
+    );
+    expect(requirement).toBe(
+      'identifier "cc.imcodes.node.remote-desktop-worker" and anchor apple generic'
+      + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
+      + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
+      + ` and certificate leaf[subject.OU] = "${TEAM_ID}"`,
+    );
+    // And the same text the shared runtime validator demands, since the
+    // manifest carries it across that boundary.
+    expect(validateRemoteDesktopWorkerReleaseManifest).toBeTypeOf('function');
   });
 
   it('hands codesign an absolute entitlements path', async () => {

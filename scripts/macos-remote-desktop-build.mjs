@@ -142,6 +142,22 @@ function sha256(bytes) {
  * The designated requirement string is byte-compared by
  * `shared/remote-desktop-worker.ts`. Generating it from one place keeps the
  * producer and the validator from drifting.
+ *
+ * This is the requirement `codesign` itself derives from a Developer ID
+ * Application certificate, reproduced exactly -- including the two marker
+ * extensions and their `/* exists *\/` comments, which are part of the text it
+ * prints and therefore part of the comparison:
+ *
+ *   1.2.840.113635.100.6.2.6  on certificate 1, the Developer ID intermediate
+ *   1.2.840.113635.100.6.1.13 on the leaf, marking Developer ID Application
+ *
+ * An earlier version named only the identifier, the Apple anchor and the team,
+ * which is both WRONG and WEAKER. Wrong because those clauses do not appear
+ * contiguously in what codesign emits -- the markers sit between them, so the
+ * substring comparison could never match a Developer-ID-signed binary, and did
+ * not, three release builds running. Weaker because without the markers an
+ * Apple Development certificate from the same team satisfies it, and those are
+ * issued to every individual developer on the account.
  */
 export function macosRemoteDesktopDesignatedRequirement(bundleIdentifier, teamId) {
   if (typeof bundleIdentifier !== 'string' || !BUNDLE_ID_RE.test(bundleIdentifier)) {
@@ -150,7 +166,10 @@ export function macosRemoteDesktopDesignatedRequirement(bundleIdentifier, teamId
   if (typeof teamId !== 'string' || !TEAM_ID_RE.test(teamId)) {
     throw new Error('invalid Apple Team ID');
   }
-  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate leaf[subject.OU] = "${teamId}"`;
+  return `identifier "${bundleIdentifier}" and anchor apple generic`
+    + ' and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */'
+    + ' and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */'
+    + ` and certificate leaf[subject.OU] = "${teamId}"`;
 }
 
 /**

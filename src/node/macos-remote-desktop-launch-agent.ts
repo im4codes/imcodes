@@ -335,6 +335,12 @@ function validateArtifact(
   const expectedRequirement = [
     `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}"`,
     'and anchor apple generic',
+    // The two markers codesign emits for a Developer ID Application leaf.
+    // They sit between the anchor and the team clause in the requirement it
+    // derives, and without them an Apple Development certificate from the
+    // same team satisfies this.
+    'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
+    'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
     `and certificate leaf[subject.OU] = "${REMOTE_DESKTOP_MACOS_TEAM_ID}"`,
   ].join(' ');
   if (manifest.os !== 'darwin'

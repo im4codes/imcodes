@@ -41,6 +41,10 @@ const TEAM_ID = 'ABCDE12345';
 const DESIGNATED_REQUIREMENT = [
   `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}"`,
   'and anchor apple generic',
+  // The two markers codesign emits for a Developer ID Application leaf; they
+  // sit between the anchor and the team clause in the real requirement.
+  'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
+  'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
   `and certificate leaf[subject.OU] = "${TEAM_ID}"`,
 ].join(' ');
 const REQUEST_ID = 'request_123456789';

@@ -43,6 +43,10 @@ const TEAM_ID = 'ABCDE12345';
 const DESIGNATED_REQUIREMENT = [
   `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}"`,
   'and anchor apple generic',
+  // The two markers codesign emits for a Developer ID Application leaf; they
+  // sit between the anchor and the team clause in the real requirement.
+  'and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */',
+  'and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */',
   `and certificate leaf[subject.OU] = "${TEAM_ID}"`,
 ].join(' ');
 const REQUEST_ID = 'request_123456789';
@@ -213,8 +217,8 @@ describe('macOS remote-desktop authenticated local IPC contract', () => {
   it('requires the configured designated requirement to bind the exact bundle and Team ID', () => {
     for (const designatedRequirement of [
       'anchor apple generic',
-      `identifier "cc.attacker.agent" and anchor apple generic and certificate leaf[subject.OU] = "${TEAM_ID}"`,
-      `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}" and anchor apple generic and certificate leaf[subject.OU] = "ZZZZZ99999"`,
+      `identifier "cc.attacker.agent" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${TEAM_ID}"`,
+      `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "ZZZZZ99999"`,
       `${DESIGNATED_REQUIREMENT} or identifier "cc.attacker.agent"`,
       DESIGNATED_REQUIREMENT.replace(`"${TEAM_ID}"`, TEAM_ID),
     ]) {

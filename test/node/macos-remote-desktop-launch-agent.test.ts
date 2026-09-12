@@ -51,7 +51,7 @@ const OTHER_USER: MacosUserSession = {
 };
 
 function designatedRequirement(bundleIdentifier: string): string {
-  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate leaf[subject.OU] = "${TEAM_ID}"`;
+  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${TEAM_ID}"`;
 }
 
 function manifest(): RemoteDesktopMacosWorkerManifest {
@@ -130,7 +130,7 @@ function manifest(): RemoteDesktopMacosWorkerManifest {
         virtualDisplayHelper: {
           bundleIdentifier: 'cc.imcodes.node.virtual-display-helper',
           designatedRequirement:
-            'identifier "cc.imcodes.node.virtual-display-helper" and anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345"',
+            'identifier "cc.imcodes.node.virtual-display-helper" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "ABCDE12345"',
           hardenedRuntime: true,
         },
       },
@@ -513,7 +513,7 @@ describe('macOS remote-desktop LaunchAgent definition', () => {
       // team -- a self-INconsistent artifact that the requirement comparison
       // rejects on its own, leaving the team pin unexercised.
       const requirement = `identifier "${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier}" `
-        + `and anchor apple generic and certificate leaf[subject.OU] = "${foreign}"`;
+        + `and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${foreign}"`;
       (forged.manifest.codeSignature as { teamId: string }).teamId = foreign;
       forged.manifest.codeSignature.bundles.launchAgent = {
         bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,

@@ -68,7 +68,7 @@ function sha256(bytes: Buffer): string {
 }
 
 function designatedRequirement(bundleIdentifier: string, teamId = TEAM_ID): string {
-  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate leaf[subject.OU] = "${teamId}"`;
+  return `identifier "${bundleIdentifier}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${teamId}"`;
 }
 
 function notarization(seed: string) {
