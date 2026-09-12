@@ -168,6 +168,76 @@ jobs:
       - run: npm run build
       - run: npm run test:unit
 
+  # ── macOS remote-desktop components (built from the immutable SDK) ────────
+
+  # Proves the published libwebrtc SDK still builds the shipped components, on
+  # a runner with no WebRTC checkout, no gn and no ninja. Before this existed
+  # nothing in CI built the macOS components at all.
+  #
+  # arm64 only here. Both architectures are built in build-node-exe.yml for a
+  # release; doing both on every push would double a four-minute job to catch
+  # regressions that are almost never architecture-specific.
+  macos-remote-desktop-components:
+    name: macOS Remote Desktop (from SDK)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: ./scripts/ci-npm-ci.sh .
+      # Deliberately not cached. The extracted SDK is ~850MB per architecture,
+      # which would spend most of the repository's 10GB Actions cache budget to
+      # save a download of well under a minute.
+      - name: Install the pinned libwebrtc SDK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lock="native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json"
+          tag="$(node -p "require('./$lock').releaseTag")"
+          asset="$(node -p "require('./$lock').assetName")"
+          repository="$(node -p "require('./$lock').repository")"
+          download="$RUNNER_TEMP/libwebrtc-sdk-download"
+          mkdir -p "$download"
+          gh release download "$tag" --repo "$repository" --pattern "$asset" \
+            --dir "$download" --clobber
+          # Verifies the lock against the archive before extracting anything,
+          # and against every extracted file's digest afterwards.
+          node scripts/install-libwebrtc-sdk.mjs --target macos-arm64 \
+            "$download/$asset" "$RUNNER_TEMP/libwebrtc-sdk"
+          rm -rf "$download"
+      - name: Verify the installed SDK against the committed lock
+        run: >-
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock
+          --target macos-arm64
+          native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json
+          "$RUNNER_TEMP/libwebrtc-sdk"
+      - name: Build the remote-desktop components
+        run: |
+          bash native/macos-remote-desktop/build-worker-from-sdk.sh \
+            --sdk-root "$RUNNER_TEMP/libwebrtc-sdk" \
+            --artifact-root "$RUNNER_TEMP/remote-desktop-components" \
+            --target-cpu arm64 --jobs 3
+      # Linking is not the same as working: a complete flag set is what
+      # separates a binary that runs from one that segfaults in a constructor,
+      # and only running it tells them apart.
+      - name: Run each component
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/remote-desktop-components"
+          for component in imcodes-remote-desktop-worker \
+            imcodes-remote-desktop-launch-agent \
+            imcodes-remote-desktop-disclosure \
+            imcodes-virtual-display-helper; do
+            test -x "$component"
+            output="$(./"$component" --imcodes-ci-probe 2>&1 | head -1)"
+            test -n "$output"
+            echo "$component -> $output"
+          done
+
   # ── Windows unit tests (WezTerm backend) ──────────────────────────────────
 
   windows-unit-tests:

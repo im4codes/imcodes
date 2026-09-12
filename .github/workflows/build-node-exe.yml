@@ -165,6 +165,40 @@ jobs:
           DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
           node scripts/macos-release-signing.mjs notarize "$DMG"
           xcrun stapler validate "$DMG"
+      # The macOS remote-desktop components, built from the published
+      # immutable SDK. Both architectures are produced here because each ships
+      # thin -- the build plan sets universalBinary = false and the runtime
+      # verifier rejects a fat Mach-O -- and both SDKs carry an arm64
+      # toolchain, so this must run on an Apple silicon runner.
+      - name: Build macOS remote-desktop components from the pinned SDK
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            lock="native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json"
+            tag="$(node -p "require('./$lock').releaseTag")"
+            asset="$(node -p "require('./$lock').assetName")"
+            repository="$(node -p "require('./$lock').repository")"
+            download="$RUNNER_TEMP/libwebrtc-sdk-download-$arch"
+            sdk="$RUNNER_TEMP/libwebrtc-sdk-$arch"
+            mkdir -p "$download"
+            gh release download "$tag" --repo "$repository" --pattern "$asset" \
+              --dir "$download" --clobber
+            node scripts/install-libwebrtc-sdk.mjs --target "macos-$arch" \
+              "$download/$asset" "$sdk"
+            node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+              --target "macos-$arch" "$lock" "$sdk"
+            bash native/macos-remote-desktop/build-worker-from-sdk.sh \
+              --sdk-root "$sdk" \
+              --artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch" \
+              --target-cpu "$arch" --jobs 3
+            # Reclaimed immediately: two extracted SDKs are ~1.7GB, and the
+            # runner still has the signing and packaging steps to do.
+            rm -rf "$download" "$sdk"
+          done
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
