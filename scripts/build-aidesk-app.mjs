@@ -26,6 +26,16 @@ export const AIDESK_BUNDLE_ID = 'to.aidesk.app';
 export const AIDESK_MAIN_EXECUTABLE = 'aidesk-agent';
 export const AIDESK_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
 
+/**
+ * Where the bundle's helpers live.
+ *
+ * `Contents/Helpers`, not `Contents/MacOS`, because that is the path
+ * `ExecAiDeskProductHelper` builds and no other. Putting them beside the main
+ * executable produces a bundle that signs, notarizes and installs perfectly
+ * and then answers every dispatch with `aidesk_product_helper_exec_failed`.
+ */
+export const AIDESK_HELPERS_DIR = 'Helpers';
+
 /** Architectures the shipped app must run on, as one Universal 2 binary. */
 export const AIDESK_ARCHITECTURES = Object.freeze(['arm64', 'x86_64']);
 
@@ -84,10 +94,9 @@ ${body}
  * here.
  */
 export function aideskSigningOrder(bundlePath) {
-  const macos = join(bundlePath, 'Contents', 'MacOS');
   return Object.freeze([
-    join(macos, AIDESK_COMPUTER_USE_EXECUTABLE),
-    join(macos, AIDESK_MAIN_EXECUTABLE),
+    join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_COMPUTER_USE_EXECUTABLE),
+    join(bundlePath, 'Contents', 'MacOS', AIDESK_MAIN_EXECUTABLE),
     bundlePath,
   ]);
 }
@@ -270,13 +279,16 @@ export function buildAideskApp(input) {
   const bundlePath = join(outDir, AIDESK_APP_NAME);
   rmSync(bundlePath, { recursive: true, force: true });
   const macos = join(bundlePath, 'Contents', 'MacOS');
+  const helpers = join(bundlePath, 'Contents', AIDESK_HELPERS_DIR);
   mkdirSync(macos, { recursive: true });
+  mkdirSync(helpers, { recursive: true });
   writeFileSync(
     join(bundlePath, 'Contents', 'Info.plist'),
     buildAideskInfoPlist({ version, minimumSystemVersion }),
   );
   buildAideskAgent(join(macos, AIDESK_MAIN_EXECUTABLE));
-  extractComputerUseExecutable(computerUseArchive, join(macos, AIDESK_COMPUTER_USE_EXECUTABLE));
+  // Into Helpers, which is where the dispatcher looks.
+  extractComputerUseExecutable(computerUseArchive, join(helpers, AIDESK_COMPUTER_USE_EXECUTABLE));
   signAideskApp(bundlePath);
   return bundlePath;
 }

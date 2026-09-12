@@ -52,17 +52,33 @@ describe('aiDesk application bundle', () => {
       .toThrow(/minimum system version/u);
   });
 
-  it('signs inside out, bundle last', () => {
-    // A signature covers everything nested under it. Sign the bundle first and
-    // its seal describes helpers that are then replaced -- `--verify --deep`
-    // rejects the result, at notarization or on a user's machine.
+  it('signs inside out, bundle last, and finds helpers where the dispatcher looks', () => {
+    // Two properties in one list. The order: a signature covers everything
+    // nested under it, so signing the bundle first leaves a seal describing
+    // helpers that are then replaced.
+    //
+    // And the path: `ExecAiDeskProductHelper` builds `Contents/Helpers/<name>`
+    // and nothing else. A helper beside the main executable produces a bundle
+    // that signs, notarizes and installs perfectly, and then answers every
+    // dispatch with `aidesk_product_helper_exec_failed` -- which is exactly
+    // what running it did before this was fixed.
     const order = aideskSigningOrder('/build/aiDesk.app');
     expect(order).toEqual([
-      '/build/aiDesk.app/Contents/MacOS/OpenComputerUse',
+      '/build/aiDesk.app/Contents/Helpers/OpenComputerUse',
       '/build/aiDesk.app/Contents/MacOS/aidesk-agent',
       '/build/aiDesk.app',
     ]);
     expect(order[order.length - 1]).toBe('/build/aiDesk.app');
+  });
+
+  it('puts helpers at the exact path the native dispatcher builds', () => {
+    // Read from the source of truth rather than restated here, so a change on
+    // either side has to be made on both.
+    const dispatcher = readFileSync(
+      'native/macos-remote-desktop/macos_permission_onboarding.mm', 'utf8',
+    );
+    expect(dispatcher).toContain('Contents/Helpers/%s');
+    expect(aideskSigningOrder('/x')[0]).toContain('/Contents/Helpers/');
   });
 
   it('ships one binary that runs on both architectures', () => {
