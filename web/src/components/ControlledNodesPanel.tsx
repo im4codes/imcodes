@@ -22,7 +22,7 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { MACHINE_IDENTITY_UNAVAILABLE, normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { formatByteSize } from '../util/byte-size.js';
@@ -57,7 +57,12 @@ function canInstallRemoteDesktopWorker(machine: MachineListItem): boolean {
   return machineAccessRole(machine) === 'owner'
     && machine.online
     && !machine.updateAvailable
-    && Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY))
+    // Either platform's "needs one download first" signal. They are separate
+    // wire values because the Windows one says `windows` in its name and the
+    // two installs are different operations, but to this button they mean the
+    // same thing.
+    && (Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY))
+      || Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY)))
     && !machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY);
 }
 

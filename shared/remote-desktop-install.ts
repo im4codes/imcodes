@@ -16,6 +16,18 @@
  */
 export const REMOTE_DESKTOP_INSTALLABLE_CAPABILITY = 'remote.desktop.windows.installable.v1' as const;
 
+/**
+ * The same meaning for macOS, under its own name.
+ *
+ * Not the constant above: that one's wire value says `windows`, and a macOS
+ * node advertising it would be lying to every consumer that reads the string
+ * rather than the symbol. The two installs are also not the same operation --
+ * Windows repairs itself by re-running the whole self-upgrade and restarting,
+ * while macOS publishes a component set into a store with rollback and a
+ * last-known-good selector, without replacing the running executable.
+ */
+export const REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY = 'remote.desktop.macos.installable.v1' as const;
+
 export const REMOTE_DESKTOP_INSTALL_MSG = {
   /** Browser → daemon: fetch and install the worker bundle. */
   REQUEST: 'remote_desktop.worker_install',
