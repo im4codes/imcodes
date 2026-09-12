@@ -114,16 +114,33 @@ function validMacosComponent(value, kind) {
     && validMacosNotarization(value.notarization);
 }
 
+/**
+ * Accepts a stapled ticket, or an explicit statement that this artifact format
+ * cannot carry one.
+ *
+ * The second shape must carry its reason and must pair `false` with `false`.
+ * An evidence record that merely omitted the staple claim, or paired a missing
+ * staple with a validated one, is the downgrade this refuses.
+ */
 function validMacosNotarization(value) {
-  return isRecord(value)
-    && exactKeys(value, ['status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated'])
-    && value.status === 'accepted'
-    && typeof value.submissionId === 'string'
-    && NOTARIZATION_SUBMISSION_ID_RE.test(value.submissionId)
-    && typeof value.ticketSha256 === 'string'
-    && SHA256_RE.test(value.ticketSha256)
-    && value.stapled === true
-    && value.stapleValidated === true;
+  if (!isRecord(value)
+    || value.status !== 'accepted'
+    || typeof value.submissionId !== 'string'
+    || !NOTARIZATION_SUBMISSION_ID_RE.test(value.submissionId)
+    || typeof value.ticketSha256 !== 'string'
+    || !SHA256_RE.test(value.ticketSha256)) {
+    return false;
+  }
+  if (value.stapled === true) {
+    return exactKeys(value, ['status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated'])
+      && value.stapleValidated === true;
+  }
+  return exactKeys(value, [
+    'status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated', 'unstapledReason',
+  ])
+    && value.stapled === false
+    && value.stapleValidated === false
+    && value.unstapledReason === 'artifact_format_cannot_carry_a_ticket';
 }
 
 function validArtifactTarget(value) {

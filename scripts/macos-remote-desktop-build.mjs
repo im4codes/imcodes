@@ -39,6 +39,7 @@ import {
   REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION,
 } from './remote-desktop-worker-artifacts.mjs';
 import { validateMacosLibwebrtcNotices } from './libwebrtc-sdk-artifacts.mjs';
+import { macosArtifactCanCarryNotarizationTicket } from '../src/node/macos-apple-trust.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = resolve(SCRIPT_DIR, '..');
@@ -481,12 +482,21 @@ export async function verifyBuiltMacosRemoteDesktopComponent(plan, component, ex
     throw new Error(`component ${component.kind} is not assessed as a notarized Developer ID binary`);
   }
 
-  const staple = commandText(await run(
-    MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun,
-    ['stapler', 'validate', executablePath],
-  ));
-  if (!/The validate action worked!/u.test(staple)) {
-    throw new Error(`component ${component.kind} has no stapled notarization ticket`);
+  // Only where a ticket can exist. These components are bare Mach-O
+  // executables, and Apple creates tickets for standalone binaries without
+  // providing any way to attach one -- so requiring a staple here required
+  // something unobtainable, and the components could never have passed their
+  // own runtime trust check. `spctl` above is the substantive check regardless:
+  // nothing makes Gatekeeper report a Notarized Developer ID for a binary
+  // Apple did not notarize.
+  if (macosArtifactCanCarryNotarizationTicket(executablePath)) {
+    const staple = commandText(await run(
+      MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun,
+      ['stapler', 'validate', executablePath],
+    ));
+    if (!/The validate action worked!/u.test(staple)) {
+      throw new Error(`component ${component.kind} has no stapled notarization ticket`);
+    }
   }
 
   const bytes = await dependencies.readFile(executablePath);

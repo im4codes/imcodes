@@ -117,11 +117,18 @@ async function planFixture() {
   return buildMacosRemoteDesktopBuildPlan(PLAN_INPUT, { repositoryRoot: REPOSITORY_ROOT });
 }
 
-async function verifyWith(overrides: FakeToolOverrides = {}, bytes?: Buffer) {
+async function verifyWith(
+  overrides: FakeToolOverrides = {},
+  bytes?: Buffer,
+  // The path matters: whether a notarization ticket can be attached at all is
+  // decided by the artifact format, so the guard's behaviour differs between a
+  // bare executable and a bundle.
+  executablePath = '/tmp/component',
+) {
   const plan = await planFixture();
   const component = plan.components[0];
   const payload = bytes ?? componentBytes(component.kind);
-  return verifyBuiltMacosRemoteDesktopComponent(plan, component, '/tmp/component', {
+  return verifyBuiltMacosRemoteDesktopComponent(plan, component, executablePath, {
     ...fakeTools(component, overrides),
     readFile: async () => payload,
   });
@@ -384,10 +391,16 @@ describe('macOS remote-desktop post-build guards', () => {
       MACOS_REMOTE_DESKTOP_BUILD_TOOLS.otool,
       MACOS_REMOTE_DESKTOP_BUILD_TOOLS.codesign,
       MACOS_REMOTE_DESKTOP_BUILD_TOOLS.spctl,
-      MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun,
     ]) {
       expect(executed).toContain(tool);
     }
+    // Deliberately not xcrun/stapler. These components are bare Mach-O
+    // executables and Apple provides no way to attach a ticket to one, so
+    // there is nothing for `stapler validate` to read -- demanding it demanded
+    // something unobtainable. `spctl` above remains the substantive check:
+    // nothing makes Gatekeeper report a Notarized Developer ID for a binary
+    // Apple did not notarize.
+    expect(executed).not.toContain(MACOS_REMOTE_DESKTOP_BUILD_TOOLS.xcrun);
     // Every tool must be invoked by absolute path, never resolved via PATH.
     for (const call of tools.calls) expect(call.executable.startsWith('/')).toBe(true);
   });
@@ -427,10 +440,16 @@ describe('macOS remote-desktop post-build guards', () => {
     })).rejects.toThrow(/notarized Developer ID/);
   });
 
-  it('rejects a missing stapled ticket', async () => {
-    await expect(verifyWith({
-      staple: 'Processing: /tmp/component\nCloudKit query for ... failed\n',
-    })).rejects.toThrow(/stapled notarization ticket/);
+  it('still demands a stapled ticket from a format that can carry one', async () => {
+    // The components themselves are bare Mach-O executables, which Apple
+    // provides no way to staple -- so the guard skips `stapler` for them. That
+    // skip must be a property of the FORMAT, not a blanket removal: anything
+    // that could carry a ticket and does not is still refused.
+    await expect(verifyWith(
+      { staple: 'Processing: /tmp/component.app\nCloudKit query for ... failed\n' },
+      undefined,
+      '/tmp/component.app',
+    )).rejects.toThrow(/stapled notarization ticket/);
   });
 
   it('rejects a failing codesign verification', async () => {

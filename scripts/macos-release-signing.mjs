@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { macosArtifactCanCarryNotarizationTicket } from '../src/node/macos-apple-trust.mjs';
 
 export const MACOS_RELEASE_SIGNING_TOOLS = Object.freeze({
   security: '/usr/bin/security',
@@ -222,10 +223,10 @@ export function macosArtifactCanBeSubmittedDirectly(artifactPath) {
 }
 
 export function macosArtifactSupportsStapling(artifactPath) {
-  if (typeof artifactPath !== 'string' || artifactPath.length === 0) {
-    throw new Error('stapling support requires an artifact path');
-  }
-  return /\.(app|dmg|pkg)$/iu.test(artifactPath.replace(/\/+$/u, ''));
+  // Delegated, not restated. The daemon applies the same rule when it verifies
+  // a shipped component, and two copies of "what can carry a ticket" would
+  // drift -- with the weaker copy being the one that decides what ships.
+  return macosArtifactCanCarryNotarizationTicket(artifactPath);
 }
 
 /**

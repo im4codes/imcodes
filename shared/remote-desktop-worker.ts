@@ -135,13 +135,34 @@ export interface RemoteDesktopMacosCodeIdentity {
   };
 }
 
-export interface RemoteDesktopMacosNotarizationEvidence {
-  status: 'accepted';
-  submissionId: string;
-  ticketSha256: string;
-  stapled: true;
-  stapleValidated: true;
-}
+/**
+ * Two shapes, because two things are true of different artifacts.
+ *
+ * A bundle or container carries its ticket, and saying so is a claim that can
+ * be checked offline. A bare Mach-O executable cannot carry one -- Apple
+ * creates the ticket but provides no way to attach it -- so the honest record
+ * states that, names the reason, and accepts that Gatekeeper will check it
+ * against Apple's service instead.
+ *
+ * A union rather than two booleans: `stapled: false` with
+ * `stapleValidated: true` is not a state that should be describable.
+ */
+export type RemoteDesktopMacosNotarizationEvidence =
+  | {
+    status: 'accepted';
+    submissionId: string;
+    ticketSha256: string;
+    stapled: true;
+    stapleValidated: true;
+  }
+  | {
+    status: 'accepted';
+    submissionId: string;
+    ticketSha256: string;
+    stapled: false;
+    stapleValidated: false;
+    unstapledReason: 'artifact_format_cannot_carry_a_ticket';
+  };
 
 export interface RemoteDesktopMacosWorkerManifest {
   manifestVersion: typeof REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION;
@@ -380,18 +401,37 @@ function validateMacosComponent(
     && validateMacosNotarizationEvidence(value.notarization);
 }
 
+/**
+ * Accepts a stapled ticket, or an explicit statement that this artifact format
+ * cannot carry one.
+ *
+ * The unstapled shape must pair `false` with `false` AND name its reason. A
+ * record that merely omitted the staple claim, or paired a missing staple with
+ * a validated one, is precisely the downgrade this refuses -- and the trust
+ * checks decide which shape is permissible from the artifact itself, not from
+ * what the record would prefer to claim.
+ */
 function validateMacosNotarizationEvidence(
   value: unknown,
 ): value is RemoteDesktopMacosNotarizationEvidence {
-  return record(value)
-    && exactKeys(value, ['status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated'])
-    && value.status === 'accepted'
-    && typeof value.submissionId === 'string'
-    && NOTARIZATION_SUBMISSION_ID_RE.test(value.submissionId)
-    && typeof value.ticketSha256 === 'string'
-    && SHA256_RE.test(value.ticketSha256)
-    && value.stapled === true
-    && value.stapleValidated === true;
+  if (!record(value)
+    || value.status !== 'accepted'
+    || typeof value.submissionId !== 'string'
+    || !NOTARIZATION_SUBMISSION_ID_RE.test(value.submissionId)
+    || typeof value.ticketSha256 !== 'string'
+    || !SHA256_RE.test(value.ticketSha256)) {
+    return false;
+  }
+  if (value.stapled === true) {
+    return exactKeys(value, ['status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated'])
+      && value.stapleValidated === true;
+  }
+  return exactKeys(value, [
+    'status', 'submissionId', 'ticketSha256', 'stapled', 'stapleValidated', 'unstapledReason',
+  ])
+    && value.stapled === false
+    && value.stapleValidated === false
+    && value.unstapledReason === 'artifact_format_cannot_carry_a_ticket';
 }
 
 export function validateRemoteDesktopVirtualDisplayPackageManifest(

@@ -76,8 +76,11 @@ function notarization(seed: string) {
     status: 'accepted' as const,
     submissionId: '123e4567-e89b-42d3-a456-426614174000',
     ticketSha256: seed.repeat(64),
-    stapled: true as const,
-    stapleValidated: true as const,
+    // Bare Mach-O executables: Apple creates a ticket for them and provides no
+    // way to attach one, so the honest record says unstapled and names why.
+    stapled: false as const,
+    stapleValidated: false as const,
+    unstapledReason: 'artifact_format_cannot_carry_a_ticket' as const,
   };
 }
 
@@ -244,11 +247,15 @@ describe('macOS remote-desktop multi-component artifact adapter', () => {
       .toBe(join(candidate.artifactDirectory, REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME));
     // Six Apple tool invocations per component. Derived from KINDS so growing
     // the atomic set cannot leave this silently asserting a stale total.
-    expect(command.calls).toHaveLength(KINDS.length * 6);
+    // Five tools per component, not six: `stapler validate` is not among them,
+    // because a bare Mach-O executable cannot carry a ticket to validate. The
+    // other five -- lipo, codesign --verify, codesign -d, codesign -r-, spctl
+    // -- all still run for every component.
+    expect(command.calls).toHaveLength(KINDS.length * 5);
     expect(command.calls.every(([executable]) => executable.startsWith('/'))).toBe(true);
     for (const kind of KINDS) {
       const componentPath = verified.components[kind].executablePath;
-      expect(command.calls.filter(([, args]) => args.at(-1) === componentPath)).toHaveLength(6);
+      expect(command.calls.filter(([, args]) => args.at(-1) === componentPath)).toHaveLength(5);
     }
   });
 
@@ -335,12 +342,28 @@ describe('macOS remote-desktop multi-component artifact adapter', () => {
           [`${kind}:spctl`]: `${FILE_NAMES[kind]}: rejected\nsource=Developer ID\n`,
         }).execute),
       )).rejects.toThrow('notarization_rejected');
+      // `stapler` is never invoked for these components: they are bare Mach-O
+      // executables, and Apple provides no way to attach a ticket to one. So
+      // the protection moves from the staple check to the CLAIM -- a manifest
+      // saying this component carries a stapled ticket describes something
+      // that cannot exist, and believing it would be the downgrade.
+      const claiming = JSON.parse(await readFile(candidate.manifestPath, 'utf8'));
+      claiming.components[kind].notarization = {
+        status: 'accepted',
+        submissionId: '123e4567-e89b-42d3-a456-426614174000',
+        ticketSha256: 'a'.repeat(64),
+        stapled: true,
+        stapleValidated: true,
+      };
+      await writeFile(candidate.manifestPath, `${JSON.stringify(claiming)}\n`);
       await expect(verifyMacosRemoteDesktopArtifact(
         candidate,
-        dependencies(trustedExecutor('arm64', {
-          [`${kind}:stapler`]: 'The validate action failed!\n',
-        }).execute),
+        dependencies(trustedExecutor('arm64').execute),
       )).rejects.toThrow('staple_invalid');
+      await writeFile(
+        candidate.manifestPath,
+        `${JSON.stringify(candidate.manifest)}\n`,
+      );
     }
   });
 

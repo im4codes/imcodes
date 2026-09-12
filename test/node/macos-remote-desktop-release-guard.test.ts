@@ -106,8 +106,11 @@ function manifest(
       status: 'accepted' as const,
       submissionId: '123e4567-e89b-42d3-a456-426614174000',
       ticketSha256: seed.repeat(64),
-      stapled: true as const,
-      stapleValidated: true as const,
+      // Bare Mach-O executables cannot carry a ticket, so the record states
+      // that and names the reason rather than claiming a staple.
+      stapled: false as const,
+      stapleValidated: false as const,
+      unstapledReason: 'artifact_format_cannot_carry_a_ticket' as const,
     },
   });
   return {
@@ -197,7 +200,7 @@ async function signingRepositoryFixture(changedEntitlementBytes = false): Promis
 
 function appleEvidence(
   calls: string[],
-  options: { unsigned?: boolean; noRuntime?: boolean; rejected?: boolean; unstapled?: boolean; wrongArch?: boolean } = {},
+  options: { unsigned?: boolean; noRuntime?: boolean; rejected?: boolean; wrongArch?: boolean } = {},
 ): MacosRemoteDesktopArtifactCommandExecutor {
   return async (executable, args) => {
     const fileName = args.at(-1) ?? '';
@@ -234,7 +237,10 @@ function appleEvidence(
         : { stdout: '', stderr: `${fileName}: accepted\nsource=Notarized Developer ID\n` };
     }
     if (operation === 'stapler') {
-      return { stdout: options.unstapled ? 'The validate action failed.\n' : 'The validate action worked!\n', stderr: '' };
+      // Retained so an artifact format that CAN carry a ticket still has a
+      // stub here, but unreachable for these components: bare Mach-O
+      // executables are never handed to `stapler`.
+      return { stdout: 'The validate action worked!\n', stderr: '' };
     }
     return { stdout: '', stderr: '' };
   };
@@ -286,7 +292,7 @@ describe('macOS remote desktop deterministic release guard', () => {
     // the slice cannot silently keep checking a stale prefix once the atomic
     // component set grows.
     const firstPassCalls = calls
-      .slice(0, KINDS.length * 6 * 2)
+      .slice(0, KINDS.length * 5 * 2)
       .map((call) => call.split(':').slice(-2).join(':'));
     const expectedPerComponent = KINDS.flatMap((kind) => [
       `${kind}:lipo`,
@@ -294,9 +300,36 @@ describe('macOS remote desktop deterministic release guard', () => {
       `${kind}:codesign-details`,
       `${kind}:codesign-requirement`,
       `${kind}:spctl`,
-      `${kind}:stapler`,
+      // No `stapler`: these are bare Mach-O executables, and Apple provides no
+      // way to attach a ticket to one, so there is nothing to validate.
     ]);
     expect(firstPassCalls).toEqual([...expectedPerComponent, ...expectedPerComponent]);
+  });
+
+  it('refuses a component claiming a staple its format cannot carry', async () => {
+    // `stapler` is never invoked for these components -- they are bare Mach-O
+    // executables and Apple provides no way to attach a ticket to one -- so
+    // the protection is the claim itself. A manifest asserting a stapled
+    // ticket describes something that cannot exist, and believing it would let
+    // an unnotarized set present itself as the strongest possible evidence.
+    const { input, releaseRoots } = await fixture();
+    const manifestPath = join(
+      releaseRoots.arm64, 'remote-desktop-worker', 'darwin-arm64',
+      REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
+    );
+    const claiming = JSON.parse(await readFile(manifestPath, 'utf8'));
+    claiming.components.worker.notarization = {
+      status: 'accepted',
+      submissionId: '123e4567-e89b-42d3-a456-426614174000',
+      ticketSha256: 'a'.repeat(64),
+      stapled: true,
+      stapleValidated: true,
+    };
+    await writeFile(manifestPath, `${JSON.stringify(claiming)}\n`);
+
+    await expect(buildMacosRemoteDesktopReleasePlan(input, {
+      artifact: { execute: appleEvidence([]) },
+    })).rejects.toThrow(/staple_invalid/u);
   });
 
   it('changes immutable release identity when an entitlement file byte changes', async () => {
@@ -323,7 +356,6 @@ describe('macOS remote desktop deterministic release guard', () => {
     ['wrong architecture', { wrongArch: true }, /architecture_mismatch/],
     ['missing hardened runtime', { noRuntime: true }, /code_identity_mismatch/],
     ['rejected notarization', { rejected: true }, /notarization_rejected/],
-    ['invalid staple', { unstapled: true }, /staple_invalid/],
   ] as const)('refuses %s evidence before returning a publication plan', async (_label, options, message) => {
     const { input } = await fixture();
     await expect(buildMacosRemoteDesktopReleasePlan(input, {

@@ -19,7 +19,17 @@
  *   * `codesign -d`      -- identifier, team, AND the hardened-runtime flag.
  *   * `codesign -d -r-`  -- the designated requirement matches exactly.
  *   * `spctl --assess`   -- Gatekeeper accepts it as a Notarized Developer ID.
- *   * `stapler validate` -- the ticket is actually stapled to THIS file.
+ *   * `stapler validate` -- the ticket is actually stapled to THIS file, for
+ *                           the artifact formats that can carry one.
+ *
+ * That last qualifier is Apple's, not a concession: tickets are created for
+ * standalone binaries but cannot be attached to them. The shipped components
+ * are bare Mach-O executables, so demanding a stapled ticket from them demands
+ * something that cannot exist -- and `spctl` remains the substantive check
+ * either way, because nothing can make Gatekeeper report "Notarized Developer
+ * ID" for a binary Apple did not notarize. What is genuinely lost is offline
+ * verification: an unstapled binary is assessed against Apple's service, so a
+ * machine with no network cannot start one.
  *
  * A packager that compared only Identifier and TeamIdentifier would accept a
  * same-team binary with the wrong designated requirement, no hardened runtime,
@@ -41,6 +51,24 @@ export const MACOS_APPLE_TRUST_ERROR = Object.freeze({
   NOTARIZATION_REJECTED: 'macos_apple_trust_notarization_rejected',
   STAPLE_INVALID: 'macos_apple_trust_staple_invalid',
 });
+
+/**
+ * Whether a notarization ticket can be attached to this artifact at all.
+ *
+ * Apple: "Although tickets are created for standalone binaries, it's not
+ * currently possible to staple tickets to them." Only bundles and the two
+ * container formats can carry one.
+ *
+ * Path-based, and deliberately fail-closed in the direction that matters: an
+ * artifact NAMED like a container is held to the stapling requirement, so the
+ * only way to escape that requirement is to genuinely not be one.
+ */
+export function macosArtifactCanCarryNotarizationTicket(artifactPath) {
+  if (typeof artifactPath !== 'string' || artifactPath.length === 0) {
+    throw new Error('notarization ticket support requires an artifact path');
+  }
+  return /\.(app|dmg|pkg)$/iu.test(artifactPath.replace(/\/+$/u, ''));
+}
 
 export function appleCommandOutput(result) {
   return `${result?.stdout ?? ''}\n${result?.stderr ?? ''}`;
@@ -103,12 +131,24 @@ export async function verifyMacosAppleTrust(
     throw new Error(MACOS_APPLE_TRUST_ERROR.NOTARIZATION_REJECTED);
   }
 
-  const staple = appleCommandOutput(
-    await execute(MACOS_APPLE_TOOLS.xcrun, ['stapler', 'validate', executablePath]),
-  );
-  if (!/(?:validate action worked|validated)/iu.test(staple)
-    || notarization?.stapled !== true
-    || notarization?.stapleValidated !== true) {
+  if (macosArtifactCanCarryNotarizationTicket(executablePath)) {
+    const staple = appleCommandOutput(
+      await execute(MACOS_APPLE_TOOLS.xcrun, ['stapler', 'validate', executablePath]),
+    );
+    if (!/(?:validate action worked|validated)/iu.test(staple)
+      || notarization?.stapled !== true
+      || notarization?.stapleValidated !== true) {
+      throw new Error(MACOS_APPLE_TRUST_ERROR.STAPLE_INVALID);
+    }
+    return;
+  }
+
+  // A format that cannot carry a ticket must SAY so, and say why. Without this
+  // the absence of a staple is indistinguishable from a manifest that simply
+  // omitted the claim, which is exactly the downgrade an attacker would want.
+  if (notarization?.stapled !== false
+    || notarization?.stapleValidated !== false
+    || notarization?.unstapledReason !== 'artifact_format_cannot_carry_a_ticket') {
     throw new Error(MACOS_APPLE_TRUST_ERROR.STAPLE_INVALID);
   }
 }
