@@ -4502,7 +4502,11 @@ html.native-ios-mac .chat-dl-btn {
   .controlled-nodes-downloads { grid-template-columns: minmax(0, 1fr); }
   .controlled-nodes-download-item { min-height: 134px; }
   .controlled-nodes-usage { grid-template-columns: minmax(0, 1fr); }
-  .controlled-nodes-usage-os li { grid-template-columns: 58px minmax(0, 1fr); }
+  /* No column template here. This line used to set 58px + 1fr, a leftover of
+     the layout the base rule replaced: a card holds three children -- the OS
+     name and two install routes -- so the second route wrapped onto a new row
+     and landed in the 58px column, one or two characters per line, while the
+     OS name overlapped the first route's text. One column stacks them. */
 }
 
 @media (max-width: 380px) {
