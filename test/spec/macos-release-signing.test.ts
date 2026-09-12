@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   assertSigningMaterialRemoved,
   buildNotarizationRecord,
+  buildUnstapledNotarizationRecord,
+  macosArtifactSupportsStapling,
   parseNotarizationSubmission,
   selectDeveloperIdSigningIdentity,
 } from '../../scripts/macos-release-signing.mjs';
@@ -134,5 +136,57 @@ describe('signing material cleanup', () => {
       keychainListOutput: '',
       remainingPaths: [`${keychainPath}.p12`],
     })).toThrow(/cleanup was incomplete.*\.p12/su);
+  });
+});
+
+describe('artifacts that cannot carry a notarization ticket', () => {
+  // Confirmed against a real notarized binary, not inferred: stapling a bare
+  // Mach-O fails with error 73, and stapling a zip is refused outright. The
+  // distinction decides whether a release verifies offline, so it is encoded
+  // rather than left as folklore.
+  it('knows which formats a ticket can be attached to', () => {
+    expect(macosArtifactSupportsStapling('/build/aiDesk.app')).toBe(true);
+    expect(macosArtifactSupportsStapling('/build/aiDesk.app/')).toBe(true);
+    expect(macosArtifactSupportsStapling('/build/imcodes.dmg')).toBe(true);
+    expect(macosArtifactSupportsStapling('/build/imcodes.pkg')).toBe(true);
+    expect(macosArtifactSupportsStapling('/build/imcodes-node-macos')).toBe(false);
+    expect(macosArtifactSupportsStapling('/build/imcodes-node-macos.zip')).toBe(false);
+  });
+
+  it('records the weaker fact plainly instead of claiming a stapled ticket', () => {
+    const record = buildUnstapledNotarizationRecord({
+      submission: { submissionId: 'sub-1', status: 'Accepted' },
+      ticketSha256: 'b'.repeat(64),
+      artifactPath: '/build/imcodes-node-macos',
+    });
+    expect(record.status).toBe('accepted');
+    expect(record.stapled).toBe(false);
+    expect(record.stapleValidated).toBe(false);
+    // The reason travels with the record, so a reader does not have to guess
+    // whether stapling was skipped or forgotten.
+    expect(record.unstapledReason).toBe('artifact_format_cannot_carry_a_ticket');
+  });
+
+  it('refuses to be used as a way around stapling something staplable', () => {
+    // Without this, "notarized but unstapled" becomes the easy path for every
+    // artifact, and releases quietly stop verifying offline.
+    expect(() => buildUnstapledNotarizationRecord({
+      submission: { submissionId: 'sub-1', status: 'Accepted' },
+      ticketSha256: 'b'.repeat(64),
+      artifactPath: '/build/aiDesk.app',
+    })).toThrow(/can be stapled/u);
+  });
+
+  it('holds the same evidence bar as the stapled record', () => {
+    expect(() => buildUnstapledNotarizationRecord({
+      submission: null,
+      ticketSha256: 'b'.repeat(64),
+      artifactPath: '/build/imcodes-node-macos',
+    })).toThrow(/parsed submission/u);
+    expect(() => buildUnstapledNotarizationRecord({
+      submission: { submissionId: 'sub-1', status: 'Accepted' },
+      ticketSha256: 'NOTAHASH',
+      artifactPath: '/build/imcodes-node-macos',
+    })).toThrow(/sha256/u);
   });
 });

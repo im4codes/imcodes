@@ -119,6 +119,20 @@ jobs:
           echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
       - name: Build controlled-node executable
         run: npm run build:node-exe
+      - name: Notarize macOS controlled-node executable
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          node scripts/macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos
+      - name: Prove the signed macOS executable still runs
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=2 dist-node-exe/imcodes-node-macos
+          ./dist-node-exe/imcodes-node-macos --version
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk

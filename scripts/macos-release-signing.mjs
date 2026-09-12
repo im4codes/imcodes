@@ -16,6 +16,7 @@ export const MACOS_RELEASE_SIGNING_TOOLS = Object.freeze({
   codesign: '/usr/bin/codesign',
   xcrun: '/usr/bin/xcrun',
   spctl: '/usr/sbin/spctl',
+  ditto: '/usr/bin/ditto',
 });
 
 const SHA1_RE = /^[A-F0-9]{40}$/;
@@ -203,6 +204,87 @@ export function importSigningIdentity(input) {
 }
 
 /** Notarize, staple, and prove the ticket is on THIS file. */
+/**
+ * Can a notarization ticket be attached to this artifact at all?
+ *
+ * `stapler` writes the ticket into a bundle or container. A bare Mach-O has
+ * nowhere to put one -- stapling an executable fails with error 73, and a zip
+ * is refused outright ("Stapler is incapable of working with ZIP archive
+ * files"). Both were confirmed against a real notarized binary rather than
+ * inferred, because the distinction decides whether a release can be verified
+ * offline.
+ */
+export function macosArtifactSupportsStapling(artifactPath) {
+  if (typeof artifactPath !== 'string' || artifactPath.length === 0) {
+    throw new Error('stapling support requires an artifact path');
+  }
+  return /\.(app|dmg|pkg)$/iu.test(artifactPath.replace(/\/+$/u, ''));
+}
+
+/**
+ * The record for an artifact that was notarized but cannot carry its ticket.
+ *
+ * Separate from `buildNotarizationRecord`, which refuses to describe an
+ * unstapled ticket, because that refusal is right for anything that *could*
+ * have been stapled. This one states the weaker fact plainly -- Gatekeeper
+ * will check this artifact online on first launch -- and refuses to be used as
+ * a way around stapling something staplable.
+ */
+export function buildUnstapledNotarizationRecord(input) {
+  const { submission, ticketSha256, artifactPath } = input;
+  if (macosArtifactSupportsStapling(artifactPath)) {
+    throw new Error(
+      `${artifactPath} can be stapled; refusing to record it as unstapled. `
+      + 'Use notarizeAndStaple so the ticket travels with the artifact.',
+    );
+  }
+  if (!submission || typeof submission.submissionId !== 'string') {
+    throw new Error('notarization record requires a parsed submission');
+  }
+  if (typeof ticketSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(ticketSha256)) {
+    throw new Error('notarization record requires a lowercase sha256 ticket digest');
+  }
+  return Object.freeze({
+    status: 'accepted',
+    submissionId: submission.submissionId,
+    ticketSha256,
+    stapled: false,
+    stapleValidated: false,
+    unstapledReason: 'artifact_format_cannot_carry_a_ticket',
+  });
+}
+
+/**
+ * Notarize a bare executable.
+ *
+ * Apple accepts only containers for submission, so the binary is zipped for the
+ * upload and the zip is thrown away afterwards -- the artifact that ships is
+ * the executable, whose notarization Apple now records against its own hash.
+ */
+export function notarizeExecutable(input) {
+  const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
+  if (macosArtifactSupportsStapling(artifactPath)) {
+    throw new Error(`${artifactPath} is a staplable format; use notarizeAndStaple`);
+  }
+  const uploadPath = `${artifactPath}.notarize.zip`;
+  try {
+    run(MACOS_RELEASE_SIGNING_TOOLS.ditto, ['-c', '-k', '--keepParent', artifactPath, uploadPath]);
+    const submitted = run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
+      'notarytool', 'submit', uploadPath,
+      '--key', apiKeyPath,
+      '--key-id', apiKeyId,
+      '--issuer', apiIssuer,
+      '--wait',
+      '--output-format', 'json',
+    ]);
+    const submission = parseNotarizationSubmission(submitted);
+    const ticketSha256 = createHash('sha256').update(readFileSync(artifactPath)).digest('hex');
+    return buildUnstapledNotarizationRecord({ submission, ticketSha256, artifactPath });
+  } finally {
+    rmSync(uploadPath, { force: true });
+  }
+}
+
 export function notarizeAndStaple(input) {
   const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
   const submitted = run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, [
@@ -280,12 +362,18 @@ async function main(argv) {
   if (mode === 'notarize') {
     const artifactPath = argv[1];
     if (!artifactPath) throw new Error('usage: macos-release-signing.mjs notarize <artifact>');
-    const record = notarizeAndStaple({
-      artifactPath,
+    const credentials = {
       apiKeyPath: requireEnv('IMCODES_MACOS_NOTARY_KEY_PATH'),
       apiKeyId: requireEnv('IMCODES_MACOS_NOTARY_KEY_ID'),
       apiIssuer: requireEnv('IMCODES_MACOS_NOTARY_ISSUER'),
-    });
+    };
+    // The format decides, not the caller: a .app/.dmg/.pkg gets its ticket
+    // attached, and a bare executable -- which Apple documents as unable to
+    // carry one -- is notarized without pretending it was stapled. Leaving the
+    // choice to each call site is how one of them silently stops stapling.
+    const record = macosArtifactSupportsStapling(artifactPath)
+      ? notarizeAndStaple({ artifactPath, ...credentials })
+      : notarizeExecutable({ artifactPath, ...credentials });
     process.stdout.write(`${JSON.stringify(record)}\n`);
     return;
   }

@@ -429,4 +429,63 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"');
   });
+
+  it('signs, notarizes and proves the macOS executable, in that order', () => {
+    // The chain used to be half-built: the release workflow imported a signing
+    // identity and cleaned it up afterwards, with nothing in between that
+    // signed or notarized anything. Every macOS artifact shipped ad-hoc signed
+    // and was refused by Gatekeeper on download, and nothing failed to say so.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      const importIdentity = workflow.indexOf('node scripts/macos-release-signing.mjs import');
+      const notaryKey = workflow.indexOf('IMCODES_MACOS_NOTARY_KEY_BASE64');
+      const build = workflow.indexOf('run: npm run build:node-exe');
+      const notarize = workflow.indexOf('macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos');
+      const runs = workflow.indexOf('./dist-node-exe/imcodes-node-macos --version');
+      const cleanup = workflow.indexOf('node scripts/macos-release-signing.mjs cleanup');
+
+      expect([importIdentity, notaryKey, build, notarize, runs, cleanup].every((at) => at >= 0), file).toBe(true);
+      // The identity has to exist before the build, because the build is what
+      // signs; notarizing has to follow the build, for the obvious reason.
+      expect(importIdentity, file).toBeLessThan(build);
+      expect(notaryKey, file).toBeLessThan(build);
+      expect(build, file).toBeLessThan(notarize);
+      expect(notarize, file).toBeLessThan(cleanup);
+      // Launching the signed binary is the only step that catches a wrong
+      // entitlement set: such a binary signs and notarizes perfectly and then
+      // dies for the user instead.
+      expect(runs, file).toBeLessThan(cleanup);
+    }
+  });
+
+  it('keeps the signing material out of the artifact and removes it even on failure', () => {
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      expect(workflow, file).toContain("if: always() && runner.os == 'macOS'");
+      // The private key reaches the runner as a secret and must never be
+      // reachable from the published artifact set.
+      expect(workflow, file).not.toContain('dist-node-exe/imcodes-macos-notary.p8');
+    }
+  });
+
+  it('signs with the pinned fingerprint and the entitlements the runtime needs', () => {
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    expect(build).toContain("'--options', 'runtime'");
+    expect(build).toContain("'native', 'macos-node', 'imcodes-node.entitlements'");
+    // A common name can match several certificates; a release pins one.
+    expect(build).toContain('IMCODES_MACOS_SIGNING_IDENTITY must be a SHA-1 fingerprint');
+    // Without an identity the build still has to produce a runnable binary, or
+    // every local macOS build breaks.
+    expect(build).toContain("sh('codesign', ['--force', '--sign', '-', artifactPath]);");
+
+    const entitlements = readFileSync('native/macos-node/imcodes-node.entitlements', 'utf8');
+    expect(entitlements).toContain('com.apple.security.cs.allow-jit');
+    expect(entitlements).toContain('com.apple.security.cs.allow-unsigned-executable-memory');
+    // Would let the process load a dylib signed by anyone, and the SEA is
+    // native-free by construction.
+    expect(entitlements).not.toContain('disable-library-validation');
+    // codesign's entitlements parser rejects XML comments outright, while
+    // `plutil -lint` accepts them -- so the failure lands at signing time.
+    expect(entitlements).not.toContain('<!--');
+  });
 });

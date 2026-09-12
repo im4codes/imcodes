@@ -713,8 +713,56 @@ jobs:
           $sha256 = [System.Security.Cryptography.SHA256]::Create()
           try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
           "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Import macOS release-signing identity
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_SIGNING_P12_BASE64: ${{ secrets.IMCODES_MACOS_SIGNING_P12_BASE64 }}
+          IMCODES_MACOS_SIGNING_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_SIGNING_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(node scripts/macos-release-signing.mjs import)"
+          # The fingerprint, not the common name: a name can match several
+          # certificates, and a release pins the exact one it signed with.
+          echo "IMCODES_MACOS_SIGNING_IDENTITY=$(printf '%s' "$IDENTITY" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).sha1))')" >> "$GITHUB_ENV"
+      - name: Write macOS notary API key
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_BASE64: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IMCODES_MACOS_NOTARY_KEY_BASE64:-}" ]; then
+            echo 'macOS notary API key is required.' >&2
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/imcodes-macos-notary.p8"
+          printf '%s' "$IMCODES_MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
       - name: Build controlled-node executable
         run: npm run build:node-exe
+      - name: Notarize macOS controlled-node executable
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # Apple documents that a standalone binary gets a ticket but cannot
+          # have one stapled to it, so this records the notarization without
+          # claiming an offline-verifiable ticket. Users reach this file through
+          # the install command or the app, neither of which quarantines it.
+          node scripts/macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos
+      - name: Prove the signed macOS executable still runs
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=2 dist-node-exe/imcodes-node-macos
+          # The hardened runtime needs the JIT entitlements to be present and
+          # correct; a binary that signs and notarizes can still die on launch
+          # without them, and that failure would otherwise reach users first.
+          ./dist-node-exe/imcodes-node-macos --version
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -805,6 +853,9 @@ jobs:
             dist-node-exe/remote-desktop-worker/**
           if-no-files-found: error
           retention-days: 30
+      - name: Remove macOS release-signing material
+        if: always() && runner.os == 'macOS'
+        run: node scripts/macos-release-signing.mjs cleanup
       - name: Remove Windows release-signing material
         if: always() && runner.os == 'Windows'
         shell: powershell

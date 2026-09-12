@@ -47,6 +47,46 @@ const require = createRequire(import.meta.url);
 
 function sh(file, args, opts = {}) { return execFileSync(file, args, { stdio: 'inherit', ...opts }); }
 
+/**
+ * Sign a macOS artifact for release, or ad-hoc when no release identity is set.
+ *
+ * Mirrors `runWindowsReleaseSigning`: a developer building locally gets the
+ * ad-hoc signature the SEA needs to run at all, and CI -- where
+ * `IMCODES_MACOS_SIGNING_IDENTITY` is exported by the signing step -- gets a
+ * Developer ID signature under the hardened runtime, which is what
+ * notarization requires.
+ *
+ * The entitlements are not optional decoration. V8 writes and executes machine
+ * code, so without them the binary signs and notarizes cleanly and then dies on
+ * launch, on a user's machine rather than in the build.
+ */
+function runMacosReleaseSigning(artifactPath) {
+  if (platform !== 'darwin') return;
+  const identity = process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim() ?? '';
+  if (!identity) {
+    // Ad-hoc. A macOS SEA must carry some signature or the loader refuses it.
+    sh('codesign', ['--force', '--sign', '-', artifactPath]);
+    return;
+  }
+  if (!/^[A-F0-9]{40}$/i.test(identity)) {
+    // The fingerprint, never a common name: a name can match several
+    // certificates and the release must pin the exact one.
+    throw new Error('IMCODES_MACOS_SIGNING_IDENTITY must be a SHA-1 fingerprint');
+  }
+  sh('codesign', [
+    '--force',
+    '--timestamp',
+    '--options', 'runtime',
+    '--entitlements', join(root, 'native', 'macos-node', 'imcodes-node.entitlements'),
+    '--sign', identity,
+    artifactPath,
+  ]);
+  // Verify here rather than trusting the exit code: a signature that does not
+  // satisfy its own designated requirement is rejected by notarization, and
+  // finding that out now costs seconds instead of a round trip to Apple.
+  sh('codesign', ['--verify', '--strict', '--verbose=2', artifactPath]);
+}
+
 function runWindowsReleaseSigning(mode, artifactPath, expectedSignerSha256 = '') {
   if (!isWin) return;
   const thumbprint = process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT?.trim() ?? '';
@@ -217,7 +257,7 @@ async function main() {
       slices.push(slicePath);
     }
     sh('lipo', ['-create', ...slices, '-output', outPath]);
-    sh('codesign', ['--force', '--sign', '-', outPath]);
+    runMacosReleaseSigning(outPath);
   } else {
     await inject(officialNode.nodeBin, outPath);
   }
