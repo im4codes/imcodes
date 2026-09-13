@@ -101,6 +101,7 @@ describe('production coordinator authority wiring', () => {
   it('refuses a second live Brain in the same project', () => {
     const port = createSupervisionRegistryPort();
     expect(port.finishAssignment({
+      expectedRevision: revision,
       assignmentId: auditorAssignmentId,
       callerSessionName: brainB.name,
       callerProjectName: PROJECT,
@@ -115,6 +116,7 @@ describe('production coordinator authority wiring', () => {
     ]);
     const port = createSupervisionRegistryPort();
     expect(port.finishAssignment({
+      expectedRevision: revision,
       assignmentId: auditorAssignmentId,
       callerSessionName: brainA.name,
       callerProjectName: PROJECT,
@@ -126,6 +128,7 @@ describe('production coordinator authority wiring', () => {
     listSessionsMock.mockReturnValue([]);
     const port = createSupervisionRegistryPort();
     expect(port.finishAssignment({
+      expectedRevision: revision,
       assignmentId: auditorAssignmentId,
       callerSessionName: brainA.name,
       callerProjectName: PROJECT,
@@ -136,6 +139,7 @@ describe('production coordinator authority wiring', () => {
   it('lets the task\'s own live coordinator finish', () => {
     const port = createSupervisionRegistryPort();
     const res = port.finishAssignment({
+      expectedRevision: revision,
       assignmentId: auditorAssignmentId,
       callerSessionName: brainA.name,
       callerProjectName: PROJECT,
@@ -188,6 +192,7 @@ describe('owner finish authority resolves the LIVE caller identity', () => {
     ]);
     const port = createSupervisionRegistryPort();
     expect(port.finishAssignment({
+      expectedRevision: revision,
       assignmentId: implementerAssignmentId,
       callerSessionName: workerLive.name,
       callerProjectName: PROJECT,
@@ -199,6 +204,7 @@ describe('owner finish authority resolves the LIVE caller identity', () => {
     listSessionsMock.mockReturnValue([brainA]);
     const port = createSupervisionRegistryPort();
     expect(port.finishAssignment({
+      expectedRevision: revision,
       assignmentId: implementerAssignmentId,
       callerSessionName: workerLive.name,
       callerProjectName: PROJECT,
@@ -209,6 +215,7 @@ describe('owner finish authority resolves the LIVE caller identity', () => {
   it('still lets the exact live owner finish', () => {
     const port = createSupervisionRegistryPort();
     expect(port.finishAssignment({
+      expectedRevision: revision,
       assignmentId: implementerAssignmentId,
       callerSessionName: workerLive.name,
       callerProjectName: PROJECT,
@@ -292,5 +299,172 @@ describe('task visibility is bound to durable project/session identity', () => {
     const handlers = handlersFor(brainA, [brainA, workerLive]);
     expect(await handlers[SUPERVISION_MCP_TOOLS.GET]({ taskId }))
       .toMatchObject({ status: 'ok' });
+  });
+});
+
+// ── R4 audit P1-1/P1-2: caller revision authority on the PUBLIC paths ─────
+// record_validation and FINISHED attest exact revision bytes. A call prepared
+// for R1 that is delayed or retried until after the SAME task/assignment was
+// rebound to R2 must be refused (old_revision) with zero durable change, never
+// reinterpreted as R2. Drives the real MCP handlers over the real registry port.
+describe('public record_validation / FINISHED require exact caller revision authority', () => {
+  const brainA = brain('deck_alpha_brain');
+  const workerLive = { ...brain('deck_alpha_rev_worker'), role: 'w1' as const };
+  const taskId = 'caller-revision-authority';
+  const R1 = `${taskId}-r1`;
+  const R2 = `${taskId}-r2`;
+  let assignmentId = '';
+
+  function handlersFor(record: ReturnType<typeof brain>) {
+    return createSupervisionMcpToolHandlers(
+      { sessionName: record.name, projectName: PROJECT } as never,
+      {
+        registry: createSupervisionRegistryPort(),
+        isProjectBrain: () => record.name === brainA.name,
+        resolveSessionIdentity: (name: string) => {
+          const found = [brainA, workerLive].find((candidate) => candidate.name === name);
+          return found ? { ...identityOf(found), projectName: PROJECT } : undefined;
+        },
+      } as never,
+    );
+  }
+  const durable = () => {
+    const registry = getSupervisionTaskRegistry();
+    return JSON.stringify({ task: registry.get(taskId), events: registry.listEvents(taskId).length });
+  };
+  const rebindToR2 = () => {
+    const rebound = getSupervisionTaskRegistry().rebindTaskAssignmentRevision({
+      taskId, assignmentId, fromRevision: R1, toRevision: R2,
+      worktreeSnapshot: {
+        worktreePath: `/tmp/${taskId}/repo`, headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: 'b'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      },
+      leaseAction: 'renew', idempotencyKey: `${taskId}-bind-r2`,
+      reason: 'Brain binds the successor revision in place',
+    });
+    expect(rebound, JSON.stringify(rebound)).toMatchObject({ ok: true });
+  };
+
+  beforeEach(async () => {
+    resetSupervisionTaskRegistryForTests();
+    listSessionsMock.mockReturnValue([brainA, workerLive]);
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.createOrGet({
+      taskId, projectName: PROJECT, classification: 'independent_top_level',
+      objective: 'caller revision authority', currentRevision: R1,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId: `${taskId}-coordinator`, taskId, role: 'coordinator',
+      identity: identityOf(brainA), required: false,
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      assignmentId: `${taskId}-implementer`, taskId, role: 'implementer',
+      identity: identityOf(workerLive), auditRevision: R1, required: true, scopeFiles: ['src/exact.ts'],
+    });
+    if (!implementer.ok) throw new Error('fixture failed');
+    assignmentId = implementer.value.assignmentId;
+    expect(await handlersFor(workerLive)[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'start', taskId, assignmentId,
+    })).toMatchObject({ status: 'ok', toStatus: 'implementing' });
+  });
+
+  it.each(['record_validation', 'finish'] as const)('refuses %s without expectedRevision and changes nothing', async (intent) => {
+    const before = durable();
+    expect(await handlersFor(workerLive)[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent, taskId, assignmentId, ...(intent === 'record_validation' ? { validationState: 'passed' } : {}),
+    })).toMatchObject({ status: 'error', reason: 'expected_revision_required' });
+    expect(durable()).toBe(before);
+    // The port boundary refuses a revisionless FINISHED on its own as well.
+    expect(createSupervisionRegistryPort().finishAssignment!({
+      assignmentId, callerSessionName: workerLive.name, callerProjectName: PROJECT,
+    } as never)).toEqual({ ok: false, reason: 'expected_revision_required' });
+    expect(durable()).toBe(before);
+  });
+
+  it('refuses a DELAYED R1 record_validation delivered after the R2 rebind', async () => {
+    // Prepared while R1 was current, delivered only after the successor bind.
+    const delayed = { intent: 'record_validation', validationState: 'passed', taskId, assignmentId, expectedRevision: R1 };
+    rebindToR2();
+    const afterRebind = durable();
+    expect(await handlersFor(workerLive)[SUPERVISION_MCP_TOOLS.INTENT](delayed))
+      .toMatchObject({ status: 'error', reason: 'old_revision' });
+    expect(durable()).toBe(afterRebind);
+    const assignment = getSupervisionTaskRegistry().getAssignment(assignmentId)!;
+    expect(assignment).toMatchObject({ status: 'implementing', auditRevision: R2 });
+    expect(assignment.validationState).toBeUndefined();
+
+    // R2's own validation is accepted and stamps R2.
+    expect(getSupervisionTaskRegistry().applyTaskIntent({
+      taskId, assignmentId, intent: 'record_validation', toStatus: 'validated', validationState: 'passed',
+      expectedRevision: R2,
+    })).toMatchObject({ ok: true });
+    expect(getSupervisionTaskRegistry().getAssignment(assignmentId)).toMatchObject({
+      validationState: 'passed', validatedRevision: R2,
+    });
+  });
+
+  it('refuses a RETRIED R1 record_validation after R1 was validated and the object rebound to R2', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const first = { taskId, assignmentId, intent: 'record_validation', toStatus: 'validated' as const, validationState: 'passed', expectedRevision: R1 };
+    expect(registry.applyTaskIntent(first)).toMatchObject({ ok: true });
+    rebindToR2();
+    const afterRebind = durable();
+    // The retry of the SAME R1 call (e.g. a transport redelivery) must not land on R2.
+    expect(registry.applyTaskIntent(first)).toEqual({ ok: false, reason: 'old_revision' });
+    expect(await handlersFor(workerLive)[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'record_validation', validationState: 'passed', taskId, assignmentId, expectedRevision: R1,
+    })).toMatchObject({ status: 'error', reason: 'old_revision' });
+    expect(durable()).toBe(afterRebind);
+  });
+
+  it('refuses a DELAYED/RETRIED R1 FINISHED against a validated R2 (owner path)', async () => {
+    const registry = getSupervisionTaskRegistry();
+    rebindToR2();
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId, intent: 'record_validation', toStatus: 'validated', validationState: 'passed',
+      expectedRevision: R2,
+    })).toMatchObject({ ok: true });
+    const validatedR2 = durable();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect(await handlersFor(workerLive)[SUPERVISION_MCP_TOOLS.INTENT]({
+        intent: 'finish', taskId, assignmentId, expectedRevision: R1,
+      }), `attempt ${attempt}`).toMatchObject({ status: 'error', reason: 'old_revision' });
+      expect(createSupervisionRegistryPort().finishAssignment!({
+        assignmentId, callerSessionName: workerLive.name, callerProjectName: PROJECT, expectedRevision: R1,
+      })).toEqual({ ok: false, reason: 'old_revision' });
+      expect(durable()).toBe(validatedR2);
+    }
+    expect(registry.getAssignment(assignmentId)).toMatchObject({ status: 'validated', auditRevision: R2 });
+
+    // The exact R2 FINISHED is accepted once and then replays quietly.
+    expect(createSupervisionRegistryPort().finishAssignment!({
+      assignmentId, callerSessionName: workerLive.name, callerProjectName: PROJECT, expectedRevision: R2,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(assignmentId)).toMatchObject({ status: 'ready_for_audit', auditRevision: R2 });
+    expect(createSupervisionRegistryPort().finishAssignment!({
+      assignmentId, callerSessionName: workerLive.name, callerProjectName: PROJECT, expectedRevision: R2,
+    })).toMatchObject({ ok: true, replay: true });
+  });
+
+  it('refuses a DELAYED R1 FINISHED on the project-Brain rebind variant', async () => {
+    const registry = getSupervisionTaskRegistry();
+    rebindToR2();
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId, intent: 'record_validation', toStatus: 'validated', validationState: 'passed',
+      expectedRevision: R2,
+    })).toMatchObject({ ok: true });
+    const validatedR2 = durable();
+    expect(await handlersFor(brainA)[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId, assignmentId, rebindSessionName: workerLive.name, expectedRevision: R1,
+    })).toMatchObject({ status: 'error', reason: 'old_revision' });
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId, callerProjectName: PROJECT, callerIdentity: identityOf(brainA),
+      rebindIdentity: identityOf(workerLive), rebindProjectName: PROJECT, expectedRevision: R1,
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    expect(durable()).toBe(validatedR2);
+    expect(await handlersFor(brainA)[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId, assignmentId, rebindSessionName: workerLive.name, expectedRevision: R2,
+    })).toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
   });
 });

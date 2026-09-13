@@ -322,6 +322,12 @@ export interface SendMessageInput {
   internalSuppressTimeline?: true;
   /** Daemon-only durable supervision lifecycle identity. */
   internalQueueSupervisionReference?: QueueSupervisionReference;
+  /**
+   * Daemon-only exact validation-authority snapshot for an automatic audit.
+   * Re-verified under the registry lock that materializes the auditor/attempt,
+   * so authority revoked after dispatch planning mints nothing.
+   */
+  internalAuditValidationAuthority?: string;
 }
 
 export interface SendMessageDelivery {
@@ -2177,6 +2183,17 @@ export async function dispatchSendMessage(
       }
     }
     const reusedAssignment = reusedAuditAssignment ?? reusedContinuationAssignment;
+    if (input.audit && input.internalAuditValidationAuthority !== undefined
+      && !registry.validationAuthoritySnapshotHolds(input.internalAuditValidationAuthority, {
+        taskId,
+        revision: String(input.task.auditRevision ?? input.task.currentRevision ?? ''),
+      })) {
+      return {
+        status: 'error',
+        reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        error: 'task registry rejected assignment: stale_audit_revision',
+      };
+    }
     const assignment = reusedAssignment
       ? { ok: true as const, value: reusedAssignment, replay: true as const }
       : registry.createAssignment({
@@ -2191,6 +2208,9 @@ export async function dispatchSendMessage(
           ...(auditRoutingReason ? { auditRoutingReason } : {}),
           ...(auditDegradedReason ? { auditDegradedReason } : {}),
           ...(provisioning ? { provisioning } : {}),
+          ...(input.audit && input.internalAuditValidationAuthority !== undefined
+            ? { validationAuthority: input.internalAuditValidationAuthority }
+            : {}),
           idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
           now,
       });
@@ -2788,6 +2808,8 @@ function adoptExactDurableAuditDelivery(input: {
   registry: ReturnType<typeof getSupervisionTaskRegistry>;
   deps: ReadyAuditDispatchDeps;
   existingAssignment?: PersistedSupervisionTaskAssignment;
+  /** Exact validation-authority snapshot re-verified under the creation lock. */
+  validationAuthority: string;
 }): { status: 'none' } | { status: 'blocked'; reason: string } | {
   status: 'adopted'; assignment: PersistedSupervisionTaskAssignment; messageId: SendMessageId;
 } {
@@ -2922,6 +2944,7 @@ function adoptExactDurableAuditDelivery(input: {
     identity: targetIdentity,
     auditAttemptId: input.attemptId,
     auditRevision: input.revision,
+    validationAuthority: input.validationAuthority,
     idempotencyKey: `adopt-durable-audit:${record.messageId}`,
   });
   if (!created.ok) {
@@ -3395,7 +3418,11 @@ export async function dispatchReadyAudit(
       && !isTerminalSupervisionTaskStatus(assignment.status)
       && (!assignment.auditRevision?.trim() || assignment.auditRevision === revision)
     ));
-    if (alignable.length === 1) {
+    // Aligning is a lifecycle write toward the freeze boundary, so it is only
+    // allowed for an owner whose own validation attests THIS revision.
+    if (alignable.length === 1 && registry.hasReadyAuditValidationAuthority({
+      taskId: task.taskId, assignmentId: alignable[0]!.assignmentId, revision, allowLegacy: false,
+    })) {
       const target = alignable[0]!;
       const aligned = registry.updateAssignment({
         assignmentId: target.assignmentId,
@@ -3416,7 +3443,30 @@ export async function dispatchReadyAudit(
     return { status: 'blocked', reason: exactError, reported };
   }
 
-  const integrationArtifact = await resolveIntegrationArtifact(task, implementer, deps, true);
+  // The immutable freeze/open-audit boundary. Readiness projections are not
+  // validation: a successor that inherited (or never cleared) a predecessor's
+  // PASS must not bind a bundle, mint an auditor/attempt or deliver anything.
+  //
+  // The decision is captured as an exact authority SNAPSHOT and carried to every
+  // later locked writer (bundle bind, auditor/attempt materialization) instead
+  // of being trusted as a one-time precheck across the awaits below.
+  const validationAuthority = registry.readyAuditValidationAuthoritySnapshot({
+    taskId: task.taskId, assignmentId: implementer.assignmentId, revision, allowLegacy: true,
+  });
+  const authorityRevoked = async (): Promise<ReadyAuditDispatchResult> => {
+    const exactError = 'automatic audit requires validation passed for the exact current revision';
+    const reported = reporter && coordinator
+      ? await reportBlocker(implementer, exactError)
+      : false;
+    return { status: 'blocked', reason: exactError, reported };
+  };
+  if (!validationAuthority) return authorityRevoked();
+
+  const integrationArtifact = await resolveIntegrationArtifact(task, implementer, deps, true, validationAuthority);
+  // Authority may have been revoked while the worktree was inspected/frozen.
+  if (!registry.validationAuthoritySnapshotHolds(validationAuthority, { taskId: task.taskId, revision })) {
+    return authorityRevoked();
+  }
   if (!integrationArtifact) {
     const exactError = 'authoritative immutable integration bundle unavailable or mismatched';
     const reported = reporter && coordinator
@@ -3447,6 +3497,7 @@ export async function dispatchReadyAudit(
     registry,
     deps,
     existingAssignment: existingAudit,
+    validationAuthority,
   });
   if (adopted.status === 'blocked') {
     const reported = await reportBlocker(implementer, adopted.reason);
@@ -3563,6 +3614,7 @@ export async function dispatchReadyAudit(
     automaticSupervision: true,
     ...(recoveredExistingMessageId ? { internalMessageId: recoveredExistingMessageId } : {}),
     internalDurableQueue: true,
+    internalAuditValidationAuthority: validationAuthority,
     audit: {
       kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
       attemptId,
@@ -3586,6 +3638,12 @@ export async function dispatchReadyAudit(
     },
   });
   const dispatch = deps.dispatch ?? dispatchSendMessage;
+  // Last synchronous authority check before anything is delivered; the send
+  // path re-verifies the same snapshot under its materialization lock.
+  if (!registry.validationAuthoritySnapshotHolds(validationAuthority, { taskId: task.taskId, revision })) {
+    releaseAuditTarget(attemptId);
+    return authorityRevoked();
+  }
   const directTarget = existingAudit?.identity.sessionName ?? candidates.ready;
   // Mandatory routing order: an already-ready authorized transport wins. If
   // none exists, the configured execution pool gets one deterministic spawn
@@ -3694,6 +3752,7 @@ async function resolveIntegrationArtifact(
   implementer: PersistedSupervisionTaskAssignment,
   deps: ReadyAuditDispatchDeps,
   allowFreeze: boolean,
+  validationAuthority?: string,
 ): Promise<ResolvedIntegrationArtifact | undefined> {
   const revision = task.currentRevision?.trim();
   if (!revision) return undefined;
@@ -3741,6 +3800,7 @@ async function resolveIntegrationArtifact(
     identity: implementer.identity,
     revision,
     bundle: frozen.bundle,
+    ...(validationAuthority !== undefined ? { validationAuthority } : {}),
     now: (deps.now ?? Date.now)(),
   });
   if (!bound.ok) return undefined;

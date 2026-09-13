@@ -99,8 +99,13 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     applyIntent: (input) => getSupervisionTaskRegistry().applyTaskIntent(input),
     finishAssignment: ({
       assignmentId, callerSessionName, callerProjectName, projectBrain,
-      rebindIdentity, rebindProjectName,
+      rebindIdentity, rebindProjectName, expectedRevision,
     }) => {
+      // Caller revision authority is mandatory on every public FINISHED path;
+      // the registry re-checks it against the locked rows before any write.
+      if (typeof expectedRevision !== 'string' || !expectedRevision.trim()) {
+        return { ok: false, reason: 'expected_revision_required' };
+      }
       const registry = getSupervisionTaskRegistry();
       const assignment = registry.getAssignment(assignmentId);
       if (!assignment) return { ok: false, reason: 'not_found' };
@@ -117,6 +122,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
           callerIdentity,
           ...(rebindIdentity ? { rebindIdentity } : {}),
           ...(rebindProjectName ? { rebindProjectName } : {}),
+          expectedRevision,
         });
       }
       // The owner path must resolve the caller's LIVE identity and prove it is
@@ -131,6 +137,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       return registry.finishAssignment({
         assignmentId,
         identity: callerIdentity,
+        expectedRevision,
       });
     },
     convergeValidatedAssignment: async ({ taskId, assignmentId }) => {

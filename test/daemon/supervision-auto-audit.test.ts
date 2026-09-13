@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -94,6 +95,37 @@ function session(
   } as SessionRecord;
 }
 
+/** Raw persisted validation rewrite for task + one assignment (undefined stamp = legacy row). */
+function stampValidation(
+  database: InstanceType<typeof DatabaseSync>,
+  taskId: string,
+  assignmentId: string,
+  taskStamp: string | undefined,
+  ownerStamp: string | undefined,
+  shape: { taskStatus?: string; ownerStatus?: string; revision?: string } = {},
+): void {
+  const taskRow = database.prepare('SELECT payload_json AS payload FROM supervision_tasks WHERE task_id = ?')
+    .get(taskId) as { payload: string };
+  const task = JSON.parse(taskRow.payload) as Record<string, unknown>;
+  delete task.validatedRevision;
+  Object.assign(task, { validationState: 'passed' },
+    taskStamp ? { validatedRevision: taskStamp } : {},
+    shape.taskStatus ? { status: shape.taskStatus } : {},
+    shape.revision ? { currentRevision: shape.revision } : {});
+  database.prepare('UPDATE supervision_tasks SET status = ?, current_revision = ?, validation_state = ?, payload_json = ? WHERE task_id = ?')
+    .run(task.status as string, (task.currentRevision as string) ?? null, 'passed', JSON.stringify(task), taskId);
+  const ownerRow = database.prepare('SELECT payload_json AS payload FROM supervision_task_assignments WHERE assignment_id = ?')
+    .get(assignmentId) as { payload: string };
+  const owner = JSON.parse(ownerRow.payload) as Record<string, unknown>;
+  delete owner.validatedRevision;
+  Object.assign(owner, { validationState: 'passed' },
+    ownerStamp ? { validatedRevision: ownerStamp } : {},
+    shape.ownerStatus ? { status: shape.ownerStatus } : {},
+    shape.revision ? { auditRevision: shape.revision } : {});
+  database.prepare('UPDATE supervision_task_assignments SET status = ?, audit_revision = ?, validation_state = ?, payload_json = ? WHERE assignment_id = ?')
+    .run(owner.status as string, (owner.auditRevision as string) ?? null, 'passed', JSON.stringify(owner), assignmentId);
+}
+
 function automaticAttempt(taskId: string, revision: string): string {
   return `auto-audit-${createHash('sha256').update(`${taskId}\0${revision}`).digest('hex').slice(0, 24)}`;
 }
@@ -174,7 +206,7 @@ function makeReadyTask(options: {
     ['record_validation', 'validated', 'passed'],
     ['open_audit', 'ready_for_audit', undefined],
   ] as const) {
-    expect(registry.applyTaskIntent({
+    expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
       taskId,
       assignmentId: worker.value.assignmentId,
       intent,
@@ -645,7 +677,7 @@ describe('automatic supervision audit materialization', () => {
       taskId, assignmentId: worker.value.assignmentId,
       intent: 'start', toStatus: 'implementing',
     })).toMatchObject({ ok: true });
-    expect(registry.applyTaskIntent({
+    expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
       taskId, assignmentId: worker.value.assignmentId,
       intent: 'record_validation', toStatus: 'validated', validationState: 'passed',
     })).toMatchObject({ ok: true });
@@ -700,7 +732,7 @@ describe('automatic supervision audit materialization', () => {
       expect(registry.applyTaskIntent({
         taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
       })).toMatchObject({ ok: true });
-      expect(registry.applyTaskIntent({
+      expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
         taskId, assignmentId: worker.value.assignmentId, intent: 'record_validation',
         toStatus: 'validated', validationState: 'passed',
       })).toMatchObject({ ok: true });
@@ -749,7 +781,7 @@ describe('automatic supervision audit materialization', () => {
     expect(registry.applyTaskIntent({
       taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
     })).toMatchObject({ ok: true });
-    expect(registry.applyTaskIntent({
+    expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
       taskId, assignmentId: worker.value.assignmentId, intent: 'record_validation',
       toStatus: 'validated', validationState: 'passed',
     })).toMatchObject({ ok: true });
@@ -3942,7 +3974,7 @@ describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
     for (const [intent, toStatus] of [
       ['start', 'implementing'], ['record_validation', 'validated'], ['open_audit', 'ready_for_audit'],
     ] as const) {
-      registry.applyTaskIntent({
+      registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
         taskId, assignmentId: worker.value.assignmentId, intent,
         ...(intent === 'record_validation' ? { validationState: 'passed' } : {}),
         identity: worker.value.identity, toStatus,
@@ -4069,7 +4101,7 @@ describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
       for (const [intent, toStatus] of [
         ['start', 'implementing'], ['record_validation', 'validated'], ['open_audit', 'ready_for_audit'],
       ] as const) {
-        registry.applyTaskIntent({
+        registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
           taskId, assignmentId: worker.value.assignmentId, intent,
           ...(intent === 'record_validation' ? { validationState: 'passed' } : {}),
           identity: worker.value.identity, toStatus,
@@ -4097,8 +4129,9 @@ describe('R5: deterministic implementer/revision alignment before materializatio
    * found nothing, and returned
    * `automatic audit requires one exact ready implementer revision`.
    */
-  function resumedAfterRework(revision = 'r5-resumed') {
-    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+  function resumedAfterRework(revision = 'r5-resumed', validation: 'exact' | 'none' = 'exact') {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'tsk_5oc_shape';
     expect(registry.createOrGet({
       taskId, projectName: 'alpha', classification: 'integration_task',
@@ -4125,8 +4158,36 @@ describe('R5: deterministic implementer/revision alignment before materializatio
     expect(registry.updateTask({ taskId, status: 'ready_for_audit' } as never)).toMatchObject({ ok: true });
     expect(registry.getTaskRecord(taskId)!.status).toBe('ready_for_audit');
     expect(registry.getAssignment(worker.value.assignmentId)!.status).toBe('implementing');
+    if (validation === 'exact') {
+      // The resumed bytes were validated for THIS revision; only the lifecycle
+      // projection is stale. Written raw so the owner stays `implementing`.
+      stampValidation(database, taskId, worker.value.assignmentId, revision, revision);
+    }
     return { registry, taskId, revision, worker: worker.value };
   }
+
+  it('does not align or materialize a resumed owner whose current revision was never validated', async () => {
+    const { registry, taskId, worker } = resumedAfterRework('r5-unvalidated', 'none');
+    const sessions = [session('deck_alpha_brain', 'brain'), session('deck_alpha_worker', 'w1')];
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      if (input.audit) throw new Error('must not materialize an unvalidated successor');
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000001' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_brain', status: 'queued' as const }],
+      };
+    });
+    const before = registry.getAssignment(worker.assignmentId)!;
+    const result = await dispatchReadyAudit(taskId, {
+      registry, listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[0]!), dispatch: dispatch as never,
+      hasDeliveryEvidence: () => false,
+    });
+    expect(result).toMatchObject({ status: 'blocked' });
+    expect(registry.getAssignment(worker.assignmentId)).toEqual(before);
+    expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+  });
 
   it('aligns the unique non-terminal implementer and materializes exactly one auditor', async () => {
     const { registry, taskId, revision, worker } = resumedAfterRework();
@@ -4404,7 +4465,7 @@ describe('zero-coordinator legacy integration recovery', () => {
       ['record_validation', 'validated', 'passed'],
       ['open_audit', 'ready_for_audit', undefined],
     ] as const) {
-      expect(registry.applyTaskIntent({
+      expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
         taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
         ...(validationState ? { validationState } : {}),
       })).toMatchObject({ ok: true });
@@ -4652,7 +4713,7 @@ describe('zero-coordinator recovery refuses conflicting historical provenance', 
       ['record_validation', 'validated', 'passed'],
       ['open_audit', 'ready_for_audit', undefined],
     ] as const) {
-      expect(registry.applyTaskIntent({
+      expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
         taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
         ...(validationState ? { validationState } : {}),
       })).toMatchObject({ ok: true });
@@ -4737,7 +4798,7 @@ describe('zero-coordinator recovery is limited to the ZERO-row legacy shape', ()
       ['record_validation', 'validated', 'passed'],
       ['open_audit', 'ready_for_audit', undefined],
     ] as const) {
-      expect(registry.applyTaskIntent({
+      expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
         taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
         ...(validationState ? { validationState } : {}),
       })).toMatchObject({ ok: true });
@@ -4923,7 +4984,7 @@ describe('control-plane auditPolicy bind (tsk_cic)', () => {
       ['record_validation', 'validated', 'passed'],
       ['open_audit', 'ready_for_audit', undefined],
     ] as const) {
-      expect(registry.applyTaskIntent({
+      expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
         taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
         ...(validationState ? { validationState } : {}),
       })).toMatchObject({ ok: true });
@@ -5895,5 +5956,372 @@ describe('automatic audit fan-out across ready auditors', () => {
     expect(calls[1]?.audit).toMatchObject({ strictCrossVendor: true });
     expect(registry.listAssignments('tsk_unselected_existing_recovery').filter((item) => item.role === 'auditor'))
       .toHaveLength(1);
+  });
+});
+
+/**
+ * P1-2 (audit auto-audit-b870aa76): the real freeze/open-audit boundary.
+ *
+ * dispatchReadyAudit (live) and the startup/periodic sweep gated only on the
+ * ready_for_audit projection, so a successor whose only PASS stamp belonged to
+ * the predecessor -- or carried no stamp at all -- froze a bundle, minted an
+ * auditor/attempt and delivered it. Both the task AND the selected owner must
+ * attest the exact current revision.
+ */
+describe('freeze/open-audit boundary requires exact current-revision validation authority', () => {
+  const R1 = 'freeze-authority-r1';
+  const R2 = 'freeze-authority-r2';
+  const sessions = () => [
+    session('deck_alpha_brain', 'brain'),
+    session('deck_alpha_worker', 'w1'),
+    session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+  ];
+
+  function validatedPredecessor(taskId: string) {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'freeze only exact validated bytes', currentRevision: R1,
+      auditPolicy: 'auto_strict_cross_vendor',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', identity: identity('deck_alpha_brain'), required: false,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
+      auditRevision: R1, scopeFiles: ['src/exact.ts'],
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    for (const [intent, toStatus, validationState] of [
+      ['start', 'implementing', undefined],
+      ['record_validation', 'validated', 'passed'],
+    ] as const) {
+      expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
+        taskId, assignmentId: worker.value.assignmentId, intent, toStatus,
+        ...(validationState ? { validationState } : {}),
+      })).toMatchObject({ ok: true });
+    }
+    expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({ validatedRevision: R1 });
+    return { database, registry, taskId, worker: worker.value };
+  }
+
+  function harness(
+    registry: SupervisionTaskRegistry,
+    taskId: string,
+    revision: string,
+    hooks: { onInspect?: () => void; onAuditDispatch?: () => void; onListTargets?: () => void } = {},
+  ) {
+    let evidence = false;
+    const inspect = vi.fn(() => {
+      hooks.onInspect?.();
+      return {
+        worktreePath: `/tmp/${taskId}/repo`, headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      };
+    });
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      if (!input.audit) {
+        return {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+          messageId: 'send_message_00000000-0000-5000-a000-0000000000c1' as SendMessageId,
+          deliveries: [{ target: 'deck_alpha_brain', status: 'queued' as const }],
+        };
+      }
+      hooks.onAuditDispatch?.();
+      // Models the real send path: the auditor/attempt is materialized under the
+      // registry lock with the carried authority snapshot.
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit.attemptId, auditRevision: revision,
+        validationAuthority: input.internalAuditValidationAuthority,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) {
+        return {
+          status: 'error' as const,
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: `task registry rejected assignment: ${created.reason}`,
+        };
+      }
+      evidence = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-0000000000c0' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId, assignmentId: created.value.assignmentId,
+      };
+    });
+    const all = sessions();
+    const records = listTargetRecords(all[2]!);
+    const listTargets = vi.fn((...args: unknown[]) => {
+      hooks.onListTargets?.();
+      return (records as (...a: unknown[]) => ReturnType<typeof records>)(...args);
+    });
+    const deps = {
+      registry, listSessions: () => all,
+      listTargets: listTargets as never, dispatch: dispatch as never,
+      hasDeliveryEvidence: () => evidence,
+      inspectAssignmentWorktree: inspect,
+      runScheduledWorktreeGcBatch: async () => {},
+    };
+    const assertNothingMaterialized = () => {
+      expect(dispatch.mock.calls.some((call) => Boolean(call[1].audit)), 'no audit delivery').toBe(false);
+      expect(inspect, 'no worktree snapshot/freeze').not.toHaveBeenCalled();
+      expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor'), 'no auditor').toEqual([]);
+      expect(registry.getTaskRecord(taskId)!.integrationBundle, 'no bundle bind').toBeUndefined();
+      expect(registry.getAssignment(
+        registry.listAssignments(taskId).find((a) => a.role === 'implementer')!.assignmentId,
+      )!.auditAttemptId, 'no attempt').toBeUndefined();
+    };
+    return { deps, dispatch, inspect, listTargets, assertNothingMaterialized };
+  }
+
+  const refused = [
+    ['unstamped legacy successor', undefined, undefined],
+    ['predecessor-stamped task and owner', R1, R1],
+    ['split: task exact, owner predecessor', R2, R1],
+    ['split: owner exact, task predecessor', R1, R2],
+    ['split: task exact, owner unstamped', R2, undefined],
+    ['split: owner exact, task unstamped', undefined, R2],
+  ] as const;
+
+  it.each(refused)('live dispatch refuses %s', async (_label, taskStamp, ownerStamp) => {
+    const shape = validatedPredecessor(`freeze-live-${String(taskStamp)}-${String(ownerStamp)}`);
+    stampValidation(shape.database, shape.taskId, shape.worker.assignmentId, taskStamp, ownerStamp, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    const h = harness(shape.registry, shape.taskId, R2);
+    const result = await dispatchReadyAudit(shape.taskId, h.deps);
+    expect(result).toMatchObject({
+      status: 'blocked', reason: 'automatic audit requires validation passed for the exact current revision',
+    });
+    h.assertNothingMaterialized();
+  });
+
+  it.each(refused)('boot sweep refuses %s', async (_label, taskStamp, ownerStamp) => {
+    __resetSupervisionConvergenceTickForTests();
+    const shape = validatedPredecessor(`freeze-sweep-${String(taskStamp)}-${String(ownerStamp)}`);
+    stampValidation(shape.database, shape.taskId, shape.worker.assignmentId, taskStamp, ownerStamp, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    const h = harness(shape.registry, shape.taskId, R2);
+    const audits = await dispatchReadyAuditSweep(h.deps);
+    expect(audits, 'the sweep selects the successor and refuses it at the boundary').toEqual([
+      expect.objectContaining({
+        status: 'blocked', reason: 'automatic audit requires validation passed for the exact current revision',
+      }),
+    ]);
+    h.assertNothingMaterialized();
+  });
+
+  it('dispatches exactly when task and owner both attest the current revision (live and sweep)', async () => {
+    const live = validatedPredecessor('freeze-exact-live');
+    stampValidation(live.database, live.taskId, live.worker.assignmentId, R2, R2, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    const liveHarness = harness(live.registry, live.taskId, R2);
+    await expect(dispatchReadyAudit(live.taskId, liveHarness.deps))
+      .resolves.toMatchObject({ status: 'dispatched', attemptId: automaticAttempt(live.taskId, R2) });
+
+    __resetSupervisionConvergenceTickForTests();
+    const swept = validatedPredecessor('freeze-exact-sweep');
+    stampValidation(swept.database, swept.taskId, swept.worker.assignmentId, R2, R2, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    const sweepHarness = harness(swept.registry, swept.taskId, R2);
+    const audits = await dispatchReadyAuditSweep(sweepHarness.deps);
+    expect(audits).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'dispatched' })]));
+  });
+
+  const revoke = (registry: SupervisionTaskRegistry, taskId: string, assignmentId: string) => () => {
+    expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
+      taskId, assignmentId, intent: 'record_validation', toStatus: null, validationState: 'failed',
+    })).toMatchObject({ ok: true });
+  };
+
+  function exactReady(taskId: string) {
+    const shape = validatedPredecessor(taskId);
+    stampValidation(shape.database, shape.taskId, shape.worker.assignmentId, R2, R2, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    return shape;
+  }
+
+  it.each(['live', 'boot sweep'] as const)(
+    '%s: validation revoked while the worktree is inspected/frozen materializes nothing',
+    async (path) => {
+      __resetSupervisionConvergenceTickForTests();
+      const shape = exactReady(`freeze-revoke-inspect-${path.replace(' ', '-')}`);
+      const h = harness(shape.registry, shape.taskId, R2, {
+        onInspect: revoke(shape.registry, shape.taskId, shape.worker.assignmentId),
+      });
+      const results = path === 'live'
+        ? [await dispatchReadyAudit(shape.taskId, h.deps)]
+        : await dispatchReadyAuditSweep(h.deps);
+      expect(results).toEqual([expect.objectContaining({
+        status: 'blocked', reason: 'automatic audit requires validation passed for the exact current revision',
+      })]);
+      expect(h.inspect).toHaveBeenCalledTimes(1);
+      // Refused right after the freeze step: no auditor target is even selected/claimed.
+      expect(h.listTargets, 'no auditor selection after revocation').not.toHaveBeenCalled();
+      expect(h.dispatch.mock.calls.some((call) => Boolean(call[1].audit)), 'no audit delivery').toBe(false);
+      expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+      expect(shape.registry.getTaskRecord(shape.taskId)!.integrationBundle).toBeUndefined();
+      expect(shape.registry.getAssignment(shape.worker.assignmentId)!.auditAttemptId).toBeUndefined();
+    },
+  );
+
+  it.each(['live', 'boot sweep'] as const)(
+    '%s: validation revoked during auditor selection is refused before any delivery',
+    async (path) => {
+      __resetSupervisionConvergenceTickForTests();
+      const shape = exactReady(`freeze-revoke-select-${path.replace(' ', '-')}`);
+      const h = harness(shape.registry, shape.taskId, R2, {
+        onListTargets: revoke(shape.registry, shape.taskId, shape.worker.assignmentId),
+      });
+      const results = path === 'live'
+        ? [await dispatchReadyAudit(shape.taskId, h.deps)]
+        : await dispatchReadyAuditSweep(h.deps);
+      expect(results).toEqual([expect.objectContaining({
+        status: 'blocked', reason: 'automatic audit requires validation passed for the exact current revision',
+      })]);
+      expect(h.listTargets).toHaveBeenCalled();
+      expect(h.dispatch.mock.calls.some((call) => Boolean(call[1].audit)), 'nothing delivered').toBe(false);
+      expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+    },
+  );
+
+  it.each(['live', 'boot sweep'] as const)(
+    '%s: validation revoked after the last check refuses auditor/attempt materialization under lock',
+    async (path) => {
+      __resetSupervisionConvergenceTickForTests();
+      const shape = exactReady(`freeze-revoke-dispatch-${path.replace(' ', '-')}`);
+      const h = harness(shape.registry, shape.taskId, R2, {
+        onAuditDispatch: revoke(shape.registry, shape.taskId, shape.worker.assignmentId),
+      });
+      const results = path === 'live'
+        ? [await dispatchReadyAudit(shape.taskId, h.deps)]
+        : await dispatchReadyAuditSweep(h.deps);
+      expect(results).toEqual([expect.objectContaining({
+        status: 'blocked', reason: 'task registry rejected assignment: stale_audit_revision',
+      })]);
+      const auditCall = h.dispatch.mock.calls.find((call) => Boolean(call[1].audit));
+      expect(auditCall?.[1].internalAuditValidationAuthority, 'the authority snapshot is carried').toEqual(expect.any(String));
+      expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'auditor')).toEqual([]);
+      expect(shape.registry.getAssignment(shape.worker.assignmentId)!.auditAttemptId).toBeUndefined();
+    },
+  );
+
+  it('replays an already-dispatched exact audit without minting a second auditor (replay control)', async () => {
+    const shape = exactReady('freeze-exact-replay');
+    const h = harness(shape.registry, shape.taskId, R2);
+    await expect(dispatchReadyAudit(shape.taskId, h.deps)).resolves.toMatchObject({ status: 'dispatched' });
+    await expect(dispatchReadyAudit(shape.taskId, h.deps)).resolves.toMatchObject({ status: 'replayed' });
+    expect(shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'auditor')).toHaveLength(1);
+  });
+
+  it('keeps legacy unstamped compatibility only without any successor transition evidence', async () => {
+    const shape = validatedPredecessor('freeze-legacy-no-successor');
+    stampValidation(shape.database, shape.taskId, shape.worker.assignmentId, undefined, undefined, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit',
+    });
+    const h = harness(shape.registry, shape.taskId, R1);
+    await expect(dispatchReadyAudit(shape.taskId, h.deps))
+      .resolves.toMatchObject({ status: 'dispatched', attemptId: automaticAttempt(shape.taskId, R1) });
+  });
+
+  it('the real send path refuses to materialize an auditor from a revoked authority snapshot', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const { taskId, revision, worker } = makeReadyTask({
+      taskId: 'send-path-authority', revision: 'send-path-authority-r1',
+      auditPolicy: 'auto_strict_cross_vendor', registry,
+    });
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit', executionPools: { state: 'legacy_unconfigured' },
+      }),
+    };
+    const implementer = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_exact_route', 'w2', 'claude-code-sdk', 'anthropic');
+    const attemptId = automaticAttempt(taskId, revision);
+    const dispatchMessage = vi.fn().mockResolvedValue({ status: 'queued' });
+    const authority = registry.readyAuditValidationAuthoritySnapshot({
+      taskId, assignmentId: worker.assignmentId, revision, allowLegacy: true,
+    });
+    expect(authority).toEqual(expect.any(String));
+    const input = (key: string, snapshot: string | undefined): SendMessageInput => ({
+      target: auditor.name,
+      message: 'automatic audit',
+      reply: true,
+      idempotencyKey: key,
+      newWorkload: true,
+      internalAuditValidationAuthority: snapshot,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId, auditedSessionName: implementer.name, strictCrossVendor: true,
+      },
+      task: {
+        taskId, currentRevision: revision, auditRevision: revision, auditAttemptId: attemptId,
+        auditPolicy: 'auto_strict_cross_vendor', executionPool: 'primary',
+      },
+    });
+    const deps = {
+      listSessions: () => [brain, implementer, auditor],
+      dispatchMessage,
+      ensureSupervisionAssignmentWorktree: async ({ assignmentId }: { assignmentId: string }) => ({
+        ok: true as const, worktreePath: `/tmp/${assignmentId}/repo`, baseRevision: undefined,
+      }),
+    };
+    const caller = { userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' };
+    // Same production shape as the exact no_selected_config recovery: the
+    // automatic route recorded its durable routing blocker first.
+    let blockerDelivered = false;
+    await expect(dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => [brain, implementer, auditor],
+      listTargets: listTargetRecords(),
+      dispatch: vi.fn(async (_c: SendRuntimeCaller, sent: SendMessageInput) => {
+        if (sent.audit) {
+          return {
+            status: 'error' as const,
+            reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+            error: 'supervision target provisioning blocked: no_selected_config',
+          };
+        }
+        blockerDelivered = true;
+        return {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000e5' as const,
+          messageId: sent.internalMessageId!,
+          deliveries: [{ target: brain.name, status: 'queued' as const }],
+        };
+      }),
+      hasDeliveryEvidence: () => blockerDelivered,
+    })).resolves.toMatchObject({ status: 'blocked' });
+
+    // A snapshot that no longer matches the durable authority (here: the owner
+    // stamp it rested on differs from the locked row) must mint nothing, even
+    // though every other recovery gate still passes.
+    const moved = JSON.parse(authority!) as { owner: { validatedRevision: string | null } };
+    moved.owner.validatedRevision = `${revision}-predecessor`;
+    const refused = await dispatchSendMessage(caller, input('send-path-authority-moved', JSON.stringify(moved)), deps);
+    expect(refused).toMatchObject({ status: 'error', error: expect.stringContaining('stale_audit_revision') });
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([]);
+    expect(dispatchMessage).not.toHaveBeenCalled();
+
+    // Positive control: the exact current snapshot materializes one auditor.
+    const fresh = registry.readyAuditValidationAuthoritySnapshot({
+      taskId, assignmentId: worker.assignmentId, revision, allowLegacy: true,
+    });
+    expect(fresh).toBe(authority);
+    const accepted = await dispatchSendMessage(caller, input('send-path-authority-fresh', fresh), deps);
+    expect(accepted, JSON.stringify(accepted)).toMatchObject({ status: 'accepted', taskId });
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
   });
 });

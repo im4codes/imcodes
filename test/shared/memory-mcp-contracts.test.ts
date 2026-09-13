@@ -30,7 +30,9 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 describe('memory MCP shared contracts', () => {
   it('publishes a strict structured integration-finalization branch without removing legacy assignment finish', () => {
     const finish = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH].inputSchema;
-    expect(finish).toMatchObject({ additionalProperties: false, required: ['assignmentId'] });
+    // The caller's revision authority is mandatory: a delayed/retried
+    // predecessor finish must be refusable, never inferred as current.
+    expect(finish).toMatchObject({ additionalProperties: false, required: ['assignmentId', 'revision'] });
     const finalization = MEMORY_MCP_TOOL_CONTRACTS[
       MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE
     ].inputSchema;

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -236,6 +237,7 @@ describe('E2E: automatic supervision progression lifecycle', () => {
       intent: 'start', taskId: created.taskId, assignmentId: created.assignmentId,
     })).resolves.toMatchObject({ status: 'ok', toStatus: 'implementing' });
     await expect(workerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
+      expectedRevision: registry.getAssignment(created.assignmentId)?.auditRevision ?? registry.getTaskRecord(registry.getAssignment(created.assignmentId)?.taskId ?? '')?.currentRevision ?? SUPERVISION_UNBOUND_REVISION,
       intent: 'record_validation', validationState: 'passed',
       taskId: created.taskId, assignmentId: created.assignmentId,
     })).resolves.toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
@@ -377,6 +379,7 @@ describe('E2E: automatic supervision progression lifecycle', () => {
     });
     await intent[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'start', taskId: created.taskId, assignmentId: created.assignmentId });
     await intent[SUPERVISION_MCP_TOOLS.INTENT]({
+      expectedRevision: registry.getAssignment(created.assignmentId)?.auditRevision ?? registry.getTaskRecord(registry.getAssignment(created.assignmentId)?.taskId ?? '')?.currentRevision ?? SUPERVISION_UNBOUND_REVISION,
       intent: 'record_validation', validationState: 'passed', taskId: created.taskId, assignmentId: created.assignmentId,
     });
     const audit = registry.listAssignments(created.taskId).find((assignment) => assignment.role === 'auditor')!;

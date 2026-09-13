@@ -269,14 +269,14 @@ describe('production MCP registration', () => {
 
     const validation = await call(SUPERVISION_MCP_TOOLS.INTENT, {
       intent: 'record_validation', taskId: 'tsk_a', assignmentId: 'rework-owner',
-      validationState: 'passed',
+      validationState: 'passed', expectedRevision: 'fake-rev-a',
     });
     expect(validation).toMatchObject({
       status: 'ok', intent: 'record_validation', fromStatus: 'rework', toStatus: 'validated',
     });
     expect(registry.applied.at(-1)).toMatchObject({
       taskId: 'tsk_a', assignmentId: 'rework-owner', intent: 'record_validation',
-      toStatus: 'validated', validationState: 'passed',
+      toStatus: 'validated', validationState: 'passed', expectedRevision: 'fake-rev-a',
     });
 
     registry.statuses.set('tsk_a', 'ready_for_audit');
@@ -359,7 +359,7 @@ describe('production MCP registration', () => {
       dispatchReadyAudit,
     });
 
-    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({ expectedRevision: 'fake-rev-a',
       intent: 'finish', taskId: 'tsk_a', assignmentId: 'worker-a',
     })).resolves.toMatchObject({ status: 'ok', intent: 'finish' });
     expect(directRegistry.finished, 'the finish itself must still commit').toHaveLength(1);
@@ -386,7 +386,7 @@ describe('production MCP registration', () => {
       dispatchReadyAudit,
     });
 
-    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+    await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({ expectedRevision: 'fake-rev-a',
       intent: 'finish', taskId: 'tsk_a', assignmentId: 'worker-a',
     })).resolves.toMatchObject({ status: 'ok', intent: 'finish' });
     expect(dispatchReadyAudit).toHaveBeenCalledOnce();
@@ -456,11 +456,12 @@ describe('production MCP registration', () => {
       // resolves through the shared fixture resolver.
       resolveSessionIdentity: (name) => (name === live.sessionName ? live : testResolveSessionIdentity(name)),
     });
-    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({ expectedRevision: 'fake-rev-a',
       intent: 'finish', taskId: 'tsk_a', assignmentId: 'drifted-worker',
       rebindSessionName: live.sessionName,
     })).toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
     expect(registry.finished.at(-1)).toEqual({
+      expectedRevision: 'fake-rev-a',
       assignmentId: 'drifted-worker', callerSessionName: 'deck_cd_brain', callerProjectName: 'codedeck',
       projectBrain: true,
       rebindIdentity: {
@@ -470,10 +471,11 @@ describe('production MCP registration', () => {
       rebindProjectName: 'codedeck',
     });
 
-    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({ expectedRevision: 'fake-rev-a',
       intent: 'finish', taskId: 'tsk_a', assignmentId: 'accepted-auditor',
     })).toMatchObject({ status: 'ok' });
     expect(registry.finished.at(-1)).toEqual({
+      expectedRevision: 'fake-rev-a',
       assignmentId: 'accepted-auditor', callerSessionName: 'deck_cd_brain',
       callerProjectName: 'codedeck', projectBrain: true,
     });
@@ -483,7 +485,7 @@ describe('production MCP registration', () => {
       taskId, projectName: 'other-project', classification: 'integration_task', status: 'validated',
       assignments: registry.assignmentStates.get(taskId) ?? [],
     });
-    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({ expectedRevision: 'fake-rev-a',
       intent: 'finish', taskId: 'tsk_a', assignmentId: 'drifted-worker',
       rebindSessionName: live.sessionName,
     })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
@@ -534,8 +536,8 @@ describe('replacement implementer recovery through the real MCP server', () => {
       const port: SupervisionRegistryPort = {
         getStatus: (id) => actual.get(id)?.status,
         applyIntent: (input) => actual.applyTaskIntent(input),
-        finishAssignment: ({ assignmentId, callerSessionName }) => actual.finishAssignment({
-          assignmentId, callerSessionName,
+        finishAssignment: ({ assignmentId, callerSessionName, expectedRevision }) => actual.finishAssignment({
+          assignmentId, callerSessionName, expectedRevision,
         }),
         list: (filter) => actual.list(filter as never) as never,
         get: (id) => actual.get(id) as never,
@@ -818,9 +820,10 @@ describe('administrative recover', () => {
     const state: any = {
       taskId: 'validated-successor-task', projectName: 'codedeck',
       status: 'ready_for_audit', currentRevision: 'revision-r2', validationState: 'passed',
+      validatedRevision: 'revision-r2',
       assignments: [{
         assignmentId, role: 'implementer', status: 'ready_for_audit', leaseId: '',
-        auditRevision: 'revision-r2', validationState: 'passed',
+        auditRevision: 'revision-r2', validationState: 'passed', validatedRevision: 'revision-r2',
         identity: testIdentity('deck_validated_successor_worker'),
       }],
     };
@@ -853,14 +856,54 @@ describe('administrative recover', () => {
     expect(dispatchReadyAudit).toHaveBeenCalledWith(state.taskId);
   });
 
+  it.each([
+    ['unstamped legacy validation', undefined],
+    ['validation stamped for the predecessor revision', 'revision-r1'],
+  ] as const)('never converges or dispatches a successor whose validation is %s', async (_label, stamp) => {
+    const assignmentId = 'inherited-validation-assignment';
+    const state: any = {
+      taskId: 'inherited-validation-task', projectName: 'codedeck',
+      status: 'ready_for_audit', currentRevision: 'revision-r2', validationState: 'passed',
+      ...(stamp ? { validatedRevision: stamp } : {}),
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditRevision: 'revision-r2', validationState: 'passed',
+        ...(stamp ? { validatedRevision: stamp } : {}),
+        identity: testIdentity('deck_inherited_validation_worker'),
+      }],
+    };
+    const convergeValidatedAssignment = vi.fn();
+    const dispatchReadyAudit = vi.fn();
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      rebindTaskAssignmentRevision: vi.fn(() => ({ ok: true as const })),
+      convergeValidatedAssignment,
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true,
+      resolveSessionIdentity: testResolveSessionIdentity, dispatchReadyAudit,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId,
+      fromRevision: 'revision-r1', toRevision: 'revision-r2',
+      leaseAction: 'preserve', idempotencyKey: `recover-inherited-validation-${stamp ?? 'legacy'}`,
+      reason: 'an outcome that does not attest R2 must not freeze R2',
+    })).resolves.toMatchObject({ status: 'ok', toRevision: 'revision-r2' });
+    expect(convergeValidatedAssignment).not.toHaveBeenCalled();
+    expect(dispatchReadyAudit).not.toHaveBeenCalled();
+  });
+
   it('does not dispatch when the recovered successor bundle cannot be refrozen', async () => {
     const assignmentId = 'unfrozen-successor-assignment';
     const state: any = {
       taskId: 'unfrozen-successor-task', projectName: 'codedeck',
       status: 'ready_for_audit', currentRevision: 'revision-r2', validationState: 'passed',
+      validatedRevision: 'revision-r2',
       assignments: [{
         assignmentId, role: 'implementer', status: 'ready_for_audit', leaseId: '',
-        auditRevision: 'revision-r2', validationState: 'passed',
+        auditRevision: 'revision-r2', validationState: 'passed', validatedRevision: 'revision-r2',
         identity: testIdentity('deck_unfrozen_successor_worker'),
       }],
     };

@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -178,7 +179,7 @@ function r1ReworkThenBoundR2(
     revision: R2,
     auditRevision: R2,
   })).toMatchObject({ ok: true });
-  expect(registry.applyTaskIntent({
+  expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
     taskId,
     assignmentId: implementerId,
     intent: 'record_validation',

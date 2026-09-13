@@ -209,10 +209,14 @@ export interface SupervisionRegistryPort {
     toStatus: SupervisionTaskLifecycleStatus | null;
     validationState?: string;
     note?: string;
+    /** Caller revision authority; mandatory for revision-authoritative intents. */
+    expectedRevision?: string;
   }): void | { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   finishAssignment?(input: {
     assignmentId: string;
     callerSessionName: string;
+    /** Mandatory caller revision authority for FINISHED. */
+    expectedRevision: string;
     callerProjectName?: string;
     projectBrain?: boolean;
     rebindIdentity?: {
@@ -373,6 +377,12 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
     rebindSessionName: z.string().min(1).optional(),
     validationState: z.enum([...SUPERVISION_CONSOLE_VALIDATION_STATES] as [string, ...string[]]).optional(),
     note: z.string().max(2000).optional(),
+    /**
+     * Exact revision the caller acted on. REQUIRED for record_validation and
+     * finish: a delayed or retried call for a predecessor revision is refused
+     * with old_revision instead of being applied to the successor.
+     */
+    expectedRevision: z.string().optional(),
   },
   [SUPERVISION_MCP_TOOLS.LIST]: {
     status: z.enum([...SUPERVISION_TASK_LIFECYCLE_STATUSES] as [string, ...string[]]).optional(),
@@ -420,7 +430,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
 const DESCRIPTIONS: Record<SupervisionMcpToolName, string> = {
   // Kept terse on purpose: every byte here is published to every MCP client and
   // the shared tool surface is already over its size budget.
-  [SUPERVISION_MCP_TOOLS.INTENT]: 'Advance a supervision task by intent; the daemon owns the status.',
+  [SUPERVISION_MCP_TOOLS.INTENT]: 'Task intent; validation and finish require expectedRevision.',
   [SUPERVISION_MCP_TOOLS.LIST]: 'List project tasks for its Brain, otherwise tasks you participate in.',
   [SUPERVISION_MCP_TOOLS.GET]: 'Read a project task as its Brain, otherwise a task you participate in.',
   [SUPERVISION_MCP_TOOLS.RECOVER]: 'Restricted task recovery.',
@@ -526,6 +536,12 @@ export function createSupervisionMcpToolHandlers(
       // transition table first made the only valid terminal edge unreachable.
       // The registry verifies the exact audit revision/attempt and atomically
       // revokes this assignment's lease and claims.
+      const expectedRevision = typeof input.expectedRevision === 'string' && input.expectedRevision.trim()
+        ? input.expectedRevision.trim()
+        : undefined;
+      if ((intent === 'record_validation' || intent === 'finish') && !expectedRevision) {
+        return err('expected_revision_required', `${intent} requires expectedRevision: the exact current revision you acted on`);
+      }
       if (intent === 'finish' && boundAssignmentId && reg.finishAssignment) {
         if (input.status !== undefined) {
           return err('model_supplied_status', 'Lifecycle status is daemon-owned; send an intent instead.');
@@ -542,6 +558,7 @@ export function createSupervisionMcpToolHandlers(
         const finished = reg.finishAssignment({
           assignmentId: boundAssignmentId,
           callerSessionName: callerSession,
+          expectedRevision: expectedRevision!,
           // Use the daemon-resolved project scope, not the optional/stale MCP
           // environment hint. Read/intent authorization above already proved
           // this exact live identity against that scope; handing the raw hint
@@ -605,6 +622,7 @@ export function createSupervisionMcpToolHandlers(
         toStatus: outcome.toStatus ?? null,
         validationState: outcome.validationState,
         note: input.note === undefined ? undefined : String(input.note),
+        ...(expectedRevision ? { expectedRevision } : {}),
       });
       if (applied && !applied.ok) return err(applied.reason, `task intent rejected: ${applied.reason}`);
       if (outcome.intent === 'record_validation' && outcome.validationState === 'passed'
@@ -1088,8 +1106,12 @@ export function createSupervisionMcpToolHandlers(
           );
         }
         let convergenceOutcome: string | undefined;
+        // Only validation stamped for the successor itself may drive immediate
+        // convergence; the registry clears any predecessor outcome on rebind.
         const validatedSuccessor = reboundTask?.validationState === 'passed'
           && reboundAssignment?.validationState === 'passed'
+          && (reboundTask as { validatedRevision?: string }).validatedRevision === toRevision
+          && (reboundAssignment as { validatedRevision?: string }).validatedRevision === toRevision
           && ['validated', 'ready_for_audit'].includes(reboundTask.status ?? '')
           && ['validated', 'ready_for_audit'].includes(reboundAssignment.status ?? '');
         if (validatedSuccessor) {

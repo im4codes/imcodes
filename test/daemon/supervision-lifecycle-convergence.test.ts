@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -315,7 +316,7 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     expect(registry.applyTaskIntent({
       taskId, assignmentId, intent: 'start', identity: workerIdentity,
     } as never)).toMatchObject({ ok: true });
-    expect(registry.applyTaskIntent({
+    expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
       taskId, assignmentId, intent: 'record_validation', validationState: 'passed', identity: workerIdentity,
     } as never)).toMatchObject({ ok: true });
     // The durable fact (validation passed) is recorded, but the object now sits

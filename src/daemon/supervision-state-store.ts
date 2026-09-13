@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -603,6 +604,12 @@ export interface PersistedSupervisionIntegrationFinalization {
 export interface PersistedSupervisionTaskRecord {
   /** Last recorded validation outcome for the task aggregate. */
   validationState?: string;
+  /**
+   * The exact revision `validationState` attests. Validation is a statement
+   * about one revision's bytes and is cleared by any revision change that does
+   * not carry a matching stamp; see bindValidationToRevision.
+   */
+  validatedRevision?: string;
   version: typeof SUPERVISION_TASK_REGISTRY_DB_VERSION;
   taskId: string;
   /** Authoritative project audience. Legacy rows are deliberately unscoped. */
@@ -729,6 +736,8 @@ export interface PersistedSupervisionTaskAssignment {
   /** Last recorded validation outcome. The console projects this directly;
    *  leaving it unwritten makes every row read 'unknown'. */
   validationState?: string;
+  /** Exact revision `validationState` attests (see bindValidationToRevision). */
+  validatedRevision?: string;
   leaseId: string;
   generation: number;
   auditAttemptId?: string;
@@ -938,6 +947,12 @@ export interface SupervisionTaskAssignmentInput {
   auditDegradedReason?: SupervisionAuditDegradedReason | null;
   provisioning?: SupervisionProvisioningEvidence | null;
   idempotencyKey?: string | null;
+  /**
+   * Exact validation-authority snapshot (readyAuditValidationAuthoritySnapshot)
+   * that authorized materializing this auditor/attempt. Re-verified under the
+   * creation lock; a revoked or moved authority refuses the materialization.
+   */
+  validationAuthority?: string | null;
   now?: number;
 }
 
@@ -1013,6 +1028,15 @@ export interface SupervisionTaskAssignmentFinishInput {
   assignmentId: string;
   identity: PersistedSupervisionTaskAssignmentIdentity;
   revision?: string | null;
+  /**
+   * Caller-supplied revision authority (every public FINISHED path supplies
+   * it). Compared under the finish lock with BOTH task.currentRevision and the
+   * assignment's auditRevision before any decision or write; a delayed or
+   * retried predecessor call can never be reinterpreted as the successor.
+   * Daemon-internal convergence callers, which derive the revision from rows
+   * they read under the same lock, omit it.
+   */
+  expectedRevision?: string | null;
   evidence?: string | null;
   now?: number;
 }
@@ -1023,6 +1047,8 @@ export interface SupervisionIntegrationBundleBindInput {
   identity: PersistedSupervisionTaskAssignmentIdentity;
   revision: string;
   bundle: SupervisionIntegrationBundle;
+  /** Exact validation-authority snapshot re-verified under the bind lock. */
+  validationAuthority?: string;
   now?: number;
 }
 
@@ -1473,6 +1499,64 @@ function safeJsonParseObject(text: string | undefined): Record<string, unknown> 
   } catch { return undefined; }
 }
 
+/**
+ * Validation attests one exact revision. Any write that moves a record from one
+ * DEFINED revision to another must not keep a validation outcome unless that
+ * outcome is explicitly stamped for the destination revision.
+ *
+ * tsk_hqx R3/R4: a Brain revision rebind spread the predecessor record, so the
+ * successor inherited `validationState: passed`. Lifecycle convergence then
+ * treated that as durable validation of the NEW revision and projected FINISHED
+ * on the next tick, freezing the successor bundle from bytes nobody had
+ * validated -- usually the old revision's. Enforcing this at the write
+ * boundary closes every current and future revision-changing path at once,
+ * rather than relying on each call site to remember the reset.
+ *
+ * Binding a first revision (undefined -> X) keeps the outcome: that is the
+ * zero-byte / missing-projection bind of the very object that was validated.
+ */
+export function bindValidationToRevision<T extends { validationState?: string; validatedRevision?: string }>(
+  previousRevision: string | undefined,
+  nextRevision: string | undefined,
+  record: T,
+): T {
+  const previous = normalizeTaskString(previousRevision);
+  const next = normalizeTaskString(nextRevision);
+  if (!record.validationState && !record.validatedRevision) return record;
+  if (!previous || previous === next) return record;
+  if (next && normalizeTaskString(record.validatedRevision) === next) return record;
+  const { validationState: _staleValidation, validatedRevision: _staleRevision, ...rest } = record;
+  return rest as T;
+}
+
+/**
+ * Authority fingerprint of a persisted row as read. Everything a stale writer
+ * could roll back is included; only the observability heartbeat clock (which
+ * never carries revision, lease or validation authority) is excluded.
+ */
+function supervisionAuthorityFingerprint(row: object | undefined): string | undefined {
+  if (!row) return undefined;
+  const { heartbeatAt: _heartbeat, ...authority } = row as Record<string, unknown>;
+  return JSON.stringify(authority);
+}
+
+/**
+ * Whether a recorded passed validation attests `revision`. Legacy rows written
+ * before revision stamping carry no `validatedRevision`; they are accepted only
+ * when `allowLegacy`, and never by a path that would project an unvalidated
+ * status (implementing/rework) forward.
+ */
+export function validationAttestsRevision(
+  record: { validationState?: string; validatedRevision?: string },
+  revision: string | undefined,
+  allowLegacy: boolean,
+): boolean {
+  if (record.validationState !== 'passed') return false;
+  const stamped = normalizeTaskString(record.validatedRevision);
+  if (!stamped) return allowLegacy;
+  return Boolean(normalizeTaskString(revision)) && stamped === normalizeTaskString(revision);
+}
+
 function parseTaskRow(row: Record<string, unknown>): PersistedSupervisionTaskRecord | undefined {
   const payload = safeJsonParseObject(typeof row.payloadJson === 'string' ? row.payloadJson : undefined);
   if (!payload || payload.version !== SUPERVISION_TASK_REGISTRY_DB_VERSION) return undefined;
@@ -1653,6 +1737,86 @@ function authoritativeAggregateDecision(input: {
   return undefined;
 }
 
+/**
+ * Nest-aware transaction statements for one registry connection.
+ *
+ * Registry methods open their own `BEGIN IMMEDIATE ... COMMIT/ROLLBACK`. To run
+ * a whole read-decide-write operation (identity convergence, eligibility,
+ * replay decision and transition) under ONE lock without rewriting every inner
+ * block, an inner BEGIN/COMMIT/ROLLBACK becomes SAVEPOINT/RELEASE/ROLLBACK TO
+ * while an outer transaction is open. At depth zero every statement is passed
+ * through unchanged, so standalone behavior is byte-for-byte what it was.
+ */
+function withNestedTransactions(target: DatabaseSyncInstance): DatabaseSyncInstance {
+  let depth = 0;
+  const exec = (sql: string): void => {
+    const statement = sql.trim().toUpperCase();
+    if (statement === 'BEGIN IMMEDIATE') {
+      if (depth === 0) {
+        target.exec(sql);
+      } else {
+        target.exec(`SAVEPOINT supervision_nested_${depth}`);
+      }
+      depth += 1;
+      return;
+    }
+    if (statement === 'COMMIT') {
+      if (depth <= 1) {
+        target.exec(sql);
+        depth = 0;
+        return;
+      }
+      target.exec(`RELEASE supervision_nested_${depth - 1}`);
+      depth -= 1;
+      return;
+    }
+    if (statement === 'ROLLBACK') {
+      if (depth <= 1) {
+        depth = 0;
+        target.exec(sql);
+        return;
+      }
+      depth -= 1;
+      target.exec(`ROLLBACK TO supervision_nested_${depth}`);
+      target.exec(`RELEASE supervision_nested_${depth}`);
+      return;
+    }
+    target.exec(sql);
+  };
+  return new Proxy(target, {
+    get(object, property) {
+      if (property === 'exec') return exec;
+      const value = Reflect.get(object, property, object) as unknown;
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(object) : value;
+    },
+  });
+}
+
+export type SupervisionTaskIntentInput = {
+  taskId: string;
+  assignmentId?: string;
+  intent: string;
+  toStatus: SupervisionTaskLifecycleStatus | null;
+  validationState?: string;
+  note?: string;
+  /**
+   * Caller identity. Optional for backward compatibility, but when supplied
+   * it is authorized on the SAME rule as every other boundary. Intents used
+   * to accept any caller while task_update refused a restart-rotated one, so
+   * `start` could succeed and the very next update fail owner_mismatch.
+   */
+  identity?: PersistedSupervisionTaskAssignmentIdentity;
+  /**
+   * Caller-supplied revision authority. MANDATORY for `record_validation`:
+   * validation attests the bytes the caller actually validated, so the daemon
+   * never infers it from whatever row is current when the call lands.
+   */
+  expectedRevision?: string;
+};
+
+/** Intents whose effect is an attestation about exact revision bytes. */
+export const SUPERVISION_REVISION_AUTHORITATIVE_INTENTS: readonly string[] = Object.freeze(['record_validation', 'finish']);
+
 export class SupervisionTaskRegistry {
   readonly #db: DatabaseSyncInstance;
   readonly #ownsDb: boolean;
@@ -1661,12 +1825,12 @@ export class SupervisionTaskRegistry {
 
   constructor(options: SupervisionStateStoreOptions = {}) {
     this.#resolveLiveParticipants = options.resolveLiveParticipants;
-    if (options.database) { this.#db = options.database; this.#ownsDb = false; }
+    if (options.database) { this.#db = withNestedTransactions(options.database); this.#ownsDb = false; }
     else {
       const dbPath = options.dbPath?.trim()
         || resolveSupervisionTaskRegistryDbPath();
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
-      this.#db = new DatabaseSync(dbPath);
+      this.#db = withNestedTransactions(new DatabaseSync(dbPath));
       this.#ownsDb = true;
     }
     const timeout = Math.max(0, Math.min(60_000, Math.floor(options.busyTimeoutMs ?? 5_000)));
@@ -1992,7 +2156,97 @@ export class SupervisionTaskRegistry {
       .run(taskId, assignmentId ?? null, eventType, status, payload ? JSON.stringify(payload) : null, now);
   }
 
-  #writeTask(record: PersistedSupervisionTaskRecord, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
+  /**
+   * Run one whole read-decide-write registry operation under a single
+   * `BEGIN IMMEDIATE`. Every read -- identity authorization, eligibility and
+   * the replay decision -- is taken from rows locked for this operation, so a
+   * successor committed by another connection can never be written over or
+   * reported as a successful replay. A refusal rolls back EVERYTHING the
+   * operation touched (including identity convergence): durable state is
+   * byte-identical to before the call.
+   */
+  /**
+   * Caller revision authority, evaluated on rows read under the caller's lock
+   * BEFORE any validation/status/event/bundle/lease write. The expected
+   * revision must be supplied and must equal both the task's current revision
+   * and (when an assignment is named) that assignment's audit revision.
+   */
+  #callerRevisionRefusal(
+    taskId: string | undefined,
+    assignmentId: string | undefined,
+    expectedRevision: string | null | undefined,
+  ): 'old_revision' | 'invalid' | 'not_found' | undefined {
+    const expected = normalizeTaskString(expectedRevision ?? undefined);
+    if (!expected) return 'invalid';
+    const assignment = assignmentId ? this.getAssignment(assignmentId) : undefined;
+    if (assignmentId && !assignment) return 'not_found';
+    const task = this.getTaskRecord(taskId ?? assignment?.taskId ?? '');
+    if (!task || (assignment && assignment.taskId !== task.taskId)) return 'not_found';
+    // Every BOUND revision (task and, when named, owner) must equal the caller's
+    // revision exactly. A side with no revision yet is the first-bind shape and
+    // cannot contradict the caller; when nothing is bound at all the caller must
+    // say so explicitly with SUPERVISION_UNBOUND_REVISION.
+    const bound = [
+      normalizeTaskString(task.currentRevision),
+      ...(assignment ? [normalizeTaskString(assignment.auditRevision)] : []),
+    ].filter((revision): revision is string => Boolean(revision));
+    if (bound.length === 0) return expected === SUPERVISION_UNBOUND_REVISION ? undefined : 'old_revision';
+    return bound.every((revision) => revision === expected) ? undefined : 'old_revision';
+  }
+
+  #atomically<T>(
+    run: () => SupervisionTaskRegistryResult<T>,
+    options: { persistOnRefusal?: boolean } = {},
+  ): SupervisionTaskRegistryResult<T> {
+    this.#db.exec('BEGIN IMMEDIATE');
+    let result: SupervisionTaskRegistryResult<T>;
+    try {
+      result = run();
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+    this.#db.exec(result.ok || options.persistOnRefusal ? 'COMMIT' : 'ROLLBACK');
+    return result;
+  }
+
+  /**
+   * Under-lock compare-and-swap for read-then-write transactions.
+   *
+   * Callers compute eligibility from rows read BEFORE `BEGIN IMMEDIATE`. Another
+   * connection may commit in that window (e.g. a Brain rebind R1→R2), and
+   * writing the pre-read rows would silently roll the successor back to the
+   * predecessor revision together with its validation. Must be called inside
+   * the transaction before the first write; any change to the task or to a
+   * named assignment since it was read refuses the whole operation.
+   */
+  #staleAuthorityReason(
+    task: PersistedSupervisionTaskRecord | undefined,
+    assignments: ReadonlyArray<PersistedSupervisionTaskAssignment | undefined>,
+  ): 'old_revision' | 'invalid_transition' | undefined {
+    let stale = false;
+    let revisionMoved = false;
+    if (task) {
+      const lockedTask = this.getTaskRecord(task.taskId);
+      if (!lockedTask) return 'invalid_transition';
+      if (supervisionAuthorityFingerprint(lockedTask) !== supervisionAuthorityFingerprint(task)) stale = true;
+      if (lockedTask.currentRevision !== task.currentRevision) revisionMoved = true;
+    }
+    for (const assignment of assignments) {
+      if (!assignment) continue;
+      const locked = this.getAssignment(assignment.assignmentId);
+      if (!locked) return 'invalid_transition';
+      if (supervisionAuthorityFingerprint(locked) !== supervisionAuthorityFingerprint(assignment)) stale = true;
+      if (locked.auditRevision !== assignment.auditRevision) revisionMoved = true;
+    }
+    if (!stale) return undefined;
+    return revisionMoved ? 'old_revision' : 'invalid_transition';
+  }
+
+  #writeTask(input: PersistedSupervisionTaskRecord, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
+    const record = bindValidationToRevision(
+      this.getTaskRecord(input.taskId)?.currentRevision, input.currentRevision, input,
+    );
     this.#db.prepare(`
       INSERT INTO supervision_tasks (task_id, project_name, top_level_task_id, classification, status, current_revision, commit_sha, push_remote_ref, blocker, validation_state, payload_json, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2007,7 +2261,10 @@ export class SupervisionTaskRegistry {
     }
   }
 
-  #writeAssignment(record: PersistedSupervisionTaskAssignment, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
+  #writeAssignment(input: PersistedSupervisionTaskAssignment, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
+    const record = bindValidationToRevision(
+      this.getAssignment(input.assignmentId)?.auditRevision, input.auditRevision, input,
+    );
     const identity = record.identity;
     this.#db.prepare(`
       INSERT INTO supervision_task_assignments (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, lease_id, generation, validation_state, audit_attempt_id, audit_revision, verdict, blocker, payload_json, created_at, updated_at)
@@ -2047,6 +2304,117 @@ export class SupervisionTaskRegistry {
        ON CONFLICT(project_name) DO UPDATE SET
          next_due_at = MIN(next_due_at, excluded.next_due_at), updated_at = excluded.updated_at`,
     ).run(projectName, now, now);
+  }
+
+  /**
+   * Validation authority at the immutable freeze/open-audit boundary.
+   *
+   * Both the task and the selected implementation owner must carry
+   * `validationState: passed` stamped for exactly `revision`. Unstamped, predecessor-
+   * stamped or split (one side stamped, or stamped differently) rows never
+   * authorize a bundle freeze, auditor assignment, attempt or delivery.
+   *
+   * Legacy rows written before revision stamping are accepted only when
+   * `allowLegacy` AND durable evidence proves no successor transition ever
+   * happened on this task: both rows are already durably `ready_for_audit` at
+   * `revision`, and no assignment, audit receipt, bound bundle or lifecycle
+   * event names any other revision.
+   */
+  hasReadyAuditValidationAuthority(input: {
+    taskId: string;
+    assignmentId: string;
+    revision: string;
+    allowLegacy: boolean;
+  }): boolean {
+    const revision = normalizeTaskString(input.revision);
+    const task = this.getTaskRecord(input.taskId);
+    const owner = this.getAssignment(input.assignmentId);
+    if (!revision || !task || !owner || owner.taskId !== task.taskId) return false;
+    if (task.validationState !== 'passed' || owner.validationState !== 'passed') return false;
+    const taskStamp = normalizeTaskString(task.validatedRevision);
+    const ownerStamp = normalizeTaskString(owner.validatedRevision);
+    if (taskStamp || ownerStamp) return taskStamp === revision && ownerStamp === revision;
+    if (!input.allowLegacy) return false;
+    if (task.status !== 'ready_for_audit' || owner.status !== 'ready_for_audit'
+      || normalizeTaskString(task.currentRevision) !== revision
+      || normalizeTaskString(owner.auditRevision) !== revision) return false;
+    return !this.#hasOtherRevisionEvidence(task, revision);
+  }
+
+  /**
+   * Exact validation-authority snapshot for the freeze/open-audit boundary, or
+   * undefined when there is no authority. The token names the task, owner and
+   * revision and captures every validation fact the decision rested on, so a
+   * later locked writer can prove NOTHING about that authority moved.
+   */
+  readyAuditValidationAuthoritySnapshot(input: {
+    taskId: string;
+    assignmentId: string;
+    revision: string;
+    allowLegacy: boolean;
+  }): string | undefined {
+    if (!this.hasReadyAuditValidationAuthority(input)) return undefined;
+    const task = this.getTaskRecord(input.taskId)!;
+    const owner = this.getAssignment(input.assignmentId)!;
+    return JSON.stringify({
+      version: 1,
+      taskId: task.taskId,
+      assignmentId: owner.assignmentId,
+      revision: normalizeTaskString(input.revision),
+      allowLegacy: input.allowLegacy,
+      task: {
+        currentRevision: task.currentRevision ?? null,
+        validationState: task.validationState ?? null,
+        validatedRevision: task.validatedRevision ?? null,
+      },
+      owner: {
+        auditRevision: owner.auditRevision ?? null,
+        validationState: owner.validationState ?? null,
+        validatedRevision: owner.validatedRevision ?? null,
+      },
+    });
+  }
+
+  /** Whether an authority snapshot still holds exactly (for this task/revision). */
+  validationAuthoritySnapshotHolds(
+    snapshot: string | undefined | null,
+    expected: { taskId: string; revision?: string },
+  ): boolean {
+    if (!snapshot) return false;
+    let parsed: { taskId?: unknown; assignmentId?: unknown; revision?: unknown; allowLegacy?: unknown };
+    try {
+      parsed = JSON.parse(snapshot) as typeof parsed;
+    } catch {
+      return false;
+    }
+    if (typeof parsed.taskId !== 'string' || typeof parsed.assignmentId !== 'string'
+      || typeof parsed.revision !== 'string' || typeof parsed.allowLegacy !== 'boolean') return false;
+    if (parsed.taskId !== expected.taskId) return false;
+    const expectedRevision = normalizeTaskString(expected.revision);
+    if (expectedRevision && parsed.revision !== expectedRevision) return false;
+    return this.readyAuditValidationAuthoritySnapshot({
+      taskId: parsed.taskId,
+      assignmentId: parsed.assignmentId,
+      revision: parsed.revision,
+      allowLegacy: parsed.allowLegacy,
+    }) === snapshot;
+  }
+
+  #hasOtherRevisionEvidence(task: PersistedSupervisionTaskRecord, revision: string): boolean {
+    const differs = (value: unknown): boolean => {
+      const normalized = typeof value === 'string' ? normalizeTaskString(value) : undefined;
+      return Boolean(normalized) && normalized !== revision;
+    };
+    if (task.integrationBundle && differs(task.integrationBundle.revision)) return true;
+    if (differs(task.baseRevision) && task.baseRevision !== task.currentRevision
+      && this.listAuditReceipts(task.taskId).length > 0) return true;
+    if (this.listAssignments(task.taskId).some((assignment) => differs(assignment.auditRevision))) return true;
+    if (this.listAuditReceipts(task.taskId).some((receipt) => differs(receipt.revision))) return true;
+    const revisionKeys = ['revision', 'auditRevision', 'fromRevision', 'toRevision', 'currentRevision', 'validatedRevision', 'previousRevision'];
+    return this.listEvents(task.taskId).some((event) => {
+      const payload = event.payload as Record<string, unknown> | undefined;
+      return Boolean(payload) && revisionKeys.some((key) => differs(payload![key]));
+    });
   }
 
   get(taskId: string): SupervisionTaskSnapshot | undefined {
@@ -3748,6 +4116,15 @@ export class SupervisionTaskRegistry {
     const scopeFiles = normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      if (input.validationAuthority !== undefined && input.validationAuthority !== null
+        && !this.validationAuthoritySnapshotHolds(input.validationAuthority, {
+          taskId: input.taskId,
+          revision: normalizeTaskString(input.auditRevision === undefined || input.auditRevision === null
+            ? undefined : String(input.auditRevision)),
+        })) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'stale_audit_revision' };
+      }
       const proposedAssignmentKey = normalizeTaskString(input.semanticAssignmentKey);
       const sequence = this.#nextEventSequence();
       let suffixAttempt = 0;
@@ -4201,6 +4578,11 @@ export class SupervisionTaskRegistry {
       : nextStatus;
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      const staleAuthority = this.#staleAuthorityReason(undefined, [existing]);
+      if (staleAuthority) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: staleAuthority };
+      }
       if (bindsTaskRevision) {
         const lockedTask = this.getTaskRecord(existing.taskId);
         if (!lockedTask || taskRevisionConflicts(lockedTask.currentRevision)) {
@@ -4658,6 +5040,11 @@ export class SupervisionTaskRegistry {
       const lockedSupersededReceipt = lockedTask?.integrationBundle && lockedAssignment
         ? this.#supersededReworkBundleReceipt(lockedTask, lockedAssignment, bundle)
         : undefined;
+      if (input.validationAuthority !== undefined
+        && !this.validationAuthoritySnapshotHolds(input.validationAuthority, { taskId: task.taskId, revision })) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'stale_audit_revision' };
+      }
       if (!lockedTask || !lockedAssignment
         || (lockedTask.integrationBundle && !lockedSupersededReceipt)
         || lockedTask.currentRevision !== revision
@@ -4731,8 +5118,10 @@ export class SupervisionTaskRegistry {
       || successor.sourceAssignmentId !== assignment.assignmentId
       || successor.revision !== task.currentRevision
       || assignment.auditRevision !== successor.revision
-      || task.validationState !== 'passed'
-      || assignment.validationState !== 'passed'
+      // Freezing a successor over its REWORK predecessor requires validation
+      // stamped for the successor itself, never the predecessor's outcome.
+      || !validationAttestsRevision(task, successor.revision, false)
+      || !validationAttestsRevision(assignment, successor.revision, false)
       || !['implementing', 'validated', 'ready_for_audit'].includes(task.status)
       || !['implementing', 'validated', 'ready_for_audit'].includes(assignment.status)
       || task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt
@@ -4766,6 +5155,21 @@ export class SupervisionTaskRegistry {
   }
 
   finishAssignment(input: SupervisionTaskAssignmentFinishInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    // FINISHED, including its replay answer, is decided only from locked rows.
+    return this.#atomically(() => {
+      if (input.expectedRevision !== undefined) {
+        const refusal = this.#callerRevisionRefusal(undefined, input.assignmentId, input.expectedRevision);
+        if (refusal) return { ok: false, reason: refusal };
+      }
+      const callerRevision = normalizeTaskString(input.expectedRevision ?? undefined);
+      return this.#finishAssignmentLocked({
+        ...input,
+        ...(callerRevision && callerRevision !== SUPERVISION_UNBOUND_REVISION ? { revision: callerRevision } : {}),
+      });
+    });
+  }
+
+  #finishAssignmentLocked(input: SupervisionTaskAssignmentFinishInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const existing = this.getAssignment(input.assignmentId);
     if (!existing) return { ok: false, reason: 'not_found' };
     if (!identityMatches(existing.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
@@ -4805,8 +5209,11 @@ export class SupervisionTaskRegistry {
       && existing.role === 'implementer'
       && existing.required
       && (existing.status === 'implementing' || existing.status === 'rework')
-      && existing.validationState === 'passed'
-      && task.validationState === 'passed'
+      // Projecting an implementing/rework object to FINISHED is only honest
+      // when the recorded validation attests THIS revision. A legacy or
+      // inherited outcome for a predecessor revision must re-validate.
+      && validationAttestsRevision(existing, requestedRevision ?? taskRevision, false)
+      && validationAttestsRevision(task, requestedRevision ?? taskRevision, false)
       && Boolean(requestedRevision ?? taskRevision)
       && existing.auditRevision === (requestedRevision ?? taskRevision)
       && taskRevision === (requestedRevision ?? taskRevision)
@@ -5052,6 +5459,11 @@ export class SupervisionTaskRegistry {
     };
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      const staleAuthority = this.#staleAuthorityReason(task, [existing, authenticatedAuditTarget]);
+      if (staleAuthority) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: staleAuthority };
+      }
       if (!alreadyApplied) {
         this.#writeAssignment(
           record,
@@ -5179,6 +5591,24 @@ export class SupervisionTaskRegistry {
     callerIdentity: PersistedSupervisionTaskAssignmentIdentity;
     rebindIdentity?: PersistedSupervisionTaskAssignmentIdentity;
     rebindProjectName?: string;
+    /** Mandatory caller revision authority, checked under the same lock. */
+    expectedRevision: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    return this.#atomically(() => {
+      const refusal = this.#callerRevisionRefusal(undefined, normalizeTaskString(input.assignmentId), input.expectedRevision);
+      if (refusal) return { ok: false, reason: refusal };
+      return this.#finishAssignmentAsProjectBrainLocked(input);
+    });
+  }
+
+  #finishAssignmentAsProjectBrainLocked(input: {
+    assignmentId: string;
+    callerProjectName: string;
+    callerIdentity: PersistedSupervisionTaskAssignmentIdentity;
+    rebindIdentity?: PersistedSupervisionTaskAssignmentIdentity;
+    rebindProjectName?: string;
+    expectedRevision: string;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const assignmentId = normalizeTaskString(input.assignmentId);
@@ -5214,6 +5644,7 @@ export class SupervisionTaskRegistry {
         assignmentId: assignment.assignmentId,
         identity: assignment.identity,
         revision: assignment.auditRevision,
+        expectedRevision: input.expectedRevision,
         now: input.now,
       });
     }
@@ -8230,21 +8661,30 @@ export class SupervisionTaskRegistry {
    * same policy that could drift, and the two would mask each other's bugs.
    * This records what was decided, with an event, in one write.
    */
-  applyTaskIntent(input: {
-    taskId: string;
-    assignmentId?: string;
-    intent: string;
-    toStatus: SupervisionTaskLifecycleStatus | null;
-    validationState?: string;
-    note?: string;
-    /**
-     * Caller identity. Optional for backward compatibility, but when supplied
-     * it is authorized on the SAME rule as every other boundary. Intents used
-     * to accept any caller while task_update refused a restart-rotated one, so
-     * `start` could succeed and the very next update fail owner_mismatch.
-     */
-    identity?: PersistedSupervisionTaskAssignmentIdentity;
-  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+  applyTaskIntent(input: SupervisionTaskIntentInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    // Identity convergence, eligibility and the intent transition share ONE
+    // lock: a refused intent leaves no partial identity write behind.
+    return this.#atomically(() => {
+      if (SUPERVISION_REVISION_AUTHORITATIVE_INTENTS.includes(input.intent)) {
+        const refusal = this.#callerRevisionRefusal(input.taskId, input.assignmentId, input.expectedRevision);
+        if (refusal) return { ok: false, reason: refusal };
+      }
+      const identityRefusal = this.#convergeIntentIdentityLocked(input);
+      if (identityRefusal) return identityRefusal;
+      // The transition runs in a nested savepoint of the SAME lock: a refused
+      // intent discards every transition write, while the identity refresh
+      // derived from these locked rows (observational metadata only) stays.
+      return this.#atomically(() => this.#applyTaskIntentLocked(input));
+    }, { persistOnRefusal: true });
+  }
+
+  /**
+   * Restart-rotated identity convergence for an intent, from rows read under
+   * the caller's lock. Returns a refusal, or undefined to continue.
+   */
+  #convergeIntentIdentityLocked(
+    input: SupervisionTaskIntentInput,
+  ): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> | undefined {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
     if (input.assignmentId && input.identity) {
@@ -8278,6 +8718,12 @@ export class SupervisionTaskRegistry {
         }
       }
     }
+    return undefined;
+  }
+
+  #applyTaskIntentLocked(input: SupervisionTaskIntentInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const task = this.getTaskRecord(input.taskId);
+    if (!task) return { ok: false, reason: 'not_found' };
     if (input.intent === 'open_audit' && task.classification === 'integration_slice') {
       // Preserve an idempotent compatibility path for durable auditor rows
       // minted before merge-before-audit became authoritative. New rows are
@@ -8301,6 +8747,11 @@ export class SupervisionTaskRegistry {
       const now = Date.now();
       this.#db.exec('BEGIN IMMEDIATE');
       try {
+        const staleAuthority = this.#staleAuthorityReason(undefined, [assignment]);
+        if (staleAuthority) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: staleAuthority };
+        }
         this.#writeAssignment({
           ...assignment,
           status: 'cancelled',
@@ -8413,6 +8864,11 @@ export class SupervisionTaskRegistry {
       if (input.intent === 'checkpoint') {
         this.#db.exec('BEGIN IMMEDIATE');
         try {
+          const staleAuthority = this.#staleAuthorityReason(task, [assignment]);
+          if (staleAuthority) {
+            this.#db.exec('ROLLBACK');
+            return { ok: false, reason: staleAuthority };
+          }
           this.#writeAssignment({ ...assignment, updatedAt: now }, eventType, {
             source: 'task_intent_assignment_sync',
             substantiveProgress: true,
@@ -8464,8 +8920,25 @@ export class SupervisionTaskRegistry {
     const record: PersistedSupervisionTaskRecord = taskChanges
       ? { ...task, status: input.toStatus!, updatedAt: now }
       : task;
+    // A validation outcome attests exactly the revision the object carries at
+    // the moment it is recorded. The assignment's own revision is authoritative
+    // (it can legitimately lead the aggregate in a validated split); the
+    // aggregate revision is the fallback before any assignment projection.
+    const callerRevision = normalizeTaskString(input.expectedRevision);
+    const validatedRevision = input.validationState
+      ? (callerRevision && callerRevision !== SUPERVISION_UNBOUND_REVISION ? callerRevision : undefined)
+        ?? normalizeTaskString(assignment?.auditRevision) ?? normalizeTaskString(task.currentRevision)
+      : undefined;
+    const validationStamp = input.validationState
+      ? { validationState: input.validationState, validatedRevision }
+      : {};
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      const staleAuthority = this.#staleAuthorityReason(task, [assignment]);
+      if (staleAuthority) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: staleAuthority };
+      }
       if (assignment && ((assignmentTarget && assignmentTarget !== assignment.status) || validationOutcome)) {
         this.#writeAssignment(
           {
@@ -8473,7 +8946,7 @@ export class SupervisionTaskRegistry {
             ...(assignmentTarget ? { status: assignmentTarget } : {}),
             // Persist the outcome, not just the event payload, so the console
             // can project a real validation state instead of 'unknown'.
-            ...(input.validationState ? { validationState: input.validationState } : {}),
+            ...validationStamp,
             updatedAt: now,
           },
             input.intent === 'open_audit'
@@ -8485,6 +8958,7 @@ export class SupervisionTaskRegistry {
             source: 'task_intent_assignment_sync',
             intent: input.intent,
             validationState: input.validationState,
+            ...(validatedRevision ? { validatedRevision } : {}),
             ...(input.intent === 'open_audit' ? {
               implementationHandoff: 'FINISHED',
               auditVerdict: null,
@@ -8493,7 +8967,7 @@ export class SupervisionTaskRegistry {
         );
       }
       if (taskChanges || validationOutcome) {
-        this.#writeTask({ ...record, ...(validationOutcome ? { validationState: validationOutcome } : {}) },
+        this.#writeTask({ ...record, ...(validationOutcome ? validationStamp : {}) },
           taskChanges ? this.#taskEventFor(input.toStatus!) : 'validated', {
           source: 'task_intent',
           intent: input.intent,
@@ -9399,9 +9873,18 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return undefined;
       }
+      const lockedTarget = this.getAssignment(plan.assignmentId);
+      if (!lockedTarget || !validationAttestsRevision(lockedTarget, plan.toRevision, true)) {
+        this.#db.exec('ROLLBACK');
+        return undefined;
+      }
       this.#writeTask({
         ...lockedTask,
         currentRevision: plan.toRevision,
+        // The aggregate adopts the implementer's validation for the revision it
+        // now names. Stamped explicitly so the revision-change guard keeps it.
+        validationState: 'passed',
+        validatedRevision: plan.toRevision,
         updatedAt: now,
       }, 'validated', {
         source: 'lifecycle_convergence_validated_revision_split',
@@ -9433,7 +9916,14 @@ export class SupervisionTaskRegistry {
     const target = this.listAssignments(task.taskId).find((assignment) => (
       assignment.role !== 'auditor'
       && assignment.role !== 'coordinator'
-      && assignment.validationState === 'passed'
+      // An object still implementing/reworking may only be projected forward on
+      // a validation that attests its current revision; a validated object may
+      // keep legacy (unstamped) validation because its status already says so.
+      && validationAttestsRevision(
+        assignment,
+        normalizeTaskString(assignment.auditRevision) ?? normalizeTaskString(task.currentRevision),
+        assignment.status !== 'implementing' && assignment.status !== 'rework',
+      )
       && assignment.status !== 'ready_for_audit'
       && (canTransitionSupervisionTaskStatus(assignment.status, 'ready_for_audit')
         || assignment.status === 'implementing'

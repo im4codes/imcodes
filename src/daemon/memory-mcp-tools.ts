@@ -255,7 +255,9 @@ const integrationFinalizationSchema = z.object({
 }).strict();
 
 const legacySupervisionFinishSchema = z.object({
-  assignmentId: z.string(), revision: z.string().optional(), evidence: z.string().optional(),
+  // `revision` is the caller's revision authority and is mandatory: a delayed
+  // or retried predecessor FINISHED must be refused, never applied to R2.
+  assignmentId: z.string(), revision: z.string().min(1), evidence: z.string().optional(),
 }).strict();
 
 export interface MemoryMcpToolContext {
@@ -2194,6 +2196,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const registry = getSupervisionTaskRegistry();
       const existing = registry.getAssignment(mapped.assignmentId);
       if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: not_found');
+      // Caller revision authority is mandatory for every legacy finish shape,
+      // including cancelled completion evidence; it is never inferred.
+      const expectedRevision = typeof mapped.metadata.revision === 'string' ? mapped.metadata.revision.trim() : '';
+      if (!expectedRevision) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: expected_revision_required');
+      }
       if (existing.status === 'cancelled' && existing.role !== 'auditor' && existing.role !== 'coordinator') {
         const inspected = await inspectSupervisionAssignmentWorktree({
           sessionName: existing.identity.sessionName,
@@ -2207,7 +2215,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           taskId: existing.taskId,
           assignmentId: existing.assignmentId,
           identity,
-          revision: mapped.metadata.revision ?? existing.auditRevision,
+          revision: expectedRevision,
           worktreeSnapshot: inspected.snapshot,
           evidence: mapped.metadata.evidence,
         });
@@ -2218,7 +2226,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const updated = registry.finishAssignment({
         assignmentId: mapped.assignmentId,
         identity,
-        revision: mapped.metadata.revision,
+        expectedRevision,
         evidence: mapped.metadata.evidence,
       });
       if (!updated.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);

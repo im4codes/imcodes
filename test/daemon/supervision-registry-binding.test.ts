@@ -9,6 +9,7 @@
  *
  * These tests therefore go through the REAL construction path.
  */
+import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 // Supervision authority now resolves the caller's LIVE identity from the daemon
@@ -132,7 +133,7 @@ describe('supervision registry binding', () => {
       status: 'implementing',
       revision,
     })).toMatchObject({ ok: true });
-    expect(registry.applyTaskIntent({
+    expect(registry.applyTaskIntent({ expectedRevision: (registry.getTaskRecord(taskId)?.currentRevision ?? SUPERVISION_UNBOUND_REVISION),
       taskId,
       assignmentId: assignment.assignmentId,
       identity: assignment.identity,
@@ -148,6 +149,7 @@ describe('supervision registry binding', () => {
       createSupervisionMcpToolDeps(),
     );
     await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      expectedRevision: registry.getAssignment(assignment.assignmentId)?.auditRevision ?? registry.getTaskRecord(registry.getAssignment(assignment.assignmentId)?.taskId ?? '')?.currentRevision ?? SUPERVISION_UNBOUND_REVISION,
       intent: 'finish', taskId, assignmentId: assignment.assignmentId,
     })).resolves.toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
     expect(registry.getAssignment(assignment.assignmentId)).toMatchObject({

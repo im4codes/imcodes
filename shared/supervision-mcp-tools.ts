@@ -56,3 +56,12 @@ export const SUPERVISION_MCP_PENDING_CONSOLIDATION: readonly SupervisionMcpToolN
 export const SUPERVISION_MCP_FORBIDDEN_ARG_NAMES: readonly string[] = Object.freeze([
   'status', 'lifecycleStatus', 'toStatus', 'nextStatus', 'taskStatus',
 ]);
+
+/**
+ * Explicit caller revision authority for an object that has NO revision bound
+ * yet (read-only review, zero-byte base bind, unbound slice). Revision-
+ * authoritative intents (record_validation, finish) always require the caller
+ * to state the revision it acted on; this value states "no revision was bound"
+ * and is refused as soon as any real revision is bound to the task or owner.
+ */
+export const SUPERVISION_UNBOUND_REVISION = '(unbound)';

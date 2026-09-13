@@ -757,7 +757,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       assignmentId: stringSchema('Caller-bound assignment.'),
       revision: stringSchema('Current revision.'),
       evidence: stringSchema('Bounded legacy assignment evidence.'),
-    }, ['assignmentId']),
+    }, ['assignmentId', 'revision']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: {
