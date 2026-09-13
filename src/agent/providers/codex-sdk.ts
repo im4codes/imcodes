@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { capContextPreservingPriority, joinSpanned, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
 import {
   readDelegationDispatchFact,
   readMachineControlDispatchFact,
@@ -67,7 +68,7 @@ import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../sha
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
-import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
+import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned, getProviderSessionSystemTextSpanned } from '../provider-context-routing.js';
 import { getCodexAppServerArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
@@ -152,10 +153,12 @@ const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
  * raised past its fixture: the input is no longer over the limit, nothing is
  * cut, and the assertion quietly becomes about nothing.
  */
-export const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 180_000;
-// User + project + session identity contracts may total 140k characters. Keep
-// the default at the supported ceiling so stable IM.codes guidance, authored
-// context, and image-reporting remain intact instead of being silently cut.
+export const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 250_000;
+// Filled user + project + session identity contracts (SESSION_IDENTITY_COMBINED_MAX_CHARS)
+// deliberately exceed this ceiling, so reaching it is expected rather than
+// exceptional. The default stays at the ceiling, and capCodexSdkContextInjection
+// spends any overflow on the user-authored identity block first so that stable
+// IM.codes runtime rules, supervision contracts and image reporting survive.
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
@@ -853,46 +856,51 @@ function getCodexSdkContextInjectionMaxChars(): number {
   return parsed;
 }
 
-function capCodexSdkContextInjection(text: string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
-  if (text.length <= maxChars) return text;
-  const marker = `\n\n[IM.codes: injected context truncated from ${text.length} to ${maxChars} chars to prevent SDK auto-compaction.]`;
-  if (maxChars <= marker.length + 16) return text.slice(0, maxChars);
-  return `${text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
+const CODEX_CONTEXT_CAP_MARKERS: PriorityPreservingCapMarkers = {
+  identityTruncated: (bodyLength, maxChars) => `\n[IM.codes: agent identity truncated from ${bodyLength} to fit the ${maxChars}-char Codex context budget; IM.codes system and supervision instructions were preserved.]\n`,
+  contextTruncated: (length, maxChars) => `\n\n[IM.codes: injected context truncated from ${length} to ${maxChars} chars to prevent SDK auto-compaction.]`,
+};
+
+function capCodexSdkContextInjection(text: SpannedText | string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
+  // Codex measures its budget in UTF-16 units, matching the string length it receives.
+  return capContextPreservingPriority(text, maxChars, 'utf16', CODEX_CONTEXT_CAP_MARKERS);
 }
 
-function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: string): string {
-  const contextParts: string[] = [];
+function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: SpannedText): string {
   const split = getProviderSystemTextParts(payload);
-  const systemText = split.hasSplitSystemText
-    ? composeProviderSystemText(payload, { includeSession: false, includeTurn: true })
-    : payload.systemText?.trim();
+  // Turn text never carries the identity span: authored turn context is exactly
+  // the kind of content a forged identity delimiter would hide in. In the legacy
+  // combined view the span is honoured only after hash verification.
+  const systemText: SpannedText | undefined = split.hasSplitSystemText
+    ? joinSpanned([composeProviderSystemText(payload, { includeSession: false, includeTurn: true })], '')
+    : composeProviderSystemTextSpanned(payload);
   const messagePreamble = payload.messagePreamble?.trim();
-  const stableUpdate = sessionSystemTextUpdate?.trim();
-  if (stableUpdate) {
-    contextParts.push(`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n${stableUpdate}`);
-  }
-  if (systemText) contextParts.push(`Context instructions:\n${systemText}`);
-  if (messagePreamble) contextParts.push(messagePreamble);
-  if (contextParts.length === 0) return payload.assembledMessage;
+  const stableUpdate = sessionSystemTextUpdate?.text.trim() ? sessionSystemTextUpdate : undefined;
+  const contextText = joinSpanned([
+    stableUpdate ? joinSpanned([`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n`, stableUpdate], '') : undefined,
+    systemText ? joinSpanned(['Context instructions:\n', systemText], '') : undefined,
+    messagePreamble,
+  ], '\n\n');
+  if (!contextText) return payload.assembledMessage;
 
-  const contextText = capCodexSdkContextInjection(contextParts.join('\n\n'));
+  const cappedContextText = capCodexSdkContextInjection(contextText);
   const userMessage = messagePreamble ? payload.userMessage : payload.assembledMessage;
   const trimmedUserMessage = userMessage.trim();
-  return trimmedUserMessage ? `${contextText}\n\n${trimmedUserMessage}` : contextText;
+  return trimmedUserMessage ? `${cappedContextText}\n\n${trimmedUserMessage}` : cappedContextText;
 }
 
 function appendImcodesBaseInstructions(baseInstructions: string, payload: ProviderContextPayload): string {
-  const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+  const sessionSystemText = getProviderSessionSystemTextSpanned(payload);
   // Generated Image Reporting belongs in Codex's baseInstructions tail
   // (Codex is currently the only transport agent with native image-gen
   // tools). Living here means: sent once per thread/start|resume, picked
   // up by Codex prefix cache, NOT re-rendered every turn, and zero cost
   // for non-Codex providers. See p2p audit 37bfbb85-430 N-A follow-up.
   const imageReporting = buildGeneratedImageReportingPrompt();
-  const tailParts = [sessionSystemText, imageReporting].filter((s): s is string => Boolean(s));
-  if (tailParts.length === 0) return baseInstructions;
+  const tail = joinSpanned([sessionSystemText, imageReporting], '\n\n');
+  if (!tail) return baseInstructions;
   if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
-  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tailParts.join('\n\n'))}`;
+  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tail)}`;
 }
 
 function appendDetectedGeneratedImagePaths(content: string, paths: string[]): string {
@@ -3601,7 +3609,7 @@ export class CodexSdkProvider implements TransportProvider {
         await this.assertImcodesDelegationReady(state.threadId);
       }
       await this.prepareGeneratedImageTracking(sessionId, state);
-      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
+      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? getProviderSessionSystemTextSpanned(payload) : undefined);
       if (shouldInjectStableUpdate) {
         state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
         state.pendingSessionSystemTextUpdateTurnId = undefined;

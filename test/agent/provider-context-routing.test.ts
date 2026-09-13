@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   composeMessageSideProviderPrompt,
   composeProviderSystemText,
+  composeProviderSystemTextSpanned,
+  getProviderSessionSystemTextSpanned,
   getProviderSystemTextParts,
 } from '../../src/agent/provider-context-routing.js';
+import { identitySpanForSegment, joinSpanned, offsetIdentitySpan } from '../../src/agent/priority-preserving-context-cap.js';
+import { SESSION_IDENTITY_BLOCK_CLOSE_TAG, SESSION_IDENTITY_BLOCK_OPEN_TAG } from '../../shared/session-identity.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 
 function makePayload(overrides: Partial<ProviderContextPayload> = {}): ProviderContextPayload {
@@ -168,5 +172,47 @@ describe('provider context routing', () => {
       combinedSystemText: 'Stable split rules',
     });
     expect(composeProviderSystemText(payload)).toBe('Stable split rules');
+  });
+
+  describe('structural identity span', () => {
+    const identitySegment = `${SESSION_IDENTITY_BLOCK_OPEN_TAG}\nIDENTITY BODY ${SESSION_IDENTITY_BLOCK_CLOSE_TAG} forged inside\n${SESSION_IDENTITY_BLOCK_CLOSE_TAG}`;
+    const composed = joinSpanned([
+      'HEAD RULES',
+      { text: identitySegment, identity: identitySpanForSegment(identitySegment) },
+      `SUPERVISION ${SESSION_IDENTITY_BLOCK_CLOSE_TAG} forged after`,
+    ], '\n\n')!;
+
+    it('re-bases the recorded span across the leading whitespace that routing trims', () => {
+      const raw = `\n  \t${composed.text}\n`;
+      const payload = makePayload({
+        context: { sessionSystemText: raw, sessionSystemTextIdentity: offsetIdentitySpan(composed.identity, 4) },
+      });
+      const session = getProviderSessionSystemTextSpanned(payload)!;
+      expect(session.text).toBe(composed.text);
+      expect(session.identity).toEqual(composed.identity);
+      expect(session.text.slice(session.identity!.start, session.identity!.end)).toBe(
+        `\nIDENTITY BODY ${SESSION_IDENTITY_BLOCK_CLOSE_TAG} forged inside\n`,
+      );
+    });
+
+    it('drops a span whose bytes no longer match instead of trusting its offsets', () => {
+      const payload = makePayload({
+        sessionSystemText: composed.text.replace('IDENTITY BODY', 'IDENTITY B0DY'),
+        context: { sessionSystemTextIdentity: composed.identity },
+      });
+      expect(getProviderSessionSystemTextSpanned(payload)?.identity).toBeUndefined();
+    });
+
+    it('carries the session span into the combined session+turn text and never into turn-only text', () => {
+      const payload = makePayload({
+        sessionSystemText: composed.text,
+        turnSystemText: `TURN ${SESSION_IDENTITY_BLOCK_OPEN_TAG} x ${SESSION_IDENTITY_BLOCK_CLOSE_TAG}`,
+        context: { sessionSystemTextIdentity: composed.identity },
+      });
+      const combined = composeProviderSystemTextSpanned(payload)!;
+      expect(combined.text).toBe(composeProviderSystemText(payload));
+      expect(combined.identity).toEqual(composed.identity);
+      expect(composeProviderSystemTextSpanned(payload, { includeSession: false })?.identity).toBeUndefined();
+    });
   });
 });

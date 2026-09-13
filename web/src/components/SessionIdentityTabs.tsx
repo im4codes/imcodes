@@ -5,6 +5,7 @@ import {
   SESSION_IDENTITY_SCOPES,
   normalizeSessionIdentityContent,
   sessionIdentityContentError,
+  sessionIdentityContentLength,
   sessionIdentityMaxChars,
   type SessionIdentityProfile,
   type SessionIdentityScope,
@@ -164,7 +165,7 @@ export function SessionIdentityTabs({
           {canPersist ? t('session.identityApply') : t('session.identitySaveAfterCreate')}
         </button>
         <span class="session-settings-muted">{t('session.identityCharacterCount', {
-          count: Array.from(draft.content).length, limit: sessionIdentityMaxChars(activeScope),
+          count: sessionIdentityContentLength(draft.content), limit: sessionIdentityMaxChars(activeScope),
         })}</span>
       </div>
       {draft.sourceFile && <div class="session-settings-muted">{t('session.identitySelectedFile', { path: draft.sourceFile })}</div>}

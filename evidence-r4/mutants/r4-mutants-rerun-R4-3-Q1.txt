@@ -1,0 +1,5 @@
+KILLED               R4-3 span bounds check skipped  <- ['rejects a end past the text span even when its hash matches the clamped slice']
+KILLED               Q1 qwen cap call removed (raw argv prompt)  <- ['filled ASCII identity + forged closing tag in later authored context: only the identity body shrinks']
+
+KILLED 2/2
+INTEGRITY OK: all source bytes restored

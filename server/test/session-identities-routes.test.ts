@@ -4,6 +4,11 @@ import { WsBridge } from '../src/ws/bridge.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import { signJwt } from '../src/security/crypto.js';
+import {
+  SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  SESSION_IDENTITY_SESSION_MAX_CHARS,
+  SESSION_IDENTITY_USER_MAX_CHARS,
+} from '../../shared/session-identity.js';
 
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
 
@@ -138,9 +143,42 @@ describe('/api/session-identities', () => {
     expect(badKey.status).toBe(400);
     const oversized = await app.request('/api/session-identities', {
       method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scope: 'user', content: 'x'.repeat(20_001) }),
+      body: JSON.stringify({ scope: 'user', content: 'x'.repeat(SESSION_IDENTITY_USER_MAX_CHARS + 1) }),
     });
     expect(oversized.status).toBe(400);
+  });
+
+  it('stores every scope at exactly its raised limit and rejects one character more', async () => {
+    const cases = [
+      { scope: 'user', scopeKey: undefined, limit: SESSION_IDENTITY_USER_MAX_CHARS },
+      { scope: 'project', scopeKey: 'project-limit', limit: SESSION_IDENTITY_PROJECT_MAX_CHARS },
+      { scope: 'session', scopeKey: 'server-1:deck_limit_brain', limit: SESSION_IDENTITY_SESSION_MAX_CHARS },
+    ] as const;
+    for (const { scope, scopeKey, limit } of cases) {
+      const atLimit = await app.request('/api/session-identities', {
+        method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope, ...(scopeKey ? { scopeKey } : {}), content: 'y'.repeat(limit) }),
+      });
+      expect(atLimit.status, `${scope} at ${limit}`).toBe(200);
+      const overLimit = await app.request('/api/session-identities', {
+        method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope, ...(scopeKey ? { scopeKey } : {}), content: 'y'.repeat(limit + 1) }),
+      });
+      expect(overLimit.status, `${scope} at ${limit + 1}`).toBe(400);
+    }
+  });
+
+  it('accepts a full 200k session identity of 4-byte code points without a hidden request-size ceiling', async () => {
+    const content = '😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS);
+    const body = JSON.stringify({ scope: 'session', scopeKey: 'server-1:deck_emoji_brain', content });
+    expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(800_000);
+    const put = await app.request('/api/session-identities', {
+      method: 'PUT', headers: { Authorization: bearer(), 'Content-Type': 'application/json' },
+      body,
+    });
+    expect(put.status).toBe(200);
+    const result = await put.json() as { profile: { content: string } };
+    expect(Array.from(result.profile.content)).toHaveLength(SESSION_IDENTITY_SESSION_MAX_CHARS);
   });
 
   it('stores a 49,323-character Chinese session identity independent of encoded request bytes', async () => {
