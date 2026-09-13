@@ -99,12 +99,14 @@ const childProcessMock = vi.hoisted(() => {
                   message: 'failed to read thread: thread-store internal error: failed to load thread history: stream did not contain valid UTF-8',
                 },
               });
-            } else if (msg.params?.threadId === 'thread-never-materialized') {
+            } else if (msg.params?.threadId === 'thread-missing-rollout'
+              || msg.params?.threadId === 'thread-fork-missing-rollout'
+              || msg.params?.threadId === 'thread-never-materialized') {
               // Verbatim codex app-server answer for a thread that was started but
               // never ran a turn, so no rollout was ever written.
               childRecord.emits({
                 id: msg.id,
-                error: { message: 'no rollout found for thread id thread-never-materialized' },
+                error: { message: `no rollout found for thread id ${msg.params?.threadId}` },
               });
             } else if (msg.params?.threadId === 'thread-rollout-permission-denied') {
               childRecord.emits({
@@ -220,6 +222,12 @@ const childProcessMock = vi.hoisted(() => {
     releaseHeldTurnStarts() {
       const held = heldTurnStarts.splice(0);
       for (const entry of held) emitTurnStartResult(entry.childRecord, entry.msg);
+    },
+    rejectHeldTurnStarts(message: string) {
+      const held = heldTurnStarts.splice(0);
+      for (const entry of held) {
+        entry.childRecord.emits({ id: entry.msg.id, error: { message } });
+      }
     },
     releaseHeldInitializes() {
       const held = heldInitializes.splice(0);
@@ -575,6 +583,62 @@ describe('CodexSdkProvider', () => {
     }
   });
 
+  it('rejects stdout buffered by the old app-server generation before restart rebinds the same thread', async () => {
+    const provider = createCodexProvider();
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_sid, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-generation-fence', cwd: '/tmp/project', resumeId: 'thread-shared' });
+    await provider.send('route-generation-fence', 'first');
+    const firstChild = childProcessMock.children[0]!;
+    firstChild.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-shared', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+    await waitForCondition(() => provider.getSessionDiagnostics('route-generation-fence')?.runningTurnId === null);
+
+    // Keep the real child.stdout -> readline parser in the path, but gate its
+    // already-parsed callback until after the restart. This models the exact
+    // race: bytes from generation N were accepted before close, while their
+    // queued line callback runs only after generation N+1 owns the provider.
+    const oldReadline = (provider as unknown as {
+      rl: EventEmitter;
+    }).rl;
+    const productionLineListener = oldReadline.listeners('line')[0] as (line: string) => void;
+    oldReadline.off('line', productionLineListener);
+    let releaseBufferedLine!: () => void;
+    const bufferedLineGate = new Promise<void>((resolve) => {
+      releaseBufferedLine = resolve;
+    });
+    let bufferedLineObserved = false;
+    oldReadline.on('line', (line: string) => {
+      bufferedLineObserved = true;
+      void bufferedLineGate.then(() => productionLineListener(line));
+    });
+    firstChild.child.stdout.write(`${JSON.stringify({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-shared',
+        turnId: 'turn-1',
+        item: { id: 'stale-shell', type: 'commandExecution', command: 'echo stale' },
+      },
+    })}\n`);
+    await waitForCondition(() => bufferedLineObserved);
+
+    await (provider as unknown as {
+      restartAppServerPreservingSessions(reason: string): Promise<void>;
+    }).restartAppServerPreservingSessions('generation-fence-test');
+    await provider.send('route-generation-fence', 'second');
+    expect(childProcessMock.children).toHaveLength(2);
+
+    releaseBufferedLine();
+    await flush();
+
+    expect(tools).toEqual([]);
+    await provider.disconnect();
+  });
+
   it('does not replay an auth-failed turn after tool activity has started', async () => {
     const provider = createCodexProvider();
     const errors: Array<{ code: string; recoverable: boolean; message: string }> = [];
@@ -631,6 +695,59 @@ describe('CodexSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('preserves completed tool evidence and waits for an explicit send after an active turn loses its rollout', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_sid, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-active-rollout-loss', cwd: '/tmp/project' });
+    await provider.send('route-active-rollout-loss', 'perform a write once');
+    const child = childProcessMock.children[0]!;
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'write-tool', type: 'commandExecution', command: 'touch once' },
+      },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'write-tool', type: 'commandExecution', command: 'touch once', status: 'completed' },
+      },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: { message: 'no rollout found for thread id thread-1' },
+        },
+      },
+    });
+    await waitForCondition(() => errors.length === 1);
+
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    expect(tools.filter((tool) => tool.id === 'write-tool').map((tool) => tool.status)).toEqual(['running', 'complete']);
+    expect(errors).toMatchObject([{
+      code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND,
+      recoverable: true,
+    }]);
+
+    await provider.send('route-active-rollout-loss', 'continue without replaying the write');
+    expect(child.requests.filter((req) => req.method === 'thread/resume')).toHaveLength(1);
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+    await provider.disconnect();
+  });
+
   it('replays once when turn/start rejects the request before Codex accepts it', async () => {
     const provider = createCodexProvider();
     const errors: ProviderError[] = [];
@@ -665,6 +782,162 @@ describe('CodexSdkProvider', () => {
     expect(turnStarts).toHaveLength(2);
     expect(turnStarts[1]?.params?.input).toEqual(turnStarts[0]?.params?.input);
     expect(errors).toEqual([]);
+    await provider.disconnect();
+  });
+
+  it('rehydrates the exact thread and retries once when turn/start races a missing rollout', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    const sessionInfo: Array<Record<string, unknown>> = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
+    childProcessMock.enqueueTurnStartError(
+      'no rollout found for thread id 01a07f61-d061-70f1-851e-a10cb250413c',
+    );
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-rollout-race', cwd: '/tmp/project' });
+    await provider.send('route-rollout-race', 'deliver once');
+
+    const child = childProcessMock.children[0]!;
+    const threadStarts = child.requests.filter((req) => req.method === 'thread/start');
+    const threadResumes = child.requests.filter((req) => req.method === 'thread/resume');
+    const turnStarts = child.requests.filter((req) => req.method === 'turn/start');
+    expect(threadStarts).toHaveLength(1);
+    expect(threadResumes).toHaveLength(1);
+    expect(threadResumes[0]?.params?.threadId).toBe('thread-1');
+    expect(turnStarts).toHaveLength(2);
+    expect(turnStarts[1]?.params?.input).toEqual(turnStarts[0]?.params?.input);
+    expect(errors).toEqual([]);
+    expect(sessionInfo.filter((info) => info.resumeId === 'thread-1')).toHaveLength(2);
+    await provider.disconnect();
+  });
+
+  it('does not replay a missing-rollout turn/start rejection after provider tool activity', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_sid, tool) => tools.push(tool));
+    childProcessMock.setHoldTurnStart(true);
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-rollout-unsafe-replay', cwd: '/tmp/project' });
+    const sendPromise = provider.send('route-rollout-unsafe-replay', 'write exactly once');
+    const child = childProcessMock.children[0]!;
+    await waitForCondition(() => child.requests.filter((req) => req.method === 'turn/start').length === 1);
+
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-before-rejection',
+        item: { id: 'unsafe-write', type: 'commandExecution', command: 'touch once' },
+      },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'unsafe-write'));
+    childProcessMock.setHoldTurnStart(false);
+    childProcessMock.rejectHeldTurnStarts('no rollout found for thread id thread-1');
+    await sendPromise;
+
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    expect(errors).toMatchObject([{
+      code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND,
+      recoverable: true,
+    }]);
+    await provider.disconnect();
+  });
+
+  it('does not resend a superseded payload when its missing-rollout rejection arrives after session replacement', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    childProcessMock.setHoldTurnStart(true);
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-rollout-superseded', cwd: '/tmp/project' });
+    const staleSend = provider.send('route-rollout-superseded', 'stale payload');
+    const child = childProcessMock.children[0]!;
+    await waitForCondition(() => child.requests.filter((req) => req.method === 'turn/start').length === 1);
+
+    await provider.createSession({
+      sessionKey: 'route-rollout-superseded',
+      cwd: '/tmp/project',
+      resumeId: 'thread-new-authority',
+      fresh: true,
+    });
+    childProcessMock.setHoldTurnStart(false);
+    childProcessMock.rejectHeldTurnStarts('no rollout found for thread id thread-1');
+    await staleSend;
+
+    const turnStarts = child.requests.filter((req) => req.method === 'turn/start');
+    expect(turnStarts).toHaveLength(1);
+    expect(turnStarts[0]?.params?.input).toEqual([{ type: 'text', text: 'stale payload' }]);
+    expect(errors).toMatchObject([{
+      code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND,
+      recoverable: true,
+    }]);
+    await provider.disconnect();
+  });
+
+  it('bounds persistent missing-rollout recovery and reports a retryable session error', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    childProcessMock.enqueueTurnStartError('no rollout found for thread id thread-1');
+    childProcessMock.enqueueTurnStartError('no rollout found for thread id thread-1');
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-rollout-missing', cwd: '/tmp/project' });
+    await provider.send('route-rollout-missing', 'never duplicate me');
+
+    const child = childProcessMock.children[0]!;
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+    expect(errors).toMatchObject([{
+      code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND,
+      recoverable: true,
+      message: 'no rollout found for thread id thread-1',
+    }]);
+    await provider.disconnect();
+  });
+
+  it('keeps auth precedence when an invalid-thread message is also an authentication failure', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    const ambiguousAuthError = '401 Unauthorized: thread/resume rejected invalid authentication credentials';
+    childProcessMock.enqueueTurnStartError(ambiguousAuthError);
+    childProcessMock.enqueueTurnStartError(ambiguousAuthError);
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-error-precedence-auth', cwd: '/tmp/project' });
+    await provider.send('route-error-precedence-auth', 'classify me');
+    await waitForCondition(() => errors.length === 1);
+
+    expect(childProcessMock.children).toHaveLength(2);
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.AUTH_FAILED,
+      recoverable: false,
+    });
+    await provider.disconnect();
+  });
+
+  it('keeps missing-binary precedence when ENOENT text also names an invalid thread', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    childProcessMock.enqueueTurnStartError('spawn codex ENOENT while thread/resume was invalid');
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-error-precedence-enoent', cwd: '/tmp/project' });
+    await provider.send('route-error-precedence-enoent', 'classify me');
+    await waitForCondition(() => errors.length === 1);
+
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND,
+      recoverable: false,
+      message: expect.stringContaining('Codex binary not found'),
+    });
     await provider.disconnect();
   });
 
@@ -4074,6 +4347,85 @@ describe('CodexSdkProvider', () => {
     expect(parseWarning?.[0]).not.toHaveProperty('line');
     expect(JSON.stringify(parseWarning?.[0]).length).toBeLessThan(2_000);
     expect(JSON.stringify(parseWarning?.[0])).not.toContain('x'.repeat(1_000));
+  });
+
+  it('replaces a persisted thread with no rollout before native compaction', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-compact-missing-rollout',
+      cwd: '/tmp/project',
+      resumeId: 'thread-missing-rollout',
+    });
+
+    await provider.send('route-compact-missing-rollout', '/compact');
+
+    const child = childProcessMock.children[0]!;
+    expect(child.requests.filter((req) => req.method === 'thread/resume')).toHaveLength(1);
+    expect(child.requests.filter((req) => req.method === 'thread/start')).toHaveLength(1);
+    expect(child.requests.filter((req) => req.method === 'thread/compact/start')).toHaveLength(1);
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(0);
+    expect(errors).toEqual([]);
+    await provider.disconnect();
+  });
+
+  it('recovers a fork-derived missing rollout across reconnect, compaction, and multiple app-server generations', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-fork-reconnect-multiround',
+      cwd: '/tmp/project',
+      // A fork produced outside this adapter is restored through its durable
+      // resume id. Its absent rollout must converge to one replacement thread.
+      resumeId: 'thread-fork-missing-rollout',
+    });
+
+    await provider.send('route-fork-reconnect-multiround', 'round one');
+    const generationOne = childProcessMock.children[0]!;
+    expect(generationOne.requests.filter((req) => req.method === 'thread/resume')).toHaveLength(1);
+    expect(generationOne.requests.filter((req) => req.method === 'thread/start')).toHaveLength(1);
+    expect(generationOne.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    generationOne.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+    await waitForCondition(() => provider.getSessionDiagnostics('route-fork-reconnect-multiround')?.runningTurnId === null);
+
+    await (provider as unknown as {
+      restartAppServerPreservingSessions(reason: string): Promise<void>;
+    }).restartAppServerPreservingSessions('multi-round-reconnect-one');
+    await provider.send('route-fork-reconnect-multiround', '/compact');
+    const generationTwo = childProcessMock.children[1]!;
+    expect(generationTwo.requests.filter((req) => req.method === 'thread/resume')).toHaveLength(1);
+    expect(generationTwo.requests.filter((req) => req.method === 'thread/compact/start')).toHaveLength(1);
+    generationTwo.emits({
+      method: 'thread/compacted',
+      params: { threadId: 'thread-1', turnId: 'compact-turn-reconnect' },
+    });
+    await waitForCondition(() => provider.getSessionDiagnostics('route-fork-reconnect-multiround')?.runningCompact === false);
+
+    await provider.send('route-fork-reconnect-multiround', 'round two after compact');
+    expect(generationTwo.requests.filter((req) => req.method === 'thread/resume')).toHaveLength(2);
+    expect(generationTwo.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    generationTwo.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+    await waitForCondition(() => provider.getSessionDiagnostics('route-fork-reconnect-multiround')?.runningTurnId === null);
+
+    await (provider as unknown as {
+      restartAppServerPreservingSessions(reason: string): Promise<void>;
+    }).restartAppServerPreservingSessions('multi-round-reconnect-two');
+    await provider.send('route-fork-reconnect-multiround', 'round three after restart');
+    const generationThree = childProcessMock.children[2]!;
+    expect(generationThree.requests.filter((req) => req.method === 'thread/resume')).toHaveLength(1);
+    expect(generationThree.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    expect(errors).toEqual([]);
+    await provider.disconnect();
   });
 
   // ── baseInstructions sourcing ──────────────────────────────────────────

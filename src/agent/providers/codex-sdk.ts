@@ -142,6 +142,7 @@ const CODEX_AUTH_RECOVERY_RETRY_LIMIT = 1;
 const CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT = 1;
 const CODEX_IM_MCP_RECOVERY_BACKOFF_MS = [0, 50, 100, 250, 500, 1_000, 2_000] as const;
 const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
+const CODEX_MISSING_ROLLOUT_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
@@ -775,7 +776,10 @@ class CodexMalformedRpcResponseError extends Error {
  * failure, and replacing that thread would silently abandon real history.
  */
 function isCodexThreadNeverMaterializedError(err: unknown): boolean {
-  return /\bno rollout found for thread id\b/i.test(errorMessage(err));
+  const message = isRecord(err) && typeof err.message === 'string'
+    ? err.message
+    : errorMessage(err);
+  return /\bno rollout found for thread id\b/i.test(message);
 }
 
 function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
@@ -3355,7 +3359,7 @@ export class CodexSdkProvider implements TransportProvider {
     });
     this.child = child;
     this.rl = readline.createInterface({ input: child.stdout });
-    this.rl.on('line', (line) => this.handleLine(line));
+    this.rl.on('line', (line) => this.handleLine(child, line));
     this.rl.on('close', () => {
       if (this.child !== child) return;
       this.handleAppServerDisconnect(child, 'unexpected_eof', new Error('Codex app-server stdout closed'));
@@ -3568,6 +3572,7 @@ export class CodexSdkProvider implements TransportProvider {
     turnDispatchGeneration: number,
     authRecoveryRetriesRemaining: number,
     activeWriterRecoveryRetriesRemaining = CODEX_ACTIVE_WRITER_RECOVERY_LIMIT,
+    missingRolloutRecoveryRetriesRemaining = CODEX_MISSING_ROLLOUT_RECOVERY_LIMIT,
   ): Promise<void> {
     // Unconditionally establish an empty delegation scope for the new turn.
     //
@@ -3668,6 +3673,35 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (
+        missingRolloutRecoveryRetriesRemaining > 0
+        && authReplaySafe
+        && isCodexThreadNeverMaterializedError(error)
+        && this.sessions.get(sessionId) === state
+        && state.turnDispatchGeneration === turnDispatchGeneration
+      ) {
+        // `thread/start` may return before codex-core's rollout is visible to
+        // the app-server. A JSON-RPC rejection proves turn/start was not
+        // accepted, so retrying the same payload is safe. Force one exact
+        // thread/resume first: if the rollout appeared, the durable identity is
+        // retained; if it is genuinely absent, ensureThreadLoaded replaces the
+        // broken thread. Never loop or replay after provider/tool output.
+        state.loaded = false;
+        logger.warn(
+          { provider: this.id, sessionId, threadId: state.threadId },
+          'Codex turn start raced a missing rollout; rehydrating once before retry',
+        );
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          authRecoveryRetriesRemaining,
+          activeWriterRecoveryRetriesRemaining,
+          missingRolloutRecoveryRetriesRemaining - 1,
+        );
+        return;
+      }
+      if (
         activeWriterRecoveryRetriesRemaining > 0
         && authReplaySafe
         && /already has an active writer/i.test(error.message)
@@ -3689,6 +3723,7 @@ export class CodexSdkProvider implements TransportProvider {
           turnDispatchGeneration,
           authRecoveryRetriesRemaining,
           activeWriterRecoveryRetriesRemaining - 1,
+          missingRolloutRecoveryRetriesRemaining,
         );
         return;
       }
@@ -3811,9 +3846,10 @@ export class CodexSdkProvider implements TransportProvider {
       } catch (err) {
         if (!isCodexThreadNeverMaterializedError(err) && !isCodexThreadHistoryUnreadableError(err)) throw err;
 
-        // A never-materialized thread names no rollout file, so the repair below
-        // finds nothing to repair and falls through to the replacement thread.
-        const repaired = await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
+        // A never-materialized thread names no rollout file, so there is no
+        // history to repair; replace it without probing unrelated files.
+        const repaired = !isCodexThreadNeverMaterializedError(err)
+          && await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
           logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
           return false;
         });
@@ -3828,7 +3864,12 @@ export class CodexSdkProvider implements TransportProvider {
         }
 
         const oldThreadId = state.threadId;
-        logger.warn({ provider: this.id, sessionId, threadId: oldThreadId, err }, 'Codex SDK stored thread history is unreadable; starting replacement thread');
+        logger.warn(
+          { provider: this.id, sessionId, threadId: oldThreadId, err },
+          isCodexThreadNeverMaterializedError(err)
+            ? 'Codex SDK stored thread has no rollout; starting replacement thread'
+            : 'Codex SDK stored thread history is unreadable; starting replacement thread',
+        );
         if (oldThreadId) this.threadToSession.delete(oldThreadId);
         state.threadId = undefined;
         state.loaded = false;
@@ -3966,7 +4007,11 @@ export class CodexSdkProvider implements TransportProvider {
     return freshPaths;
   }
 
-  private handleLine(line: string): void {
+  private handleLine(child: ChildProcessWithoutNullStreams, line: string): void {
+    // A prior app-server generation can still have already-buffered stdout
+    // callbacks after restart. Thread ids are deliberately preserved across
+    // restart, so threadToSession alone cannot distinguish those stale events.
+    if (this.child !== child) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     let msg: JsonRpcResponse;
@@ -5133,6 +5178,13 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearActiveItemEvidence(state);
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
+        if (isCodexThreadNeverMaterializedError(error)) {
+          // The turn may already have executed tools, so never replay it here.
+          // Force only the next explicit user/daemon send through bounded
+          // thread rehydration while preserving the terminal tool evidence
+          // already emitted for this unknown-outcome turn.
+          state.loaded = false;
+        }
         if (this.isCodexAuthError(error)) {
           if (
             authRecoveryPayload
@@ -6621,7 +6673,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (isCodexAuthFailureMessage(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.AUTH_FAILED, message, false, details ?? err);
     }
-    if (isCodexThreadHistoryUnreadableError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
+    if (isCodexThreadHistoryUnreadableError(err) || isCodexThreadNeverMaterializedError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
