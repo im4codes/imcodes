@@ -15,6 +15,16 @@ import { createServer, createUser } from '../src/db/queries.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '../../shared/remote-desktop-platform.js';
+import {
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+} from '../../shared/remote-desktop-access.js';
+import {
   HOST_ENDPOINT_ROLE,
   HOST_IDENTITY_ERROR,
   HOST_MERGE_STATE,
@@ -429,6 +439,46 @@ describe('resumable backfill (3.6)', () => {
     // A third pass is a no-op.
     const third = await backfillCanonicalHosts({ db, limit: 10, now: NOW + 2, random, ownerUserId: userId });
     expect(third).toMatchObject({ processed: 0, hostsCreated: 0, publicIdsAssigned: 0, remaining: 0 });
+  });
+});
+
+describe('macOS v3 endpoints', () => {
+  it('backfills a canonical host for a complete macOS profile and skips one still awaiting Screen Recording', async () => {
+    // Host identity used to be keyed on the Windows v2 token, so a Mac with a
+    // full v3 profile never got a host endpoint and every session it was asked
+    // for stopped right after being requested.
+    const userId = await seedUser();
+    const complete = await seedEndpoint({ userId, role: 'controlled', eligible: false });
+    await db.execute('UPDATE servers SET controlled_capabilities = $2::jsonb WHERE id = $1', [complete, JSON.stringify([
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+    ])]);
+    // Screen Recording not granted yet: the capture-less baseline. Not a
+    // session profile, so it must neither get a host nor linger as "remaining".
+    const awaitingGrant = await seedEndpoint({ userId, role: 'controlled', eligible: false });
+    await db.execute('UPDATE servers SET controlled_capabilities = $2::jsonb WHERE id = $1', [awaitingGrant, JSON.stringify([
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ])]);
+
+    let cursor = 0;
+    const random: PublicNodeIdRandom = () => 6_836_295_000 + (cursor++);
+    const pass = await backfillCanonicalHosts({ db, limit: 10, now: NOW, random, ownerUserId: userId });
+    expect(pass).toMatchObject({ processed: 1, hostsCreated: 1, remaining: 0 });
+    expect(await resolveHostIdForServer(db, complete)).not.toBeNull();
+    expect(await resolveHostIdForServer(db, awaitingGrant)).toBeNull();
+
+    const hostId = (await resolveHostIdForServer(db, complete))!;
+    expect(await resolveExecutionEndpoint({ db, hostId })).toMatchObject({
+      serverId: complete,
+      role: HOST_ENDPOINT_ROLE.CONTROLLED,
+    });
   });
 });
 

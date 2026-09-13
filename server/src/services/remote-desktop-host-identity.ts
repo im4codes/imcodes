@@ -19,6 +19,11 @@ import { randomInt, randomUUID } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import { REMOTE_DESKTOP_CAPABILITY, REMOTE_DESKTOP_LIMITS } from '../../../shared/remote-desktop.js';
 import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  resolveRemoteDesktopSessionProfile,
+} from '../../../shared/remote-desktop-platform.js';
+import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
   REMOTE_DESKTOP_PUBLIC_ID,
   isAcceptableRemoteDesktopPublicNodeId,
@@ -125,7 +130,12 @@ interface EndpointRow {
 }
 
 function hasRemoteDesktopCapability(raw: unknown): boolean {
-  return Array.isArray(raw) && raw.includes(REMOTE_DESKTOP_CAPABILITY);
+  // A complete session profile of any platform. Checking for the Windows v2
+  // token meant a macOS node advertising a full v3 profile never got a
+  // canonical host: no host endpoint, so every session it was asked for stopped
+  // right after being requested.
+  return Array.isArray(raw)
+    && resolveRemoteDesktopSessionProfile(raw.filter((item): item is string => typeof item === 'string')) !== null;
 }
 
 /**
@@ -590,19 +600,32 @@ export async function backfillCanonicalHosts(input: {
   ownerUserId?: string;
 }): Promise<{ processed: number; hostsCreated: number; publicIdsAssigned: number; conflicts: number; remaining: number }> {
   const { db, limit, now, ownerUserId } = input;
-  const capability = JSON.stringify([REMOTE_DESKTOP_CAPABILITY]);
+  // Either marker a session profile can be built on: the Windows v2 token or
+  // the cross-platform v3 session capability. The full profile is checked per
+  // row below before anything is created.
+  // A v3 marker alone is not enough to pre-select: a Mac still waiting for its
+  // Screen Recording grant advertises the session marker without any capture
+  // capability, and would otherwise be re-selected, rejected and counted on
+  // every pass, crowding eligible machines out of a bounded batch.
+  const capability = JSON.stringify({
+    legacy: REMOTE_DESKTOP_CAPABILITY,
+    session: REMOTE_DESKTOP_SESSION_CAPABILITY,
+    captures: Object.values(REMOTE_DESKTOP_CAPTURE_CAPABILITY),
+  });
 
   const pendingFilter = `
-      WHERE s.controlled_capabilities @> $1::jsonb
+      WHERE (s.controlled_capabilities ? ($1::jsonb->>'legacy')
+          OR (s.controlled_capabilities ? ($1::jsonb->>'session')
+            AND s.controlled_capabilities ?| ARRAY(SELECT jsonb_array_elements_text($1::jsonb->'captures'))))
         AND ($2::text IS NULL OR s.user_id = $2)
         AND NOT EXISTS (
           SELECT 1 FROM remote_desktop_host_endpoints e WHERE e.server_id = s.id
         )`;
 
-  const pending = await db.query<{ id: string }>(
-    `SELECT s.id FROM servers s ${pendingFilter} ORDER BY s.id LIMIT $3`,
+  const pending = (await db.query<{ id: string; controlled_capabilities: unknown }>(
+    `SELECT s.id, s.controlled_capabilities FROM servers s ${pendingFilter} ORDER BY s.id LIMIT $3`,
     [capability, ownerUserId ?? null, limit],
-  );
+  )).filter((row) => isEligibleEndpoint(row));
 
   let hostsCreated = 0;
   let publicIdsAssigned = 0;
