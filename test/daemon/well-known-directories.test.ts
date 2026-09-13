@@ -5,6 +5,7 @@ import {
   parseWindowsRegistryValue,
   parseWindowsRegistrySubkeys,
   parseXdgUserDirs,
+  isMacosServiceProfile,
   isWindowsServiceProfile,
   resolveWellKnownDirectory,
   wellKnownDirectoryCandidates,
@@ -375,12 +376,74 @@ describe('macOS', () => {
       platform: 'darwin',
       homedir: () => '/Users/k',
       env: {},
+      resolveMacosConsoleUser: async () => ({ home: '/Users/k' }),
       readFile: async () => { consulted = true; return ''; },
       directoryExists: exists('/Users/k/Documents'),
     });
     // Finder localizes the DISPLAY name only; the directory really is English.
     expect(resolved).toBe('/Users/k/Documents');
     expect(consulted, 'macOS has no user-dirs.dirs to read').toBe(false);
+  });
+
+  it('recognizes the root profiles used by a LaunchDaemon', () => {
+    expect(isMacosServiceProfile('/var/root')).toBe(true);
+    expect(isMacosServiceProfile('/private/var/root/')).toBe(true);
+    expect(isMacosServiceProfile('/Users/root')).toBe(false);
+    expect(isMacosServiceProfile('/Users/k')).toBe(false);
+  });
+
+  it.each([
+    [WELL_KNOWN_DIRECTORY.HOME, '/Users/k'],
+    [WELL_KNOWN_DIRECTORY.DESKTOP, '/Users/k/Desktop'],
+    [WELL_KNOWN_DIRECTORY.DOWNLOADS, '/Users/k/Downloads'],
+    [WELL_KNOWN_DIRECTORY.DOCUMENTS, '/Users/k/Documents'],
+  ] as const)('resolves %s for the active Aqua user, never root', async (kind, expected) => {
+    const resolved = await resolveWellKnownDirectory(kind, {
+      platform: 'darwin',
+      homedir: () => '/var/root',
+      env: { HOME: '/var/root' },
+      resolveMacosConsoleUser: async () => ({ home: '/Users/k' }),
+      directoryExists: exists(
+        '/Users/k/Desktop',
+        '/Users/k/Downloads',
+        '/Users/k/Documents',
+      ),
+    });
+    expect(resolved).toBe(expected);
+    expect(resolved).not.toContain('/var/root');
+  });
+
+  it('fails closed instead of falling back to root when no Aqua user exists', async () => {
+    await expect(resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DOWNLOADS, {
+      platform: 'darwin',
+      homedir: () => '/var/root',
+      resolveMacosConsoleUser: async () => { throw new Error('no_aqua_user'); },
+    })).rejects.toThrow('no_aqua_user');
+  });
+
+  it('keeps an ordinary user usable if console discovery is temporarily unavailable', async () => {
+    const resolved = await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DESKTOP, {
+      platform: 'darwin',
+      homedir: () => '/Users/k',
+      resolveMacosConsoleUser: async () => { throw new Error('stat unavailable'); },
+      directoryExists: exists('/Users/k/Desktop'),
+    });
+    expect(resolved).toBe('/Users/k/Desktop');
+  });
+
+  it('does not serve the previous Aqua user after a fast user switch', async () => {
+    let activeHome = '/Users/alice';
+    const deps = {
+      platform: 'darwin' as const,
+      homedir: () => '/var/root',
+      resolveMacosConsoleUser: async () => ({ home: activeHome }),
+      directoryExists: async () => true,
+    };
+    expect(await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DOWNLOADS, deps))
+      .toBe('/Users/alice/Downloads');
+    activeHome = '/Users/bob';
+    expect(await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY.DOWNLOADS, deps))
+      .toBe('/Users/bob/Downloads');
   });
 });
 

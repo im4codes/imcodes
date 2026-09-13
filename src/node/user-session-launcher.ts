@@ -22,6 +22,8 @@ export interface MacosUserSession {
   tempDir: string;
 }
 
+export type MacosConsoleUser = Omit<MacosUserSession, 'tempDir'>;
+
 export type MacosRemoteDesktopGraphicalSessionAuthority =
   | {
     readonly kind: 'aqua_user';
@@ -121,6 +123,13 @@ function isAbsoluteBoundedPath(value: string): boolean {
 }
 
 export function assertMacosUserSession(user: MacosUserSession): void {
+  assertMacosConsoleUser(user);
+  if (!isAbsoluteBoundedPath(user.tempDir)) {
+    throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER_TEMP);
+  }
+}
+
+function assertMacosConsoleUser(user: MacosConsoleUser): void {
   if (!isEligibleMacosUserName(user.name)
     || !Number.isInteger(user.uid)
     || user.uid <= 0
@@ -133,21 +142,12 @@ export function assertMacosUserSession(user: MacosUserSession): void {
   if (!isAbsoluteBoundedPath(user.home)) {
     throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER_HOME);
   }
-  if (!isAbsoluteBoundedPath(user.tempDir)) {
-    throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER_TEMP);
-  }
 }
 
-/**
- * Resolve the one active macOS GUI console user.
- *
- * The error strings intentionally preserve the existing Computer Use contract
- * while this launcher becomes the common seam for Computer Use and remote
- * desktop. The launcher owns no request, route, socket or authority state.
- */
-export async function resolveMacosUserSession(
+/** Resolve the active Aqua account without reading any process-specific state. */
+export async function resolveMacosConsoleUser(
   options: MacosUserSessionDiscoveryOptions = {},
-): Promise<MacosUserSession> {
+): Promise<MacosConsoleUser> {
   const execText = options.execFileText ?? defaultExecFileText;
   const name = await execText('/usr/bin/stat', ['-f', '%Su', '/dev/console']);
   if (!isEligibleMacosUserName(name)) {
@@ -166,14 +166,28 @@ export async function resolveMacosUserSession(
     `/Users/${name}`,
     'NFSHomeDirectory',
   ]).then((line) => line.replace(/^NFSHomeDirectory:\s*/, '').trim());
-  if (!isAbsoluteBoundedPath(home)) {
-    throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER_HOME);
-  }
+  const user = { name, uid, gid, home };
+  assertMacosConsoleUser(user);
+  return user;
+}
+
+/**
+ * Resolve the one active macOS GUI console user.
+ *
+ * The error strings intentionally preserve the existing Computer Use contract
+ * while this launcher becomes the common seam for Computer Use and remote
+ * desktop. The launcher owns no request, route, socket or authority state.
+ */
+export async function resolveMacosUserSession(
+  options: MacosUserSessionDiscoveryOptions = {},
+): Promise<MacosUserSession> {
+  const execText = options.execFileText ?? defaultExecFileText;
+  const user = await resolveMacosConsoleUser({ execFileText: execText });
 
   const tempDir = await execText('/usr/bin/sudo', [
     '-n',
     '-u',
-    name,
+    user.name,
     '/usr/bin/getconf',
     'DARWIN_USER_TEMP_DIR',
   ]);
@@ -181,7 +195,7 @@ export async function resolveMacosUserSession(
     throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER_TEMP);
   }
 
-  return { name, uid, gid, home, tempDir };
+  return { ...user, tempDir };
 }
 
 /**

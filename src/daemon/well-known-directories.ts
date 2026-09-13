@@ -15,9 +15,9 @@
  * - macOS is the easy one: the on-disk names are always English and only the
  *   Finder display is localized, so the join is correct.
  *
- * Every lookup still falls back to the English join, and finally to the home
- * directory, so a machine without a registry hive or an XDG config is degraded
- * rather than broken.
+ * Every lookup still falls back to the English join, and finally to the target
+ * user's home directory. The one deliberate exception is a macOS root daemon
+ * with no verifiable Aqua user: it fails closed rather than exposing /var/root.
  *
  * SECURITY: this module only turns a NAME into a path. It performs no access
  * check and grants no reach. Callers must keep feeding the result through the
@@ -29,6 +29,7 @@ import { readFile as fsReadFile, stat as fsStat } from 'node:fs/promises';
 import { homedir as osHomedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { resolveMacosConsoleUser } from '../node/user-session-launcher.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -113,6 +114,8 @@ export interface WellKnownDirectoryDeps {
   homedir?: () => string;
   env?: NodeJS.ProcessEnv;
   readFile?: (filePath: string) => Promise<string>;
+  /** Active Aqua account. The daemon itself commonly runs as root. */
+  resolveMacosConsoleUser?: () => Promise<{ home: string }>;
   /** Resolves one `Shell Folders` value under `hiveRoot`, or null if absent. */
   readWindowsShellFolder?: (valueName: string, hiveRoot: string) => Promise<string | null>;
   /** Leaf subkey names under a registry key. */
@@ -311,14 +314,19 @@ interface TargetUser {
   env: NodeJS.ProcessEnv;
 }
 
+/** macOS LaunchDaemons run with this home rather than the Aqua user's home. */
+export function isMacosServiceProfile(home: string): boolean {
+  return /^\/(?:private\/)?var\/root\/?$/.test(home);
+}
+
 /**
  * Resolve the account whose Desktop/Downloads/Documents the caller means.
  *
  * Normally that is this process. But the controlled node installs itself as a
- * scheduled task running as LocalSystem, and a LaunchDaemon/systemd unit runs
- * as root -- none of which is the person at the keyboard. On Windows we can
- * recover the real account; elsewhere we currently cannot, and say so rather
- * than pretending.
+ * scheduled task running as LocalSystem, and its macOS LaunchDaemon runs as
+ * root -- neither is the person at the keyboard. Resolve the authoritative
+ * active account on both platforms instead of deriving shortcuts from the
+ * service profile.
  */
 async function resolveTargetUser(
   platform: NodeJS.Platform,
@@ -327,6 +335,18 @@ async function resolveTargetUser(
   deps: WellKnownDirectoryDeps,
 ): Promise<TargetUser> {
   const own: TargetUser = { home: ownHome, windowsHive: 'HKCU', env };
+  if (platform === 'darwin') {
+    try {
+      const interactive = await (deps.resolveMacosConsoleUser ?? resolveMacosConsoleUser)();
+      return { ...own, home: interactive.home };
+    } catch (error) {
+      // An interactive process may still use its own account when console-user
+      // discovery is unavailable. A root daemon must not silently expose
+      // /var/root behind a button labelled Desktop or Downloads.
+      if (isMacosServiceProfile(ownHome)) throw error;
+      return own;
+    }
+  }
   if (platform !== 'win32' || !isWindowsServiceProfile(ownHome)) return own;
 
   const interactive = await resolveWindowsInteractiveUser(deps);
@@ -340,14 +360,12 @@ async function resolveTargetUser(
   };
 }
 
-export async function wellKnownDirectoryCandidates(
+async function wellKnownDirectoryCandidatesForTarget(
   kind: WellKnownDirectoryKind,
-  deps: WellKnownDirectoryDeps = {},
+  platform: NodeJS.Platform,
+  target: TargetUser,
+  deps: WellKnownDirectoryDeps,
 ): Promise<string[]> {
-  const platform = deps.platform ?? process.platform;
-  const ownHome = deps.homedir?.() ?? osHomedir();
-  const env = deps.env ?? process.env;
-  const target = await resolveTargetUser(platform, ownHome, env, deps);
   if (kind === WELL_KNOWN_DIRECTORY.HOME) return [target.home];
 
   const readFile = deps.readFile ?? ((filePath: string) => fsReadFile(filePath, 'utf8'));
@@ -363,11 +381,20 @@ export async function wellKnownDirectoryCandidates(
     if (configured) candidates.push(configured);
   }
 
-  // macOS always lands here, and it is the correct answer there: the on-disk
-  // names are English and only the Finder display is localized.
   candidates.push(platformPath.join(target.home, ENGLISH_DIRECTORY_NAMES[kind]));
   candidates.push(target.home);
   return candidates.filter((candidate, index) => candidates.indexOf(candidate) === index);
+}
+
+export async function wellKnownDirectoryCandidates(
+  kind: WellKnownDirectoryKind,
+  deps: WellKnownDirectoryDeps = {},
+): Promise<string[]> {
+  const platform = deps.platform ?? process.platform;
+  const ownHome = deps.homedir?.() ?? osHomedir();
+  const env = deps.env ?? process.env;
+  const target = await resolveTargetUser(platform, ownHome, env, deps);
+  return wellKnownDirectoryCandidatesForTarget(kind, platform, target, deps);
 }
 
 const resolutionCache = new Map<string, Promise<string>>();
@@ -380,28 +407,29 @@ export function clearWellKnownDirectoryCache(): void {
 /**
  * The first candidate that exists, or the home directory.
  *
- * Never rejects and never returns a path that does not exist: a shortcut
- * button that reports "not found" teaches the user nothing, whereas landing in
- * the home directory is recoverable and the resolved path is echoed back in
- * `resolvedPath` so the breadcrumb shows where they actually are.
+ * Never returns a path that does not exist: a shortcut button that reports
+ * "not found" teaches the user nothing, whereas landing in the target home is
+ * recoverable and the resolved path is echoed back in `resolvedPath`. A macOS
+ * root daemon with no active Aqua user rejects instead of exposing root's home.
  */
 export async function resolveWellKnownDirectory(
   kind: WellKnownDirectoryKind,
   deps: WellKnownDirectoryDeps = {},
 ): Promise<string> {
   const ownHome = deps.homedir?.() ?? osHomedir();
+  const platform = deps.platform ?? process.platform;
+  const env = deps.env ?? process.env;
+  const target = await resolveTargetUser(platform, ownHome, env, deps);
 
-  // Cache per (kind, own home) so a test that swaps homedir is not served
-  // another test's answer, and a real user switching accounts cannot be
-  // either. Keyed on OUR home rather than the target's, because the target is
-  // what the lookup produces.
-  const cacheKey = `${deps.platform ?? process.platform}:${ownHome}:${kind}`;
+  // A service's own home is stable while its interactive account can switch,
+  // so the resolved target home must be part of the identity.
+  const cacheKey = `${platform}:${ownHome}:${target.home}:${kind}`;
   const cached = resolutionCache.get(cacheKey);
   if (cached) return cached;
 
   const directoryExists = deps.directoryExists ?? defaultDirectoryExists;
   const pending = (async () => {
-    const candidates = await wellKnownDirectoryCandidates(kind, deps);
+    const candidates = await wellKnownDirectoryCandidatesForTarget(kind, platform, target, deps);
     // HOME yields exactly one candidate and must not be existence-filtered
     // down to our own profile; an unreachable home is still the right answer.
     if (kind === WELL_KNOWN_DIRECTORY.HOME) return candidates[0] ?? ownHome;
@@ -411,7 +439,7 @@ export async function resolveWellKnownDirectory(
     // Last resort is the TARGET's home, not ours -- falling back to the
     // service profile is the bug this whole path exists to avoid.
     return candidates.at(-1) ?? ownHome;
-  })().catch(() => ownHome);
+  })().catch(() => target.home);
 
   resolutionCache.set(cacheKey, pending);
   return pending;

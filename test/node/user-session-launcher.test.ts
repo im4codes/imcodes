@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   MACOS_USER_SESSION_ERROR,
+  resolveMacosConsoleUser,
   resolveMacosRemoteDesktopGraphicalSessionAuthority,
   resolveMacosUserSession,
   type MacosUserSession,
@@ -15,6 +16,34 @@ const AQUA_USER: MacosUserSession = {
 };
 
 describe('macOS graphical-session authority', () => {
+  it('resolves the console account home without requiring its temp directory', async () => {
+    const calls: Array<[string, readonly string[]]> = [];
+    const user = await resolveMacosConsoleUser({
+      execFileText: async (file, args) => {
+        calls.push([file, args]);
+        if (file === '/usr/bin/stat') return 'desktop-user';
+        if (file === '/usr/bin/id' && args[0] === '-u') return '501';
+        if (file === '/usr/bin/id' && args[0] === '-g') return '20';
+        if (file === '/usr/bin/dscl') return 'NFSHomeDirectory: /Users/desktop-user';
+        throw new Error(`unexpected command: ${file}`);
+      },
+    });
+
+    expect(user).toEqual({
+      name: 'desktop-user',
+      uid: 501,
+      gid: 20,
+      home: '/Users/desktop-user',
+    });
+    expect(calls.map(([file]) => file)).toEqual([
+      '/usr/bin/stat',
+      '/usr/bin/id',
+      '/usr/bin/id',
+      '/usr/bin/dscl',
+    ]);
+    expect(calls.some(([file]) => file === '/usr/bin/sudo')).toBe(false);
+  });
+
   it('creates explicit LoginWindow bootstrap authority without resolving an Aqua user', async () => {
     const resolveAquaUser = vi.fn(async () => AQUA_USER);
     const authority = await resolveMacosRemoteDesktopGraphicalSessionAuthority(
