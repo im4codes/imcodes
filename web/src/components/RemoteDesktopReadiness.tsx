@@ -33,6 +33,49 @@ export function RemoteDesktopReadiness({
     ? REMOTE_DESKTOP_WEB_READINESS.VIEW_ONLY
     : readiness.kind;
 
+  // Everything granted: nothing for the operator to do, so it folds to one
+  // line instead of a panel of green badges. The detail stays one click away.
+  const fullyReady = !unsupportedProfile
+    && readiness.screenRecordingReady === true
+    && accessibilityReady;
+  if (fullyReady) {
+    return (
+      <details
+        class={`remote-desktop-readiness is-collapsed${compact ? ' is-compact' : ''}`}
+        data-readiness={displayedKind}
+        aria-label={t('remote_desktop.macos_readiness_title')}
+      >
+        <summary>
+          <strong>{t('remote_desktop.macos_readiness_title')}</strong>
+          <i class="is-ready">{t('remote_desktop.macos_control_ready')}</i>
+        </summary>
+        {renderUnsupportedActions()}
+      </details>
+    );
+  }
+
+  function renderUnsupportedActions() {
+    if (!(readiness.unsupportedActions.lockScreen
+      || readiness.unsupportedActions.capturePrivacy
+      || readiness.unsupportedActions.displayControl)) return null;
+    return (
+      <div class="remote-desktop-readiness-unsupported">
+        <span>{t('remote_desktop.macos_unsupported_actions')}</span>
+        <ul>
+          {readiness.unsupportedActions.lockScreen && (
+            <li>{t('remote_desktop.macos_unsupported_lock_screen')}</li>
+          )}
+          {readiness.unsupportedActions.capturePrivacy && (
+            <li>{t('remote_desktop.macos_unsupported_capture_privacy')}</li>
+          )}
+          {readiness.unsupportedActions.displayControl && (
+            <li>{t('remote_desktop.macos_unsupported_display_control')}</li>
+          )}
+        </ul>
+      </div>
+    );
+  }
+
   return (
     <section
       class={`remote-desktop-readiness${compact ? ' is-compact' : ''}`}
@@ -76,24 +119,7 @@ export function RemoteDesktopReadiness({
           {accessibilityReady && (
             <p>{t('remote_desktop.macos_control_ready')}</p>
           )}
-          {(readiness.unsupportedActions.lockScreen
-            || readiness.unsupportedActions.capturePrivacy
-            || readiness.unsupportedActions.displayControl) && (
-            <div class="remote-desktop-readiness-unsupported">
-              <span>{t('remote_desktop.macos_unsupported_actions')}</span>
-              <ul>
-                {readiness.unsupportedActions.lockScreen && (
-                  <li>{t('remote_desktop.macos_unsupported_lock_screen')}</li>
-                )}
-                {readiness.unsupportedActions.capturePrivacy && (
-                  <li>{t('remote_desktop.macos_unsupported_capture_privacy')}</li>
-                )}
-                {readiness.unsupportedActions.displayControl && (
-                  <li>{t('remote_desktop.macos_unsupported_display_control')}</li>
-                )}
-              </ul>
-            </div>
-          )}
+          {renderUnsupportedActions()}
         </>
       )}
     </section>

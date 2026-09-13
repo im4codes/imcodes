@@ -10299,6 +10299,45 @@ button.quick-agent-delegation-preset.active {
   flex: 1 1 100%;
 }
 
+/* Everything granted: one line, details on demand. */
+.remote-desktop-readiness.is-collapsed {
+  padding: 5px 10px;
+  gap: 4px;
+}
+
+.remote-desktop-readiness.is-collapsed > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.remote-desktop-readiness.is-collapsed > summary::-webkit-details-marker {
+  display: none;
+}
+
+.remote-desktop-readiness.is-collapsed > summary::after {
+  content: '▸';
+  margin-left: auto;
+  color: #6f93ad;
+  transition: transform 0.15s ease;
+}
+
+.remote-desktop-readiness.is-collapsed[open] > summary::after {
+  transform: rotate(90deg);
+}
+
+.remote-desktop-readiness.is-collapsed > summary > strong {
+  color: #e8fbff;
+  font-size: 11.5px;
+}
+
+.remote-desktop-readiness.is-collapsed > summary > i {
+  font-style: normal;
+  color: #5eead4;
+}
+
 .remote-desktop-readiness > strong {
   color: #e8fbff;
   font-size: 11.5px;

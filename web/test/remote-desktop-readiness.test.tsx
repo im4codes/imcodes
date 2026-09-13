@@ -74,8 +74,10 @@ describe('RemoteDesktopReadiness', () => {
     ];
     const result = render(<RemoteDesktopReadiness capabilities={control} />);
     expect(result.container.querySelector('[data-readiness="ready"]')).not.toBeNull();
-    expect(result.container.querySelector('[data-permission="accessibility"]')?.textContent)
-      .toContain('remote_desktop.macos_permission_ready');
+    // Fully granted folds to one line: nothing for the operator to do, so no
+    // per-permission badges taking up the machine row.
+    expect(result.container.querySelector('details.is-collapsed')).not.toBeNull();
+    expect(result.container.querySelector('[data-permission]')).toBeNull();
     expect(result.container.textContent).toContain('remote_desktop.macos_control_ready');
 
     result.rerender(<RemoteDesktopReadiness capabilities={MAC_VIEW} />);
