@@ -723,7 +723,10 @@ export class DelegationReplyStore {
     if (!authority.assignmentId.trim() || !authority.messageId.trim()
       || authority.origins.length === 0) return { status: 'none' };
     const originNames = new Set(authority.origins.map((origin) => origin.sessionName));
-    const messageIds = new Set([authority.messageId, ...authority.supersededMessageIds]);
+    const authoritativeMessageIds = new Set([
+      authority.messageId,
+      ...authority.supersededMessageIds,
+    ]);
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       const rows = queryRows();
@@ -737,12 +740,26 @@ export class DelegationReplyStore {
           record.assignmentId !== authority.assignmentId
           || record.auditedSessionName !== auditedSessionName
           || !originNames.has(record.origin.sessionName)
-          || record.target.sessionName !== authority.target.sessionName
-          || !messageIds.has(record.messageId)
+          // A stale target runtime is metadata only when the registry already
+          // names its message id as this exact assignment's superseded
+          // delivery. An unknown row from another same-name runtime remains a
+          // competing verdict principal and must fail closed.
+          || (!identityMatches(record.target, authority.target)
+            && (record.target.sessionName !== authority.target.sessionName
+              || !authoritativeMessageIds.has(record.messageId)))
         ))) {
         this.#db.exec('ROLLBACK');
         return { status: 'ambiguous' };
       }
+      // message_id is delivery metadata, not a second owner. A manual
+      // audit-metadata continuation and an automatic redelivery can both leave
+      // pending rows for the SAME registry assignment/attempt/revision. Once
+      // the exact registry object, audited session, authorized origin name and
+      // target name all agree above, an unexpected message id is redundant
+      // metadata and is retired below together with the other superseded rows.
+      // The canonical row is still selected by the current deterministic id
+      // and exact runtime identities, so an unbound/non-canonical row can never
+      // become authority by itself.
       let current = records.filter((record) => (
         record.messageId === authority.messageId
         && identityMatches(record.target, authority.target)

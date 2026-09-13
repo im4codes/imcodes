@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
     deliverDelegationNotification: ReturnType<typeof vi.fn>;
   },
   store: {
+    create: vi.fn(),
     matchPendingAuditAuthority: vi.fn(),
     rebindAssignmentTarget: vi.fn(),
     receive: vi.fn(),
@@ -36,6 +37,9 @@ const mocks = vi.hoisted(() => ({
   appendMatchingAuditReceipt: vi.fn(),
   finishAssignment: vi.fn(),
   getAssignment: vi.fn(),
+  getTaskRecord: vi.fn(),
+  listAssignments: vi.fn(() => []),
+  listAuditReceipts: vi.fn(() => []),
   queueSnapshot: vi.fn(() => ({ pendingMessageEntries: [] })),
   hasDeliveryTombstone: vi.fn(() => false),
 }));
@@ -70,6 +74,9 @@ vi.mock('../../src/daemon/supervision-state-store.js', () => ({
     appendMatchingAuditReceipt: mocks.appendMatchingAuditReceipt,
     finishAssignment: mocks.finishAssignment,
     getAssignment: mocks.getAssignment,
+    getTaskRecord: mocks.getTaskRecord,
+    listAssignments: mocks.listAssignments,
+    listAuditReceipts: mocks.listAuditReceipts,
   }),
 }));
 
@@ -139,6 +146,7 @@ describe('delegation reply ingress', () => {
     };
     mocks.restoredRuntime = undefined;
     mocks.store.receive.mockReset().mockReturnValue({ ok: true, record, replay: false });
+    mocks.store.create.mockReset();
     mocks.store.matchPendingAuditAuthority.mockReset();
     mocks.store.rebindAssignmentTarget.mockReset();
     mocks.store.listPendingByCoordinator = vi.fn(() => []);
@@ -156,6 +164,9 @@ describe('delegation reply ingress', () => {
     mocks.appendMatchingAuditReceipt.mockReset().mockReturnValue({ ok: true, value: {} });
     mocks.finishAssignment.mockReset().mockReturnValue({ ok: true, value: {}, replay: false });
     mocks.getAssignment.mockReset();
+    mocks.getTaskRecord.mockReset();
+    mocks.listAssignments.mockReset().mockReturnValue([]);
+    mocks.listAuditReceipts.mockReset().mockReturnValue([]);
     mocks.queueSnapshot.mockReset().mockReturnValue({ pendingMessageEntries: [] });
     mocks.hasDeliveryTombstone.mockReset().mockReturnValue(false);
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
@@ -317,6 +328,165 @@ describe('delegation reply ingress', () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it('restores a lost reply controller from one exact durable audit authority after restart', async () => {
+    const taskId = 'tsk_hqx_restart_controller';
+    const assignmentId = 'asg_nz8';
+    const attemptId = 'auto-audit-r11';
+    const revision = 'automatic-brain-notification-continuation-r11';
+    const coordinator = {
+      assignmentId: 'asg_hqy', taskId, role: 'coordinator', status: 'implementing',
+      generation: 3, auditRevision: revision,
+      identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+    };
+    const implementer = {
+      assignmentId: 'asg_hr2', taskId, role: 'implementer', required: true,
+      // Production ready_for_audit implementers bind the revision and bundle,
+      // while the auditor alone owns the attempt controller.
+      status: 'ready_for_audit', generation: 7, auditRevision: revision,
+      identity: {
+        sessionName: 'deck_hqx_impl', sessionInstanceId: 'impl-instance', runtimeEpoch: 'impl-epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+      },
+    };
+    const auditor = {
+      assignmentId, taskId, role: 'auditor', status: 'auditing', generation: 4,
+      auditAttemptId: attemptId, auditRevision: revision,
+      identity: { ...target, agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+    };
+    const restoredRecord = {
+      ...record,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      taskId, assignmentId, auditAttemptId: attemptId, auditRevision: revision,
+      auditedSessionName: implementer.identity.sessionName,
+      coordinatorAssignmentId: coordinator.assignmentId,
+      origin: coordinator.identity,
+      target: auditor.identity,
+      status: 'pending' as const,
+    };
+    mocks.getAssignment.mockReturnValue(auditor);
+    mocks.getTaskRecord.mockReturnValue({
+      taskId,
+      currentRevision: revision,
+      integrationBundle: { taskId, sourceAssignmentId: implementer.assignmentId, revision },
+    });
+    mocks.listAssignments.mockReturnValue([coordinator, implementer, auditor]);
+    mocks.listAuditReceipts.mockReturnValue([]);
+    let restored: typeof restoredRecord | undefined;
+    mocks.store.matchPendingAuditAuthority.mockImplementation(() => restored);
+    mocks.store.create.mockImplementation(() => {
+      restored = restoredRecord;
+      return { record: restoredRecord };
+    });
+    mocks.store.receive.mockImplementation((input: { result: string }) => ({
+      ok: true, record: { ...restoredRecord, result: input.result }, replay: false,
+    }));
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId, assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', findings: 'restart-safe exact receipt',
+        validations: [{ kind: 'test', label: 'restart', outcome: 'passed', summary: 'exact authority' }],
+      }),
+      senderSessionName: target.sessionName,
+      now: 500,
+    })).resolves.toEqual({ ok: true });
+
+    expect(mocks.store.create).toHaveBeenCalledWith(expect.objectContaining({
+      origin: coordinator.identity,
+      target: auditor.identity,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      taskId, assignmentId, auditAttemptId: attemptId, auditRevision: revision,
+      auditedSessionName: implementer.identity.sessionName,
+      coordinatorAssignmentId: coordinator.assignmentId,
+      now: 500,
+    }));
+    expect(mocks.store.matchPendingAuditAuthority).toHaveBeenCalledTimes(2);
+    expect(mocks.appendMatchingAuditReceipt).toHaveBeenCalledOnce();
+    expect(mocks.finishAssignment).toHaveBeenCalledOnce();
+  });
+
+  it('does not restore a controller through a foreign integration-bundle source', async () => {
+    const taskId = 'tsk_restart_foreign_bundle';
+    const assignmentId = 'asg_restart_foreign_bundle_auditor';
+    const attemptId = 'auto-audit-restart-foreign-bundle';
+    const revision = 'restart-foreign-bundle-r1';
+    const coordinator = {
+      assignmentId: 'asg_restart_foreign_bundle_brain', taskId, role: 'coordinator',
+      status: 'implementing', generation: 1, auditRevision: revision,
+      identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+    };
+    const implementer = {
+      assignmentId: 'asg_restart_foreign_bundle_worker', taskId, role: 'implementer', required: true,
+      status: 'ready_for_audit', generation: 2, auditRevision: revision,
+      identity: {
+        sessionName: 'deck_restart_foreign_worker',
+        sessionInstanceId: 'restart-foreign-worker-instance',
+        runtimeEpoch: 'restart-foreign-worker-epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai',
+      },
+    };
+    const auditor = {
+      assignmentId, taskId, role: 'auditor', status: 'auditing', generation: 1,
+      auditAttemptId: attemptId, auditRevision: revision,
+      identity: { ...target, agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+    };
+    mocks.getAssignment.mockReturnValue(auditor);
+    mocks.getTaskRecord.mockReturnValue({
+      taskId,
+      currentRevision: revision,
+      integrationBundle: {
+        taskId, sourceAssignmentId: 'asg_foreign_task_worker', revision,
+      },
+    });
+    mocks.listAssignments.mockReturnValue([coordinator, implementer, auditor]);
+    mocks.listAuditReceipts.mockReturnValue([]);
+    mocks.store.matchPendingAuditAuthority.mockReturnValue(undefined);
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId, assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'PASS', findings: 'must remain bound to the frozen source',
+        validations: [{ kind: 'test', label: 'foreign source', outcome: 'passed', summary: 'exact' }],
+      }),
+      senderSessionName: target.sessionName,
+      now: 510,
+    })).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
+
+    expect(mocks.store.create).not.toHaveBeenCalled();
+    expect(mocks.appendMatchingAuditReceipt).not.toHaveBeenCalled();
+  });
+
+  it('reports an exact closed receipt instead of attempt_mismatch when its controller is gone', async () => {
+    const taskId = 'tsk_closed_controller';
+    const assignmentId = 'asg_closed_controller';
+    const attemptId = 'auto-audit-closed-controller';
+    const revision = 'closed-controller-r1';
+    mocks.getAssignment.mockReturnValue({
+      assignmentId, taskId, role: 'auditor', status: 'finalized',
+      auditAttemptId: attemptId, auditRevision: revision,
+      identity: { ...target, agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+    });
+    mocks.listAuditReceipts.mockReturnValue([{
+      assignmentId, attemptId, revision, receiptKind: 'final', verdict: 'REWORK',
+    }]);
+    mocks.store.matchPendingAuditAuthority.mockReturnValue(undefined);
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId, assignmentId, attemptId, revision,
+        receiptKind: 'final', verdict: 'REWORK', findings: 'already durable', validations: [],
+      }),
+      senderSessionName: target.sessionName,
+      now: 600,
+    })).resolves.toEqual({ ok: false, error: 'receipt_closed' });
+    expect(mocks.store.create).not.toHaveBeenCalled();
+    expect(mocks.appendMatchingAuditReceipt).not.toHaveBeenCalled();
   });
 
   it('does not promote verdict-looking ordinary reply text into trusted timeline metadata', async () => {

@@ -8,6 +8,7 @@ import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import {
   SUPERVISION_MCP_TOOLS, SUPERVISION_MCP_REGISTERED_TOOLS,
   SUPERVISION_MCP_PENDING_CONSOLIDATION, SUPERVISION_MCP_FORBIDDEN_ARG_NAMES,
+  SUPERVISION_UNBOUND_REVISION,
 } from '../../shared/supervision-mcp-tools.js';
 import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
@@ -695,6 +696,44 @@ describe('list/get visibility guards', () => {
 });
 
 describe('administrative recover', () => {
+  it('turns a null/null coordination recovery generation into an explicit unbound CAS', async () => {
+    const taskId = 'tsk_null_revision';
+    const assignmentId = 'asg_null_revision';
+    registry.statuses.set(taskId, 'implementing');
+    registry.participants.set(taskId, ['deck_cd_brain']);
+    registry.assignmentStates.set(taskId, [{
+      assignmentId, role: 'implementer', status: 'implementing', leaseId: 'lease-null', generation: 1,
+      identity: testIdentity('deck_null_worker'),
+    }]);
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId,
+      taskStatus: 'implementing', assignmentStatus: 'implementing',
+      expectedGeneration: 1,
+      leaseAction: 'renew', idempotencyKey: 'null-null-live-counterexample',
+      reason: 'same-object recovery without fabricating a base SHA',
+    })).toMatchObject({ status: 'ok', taskId, assignmentId });
+    expect(registry.coordinated).toEqual([expect.objectContaining({
+      taskId, assignmentId,
+      expectedRevision: SUPERVISION_UNBOUND_REVISION,
+      expectedGeneration: 1,
+    })]);
+
+    registry.coordinated = [];
+    registry.currentRevisions.set(taskId, 'now-bound-r2');
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId,
+      taskStatus: 'implementing', assignmentStatus: 'implementing',
+      expectedGeneration: 1,
+      leaseAction: 'renew', idempotencyKey: 'missing-bound-revision-is-refused',
+      reason: 'a bound recovery must name its exact revision',
+    })).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(registry.coordinated).toEqual([]);
+  });
+
   it('lets only the authoritative same-project Brain atomically repair coordination state, scope, lease, and live identity', async () => {
     const liveIdentity = {
       sessionName: 'deck_recovered_worker', sessionInstanceId: 'instance-recovered', runtimeEpoch: 'epoch-recovered',
@@ -752,6 +791,68 @@ describe('administrative recover', () => {
       idempotencyKey: 'cross-project-rebind-refused',
     })).toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.coordinated).toEqual([]);
+  });
+
+  it('routes a generic auditor rebind through selected same-object authority without caller-supplied attempt fields', async () => {
+    const taskId = 'tsk_luo_policy_recovery';
+    const assignmentId = 'asg_m3s';
+    const revision = 'remote-desktop-security-notifications-r2';
+    const attemptId = 'auto-audit-luo-r2';
+    registry.statuses.set(taskId, 'ready_for_audit');
+    registry.currentRevisions.set(taskId, revision);
+    registry.participants.set(taskId, ['deck_cd_brain']);
+    registry.assignmentStates.set(taskId, [
+      {
+        assignmentId: 'asg_lut', role: 'implementer', status: 'ready_for_audit', leaseId: '',
+        auditRevision: revision, identity: testIdentity('deck_luo_worker'),
+      },
+      {
+        assignmentId, role: 'auditor', status: 'auditing', leaseId: 'audit-lease', generation: 2,
+        auditAttemptId: attemptId, auditRevision: revision,
+        identity: { ...testIdentity('deck_old_auditor'), agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+      },
+    ]);
+    const originalItem = registry.item.bind(registry);
+    registry.item = (id: string) => ({
+      ...originalItem(id),
+      auditPolicy: id === taskId ? 'auto_allow_degraded' : undefined,
+      validationState: id === taskId ? 'passed' : undefined,
+    });
+    const replacement = {
+      ...testResolveSessionIdentity('deck_new_auditor'),
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+    };
+    const binding = {
+      pool: 'primary' as const, origin: 'reused' as const,
+      requested: {
+        capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet',
+        agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model: 'sonnet',
+      },
+      actual: { ...replacement, runtimeType: 'transport' as const, model: 'sonnet' },
+    };
+    const retire = vi.fn().mockReturnValue(true);
+    const dispatch = vi.fn().mockResolvedValue({ status: 'dispatched', assignmentId, auditAttemptId: attemptId });
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
+      resolveAuditorRecoveryBinding: () => binding,
+      retireSupersededAuditDelivery: retire,
+      dispatchReadyAudit: dispatch,
+    });
+
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId, rebindSessionName: replacement.sessionName,
+      reason: 'recover the exact auto_allow_degraded audit controller',
+    })).toMatchObject({
+      status: 'ok', taskId, assignmentId, expectedRevision: revision, auditAttemptId: attemptId,
+    });
+    expect(registry.orphanedAuditorRebound).toEqual([expect.objectContaining({
+      taskId, assignmentId, expectedRevision: revision, auditAttemptId: attemptId,
+      executionBinding: binding,
+    })]);
+    expect(registry.rebound).toEqual([]);
+    expect(retire).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledWith(taskId);
   });
 
   it('does not let a project Brain coordinate an assignment across project scope', async () => {

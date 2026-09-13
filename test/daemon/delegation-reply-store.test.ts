@@ -243,7 +243,7 @@ describe('DelegationReplyStore', () => {
     }
   });
 
-  it('atomically converges stale SAME-assignment claims but leaves foreign authority untouched', () => {
+  it('atomically converges stale-origin SAME-assignment claims but leaves foreign authority untouched', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });
     const exact = {
@@ -259,7 +259,6 @@ describe('DelegationReplyStore', () => {
     const stale = store.create({
       ...exact,
       origin: { ...origin, sessionInstanceId: 'old-origin-instance', runtimeEpoch: 'old-origin-epoch' },
-      target: { ...target, sessionInstanceId: 'old-target-instance', runtimeEpoch: 'old-target-epoch' },
       dispatchId: 'dispatch-stale',
       messageId: 'message-generation-1',
       now: 100,
@@ -309,6 +308,190 @@ describe('DelegationReplyStore', () => {
     expect(store.findPendingAuditDelivery({ ...query, now: 301 })).toEqual({ status: 'ambiguous' });
     expect(store.get(current.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
     expect(store.get(foreign.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    store.close();
+    database.close();
+  });
+
+  it('converges duplicate audit-delivery metadata onto the one canonical assignment authority', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const exact = {
+      origin,
+      target,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-duplicate-delivery-metadata',
+      auditRevision: 'revision-duplicate-delivery-metadata',
+      auditedSessionName: 'deck_project_worker',
+      taskId: 'task-duplicate-delivery-metadata',
+      assignmentId: 'assignment-one-auditor',
+    } as const;
+    const canonical = store.create({
+      ...exact,
+      dispatchId: 'dispatch-canonical-audit',
+      messageId: 'message-canonical-audit',
+      now: 100,
+    });
+    // Production counterexample: a same-assignment audit-metadata append can
+    // carry a different transport message id. It is a second delivery row, not
+    // a second auditor/attempt/object, and must not become waiting_for_brain.
+    const duplicateMetadata = store.create({
+      ...exact,
+      origin: {
+        sessionName: 'deck_project_implementer',
+        sessionInstanceId: 'implementer-instance',
+        runtimeEpoch: 'implementer-epoch',
+      },
+      dispatchId: 'dispatch-duplicate-audit-metadata',
+      messageId: 'message-manual-audit-metadata',
+      now: 101,
+    });
+    // An ordinary append for the same assignment is a separate reply channel;
+    // audit convergence must neither count nor expire it.
+    const ordinaryAppend = store.create({
+      origin,
+      target,
+      taskId: exact.taskId,
+      assignmentId: exact.assignmentId,
+      dispatchId: 'dispatch-ordinary-append',
+      messageId: 'message-ordinary-append',
+      now: 102,
+    });
+
+    expect(store.findPendingAuditDelivery({
+      taskId: exact.taskId,
+      auditAttemptId: exact.auditAttemptId,
+      auditRevision: exact.auditRevision,
+      auditedSessionName: exact.auditedSessionName,
+      assignmentAuthority: {
+        assignmentId: exact.assignmentId,
+        messageId: canonical.record.messageId,
+        supersededMessageIds: [],
+        origins: [origin, duplicateMetadata.record.origin],
+        target,
+      },
+      now: 200,
+    })).toMatchObject({
+      status: 'matched',
+      record: {
+        delegationId: canonical.record.delegationId,
+        assignmentId: exact.assignmentId,
+        auditAttemptId: exact.auditAttemptId,
+        auditRevision: exact.auditRevision,
+      },
+    });
+    expect(store.get(canonical.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    expect(store.get(duplicateMetadata.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
+    expect(store.get(ordinaryAppend.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    store.close();
+    database.close();
+  });
+
+  it('keeps the running ngn auditor canonical when routing appends duplicate metadata', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const runningAuditor = {
+      origin,
+      target: {
+        sessionName: 'deck_sub_0610320z',
+        sessionInstanceId: 'ngn-auditor-instance',
+        runtimeEpoch: 'ngn-auditor-epoch',
+      },
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      taskId: 'tsk_ngn',
+      assignmentId: 'asg_o3r',
+      auditAttemptId: 'auto-audit-77f7ac3da0fa6d1b88cfc445',
+      auditRevision: 'tsk-ngn-r1-live-revision',
+      auditedSessionName: 'deck_ngn_implementer',
+    } as const;
+    const canonical = store.create({
+      ...runningAuditor,
+      dispatchId: 'dispatch-ngn-running-auditor',
+      messageId: 'message-ngn-running-auditor',
+      now: 100,
+    });
+    // Live incident #6 recurrence: routing appended another row for the exact
+    // same auditor object, attempt, revision and runtime identity while the
+    // canonical delivery was already running and no receipt existed.
+    const duplicateRoutingMetadata = store.create({
+      ...runningAuditor,
+      dispatchId: 'dispatch-ngn-duplicate-routing-metadata',
+      messageId: 'message-ngn-duplicate-routing-metadata',
+      now: 101,
+    });
+    // Current writers replace exact same-identity redelivery rows eagerly.
+    // Re-open the older row to reproduce the two-pending-row state persisted
+    // by the live pre-fix routing race that the read-side convergence repairs.
+    database.prepare('UPDATE delegation_replies SET status = ? WHERE delegation_id = ?')
+      .run(AGENT_DELEGATION_REPLY_STATUSES.PENDING, canonical.record.delegationId);
+
+    expect(store.findPendingAuditDelivery({
+      taskId: runningAuditor.taskId,
+      auditAttemptId: runningAuditor.auditAttemptId,
+      auditRevision: runningAuditor.auditRevision,
+      auditedSessionName: runningAuditor.auditedSessionName,
+      assignmentAuthority: {
+        assignmentId: runningAuditor.assignmentId,
+        messageId: canonical.record.messageId,
+        supersededMessageIds: [],
+        origins: [origin],
+        target: runningAuditor.target,
+      },
+      now: 200,
+    })).toMatchObject({
+      status: 'matched',
+      record: {
+        delegationId: canonical.record.delegationId,
+        taskId: runningAuditor.taskId,
+        assignmentId: runningAuditor.assignmentId,
+        auditAttemptId: runningAuditor.auditAttemptId,
+        auditRevision: runningAuditor.auditRevision,
+        target: runningAuditor.target,
+      },
+    });
+    expect(store.get(canonical.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    expect(store.get(duplicateRoutingMetadata.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
+
+    // Incident addendum: a second runtime reused the exact same session name
+    // after R1 had finalized and attempted a conflicting PASS correction.
+    // It is a different verdict principal, not duplicate routing metadata.
+    const staleConcurrentAuditor = store.create({
+      ...runningAuditor,
+      target: {
+        ...runningAuditor.target,
+        sessionInstanceId: 'ngn-stale-concurrent-instance',
+        runtimeEpoch: 'ngn-stale-concurrent-epoch',
+      },
+      dispatchId: 'dispatch-ngn-stale-concurrent-auditor',
+      messageId: 'message-ngn-stale-concurrent-auditor',
+      now: 201,
+    });
+    const beforeStaleFence = [
+      store.get(canonical.record.delegationId),
+      store.get(staleConcurrentAuditor.record.delegationId),
+    ];
+    expect(store.findPendingAuditDelivery({
+      taskId: runningAuditor.taskId,
+      auditAttemptId: runningAuditor.auditAttemptId,
+      auditRevision: runningAuditor.auditRevision,
+      auditedSessionName: runningAuditor.auditedSessionName,
+      assignmentAuthority: {
+        assignmentId: runningAuditor.assignmentId,
+        messageId: canonical.record.messageId,
+        supersededMessageIds: [],
+        origins: [origin],
+        target: runningAuditor.target,
+      },
+      now: 202,
+    })).toEqual({ status: 'ambiguous' });
+    expect([
+      store.get(canonical.record.delegationId),
+      store.get(staleConcurrentAuditor.record.delegationId),
+    ]).toEqual(beforeStaleFence);
     store.close();
     database.close();
   });

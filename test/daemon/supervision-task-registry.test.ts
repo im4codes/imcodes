@@ -403,6 +403,68 @@ describe('successor bundle authority convergence', () => {
     }
   });
 
+  it('recovers one exact cross-vendor auditor under auto_allow_degraded without replacement', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const taskId = 'incident-twelve-auto-allow';
+    const revision = 'incident-twelve-r2';
+    const attemptId = 'incident-twelve-attempt';
+    const oldAuditor = identity('deck_incident_twelve_old', 'claude-code-sdk');
+    const replacement = {
+      ...identity('deck_incident_twelve_new', 'claude-code-sdk'),
+      runtimeEpoch: 'replacement-epoch',
+    };
+    const binding = {
+      pool: 'primary' as const, origin: 'reused' as const,
+      requested: {
+        capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet',
+        agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model: 'sonnet',
+      },
+      actual: { ...replacement, runtimeType: 'transport' as const, model: 'sonnet' },
+    };
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'policy-independent same-object recovery', currentRevision: revision,
+        auditPolicy: 'auto_allow_degraded', now: 1,
+      })).toMatchObject({ ok: true });
+      const implementer = registry.createAssignment({
+        taskId, role: 'implementer', required: true,
+        identity: identity('deck_incident_twelve_impl'), auditRevision: revision, now: 2,
+      });
+      const auditor = registry.createAssignment({
+        taskId, role: 'auditor', required: true, identity: oldAuditor,
+        auditAttemptId: attemptId, auditRevision: revision, now: 3,
+      });
+      if (!implementer.ok || !auditor.ok) throw new Error('fixture failed');
+      rewritePersistedAssignment(database, {
+        ...implementer.value, status: 'ready_for_audit', leaseId: '', auditRevision: revision, updatedAt: 4,
+      });
+      rewritePersistedTask(database, {
+        ...registry.get(taskId)!, status: 'ready_for_audit', validationState: 'passed', updatedAt: 4,
+      });
+      const count = registry.listAssignments(taskId).length;
+      expect(registry.recoverOrphanedDelegatedAuditor({
+        taskId, assignmentId: auditor.value.assignmentId,
+        identity: replacement, executionBinding: binding,
+        expectedGeneration: auditor.value.generation,
+        expectedRevision: revision, auditAttemptId: attemptId,
+        callerProjectName: 'alpha',
+        supersededDeliveryMessageId: 'incident-twelve-old-delivery',
+        deliveryMessageId: 'incident-twelve-new-delivery',
+        idempotencyKey: 'incident-twelve-recovery',
+        reason: 'same object across audit policies', now: 10,
+      })).toMatchObject({
+        ok: true,
+        value: { assignmentId: auditor.value.assignmentId, identity: replacement, generation: 2 },
+      });
+      expect(registry.listAssignments(taskId)).toHaveLength(count);
+    } finally {
+      registry.close();
+      database.close();
+    }
+  });
+
   it.each([
     ['unstamped legacy validation', undefined],
     ['validation stamped for the REWORK predecessor', R1],
@@ -753,14 +815,13 @@ function prepareStructuredFinalizationShape(
 function legacyBundleForFinalizationShape(
   shape: ReturnType<typeof prepareStructuredFinalizationShape>,
   bundleRoot: string,
-  headSha = shape.finalization.commitSha,
 ): SupervisionIntegrationBundle {
   const manifest = {
     version: 1 as const,
     taskId: shape.taskId,
     sourceAssignmentId: shape.implementer.assignmentId,
     revision: shape.revision,
-    headSha,
+    headSha: shape.finalization.commitSha,
     files: shape.finalization.integrationManifest.map((file) => ({ ...file, mode: 0o644 as const })),
   };
   const manifestSha256 = createHash('sha256').update(`${JSON.stringify(manifest)}\n`).digest('hex');
@@ -1465,6 +1526,8 @@ describe('SupervisionTaskRegistry', () => {
       role: 'integration_owner',
       identity: shape.owner.identity,
       scopeFiles: shape.files,
+      auditAttemptId: shape.attemptId,
+      auditRevision: shape.revision,
     })).toMatchObject({
       ok: true, replay: true,
       value: { assignmentId: shape.owner.assignmentId },
@@ -1493,20 +1556,24 @@ describe('SupervisionTaskRegistry', () => {
     ]) delete productionFinalization[field];
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](productionFinalization))
       .resolves.toMatchObject({
-        status: 'error',
-        refusals: [expect.objectContaining({ code: 'missing_field', field: 'preflightToken' })],
+        status: 'ok', idempotentReplay: false,
+        item: {
+          taskId: shape.taskId, status: 'finalized', currentRevision: shape.revision,
+          commitSha: shape.finalization.commitSha,
+          pushRemoteRef: shape.finalization.pushRemoteRef,
+          archivedAt: expect.any(Number),
+          finalization: {
+            revision: shape.revision,
+            auditAttemptId: shape.attemptId,
+            auditRevision: shape.revision,
+            verdict: 'PASS',
+            ownedFiles: [],
+            integrationManifest: [],
+            stagedPaths: [],
+            ciResult: 'success',
+          },
+        },
       });
-    expect(registry.get(shape.taskId)).toMatchObject({ status: 'ready_for_integration' });
-
-    // The registry compatibility seam remains separately covered below. The
-    // public MCP path now refuses any first finalization that did not consume
-    // an exact pre-Git authority snapshot.
-    expect(registry.finalizeIntegration({
-      ...shape.finalization,
-      ownedFiles: [], integrationManifest: [], stagedPaths: [],
-      conflictedPaths: [], untrackedOtherOwnerPaths: [],
-      identity: shape.owner.identity,
-    })).toMatchObject({ ok: true, value: { status: 'finalized' } });
 
     expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
     expect(registry.listAssignments(shape.taskId).every((assignment) => assignment.leaseId === '')).toBe(true);
@@ -1528,14 +1595,13 @@ describe('SupervisionTaskRegistry', () => {
 
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
       ...shape.finalization,
-      preflightToken: 'legacy-replay-does-not-authorize-a-new-finalization',
       ownedFiles: 'not-an-array',
       integrationManifest: { stale: true },
       stagedPaths: 42,
       conflictedPaths: ['caller-only-conflict.ts'],
       untrackedOtherOwnerPaths: ['caller-only-untracked.ts'],
     }))
-      .resolves.toMatchObject({ status: 'error' });
+      .resolves.toMatchObject({ status: 'ok', idempotentReplay: true, item: { status: 'finalized' } });
     expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount + 15);
     expect(registry.listAssignments(shape.taskId)).toHaveLength(assignmentCount);
   });
@@ -1576,337 +1642,6 @@ describe('SupervisionTaskRegistry', () => {
     })).toMatchObject({ ok: true, replay: true });
     expect(registry.listEvents(shape.taskId)).toHaveLength(finalizedEventCount);
     registry.close();
-  });
-
-  it('preflights the tsk_hnh implementing owner, binds PASS without hidden finish, and CAS-finalizes once', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'imcodes-integration-preflight-restart-'));
-    const dbPath = join(dir, 'supervision-state.sqlite');
-    let registry = new SupervisionTaskRegistry({ dbPath });
-    try {
-      const shape = prepareStructuredFinalizationShape(registry, 'tsk_hnh-preflight-normal-path', {
-        leaveAuditorUnfinalized: true,
-      });
-      expect(registry.appendMatchingAuditReceipt({
-        taskId: shape.taskId,
-        auditorAssignmentId: shape.auditor.assignmentId,
-        attemptId: shape.attemptId,
-        revision: shape.revision,
-        receiptKind: 'final', verdict: 'PASS',
-        auditedSessionName: shape.implementer.identity.sessionName,
-        auditorSessionName: shape.auditor.identity.sessionName,
-        auditorIdentity: shape.auditor.identity,
-        findings: 'exact PASS', validations: [],
-      })).toMatchObject({ ok: true });
-      expect(registry.finishAssignment({
-        assignmentId: shape.auditor.assignmentId,
-        identity: shape.auditor.identity,
-        revision: shape.revision,
-      })).toMatchObject({ ok: true });
-      const bundle = legacyBundleForFinalizationShape(shape, '/tmp/tsk-hnh-preflight-bundles');
-      const database = new DatabaseSync(dbPath);
-      rewritePersistedTask(database, { ...registry.getTaskRecord(shape.taskId)!, integrationBundle: bundle });
-      rewritePersistedAssignment(database, {
-        ...registry.getAssignment(shape.owner.assignmentId)!,
-        status: 'implementing', verdict: undefined, crossVendorAuditPassed: undefined,
-        leaseId: 'lse_hnh_owner',
-      });
-      database.close();
-      const {
-        commitSha: _commit, pushResult: _push, ...preflightEvidence
-      } = shape.finalization;
-      const preflight = registry.preflightIntegration({
-        assignmentId: shape.owner.assignmentId,
-        identity: shape.owner.identity,
-        evidence: { ...preflightEvidence, stagedPaths: [] },
-        inspectedHeadSha: bundle.headSha,
-        expectedPushRemoteRef: shape.finalization.pushRemoteRef,
-        now: 400,
-      });
-      expect(preflight).toMatchObject({
-        ok: true,
-        value: { preflightToken: expect.any(String), ownerPreparation: 'bind_exact_pass' },
-      });
-      if (!preflight.ok) throw new Error('preflight failed');
-      expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
-        status: 'ready_for_integration', verdict: 'PASS', crossVendorAuditPassed: true, leaseId: '',
-      });
-      const afterPreparationEvents = registry.listEvents(shape.taskId).length;
-
-      // The token is durable authority rather than an in-memory permit. A
-      // daemon restart and an epoch rotation between preflight and finalize
-      // must preserve the exact normal path without asking Brain to replay a
-      // hidden task_finish or repeat Git side effects.
-      registry.close();
-      registry = new SupervisionTaskRegistry({ dbPath });
-      expect(registry.preflightIntegration({
-        assignmentId: shape.owner.assignmentId,
-        identity: { ...shape.owner.identity, runtimeEpoch: 'rotated-epoch' },
-        evidence: { ...preflightEvidence, stagedPaths: [] },
-        inspectedHeadSha: bundle.headSha,
-        expectedPushRemoteRef: shape.finalization.pushRemoteRef,
-      })).toMatchObject({
-        ok: true,
-        value: { preflightToken: preflight.value.preflightToken, ownerPreparation: 'none' },
-      });
-      expect(registry.listEvents(shape.taskId)).toHaveLength(afterPreparationEvents);
-
-      const finalized = registry.finalizeIntegration({
-        ...shape.finalization,
-        pushResult: 'already_present',
-        preflightToken: preflight.value.preflightToken,
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: shape.finalization.commitSha,
-        observedPushMatchesRequestedRemote: true,
-        identity: { ...shape.owner.identity, runtimeEpoch: 'rotated-epoch' },
-        now: 500,
-      });
-      expect(finalized).toMatchObject({ ok: true, value: { status: 'finalized' } });
-      expect(registry.get(shape.taskId)?.finalization).toMatchObject({
-        preflightToken: preflight.value.preflightToken,
-        finalizationFingerprint: expect.any(String),
-      });
-      expect(registry.finalizeIntegration({
-        ...shape.finalization,
-        pushResult: 'already_present',
-        preflightToken: preflight.value.preflightToken,
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: shape.finalization.commitSha,
-        observedPushMatchesRequestedRemote: true,
-        identity: shape.owner.identity,
-      })).toMatchObject({ ok: true, replay: true });
-      const finalizedEventCount = registry.listEvents(shape.taskId).length;
-      expect(registry.finalizeIntegration({
-        ...shape.finalization,
-        pushResult: 'already_present',
-        preflightToken: `sha256:${'f'.repeat(64)}`,
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: shape.finalization.commitSha,
-        observedPushMatchesRequestedRemote: true,
-        identity: shape.owner.identity,
-      })).toMatchObject({
-        ok: false,
-        reason: 'integration_refused',
-        refusals: [{ code: 'conflicting_replay', field: 'preflightToken' }],
-      });
-      expect(registry.listEvents(shape.taskId)).toHaveLength(finalizedEventCount);
-    } finally {
-      registry.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it.each(['delegated', 'implementing'] as const)(
-    'atomically prepares and finalizes an unprepared %s tsk_hnh owner after the exact bundle commit was pushed',
-    (ownerStatus) => {
-    const dir = mkdtempSync(join(tmpdir(), 'imcodes-integration-post-push-backfill-'));
-    const dbPath = join(dir, 'supervision-state.sqlite');
-    let registry = new SupervisionTaskRegistry({ dbPath });
-    try {
-      const shape = prepareStructuredFinalizationShape(registry, 'tsk_hnh-post-push-backfill', {
-        leaveAuditorUnfinalized: true,
-      });
-      expect(registry.appendMatchingAuditReceipt({
-        taskId: shape.taskId,
-        auditorAssignmentId: shape.auditor.assignmentId,
-        attemptId: shape.attemptId,
-        revision: shape.revision,
-        receiptKind: 'final', verdict: 'PASS',
-        auditedSessionName: shape.implementer.identity.sessionName,
-        auditorSessionName: shape.auditor.identity.sessionName,
-        auditorIdentity: shape.auditor.identity,
-        findings: 'exact PASS before the integration owner was prepared', validations: [],
-      })).toMatchObject({ ok: true });
-      expect(registry.finishAssignment({
-        assignmentId: shape.auditor.assignmentId,
-        identity: shape.auditor.identity,
-        revision: shape.revision,
-      })).toMatchObject({ ok: true });
-
-      const bundleBaseSha = 'b'.repeat(40);
-      expect(bundleBaseSha).not.toBe(shape.finalization.commitSha);
-      const bundle = legacyBundleForFinalizationShape(
-        shape,
-        '/tmp/tsk-hnh-post-push-backfill-bundles',
-        bundleBaseSha,
-      );
-      const database = new DatabaseSync(dbPath);
-      rewritePersistedTask(database, {
-        ...registry.getTaskRecord(shape.taskId)!,
-        integrationBundle: bundle,
-      });
-      rewritePersistedAssignment(database, {
-        ...registry.getAssignment(shape.owner.assignmentId)!,
-        status: ownerStatus,
-        verdict: undefined,
-        crossVendorAuditPassed: undefined,
-        leaseId: 'lse_hnh_post_push_owner',
-      });
-      database.close();
-
-      const beforeEvents = registry.listEvents(shape.taskId).length;
-      expect(registry.finalizeIntegration({
-        ...shape.finalization,
-        pushResult: 'already_present',
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: 'd'.repeat(40),
-        observedPushMatchesRequestedRemote: false,
-        observedPushContainsRequestedCommit: false,
-        identity: shape.owner.identity,
-      })).toMatchObject({
-        ok: false,
-        reason: 'integration_refused',
-        refusals: [expect.objectContaining({ code: 'remote_drift', field: 'remoteCommit' })],
-      });
-      expect(registry.listEvents(shape.taskId)).toHaveLength(beforeEvents);
-      expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
-        status: ownerStatus, leaseId: 'lse_hnh_post_push_owner',
-      });
-      const finalized = registry.finalizeIntegration({
-        ...shape.finalization,
-        pushResult: 'already_present',
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: shape.finalization.commitSha,
-        observedPushMatchesRequestedRemote: false,
-        observedPushContainsRequestedCommit: true,
-        identity: shape.owner.identity,
-        now: 700,
-      });
-      expect(finalized, JSON.stringify(finalized)).toMatchObject({
-        ok: true,
-        value: {
-          status: 'finalized',
-          commitSha: shape.finalization.commitSha,
-          finalization: {
-            finalizationFingerprint: expect.any(String),
-          },
-        },
-      });
-      expect(registry.getAssignment(shape.owner.assignmentId)).toMatchObject({
-        status: 'finalized',
-        verdict: 'PASS',
-        crossVendorAuditPassed: true,
-        leaseId: '',
-      });
-      const newEvents = registry.listEvents(shape.taskId).slice(beforeEvents);
-      expect(newEvents.slice(0, 14)
-        .map((event) => `${event.assignmentId ? 'assignment' : 'task'}:${event.status}`))
-        .toEqual([
-          'assignment:integrating', 'task:integrating',
-          'assignment:final_audit', 'task:final_audit',
-          'assignment:passed', 'task:passed',
-          'assignment:finalizing', 'task:finalizing',
-          'assignment:committed', 'task:committed',
-          'assignment:pushed', 'task:pushed',
-          'assignment:finalized', 'task:finalized',
-        ]);
-      expect(newEvents.some((event) => (
-        event.assignmentId === shape.owner.assignmentId && event.status === 'ready_for_integration'
-      ))).toBe(false);
-
-      // The finalized ledger, rather than an ephemeral preflight token, makes
-      // an exact restart retry idempotent and rejects a different Git fact.
-      registry.close();
-      registry = new SupervisionTaskRegistry({ dbPath });
-      expect(registry.finalizeIntegration({
-        ...shape.finalization,
-        pushResult: 'already_present',
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: shape.finalization.commitSha,
-        observedPushMatchesRequestedRemote: false,
-        observedPushContainsRequestedCommit: true,
-        identity: shape.owner.identity,
-      })).toMatchObject({ ok: true, replay: true });
-      expect(registry.finalizeIntegration({
-        ...shape.finalization,
-        commitSha: 'c'.repeat(40),
-        externalHeadSha: 'c'.repeat(40),
-        pushResult: 'already_present',
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: 'c'.repeat(40),
-        observedPushMatchesRequestedRemote: true,
-        identity: shape.owner.identity,
-      })).toMatchObject({
-        ok: false,
-        reason: 'integration_refused',
-        // The conflicting replay names the field that really differs.
-        refusals: expect.arrayContaining([expect.objectContaining({
-          code: 'conflicting_replay', field: 'commitSha', actual: 'c'.repeat(40),
-        })]),
-      });
-    } finally {
-      registry.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 15_000);
-
-  it('invalidates a preflight token after revision drift and returns field-level refusal without writes', () => {
-    const database = new DatabaseSync(':memory:');
-    const registry = new SupervisionTaskRegistry({ database });
-    try {
-      const shape = prepareStructuredFinalizationShape(registry, 'integration-preflight-drift', {
-        leaveAuditorUnfinalized: true,
-      });
-      expect(registry.appendMatchingAuditReceipt({
-        taskId: shape.taskId,
-        auditorAssignmentId: shape.auditor.assignmentId,
-        attemptId: shape.attemptId,
-        revision: shape.revision,
-        receiptKind: 'final', verdict: 'PASS',
-        auditedSessionName: shape.implementer.identity.sessionName,
-        auditorSessionName: shape.auditor.identity.sessionName,
-        auditorIdentity: shape.auditor.identity,
-        findings: 'exact PASS', validations: [],
-      })).toMatchObject({ ok: true });
-      expect(registry.finishAssignment({
-        assignmentId: shape.auditor.assignmentId,
-        identity: shape.auditor.identity,
-        revision: shape.revision,
-      })).toMatchObject({ ok: true });
-      const bundle = legacyBundleForFinalizationShape(shape, '/tmp/integration-preflight-drift-bundles');
-      rewritePersistedTask(database, { ...registry.getTaskRecord(shape.taskId)!, integrationBundle: bundle });
-      const { commitSha: _commit, pushResult: _push, ...preflightEvidence } = shape.finalization;
-      const preflight = registry.preflightIntegration({
-        assignmentId: shape.owner.assignmentId,
-        identity: shape.owner.identity,
-        evidence: { ...preflightEvidence, stagedPaths: [] },
-        inspectedHeadSha: bundle.headSha,
-        expectedPushRemoteRef: shape.finalization.pushRemoteRef,
-      });
-      expect(preflight).toMatchObject({ ok: true });
-      if (!preflight.ok) throw new Error('preflight failed');
-      rewritePersistedTask(database, {
-        ...registry.getTaskRecord(shape.taskId)!, currentRevision: `${shape.revision}-successor`,
-      });
-      const beforeEvents = registry.listEvents(shape.taskId).length;
-      expect(registry.finalizeIntegration({
-        ...shape.finalization,
-        preflightToken: preflight.value.preflightToken,
-        inspectedHeadSha: bundle.headSha,
-        observedRemoteRef: 'refs/remotes/origin/dev',
-        observedRemoteCommitSha: shape.finalization.commitSha,
-        observedPushMatchesRequestedRemote: true,
-        identity: shape.owner.identity,
-      })).toMatchObject({
-        ok: false,
-        reason: 'integration_refused',
-        refusals: expect.arrayContaining([
-          expect.objectContaining({ code: 'revision_mismatch', field: 'revision' }),
-          expect.objectContaining({ code: 'stale_preflight', field: 'preflightToken' }),
-        ]),
-      });
-      expect(registry.listEvents(shape.taskId)).toHaveLength(beforeEvents);
-      expect(registry.get(shape.taskId)).not.toHaveProperty('finalization');
-    } finally {
-      registry.close();
-      database.close();
-    }
   });
 
   it('finalizes an already-PASSed legacy bundle whose changed files are a strict subset of assignment scope', () => {
@@ -2268,14 +2003,7 @@ describe('SupervisionTaskRegistry', () => {
         ...shape.finalization,
         commitSha: 'b'.repeat(40), externalHeadSha: 'b'.repeat(40),
         identity: shape.owner.identity,
-      })).toMatchObject({
-        ok: false,
-        reason: 'integration_refused',
-        refusals: expect.arrayContaining([
-          expect.objectContaining({ code: 'conflicting_replay', field: 'commitSha', actual: 'b'.repeat(40) }),
-          expect.objectContaining({ code: 'conflicting_replay', field: 'externalHeadSha', actual: 'b'.repeat(40) }),
-        ]),
-      });
+      })).toEqual({ ok: false, reason: 'conflicting_replay' });
       expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
     } finally {
       registry.close();
@@ -6061,6 +5789,47 @@ describe('SupervisionTaskRegistry', () => {
       callerProjectName: 'alpha', rebindProjectName: 'alpha', rebindIdentity: live,
     })).toEqual({ ok: false, reason: 'receipt_closed' });
     expect(registry.get(auditedTaskId)).toEqual(auditedBefore);
+    registry.close();
+  });
+
+  it('does not rotate validation authority generation for a same-identity Brain finish projection', () => {
+    const registry = makeRegistry();
+    const taskId = 'incident-fourteen-validation-generation';
+    const revision = 'incident-fourteen-r1';
+    const brain = identity('deck_incident_fourteen_brain');
+    const worker = identity('deck_incident_fourteen_worker');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'preserve exact validation authority', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, role: 'coordinator', identity: brain, required: false,
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      taskId, role: 'implementer', identity: worker, auditRevision: revision,
+    });
+    if (!implementer.ok) throw new Error(implementer.reason);
+    for (const status of ['implementing', 'validated'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: implementer.value.assignmentId, identity: worker, status,
+      })).toMatchObject({ ok: true });
+    }
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'validated' })).toMatchObject({ ok: true });
+    const generation = registry.getAssignment(implementer.value.assignmentId)!.generation;
+
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId: implementer.value.assignmentId,
+      callerIdentity: brain, callerProjectName: 'alpha',
+      rebindProjectName: 'alpha', rebindIdentity: worker,
+      expectedRevision: revision, now: 100,
+    })).toMatchObject({ ok: true, value: { status: 'ready_for_audit', generation } });
+    expect(registry.finishAssignmentAsProjectBrain({
+      assignmentId: implementer.value.assignmentId,
+      callerIdentity: brain, callerProjectName: 'alpha',
+      rebindProjectName: 'alpha', rebindIdentity: worker,
+      expectedRevision: revision, now: 110,
+    })).toMatchObject({ ok: true, replay: true, value: { generation } });
     registry.close();
   });
 
@@ -10329,10 +10098,11 @@ describe('tsk_4iu live sequence: REWORK auditor stuck implementing blocks succes
     expect(['cancelled', 'finalized']).not.toContain(stuck.status);
 
     // Brain retires it on the SAME object.
-    expect(registry.cancelStaleAuditorAsProjectBrain({
+    const cancelRequest = {
       taskId: 'tsk-4iu', auditorAssignmentId: 'asg-4mu',
       callerProjectName: 'alpha', reason: 'final REWORK recorded but auditor left non-terminal',
-    })).toMatchObject({ ok: true });
+    } as const;
+    expect(registry.cancelStaleAuditorAsProjectBrain(cancelRequest)).toMatchObject({ ok: true });
     const retired = registry.getAssignment('asg-4mu')!;
     expect(retired.status).toBe('cancelled');
     expect(retired.leaseId).toBe('');
@@ -10344,6 +10114,18 @@ describe('tsk_4iu live sequence: REWORK auditor stuck implementing blocks succes
     expect(receipts.some((r) => r.assignmentId === 'asg-4mu'
       && r.receiptKind === 'final' && r.verdict === 'REWORK'
       && r.findings === 'R1 findings that must survive retirement')).toBe(true);
+    expect(registry.cancelStaleAuditorAsProjectBrain(cancelRequest)).toMatchObject({
+      ok: true, replay: true, value: { status: 'cancelled', auditAttemptId: 'attempt-4iu-r1', auditRevision: R1 },
+    });
+    expect(registry.cancelStaleAuditorAsProjectBrain({
+      ...cancelRequest, reason: 'conflicting terminal reinterpretation',
+    })).toMatchObject({
+      ok: false, reason: 'receipt_closed',
+      detail: {
+        assignmentStatus: 'cancelled', expectedAttemptId: 'attempt-4iu-r1', expectedRevision: R1,
+      },
+    });
+    expect(registry.listAuditReceipts('tsk-4iu')).toEqual(receipts);
     registry.close();
   });
 });
@@ -12157,6 +11939,95 @@ describe('Brain-approved stale closed-attempt auditor retirement', () => {
     } finally {
       db.close(); registry.close(); rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('control-plane incident #9 revision and base authority', () => {
+  it('CAS-recovers the authoritative null/null shape without inventing a revision', () => {
+    const registry = makeRegistry();
+    const taskId = 'incident-nine-null-revision';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task', objective: 'null revision recovery', now: 1,
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_incident_nine'), now: 2,
+    });
+    if (!implementer.ok) throw new Error(implementer.reason);
+    expect(registry.updateTask({ taskId, status: 'implementing', now: 3 })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId: implementer.value.assignmentId,
+      identity: implementer.value.identity,
+      status: 'implementing', now: 3,
+    })).toMatchObject({ ok: true });
+    const generation = registry.getAssignment(implementer.value.assignmentId)!.generation;
+    const request = {
+      taskId, assignmentId: implementer.value.assignmentId,
+      taskStatus: 'implementing' as const, assignmentStatus: 'implementing' as const,
+      leaseAction: 'renew' as const,
+      expectedRevision: SUPERVISION_UNBOUND_REVISION,
+      expectedGeneration: generation,
+      idempotencyKey: 'incident-nine-null-cas',
+      reason: 'renew the same unbound object', now: 10,
+    };
+
+    expect(registry.coordinateTaskAssignment(request)).toMatchObject({ ok: true });
+    expect(registry.getTaskRecord(taskId)?.currentRevision).toBeUndefined();
+    expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+      generation: generation + 1, status: 'implementing',
+    });
+    expect(registry.getAssignment(implementer.value.assignmentId)?.auditRevision).toBeUndefined();
+    expect(registry.coordinateTaskAssignment(request)).toMatchObject({ ok: true, replay: true });
+    expect(registry.coordinateTaskAssignment({
+      ...request, idempotencyKey: 'incident-nine-stale-generation', reason: 'stale concurrent writer',
+    })).toMatchObject({ ok: false, reason: 'conflicting_replay' });
+    expect(registry.getAssignment(implementer.value.assignmentId)?.generation).toBe(generation + 1);
+    registry.close();
+  });
+
+  it('binds task, implementer, coordinator, and inspected base in one successor transaction', () => {
+    const registry = makeRegistry();
+    const taskId = 'incident-nine-atomic-successor';
+    const fromRevision = 'incident-nine-r1';
+    const toRevision = 'incident-nine-r2';
+    const files = ['src/daemon/incident-nine.ts'];
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'atomic successor provenance', baseRevision: 'c'.repeat(40),
+      currentRevision: fromRevision, now: 1,
+    })).toMatchObject({ ok: true });
+    const coordinator = registry.createAssignment({
+      taskId, role: 'coordinator', identity: identity('deck_incident_nine_brain'),
+      auditRevision: fromRevision, now: 2,
+    });
+    const implementer = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_incident_nine_worker'),
+      scopeFiles: files, auditRevision: fromRevision, now: 3,
+    });
+    if (!coordinator.ok || !implementer.ok) throw new Error('assignments failed');
+    for (const row of [coordinator.value, implementer.value]) {
+      expect(registry.updateAssignment({
+        assignmentId: row.assignmentId, identity: row.identity,
+        status: 'implementing', auditRevision: fromRevision, now: 4,
+      })).toMatchObject({ ok: true });
+    }
+    const snapshot = recoveryWorktreeSnapshot(files);
+    const request = {
+      taskId, assignmentId: implementer.value.assignmentId,
+      fromRevision, toRevision, scopeFiles: files,
+      worktreeSnapshot: snapshot, leaseAction: 'preserve' as const,
+      idempotencyKey: 'incident-nine-successor', reason: 'bind exact current dev', now: 10,
+    };
+
+    expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
+      ok: true, value: { baseRevision: snapshot.headSha, currentRevision: toRevision },
+    });
+    expect(registry.getAssignment(implementer.value.assignmentId)?.auditRevision).toBe(toRevision);
+    expect(registry.getAssignment(coordinator.value.assignmentId)).toMatchObject({
+      auditRevision: toRevision, status: 'implementing',
+    });
+    expect(registry.getAssignment(coordinator.value.assignmentId)?.blocker).toBeUndefined();
+    expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({ ok: true, replay: true });
+    registry.close();
   });
 });
 

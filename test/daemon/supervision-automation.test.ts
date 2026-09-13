@@ -6500,6 +6500,46 @@ describe('SupervisionAutomation', () => {
       expect(registry.getAssignment(assignmentId)!.blocker).toBe('needs Brain adjudication');
     });
 
+    it('preserves a task-level dependency wait without watchdog noise or overwrite', async () => {
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'watchdog-task-dependency-wait';
+      const assignmentId = 'watchdog-task-dependency-wait-implementer';
+      const identity = liveWorkerIdentity();
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'wait for an audited dependency', now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity,
+        scopeFiles: ['src/dependency.ts'], now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      expect(registry.updateTask({ taskId, status: 'implementing', now: 3_000 }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId, identity, status: 'implementing', now: 3_000,
+      }).ok).toBe(true);
+      const dependencyWait = JSON.stringify({
+        kind: 'dependency_wait',
+        taskId,
+        dependencyTaskId: 'tsk_upstream',
+        condition: 'PASS+integration',
+      });
+      expect(registry.updateTask({ taskId, blocker: dependencyWait, now: 3_500 }).ok).toBe(true);
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      mockTransportRuntime.send.mockClear();
+
+      const due = 3_500 + 10 * 60_000;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.getTaskRecord(taskId)?.blocker).toBe(dependencyWait);
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_heartbeat'
+      ))).toHaveLength(0);
+    });
+
     it.each([
       ['tool start', 'tool.call', { id: 'read-1', name: 'Read', input: { path: 'src/activity.ts' } }, 'provider_tool_call'],
       ['tool completion', 'tool.result', { id: 'test-1', text: 'vitest: 223 passed' }, 'provider_tool_result'],

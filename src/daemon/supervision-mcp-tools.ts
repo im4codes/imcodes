@@ -15,6 +15,7 @@ import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server
 import {
   SUPERVISION_MCP_TOOLS,
   SUPERVISION_MCP_REGISTERED_TOOLS,
+  SUPERVISION_UNBOUND_REVISION,
   type SupervisionMcpToolName,
 } from '../../shared/supervision-mcp-tools.js';
 import {
@@ -797,8 +798,8 @@ export function createSupervisionMcpToolHandlers(
         && ownedFiles.length > 0 && evidenceManifestSha256
         && recoveryAssignment?.role === 'auditor'
       );
-      const orphanedAuditorRecoveryRequested = evidenceBoundAuditorRecoveryRequested || Boolean(
-        assignmentId && rebindSessionName && expectedRevision && auditAttemptId,
+      const orphanedAuditorRecoveryRequested = Boolean(
+        assignmentId && rebindSessionName && recoveryAssignment?.role === 'auditor',
       );
       if (orphanedAuditorRecoveryRequested) {
         const unexpectedRecoveryFields = fromRevision || toRevision || taskStatus || assignmentStatus
@@ -808,7 +809,7 @@ export function createSupervisionMcpToolHandlers(
         const invalidEvidenceBoundRequest = evidenceBoundAuditorRecoveryRequested
           && (!reason || Boolean(auditAttemptId && auditAttemptId !== recoveryAssignment?.auditAttemptId));
         const invalidLegacyRequest = !evidenceBoundAuditorRecoveryRequested
-          && (!idempotencyKey || ownedFiles.length > 0 || Boolean(evidenceManifestSha256));
+          && (ownedFiles.length > 0 || Boolean(evidenceManifestSha256));
         if (unexpectedRecoveryFields || invalidEvidenceBoundRequest || invalidLegacyRequest) {
           return err(
             'validation_failed',
@@ -826,21 +827,22 @@ export function createSupervisionMcpToolHandlers(
             : 'orphaned auditor recovery requires the authoritative project Brain or administrator');
         }
         const assignment = task.assignments?.find((candidate) => candidate.assignmentId === assignmentId);
+        const effectiveRevision = expectedRevision || String(assignment?.auditRevision ?? '').trim();
         const effectiveAuditAttemptId = evidenceBoundAuditorRecoveryRequested
           ? String(assignment?.auditAttemptId ?? '').trim()
-          : auditAttemptId;
-        if (!effectiveAuditAttemptId) {
-          return err('invalid_transition', 'auditor recovery requires the existing exact audit attempt');
+          : auditAttemptId || String(assignment?.auditAttemptId ?? '').trim();
+        if (!effectiveRevision || !effectiveAuditAttemptId) {
+          return err('invalid_transition', 'auditor recovery requires the existing exact revision and audit attempt');
         }
         const implementers = task.assignments?.filter((candidate) => (
           candidate.role === 'implementer'
           && (!evidenceBoundAuditorRecoveryRequested || candidate.required === true)
           && candidate.status === 'ready_for_audit'
-          && candidate.auditRevision === expectedRevision
+          && candidate.auditRevision === effectiveRevision
         )) ?? [];
         const exactOpenAuditors = task.assignments?.filter((candidate) => (
           candidate.role === 'auditor'
-          && candidate.auditRevision === expectedRevision
+          && candidate.auditRevision === effectiveRevision
           && candidate.status !== 'cancelled'
           && candidate.status !== 'finalized'
           && candidate.status !== 'passed'
@@ -855,7 +857,7 @@ export function createSupervisionMcpToolHandlers(
           || (evidenceBoundAuditorRecoveryRequested && assignment.required !== true)
           || !recoverableStatus
           || assignment.auditAttemptId !== effectiveAuditAttemptId
-          || assignment.auditRevision !== expectedRevision
+          || assignment.auditRevision !== effectiveRevision
           || !Number.isSafeInteger(assignment.generation)
           || implementers.length !== 1
           || (assignment.status === 'cancelled'
@@ -912,14 +914,15 @@ export function createSupervisionMcpToolHandlers(
           },
           executionBinding,
           expectedGeneration: assignment.generation!,
-          expectedRevision,
+          expectedRevision: effectiveRevision,
           auditAttemptId: effectiveAuditAttemptId,
           callerProjectName: taskProjectName,
           supersededDeliveryMessageId,
           deliveryMessageId,
           idempotencyKey: idempotencyKey || [
-            'evidence-bound-auditor-rebind', taskId, assignmentId,
-            effectiveAuditAttemptId, expectedRevision, evidenceManifestSha256,
+            evidenceBoundAuditorRecoveryRequested ? 'evidence-bound-auditor-rebind' : 'exact-auditor-rebind',
+            taskId, assignmentId,
+            effectiveAuditAttemptId, effectiveRevision, evidenceManifestSha256,
             rebindSessionName,
           ].join(':'),
           reason,
@@ -953,7 +956,9 @@ export function createSupervisionMcpToolHandlers(
             return err('identity_rejected', 'superseded audit delivery identity no longer matches');
           }
         }
-        const rebound = reg.recoverOrphanedDelegatedAuditor?.(recoveryInput);
+        const rebound = alreadyRebound && assignment.status !== 'cancelled'
+          ? { ok: true as const, replay: true }
+          : reg.recoverOrphanedDelegatedAuditor?.(recoveryInput);
         if (!rebound) return err('unavailable', 'orphaned auditor recovery is not bound');
         if (!rebound.ok) return err(rebound.reason, `orphaned auditor recovery rejected: ${rebound.reason}`);
         let auditTrigger: unknown;
@@ -967,7 +972,7 @@ export function createSupervisionMcpToolHandlers(
           taskId,
           assignmentId,
           rebindSessionName,
-          expectedRevision,
+          expectedRevision: effectiveRevision,
           auditAttemptId: effectiveAuditAttemptId,
           replay: rebound.replay === true,
           ...(auditTrigger !== undefined ? { auditTrigger } : {}),
@@ -1175,21 +1180,32 @@ export function createSupervisionMcpToolHandlers(
         const refreshesExecutionAuthority = Boolean(
           reboundIdentity && (assignment?.executionBinding || assignment?.provisioning),
         );
-        const executionAuthorityFencePresent = Boolean(
-          expectedRevision || expectedGeneration !== undefined || evidenceManifestSha256,
+        const coordinationExpectedRevision = expectedRevision || (
+          expectedGeneration !== undefined
+          && !task.currentRevision
+          && !assignment?.auditRevision
+            ? SUPERVISION_UNBOUND_REVISION
+            : ''
         );
-        if (refreshesExecutionAuthority
-          && (!expectedRevision || !Number.isSafeInteger(expectedGeneration) || expectedGeneration! < 0)) {
+        const coordinationCasPresent = Boolean(
+          coordinationExpectedRevision || expectedGeneration !== undefined,
+        );
+        if (coordinationCasPresent
+          && (!coordinationExpectedRevision
+            || !Number.isSafeInteger(expectedGeneration) || expectedGeneration! < 0)) {
+          return err(
+            'validation_failed',
+            'coordination recovery requires an exact revision/generation pair',
+          );
+        }
+        if (refreshesExecutionAuthority && !coordinationCasPresent) {
           return err(
             'validation_failed',
             'coordination execution-authority rebind requires expectedRevision and expectedGeneration',
           );
         }
-        if (!refreshesExecutionAuthority && executionAuthorityFencePresent) {
-          return err(
-            'validation_failed',
-            'coordination revision/evidence fences require an execution-authority rebind',
-          );
+        if (!refreshesExecutionAuthority && evidenceManifestSha256) {
+          return err('validation_failed', 'coordination evidence authority requires an execution-authority rebind');
         }
         const reboundExecutionBinding = refreshesExecutionAuthority
           ? deps.resolveAuditorRecoveryBinding?.(rebindSessionName!)
@@ -1213,9 +1229,11 @@ export function createSupervisionMcpToolHandlers(
           ...(reboundExecutionBinding ? {
             executionBinding: reboundExecutionBinding,
             provisioning: reboundProvisioning,
-            expectedRevision,
-            expectedGeneration: expectedGeneration!,
             ...(evidenceManifestSha256 ? { evidenceManifestSha256 } : {}),
+          } : {}),
+          ...(coordinationCasPresent ? {
+            expectedRevision: coordinationExpectedRevision,
+            expectedGeneration: expectedGeneration!,
           } : {}),
           idempotencyKey,
           reason,

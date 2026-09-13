@@ -37,6 +37,7 @@ import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-ins
 import { getTransportQueueStore } from './transport-queue-store.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../agent/transport-provider.js';
+import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const inFlight = new Map<string, Promise<DelegationReplyIngressResult>>();
@@ -166,6 +167,81 @@ function delegatedPeerAuditResult(
   });
 }
 
+/**
+ * Re-materialize only the reply controller for one exact durable audit round.
+ *
+ * The registry owns the auditor/attempt/revision/identity.  A daemon restart
+ * must not make that authority unsubmitable merely because its display/delivery
+ * row was lost.  This deliberately creates no task, assignment, attempt, or
+ * verdict: it reconstructs the bounded return channel from one exact current
+ * coordinator, implementer and auditor, then the normal matcher re-verifies it.
+ */
+function restoreExactAuditReplyController(input: {
+  taskId: string;
+  assignmentId: string;
+  attemptId: string;
+  revision: string;
+  sender: DelegationReplyBoundIdentity;
+  now: number;
+}): DelegationReplyRecord | undefined {
+  const registry = getSupervisionTaskRegistry();
+  const task = registry.getTaskRecord(input.taskId);
+  const assignments = task ? registry.listAssignments(input.taskId) : [];
+  const auditor = assignments.find((candidate) => candidate.assignmentId === input.assignmentId);
+  if (!task || task.currentRevision !== input.revision
+    || !auditor || auditor.role !== 'auditor'
+    || auditor.auditAttemptId !== input.attemptId
+    || auditor.auditRevision !== input.revision
+    || !identityMatches(auditor.identity, input.sender)
+    || ['cancelled', 'finalized', 'committed', 'pushed'].includes(auditor.status)) return undefined;
+  const finalReceipts = registry.listAuditReceipts(input.taskId).filter((receipt) => (
+    receipt.assignmentId === input.assignmentId
+    && receipt.attemptId === input.attemptId
+    && receipt.revision === input.revision
+    && receipt.receiptKind === 'final'
+  ));
+  if (finalReceipts.length > 0) return undefined;
+  // The attempt belongs to the auditor/controller. Production implementers in
+  // ready_for_audit carry the exact revision and frozen-bundle provenance, but
+  // deliberately do not copy auditAttemptId. Requiring that copy made a lost
+  // controller impossible to restore after restart. Select the one exact
+  // revision target instead and, when present, pin it to the persisted bundle
+  // source so another task participant cannot become the audited authority.
+  const implementers = assignments.filter((candidate) => (
+    candidate.role === 'implementer' && candidate.required
+    && candidate.status === 'ready_for_audit'
+    && candidate.auditRevision === input.revision
+    && (!task.integrationBundle
+      || task.integrationBundle.sourceAssignmentId === candidate.assignmentId)
+  ));
+  const coordinators = assignments.filter((candidate) => (
+    candidate.role === 'coordinator'
+    && !['cancelled', 'finalized', 'committed', 'pushed'].includes(candidate.status)
+    && (!candidate.auditRevision || candidate.auditRevision === input.revision)
+  ));
+  if (implementers.length !== 1 || coordinators.length !== 1) return undefined;
+  const coordinator = coordinators[0]!;
+  const messageId = deterministicAutomaticAuditDeliveryMessageId(
+    input.assignmentId,
+    input.attemptId,
+    Math.max(1, auditor.generation),
+  );
+  return getDelegationReplyStore().create({
+    origin: coordinator.identity,
+    target: auditor.identity,
+    dispatchId: messageId,
+    messageId,
+    purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+    auditAttemptId: input.attemptId,
+    auditRevision: input.revision,
+    auditedSessionName: implementers[0]!.identity.sessionName,
+    taskId: input.taskId,
+    assignmentId: input.assignmentId,
+    coordinatorAssignmentId: coordinator.assignmentId,
+    now: input.now,
+  }).record;
+}
+
 async function submitDelegatedPeerAuditReply(input: {
   envelope: PeerAuditReplyEnvelope;
   sender: SessionRecord;
@@ -180,20 +256,6 @@ async function submitDelegatedPeerAuditReply(input: {
   if (!taskId || !assignmentId || !revision || !receiptKind) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH };
   }
-  let authority = getDelegationReplyStore().matchPendingAuditAuthority({
-    taskId,
-    assignmentId,
-    auditAttemptId: input.envelope.attemptId,
-    auditRevision: revision,
-    sender: senderIdentity,
-    now: input.receivedAt,
-  });
-  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
-  if ((authority.taskId && authority.taskId !== taskId)
-    || (authority.assignmentId && authority.assignmentId !== assignmentId)
-    || (authority.auditRevision && authority.auditRevision !== revision)) {
-    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH };
-  }
   const registry = getSupervisionTaskRegistry();
   const auditAssignment = registry.getAssignment(assignmentId);
   if (!auditAssignment || auditAssignment.taskId !== taskId || auditAssignment.role !== 'auditor'
@@ -205,6 +267,43 @@ async function submitDelegatedPeerAuditReply(input: {
     || auditAssignment.identity.sessionInstanceId !== senderIdentity.sessionInstanceId
     || auditAssignment.identity.runtimeEpoch !== senderIdentity.runtimeEpoch) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH };
+  }
+  let authority = getDelegationReplyStore().matchPendingAuditAuthority({
+    taskId,
+    assignmentId,
+    auditAttemptId: input.envelope.attemptId,
+    auditRevision: revision,
+    sender: senderIdentity,
+    now: input.receivedAt,
+  });
+  if (!authority) {
+    const exactClosedReceipt = registry.listAuditReceipts(taskId).some((receipt) => (
+      receipt.assignmentId === assignmentId
+      && receipt.attemptId === input.envelope.attemptId
+      && receipt.revision === revision
+      && receipt.receiptKind === 'final'
+    ));
+    if (exactClosedReceipt || ['cancelled', 'finalized'].includes(auditAssignment.status)) {
+      return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.RECEIPT_CLOSED };
+    }
+    restoreExactAuditReplyController({
+      taskId, assignmentId, attemptId: input.envelope.attemptId,
+      revision, sender: senderIdentity, now: input.receivedAt,
+    });
+    authority = getDelegationReplyStore().matchPendingAuditAuthority({
+      taskId,
+      assignmentId,
+      auditAttemptId: input.envelope.attemptId,
+      auditRevision: revision,
+      sender: senderIdentity,
+      now: input.receivedAt,
+    });
+  }
+  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
+  if ((authority.taskId && authority.taskId !== taskId)
+    || (authority.assignmentId && authority.assignmentId !== assignmentId)
+    || (authority.auditRevision && authority.auditRevision !== revision)) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH };
   }
   if (!identityMatches(authority.target, senderIdentity)) {
     authority = getDelegationReplyStore().rebindAssignmentTarget({
