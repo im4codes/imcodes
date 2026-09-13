@@ -24,6 +24,7 @@ vi.mock('../../src/hooks/useMachines.js', () => ({
 }));
 
 import { ControlledNodeQuickMenu } from '../../src/components/ControlledNodeQuickMenu.js';
+import { ControlledNodeMachineMenu } from '../../src/components/ControlledNodeMachineMenu.js';
 
 afterEach(() => {
   cleanup();
@@ -43,6 +44,21 @@ function node(overrides: Partial<MachineListItem>): MachineListItem {
     capabilities: [REMOTE_DESKTOP_CAPABILITY],
     ...overrides,
   };
+}
+
+function pointerPress(target: EventTarget, pointerType: 'mouse' | 'touch'): void {
+  // jsdom has no PointerEvent constructor. Testing Library's pointerDown
+  // fallback also omits `composed`, so it never reaches the document capture
+  // listener under the component CI config. MouseEvent preserves the browser
+  // event path; pointerType supplies the only pointer-specific detail needed.
+  const event = new MouseEvent('pointerdown', {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    button: 0,
+  });
+  Object.defineProperty(event, 'pointerType', { configurable: true, value: pointerType });
+  fireEvent(target, event);
 }
 
 describe('ControlledNodeQuickMenu', () => {
@@ -106,13 +122,101 @@ describe('ControlledNodeQuickMenu', () => {
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
   });
 
-  it('closes on an outside pointer press', async () => {
+  it.each(['mouse', 'touch'] as const)('closes on an outside %s pointer press', async (pointerType) => {
     machines = [node({})];
     render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
     expect(await screen.findByRole('menu')).toBeTruthy();
-    fireEvent.pointerDown(document.body);
+    pointerPress(document.body, pointerType);
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it.each(['mouse', 'touch'] as const)('keeps the menu open for inside %s pointer presses', async (pointerType) => {
+    machines = [node({})];
+    render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+    const row = await screen.findByRole('menuitem', { name: /Desktop One/ });
+
+    pointerPress(row, pointerType);
+
+    expect(screen.getByRole('menu')).toBeTruthy();
+  });
+
+  it('closes in capture phase when an outside control stops bubbling', async () => {
+    machines = [node({})];
+    const outside = document.createElement('button');
+    outside.addEventListener('pointerdown', (event) => event.stopPropagation());
+    document.body.appendChild(outside);
+    try {
+      render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} />);
+      fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+      expect(await screen.findByRole('menu')).toBeTruthy();
+
+      pointerPress(outside, 'mouse');
+
+      await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    } finally {
+      outside.remove();
+    }
+  });
+
+  it('removes dismissal listeners while closed and reinstalls them on remount', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    const anchorRef = { current: anchor };
+    const onClose = vi.fn();
+    const props = {
+      anchorRef,
+      open: true,
+      onClose,
+      onSelect: () => {},
+    };
+    const view = render(<ControlledNodeMachineMenu {...props} />);
+
+    expect(await screen.findByRole('menu')).toBeTruthy();
+    pointerPress(document.body, 'mouse');
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    view.rerender(<ControlledNodeMachineMenu {...props} open={false} />);
+    pointerPress(document.body, 'touch');
+    expect(onClose, 'closed menu listener must be removed').toHaveBeenCalledTimes(1);
+
+    view.rerender(<ControlledNodeMachineMenu {...props} />);
+    expect(await screen.findByRole('menu')).toBeTruthy();
+    pointerPress(document.body, 'touch');
+    expect(onClose, 'reopened menu gets exactly one fresh listener').toHaveBeenCalledTimes(2);
+    anchor.remove();
+  });
+
+  it('rebinds dismissal to the latest onClose callback', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    const anchorRef = { current: anchor };
+    const firstClose = vi.fn();
+    const latestClose = vi.fn();
+    const view = render(
+      <ControlledNodeMachineMenu
+        anchorRef={anchorRef}
+        open
+        onClose={firstClose}
+        onSelect={() => {}}
+      />,
+    );
+    expect(await screen.findByRole('menu')).toBeTruthy();
+
+    view.rerender(
+      <ControlledNodeMachineMenu
+        anchorRef={anchorRef}
+        open
+        onClose={latestClose}
+        onSelect={() => {}}
+      />,
+    );
+    pointerPress(document.body, 'mouse');
+
+    expect(firstClose).not.toHaveBeenCalled();
+    expect(latestClose).toHaveBeenCalledTimes(1);
+    anchor.remove();
   });
 
   it('portals into the fullscreen element when it holds the trigger', async () => {
