@@ -320,6 +320,7 @@ source_set("macos_permission_onboarding") {
     "ApplicationServices.framework",
     "CoreGraphics.framework",
     "Foundation.framework",
+    "Security.framework",
   ]
 }
 

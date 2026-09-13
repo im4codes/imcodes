@@ -24,9 +24,16 @@ import {
   type MacosRemoteDesktopGlobalLaunchAgentDefinition,
   type MacosRemoteDesktopGlobalLaunchAgentLoadReceipt,
   type MacosRemoteDesktopGlobalLaunchAgentRollback,
+  type MacosRemoteDesktopLauncherSpec,
   type MacosRemoteDesktopLifecycleEvent,
 } from './macos-remote-desktop-launch-agent.js';
 import { defaultCredentialPath } from './enrollment.js';
+import { stat } from 'node:fs/promises';
+import { installMacosAideskAppFromArchive } from './macos-computer-use.js';
+import {
+  controlledNodeComputerUseHelperFilename,
+  CONTROLLED_NODE_OS_MAC,
+} from '../../shared/controlled-node-artifacts.js';
 import {
   resolveMacosUserSession,
   resolveMacosRemoteDesktopGraphicalSessionAuthority,
@@ -58,7 +65,8 @@ import { randomBytes } from 'node:crypto';
 import {
   executeMacosRemoteDesktopResponsibleCommand,
   macosRemoteDesktopResponsibleCommandInvocation,
-  resolveMacosRemoteDesktopBundledLaunchAgentExecutable,
+  MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH,
+  resolveMacosRemoteDesktopResponsibleLauncher,
   type MacosRemoteDesktopResponsibleCommandOptions,
   type MacosRemoteDesktopResponsibleCommandResult,
 } from './macos-remote-desktop-responsible-spawn.js';
@@ -165,7 +173,13 @@ export interface MacosRemoteDesktopProductionDependencies {
   /** Test seam for choosing where the per-user agent runs from. */
   resolveLaunchAgentExecutable?: (
     artifact: VerifiedMacosRemoteDesktopArtifact,
-  ) => Promise<string | null>;
+  ) => Promise<string | MacosRemoteDesktopLauncherSpec | null>;
+  /**
+   * Installs aiDesk.to by IM.codes.app from the archive the node delivered.
+   * Production installs it when no responsible app path is overridden; the
+   * seam lets tests observe or skip it.
+   */
+  installResponsibleApp?: () => Promise<void>;
   /**
    * Start the virtual-display authority link for each session. Off unless asked
    * for. The session does not need it -- capture and input run on the real
@@ -806,6 +820,36 @@ export function macosRemoteDesktopNativeCommandInvocation(
   return macosRemoteDesktopResponsibleCommandInvocation(user, appPath, args, output);
 }
 
+/**
+ * aiDesk.to by IM.codes.app arrives with the node's other components as an
+ * archive and nothing else ever unpacks it, so without this the responsible
+ * launch had no app and every native command failed. Installed (or confirmed)
+ * once per delivered archive; a failure is reported and retried next launch.
+ */
+function createMacosAideskAppInstaller(
+  onError: ((error: unknown) => void) | undefined,
+): () => Promise<void> {
+  const archive = join(
+    dirname(defaultCredentialPath('darwin')),
+    'computer-use-helper',
+    controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC),
+  );
+  const installRoot = dirname(MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH);
+  let installedKey: string | null = null;
+  let pending: Promise<void> | null = null;
+  return async () => {
+    const info = await stat(archive).catch(() => null);
+    if (!info?.isFile()) return;
+    const key = `${info.size}:${info.mtimeMs}:${info.ino}`;
+    if (installedKey === key) return;
+    pending ??= installMacosAideskAppFromArchive(archive, installRoot)
+      .then(() => { installedKey = key; })
+      .catch((error: unknown) => { onError?.(error); })
+      .finally(() => { pending = null; });
+    await pending;
+  };
+}
+
 async function defaultExecuteNativeCommand(
   user: MacosUserSession,
   component: VerifiedMacosRemoteDesktopComponent,
@@ -933,13 +977,21 @@ export function createMacosRemoteDesktopProductionDependencies(
   const storeRoot = dependencies.storeRoot ?? defaultMacosRemoteDesktopArtifactStoreRoot(arch);
   const selectArtifact = dependencies.selectArtifact ?? selectMacosRemoteDesktopArtifact;
   const resolveUser = dependencies.resolveUserSession ?? resolveMacosUserSession;
+  const installResponsibleApp = dependencies.installResponsibleApp
+    ?? (dependencies.responsibleAppPath
+      ? async () => {}
+      : createMacosAideskAppInstaller(dependencies.onBackgroundError));
+  const executeResponsibleCommand: MacosRemoteDesktopResponsibleCommandRunner = async (options) => {
+    await installResponsibleApp();
+    return await (dependencies.executeResponsibleCommand ?? executeMacosRemoteDesktopResponsibleCommand)(options);
+  };
   const executeNativeCommand = dependencies.executeNativeCommand
     ?? ((user, component, args) => defaultExecuteNativeCommand(
       user,
       component,
       args,
       dependencies.responsibleAppPath,
-      dependencies.executeResponsibleCommand,
+      executeResponsibleCommand,
     ));
   const launchNativeCleanup = dependencies.launchNativeCleanup
     ?? ((user, component, args) => defaultLaunchNativeCleanup(
@@ -947,7 +999,7 @@ export function createMacosRemoteDesktopProductionDependencies(
       component,
       args,
       dependencies.responsibleAppPath,
-      dependencies.executeResponsibleCommand,
+      executeResponsibleCommand,
     ));
   let activeArtifact: VerifiedMacosRemoteDesktopArtifact | null = null;
   let activeUser: MacosUserSession | null = null;
@@ -1029,9 +1081,12 @@ export function createMacosRemoteDesktopProductionDependencies(
     // carries this exact component set, so the one grant the person gave that
     // app is the grant capture and input run under.
     resolveLaunchAgentExecutable: dependencies.resolveLaunchAgentExecutable
-      ?? ((artifact) => resolveMacosRemoteDesktopBundledLaunchAgentExecutable(artifact, {
-        appPath: dependencies.responsibleAppPath,
-      })),
+      ?? (async (artifact) => {
+        await installResponsibleApp();
+        return await resolveMacosRemoteDesktopResponsibleLauncher(artifact, {
+          appPath: dependencies.responsibleAppPath,
+        });
+      }),
     /**
      * The stock virtual-display authority.
      *
@@ -1170,7 +1225,7 @@ export function createMacosRemoteDesktopProductionDependencies(
           // answers, up to its own bound. Awaiting it under the short command
           // timeout reported a failure within seconds while the prompt was on
           // screen, and left the process behind.
-          await (dependencies.executeResponsibleCommand ?? executeMacosRemoteDesktopResponsibleCommand)({
+          await executeResponsibleCommand({
             user,
             component: artifact.components.worker,
             args: [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.requestPermissions],

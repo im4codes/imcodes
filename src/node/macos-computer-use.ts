@@ -272,6 +272,45 @@ async function publishAppBundle(
   return appPath;
 }
 
+/**
+ * Installs the signed app from the archive the node delivered into
+ * `installRoot` (root-owned, 0755), reusing the verified copy already there
+ * when the archive has not changed. Returns null when no archive was delivered.
+ */
+export async function installMacosAideskAppFromArchive(
+  sourceArchive: string,
+  installRoot: string,
+  options: Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'> = {},
+): Promise<string | null> {
+  if (!await isRegularFile(sourceArchive)) return null;
+  await mkdir(installRoot, { recursive: true, mode: 0o755 });
+  const rootStat = await lstat(installRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error('computer_use_runtime_root_not_directory');
+  }
+  await chmod(installRoot, 0o755);
+  const extract = options.extractAppArchive ?? defaultExtractAppArchive;
+  const runningAsRoot = process.geteuid?.() === 0;
+  if (runningAsRoot) {
+    await chown(installRoot, 0, 0);
+    // An app left behind owned by someone else is never reused, whatever its digest.
+    const installed = await lstat(join(installRoot, MACOS_AIDESK_APP_NAME)).catch(() => null);
+    if (installed && installed.uid !== 0) {
+      await rm(join(installRoot, MACOS_COMPUTER_USE_SOURCE_DIGEST), { force: true });
+    }
+  }
+  return await publishAppBundle(sourceArchive, installRoot, {
+    verifyAppBundle: options.verifyAppBundle ?? verifyMacosComputerUseAppBundle,
+    // ditto keeps the archive's owners, which name whoever built it. The app
+    // aiDesk launches helpers from must be root's alone before it is verified
+    // and published, or that user could swap its contents afterwards.
+    extractAppArchive: async (archivePath, destinationRoot) => {
+      await extract(archivePath, destinationRoot);
+      if (runningAsRoot) await execFileText('/usr/sbin/chown', ['-R', 'root:wheel', destinationRoot]);
+    },
+  });
+}
+
 export async function prepareMacosComputerUseRuntime(
   sourceNodeExecutable: string,
   sourceOpenComputerUseArchive: string | undefined,

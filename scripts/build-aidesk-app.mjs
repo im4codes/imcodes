@@ -163,6 +163,8 @@ function compileAgentSlice(arch, outPath) {
     '-framework', 'ApplicationServices',
     '-framework', 'CoreGraphics',
     '-framework', 'Foundation',
+    // Signature checks on helpers launched from the node's component store.
+    '-framework', 'Security',
     '-o', outPath,
   ]);
 }

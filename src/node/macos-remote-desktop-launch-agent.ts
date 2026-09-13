@@ -169,10 +169,14 @@ export interface MacosRemoteDesktopLaunchAgentSupervisorDependencies {
     definition: MacosRemoteDesktopLaunchAgentDefinition,
   ) => Promise<void>;
   lifecycleSource?: MacosRemoteDesktopLifecycleSource;
-  /** Where the agent is run from; null or absent means the component store. */
+  /**
+   * Where the agent is run from: aiDesk's main executable, optionally with the
+   * leading arguments that locate the helpers. Null or absent means the
+   * component store's own agent.
+   */
   resolveLauncherExecutable?: (
     artifact: VerifiedMacosRemoteDesktopArtifact,
-  ) => Promise<string | null>;
+  ) => Promise<string | MacosRemoteDesktopLauncherSpec | null>;
   onBackgroundError?: (error: unknown) => void;
   now?: () => number;
   maxCrashRestarts?: number;
@@ -240,9 +244,15 @@ function plistDictionary(values: Readonly<Record<string, string>>, indent: strin
   ];
 }
 
+/** A launcher executable and the leading arguments it needs. */
+export interface MacosRemoteDesktopLauncherSpec {
+  executablePath: string;
+  arguments: readonly string[];
+}
+
 function buildPlist(
   user: MacosUserSession,
-  executablePath: string,
+  programArguments: readonly string[],
   environment: Readonly<Record<string, string>>,
 ): string {
   const lines = [
@@ -253,7 +263,7 @@ function buildPlist(
     '  <key>Label</key>',
     plistString(MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.label, '  '),
     '  <key>ProgramArguments</key>',
-    ...plistArray([executablePath, LAUNCH_AGENT_ARGUMENT], '  '),
+    ...plistArray(programArguments, '  '),
     '  <key>EnvironmentVariables</key>',
     ...plistDictionary(environment, '  '),
     '  <key>WorkingDirectory</key>',
@@ -380,6 +390,12 @@ export function buildMacosRemoteDesktopLaunchAgentDefinition(
      * resolveMacosRemoteDesktopBundledLaunchAgentExecutable).
      */
     launcherExecutablePath?: string | null;
+    /**
+     * Leading arguments for the launcher (for aiDesk: the component store
+     * directory). Ignored unless a launcher is used, and refused if any could
+     * be read as a separate plist token.
+     */
+    launcherArguments?: readonly string[];
   } = {},
 ): MacosRemoteDesktopLaunchAgentDefinition {
   assertMacosUserSession(user);
@@ -411,7 +427,16 @@ export function buildMacosRemoteDesktopLaunchAgentDefinition(
   });
   const domainTarget = `gui/${user.uid}`;
   const serviceTarget = `${domainTarget}/${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.label}`;
-  const programArguments = Object.freeze([codeIdentity.executablePath, LAUNCH_AGENT_ARGUMENT]);
+  const launcherArguments = codeIdentity !== verifiedIdentity
+    && (options.launcherArguments ?? []).every((argument) => argument.length > 0
+      && !/[\0\r\n]/u.test(argument))
+    ? options.launcherArguments ?? []
+    : [];
+  const programArguments = Object.freeze([
+    codeIdentity.executablePath,
+    ...launcherArguments,
+    LAUNCH_AGENT_ARGUMENT,
+  ]);
   return Object.freeze({
     user: Object.freeze({ ...user }),
     label: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.label,
@@ -427,7 +452,7 @@ export function buildMacosRemoteDesktopLaunchAgentDefinition(
     bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
     teamId: codeIdentity.teamId,
     designatedRequirement: codeIdentity.designatedRequirement,
-    plist: buildPlist(user, codeIdentity.executablePath, environment),
+    plist: buildPlist(user, programArguments, environment),
   });
 }
 
@@ -954,9 +979,15 @@ export class MacosRemoteDesktopLaunchAgentSupervisor {
 
     // Resolved before the launch is minted, so a slow app verification cannot
     // hold a challenge open, and re-checked against the transition afterwards.
-    const launcherExecutablePath = await (this.dependencies.resolveLauncherExecutable?.(
+    const launcher = await (this.dependencies.resolveLauncherExecutable?.(
       this.dependencies.artifact,
     ) ?? Promise.resolve(null)).catch(() => null);
+    const launcherExecutablePath = typeof launcher === 'string'
+      ? launcher
+      : launcher?.executablePath ?? null;
+    const launcherArguments = launcher !== null && typeof launcher === 'object'
+      ? launcher.arguments
+      : [];
     if (epoch !== this.transitionEpoch || this.closed || this.suspended || this.locked) return null;
     const launch = this.dependencies.beginIpcLaunch();
     if (launch.workerGeneration <= this.lastWorkerGeneration) {
@@ -967,7 +998,7 @@ export class MacosRemoteDesktopLaunchAgentSupervisor {
       user,
       this.dependencies.artifact,
       launch,
-      { launcherExecutablePath },
+      { launcherExecutablePath, launcherArguments },
     );
     const active: ActiveLaunch = { definition, launched: false };
     this.active = active;

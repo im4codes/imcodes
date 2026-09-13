@@ -18,6 +18,16 @@ inline constexpr char kAiDeskComputerUseHelperName[] = "OpenComputerUse";
 inline constexpr char kAiDeskLaunchAgentArgument[] =
     "--macos-remote-desktop-launch-agent";
 
+// Prefix of an optional first argument naming the root-owned component store
+// directory to launch the remote-desktop helper from, instead of the bundle's
+// Contents/Helpers. The node installs the signed component set there; the app
+// bundle it ships is only the permission-responsible launcher. The directory,
+// every ancestor, and the helper file must be root-owned and not writable by
+// anyone else, and the helper must carry the expected Developer ID signature,
+// or nothing is launched.
+inline constexpr char kAiDeskComponentDirectoryArgumentPrefix[] =
+    "--aidesk-component-dir=";
+
 enum class AiDeskProductHelper {
   kComputerUse,
   kRemoteDesktopWorker,

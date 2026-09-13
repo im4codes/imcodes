@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  installMacosAideskAppFromArchive,
   MACOS_AIDESK_APP_NAME,
   macosComputerUseAppBundleForExecutable,
   prepareMacosComputerUseRuntime,
@@ -99,6 +100,38 @@ describe('macOS Computer Use runtime boundary', () => {
     );
     expect(await readFile(runtime.openComputerUseExecutable, 'utf8')).toBe('aidesk-v1');
     await expect(lstat(join(runtimeRoot, 'Open Computer Use.app'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('installs the delivered aiDesk.to app once per archive and does nothing without one', async () => {
+    const dir = await tempDir();
+    const installRoot = join(dir, 'aidesk');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
+    const extractAppArchive = vi.fn(async (_archive: string, destination: string) => {
+      await writeExtractedAiDesk(destination, 'aidesk-store-launcher');
+    });
+    const verifyAppBundle = vi.fn(async () => {});
+
+    await expect(installMacosAideskAppFromArchive(sourceArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    })).resolves.toBeNull();
+    expect(extractAppArchive).not.toHaveBeenCalled();
+
+    await writeFile(sourceArchive, 'aidesk-archive-v1', { mode: 0o644 });
+    const installed = await installMacosAideskAppFromArchive(sourceArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    });
+    expect(installed).toBe(join(installRoot, MACOS_AIDESK_APP_NAME));
+    expect(await readFile(join(installed!, 'Contents', 'MacOS', 'aidesk-agent'), 'utf8'))
+      .toBe('aidesk-store-launcher');
+    expect(((await lstat(installRoot)).mode & 0o777)).toBe(0o755);
+
+    await expect(installMacosAideskAppFromArchive(sourceArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    })).resolves.toBe(installed);
+    expect(extractAppArchive).toHaveBeenCalledOnce();
   });
 
   it('publishes the complete upstream-signed app without rebuilding or re-signing it', async () => {

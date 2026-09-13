@@ -916,6 +916,34 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     expect(launches).toHaveLength(launchCount);
   });
 
+  it('installs the delivered aiDesk.to app before any responsible launch', async () => {
+    const verified = artifact();
+    const storeRoot = await trustedStore(verified.releaseName!);
+    const order: string[] = [];
+    const installResponsibleApp = vi.fn(async () => { order.push('install'); });
+    const executeResponsibleCommand = vi.fn(async () => {
+      order.push('launch');
+      return { stdout: `${JSON.stringify(snapshot())}\n`, stderr: '' };
+    });
+    const options = stockFactory({
+      platform: 'darwin',
+      arch: 'arm64',
+      storeRoot,
+      responsibleAppPath: '/missing/aiDesk.to by IM.codes.app',
+      installResponsibleApp,
+      selectArtifact: vi.fn(async () => verified),
+      resolveUserSession: async () => USER,
+      executeResponsibleCommand,
+    })!;
+    await options.resolveVerifiedArtifact();
+    await options.resolveUserSession();
+
+    await options.inspectReadiness(verified, USER);
+    expect(order).toEqual(['install', 'launch']);
+    await expect(options.resolveLaunchAgentExecutable?.(verified)).resolves.toBeNull();
+    expect(installResponsibleApp).toHaveBeenCalledTimes(2);
+  });
+
   it('uses one responsibility-safe runner for readiness and generation cleanup', async () => {
     const verified = artifact();
     const storeRoot = await trustedStore(verified.releaseName!);
