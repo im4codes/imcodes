@@ -845,7 +845,8 @@ describe('ChatView', () => {
     const revokeObjectURL = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const opened = { opener: window } as unknown as Window;
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(opened);
 
     try {
       const wsListeners = new Set<(msg: any) => void>();
@@ -887,7 +888,8 @@ describe('ChatView', () => {
       });
 
       expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank', 'noopener,noreferrer');
+      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank');
+      expect(opened.opener).toBeNull();
       expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
 
       vi.runOnlyPendingTimers();
