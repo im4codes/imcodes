@@ -324,6 +324,7 @@ export const REMOTE_DESKTOP_AUDIT_EVENT = {
   STOPPED: 'remote_desktop.stopped',
   REVOKED: 'remote_desktop.revoked',
   FAILED: 'remote_desktop.failed',
+  AUTO_UNLOCK_SUCCEEDED: 'remote_desktop.auto_unlock_succeeded',
 } as const;
 
 export const REMOTE_DESKTOP_LIMITS = {
@@ -628,6 +629,12 @@ export interface RemoteDesktopStatus {
   signInScreen?: boolean;
   /** The node holds a stored sign-in secret it can be asked to type. */
   unlockAvailable?: boolean;
+  /**
+   * The node's built-in auto unlock typed its stored sign-in secret for this
+   * session and the lock screen then ended. Sticky for the session, so a status
+   * replay repeats it; the Server notifies the owner at most once per route.
+   */
+  autoUnlockSucceeded?: true;
   /** Present only while input is off, naming what it is waiting on. */
   inputBlocked?: RemoteDesktopInputBlocked;
 }
@@ -1028,8 +1035,9 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
       : invalid();
   }
   if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'inputBlocked', 'atomicButtonClick', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'autoUnlockSucceeded', 'inputBlocked', 'atomicButtonClick', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
       || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
+      || (value.autoUnlockSucceeded !== undefined && value.autoUnlockSucceeded !== true)
       || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
       || (value.atomicButtonClick !== undefined && typeof value.atomicButtonClick !== 'boolean')
       || (value.peerConnected !== undefined && typeof value.peerConnected !== 'boolean')

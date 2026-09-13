@@ -643,6 +643,9 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   // A reply from the daemon. `secret` is revealed only for a requested unlock
   // and is wiped here after it has been typed.
   void OnUnlockReply(bool configured, std::string sign_in);
+  // Worker-loop tick: after typing the stored sign-in secret, watch for the
+  // lock to end within the success window and report it once.
+  void ObserveTypedUnlock();
   void SignalTerminal(std::string_view reason);
   void OnSessionTerminal(const rd::common::TerminalError& error);
   void OnQualityTarget(const rd::common::TransportCallbackStamp& stamp,
@@ -691,6 +694,9 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   std::mutex quality_mutex_;
   bool unlock_configured_ = false;
   bool unlock_pending_ = false;
+  bool unlock_typed_ = false;
+  std::int64_t unlock_typed_at_ms_ = 0;
+  bool typed_unlock_succeeded_ = false;
   std::vector<std::int64_t> unlock_attempts_ms_;
   std::function<bool(bool)> unlock_requester_;
   std::optional<
@@ -1496,7 +1502,31 @@ bool WorkerTransportSink::EmitStatus() {
     else
       root["inputBlocked"] = imcodes::rd::kInputBlockedInputUnavailable;
   }
+  if (typed_unlock_succeeded_)
+    root["autoUnlockSucceeded"] = true;
   return emitter_->Emit(root);
+}
+
+void WorkerTransportSink::ObserveTypedUnlock() {
+  if (!unlock_typed_)
+    return;
+  const std::int64_t now_ms = SampleNow().monotonic_ms;
+  // Only a signed-in console counts as unlocked; an inactive console (another
+  // user switched in) is not this unlock succeeding.
+  const bool locked =
+      std::strcmp(WorkerReadinessProbe::ProbeConsoleSessionState(),
+                  macos::kNativeSessionStateActiveUnlocked) != 0;
+  if (imcodes::rd::IsTypedUnlockSuccess(true, locked, true, unlock_typed_at_ms_,
+                                       now_ms)) {
+    unlock_typed_ = false;
+    if (!typed_unlock_succeeded_) {
+      typed_unlock_succeeded_ = true;
+      (void)EmitStatus();
+    }
+  } else if (now_ms - unlock_typed_at_ms_ >
+             imcodes::rd::kTypedUnlockWindowMs) {
+    unlock_typed_ = false;
+  }
 }
 
 bool WorkerTransportSink::CorrelationMatches(
@@ -1586,6 +1616,8 @@ void WorkerTransportSink::OnUnlockReply(bool configured, std::string sign_in) {
     if (pending && on_lock_screen && macos::DecodeBase64Url(sign_in, &decoded)) {
       TypeSignIn(decoded);
       std::cerr << "macos_remote_desktop_worker_unlock_typed\n";
+      unlock_typed_ = true;
+      unlock_typed_at_ms_ = SampleNow().monotonic_ms;
     }
     WipeString(&decoded);
     WipeString(&sign_in);
@@ -2614,6 +2646,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       status = EX_UNAVAILABLE;
       break;
     }
+    sink.ObserveTypedUnlock();
     sink.DrainQualityTarget();
 
     // Outbound media progress, once a second -- the Windows worker's stats

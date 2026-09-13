@@ -5,6 +5,8 @@ import type { Database } from '../src/db/client.js';
 import type { ControlledMachineAccessRow } from '../src/share/machine-access.js';
 import {
   RemoteDesktopRouter,
+  type RemoteDesktopAutoUnlockEvent,
+  type RemoteDesktopRouterHooks,
   type RemoteDesktopRouteRegistry,
   type RemoteDesktopRouteRegistryIdentity,
 } from '../src/ws/remote-desktop-router.js';
@@ -21,6 +23,7 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  validateRemoteDesktopDaemonMessage,
 } from '../../shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
@@ -89,6 +92,7 @@ function fixture(options: {
   routeRegistry?: RemoteDesktopRouteRegistry;
   routeAuthority?: RemoteDesktopRouteRegistryIdentity['authority'];
   allocateRouteGeneration?: () => Promise<number>;
+  autoUnlockSucceeded?: RemoteDesktopRouterHooks['autoUnlockSucceeded'];
 } = {}) {
   const browserA = {} as WebSocket;
   const browserB = {} as WebSocket;
@@ -150,6 +154,7 @@ function fixture(options: {
     resolveAccess: async (_db, userId) => resolver(userId),
     routeRegistry,
     audit: (event, fields) => { audits.push({ event, fields }); },
+    ...(options.autoUnlockSucceeded ? { autoUnlockSucceeded: options.autoUnlockSucceeded } : {}),
   });
   return {
     router,
@@ -456,6 +461,43 @@ describe('RemoteDesktopRouter', () => {
       error: REMOTE_DESKTOP_ERROR.SESSION_LIMIT,
       retryable: true,
     });
+  });
+
+  it('notifies built-in auto unlock success once per connection, never on replay or without the fact', async () => {
+    const events: RemoteDesktopAutoUnlockEvent[] = [];
+    const f = fixture({ autoUnlockSucceeded: (event) => { events.push(event); } });
+    const first = await authorize(f);
+    const status = (authority: typeof first, extra: Record<string, unknown> = {}) => f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      inputEnabled: false,
+      ...extra,
+    }, 7);
+    // Sign-in screen, unlock available, manual/local unlock: no fact, no notification.
+    status(first, { signInScreen: true, unlockAvailable: true });
+    status(first);
+    expect(events).toEqual([]);
+    // The worker reports success and then repeats it on every later status.
+    status(first, { autoUnlockSucceeded: true });
+    status(first, { autoUnlockSucceeded: true });
+    status(first, { autoUnlockSucceeded: true, signInScreen: false });
+    expect(events).toEqual([expect.objectContaining({
+      serverId: 'controlled-win', sessionId: first.sessionId, userId: 'owner-user',
+    })]);
+    // A genuinely new connection notifies once again.
+    const second = await authorize(f, f.browserB, 'owner-user', 'request_auto_unlock_second_000001');
+    expect(second.sessionId).not.toBe(first.sessionId);
+    status(second, { autoUnlockSucceeded: true });
+    status(second, { autoUnlockSucceeded: true });
+    expect(events.map((event) => event.sessionId)).toEqual([first.sessionId, second.sessionId]);
+    // Only `true` is a valid fact.
+    expect(validateRemoteDesktopDaemonMessage({
+      type: REMOTE_DESKTOP_MSG.STATUS, ...first, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1, state: REMOTE_DESKTOP_STATE.DIRECT, inputEnabled: false, autoUnlockSucceeded: false,
+    }).ok).toBe(false);
   });
 
   it('caps audit output even when a worker churns bounded status metadata', async () => {

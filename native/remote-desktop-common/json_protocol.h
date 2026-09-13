@@ -42,6 +42,22 @@ inline constexpr char kWorkerCrashType[] = "remote_desktop.worker_crash";
 // secret. Content-free by design; it records that it happened, never what.
 inline constexpr char kAutoUnlockAttemptType[] =
     "remote_desktop.auto_unlock_attempt";
+// How long after the worker typed the stored sign-in secret the lock may end
+// and still count as the built-in auto unlock succeeding. The lock normally
+// ends within seconds of Enter; a later unlock is someone else's.
+inline constexpr int64_t kTypedUnlockWindowMs = 20'000;
+
+// A lock -> unlock edge is the built-in auto unlock succeeding only when the
+// worker typed the stored secret during that lock, recently enough.
+inline constexpr bool IsTypedUnlockSuccess(bool was_locked,
+                                          bool locked,
+                                          bool secret_typed_this_lock,
+                                          int64_t typed_at_ms,
+                                          int64_t now_ms) {
+  return was_locked && !locked && secret_typed_this_lock &&
+         now_ms >= typed_at_ms &&
+         now_ms - typed_at_ms <= kTypedUnlockWindowMs;
+}
 inline constexpr char kPrepareType[] = "remote_desktop.prepare";
 inline constexpr char kOfferType[] = "remote_desktop.offer";
 inline constexpr char kAnswerType[] = "remote_desktop.answer";

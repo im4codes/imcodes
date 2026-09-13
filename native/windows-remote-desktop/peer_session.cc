@@ -1647,7 +1647,14 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
   }
   if (sign_in_screen_) root["signInScreen"] = true;
   if (unlock_available_) root["unlockAvailable"] = true;
+  if (auto_unlock_succeeded_) root["autoUnlockSucceeded"] = true;
   emit_(root);
+}
+
+void PeerSession::MarkAutoUnlockSucceeded() {
+  if (closed_ || auto_unlock_succeeded_) return;
+  auto_unlock_succeeded_ = true;
+  SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());
 }
 
 void PeerSession::SetSignInState(bool sign_in_screen, bool unlock_available) {

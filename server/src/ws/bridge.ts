@@ -69,6 +69,7 @@ import {
 } from './machine-exec-registry.js';
 import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
 import { resolvePendingAutoUnlock } from './auto-unlock-registry.js';
+import { notifyRemoteDesktopAutoUnlock } from '../services/remote-desktop-auto-unlock-notification.js';
 import { validateControlledNodeAutoUnlockResult } from '../../../shared/controlled-node-auto-unlock.js';
 import {
   NODE_ROLE,
@@ -1871,6 +1872,12 @@ export class WsBridge {
         details,
       }, db);
     },
+    autoUnlockSucceeded: (event) => {
+      const db = this.db;
+      const env = this.pushEnv;
+      if (!db || !env) return;
+      void notifyRemoteDesktopAutoUnlock(db, env, event);
+    },
   });
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
@@ -1889,6 +1896,8 @@ export class WsBridge {
   /** Content-bearing timeline events discarded because nobody was subscribed. */
   private timelineNoSubscriberDrops = 0;
   private lastTimelineNoSubscriberLogAt = 0;
+  /** Push credentials of the daemon connection, for owner security pushes. */
+  private pushEnv: Env | null = null;
   private pendingIdlePushes = new Map<string, {
     timer: ReturnType<typeof setTimeout> | null;
     db: Database;
@@ -4265,6 +4274,7 @@ export class WsBridge {
 
   handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
     this.db = db;
+    this.pushEnv = env;
     this.directFileTransferTicketSigningKey = env.JWT_SIGNING_KEY;
     // Production startup already enforces a strong JWT_SIGNING_KEY. Some
     // narrowly-scoped bridge tests and embedded callers intentionally omit it;

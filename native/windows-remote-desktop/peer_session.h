@@ -83,6 +83,9 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
    * a stored secret can actually answer it.
    */
   void SetSignInState(bool sign_in_screen, bool unlock_available);
+  // The built-in auto unlock succeeded while this session was controlling.
+  // Sticky: every later status repeats it; the Server notifies once per route.
+  void MarkAutoUnlockSucceeded();
   bool protected_content_masked() const;
   bool closed() const { return closed_.load(); }
   void CheckMediaProgress();
@@ -218,6 +221,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   int64_t video_gate_deadline_ms_ = 0;
   bool sign_in_screen_ = false;
   bool unlock_available_ = false;
+  bool auto_unlock_succeeded_ = false;
   /** Last input readiness reported, so only changes are pushed. */
   bool reported_input_ready_ = false;
   webrtc::Thread* const signaling_thread_;

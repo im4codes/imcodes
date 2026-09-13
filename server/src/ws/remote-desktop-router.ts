@@ -117,7 +117,21 @@ export interface RemoteDesktopRouterHooks {
   supportsDefaultShieldedRoute?(): boolean;
   routeRegistry?: RemoteDesktopRouteRegistry;
   audit?(event: string, fields: Readonly<Record<string, string | number | boolean>>): void;
+  /**
+   * The node's built-in auto unlock succeeded for this route. Called at most
+   * once per route (one logical connection), however often the worker repeats
+   * it, across browser resume and daemon replacement of the same route.
+   */
+  autoUnlockSucceeded?(event: RemoteDesktopAutoUnlockEvent): void;
   now?(): number;
+}
+
+export interface RemoteDesktopAutoUnlockEvent {
+  serverId: string;
+  /** The route id: stable for one logical connection. */
+  sessionId: string;
+  actor: RemoteDesktopActor;
+  userId?: string;
 }
 
 export interface RemoteDesktopRouteRegistryIdentity {
@@ -244,6 +258,7 @@ interface RemoteDesktopRoute {
   leaseTimer: ReturnType<typeof setTimeout>;
   renewalTimer: ReturnType<typeof setInterval>;
   browserReconnectTimer: ReturnType<typeof setTimeout> | null;
+  autoUnlockNotified: boolean;
 }
 
 interface PendingGuestAdmission {
@@ -545,6 +560,20 @@ export class RemoteDesktopRouter {
           enabled: effectiveInputEnabled,
           inputEpoch: route.inputEpoch,
         });
+      }
+      if (parsed.value.autoUnlockSucceeded === true && !route.autoUnlockNotified) {
+        route.autoUnlockNotified = true;
+        this.audit(REMOTE_DESKTOP_AUDIT_EVENT.AUTO_UNLOCK_SUCCEEDED, route, {});
+        try {
+          this.hooks.autoUnlockSucceeded?.({
+            serverId: this.hooks.serverId(),
+            sessionId: route.sessionId,
+            actor: route.actor,
+            ...(route.userId ? { userId: route.userId } : {}),
+          });
+        } catch {
+          // Notification is best effort and never affects the session.
+        }
       }
       const stats = this.stats();
       // Aggregate collaboration counts come from the Server registry rather
@@ -1624,6 +1653,7 @@ export class RemoteDesktopRouter {
       connectionRoute: undefined,
       registryCloseStarted: false,
       browserReconnectTimer: null,
+      autoUnlockNotified: false,
     });
     route.negotiationTimer = this.timer(() => {
       if (this.routesBySession.get(route.sessionId) === route) {

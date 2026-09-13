@@ -1085,10 +1085,22 @@ class WorkerRuntime {
    */
   void UpdateSignInStateOnSignaling(const std::wstring& input_desktop) {
     const bool locked = CurrentSessionIsLocked();
+    if (IsTypedUnlockSuccess(session_locked_, locked, secret_typed_this_lock_,
+                            secret_typed_at_ms_,
+                            static_cast<int64_t>(GetTickCount64()))) {
+      // The stored secret this worker just typed opened the lock. Credit the
+      // sessions that were controlling; each Server route notifies once.
+      for (const auto& [id, session] : sessions_) {
+        if (!session->closed() && session->controlling()) {
+          session->MarkAutoUnlockSucceeded();
+        }
+      }
+    }
     if (!locked && session_locked_) {
       // Unlocked: both budgets belong to the lock that just ended.
       auto_unlock_attempts_ = 0;
       auto_unlock_raise_attempts_ = 0;
+      secret_typed_this_lock_ = false;
     }
     session_locked_ = locked;
     const bool sign_in_screen = locked || input_desktop == kSignInDesktop;
@@ -1168,6 +1180,8 @@ class WorkerRuntime {
     if (!typed_ok) return false;
     input_.KeyDown(kAutoUnlockOwner, "Enter", false);
     input_.KeyUp(kAutoUnlockOwner, "Enter");
+    secret_typed_this_lock_ = true;
+    secret_typed_at_ms_ = static_cast<int64_t>(GetTickCount64());
     writer_->Emit(AutoUnlockAttemptEnvelope());
     return true;
   }
@@ -1245,6 +1259,8 @@ class WorkerRuntime {
   bool session_locked_ = false;
   int auto_unlock_raise_attempts_ = 0;
   int auto_unlock_attempts_ = 0;
+  bool secret_typed_this_lock_ = false;
+  int64_t secret_typed_at_ms_ = 0;
   int compositor_scan_ticks_ = 0;
   int topology_scan_ticks_ = 0;
   int topology_refresh_debounce_ticks_ = 0;
