@@ -58,6 +58,7 @@ import {
   parseSupervisionExecutionStateDetailsFromText,
   resolveSupervisionCustomInstructionsDetail,
   normalizeSupervisionUiLocale,
+  resolveSupervisionAuditBlockingSeverities,
   type SessionSupervisionSnapshot,
   type SupervisionExecutionState,
   type SupervisionUnavailableReason,
@@ -993,7 +994,8 @@ function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string 
   return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText, {
     attempt: run.reworkDispatches,
     limit: run.snapshot.maxAuditLoops,
-  }, run.snapshot.auditTargetSessionName, run.snapshot.uiLocale);
+  }, run.snapshot.auditTargetSessionName, run.snapshot.uiLocale,
+  resolveSupervisionAuditBlockingSeverities(run.snapshot));
 }
 
 function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
@@ -1606,7 +1608,7 @@ class SupervisionAutomation {
         // worker has no authority to clear it, so another heartbeat cannot
         // produce progress -- it only burns quota and hides the blocker behind
         // reminder noise. Leave the single blocker standing instead.
-        if (normalizeBlockerText(assignment.blocker) || normalizeBlockerText(task.blocker)) continue;
+        if (normalizeBlockerText(assignment.blocker)) continue;
         const assignmentEvents = events.filter((event) => event.assignmentId === assignment.assignmentId);
         // While work is only delegated, runtime identity repair is
         // observational rather than substantive implementation progress. Use
@@ -4346,6 +4348,7 @@ class SupervisionAutomation {
       ...(baseline.changeDir ? { changeDir: baseline.changeDir } : {}),
       changedPaths: baseline.fileContents.map((entry) => entry.path),
       uiLocale: current.snapshot.uiLocale,
+      blockingSeverities: resolveSupervisionAuditBlockingSeverities(current.snapshot),
     });
     const orchestrationPrompt = buildAgentDelegationOrchestrationPrompt({
       targetSession: targetName,

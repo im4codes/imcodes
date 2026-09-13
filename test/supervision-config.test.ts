@@ -38,6 +38,8 @@ import {
   mergeTransportConfigPreservingSupervision,
   normalizeSessionSupervisionSnapshot,
   normalizeSupervisionUiLocale,
+  readSupervisionSnapshotFromTransportConfig,
+  resolveSupervisionAuditBlockingSeverities,
   normalizeSupervisorDefaultConfig,
   parseSupervisionExecutionStateDetailsFromText,
   parseSupervisionExecutionStateFromText,
@@ -981,3 +983,29 @@ describe('automatic audit policy source (tsk_5ny)', () => {
     expect(supervisionTaskAuditPolicyFromSnapshot(undefined)).toBeUndefined();
   });
 });
+describe('supervision audit blocking severities', () => {
+  it('keeps legacy snapshots byte-stable and resolves them to P0 only', () => {
+    const legacy = normalizeSessionSupervisionSnapshot({ mode: 'supervised_audit', maxAuditLoops: 2 });
+    expect(legacy).not.toHaveProperty('auditBlockingSeverities');
+    expect(resolveSupervisionAuditBlockingSeverities(legacy)).toEqual(['P0']);
+    expect(resolveSupervisionAuditBlockingSeverities(undefined)).toEqual(['P0']);
+  });
+
+  it('round-trips an explicit selection through the transport config and canonicalizes it', () => {
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: 'supervised_audit', auditBlockingSeverities: ['P2', 'P0', 'P2', 'P9'] as never,
+    });
+    expect(snapshot.auditBlockingSeverities).toEqual(['P0', 'P2']);
+    const restored = readSupervisionSnapshotFromTransportConfig({ supervision: snapshot });
+    expect(restored.auditBlockingSeverities).toEqual(['P0', 'P2']);
+    expect(resolveSupervisionAuditBlockingSeverities(restored)).toEqual(['P0', 'P2']);
+  });
+
+  it('never persists an empty or malformed selection as blocking nothing', () => {
+    for (const value of [[], 'P1', [42]]) {
+      const snapshot = normalizeSessionSupervisionSnapshot({ mode: 'supervised_audit', auditBlockingSeverities: value as never });
+      expect(snapshot.auditBlockingSeverities).toEqual(['P0']);
+    }
+  });
+});
+

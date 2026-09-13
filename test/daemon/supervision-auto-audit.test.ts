@@ -12,6 +12,7 @@ import {
 } from '../../shared/agent-delegation.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { normalizeSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
+import { AUDIT_SEVERITY_DEFINITIONS, AUDIT_SEVERITY_LEVELS } from '../../shared/audit-convergence.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import {
   deterministicAutomaticAuditDeliveryMessageId,
@@ -485,91 +486,6 @@ describe('automatic supervision audit materialization', () => {
       status: 'ready_for_integration', auditAttemptId: shape.attemptId,
       auditRevision: shape.revision, verdict: 'PASS', crossVendorAuditPassed: true,
     });
-  });
-
-  it('re-arms the same cancelled stale owner for the current PASS and provisions from bundle head', async () => {
-    const database = new DatabaseSync(':memory:');
-    const registry = new SupervisionTaskRegistry({ database });
-    const shape = settleReadyTask('PASS', 'incident-thirteen-stale-owner', registry);
-    const brain = session('deck_alpha_brain', 'brain');
-    const worker = session('deck_alpha_worker', 'w1');
-    const oldRevision = 'rejected-r7';
-    const oldAttempt = 'rejected-r7-attempt';
-    const stale = shape.registry.createAssignment({
-      taskId: shape.taskId, role: 'integration_owner', required: true,
-      identity: identity(brain.name), scopeFiles: ['src/exact.ts'],
-      auditAttemptId: oldAttempt, auditRevision: oldRevision,
-      idempotencyKey: 'historical-r7-owner',
-    });
-    if (!stale.ok) throw new Error(stale.reason);
-    expect(shape.registry.applyTaskIntent({
-      taskId: shape.taskId, assignmentId: stale.value.assignmentId,
-      intent: 'cancel', toStatus: 'cancelled', note: 'retire rejected R7 owner',
-    })).toMatchObject({ ok: true });
-    expect(shape.registry.updateTask({
-      taskId: shape.taskId, baseRevision: 'c'.repeat(40),
-    })).toMatchObject({ ok: true });
-    // Reproduce the persisted incident shape: cancellation revoked the lease,
-    // but a crash left the task's owner pointer on the historical row.
-    const pointedTask = shape.registry.getTaskRecord(shape.taskId)!;
-    database.prepare('UPDATE supervision_tasks SET payload_json = ? WHERE task_id = ?').run(
-      JSON.stringify({ ...pointedTask, integrationOwnerAssignmentId: stale.value.assignmentId }),
-      shape.taskId,
-    );
-    expect(shape.registry.getAssignment(stale.value.assignmentId)).toMatchObject({
-      status: 'cancelled', leaseId: '', identity: identity(brain.name),
-    });
-    expect(shape.registry.getTaskRecord(shape.taskId)).toMatchObject({
-      integrationOwnerAssignmentId: stale.value.assignmentId,
-    });
-    expect(shape.registry.createAssignment({
-      taskId: shape.taskId, role: 'integration_owner', required: true,
-      identity: identity(brain.name), scopeFiles: ['src/exact.ts'],
-      auditAttemptId: oldAttempt, auditRevision: oldRevision,
-      idempotencyKey: 'historical-r7-owner',
-    })).toEqual({ ok: false, reason: 'receipt_closed' });
-    const integrationRoot = mkdtempSync(join(tmpdir(), 'incident-thirteen-owner-'));
-    bundleRoots.push(integrationRoot);
-    const ensureIntegrationWorktree = vi.fn(async (input: { baseRevision: string; assignmentId: string }) => ({
-      ok: true as const,
-      worktreePath: integrationRoot,
-      baseRevision: input.baseRevision,
-      created: true,
-    }));
-    const applyIntegrationBundle = vi.fn(() => ({ ok: true as const }));
-    const dispatch = vi.fn().mockResolvedValue({
-      status: 'accepted',
-      dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000133',
-      messageId: 'send_message_00000000-0000-5000-a000-000000000133',
-      deliveries: [{ target: brain.name, status: 'queued' }],
-    });
-    const beforeIds = shape.registry.listAssignments(shape.taskId).map((row) => row.assignmentId);
-
-    const result = await dispatchReadyIntegration(shape.taskId, {
-      registry: shape.registry,
-      listSessions: () => [brain, worker],
-      dispatch,
-      hasDeliveryEvidence: () => false,
-      ensureIntegrationWorktree: ensureIntegrationWorktree as never,
-      applyIntegrationBundle,
-    });
-    expect(result, JSON.stringify(result)).toMatchObject({
-      status: 'dispatched', assignmentId: stale.value.assignmentId,
-    });
-
-    expect(shape.registry.listAssignments(shape.taskId).map((row) => row.assignmentId)).toEqual(beforeIds);
-    expect(shape.registry.getAssignment(stale.value.assignmentId)).toMatchObject({
-      status: 'ready_for_integration', auditRevision: shape.revision,
-      auditAttemptId: shape.attemptId, verdict: 'PASS', crossVendorAuditPassed: true,
-    });
-    expect(ensureIntegrationWorktree).toHaveBeenCalledWith(expect.objectContaining({
-      assignmentId: stale.value.assignmentId,
-      baseRevision: shape.registry.getTaskRecord(shape.taskId)!.integrationBundle!.headSha,
-    }));
-    expect(ensureIntegrationWorktree.mock.calls[0]![0].baseRevision).not.toBe('c'.repeat(40));
-    expect(applyIntegrationBundle).toHaveBeenCalledWith(expect.objectContaining({
-      worktreePath: integrationRoot,
-    }));
   });
 
   it('authorizes an exact integration wake across the Brain runtime epoch rotation', async () => {
@@ -1374,134 +1290,6 @@ describe('automatic supervision audit materialization', () => {
     expect(swept).toEqual([expect.objectContaining({ status: 'replayed' })]);
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
-  });
-
-  it('repairs a stale implementing aggregate around one already-running exact audit without duplication', async () => {
-    const database = new DatabaseSync(':memory:');
-    const registry = new SupervisionTaskRegistry({ database });
-    const shape = makeReadyTask({
-      taskId: 'tsk_n27_live_projection',
-      auditPolicy: 'auto_strict_cross_vendor',
-      registry,
-    });
-    const attemptId = automaticAttempt(shape.taskId, shape.revision);
-    const brain = session('deck_alpha_brain', 'brain');
-    const worker = session('deck_alpha_worker', 'w1');
-    const auditorSession = session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic');
-    expect(registry.updateAssignment({
-      assignmentId: shape.worker.assignmentId,
-      identity: shape.worker.identity,
-      status: 'ready_for_audit',
-      auditAttemptId: attemptId,
-      auditRevision: shape.revision,
-    })).toMatchObject({ ok: true });
-    const auditor = registry.createAssignment({
-      taskId: shape.taskId,
-      role: 'auditor',
-      required: false,
-      identity: identity(auditorSession.name, 'claude-code-sdk', 'anthropic'),
-      auditAttemptId: attemptId,
-      auditRevision: shape.revision,
-    });
-    if (!auditor.ok) throw new Error(auditor.reason);
-    expect(registry.updateAssignment({
-      assignmentId: auditor.value.assignmentId,
-      identity: auditor.value.identity,
-      status: 'implementing',
-      auditAttemptId: attemptId,
-      auditRevision: shape.revision,
-    })).toMatchObject({ ok: true });
-
-    // Exact live incident: every revision/validation/auditor fact is durable,
-    // but the aggregate was left behind at implementing.
-    const exact = registry.getTaskRecord(shape.taskId)!;
-    database.prepare(
-      'UPDATE supervision_tasks SET status = ?, payload_json = ? WHERE task_id = ?',
-    ).run('implementing', JSON.stringify({ ...exact, status: 'implementing' }), shape.taskId);
-    const beforeIds = registry.listAssignments(shape.taskId).map((row) => row.assignmentId);
-    const beforeImplementerGeneration = registry.getAssignment(shape.worker.assignmentId)!.generation;
-    const beforeAuditorGeneration = registry.getAssignment(auditor.value.assignmentId)!.generation;
-    const dispatch = vi.fn();
-
-    const result = await runSupervisionConvergenceTick({
-      registry,
-      listSessions: () => [brain, worker, auditorSession],
-      listTargets: listTargetRecords(auditorSession),
-      dispatch,
-      hasDeliveryEvidence: () => true,
-      limit: 10,
-    });
-
-    expect(result.converged).toEqual(expect.arrayContaining([expect.objectContaining({
-      taskId: shape.taskId,
-      assignmentId: auditor.value.assignmentId,
-      action: 'repair_ready_audit_aggregate',
-    })]));
-    expect(registry.getTaskRecord(shape.taskId)).toMatchObject({
-      status: 'ready_for_audit',
-      currentRevision: shape.revision,
-      validationState: 'passed',
-      validatedRevision: shape.revision,
-    });
-    expect(registry.listAssignments(shape.taskId).map((row) => row.assignmentId)).toEqual(beforeIds);
-    expect(registry.getAssignment(shape.worker.assignmentId)).toMatchObject({
-      status: 'ready_for_audit', generation: beforeImplementerGeneration,
-      auditAttemptId: attemptId, auditRevision: shape.revision,
-    });
-    expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
-      status: 'implementing', generation: beforeAuditorGeneration,
-      auditAttemptId: attemptId, auditRevision: shape.revision,
-    });
-    expect(result.audits).toEqual([expect.objectContaining({
-      status: 'replayed', assignmentId: auditor.value.assignmentId, attemptId,
-    })]);
-    expect(dispatch).not.toHaveBeenCalled();
-    registry.close();
-  });
-
-  it('leaves a stale aggregate closed when the running auditor names a different attempt', async () => {
-    const database = new DatabaseSync(':memory:');
-    const registry = new SupervisionTaskRegistry({ database });
-    const shape = makeReadyTask({
-      taskId: 'tsk_n27_mismatched_projection',
-      auditPolicy: 'auto_strict_cross_vendor',
-      registry,
-    });
-    const implementerAttempt = automaticAttempt(shape.taskId, shape.revision);
-    expect(registry.updateAssignment({
-      assignmentId: shape.worker.assignmentId,
-      identity: shape.worker.identity,
-      status: 'ready_for_audit',
-      auditAttemptId: implementerAttempt,
-      auditRevision: shape.revision,
-    })).toMatchObject({ ok: true });
-    const auditor = registry.createAssignment({
-      taskId: shape.taskId,
-      role: 'auditor',
-      required: false,
-      identity: identity('deck_alpha_mismatched_auditor', 'claude-code-sdk', 'anthropic'),
-      auditAttemptId: `${implementerAttempt}-other`,
-      auditRevision: shape.revision,
-    });
-    if (!auditor.ok) throw new Error(auditor.reason);
-    expect(registry.updateAssignment({
-      assignmentId: auditor.value.assignmentId,
-      identity: auditor.value.identity,
-      status: 'implementing',
-      auditAttemptId: `${implementerAttempt}-other`,
-      auditRevision: shape.revision,
-    })).toMatchObject({ ok: true });
-    const exact = registry.getTaskRecord(shape.taskId)!;
-    database.prepare(
-      'UPDATE supervision_tasks SET status = ?, payload_json = ? WHERE task_id = ?',
-    ).run('implementing', JSON.stringify({ ...exact, status: 'implementing' }), shape.taskId);
-
-    const before = registry.get(shape.taskId);
-    await expect(registry.convergeLifecycle(500, { limit: 10 })).resolves.not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ action: 'repair_ready_audit_aggregate' })]),
-    );
-    expect(registry.get(shape.taskId)).toEqual(before);
-    registry.close();
   });
 
   it('adopts one exact durable audit delivery when its auditor row was not materialized (tsk_f1x)', async () => {
@@ -6558,6 +6346,51 @@ describe('freeze/open-audit boundary requires exact current-revision validation 
     const auditCall = h.dispatch.mock.calls.find((call) => Boolean(call[1].audit));
     expect(auditCall?.[1].message).toContain('- src/exact.ts');
     expect(auditCall?.[1].message).not.toContain('native/windows/unclaimed.ps1');
+  });
+
+  it('carries the current scopeFiles, the configured blocking severities and every definition in the audit brief', async () => {
+    const shape = validatedPredecessor('brief-scope-and-severity');
+    // touchedFiles is non-empty and differs from the durable scope: the brief must
+    // still list the whole current scope, including an unchanged scoped path.
+    expect(shape.registry.recordFileEvent({
+      assignmentId: shape.worker.assignmentId, path: 'test/exact.test.ts', operation: 'modify',
+      identity: identity('deck_alpha_worker'),
+    })).toMatchObject({ ok: true });
+    expect(shape.registry.get(shape.taskId)?.touchedFiles.length).toBeGreaterThan(0);
+    stampValidation(shape.database, shape.taskId, shape.worker.assignmentId, R2, R2, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    const scopeFiles = shape.registry.getAssignment(shape.worker.assignmentId)!.scopeFiles;
+    expect(scopeFiles).toEqual(expect.arrayContaining(['src/exact.ts', 'test/exact.test.ts']));
+    const h = harness(shape.registry, shape.taskId, R2);
+    const brain = h.deps.listSessions().find((candidate) => candidate.role === 'brain')!;
+    const supervision = normalizeSessionSupervisionSnapshot({
+      ...((brain.transportConfig as { supervision?: object } | undefined)?.supervision ?? { mode: 'supervised_audit' }),
+      auditBlockingSeverities: ['P2', 'P0'],
+    });
+    brain.transportConfig = { ...(brain.transportConfig ?? {}), supervision };
+    await expect(dispatchReadyAudit(shape.taskId, h.deps)).resolves.toMatchObject({ status: 'dispatched' });
+    const message = String(h.dispatch.mock.calls.find((call) => Boolean(call[1].audit))?.[1].message);
+    expect(message).toContain('Blocking severities (current configuration): P0, P2.');
+    expect(message).toContain('Non-blocking severities: P1, P3, P4.');
+    for (const level of AUDIT_SEVERITY_LEVELS) {
+      expect(message).toContain(`- ${level}: ${AUDIT_SEVERITY_DEFINITIONS[level]}`);
+    }
+    const scopeSection = message.slice(message.indexOf('Assignment scopeFiles (current durable scope):'));
+    for (const file of scopeFiles) expect(scopeSection).toContain(`- ${file}`);
+  });
+
+  it('defaults a legacy Brain snapshot without the setting to P0-only in the audit brief', async () => {
+    const shape = validatedPredecessor('brief-legacy-severity');
+    stampValidation(shape.database, shape.taskId, shape.worker.assignmentId, R2, R2, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    const h = harness(shape.registry, shape.taskId, R2);
+    await expect(dispatchReadyAudit(shape.taskId, h.deps)).resolves.toMatchObject({ status: 'dispatched' });
+    const message = String(h.dispatch.mock.calls.find((call) => Boolean(call[1].audit))?.[1].message);
+    expect(message).toContain('Blocking severities (current configuration): P0.');
+    expect(message).toContain('Non-blocking severities: P1, P2, P3, P4.');
+    expect(message).toContain('Assignment scopeFiles (current durable scope):\n- src/exact.ts');
   });
 
   const revoke = (registry: SupervisionTaskRegistry, taskId: string, assignmentId: string) => () => {

@@ -18,6 +18,7 @@ import {
 import {
   patchPeerAuditTargetInTransportConfig,
   readSupervisionSnapshotFromTransportConfig,
+  resolveSupervisionAuditBlockingSeverities,
 } from '../../shared/supervision-config.js';
 import { persistSessionRecord } from '../agent/session-manager.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -728,6 +729,9 @@ export class PeerAuditService {
       changedPaths: context.changedPaths,
       validations: context.validations,
       ...(context.narrowScope ? { narrowScope: true } : {}),
+      blockingSeverities: resolveSupervisionAuditBlockingSeverities(
+        readSupervisionSnapshotFromTransportConfig(record.transportConfig),
+      ),
       supervisorRationale: baseline.supervisorRationale,
       ...(this.#lastReworkFindings.get(record.name)
         ? { priorReworkFindings: this.#lastReworkFindings.get(record.name) }

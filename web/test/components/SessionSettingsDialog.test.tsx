@@ -631,6 +631,76 @@ describe('SessionSettingsDialog supervision', () => {
     ).toBe(false);
   });
 
+  const renderAuditDialog = (supervisionOverrides: Record<string, unknown> = {}) => render(
+    <SessionSettingsDialog
+      canControlAutomaticSupervision
+      serverId="srv-1"
+      sessionName="deck_proj_brain"
+      label="Brain"
+      description="desc"
+      cwd="/proj"
+      type="codex-sdk"
+      activeModel={CODEX_MODEL_IDS[0]}
+      sessionInstanceId="brain-instance-1"
+      runtimeEpoch="brain-runtime-1"
+      ws={{ connected: true, send() {}, onMessage: () => () => undefined } as any}
+      peerAuditSessions={[]}
+      transportConfig={{
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: CODEX_MODEL_IDS[0],
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxAuditLoops: 2,
+          ...supervisionOverrides,
+        },
+      }}
+      onClose={vi.fn()}
+      onSaved={vi.fn()}
+    />,
+  );
+
+  const severityBox = (level: string) => screen.getByTestId(`audit-blocking-severity-${level}`) as HTMLInputElement;
+
+  it('shows P0-P4 blocking checkboxes with definitions, defaulting a legacy snapshot to P0 only', () => {
+    renderAuditDialog();
+    expect(screen.getByText('auditBlockingSeverities')).toBeDefined();
+    for (const level of ['P0', 'P1', 'P2', 'P3', 'P4']) {
+      expect(screen.getByTestId(`audit-blocking-severity-description-${level}`).textContent).toBe(level);
+      expect(severityBox(level).checked, `${level} checked`).toBe(level === 'P0');
+    }
+    // The single remaining level cannot be cleared.
+    expect(severityBox('P0').disabled).toBe(true);
+    expect(screen.getByTestId('audit-blocking-summary').textContent).toBe('summaryAuditBlocking:P0');
+  });
+
+  it('persists the selected blocking severities and keeps at least one selected', async () => {
+    renderAuditDialog();
+    fireEvent.click(severityBox('P2'));
+    fireEvent.click(severityBox('P1'));
+    expect(severityBox('P0').disabled).toBe(false);
+    fireEvent.click(severityBox('P0'));
+    expect(severityBox('P0').checked).toBe(false);
+    fireEvent.click(severityBox('P1'));
+    expect(severityBox('P2').checked).toBe(true);
+    expect(severityBox('P2').disabled, 'the last selected level stays locked').toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => { expect(patchSessionMock).toHaveBeenCalled(); });
+    const saved = patchSessionMock.mock.calls.at(-1)?.[2] as { transportConfig?: { supervision?: Record<string, unknown> } };
+    expect(saved.transportConfig?.supervision?.auditBlockingSeverities).toEqual(['P2']);
+    expect(hasInvalidSessionSupervisionSnapshot(saved.transportConfig ?? null)).toBe(false);
+  });
+
+  it('restores persisted blocking severities from the snapshot', () => {
+    renderAuditDialog({ auditBlockingSeverities: ['P1', 'P0'] });
+    expect(severityBox('P0').checked).toBe(true);
+    expect(severityBox('P1').checked).toBe(true);
+    expect(severityBox('P2').checked).toBe(false);
+    expect(screen.getByTestId('audit-blocking-summary').textContent).toBe('summaryAuditBlocking:P0, P1');
+  });
+
   it('persists the default Brain model to account defaults without another pool interaction', async () => {
     render(
       <SessionSettingsDialog

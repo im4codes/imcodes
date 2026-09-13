@@ -22,8 +22,30 @@ export const AUDIT_CONVERGENCE_CONTRACT_ID = 'audit_convergence_v1' as const;
 export const AUDIT_SEVERITY_LEVELS = ['P0', 'P1', 'P2', 'P3', 'P4'] as const;
 export type AuditSeverity = typeof AUDIT_SEVERITY_LEVELS[number];
 
-/** Findings at these levels must be fixed: any of them means REWORK. */
-export const AUDIT_BLOCKING_SEVERITIES = ['P0', 'P1', 'P2'] as const satisfies readonly AuditSeverity[];
+/**
+ * Blocking severities when nothing is configured (and for legacy snapshots that
+ * predate the setting). Only P0 blocks by default; every other level is a
+ * non-blocking follow-up unless the user explicitly selects it.
+ */
+export const AUDIT_DEFAULT_BLOCKING_SEVERITIES = ['P0'] as const satisfies readonly AuditSeverity[];
+
+/** @deprecated Use the configured set; kept as the default-set alias for existing imports. */
+export const AUDIT_BLOCKING_SEVERITIES = AUDIT_DEFAULT_BLOCKING_SEVERITIES;
+
+export function isAuditSeverity(value: unknown): value is AuditSeverity {
+  return typeof value === 'string' && (AUDIT_SEVERITY_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * Canonical blocking set: known levels only, deduplicated, in P0..P4 order.
+ * Anything empty, missing or malformed falls back to the default (P0), so a
+ * configuration can never silently block nothing.
+ */
+export function normalizeAuditBlockingSeverities(value: unknown): AuditSeverity[] {
+  const selected = new Set(Array.isArray(value) ? value.filter(isAuditSeverity) : []);
+  const levels = AUDIT_SEVERITY_LEVELS.filter((level) => selected.has(level));
+  return levels.length > 0 ? levels : [...AUDIT_DEFAULT_BLOCKING_SEVERITIES];
+}
 
 export const AUDIT_SEVERITY_DEFINITIONS: Readonly<Record<AuditSeverity, string>> = {
   P0: 'data loss or corruption, security hole, production down or unrecoverable',
@@ -40,23 +62,29 @@ export const AUDIT_CONVERGENCE_ROLES = {
 } as const;
 export type AuditConvergenceRole = typeof AUDIT_CONVERGENCE_ROLES[keyof typeof AUDIT_CONVERGENCE_ROLES];
 
-const nonBlockingSeverities = AUDIT_SEVERITY_LEVELS.filter(
-  (level) => !(AUDIT_BLOCKING_SEVERITIES as readonly AuditSeverity[]).includes(level),
-);
+function nonBlockingSeverities(blocking: readonly AuditSeverity[]): AuditSeverity[] {
+  return AUDIT_SEVERITY_LEVELS.filter((level) => !blocking.includes(level));
+}
 
 /** Full body, for the stable system prompt only. */
 export function buildAuditConvergenceContract(): string {
-  const blocking = AUDIT_BLOCKING_SEVERITIES.join('/');
-  const nonBlocking = nonBlockingSeverities.join('/');
+  const defaults = AUDIT_DEFAULT_BLOCKING_SEVERITIES.join('/');
   return JSON.stringify({
     contractId: AUDIT_CONVERGENCE_CONTRACT_ID,
     v: 1,
     severity: AUDIT_SEVERITY_DEFINITIONS,
     verdict: {
-      REWORK: `any ${blocking} finding`,
-      PASS: `no finding above ${nonBlocking}`,
-      nonBlocking: `${nonBlocking}: record as follow-ups; never REWORK, no separate re-audit`,
+      blockingSource: `the current configuration: the blocking list carried by contractRef.blocking and the audit brief; ${defaults} when none is given`,
+      REWORK: 'at least one finding at a configured blocking severity',
+      PASS: 'no finding at a configured blocking severity',
+      nonBlocking: 'every other severity: record as follow-ups; never REWORK, no separate re-audit',
       briefMayNotRaiseBar: true,
+    },
+    antiNitpick: {
+      rule: 'never nitpick, manufacture, or inflate findings to justify REWORK; do not hunt for problems for their own sake',
+      severity: 'assign the level that the definition actually matches, backed by concrete evidence; never upgrade a finding to reach a blocking level',
+      noFinding: 'when no finding reaches a configured blocking severity, PASS',
+      scope: 'judge against the stated acceptance and scope only; do not expand acceptance or reopen accepted non-blocking items',
     },
     firstPass: {
       findings: 'all at once, each with severity, violated invariant, location and evidence',
@@ -67,7 +95,7 @@ export function buildAuditConvergenceContract(): string {
       fix: 'the whole invariant class at every affected instance',
       forbid: 'minimal point patch',
       test: 'a counterexample covering the class',
-      reaudit: `repair delta plus closure of every prior ${blocking} class`,
+      reaudit: 'repair delta plus closure of every prior blocking class',
     },
     evidence: {
       structuredResults: 'exact-bound implementer or teammate structured test results are valid evidence after coherence review; no duplicate run required',
@@ -88,16 +116,39 @@ export function buildAuditConvergenceContract(): string {
 }
 
 /** "P0, P1 or P2" -- derived, so prose can never drift from the blocking set. */
-export function formatAuditBlockingSeverities(): string {
-  const levels = [...AUDIT_BLOCKING_SEVERITIES];
-  return levels.length > 1 ? `${levels.slice(0, -1).join(', ')} or ${levels[levels.length - 1]}` : levels.join('');
+export function formatAuditBlockingSeverities(
+  levels: readonly AuditSeverity[] = AUDIT_DEFAULT_BLOCKING_SEVERITIES,
+): string {
+  const normalized = normalizeAuditBlockingSeverities(levels);
+  return normalized.length > 1
+    ? `${normalized.slice(0, -1).join(', ')} or ${normalized[normalized.length - 1]}`
+    : normalized.join('');
 }
 
 /** What an audit, re-audit or rework message carries instead of the body. */
-export function buildAuditConvergenceContractRef(role: AuditConvergenceRole): string {
+export function buildAuditConvergenceContractRef(
+  role: AuditConvergenceRole,
+  blocking: readonly AuditSeverity[] = AUDIT_DEFAULT_BLOCKING_SEVERITIES,
+): string {
   return JSON.stringify({
     contractRef: AUDIT_CONVERGENCE_CONTRACT_ID,
     role,
-    blocking: [...AUDIT_BLOCKING_SEVERITIES],
+    blocking: normalizeAuditBlockingSeverities(blocking),
   });
+}
+
+/**
+ * Brief lines that make the configured gate explicit for one audit: the exact
+ * blocking levels, the non-blocking remainder and every level definition.
+ */
+export function buildAuditSeverityPolicyLines(blocking: readonly AuditSeverity[]): string[] {
+  const levels = normalizeAuditBlockingSeverities(blocking);
+  const nonBlocking = nonBlockingSeverities(levels);
+  return [
+    `Blocking severities (current configuration): ${levels.join(', ')}. Only findings at these levels justify REWORK.`,
+    `Non-blocking severities: ${nonBlocking.length > 0 ? nonBlocking.join(', ') : 'none'}. Record them as follow-ups; they never justify REWORK.`,
+    'Do not nitpick or manufacture findings; assign the level the definition matches, with concrete evidence.',
+    'Severity definitions:',
+    ...AUDIT_SEVERITY_LEVELS.map((level) => `- ${level}: ${AUDIT_SEVERITY_DEFINITIONS[level]}`),
+  ];
 }

@@ -589,13 +589,33 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('VERDICT BOUNDARY');
-    expect(prompt).toContain('REWORK if and only if a P0, P1 or P2 finding exists');
+    expect(prompt).toContain('REWORK if and only if a P0 finding exists');
     expect(prompt).toContain('Do NOT use REWORK merely because an optional check was unavailable');
     expect(prompt).toContain('raw logs/transcripts/hashes/bundle attachments are absent');
     expect(prompt).toContain('evidence packaging/control-plane/receipt delivery failed');
     expect(prompt).toContain('an implementer or teammate structured result satisfies this');
     expect(prompt).toContain('does not need raw artifacts or a duplicate run');
     expect(prompt).toContain('they do not block PASS');
+  });
+
+  it('carries the configured blocking severities in every audit, re-audit and rework reference', () => {
+    const configured = ['P1', 'P0'] as const;
+    const peer = buildPeerAuditBriefV1({
+      attemptId: 'attempt_configured', taskRequest: 'Implement it', completedResult: 'Done',
+      acceptanceCriteria: ['It works'], blockingSeverities: [...configured],
+    });
+    expect(peer).toContain('REWORK if and only if a P0 or P1 finding exists');
+    expect(peer).toContain(`{"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}","role":"auditor","blocking":["P0","P1"]}`);
+    const automatic = buildAutomaticAuditTaskPrompt({
+      attemptId: 'attempt_configured', targetSession: 'deck_sub_auditor', auditedSessionName: 'deck_alpha_w1',
+      narrow: false, blockingSeverities: [...configured],
+    });
+    expect(automatic).toContain(`{"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}","role":"orchestrator","blocking":["P0","P1"]}`);
+    const rework = buildReworkBriefPrompt('deck_alpha_w1', 'task', undefined, 'finding', undefined, undefined, 'en', [...configured]);
+    expect(rework).toContain(`{"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}","role":"implementer","blocking":["P0","P1"]}`);
+    // Omitted configuration is the P0-only default everywhere.
+    expect(buildReworkBriefPrompt('deck_alpha_w1', 'task', undefined, 'finding'))
+      .toContain(`{"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}","role":"implementer","blocking":["P0"]}`);
   });
 
   it('does NOT include IM.codes workflow background in the continue prompt', () => {

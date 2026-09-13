@@ -1,6 +1,7 @@
 /**
  * SessionSettingsDialog — edit metadata and view cwd for main or sub sessions.
  */
+import { AUDIT_SEVERITY_LEVELS, normalizeAuditBlockingSeverities, type AuditSeverity } from '@shared/audit-convergence.js';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -37,6 +38,7 @@ import {
   mergeSupervisionCustomInstructions,
   normalizeSupervisorDefaultConfig,
   readSupervisionSnapshotFromTransportConfig,
+  resolveSupervisionAuditBlockingSeverities,
   resolveSupervisionModelForBackend,
   SUPERVISION_PROMPT_VERSION,
   SUPERVISION_REPAIR_PROMPT_VERSION,
@@ -159,6 +161,7 @@ type SupervisionDraft = {
   maxAutoContinueStreak?: number;
   maxAutoContinueTotal?: number;
   maxAuditLoops?: number;
+  auditBlockingSeverities?: AuditSeverity[];
   taskRunPromptVersion?: string;
 };
 
@@ -916,6 +919,18 @@ export function SessionSettingsDialog({
   const supervisionAutoContinueStreak = supervision.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
+  const supervisionAuditBlockingSeverities = resolveSupervisionAuditBlockingSeverities(supervision);
+  const toggleAuditBlockingSeverity = (level: AuditSeverity, checked: boolean): void => {
+    setSupervision((prev) => {
+      const current = resolveSupervisionAuditBlockingSeverities(prev);
+      const next = checked
+        ? [...current, level]
+        : current.filter((item) => item !== level);
+      // At least one blocking level must stay selected; the last one cannot be cleared.
+      if (next.length === 0) return prev;
+      return { ...prev, auditBlockingSeverities: normalizeAuditBlockingSeverities(next) };
+    });
+  };
   const executionPoolSessions = useMemo(() => {
     const merged = new Map(peerAuditSessions.map((session) => [session.sessionName, session]));
     for (const session of supervisorDefaultsPref.executionPoolSessions) {
@@ -1054,6 +1069,7 @@ export function SessionSettingsDialog({
     ...(isAuditMode
       ? {
           maxAuditLoops: supervisionAuditLoops,
+          auditBlockingSeverities: supervisionAuditBlockingSeverities,
           taskRunPromptVersion,
         }
       : {}),
@@ -1064,6 +1080,7 @@ export function SessionSettingsDialog({
     defaultsBackupSupportsPreset,
     defaultsSupportsPreset,
     supervision.mode,
+    supervisionAuditBlockingSeverities.join(','),
     supervisionAuditLoops,
     supervisionAutoContinueStreak,
     supervisionAutoContinueTotal,
@@ -1147,6 +1164,7 @@ export function SessionSettingsDialog({
           maxAutoContinueTotal: prev.maxAutoContinueTotal ?? supervisorDefaultsAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
+          ...(prev.auditBlockingSeverities ? { auditBlockingSeverities: prev.auditBlockingSeverities } : {}),
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
         };
       }
@@ -1166,6 +1184,7 @@ export function SessionSettingsDialog({
             : prev.maxAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
+          ...(prev.auditBlockingSeverities ? { auditBlockingSeverities: prev.auditBlockingSeverities } : {}),
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
         };
       }
@@ -1618,6 +1637,30 @@ export function SessionSettingsDialog({
                     disabled={saving}
                   />
                 </div>
+                <div class="session-settings-audit-severities" data-testid="audit-blocking-severities">
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.auditBlockingSeverities')}</div>
+                  <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>{t('session.supervision.auditBlockingSeveritiesHelp')}</div>
+                  {AUDIT_SEVERITY_LEVELS.map((level) => {
+                    const checked = supervisionAuditBlockingSeverities.includes(level);
+                    const lastSelected = checked && supervisionAuditBlockingSeverities.length === 1;
+                    return (
+                      <label key={level} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, color: '#cbd5e1', marginBottom: 4 }}>
+                        <input
+                          type="checkbox"
+                          data-testid={`audit-blocking-severity-${level}`}
+                          checked={checked}
+                          disabled={saving || lastSelected}
+                          title={lastSelected ? t('session.supervision.auditBlockingSeveritiesAtLeastOne') : undefined}
+                          onChange={(e) => toggleAuditBlockingSeverity(level, (e.target as HTMLInputElement).checked)}
+                        />
+                        <span>
+                          <strong>{level}</strong>{' '}
+                          <span style={{ color: '#94a3b8' }} data-testid={`audit-blocking-severity-description-${level}`}>{t(`session.supervision.auditSeverity.${level}`)}</span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
 
               </div>
             )}
@@ -1651,6 +1694,13 @@ export function SessionSettingsDialog({
                 <div style={{ fontSize: 12, color: '#94a3b8' }}>
                   {t('session.supervision.summaryAudit', {
                     loops: supervisionAuditLoops,
+                  })}
+                </div>
+              )}
+              {isAuditMode && (
+                <div style={{ fontSize: 12, color: '#94a3b8' }} data-testid="audit-blocking-summary">
+                  {t('session.supervision.summaryAuditBlocking', {
+                    value: supervisionAuditBlockingSeverities.join(', '),
                   })}
                 </div>
               )}
