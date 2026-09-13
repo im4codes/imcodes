@@ -103,7 +103,9 @@ import {
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  isAuditableSupervisionTaskClassification,
   isSupervisionTaskAuditPolicy,
+  supervisionTaskAuditPolicyFromSnapshot,
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
 import {
@@ -134,7 +136,7 @@ import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
-import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
+import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
 import {
   inspectSupervisionAssignmentWorktree,
@@ -2033,14 +2035,23 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
       }
       const requestedRole = typeof args.role === 'string' ? args.role : 'implementer';
+      const classification = typeof args.classification === 'string'
+        ? args.classification as never
+        : 'integration_slice';
+      const taskAuditPolicy = isAuditableSupervisionTaskClassification(classification)
+        ? supervisionTaskAuditPolicyFromSnapshot(
+            resolveProjectAuthoritativeSupervisionSnapshot(projectName, await sendSessions()),
+          )
+        : undefined;
       const task = existing
         ? { ok: true as const, value: existing, replay: true as const }
         : registry.createOrGet({
             projectName,
             topLevelTaskId: stringArg(args, 'topLevelTaskId'),
-            classification: typeof args.classification === 'string' ? args.classification as never : undefined,
+            classification,
             objective: stringArg(args, 'objective'),
             acceptance: stringArrayArg(args, 'acceptance'),
+            ...(taskAuditPolicy ? { auditPolicy: taskAuditPolicy } : {}),
             idempotencyKey: stringArg(args, 'idempotencyKey'),
           });
       if (!task.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_start rejected: ${task.reason}`);

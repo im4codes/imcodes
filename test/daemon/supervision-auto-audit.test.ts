@@ -5748,4 +5748,64 @@ describe('automatic audit fan-out across ready auditors', () => {
       { target: busy.name, autoProvision: undefined },
     ]);
   });
+
+  it('rebinds one existing unselected auditor to an exact selected cross-vendor target', async () => {
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const stale = session('deck_alpha_cursor', 'w2', 'cursor-headless', 'cursor');
+    const selected = session('deck_alpha_cc', 'w2', 'claude-code-sdk', 'anthropic');
+    const { registry, revision } = makeReadyTask({
+      taskId: 'tsk_unselected_existing_recovery',
+      revision: 'unselected-existing-r1',
+      auditPolicy: 'auto_allow_degraded',
+    });
+    const attemptId = automaticAttempt('tsk_unselected_existing_recovery', revision);
+    const auditor = registry.createAssignment({
+      taskId: 'tsk_unselected_existing_recovery', role: 'auditor', required: true,
+      identity: identity(stale.name, 'cursor-headless', 'cursor'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    const calls: SendMessageInput[] = [];
+    const dispatch = vi.fn(async (_caller: unknown, input: SendMessageInput) => {
+      calls.push(input);
+      if (input.target === stale.name) {
+        return {
+          status: 'error' as const,
+          reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+          error: 'task execution pool rejected target: unselected_config',
+        };
+      }
+      return {
+        status: 'accepted' as const,
+        assignmentId: auditor.value.assignmentId,
+        messageId: 'send_message_00000000-0000-5000-a000-00000000feed' as SendMessageId,
+      };
+    });
+
+    await expect(dispatchReadyAudit('tsk_unselected_existing_recovery', {
+      registry,
+      listSessions: () => [brain, worker, stale, selected],
+      listTargets: listTargetRecords(selected),
+      dispatch: dispatch as never,
+      hasDeliveryEvidence: () => false,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/unselected-existing/repo', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
+    })).resolves.toMatchObject({
+      status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId,
+    });
+    expect(calls.map((input) => input.target)).toEqual([stale.name, selected.name]);
+    expect(calls[1]?.task).toMatchObject({
+      taskId: 'tsk_unselected_existing_recovery',
+      assignmentId: auditor.value.assignmentId,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+    });
+    expect(calls[1]?.audit).toMatchObject({ strictCrossVendor: true });
+    expect(registry.listAssignments('tsk_unselected_existing_recovery').filter((item) => item.role === 'auditor'))
+      .toHaveLength(1);
+  });
 });

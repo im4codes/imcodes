@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,6 +20,7 @@ import type { SessionRecord } from '../../src/store/session-store.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import {
+  embedSessionSupervisionSnapshot,
   SUPERVISION_TASK_REGISTRY_CONTRACT,
   type SupervisionTaskClassification,
 } from '../../shared/supervision-config.js';
@@ -130,6 +132,185 @@ function identity(name: string, agentType = 'codex-sdk'): PersistedSupervisionTa
 const TEST_SESSION_AGENT_TYPES: Record<string, string> = { deck_alpha_w2: 'claude-code-sdk' };
 const testIdentityResolver = (name: string) => ({
   ...identity(name, TEST_SESSION_AGENT_TYPES[name]), projectName: 'alpha',
+});
+
+describe('successor bundle authority convergence', () => {
+  const R1 = 'bundle-successor-r1';
+  const R2 = '8ce14894576439d0da1702a1c81e2caac37881a226bc861e3f9e0490fa31097f';
+  const ATTEMPT = 'auto-audit-predecessor-rework';
+
+  function bundle(taskId: string, assignmentId: string, revision: string, fileHash: string) {
+    const manifest = {
+      version: 1 as const,
+      taskId,
+      sourceAssignmentId: assignmentId,
+      revision,
+      headSha: '8'.repeat(40),
+      files: [{ path: 'test/setup/isolated-home.ts', sha256: fileHash, mode: 0o644 as const }],
+    };
+    const manifestSha256 = createHash('sha256').update(`${JSON.stringify(manifest)}\n`).digest('hex');
+    return {
+      ...manifest,
+      manifestSha256,
+      bundleRoot: '/tmp/successor-bundles',
+      bundlePath: `/tmp/successor-bundles/${manifestSha256.slice(0, 2)}/${manifestSha256}`,
+    };
+  }
+
+  function brokenPostReworkShape(taskId: string) {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    const implementerId = `${taskId}-implementer`;
+    const auditorId = `${taskId}-auditor`;
+    const owner = identity('deck_alpha_successor_owner', 'claude-code-sdk');
+    const auditorIdentity = identity('deck_alpha_successor_auditor');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'freeze the exact post-REWORK successor', currentRevision: R1,
+      auditPolicy: 'auto_allow_degraded',
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      taskId, assignmentId: implementerId, role: 'implementer', required: true,
+      identity: owner, scopeFiles: ['test/setup/isolated-home.ts'], auditRevision: R1,
+    });
+    if (!implementer.ok) throw new Error(implementer.reason);
+    rewritePersistedAssignment(database, {
+      ...implementer.value, status: 'implementing', validationState: 'passed', updatedAt: 10,
+    });
+    rewritePersistedTask(database, {
+      ...registry.getTaskRecord(taskId)!, status: 'validated', validationState: 'passed', updatedAt: 10,
+    });
+    const r1Bundle = bundle(taskId, implementerId, R1, '1'.repeat(64));
+    expect(registry.bindIntegrationBundle({
+      taskId, assignmentId: implementerId, identity: owner, revision: R1, bundle: r1Bundle, now: 20,
+    })).toMatchObject({ ok: true });
+    const auditor = registry.createAssignment({
+      taskId, assignmentId: auditorId, role: 'auditor', required: true,
+      identity: auditorIdentity, auditAttemptId: ATTEMPT, auditRevision: R1,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    seedFinalAuditReceipt(database, {
+      receiptId: `${taskId}-receipt`, taskId, assignmentId: auditorId,
+      attemptId: ATTEMPT, revision: R1, verdict: 'REWORK',
+      senderIdentity: auditorIdentity, createdAt: 30,
+    });
+    rewritePersistedAssignment(database, {
+      ...auditor.value, status: 'finalized', leaseId: '', auditAttemptId: ATTEMPT,
+      auditRevision: R1, verdict: 'REWORK', updatedAt: 31,
+    });
+    // Exact persisted production split: both live revision columns are R2, but
+    // the task still points at the R1 bundle and the owner still carries R1's
+    // terminal audit projection.
+    rewritePersistedAssignment(database, {
+      ...registry.getAssignment(implementerId)!, status: 'ready_for_audit', leaseId: '',
+      validationState: 'passed', auditRevision: R2, auditAttemptId: ATTEMPT,
+      verdict: 'REWORK', blocker: 'R1 finding', updatedAt: 40,
+    });
+    rewritePersistedTask(database, {
+      ...registry.getTaskRecord(taskId)!, status: 'ready_for_audit', validationState: 'passed',
+      currentRevision: R2, integrationBundle: r1Bundle, updatedAt: 40,
+    });
+    return { database, registry, taskId, implementerId, auditorId, owner, r1Bundle };
+  }
+
+  it('atomically replaces the exact terminal-REWORK predecessor bundle with R2 bytes', () => {
+    const shape = brokenPostReworkShape('bundle-successor-repair');
+    try {
+      const r2Bundle = bundle(shape.taskId, shape.implementerId, R2, '2'.repeat(64));
+      expect(shape.registry.canRefreezeSupersededReworkBundle({
+        taskId: shape.taskId, assignmentId: shape.implementerId,
+        identity: shape.owner, revision: R2,
+      })).toBe(true);
+      expect(shape.registry.bindIntegrationBundle({
+        taskId: shape.taskId, assignmentId: shape.implementerId,
+        identity: shape.owner, revision: R2, bundle: r2Bundle, now: 50,
+      })).toMatchObject({ ok: true });
+      expect(shape.registry.getTaskRecord(shape.taskId)?.integrationBundle).toEqual(r2Bundle);
+      expect(shape.registry.getAssignment(shape.implementerId)).toMatchObject({
+        status: 'ready_for_audit', validationState: 'passed', auditRevision: R2,
+      });
+      expect(shape.registry.getAssignment(shape.implementerId)?.auditAttemptId).toBeUndefined();
+      expect(shape.registry.getAssignment(shape.implementerId)?.verdict).toBeUndefined();
+      expect(shape.registry.getAssignment(shape.implementerId)?.blocker).toBeUndefined();
+      expect(shape.registry.listAuditReceipts(shape.taskId)).toHaveLength(1);
+    } finally {
+      shape.registry.close();
+      shape.database.close();
+    }
+  });
+
+  it('refuses to refreeze when the predecessor auditor is not exactly finalized', () => {
+    const shape = brokenPostReworkShape('bundle-successor-refuse-live-auditor');
+    try {
+      rewritePersistedAssignment(shape.database, {
+        ...shape.registry.getAssignment(shape.auditorId)!, status: 'cancelled', updatedAt: 45,
+      });
+      const r2Bundle = bundle(shape.taskId, shape.implementerId, R2, '2'.repeat(64));
+      expect(shape.registry.canRefreezeSupersededReworkBundle({
+        taskId: shape.taskId, assignmentId: shape.implementerId,
+        identity: shape.owner, revision: R2,
+      })).toBe(false);
+      expect(shape.registry.bindIntegrationBundle({
+        taskId: shape.taskId, assignmentId: shape.implementerId,
+        identity: shape.owner, revision: R2, bundle: r2Bundle, now: 50,
+      })).toMatchObject({ ok: false, reason: 'manifest_mismatch' });
+      expect(shape.registry.getTaskRecord(shape.taskId)?.integrationBundle).toEqual(shape.r1Bundle);
+    } finally {
+      shape.registry.close();
+      shape.database.close();
+    }
+  });
+
+  it('clears an exact predecessor bundle and inherited audit fields when R2 first binds', () => {
+    const shape = brokenPostReworkShape('bundle-successor-prevention');
+    try {
+      // Reconstruct the pre-bind R1 owner/task while preserving the exact R1
+      // bundle. The ordinary revision update must remove that pointer itself.
+      rewritePersistedAssignment(shape.database, {
+        ...shape.registry.getAssignment(shape.implementerId)!, status: 'rework', leaseId: 'lease-r1',
+        auditRevision: R1, auditAttemptId: ATTEMPT, verdict: 'REWORK', blocker: 'R1 finding', updatedAt: 45,
+      });
+      rewritePersistedTask(shape.database, {
+        ...shape.registry.getTaskRecord(shape.taskId)!, status: 'rework', currentRevision: R1,
+        integrationBundle: shape.r1Bundle, updatedAt: 45,
+      });
+      expect(shape.registry.updateAssignment({
+        assignmentId: shape.implementerId, identity: shape.owner, revision: R2, auditRevision: R2,
+      })).toMatchObject({ ok: true });
+      expect(shape.registry.getTaskRecord(shape.taskId)?.currentRevision).toBe(R2);
+      expect(shape.registry.getTaskRecord(shape.taskId)?.integrationBundle).toBeUndefined();
+      expect(shape.registry.getAssignment(shape.implementerId)?.auditAttemptId).toBeUndefined();
+      expect(shape.registry.getAssignment(shape.implementerId)?.verdict).toBeUndefined();
+      expect(shape.registry.getAssignment(shape.implementerId)?.blocker).toBeUndefined();
+    } finally {
+      shape.registry.close();
+      shape.database.close();
+    }
+  });
+
+  it('snapshots auto-audit policy when supervision_task_start creates an auditable task', async () => {
+    resetSupervisionTaskRegistryForTests();
+    try {
+      const brain = session('deck_alpha_brain');
+      brain.transportConfig = embedSessionSupervisionSnapshot(
+        brain.transportConfig,
+        { mode: 'supervised_audit' },
+      );
+      const handlers = createMemoryMcpToolHandlers(
+        { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+        { sendDeps: { listSessions: () => [brain], isSessionAuthoritativelyActive: async () => true } },
+      );
+      const started = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
+        role: 'coordinator', classification: 'independent_top_level',
+        objective: 'must carry the current auto-audit authority', idempotencyKey: 'auto-policy-start',
+      });
+      expect(started).toMatchObject({ status: 'ok' });
+      expect(getSupervisionTaskRegistry().get(started.taskId as string)?.auditPolicy)
+        .toBe('auto_allow_degraded');
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
 });
 
 function session(name: string, projectName = 'alpha', agentType = 'codex-sdk'): SessionRecord {

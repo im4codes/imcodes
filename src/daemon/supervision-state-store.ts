@@ -3752,6 +3752,16 @@ export class SupervisionTaskRegistry {
       && Boolean(requestedRevision)
       && Boolean(task.currentRevision)
       && task.currentRevision !== requestedRevision;
+    const supersedesExactIntegrationBundle = Boolean(
+      movesTaskRevisionToSuccessor
+      && task.integrationBundle
+      && task.integrationBundle.taskId === task.taskId
+      && task.integrationBundle.sourceAssignmentId === existing.assignmentId
+      && task.integrationBundle.revision === task.currentRevision,
+    );
+    if (movesTaskRevisionToSuccessor && task.integrationBundle && !supersedesExactIntegrationBundle) {
+      return { ok: false, reason: 'manifest_mismatch' };
+    }
     if (movesTaskRevisionToSuccessor) {
       const rejectDetail = { taskStatus: task.status, assignmentStatus: existing.status };
       // 1. Implementation role is a PRECONDITION of authority, not a substitute:
@@ -3896,16 +3906,22 @@ export class SupervisionTaskRegistry {
         },
       } : undefined,
       status: nextStatus,
-      auditAttemptId: normalizeTaskString(input.auditAttemptId) ?? existing.auditAttemptId,
+      auditAttemptId: normalizeTaskString(input.auditAttemptId)
+        ?? (movesTaskRevisionToSuccessor ? undefined : existing.auditAttemptId),
       auditRevision: requestedAuditRevision
         ?? (bindsImplementationRevision ? requestedRevision : undefined)
         ?? existing.auditRevision,
-      verdict: requestedVerdict ?? (nextStatus === 'auditing' ? undefined : existing.verdict),
+      verdict: requestedVerdict
+        ?? (nextStatus === 'auditing' || movesTaskRevisionToSuccessor ? undefined : existing.verdict),
       blocker: normalizeTaskString(input.blocker)
-        ?? (nextStatus === 'auditing' || nextStatus === 'passed' || nextStatus === 'ready_for_integration' ? undefined : existing.blocker),
-      externalRunId: normalizeTaskString(input.externalRunId) ?? existing.externalRunId,
-      externalHeadSha: normalizeTaskString(input.externalHeadSha) ?? existing.externalHeadSha,
-      externalTaskId: normalizeTaskString(input.externalTaskId) ?? existing.externalTaskId,
+        ?? (nextStatus === 'auditing' || nextStatus === 'passed' || nextStatus === 'ready_for_integration'
+          || movesTaskRevisionToSuccessor ? undefined : existing.blocker),
+      externalRunId: normalizeTaskString(input.externalRunId)
+        ?? (movesTaskRevisionToSuccessor ? undefined : existing.externalRunId),
+      externalHeadSha: normalizeTaskString(input.externalHeadSha)
+        ?? (movesTaskRevisionToSuccessor ? undefined : existing.externalHeadSha),
+      externalTaskId: normalizeTaskString(input.externalTaskId)
+        ?? (movesTaskRevisionToSuccessor ? undefined : existing.externalTaskId),
       // Revision-scoped reviews do not cross a successor boundary on the
       // CALLER's own record either. The demotion loop below only retires OTHER
       // parked implementers, so without this an economy owner kept its own
@@ -3916,7 +3932,10 @@ export class SupervisionTaskRegistry {
         ?? (movesTaskRevisionToSuccessor ? undefined : existing.primaryReviewPassed),
       crossVendorAuditPassed: input.crossVendorAuditPassed
         ?? (movesTaskRevisionToSuccessor ? undefined : existing.crossVendorAuditPassed),
-      auditRoutingReason: input.auditRoutingReason ?? existing.auditRoutingReason,
+      auditRoutingReason: input.auditRoutingReason
+        ?? (movesTaskRevisionToSuccessor ? undefined : existing.auditRoutingReason),
+      auditDegradedReason: movesTaskRevisionToSuccessor
+        ? undefined : existing.auditDegradedReason,
       updatedAt: now,
     };
     const eventType = nextStatus === 'auditing' ? 'audit_requested'
@@ -3973,11 +3992,32 @@ export class SupervisionTaskRegistry {
           // transition table is NOT widened, so an ordinary updateTask still
           // cannot walk ready_for_integration back to implementing.
           const catchUpStatus = movesTaskRevisionToSuccessor ? 'implementing' as const : lockedTask.status;
-          this.#writeTask({ ...lockedTask, status: catchUpStatus, currentRevision: requestedRevision, updatedAt: now }, this.#taskEventFor(catchUpStatus), {
+          const lockedBundle = lockedTask.integrationBundle;
+          const clearsExactPredecessorBundle = Boolean(
+            movesTaskRevisionToSuccessor
+            && lockedBundle
+            && lockedBundle.taskId === lockedTask.taskId
+            && lockedBundle.sourceAssignmentId === existing.assignmentId
+            && lockedBundle.revision === lockedTask.currentRevision,
+          );
+          if (movesTaskRevisionToSuccessor && lockedBundle && !clearsExactPredecessorBundle) {
+            this.#db.exec('ROLLBACK');
+            return { ok: false, reason: 'manifest_mismatch' };
+          }
+          this.#writeTask({
+            ...lockedTask,
+            status: catchUpStatus,
+            currentRevision: requestedRevision,
+            ...(clearsExactPredecessorBundle ? { integrationBundle: undefined } : {}),
+            updatedAt: now,
+          }, this.#taskEventFor(catchUpStatus), {
             source: 'assignment_update',
             assignmentId: existing.assignmentId,
             revisionBound: true,
             revision: requestedRevision,
+            ...(clearsExactPredecessorBundle
+              ? { supersededIntegrationBundleRevision: lockedBundle!.revision }
+              : {}),
           });
         }
       }
@@ -4299,6 +4339,27 @@ export class SupervisionTaskRegistry {
    * content-addressed object; this transaction makes its exact identity part
    * of the task authority that survives daemon/store reopen.
    */
+  canRefreezeSupersededReworkBundle(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: PersistedSupervisionTaskAssignmentIdentity;
+    revision: string;
+  }): boolean {
+    const task = this.getTaskRecord(input.taskId);
+    const assignment = this.getAssignment(input.assignmentId);
+    return Boolean(
+      task
+      && assignment
+      && assignment.taskId === task.taskId
+      && identityMatches(assignment.identity, input.identity)
+      && this.#supersededReworkBundleReceipt(task, assignment, {
+        taskId: task.taskId,
+        sourceAssignmentId: assignment.assignmentId,
+        revision: input.revision,
+      }),
+    );
+  }
+
   bindIntegrationBundle(
     input: SupervisionIntegrationBundleBindInput,
   ): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
@@ -4318,7 +4379,10 @@ export class SupervisionTaskRegistry {
       || bundle.taskId !== task.taskId
       || bundle.sourceAssignmentId !== assignment.assignmentId
       || bundle.revision !== revision) return { ok: false, reason: 'manifest_mismatch' };
-    if (task.integrationBundle) {
+    const supersededReworkReceipt = task.integrationBundle
+      ? this.#supersededReworkBundleReceipt(task, assignment, bundle)
+      : undefined;
+    if (task.integrationBundle && !supersededReworkReceipt) {
       return sameIntegrationBundleBinding(task.integrationBundle, bundle)
         ? { ok: true, value: task, replay: true }
         : { ok: false, reason: 'manifest_mismatch' };
@@ -4333,8 +4397,11 @@ export class SupervisionTaskRegistry {
     try {
       const lockedTask = this.getTaskRecord(task.taskId);
       const lockedAssignment = this.getAssignment(assignment.assignmentId);
+      const lockedSupersededReceipt = lockedTask?.integrationBundle && lockedAssignment
+        ? this.#supersededReworkBundleReceipt(lockedTask, lockedAssignment, bundle)
+        : undefined;
       if (!lockedTask || !lockedAssignment
-        || lockedTask.integrationBundle
+        || (lockedTask.integrationBundle && !lockedSupersededReceipt)
         || lockedTask.currentRevision !== revision
         || lockedAssignment.auditRevision !== revision
         || !identityMatches(lockedAssignment.identity, input.identity)) {
@@ -4343,8 +4410,35 @@ export class SupervisionTaskRegistry {
           ? { ok: true, value: lockedTask!, replay: true }
           : { ok: false, reason: 'manifest_mismatch' };
       }
+      if (lockedSupersededReceipt) {
+        // A crashed successor handoff can leave the predecessor bundle and its
+        // REWORK projection attached after both revision columns already moved
+        // forward. The old receipt remains immutable history, but none of its
+        // revision-scoped authority may leak into the freshly frozen successor.
+        this.#writeAssignment({
+          ...lockedAssignment,
+          auditAttemptId: undefined,
+          verdict: undefined,
+          blocker: undefined,
+          externalRunId: undefined,
+          externalHeadSha: undefined,
+          externalTaskId: undefined,
+          primaryReviewPassed: undefined,
+          crossVendorAuditPassed: undefined,
+          auditRoutingReason: undefined,
+          auditDegradedReason: undefined,
+          updatedAt: now,
+        }, 'recovered', {
+          source: 'superseded_rework_bundle_refreeze',
+          priorRevision: lockedTask.integrationBundle!.revision,
+          successorRevision: revision,
+          sourceReceiptId: lockedSupersededReceipt.receiptId,
+        });
+      }
       this.#writeTask(bound, this.#taskEventFor(bound.status), {
-        source: 'immutable_integration_bundle_frozen',
+        source: lockedSupersededReceipt
+          ? 'immutable_integration_bundle_refrozen_after_rework'
+          : 'immutable_integration_bundle_frozen',
         assignmentId: assignment.assignmentId,
         revision,
         manifestSha256: bundle.manifestSha256,
@@ -4357,6 +4451,60 @@ export class SupervisionTaskRegistry {
       this.#db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /**
+   * Prove that an attached bundle is only the immutable predecessor of the
+   * validated successor being frozen now. This is intentionally much narrower
+   * than a generic bundle replacement: the same implementation object must own
+   * both revisions and the predecessor must have one exact terminal REWORK.
+   */
+  #supersededReworkBundleReceipt(
+    task: PersistedSupervisionTaskRecord,
+    assignment: PersistedSupervisionTaskAssignment,
+    successor: Pick<SupervisionIntegrationBundle, 'taskId' | 'sourceAssignmentId' | 'revision'>,
+  ): PersistedSupervisionAuditReceipt | undefined {
+    const predecessor = task.integrationBundle;
+    if (!predecessor
+      || predecessor.taskId !== task.taskId
+      || predecessor.sourceAssignmentId !== assignment.assignmentId
+      || predecessor.revision === successor.revision
+      || successor.taskId !== task.taskId
+      || successor.sourceAssignmentId !== assignment.assignmentId
+      || successor.revision !== task.currentRevision
+      || assignment.auditRevision !== successor.revision
+      || task.validationState !== 'passed'
+      || assignment.validationState !== 'passed'
+      || !['implementing', 'validated', 'ready_for_audit'].includes(task.status)
+      || !['implementing', 'validated', 'ready_for_audit'].includes(assignment.status)
+      || task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt
+      || task.integrationOwnerAssignmentId
+      || assignment.verdict?.trim().toUpperCase() !== 'REWORK'
+      || !assignment.auditAttemptId) return undefined;
+    if (this.listAuditReceipts(task.taskId).some((receipt) => (
+      receipt.revision === successor.revision && receipt.receiptKind === 'final'
+    ))) return undefined;
+    if (this.listAssignments(task.taskId).some((candidate) => (
+      candidate.role === 'auditor'
+      && candidate.auditRevision === successor.revision
+      && !['cancelled', 'finalized'].includes(candidate.status)
+    ))) return undefined;
+    const receipts = this.listAuditReceipts(task.taskId).filter((receipt) => (
+      receipt.revision === predecessor.revision
+      && receipt.attemptId === assignment.auditAttemptId
+      && receipt.receiptKind === 'final'
+      && receipt.verdict === 'REWORK'
+    ));
+    if (receipts.length !== 1) return undefined;
+    const auditor = this.getAssignment(receipts[0]!.assignmentId);
+    return auditor?.role === 'auditor'
+      && auditor.status === 'finalized'
+      && !auditor.leaseId
+      && auditor.auditRevision === predecessor.revision
+      && auditor.auditAttemptId === assignment.auditAttemptId
+      && auditor.verdict?.trim().toUpperCase() === 'REWORK'
+      ? receipts[0]
+      : undefined;
   }
 
   finishAssignment(input: SupervisionTaskAssignmentFinishInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {

@@ -1899,10 +1899,7 @@ export async function dispatchSendMessage(
             && assignment.auditRevision === recoveryRevision
             && !['cancelled', 'recovered', 'finalized'].includes(assignment.status)
           ));
-          const selectedCxOrCcTransport = (
-            (targetIdentity.agentType === 'codex-sdk' && targetIdentity.providerFamily === 'openai')
-            || (targetIdentity.agentType === 'claude-code-sdk' && targetIdentity.providerFamily === 'anthropic')
-          ) && (targetRecord.runtimeType ?? getSessionRuntimeType(targetRecord.agentType)) === 'transport';
+          const selectedCxOrCcTransport = isAutomaticAuditTransportTarget(targetRecord);
           const exactStrictSameObjectRecovery = Boolean(
             input.audit.strictCrossVendor === true
             && poolSelected
@@ -2945,6 +2942,12 @@ interface AutomaticAuditTransportTargets {
   busy?: string;
 }
 
+function isAutomaticAuditTransportTarget(target: SessionRecord): boolean {
+  return ((target.agentType === 'codex-sdk' && resolvePeerAuditProviderFamily(target) === 'openai')
+    || (target.agentType === 'claude-code-sdk' && resolvePeerAuditProviderFamily(target) === 'anthropic'))
+    && (target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport';
+}
+
 /**
  * Choose an auditor AND claim it, in one synchronous step.
  *
@@ -3524,13 +3527,7 @@ export async function dispatchReadyAudit(
   }
 
   // Pool scoping context, NOT a relay. The audit envelope is delivered straight
-  // to the auditor either way; this session only scopes the eligible-pool query
-  // (userId/sessionName/project). Requiring it to be a live Brain made the
-  // normal automatic path depend on a Brain session being up, and when it was
-  // not the daemon blocked and a human had to drive the manual two-step relay.
-  // The implementer is same-project and already authoritative here, so it is a
-  // correct fallback scope; identity, pool eligibility and the cross-vendor
-  // pick below are unchanged.
+  // to the auditor either way; this session only scopes the eligible-pool query.
   const brain = (coordinator ? exactLiveSessionForAssignment(coordinator, sessions) : undefined)
     ?? exactLiveSessionForAssignment(implementer, sessions);
   if (!brain) {
@@ -3540,10 +3537,6 @@ export async function dispatchReadyAudit(
       : false;
     return { status: 'blocked', reason, reported };
   }
-  // Automatic materialization is deliberately transport-only. Process peers
-  // remain valid for the existing Brain-controlled exact/manual audit path,
-  // but plain tmux delivery has no recipient-side durable command-id boundary
-  // and therefore cannot satisfy restart-safe exactly-once auto delivery.
   const candidates: AutomaticAuditTransportTargets = existingAudit
     ? {}
     : eligibleAutomaticAuditTransportTargets(
@@ -3559,6 +3552,7 @@ export async function dispatchReadyAudit(
     projectName: task.projectName,
     projectRoot: brain.projectDir,
   };
+  let repairingUnselectedExisting = false;
   const buildInput = (target?: string, autoProvision = false): SendMessageInput => ({
     ...(target ? { target } : {}),
     message: boundedAuditBrief(task, revision, integrationArtifact.path),
@@ -3572,7 +3566,13 @@ export async function dispatchReadyAudit(
       kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
       attemptId,
       auditedSessionName: implementer.identity.sessionName,
-      ...(task.auditPolicy === 'auto_strict_cross_vendor' ? { strictCrossVendor: true } : {}),
+      ...(task.auditPolicy === 'auto_strict_cross_vendor' || repairingUnselectedExisting
+        || (existingAudit && target && sessions.some((session) => (
+          session.name === target
+          && resolvePeerAuditProviderFamily(session) !== implementer.identity.providerFamily
+        )))
+        ? { strictCrossVendor: true }
+        : {}),
     },
     task: {
       taskId: task.taskId,
@@ -3593,6 +3593,27 @@ export async function dispatchReadyAudit(
   let result = await dispatch(caller, buildInput(directTarget, !directTarget));
   if (!directTarget && candidates.busy && mayFallbackToBusyAfterProvision(result)) {
     result = await dispatch(caller, buildInput(candidates.busy));
+  }
+  if (existingAudit && result.status === 'error'
+    && result.error.includes('task execution pool rejected target: unselected_config')) {
+    // The assignment is the durable audit object; its historical target is not.
+    // Re-run the authoritative live pool selection only after the old target's
+    // side-effect-free pool rejection, then let the existing exact-assignment
+    // continuation atomically rebind and deliver. No auditor/attempt/revision is
+    // minted here, and an absent eligible target remains a normal blocker.
+    const recoveryCandidates = eligibleAutomaticAuditTransportTargets(
+      brain,
+      implementer,
+      false,
+      deps,
+      attemptId,
+    );
+    const recoveryTarget = recoveryCandidates.ready ?? recoveryCandidates.busy;
+    if (recoveryTarget) {
+      recoveredExistingMessageId = undefined;
+      repairingUnselectedExisting = true;
+      result = await dispatch(caller, buildInput(recoveryTarget));
+    }
   }
   if (result.status !== 'accepted' || !result.assignmentId) {
     // Nothing was routed, so nothing may keep holding a ready peer out of the
@@ -3684,11 +3705,23 @@ async function resolveIntegrationArtifact(
   }
   const persisted = task.integrationBundle;
   if (persisted) {
-    if (persisted.taskId !== task.taskId
-      || persisted.sourceAssignmentId !== implementer.assignmentId
-      || persisted.revision !== revision
-      || !verifySupervisionIntegrationBundle(persisted).ok) return undefined;
-    return { path: persisted.bundlePath, files: persisted.files, bundle: persisted };
+    if (persisted.taskId === task.taskId
+      && persisted.sourceAssignmentId === implementer.assignmentId
+      && persisted.revision === revision
+      && verifySupervisionIntegrationBundle(persisted).ok) {
+      return { path: persisted.bundlePath, files: persisted.files, bundle: persisted };
+    }
+    // Do not let a predecessor REWORK bundle permanently mask a validated
+    // successor. bindIntegrationBundle owns the narrow, receipt-backed CAS that
+    // decides whether this exact stale binding may be replaced; all unrelated
+    // or unaudited mismatches still fail closed there.
+    if (!allowFreeze) return undefined;
+    if (!(deps.registry ?? getSupervisionTaskRegistry()).canRefreezeSupersededReworkBundle({
+      taskId: task.taskId,
+      assignmentId: implementer.assignmentId,
+      identity: implementer.identity,
+      revision,
+    })) return undefined;
   }
   if (!allowFreeze) return undefined;
   const snapshot = await inspectAssignmentForConvergence(implementer, deps);
