@@ -26,8 +26,8 @@ export interface ControlledNodeMachineMenuProps {
   isSelectable?(machine: MachineListItem): boolean;
   /** Tooltip for a row that cannot be picked. Defaults to offline / exec-off. */
   disabledReason?(machine: MachineListItem): string | undefined;
-  /** Extra entries rendered above the list (e.g. the sidebar's wall entry). */
-  header?: ComponentChildren;
+  /** Optional primary action centered in the menu title bar. */
+  titleAction?: ComponentChildren;
   /** A status line shown above the list (e.g. a host limit). */
   notice?: string;
   /** Accessible label and heading. Defaults to controlled_nodes.machines_title. */
@@ -71,7 +71,7 @@ function MachineMenuBody({
   onSelect,
   isSelectable = canOpenRemoteDesktopMachine,
   disabledReason,
-  header,
+  titleAction,
   notice,
   label,
   emptyText,
@@ -171,8 +171,9 @@ function MachineMenuBody({
         maxHeight: position.maxHeight,
       }}
     >
-      <div class="controlled-node-quick-menu-head">
-        <span>{title}</span>
+      <div class="controlled-node-quick-menu-head" role="none">
+        <span class="controlled-node-quick-menu-title">{title}</span>
+        {titleAction && <div class="controlled-node-quick-menu-title-action" role="none">{titleAction}</div>}
         <span class="controlled-node-quick-count">{visible.length}</span>
       </div>
       {/* A team is a group you can share. Picking one here is the same act as
@@ -194,7 +195,6 @@ function MachineMenuBody({
           ))}
         </div>
       )}
-      {header}
       {notice && <div class="controlled-node-quick-notice" role="status">{notice}</div>}
       {!loaded && !error && <div class="controlled-node-quick-state">{t('common.loading')}</div>}
       {error != null && machines.length === 0 && (

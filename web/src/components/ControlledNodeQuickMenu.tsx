@@ -44,13 +44,14 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
         open={open}
         onClose={close}
         onSelect={(machine) => onOpenRemoteDesktop?.(machine)}
-        header={onOpenRemoteDesktopWall && (
+        titleAction={onOpenRemoteDesktopWall && (
           <button
             type="button"
             class="controlled-node-quick-wall"
             role="menuitem"
+            aria-label={t('remote_desktop.wall_short_title')}
             onClick={() => { close(); onOpenRemoteDesktopWall(); }}
-          ><span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}</button>
+          >{t('remote_desktop.wall_short_title')}</button>
         )}
       />
     </>

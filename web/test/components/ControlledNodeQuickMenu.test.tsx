@@ -1,4 +1,7 @@
 /** @vitest-environment jsdom */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
@@ -112,14 +115,107 @@ describe('ControlledNodeQuickMenu', () => {
     expect(row.getAttribute('title')).toBe('controlled_nodes.exec_off');
   });
 
-  it('keeps the wall entry and closes when it is chosen', async () => {
+  it('centers the only wall entry in the title bar before group tabs and preserves click behavior', async () => {
+    machines = [node({ teamIds: ['team-1'], teamNames: ['Ops'] })];
+    const onWall = vi.fn();
+    render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} onOpenRemoteDesktopWall={onWall} />);
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+
+    const menu = await screen.findByRole('menu');
+    const wall = screen.getByRole('menuitem', { name: 'remote_desktop.wall_short_title' });
+    const titleBar = menu.querySelector('.controlled-node-quick-menu-head')!;
+    const tabs = menu.querySelector('.controlled-node-quick-groups')!;
+    expect(menu.querySelectorAll('.controlled-node-quick-wall')).toHaveLength(1);
+    expect(titleBar.contains(wall)).toBe(true);
+    expect(wall.parentElement?.classList.contains('controlled-node-quick-menu-title-action')).toBe(true);
+    expect(wall.parentElement?.getAttribute('role')).toBe('none');
+    expect(titleBar.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(wall.querySelector('[aria-hidden="true"]')).toBeNull();
+    expect(wall.textContent).toBe('remote_desktop.wall_short_title');
+    expect(menu.textContent).not.toContain('remote_desktop.workspace_wall');
+
+    fireEvent.click(wall);
+    expect(onWall).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('keeps the wall action permission-gated', async () => {
+    machines = [node({})];
+    render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+    expect(await screen.findByRole('menu')).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: 'remote_desktop.wall_short_title' })).toBeNull();
+  });
+
+  it('exposes a focusable semantic wall button that Enter activates', async () => {
     machines = [node({})];
     const onWall = vi.fn();
     render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} onOpenRemoteDesktopWall={onWall} />);
     fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
-    fireEvent.click(await screen.findByRole('menuitem', { name: /remote_desktop\.workspace_wall/ }));
+    const wall = await screen.findByRole('menuitem', { name: 'remote_desktop.wall_short_title' }) as HTMLButtonElement;
+
+    expect(wall.type).toBe('button');
+    expect(wall.tabIndex).toBe(0);
+    wall.focus();
+    expect(document.activeElement).toBe(wall);
+    // jsdom omits the browser's default Enter-to-click action for buttons.
+    // Replaying that uncancelled default proves this remains native keyboard activation.
+    const runDefault = fireEvent.keyDown(wall, { key: 'Enter' });
+    if (runDefault) fireEvent.click(wall, { detail: 0 });
+    fireEvent.keyUp(wall, { key: 'Enter' });
+
     expect(onWall).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('keeps the centered title action usable in a narrow touch viewport', async () => {
+    const width = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    const matchMedia = Object.getOwnPropertyDescriptor(window, 'matchMedia');
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 });
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
+    });
+    machines = [node({ teamIds: ['team-1'], teamNames: ['A very long shared team'] })];
+    try {
+      render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} onOpenRemoteDesktopWall={() => {}} />);
+      fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+      const menu = await screen.findByRole('menu');
+      const head = menu.querySelector('.controlled-node-quick-menu-head')!;
+      const wall = screen.getByRole('menuitem', { name: 'remote_desktop.wall_short_title' });
+      const tabs = menu.querySelector('.controlled-node-quick-groups')!;
+
+      expect((menu as HTMLElement).style.width).toBe('304px');
+      expect(head.contains(wall)).toBe(true);
+      expect(head.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(wall.getAttribute('aria-label')).toBe('remote_desktop.wall_short_title');
+
+      const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+      const css = readFileSync(resolve(webRoot, 'src/styles.css'), 'utf8');
+      expect(css).toMatch(/\.controlled-node-quick-menu-head\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto minmax\(0, 1fr\)/);
+      expect(css).toMatch(/@media \(max-width: 420px\)[\s\S]*?\.controlled-node-quick-wall\s*\{[^}]*max-width:/);
+      expect(css).toMatch(/\.controlled-node-quick-wall:focus-visible\s*\{/);
+      expect(css).toMatch(/\.controlled-node-quick-wall:active\s*\{/);
+      expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.controlled-node-quick-wall\s*\{[^}]*transition:\s*none/);
+    } finally {
+      if (width) Object.defineProperty(window, 'innerWidth', width);
+      if (matchMedia) Object.defineProperty(window, 'matchMedia', matchMedia);
+      else delete (window as Window & { matchMedia?: typeof window.matchMedia }).matchMedia;
+    }
+  });
+
+  it('provides an unbranded semantic short wall title in every locale without changing workspace_wall', () => {
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+    for (const locale of ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW']) {
+      const messages = JSON.parse(readFileSync(
+        resolve(webRoot, `src/i18n/locales/${locale}.json`),
+        'utf8',
+      )) as { remote_desktop?: { wall_short_title?: string; workspace_wall?: string } };
+      const shortTitle = messages.remote_desktop?.wall_short_title;
+      expect(shortTitle).toBeTruthy();
+      expect(shortTitle?.toLowerCase()).not.toContain('aidesk.to');
+      expect(messages.remote_desktop?.workspace_wall?.toLowerCase()).toContain('aidesk.to');
+    }
   });
 
   it.each(['mouse', 'touch'] as const)('closes on an outside %s pointer press', async (pointerType) => {
