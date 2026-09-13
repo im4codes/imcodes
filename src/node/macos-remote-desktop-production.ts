@@ -10,11 +10,11 @@ import {
   type VerifiedMacosRemoteDesktopComponent,
   type VerifiedMacosRemoteDesktopArtifact,
 } from './macos-remote-desktop-artifact.js';
-import type {
-  MacosRemoteDesktopHostCleanupReason,
-  MacosRemoteDesktopHostCleanupOutcome,
-  MacosRemoteDesktopHostCleanupRequest,
-  MacosRemoteDesktopWorkerHostOptions,
+import {
+  MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OUTCOME_REASON,
+  type MacosRemoteDesktopHostCleanupOutcome,
+  type MacosRemoteDesktopHostCleanupRequest,
+  type MacosRemoteDesktopWorkerHostOptions,
 } from './macos-remote-desktop-worker-host.js';
 import {
   buildMacosRemoteDesktopGlobalLaunchAgentDefinition,
@@ -895,8 +895,25 @@ async function defaultLaunchNativeCleanup(
     : args[0] === MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.stopCapture
       ? 'macos_remote_desktop_stop_capture_ok'
       : '';
+  const noActiveGeneration = args[0] === MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.releaseInput
+    ? 'macos_remote_desktop_release_input_no_active_generation'
+    : args[0] === MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.stopCapture
+      ? 'macos_remote_desktop_stop_capture_no_active_generation'
+      : '';
+  if (noActiveGeneration
+    && !result.stdout.trim()
+    && result.stderr.trim() === noActiveGeneration) {
+    throw new MacosRemoteDesktopNoActiveGenerationError();
+  }
   if (!expected || result.stderr.trim() || result.stdout.trim() !== expected) {
     throw new Error('macos_remote_desktop_native_cleanup_failed');
+  }
+}
+
+class MacosRemoteDesktopNoActiveGenerationError extends Error {
+  constructor() {
+    super('macos_remote_desktop_native_cleanup_no_active_generation');
+    this.name = 'MacosRemoteDesktopNoActiveGenerationError';
   }
 }
 
@@ -1038,8 +1055,13 @@ export function createMacosRemoteDesktopProductionDependencies(
       );
       return { ok: true };
     } catch (error) {
-      dependencies.onBackgroundError?.(error);
-      return { ok: false, error };
+      return error instanceof MacosRemoteDesktopNoActiveGenerationError
+        ? {
+          ok: false,
+          reason: MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OUTCOME_REASON.NO_ACTIVE_GENERATION,
+          error,
+        }
+        : { ok: false, error };
     }
   };
 

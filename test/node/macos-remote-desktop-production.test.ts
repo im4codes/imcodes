@@ -975,7 +975,13 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     await expect(options.releaseInput?.({ reason: 'close', workerGeneration: 11 }))
       .resolves.toEqual({ ok: true });
     await expect(options.stopCapture?.({ reason: 'close', workerGeneration: 11 }))
-      .resolves.toMatchObject({ ok: false });
+      .resolves.toMatchObject({
+        ok: false,
+        reason: 'no_active_generation',
+        error: expect.objectContaining({
+          message: 'macos_remote_desktop_native_cleanup_no_active_generation',
+        }),
+      });
 
     expect(executeResponsibleCommand).toHaveBeenCalledTimes(3);
     for (const [request] of executeResponsibleCommand.mock.calls) {
@@ -996,6 +1002,34 @@ describe('stock macOS remote-desktop production dependency factory', () => {
         '11',
       ],
     ]);
+  });
+
+  it('does not classify malformed or mismatched native cleanup output as no-active', async () => {
+    const verified = artifact();
+    const executeResponsibleCommand = vi.fn(async () => ({
+      stdout: '',
+      stderr: 'macos_remote_desktop_release_input_no_active_generation\nextra',
+    }));
+    const options = stockFactory({
+      platform: 'darwin',
+      arch: 'arm64',
+      responsibleAppPath: '/verified/aiDesk.to by IM.codes.app',
+      selectArtifact: vi.fn(async () => verified),
+      resolveUserSession: async () => USER,
+      executeResponsibleCommand,
+    })!;
+    await options.resolveVerifiedArtifact();
+    await options.resolveUserSession();
+
+    await expect(options.releaseInput?.({ reason: 'close', workerGeneration: 12 }))
+      .resolves.toMatchObject({
+        ok: false,
+        error: expect.objectContaining({
+          message: 'macos_remote_desktop_native_cleanup_failed',
+        }),
+      });
+    expect(await options.releaseInput?.({ reason: 'close', workerGeneration: 12 }))
+      .not.toHaveProperty('reason');
   });
 
   it('uses bounded fixed cleanup commands and never carries an ambient credential', async () => {

@@ -9,6 +9,7 @@ import {
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_TERMINAL_REASON,
   type RemoteDesktopDaemonCommand,
   type RemoteDesktopDaemonMessage,
   type RemoteDesktopPrepare,
@@ -38,6 +39,7 @@ import type {
   MacosRemoteDesktopIpcSession,
 } from '../../src/node/macos-remote-desktop-ipc.js';
 import type { MacosRemoteDesktopIpcServerOptions } from '../../src/node/macos-remote-desktop-ipc-server.js';
+import type { MacosRemoteDesktopIpcDisconnectReason } from '../../src/node/macos-remote-desktop-ipc-server.js';
 import type {
   MacosRemoteDesktopLaunchAgentSnapshot,
   MacosRemoteDesktopLaunchAgentSupervisorDependencies,
@@ -156,6 +158,7 @@ interface Harness {
     sessionOverrides?: Partial<MacosRemoteDesktopIpcSession>,
   ): boolean;
   workerMessage(message: RemoteDesktopDaemonMessage): void;
+  disconnect(reason: MacosRemoteDesktopIpcDisconnectReason, error?: Error): void;
   lifecycle: Lifecycle;
   stopped: ReturnType<typeof vi.fn>;
   serverStarts: ReturnType<typeof vi.fn>;
@@ -283,6 +286,7 @@ function harness(overrides: Partial<MacosRemoteDesktopWorkerHostOptions> = {}): 
       return true;
     },
     workerMessage: (message) => { void serverOptions?.onWorkerMessage(message); },
+    disconnect: (reason, error) => { void serverOptions?.onDisconnect?.(reason, error); },
   };
 }
 
@@ -859,6 +863,350 @@ describe('macOS remote-desktop worker host', () => {
     expect(value.host.available()).toBe(true);
     expect(releaseInput).not.toHaveBeenCalled();
     expect(stopCapture).not.toHaveBeenCalled();
+  });
+
+  it('keeps the capability profile stable across a terminal-proven worker exit and restart', async () => {
+    const onProfileChanged = vi.fn();
+    const notices: unknown[] = [];
+    const errors: unknown[] = [];
+    const value = harness({
+      onProfileChanged,
+      onLifecycleNotice: (notice) => notices.push(notice),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+    expect(onProfileChanged).toHaveBeenCalledTimes(1);
+    await value.host.handle(prepare());
+    expect(await value.host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+    })).toBe(true);
+    expect(await value.host.handle({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      sdp: 'v=0',
+    })).toBe(false);
+
+    value.workerMessage({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_CONTROLLER,
+    });
+    value.disconnect('peer_disconnected');
+
+    expect(value.host.available()).toBe(true);
+    expect(value.host.adapterCapabilities()).toContain(REMOTE_DESKTOP_INPUT_CAPABILITY);
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(2));
+    // No unavailable profile was published between the two authenticated
+    // workers, so the controlled-node socket does not reconnect/flicker.
+    expect(onProfileChanged).toHaveBeenCalledTimes(1);
+    expect(errors).toEqual([]);
+    expect(notices).toContainEqual({
+      kind: 'expected_worker_exit',
+      workerGeneration: 1,
+    });
+    expect(value.authenticate()).toBe(true);
+    await vi.waitFor(() => expect(value.host.available()).toBe(true));
+    expect(onProfileChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it('withdraws capability and reports an unproven or faulty worker disconnect', async () => {
+    for (const reason of ['peer_disconnected', 'write_failed'] as const) {
+      const onProfileChanged = vi.fn();
+      const errors: unknown[] = [];
+      const value = harness({
+        onProfileChanged,
+        onBackgroundError: (error) => errors.push(error),
+      });
+      await startAuthenticated(value);
+      value.disconnect(reason);
+      expect(value.host.available()).toBe(false);
+      expect(onProfileChanged).toHaveBeenCalledTimes(2);
+      expect(errors).toContainEqual(expect.objectContaining({
+        message: `macos_remote_desktop_worker_disconnected:${reason}`,
+      }));
+    }
+  });
+
+  it('withdraws a retained profile when the proven-exit replacement cannot become ready', async () => {
+    let encoder = true;
+    const onProfileChanged = vi.fn();
+    const value = harness({
+      onProfileChanged,
+      inspectReadiness: async () => ({
+        screenRecording: true,
+        encoder,
+        accessibility: true,
+        clipboard: true,
+        disclosure: true,
+      }),
+    });
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    value.workerMessage({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_LOCAL_USER,
+    });
+    encoder = false;
+    value.disconnect('peer_disconnected');
+
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(onProfileChanged).toHaveBeenCalledTimes(2));
+    expect(value.host.available()).toBe(false);
+  });
+
+  it('degrades no-active cleanup only after exact-generation termination proof', async () => {
+    const errors: unknown[] = [];
+    const notices: unknown[] = [];
+    const noActive = () => ({
+      ok: false,
+      reason: 'no_active_generation' as const,
+      error: new Error('native_no_active'),
+    });
+    const value = harness({
+      releaseInput: noActive,
+      stopCapture: noActive,
+      onLifecycleNotice: (notice) => notices.push(notice),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+
+    value.workerMessage({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_LOCAL_USER,
+    });
+    value.lifecycle.emit({ type: 'lock' });
+    await vi.waitFor(() => expect(notices).toHaveLength(2));
+
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'macos_remote_desktop_lifecycle_event:lock',
+    ]);
+    expect(notices).toEqual([
+      expect.objectContaining({
+        kind: 'cleanup_no_active_generation',
+        workerGeneration: 1,
+        operation: 'release_input',
+      }),
+      expect.objectContaining({
+        kind: 'cleanup_no_active_generation',
+        workerGeneration: 1,
+        operation: 'stop_capture',
+      }),
+    ]);
+  });
+
+  it('invalidates a TERMINAL proof when the same worker generation tracks a new PREPARE', async () => {
+    const errors: unknown[] = [];
+    const notices: unknown[] = [];
+    const cleanup = vi.fn(() => ({
+      ok: false,
+      reason: 'no_active_generation' as const,
+      error: new Error('active_generation_reported_absent'),
+    }));
+    const value = harness({
+      releaseInput: cleanup,
+      stopCapture: cleanup,
+      onLifecycleNotice: (notice) => notices.push(notice),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+
+    // Session A ends and establishes a generation-local proof.
+    await value.host.handle(prepare());
+    value.workerMessage({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_LOCAL_USER,
+    });
+
+    // The same worker (generation 1) accepts session B without a restart.
+    // That new authority makes A's TERMINAL insufficient evidence that the
+    // generation is still ended.
+    expect(await value.host.handle(prepare({
+      requestId: 'request_session_b_123456789',
+      sessionId: 'session_b_123456789',
+      capability: 'e'.repeat(43),
+    }))).toBe(true);
+    value.lifecycle.emit({ type: 'lock' });
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(errors).toHaveLength(3));
+
+    // Causal mutant: deleting markWorkerActive would turn both cleanup errors
+    // into degraded notices, so these assertions fail compile-clean mutants.
+    expect(notices).toEqual([]);
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'macos_remote_desktop_lifecycle_event:lock',
+      'active_generation_reported_absent',
+      'active_generation_reported_absent',
+    ]);
+  });
+
+  it('does not treat session A TERMINAL as generation proof while session B is still tracked', async () => {
+    const errors: unknown[] = [];
+    const notices: unknown[] = [];
+    const cleanup = vi.fn(() => ({
+      ok: false,
+      reason: 'no_active_generation' as const,
+      error: new Error('concurrent_generation_reported_absent'),
+    }));
+    const value = harness({
+      releaseInput: cleanup,
+      stopCapture: cleanup,
+      onLifecycleNotice: (notice) => notices.push(notice),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+
+    const sessionB = prepare({
+      requestId: 'request_concurrent_b_123456789',
+      sessionId: 'session_concurrent_b_123456789',
+      capability: 'f'.repeat(43),
+    });
+    expect(await value.host.handle(prepare())).toBe(true);
+    expect(await value.host.handle(sessionB)).toBe(true);
+    expect(value.serverStarts).toHaveBeenCalledTimes(1);
+
+    value.workerMessage({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_LOCAL_USER,
+    });
+    value.lifecycle.emit({ type: 'lock' });
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(errors).toHaveLength(3));
+
+    // Causal mutant: removing the zero-authority half of
+    // hasWorkerTerminationProof downgrades both failures and fails this test.
+    expect(notices).toEqual([]);
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'macos_remote_desktop_lifecycle_event:lock',
+      'concurrent_generation_reported_absent',
+      'concurrent_generation_reported_absent',
+    ]);
+  });
+
+  it('uses a matching agent-crash event as termination proof but rejects a stale generation', async () => {
+    const errors: unknown[] = [];
+    const notices: unknown[] = [];
+    const cleanup = vi.fn(() => ({
+      ok: false,
+      reason: 'no_active_generation' as const,
+      error: new Error('crashed_generation_absent'),
+    }));
+    const value = harness({
+      releaseInput: cleanup,
+      stopCapture: cleanup,
+      onLifecycleNotice: (notice) => notices.push(notice),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+
+    value.lifecycle.emit({ type: 'agent_crash', workerGeneration: 99 });
+    expect(cleanup).not.toHaveBeenCalled();
+    value.lifecycle.emit({ type: 'agent_crash', workerGeneration: 1 });
+    await vi.waitFor(() => expect(notices).toHaveLength(2));
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'macos_remote_desktop_lifecycle_event:agent_crash',
+      'macos_remote_desktop_lifecycle_event:agent_crash',
+    ]);
+  });
+
+  it('retains no-active cleanup as a failure while that generation may still be live', async () => {
+    const errors: unknown[] = [];
+    const notices: unknown[] = [];
+    const value = harness({
+      releaseInput: () => ({
+        ok: false,
+        reason: 'no_active_generation',
+        error: new Error('release_no_active'),
+      }),
+      stopCapture: () => ({
+        ok: false,
+        reason: 'no_active_generation',
+        error: new Error('stop_no_active'),
+      }),
+      onLifecycleNotice: (notice) => notices.push(notice),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    value.host.onDaemonDisconnected();
+    await vi.waitFor(() => expect(errors).toHaveLength(2));
+
+    expect(notices).toEqual([]);
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'release_no_active',
+      'stop_no_active',
+    ]);
+  });
+
+  it('treats duplicate same-generation release as degraded only when exact stop proves teardown', async () => {
+    const errors: unknown[] = [];
+    const notices: unknown[] = [];
+    const value = harness({
+      releaseInput: () => ({
+        ok: false,
+        reason: 'no_active_generation',
+        error: new Error('duplicate_release'),
+      }),
+      stopCapture: () => ({ ok: true }),
+      onLifecycleNotice: (notice) => notices.push(notice),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    value.host.onDaemonDisconnected();
+    await vi.waitFor(() => expect(notices).toHaveLength(1));
+
+    expect(errors).toEqual([]);
+    expect(notices).toEqual([expect.objectContaining({
+      kind: 'cleanup_no_active_generation',
+      workerGeneration: 1,
+      operation: 'release_input',
+      lifecycleReason: MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON.DAEMON_DISCONNECTED,
+    })]);
+  });
+
+  it('waits for cleanup of generation N before starting N+1 and never retargets it', async () => {
+    let settleStop!: (outcome: { ok: boolean }) => void;
+    const stopCapture = vi.fn(() => new Promise<{ ok: boolean }>((resolve) => {
+      settleStop = resolve;
+    }));
+    const releaseInput = vi.fn(async () => ({ ok: true }));
+    const value = harness({ releaseInput, stopCapture });
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    value.host.onDaemonDisconnected();
+
+    await Promise.resolve();
+    expect(stopCapture).toHaveBeenCalledWith({
+      reason: MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON.DAEMON_DISCONNECTED,
+      workerGeneration: 1,
+    });
+    expect(value.serverStarts).toHaveBeenCalledTimes(1);
+    settleStop({ ok: true });
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(2));
+    expect(value.authenticate()).toBe(true);
+    await vi.waitFor(() => expect(value.host.available()).toBe(true));
+    expect(stopCapture).toHaveBeenCalledTimes(1);
   });
 
   it('retires open routes on Server disconnect and replaces the worker whose session was stopped', async () => {

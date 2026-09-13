@@ -121,9 +121,40 @@ export interface MacosRemoteDesktopHostCleanupRequest {
 }
 
 /** Settlement of one cleanup, derived from real completion, not dispatch. */
+export const MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OUTCOME_REASON = Object.freeze({
+  NO_ACTIVE_GENERATION: 'no_active_generation',
+} as const);
+
+export const MACOS_REMOTE_DESKTOP_HOST_CLEANUP_NOTICE_KIND = Object.freeze({
+  NO_ACTIVE_GENERATION: 'cleanup_no_active_generation',
+  EXPECTED_WORKER_EXIT: 'expected_worker_exit',
+} as const);
+
+export const MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION = Object.freeze({
+  RELEASE_INPUT: 'release_input',
+  STOP_CAPTURE: 'stop_capture',
+} as const);
+
 export interface MacosRemoteDesktopHostCleanupOutcome {
   ok: boolean;
+  /**
+   * The exact generation-bound control endpoint reported that this generation
+   * was no longer active. The host owns the lifecycle evidence and therefore
+   * decides whether this is an idempotent late cleanup or a real failure.
+   */
+  reason?: typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OUTCOME_REASON.NO_ACTIVE_GENERATION;
   error?: unknown;
+}
+
+export interface MacosRemoteDesktopHostCleanupNotice {
+  kind: typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_NOTICE_KIND[
+    keyof typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_NOTICE_KIND
+  ];
+  workerGeneration: number;
+  operation?: typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION[
+    keyof typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION
+  ];
+  lifecycleReason?: MacosRemoteDesktopHostCleanupReason;
 }
 
 /**
@@ -274,6 +305,8 @@ export interface MacosRemoteDesktopWorkerHostOptions {
   ) => MacosRemoteDesktopLaunchSupervisor;
   /** Refreshes the next controlled-node auth frame when local readiness narrows. */
   onProfileChanged?: () => void;
+  /** Structured, non-failure lifecycle evidence; never contains native output. */
+  onLifecycleNotice?: (notice: MacosRemoteDesktopHostCleanupNotice) => void;
   onBackgroundError?: (error: unknown) => void;
 }
 
@@ -434,6 +467,13 @@ export class MacosRemoteDesktopWorkerHost {
   private activeWorkerGeneration = 0;
   /** Never decreases: see `workerGenerationFloor`. */
   private highestWorkerGeneration = 0;
+  /** Generations whose termination was observed, not inferred from cleanup text. */
+  private readonly terminatedWorkerGenerations = new Set<number>();
+  /** Routes whose STOP/CANCEL was sent but whose terminal proof has not arrived. */
+  private readonly stoppingSessions = new Set<string>();
+  /** Preserve the last good profile only across one proven normal replacement. */
+  private preserveProfileForNextStart = false;
+  private retainedProfileStartGeneration: number | null = null;
   private serviceGeneration = 0;
   private authenticated = false;
   private closed = false;
@@ -484,6 +524,10 @@ export class MacosRemoteDesktopWorkerHost {
     if (this.authenticated) return Promise.resolve();
     if (this.startPromise) return this.startPromise;
     const generation = ++this.lifecycleGeneration;
+    if (this.preserveProfileForNextStart) {
+      this.preserveProfileForNextStart = false;
+      this.retainedProfileStartGeneration = generation;
+    }
     const start = this.startGeneration(generation);
     const memo = start.finally(() => {
       if (this.startPromise === memo) this.startPromise = null;
@@ -493,7 +537,10 @@ export class MacosRemoteDesktopWorkerHost {
   }
 
   available(): boolean {
-    return !this.closed && this.authenticated
+    const replacementRetainsProfile = this.preserveProfileForNextStart
+      || this.retainedProfileStartGeneration !== null;
+    return !this.closed
+      && (this.authenticated || replacementRetainsProfile)
       && this.profile.mode !== MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE;
   }
 
@@ -568,6 +615,12 @@ export class MacosRemoteDesktopWorkerHost {
         return false;
       }
       try {
+        // TERMINAL proves only that the previous session ended. A worker may
+        // accept another route without restarting, so admitting a new
+        // authority on the same generation revokes that old proof before the
+        // command can be tracked or sent. Both expected-exit classification
+        // and cleanup downgrade consult this one proof set.
+        this.markWorkerActive(this.activeWorkerGeneration);
         this.core.track(command, null);
         const sent = await this.sendCurrent(command, generation);
         if (!sent) this.core.untrack(command.sessionId);
@@ -594,6 +647,9 @@ export class MacosRemoteDesktopWorkerHost {
       await this.core.waitForPreparing(command.sessionId);
     }
     if (!this.core.has(command.sessionId)) return false;
+    if (this.stoppingSessions.has(command.sessionId)
+      && command.type !== REMOTE_DESKTOP_MSG.STOP
+      && command.type !== REMOTE_DESKTOP_MSG.CANCEL) return false;
     if (command.type === REMOTE_DESKTOP_MSG.OFFER) {
       this.core.markOfferPending(command.sessionId, {
         connectionGeneration: this.connectionGeneration,
@@ -603,7 +659,10 @@ export class MacosRemoteDesktopWorkerHost {
     const sent = await this.sendCurrent(command, generation);
     if (sent && (command.type === REMOTE_DESKTOP_MSG.STOP
       || command.type === REMOTE_DESKTOP_MSG.CANCEL)) {
-      this.core.untrack(command.sessionId);
+      // Keep the bounded route authority only long enough to authenticate the
+      // worker's TERMINAL. Untracking here discarded that proof, making every
+      // subsequent normal peer exit indistinguishable from a crash.
+      this.stoppingSessions.add(command.sessionId);
     }
     return sent;
   }
@@ -801,6 +860,18 @@ export class MacosRemoteDesktopWorkerHost {
         },
         onDisconnect: (reason, error) => {
           if (!this.isCurrent(generation)) return;
+          const workerGeneration = this.activeWorkerGeneration;
+          const expectedWorkerExit = reason === 'peer_disconnected'
+            && workerGeneration > 0
+            && this.hasWorkerTerminationProof(workerGeneration);
+          if (expectedWorkerExit) {
+            this.options.onLifecycleNotice?.({
+              kind: MACOS_REMOTE_DESKTOP_HOST_CLEANUP_NOTICE_KIND.EXPECTED_WORKER_EXIT,
+              workerGeneration,
+            });
+            this.invalidateForLifecycle(generation, true, Promise.resolve(), true);
+            return;
+          }
           this.options.onBackgroundError?.(error ?? new Error(`macos_remote_desktop_worker_disconnected:${reason}`));
           const restart = this.authenticated && (
             reason === 'peer_disconnected'
@@ -880,7 +951,9 @@ export class MacosRemoteDesktopWorkerHost {
           beginIpcLaunch: () => launch,
           // Server owns this generation. Supervisor invalidation only retires
           // route/UI state; host lifecycle cleanup revokes the IPC authority.
-          markAuthorityUnavailable: () => this.clearAdvertisedProfile(),
+          markAuthorityUnavailable: () => this.clearAdvertisedProfile(
+            this.retainedProfileStartGeneration === generation,
+          ),
           releaseInput: () => ({ ok: true }),
           stopCapture: () => ({ ok: true }),
           invalidateRoutes: () => this.failTrackedRoutes(),
@@ -962,6 +1035,9 @@ export class MacosRemoteDesktopWorkerHost {
         ));
         return;
       }
+      if (this.retainedProfileStartGeneration === generation) {
+        this.retainedProfileStartGeneration = null;
+      }
       this.setAdvertisedProfile(profile);
       this.scheduleReadinessPoll(generation);
     } catch (error) {
@@ -970,6 +1046,14 @@ export class MacosRemoteDesktopWorkerHost {
         this.options.onBackgroundError?.(error);
         this.invalidateAuthority();
         await this.shutdownResources();
+      }
+    } finally {
+      // A retained profile bridges only one proven normal replacement. If the
+      // replacement cannot authenticate and publish, withdraw it rather than
+      // advertising stale capability forever.
+      if (this.retainedProfileStartGeneration === generation) {
+        this.retainedProfileStartGeneration = null;
+        this.clearAdvertisedProfile();
       }
     }
   }
@@ -1119,6 +1203,8 @@ export class MacosRemoteDesktopWorkerHost {
       if (event.kind !== 'message') continue;
       this.emit(event.value);
       if (event.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
+        this.markWorkerTerminated(this.activeWorkerGeneration);
+        this.stoppingSessions.delete(event.value.sessionId);
         this.core.untrack(event.value.sessionId);
       }
     }
@@ -1132,6 +1218,9 @@ export class MacosRemoteDesktopWorkerHost {
     this.options.onBackgroundError?.(new Error(`macos_remote_desktop_lifecycle_event:${event.type}`));
     if (event.type === 'agent_crash'
       && event.workerGeneration !== this.activeWorkerGeneration) return;
+    if (event.type === 'agent_crash') {
+      this.markWorkerTerminated(event.workerGeneration);
+    }
     if (event.type === 'service_generation') {
       if (event.serviceGeneration <= this.serviceGeneration) return;
       this.serviceGeneration = event.serviceGeneration;
@@ -1156,8 +1245,17 @@ export class MacosRemoteDesktopWorkerHost {
    */
   private runLocalCleanup(event: MacosRemoteDesktopHostCleanupReason): Promise<void> {
     const workerGeneration = this.activeWorkerGeneration;
-    const cleanups = [this.options.releaseInput, this.options.stopCapture]
-      .filter((entry): entry is NonNullable<typeof entry> => typeof entry === 'function');
+    type CleanupOperation = typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION[
+      keyof typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION
+    ];
+    type Cleanup = NonNullable<MacosRemoteDesktopWorkerHostOptions['releaseInput']>;
+    const cleanupCandidates: Array<readonly [CleanupOperation, Cleanup | undefined]> = [
+      [MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION.RELEASE_INPUT, this.options.releaseInput],
+      [MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION.STOP_CAPTURE, this.options.stopCapture],
+    ];
+    const cleanups = cleanupCandidates.filter(
+      (entry): entry is readonly [CleanupOperation, Cleanup] => typeof entry[1] === 'function',
+    );
     if (cleanups.length === 0) return Promise.resolve();
     if (!Number.isSafeInteger(workerGeneration) || workerGeneration <= 0) {
       // No live generation to bind to. Dispatching anyway would send the
@@ -1168,22 +1266,86 @@ export class MacosRemoteDesktopWorkerHost {
       return Promise.resolve();
     }
     const request: MacosRemoteDesktopHostCleanupRequest = { reason: event, workerGeneration };
-    const settled = Promise.allSettled(cleanups.map(async (cleanup) => {
+    // Freeze this before lifecycle invalidation clears routes. Reading the
+    // authority count after async cleanup settles would always observe zero
+    // and could launder a failure that was dispatched while session B lived.
+    const terminationProvenBeforeCleanup = this.hasWorkerTerminationProof(workerGeneration);
+    const settled = Promise.all(cleanups.map(([operation, cleanup]) => {
       try {
-        const outcome = await cleanup(request);
-        if (!outcome?.ok) {
-          this.options.onBackgroundError?.(
-            outcome?.error ?? new Error('macos_remote_desktop_host_cleanup_failed'),
-          );
-        }
+        return Promise.resolve(cleanup(request)).then((outcome) => ({
+          operation,
+          outcome: outcome ?? {
+            ok: false,
+            error: new Error('macos_remote_desktop_host_cleanup_failed'),
+          },
+          reported: false,
+        }), (error: unknown) => ({
+          operation,
+          outcome: { ok: false, error },
+          reported: false,
+        }));
       } catch (error) {
-        // A synchronous throw and a rejected promise are the same failure to a
-        // caller; both must surface, or a cleanup that never ran would look
-        // indistinguishable from one that succeeded.
+        // Preserve synchronous fault visibility for lifecycle invalidation.
         this.options.onBackgroundError?.(error);
+        return Promise.resolve({
+          operation,
+          outcome: { ok: false, error },
+          reported: true,
+        });
       }
-    })).then(() => undefined);
+    })).then((results) => {
+      // A successful exact-generation stop is itself termination proof. Apply
+      // it before classifying a concurrently completed release result.
+      const stoppedExactGeneration = results.some(({ operation, outcome }) => (
+        operation === MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OPERATION.STOP_CAPTURE && outcome.ok
+      ));
+      if (stoppedExactGeneration) {
+        this.markWorkerTerminated(workerGeneration);
+      }
+      const terminationProven = terminationProvenBeforeCleanup || stoppedExactGeneration;
+      for (const { operation, outcome, reported } of results) {
+        if (outcome.ok || reported) continue;
+        if ('reason' in outcome
+          && outcome.reason === MACOS_REMOTE_DESKTOP_HOST_CLEANUP_OUTCOME_REASON.NO_ACTIVE_GENERATION
+          && terminationProven) {
+          this.options.onLifecycleNotice?.({
+            kind: MACOS_REMOTE_DESKTOP_HOST_CLEANUP_NOTICE_KIND.NO_ACTIVE_GENERATION,
+            workerGeneration,
+            operation,
+            lifecycleReason: event,
+          });
+          continue;
+        }
+        this.options.onBackgroundError?.(
+          outcome.error ?? new Error('macos_remote_desktop_host_cleanup_failed'),
+        );
+      }
+    });
     return this.withCleanupBound(settled);
+  }
+
+  private markWorkerTerminated(workerGeneration: number): void {
+    if (!Number.isSafeInteger(workerGeneration) || workerGeneration <= 0) return;
+    this.terminatedWorkerGenerations.add(workerGeneration);
+    // Generation numbers are monotonic. A small tail covers delayed/duplicate
+    // cleanup without allowing process-lifetime growth.
+    const floor = Math.max(1, workerGeneration - 8);
+    for (const known of this.terminatedWorkerGenerations) {
+      if (known < floor) this.terminatedWorkerGenerations.delete(known);
+    }
+  }
+
+  private markWorkerActive(workerGeneration: number): void {
+    if (!Number.isSafeInteger(workerGeneration) || workerGeneration <= 0) return;
+    this.terminatedWorkerGenerations.delete(workerGeneration);
+  }
+
+  private hasWorkerTerminationProof(workerGeneration: number): boolean {
+    // A TERMINAL is session-scoped. It proves the whole worker generation has
+    // ended only while no other route authority on that generation remains.
+    // This one gate is shared by cleanup downgrade and expected peer exit.
+    return this.terminatedWorkerGenerations.has(workerGeneration)
+      && this.core.authorities().size === 0;
   }
 
   /** Bounded wait; a wedged worker must not be able to block teardown. */
@@ -1207,6 +1369,7 @@ export class MacosRemoteDesktopWorkerHost {
     generation: number,
     restart = false,
     cleanupSettled: Promise<void> = Promise.resolve(),
+    preserveAdvertisedProfile = false,
   ): void {
     if (!this.isCurrent(generation)) return;
     this.cancelPendingAuthentication(generation);
@@ -1214,7 +1377,12 @@ export class MacosRemoteDesktopWorkerHost {
     // Route authority is revoked SYNCHRONOUSLY, before any await: no peer may
     // keep acting on this generation while cleanup is still draining. The
     // worker itself is kept alive until cleanup settles.
-    this.invalidateAuthority();
+    if (preserveAdvertisedProfile) this.preserveProfileForNextStart = true;
+    else {
+      this.preserveProfileForNextStart = false;
+      this.retainedProfileStartGeneration = null;
+    }
+    this.invalidateAuthority(preserveAdvertisedProfile);
     const teardown = this.shutdownResources(cleanupSettled);
     if (restart && !this.closed) {
       void teardown.then(() => this.start()).catch((error) => {
@@ -1223,10 +1391,10 @@ export class MacosRemoteDesktopWorkerHost {
     }
   }
 
-  private invalidateAuthority(): void {
+  private invalidateAuthority(preserveAdvertisedProfile = false): void {
     // Requests addressed to this worker can no longer be answered by it.
     this.failPendingPrivacyReplies();
-    this.clearAdvertisedProfile();
+    this.clearAdvertisedProfile(preserveAdvertisedProfile);
     if (this.connectionGeneration !== 0) {
       this.core.endConnection(this.connectionGeneration);
       this.connectionGeneration = 0;
@@ -1260,10 +1428,10 @@ export class MacosRemoteDesktopWorkerHost {
     }
   }
 
-  private clearAdvertisedProfile(): void {
+  private clearAdvertisedProfile(preserveAdvertisedProfile = false): void {
     this.clearReadinessPoll();
     this.authenticated = false;
-    this.setAdvertisedProfile(EMPTY_PROFILE);
+    if (!preserveAdvertisedProfile) this.setAdvertisedProfile(EMPTY_PROFILE);
     this.activeArtifact = null;
     this.activeUser = null;
     this.activePrincipal = null;
@@ -1287,6 +1455,7 @@ export class MacosRemoteDesktopWorkerHost {
     this.core.failAll(REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED, (message) => {
       this.emit(message);
     });
+    this.stoppingSessions.clear();
   }
 
   private emit(message: RemoteDesktopDaemonMessage): void {

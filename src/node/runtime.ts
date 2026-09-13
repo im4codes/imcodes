@@ -356,6 +356,10 @@ export function createControlledNodeRuntime(
       },
       macos: options.macosRemoteDesktopWorker ? {
         ...options.macosRemoteDesktopWorker,
+        onLifecycleNotice: (notice) => {
+          options.macosRemoteDesktopWorker?.onLifecycleNotice?.(notice);
+          logger.info(notice, 'macOS remote-desktop lifecycle transition');
+        },
         onProfileChanged: () => {
           options.macosRemoteDesktopWorker?.onProfileChanged?.();
           onMacosRemoteDesktopProfileChanged();
