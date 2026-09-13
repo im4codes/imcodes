@@ -20,6 +20,7 @@ import {
   type SupervisionExecutionSummary,
 } from './supervision-execution-summary.js';
 import { isControlledNodeId } from './controlled-node-identity.js';
+import { readSupervisionTaskTitle } from './supervision-task-identity.js';
 import { isLocalComputerUseAlias } from './machine-reference.js';
 
 export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
@@ -68,6 +69,12 @@ export interface DelegationDispatchFact {
   /** Required: without both ids the dispatch cannot be checked against the registry. */
   taskId?: string;
   assignmentId?: string;
+  /**
+   * Readable task title the daemon derived from the registry objective and
+   * returned on the accepted receipt. Bounded again on every read; absent on
+   * legacy receipts, which render an explicit untitled placeholder.
+   */
+  taskTitle?: string;
   /** Present for an authenticated controlled-device dispatch. */
   tool?: (typeof MACHINE_CONTROL_DISPATCH_TOOLS)[number];
   machine?: string;
@@ -145,13 +152,26 @@ export const readDelegationDispatchFact = (
   const deliveries = readDeliveries(output);
   if (deliveries.length === 0) return null;
   const task = asRecord(asRecord(toolArguments)?.task);
-  const taskId = asMeaningfulString(task?.taskId);
-  const assignmentId = asMeaningfulString(task?.assignmentId);
+  const requestedTaskId = asMeaningfulString(task?.taskId);
+  const requestedAssignmentId = asMeaningfulString(task?.assignmentId);
+  // A NEW supervised task carries only an objective in its arguments; the
+  // daemon mints the authoritative ids and returns them on the accepted
+  // result. Those result ids are the authority. When the caller also named
+  // ids they must agree exactly -- a disagreement proves nothing.
+  const acceptedTaskId = asMeaningfulString(output.taskId);
+  const acceptedAssignmentId = asMeaningfulString(output.assignmentId);
+  if ((requestedTaskId && acceptedTaskId && requestedTaskId !== acceptedTaskId)
+    || (requestedAssignmentId && acceptedAssignmentId && requestedAssignmentId !== acceptedAssignmentId)) {
+    return null;
+  }
+  const taskId = acceptedTaskId ?? requestedTaskId;
+  const assignmentId = acceptedAssignmentId ?? requestedAssignmentId;
   // Both ids are required. An ordinary send with no task binding is a real
   // message, but it is not evidence that supervised work was assigned, so it
   // must not substantiate an assigned/queued/recovered claim.
   if (!taskId || !assignmentId) return null;
-  return { dispatchId, taskId, assignmentId, deliveries };
+  const taskTitle = readSupervisionTaskTitle(output.taskTitle);
+  return { dispatchId, taskId, assignmentId, ...(taskTitle ? { taskTitle } : {}), deliveries };
 };
 
 /**

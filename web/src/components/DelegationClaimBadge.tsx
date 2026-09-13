@@ -17,10 +17,24 @@
 import { useTranslation } from 'react-i18next';
 import { readDelegationClaim } from '@shared/delegation-claim.js';
 import type { SupervisionExecutionSummary } from '@shared/supervision-execution-summary.js';
+import { readSupervisionTaskTitle } from '@shared/supervision-task-identity.js';
+import {
+  resolveCardAssignmentStatus,
+  type LiveAssignmentStatus,
+} from '../timeline/supervision-assignment-status.js';
 
 export interface DelegationClaimBadgeProps {
   /** Metadata record of a completed assistant message. */
   metadata?: Record<string, unknown>;
+  /**
+   * Daemon-announced lifecycle status per assignment id (see
+   * web/src/timeline/supervision-assignment-status.ts). It supersedes the
+   * status frozen into the projection at send time only when it is newer than
+   * this card (`messageTs`).
+   */
+  liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
+  /** Daemon time of the message that carries this card. */
+  messageTs?: number;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -86,7 +100,7 @@ export const formatExecutionDiagnostics = (execution: SupervisionExecutionSummar
   execution.source,
 ].filter(Boolean).join(' · ');
 
-export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
+export function DelegationClaimBadge({ metadata, liveAssignmentStatuses, messageTs }: DelegationClaimBadgeProps) {
   const { t } = useTranslation();
   const claim = readDelegationClaim(metadata);
   if (!claim) return null;
@@ -121,7 +135,15 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
       </span>
       <ul class="delegation-claim-dispatches">
         {dispatches.map((dispatch) => {
-          const execution = executionOf(dispatch);
+          const sentExecution = executionOf(dispatch);
+          const assignmentStatus = resolveCardAssignmentStatus({
+            sentStatus: sentExecution?.assignmentStatus,
+            live: dispatch.assignmentId ? liveAssignmentStatuses?.get(dispatch.assignmentId) : undefined,
+            cardTs: messageTs,
+          });
+          const execution = sentExecution && assignmentStatus && assignmentStatus !== sentExecution.assignmentStatus
+            ? { ...sentExecution, assignmentStatus }
+            : sentExecution;
           const localizedIdentity = execution?.label && execution.label !== execution.sessionName
             ? t('delegation.claim.execution_identity', {
               defaultValue: '{{label}} ({{sessionName}})',
@@ -134,6 +156,7 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
             key={dispatch.dispatchId}
             class="delegation-claim-dispatch"
             data-delegation-dispatch={dispatch.dispatchId}
+            {...(assignmentStatus ? { 'data-assignment-status': assignmentStatus } : {})}
           >
             {dispatch.kind === 'machine-control' && dispatch.tool && dispatch.machine ? (
               <span class="delegation-claim-execution" data-delegation-field="machineControl">
@@ -149,22 +172,40 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
                 <code>{formatExecutionSummary(execution, localizedIdentity)}</code>
               </span>
             ) : null}
-            {dispatch.taskId ? (
-              <span
-                class="delegation-claim-id delegation-claim-secondary"
-                data-delegation-field="taskId"
-              >
-                {t('delegation.claim.task_id', 'Task ID')}
-                {': '}
-                <code>{dispatch.taskId}</code>
+            {dispatch.taskId || dispatch.assignmentId ? (
+              /*
+                The formal task identity is always visible, on live and reloaded
+                cards alike: the registry title the daemon returned on the
+                accepted receipt (bounded again here), and the exact taskId and
+                assignmentId a recipient must be able to verify.
+              */
+              <span class="delegation-claim-task" data-delegation-field="taskIdentity">
+                <span class="delegation-claim-task-title" data-delegation-field="taskTitle">
+                  {t('delegation.claim.task_title', 'Task')}
+                  {': '}
+                  {readSupervisionTaskTitle(dispatch.taskTitle)
+                    ?? t('delegation.claim.task_title_unavailable', 'Untitled task')}
+                </span>
+                {dispatch.taskId ? (
+                  <span class="delegation-claim-id" data-delegation-field="taskId">
+                    {t('delegation.claim.task_id', 'Task ID')}
+                    {': '}
+                    <code>{dispatch.taskId}</code>
+                  </span>
+                ) : null}
+                {dispatch.assignmentId ? (
+                  <span class="delegation-claim-id" data-delegation-field="assignmentId">
+                    {t('delegation.claim.assignment_id', 'Assignment ID')}
+                    {': '}
+                    <code>{dispatch.assignmentId}</code>
+                  </span>
+                ) : null}
               </span>
             ) : null}
             {/*
-              Collapsed, and closed by default. These ids answer no question a
-              reader has while reading; they exist to be quoted back exactly
-              when something has gone wrong, and a legacy receipt with no
-              executor has nothing else to show, so they are demoted rather
-              than removed.
+              Collapsed, and closed by default. The dispatch id and the executor
+              detail answer no question a reader has while reading; they exist
+              to be quoted back exactly when something has gone wrong.
             */}
             <details class="delegation-claim-diagnostics" data-delegation-field="diagnostics">
               <summary>{t('delegation.claim.diagnostics', 'Diagnostics')}</summary>
@@ -173,13 +214,6 @@ export function DelegationClaimBadge({ metadata }: DelegationClaimBadgeProps) {
                 {': '}
                 <code>{dispatch.dispatchId}</code>
               </span>
-              {dispatch.assignmentId ? (
-                <span class="delegation-claim-id" data-delegation-field="assignmentId">
-                  {t('delegation.claim.assignment_id', 'Assignment ID')}
-                  {': '}
-                  <code>{dispatch.assignmentId}</code>
-                </span>
-              ) : null}
               {execution && formatExecutionDiagnostics(execution) ? (
                 <span class="delegation-claim-id" data-delegation-field="executionDetail">
                   <code>{formatExecutionDiagnostics(execution)}</code>

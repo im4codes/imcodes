@@ -793,16 +793,6 @@
       "presetHelp": "Направляет supervisor через пресет-эндпоинт с собственным base URL, API-ключом и зафиксированной моделью. Пресеты настраиваются в панели Shared Context.",
       "presetNone": "(нет)",
       "maxAuditLoops": "Макс. циклов аудита",
-      "auditBlockingSeverities": "Блокирующие уровни аудита",
-      "auditBlockingSeveritiesHelp": "Блокируют (REWORK) только замечания отмеченных уровней. Неотмеченные уровни — неблокирующие улучшения. По умолчанию только P0. Должен остаться хотя бы один уровень.",
-      "auditBlockingSeveritiesAtLeastOne": "Должен остаться выбранным хотя бы один блокирующий уровень",
-      "auditSeverity": {
-        "P0": "Потеря или повреждение данных, уязвимость, продакшн недоступен или не восстанавливается",
-        "P1": "Нарушение явного критерия приёмки, регрессия, зависание или постоянная блокировка, частичная запись",
-        "P2": "Дефект граничных случаев, конкурентности или путей ошибок; для изменения нет ключевого теста",
-        "P3": "Проблема сопровождаемости без влияния на корректность",
-        "P4": "Стиль, именование, формулировки или необязательное улучшение"
-      },
       "maxAutoContinueStreak": "Макс. повторяющихся auto-continue",
       "maxAutoContinueStreakHelp": "Останавливает Auto после такого числа подряд идущих continue одного типа. 0 = без лимита.",
       "maxAutoContinueTotal": "Жесткий лимит auto-continue",
@@ -817,7 +807,6 @@
       "summaryCustomInstructions": "Пользовательские инструкции: {{value}}",
       "summaryCustomInstructionsSet": "заданы",
       "summaryAudit": "Автоматическая маршрутизация · циклов: {{loops}}",
-      "summaryAuditBlocking": "блокирует {{value}}",
       "summaryMeta": "Промпт {{promptVersion}}, исправление {{repairVersion}}, повторы парсинга {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "Контроль доступен только для transport-сессий.",
       "unsupported": "Настройки контроля недоступны для process-сессий.",
@@ -3067,6 +3056,8 @@
       "dispatch_id": "ID отправки",
       "task_id": "ID задачи",
       "assignment_id": "ID назначения",
+      "task_title": "Задача",
+      "task_title_unavailable": "Задача без названия",
       "execution": "Выполняется на",
       "execution_identity": "{{label}} ({{sessionName}})",
       "diagnostics": "Диагностика"

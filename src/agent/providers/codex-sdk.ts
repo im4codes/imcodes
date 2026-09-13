@@ -70,6 +70,18 @@ import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
 import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned, getProviderSessionSystemTextSpanned } from '../provider-context-routing.js';
 import { getCodexAppServerArgs } from './getDefaultCodexMcpArgs.js';
+import {
+  NativeAgentFenceSlot,
+  fenceOf,
+  readCodexThreadNativeAgentFence,
+  withCodexNativeAgentFence,
+} from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../../shared/delegation-availability.js';
@@ -91,6 +103,7 @@ import {
   buildSdkSubagentSafeDetail,
   isBackgroundedSdkSubagentTool,
   makeCodexSubagentCanonicalKey,
+  readSdkSubagentFullRequest,
   readSdkSubagentStartedAtMs,
   sanitizeSdkSubagentText,
   type SdkSubagentDetail,
@@ -200,9 +213,12 @@ const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
 const CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES = new Set(['spawn_agent', 'spawnAgent']);
 
 /**
- * Native collaboration calls other than spawn. These are projected for
- * OBSERVABILITY ONLY -- the hard gate is `--disable multi_agent` at app-server
- * start, because an adapter sees an item only after the tool already ran.
+ * Native collaboration calls other than spawn. The adapter sees an item only
+ * after the tool already ran, so these are projected for observability. The
+ * enforcing boundary is the per-thread fence (`startNewThread`): a managed
+ * session's thread has no multi-agent tools at all. What the relay still
+ * observes in a managed session is evidence of an unproven fence, recorded and
+ * turn-stopped by src/daemon/native-collaboration-guard.ts.
  *
  * They were previously dropped on the floor, which is how a Brain could really
  * call list_agents + followup_task and leave no tool.call in the timeline at
@@ -1089,6 +1105,14 @@ interface CodexSdkSessionState {
    */
   serviceTier?: string;
   threadId?: string;
+  /**
+   * The native-agent fence of `threadId`, as this provider started it or as
+   * the thread's own rollout proves it. Codex fixes the fence when a thread is
+   * created, so the record is valid exactly for that thread id.
+   */
+  nativeAgentFence?: { threadId: string; fence: NativeAgentFence };
+  /** The fence of a `thread/start` in flight (no thread id yet). */
+  pendingThreadFence?: NativeAgentFence;
   loaded: boolean;
   runningTurnId?: string;
   runtimeActivityGeneration?: ActivityGeneration;
@@ -1839,12 +1863,14 @@ function runtimeSubagentToolFromPayload(
   const startedAtMs = readSdkSubagentStartedAtMs(record) ?? readSdkSubagentStartedAtMs(payload);
   const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
+  const fullRequest = readSdkSubagentFullRequest(record);
   const detail = buildSdkSubagentSafeDetail({
     kind: SDK_SUBAGENT_DETAIL_KIND,
     summary,
     input: {
       action: 'codex-runtime-subagent',
       description: prompt ?? summary,
+      ...(fullRequest ? { fullRequest } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -2243,6 +2269,12 @@ function buildRawSpawnAgentRuntimePayload(
   const prompt = meaningfulString(call.args.message)
     ?? meaningfulString(call.args.prompt)
     ?? meaningfulString(call.args.instructions);
+  // The display prompt above is capped; classification needs the whole request.
+  const fullRequest = readSdkSubagentFullRequest({
+    message: call.args.message,
+    prompt: call.args.prompt,
+    instructions: call.args.instructions,
+  });
   const model = meaningfulString(call.args.model)
     ?? meaningfulString(call.args.agentId)
     ?? meaningfulString(call.args.agent_id);
@@ -2252,6 +2284,7 @@ function buildRawSpawnAgentRuntimePayload(
     status: 'running',
     ...(agentName ? { nickname: agentName } : {}),
     ...(prompt ? { prompt } : {}),
+    ...(fullRequest ? { full_request: fullRequest } : {}),
     ...(model ? { model } : {}),
     backgrounded: true,
     startedAtMs: call.startedAtMs,
@@ -2291,6 +2324,7 @@ function collabAgentToolFromItem(
     : statusMapping.toolStatus === 'error'
       ? (statusMapping.diagnosticCode ? 'diagnostic' : 'failed')
       : undefined;
+  const fullRequest = readSdkSubagentFullRequest(item);
   const detail = buildSdkSubagentSafeDetail({
     kind: SDK_SUBAGENT_DETAIL_KIND,
     summary,
@@ -2298,6 +2332,7 @@ function collabAgentToolFromItem(
       action: 'codex-collaboration',
       receiverCount,
       description: prompt ?? summary,
+      ...(fullRequest ? { fullRequest } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -2601,6 +2636,9 @@ export class CodexSdkProvider implements TransportProvider {
     contextSupport: 'degraded-message-side-context-mapping',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // Native multi-agent is withheld per THREAD at creation for managed
+    // sessions (config.features); Codex keeps it for the thread's lifetime.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
@@ -2611,6 +2649,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, CodexSdkSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot('codex-sdk');
   private threadToSession = new Map<string, string>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -2776,6 +2815,7 @@ export class CodexSdkProvider implements TransportProvider {
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,
+      ...(existing?.nativeAgentFence ? { nativeAgentFence: existing.nativeAgentFence } : {}),
       loaded: false,
       runningTurnId: undefined,
       turnDispatchGeneration: 0,
@@ -3251,8 +3291,8 @@ export class CodexSdkProvider implements TransportProvider {
    * so this re-verifies on every Brain turn.
    *
    * Anything short of "exact server connected with the exact delegation tools"
-   * fails closed. There is no native fallback to degrade into -- native
-   * multi-agent is removed at app-server start by `--disable multi_agent`.
+   * fails closed. Native multi-agent is never a fallback for delegated task
+   * work: a managed Brain's thread is created without it.
    */
   private async assertImcodesDelegationReady(threadId: string): Promise<void> {
     const servers: Array<Record<string, unknown>> = [];
@@ -3910,24 +3950,64 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async startNewThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
-    const result = await this.request('thread/start', {
-      cwd: state.cwd,
-      ...this.sessionEnvironmentParams(state),
-      ...this.sessionMcpConfigParams(state),
-      approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
-      personality: 'none',
-      ...(state.model ? { model: state.model } : {}),
-      baseInstructions,
-    });
-    const threadId = result?.thread?.id;
-    if (!threadId) {
-      throw new Error('Codex app-server did not return a thread id');
+    // The fence is decided HERE, on the send path, before any user or task
+    // bytes reach the thread: a managed session's thread is created without
+    // native multi-agent tools, and Codex keeps that for every later resume.
+    const fenced = this.nativeAgentFence.required(sessionId, state.imcodesSessionName);
+    const fence = fenceOf(fenced);
+    state.pendingThreadFence = fence;
+    try {
+      const result = await this.request('thread/start', {
+        cwd: state.cwd,
+        ...this.sessionEnvironmentParams(state),
+        ...(fenced ? { config: withCodexNativeAgentFence(state.mcpConfig) } : this.sessionMcpConfigParams(state)),
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+        personality: 'none',
+        ...(state.model ? { model: state.model } : {}),
+        baseInstructions,
+      });
+      const threadId = result?.thread?.id;
+      if (!threadId) {
+        throw new Error('Codex app-server did not return a thread id');
+      }
+      state.threadId = threadId;
+      state.nativeAgentFence = { threadId, fence };
+      state.loaded = true;
+      this.threadToSession.set(threadId, sessionId);
+      this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+    } finally {
+      state.pendingThreadFence = undefined;
     }
-    state.threadId = threadId;
-    state.loaded = true;
-    this.threadToSession.set(threadId, sessionId);
-    this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+  }
+
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * The native-agent fence of the thread serving this route. A thread's fence
+   * is what it was created with: recorded when this provider started it, or
+   * proven by the thread's own rollout (`turn_context.multi_agent_version`).
+   * With no thread yet, the send path's `thread/start` decides it.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (!state) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    const threadId = state.threadId;
+    if (!threadId) {
+      return state.pendingThreadFence
+        ?? this.nativeAgentFence.nextLaunchFence(providerSessionId, state.imcodesSessionName);
+    }
+    if (state.nativeAgentFence?.threadId === threadId) return state.nativeAgentFence.fence;
+    const fence = await readCodexThreadNativeAgentFence(threadId, { env: state.env });
+    // Cache only a proven fence, and only for the thread that was read.
+    if (fence === NATIVE_AGENT_FENCES.DISABLED
+      && this.sessions.get(providerSessionId) === state
+      && state.threadId === threadId) {
+      state.nativeAgentFence = { threadId, fence };
+    }
+    return fence;
   }
 
   private async repairUnreadableThreadHistory(err: unknown): Promise<boolean> {

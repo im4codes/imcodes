@@ -723,10 +723,7 @@ export class DelegationReplyStore {
     if (!authority.assignmentId.trim() || !authority.messageId.trim()
       || authority.origins.length === 0) return { status: 'none' };
     const originNames = new Set(authority.origins.map((origin) => origin.sessionName));
-    const authoritativeMessageIds = new Set([
-      authority.messageId,
-      ...authority.supersededMessageIds,
-    ]);
+    const messageIds = new Set([authority.messageId, ...authority.supersededMessageIds]);
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       const rows = queryRows();
@@ -740,26 +737,12 @@ export class DelegationReplyStore {
           record.assignmentId !== authority.assignmentId
           || record.auditedSessionName !== auditedSessionName
           || !originNames.has(record.origin.sessionName)
-          // A stale target runtime is metadata only when the registry already
-          // names its message id as this exact assignment's superseded
-          // delivery. An unknown row from another same-name runtime remains a
-          // competing verdict principal and must fail closed.
-          || (!identityMatches(record.target, authority.target)
-            && (record.target.sessionName !== authority.target.sessionName
-              || !authoritativeMessageIds.has(record.messageId)))
+          || record.target.sessionName !== authority.target.sessionName
+          || !messageIds.has(record.messageId)
         ))) {
         this.#db.exec('ROLLBACK');
         return { status: 'ambiguous' };
       }
-      // message_id is delivery metadata, not a second owner. A manual
-      // audit-metadata continuation and an automatic redelivery can both leave
-      // pending rows for the SAME registry assignment/attempt/revision. Once
-      // the exact registry object, audited session, authorized origin name and
-      // target name all agree above, an unexpected message id is redundant
-      // metadata and is retired below together with the other superseded rows.
-      // The canonical row is still selected by the current deterministic id
-      // and exact runtime identities, so an unbound/non-canonical row can never
-      // become authority by itself.
       let current = records.filter((record) => (
         record.messageId === authority.messageId
         && identityMatches(record.target, authority.target)
@@ -997,6 +980,61 @@ export class DelegationReplyStore {
         record !== undefined
         && record.status !== AGENT_DELEGATION_REPLY_STATUSES.DELIVERED
         && record.status !== AGENT_DELEGATION_REPLY_STATUSES.EXPIRED
+      ));
+  }
+
+  /**
+   * The message ids that carried one exact assignment to one target session:
+   * the original task dispatch plus any reply-bound continuation. Reply status
+   * is irrelevant here -- a delivered or expired reply still proves which
+   * message bound the assignment to that session.
+   */
+  listAssignmentDeliveryMessageIds(input: {
+    taskId: string;
+    assignmentId: string;
+    targetSessionName: string;
+  }): string[] {
+    const taskId = input.taskId?.trim();
+    const assignmentId = input.assignmentId?.trim();
+    const targetSessionName = input.targetSessionName?.trim();
+    if (!taskId || !assignmentId || !targetSessionName) return [];
+    const rows = this.#db.prepare(`
+      SELECT message_id AS messageId
+      FROM delegation_replies
+      WHERE task_id = ? AND assignment_id = ? AND target_session_name = ?
+      ORDER BY created_at ASC
+    `).all(taskId, assignmentId, targetSessionName) as Array<{ messageId?: unknown }>;
+    return [...new Set(rows
+      .map((row) => (typeof row.messageId === 'string' ? row.messageId.trim() : ''))
+      .filter((messageId) => messageId.length > 0))];
+  }
+
+  /**
+   * Durable replies still owed to (or not yet delivered to) one origin session.
+   * Delivered and expired rows are closed and never returned (the status
+   * filter is the query's own; `get` reads the same column synchronously). A
+   * non-task reply whose deadline passed is closed even before the expiry
+   * sweep marks it. A task-bound row never times out, so its liveness is the
+   * supervision registry's to decide -- callers must check it there.
+   */
+  listOpenByOriginSession(sessionName: string, now = Date.now()): DelegationReplyRecord[] {
+    const origin = sessionName?.trim();
+    if (!origin) return [];
+    const rows = this.#db.prepare(`
+      SELECT delegation_id AS delegationId
+      FROM delegation_replies
+      WHERE origin_session_name = ? AND status IN (?, ?)
+      ORDER BY created_at ASC
+    `).all(
+      origin,
+      AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+      AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
+    ) as Array<{ delegationId?: unknown }>;
+    return rows
+      .map((row) => this.get(String(row.delegationId ?? '')))
+      .filter((record): record is DelegationReplyRecord => (
+        record !== undefined
+        && (Boolean(record.taskId && record.assignmentId) || record.expiresAt > now)
       ));
   }
 

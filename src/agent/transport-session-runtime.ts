@@ -8,6 +8,13 @@ import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderActiveTurnDeliveryKind, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  readNativeAgentAdmissionMode,
+  type NativeAgentAdmissionMode,
+  type NativeAgentFence,
+} from '../../shared/native-collaboration-policy.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -1119,6 +1126,27 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     if (!this._providerSessionId) throw new Error('service_tier_no_session');
     await this.provider.setServiceTier(this._providerSessionId, tier);
+  }
+
+  /**
+   * How the provider serving this runtime keeps native agent tools out of
+   * managed work, and for a `session_fence` provider the fence of THIS
+   * runtime's provider session. Anything the provider cannot state or answer
+   * is reported as an unproven default, never as a fence.
+   */
+  async resolveNativeAgentAdmission(): Promise<{ mode: NativeAgentAdmissionMode; fence?: NativeAgentFence }> {
+    const mode = readNativeAgentAdmissionMode(this.provider.capabilities?.nativeAgentAdmission);
+    if (mode !== NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE) return { mode };
+    const providerSessionId = this._providerSessionId;
+    if (!providerSessionId || !this.provider.getNativeAgentFence) {
+      return { mode, fence: NATIVE_AGENT_FENCES.PROVIDER_DEFAULT };
+    }
+    try {
+      return { mode, fence: await this.provider.getNativeAgentFence(providerSessionId) };
+    } catch (error) {
+      logger.warn({ provider: this.provider.id, providerSessionId, error }, 'native agent fence query failed; treating as unproven');
+      return { mode, fence: NATIVE_AGENT_FENCES.PROVIDER_DEFAULT };
+    }
   }
 
   get providerSessionId(): string | null { return this._providerSessionId; }

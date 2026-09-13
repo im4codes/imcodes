@@ -225,8 +225,10 @@ describe('buildProviderContextPayload', () => {
         // Supervised work is arranged by hand, never on the Brain's own initiative.
         expect(text).toContain('explicit_user_request');
         // The routing constraint the baseline exists for is preserved: when a
-        // Brain does delegate, it delegates through IM.codes, not provider-native.
-        expect(text).toContain('provider_native_spawn');
+        // Brain does delegate task work, it delegates through IM.codes. Native
+        // agents remain available for read-only analysis, never as participants.
+        expect(text).toContain('provider_native_task_participation');
+        expect(text).toContain('ephemeral_read_only_analysis');
         for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
           expect(text, `${automatic} must not reach a supervision-${label} Brain`).not.toContain(automatic);
         }

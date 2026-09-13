@@ -30,6 +30,34 @@ describe('delegation dispatch facts', () => {
     });
   });
 
+  it('substantiates a new supervised task from the daemon-minted ids on the accepted result', () => {
+    // A new task send names only an objective; the authority ids exist only
+    // on the accepted result the daemon returned.
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'send_message',
+      { target: 'deck_sub_worker', message: 'implement it', task: { objective: 'Implement the retry queue' } },
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_new', assignmentId: 'asg_new' },
+    );
+    expect(fact).toMatchObject({ taskId: 'tsk_new', assignmentId: 'asg_new' });
+  });
+
+  it('refuses requested ids that disagree with the accepted authority ids', () => {
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_other', assignmentId: 'asg_5gl' },
+    )).toBeNull();
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_5gi', assignmentId: 'asg_other' },
+    )).toBeNull();
+    // Agreement (continuation of an existing assignment) stays substantiated.
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_5gi', assignmentId: 'asg_5gl' },
+    )).toMatchObject({ taskId: 'tsk_5gi', assignmentId: 'asg_5gl' });
+  });
+
   it('refuses a native collaboration send_message that shares the short name', () => {
     // Codex's own send_message carries no IM.codes authority. Distinguishing by
     // tool name alone is exactly how a non-durable native call could have been

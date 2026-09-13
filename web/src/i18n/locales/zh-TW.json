@@ -793,16 +793,6 @@
       "presetHelp": "讓監督流量走某個預設的 endpoint（獨立的 base URL、API key 與固定模型）。預設在共享上下文面板裡管理。",
       "presetNone": "（無）",
       "maxAuditLoops": "最大稽核循環",
-      "auditBlockingSeverities": "稽核阻斷等級",
-      "auditBlockingSeveritiesHelp": "僅勾選等級的問題會阻斷（REWORK）；未勾選等級為非阻斷的後續改進。預設僅 P0，至少保留一項。",
-      "auditBlockingSeveritiesAtLeastOne": "至少需要保留一個阻斷等級",
-      "auditSeverity": {
-        "P0": "資料遺失或損毀、安全漏洞、正式環境不可用或無法復原",
-        "P1": "違反明確驗收標準、回歸、卡住或永久阻塞、部分寫入",
-        "P2": "邊界、並行或錯誤路徑缺陷；變更行為缺少關鍵測試",
-        "P3": "不影響正確性的可維護性問題",
-        "P4": "風格、命名、措辭或可選改進"
-      },
       "maxAutoContinueStreak": "同類自動繼續上限",
       "maxAutoContinueStreakHelp": "同一種 continue 類型連續達到此次數後停止自動繼續。0 表示不限制。",
       "maxAutoContinueTotal": "自動繼續硬上限",
@@ -817,7 +807,6 @@
       "summaryCustomInstructions": "自訂提示詞：{{value}}",
       "summaryCustomInstructionsSet": "已設定",
       "summaryAudit": "自動路由 · 循環 {{loops}} 次",
-      "summaryAuditBlocking": "阻斷 {{value}}",
       "summaryMeta": "提示 {{promptVersion}}，修復 {{repairVersion}}，解析重試 {{parseRetries}}，任務執行 {{taskRunVersion}}",
       "disabledHint": "只有 transport 工作階段支援監督。",
       "unsupported": "process 工作階段不支援監督設定。",
@@ -3068,6 +3057,8 @@
       "dispatch_id": "派發 ID",
       "task_id": "任務 ID",
       "assignment_id": "指派 ID",
+      "task_title": "任務",
+      "task_title_unavailable": "未命名任務",
       "execution": "執行於",
       "execution_identity": "{{label}}（{{sessionName}}）",
       "diagnostics": "診斷資訊"

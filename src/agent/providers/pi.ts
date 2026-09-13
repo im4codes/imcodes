@@ -76,6 +76,7 @@ import {
   resolvePiBinary,
 } from './pi/runtime.js';
 import logger from '../../util/logger.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const RPC_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 3_000;
@@ -176,6 +177,8 @@ export class PiProvider implements TransportProvider {
     supportedEffortLevels: PI_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // Pi has no provider-native agent tool.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.NO_NATIVE_AGENT_TOOLS,
   };
 
   private config: ProviderConfig | null = null;

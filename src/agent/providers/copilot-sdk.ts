@@ -40,6 +40,22 @@ import {
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
   type AgentDelegationNotificationResult,
 } from '../../../shared/agent-delegation.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  collectNativeAgentRequestStrings,
+  denyNativeCollaborationGateUnavailable,
+  type NativeCollaborationGate,
+  type NativeCollaborationGateDecision,
+} from '../../../shared/native-collaboration-policy.js';
+import { COPILOT_NATIVE_AGENT_TOOLS } from '../native-agent-fence.js';
+
+const COPILOT_NATIVE_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set(COPILOT_NATIVE_AGENT_TOOLS);
+
+/** The Copilot SDK pre-tool-use hook output this provider returns. */
+interface CopilotPreToolUseDecision {
+  permissionDecision: 'deny';
+  permissionDecisionReason: string;
+}
 
 const COPILOT_BIN = 'copilot';
 const MIN_PROTOCOL_VERSION = 3;
@@ -294,6 +310,8 @@ export class CopilotSdkProvider implements TransportProvider {
     supportedEffortLevels: ['low', 'medium', 'high', 'max'],
     contextSupport: 'degraded-message-side-context-mapping',
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // `task` / `write_agent` are refused per call by hooks.onPreToolUse.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.PRE_EXECUTION_GATE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
@@ -307,6 +325,7 @@ export class CopilotSdkProvider implements TransportProvider {
   private sdk: typeof import('@github/copilot-sdk') | null = null;
   private client: CopilotClientLike | null = null;
   private sessions = new Map<string, CopilotSessionState>();
+  private nativeCollaborationGate?: NativeCollaborationGate;
   private poisonedSessionIds = new Set<string>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -946,13 +965,58 @@ export class CopilotSdkProvider implements TransportProvider {
   }
 
   private buildSessionConfig(config: SessionConfig, model?: string, effort?: TransportEffortLevel): Record<string, unknown> {
+    const routeId = config.bindExistingKey ?? config.sessionKey;
     return {
       workingDirectory: config.cwd,
       ...(model ? { model } : {}),
       ...(mapEffortToCopilot(effort) ? { reasoningEffort: mapEffortToCopilot(effort) } : {}),
       mcpServers: getDefaultMcpServers(config),
-      onPermissionRequest: (request: Record<string, unknown>) => this.handlePermissionRequest(config.bindExistingKey ?? config.sessionKey, request),
+      onPermissionRequest: (request: Record<string, unknown>) => this.handlePermissionRequest(routeId, request),
+      // Created and resumed sessions both carry it: the CLI asks before every
+      // tool, independently of the permission mode.
+      hooks: {
+        onPreToolUse: (input: unknown) => this.evaluateNativeAgentToolUse(routeId, input),
+      },
     };
+  }
+
+  setNativeCollaborationGate(gate: NativeCollaborationGate): void {
+    this.nativeCollaborationGate = gate;
+  }
+
+  /**
+   * Pre-execution admission for Copilot's native agent tools (`task` spawns an
+   * agent, `write_agent` hands a running one more work). The daemon gate admits
+   * everything in an unmanaged session and only proven analysis in a managed
+   * one. The Copilot SDK swallows a throwing hook as "no decision", which would
+   * let the tool run, so this never throws: any failure denies the call.
+   */
+  private evaluateNativeAgentToolUse(routeId: string, input: unknown): CopilotPreToolUseDecision | undefined {
+    let toolName = '';
+    try {
+      const record = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : undefined;
+      toolName = typeof record?.toolName === 'string' ? record.toolName : '';
+      if (!COPILOT_NATIVE_AGENT_TOOL_NAMES.has(toolName)) return undefined;
+      const gate = this.nativeCollaborationGate;
+      if (!gate) return undefined;
+      let args: unknown = record?.toolArgs;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { /* keep the raw string as request text */ }
+      }
+      const decision: NativeCollaborationGateDecision = gate(routeId, {
+        provider: this.id,
+        toolName,
+        requestText: collectNativeAgentRequestStrings(args).join('\n'),
+      });
+      return decision.allow ? undefined : { permissionDecision: 'deny', permissionDecisionReason: decision.reason };
+    } catch (error) {
+      logger.warn({ provider: this.id, routeId, toolName, error }, 'Copilot native agent gate failed; denying tool');
+      const decision = denyNativeCollaborationGateUnavailable({ provider: this.id, toolName: toolName || 'unknown' });
+      return {
+        permissionDecision: 'deny',
+        permissionDecisionReason: decision.allow ? 'IM.codes native agent policy unavailable' : decision.reason,
+      };
+    }
   }
 
   private attachSession(state: CopilotSessionState): void {

@@ -45,6 +45,13 @@ import {
 import { ensureQwenMcpHasImcodesEntry, type QwenMcpEnsureResult } from '../../daemon/qwen-mcp-config.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import { NativeAgentFenceSlot, QWEN_NATIVE_AGENT_TOOLS, fenceOf } from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import {
   MEMORY_MCP_PROVIDER_STATUS_REASON,
   MEMORY_MCP_STATUS,
@@ -61,6 +68,7 @@ import {
   isSdkRuntimeSubagentEventName,
   makeQwenSubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
+  readSdkSubagentFullRequest,
   readSdkSubagentStartedAtMs,
   startsWithSdkRuntimeSubagentTag,
   type SdkSubagentDetail,
@@ -220,6 +228,10 @@ interface QwenSessionState {
   lastStatusSignature: string | null;
   /** Stable IM.codes context already injected into this Qwen conversation. */
   sessionSystemTextInjected?: string;
+  /** The IM.codes session this route serves, when known at creation. */
+  imcodesSessionName?: string;
+  /** The native-agent fence the running turn process was spawned with. */
+  turnNativeAgentFence?: NativeAgentFence;
 }
 
 function toQwenReasoning(effort: TransportEffortLevel): false | { effort: 'low' | 'medium' | 'high' } {
@@ -561,6 +573,7 @@ function qwenRuntimeSubagentToolFromPayload(
     input: {
       action: 'qwen-runtime-subagent',
       description: prompt ?? summary,
+      ...(readSdkSubagentFullRequest(record) ? { fullRequest: readSdkSubagentFullRequest(record) } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -613,6 +626,9 @@ export class QwenProvider implements TransportProvider {
     supportedEffortLevels: QWEN_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
+    // Every turn is its own CLI process; a managed session's turn is spawned
+    // with `--exclude-tools agent,task`.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
     compact: {
       execution: 'slash-command',
       providerCommand: QWEN_COMPACT_SLASH_COMMAND,
@@ -626,6 +642,7 @@ export class QwenProvider implements TransportProvider {
   private config: ProviderConfig | null = null;
   private mcpRegistration: QwenMcpEnsureResult | null = null;
   private sessions = new Map<string, QwenSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot('qwen');
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -760,8 +777,27 @@ export class QwenProvider implements TransportProvider {
       emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
       lastStatusSignature: existing?.lastStatusSignature ?? null,
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
+      imcodesSessionName: config.sessionName ?? existing?.imcodesSessionName,
+      turnNativeAgentFence: existing?.turnNativeAgentFence,
     });
     return sessionId;
+  }
+
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * A running turn has exactly the fence its process was spawned with; Qwen
+   * has no native append, so later bytes always wait for the NEXT turn, which
+   * decides its own fence on this provider's spawn path.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (state?.child && !state.child.killed) {
+      return state.turnNativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    }
+    return this.nativeAgentFence.nextLaunchFence(providerSessionId, state?.imcodesSessionName);
   }
 
   async endSession(sessionId: string): Promise<void> {
@@ -937,6 +973,11 @@ export class QwenProvider implements TransportProvider {
       args.push('--session-id', state.qwenConversationId);
     }
 
+    const settingsPath = await this.ensureSettingsPath(state);
+    // Decided after the last await and immediately before the spawn, so the
+    // turn process carries exactly the fence recorded for it.
+    const nativeAgentsFenced = this.nativeAgentFence.required(sessionId, state.imcodesSessionName);
+    if (nativeAgentsFenced) args.push('--exclude-tools', QWEN_NATIVE_AGENT_TOOLS.join(','));
     const resolved = resolveExecutableForSpawn(QWEN_BIN);
     const finalArgs = [...resolved.prependArgs, ...args];
     const child = spawn(resolved.executable, finalArgs, {
@@ -951,13 +992,14 @@ export class QwenProvider implements TransportProvider {
         ...((this.config.env as Record<string, string> | undefined) ?? {}),
         ...(state.env ?? {}),
         ...(state.mcpEnv ?? {}),
-        QWEN_CODE_SYSTEM_SETTINGS_PATH: await this.ensureSettingsPath(state),
+        QWEN_CODE_SYSTEM_SETTINGS_PATH: settingsPath,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
       windowsHide: true,
     });
     state.child = child;
+    state.turnNativeAgentFence = fenceOf(nativeAgentsFenced);
     // Crash coverage: if the daemon dies without running teardown, the startup
     // sweep reaps this group using the registry's process-start fingerprint.
     state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);

@@ -113,12 +113,14 @@ import {
   isSdkRuntimeSubagentEventName,
   makeGeminiSubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
+  readSdkSubagentFullRequest,
   readSdkSubagentStartedAtMs,
   startsWithSdkRuntimeSubagentTag,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
 } from '../../../shared/sdk-subagent-status.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const GEMINI_BIN = 'gemini';
 /** ACP mode id we request once per session. Matches the `yolo` mode advertised
@@ -371,6 +373,7 @@ function geminiRuntimeSubagentToolFromPayload(
     input: {
       action: 'gemini-runtime-subagent',
       description: prompt ?? summary,
+      ...(readSdkSubagentFullRequest(record) ? { fullRequest: readSdkSubagentFullRequest(record) } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -424,6 +427,10 @@ export class GeminiSdkProvider implements TransportProvider {
       cancellation: 'none',
       reason: 'Verified with Gemini CLI 0.39.1: regular CLI registers /compress with /compact and /summarize aliases, but the --acp command registry used by this adapter does not register compress/compact.',
     },
+    // Native sub-agents can be neither refused per call nor withheld per
+    // session (the only disable is process-wide), so this runtime cannot
+    // send or receive supervised work.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   private config: ProviderConfig | null = null;

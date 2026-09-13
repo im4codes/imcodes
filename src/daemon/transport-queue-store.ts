@@ -18,6 +18,8 @@ import {
   type QueueSupervisionReference,
 } from '../../shared/transport-queue-types.js';
 import { buildQueueProjectionEntry } from '../../shared/transport-queue-privacy.js';
+import { resolveTransportConversationKey } from '../agent/transport-resume-opts.js';
+import { getSession } from '../store/session-store.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
 const require = createRequire(import.meta.url);
@@ -304,6 +306,7 @@ export class TransportQueueStore {
         created_at INTEGER NOT NULL,
         recipient_session_instance_id TEXT,
         recipient_runtime_epoch TEXT,
+        provider_conversation_key TEXT,
         PRIMARY KEY (session_name, queue_epoch, client_message_id)
       );
 
@@ -318,6 +321,34 @@ export class TransportQueueStore {
     `);
     this.migrateRecipientIdentityColumns();
     this.migrateSupervisionReferenceColumn();
+    this.migrateDeliveryConversationColumn();
+  }
+
+  /**
+   * Tombstones written before conversation stamping carry NULL: proof that a
+   * message was delivered, never proof of WHICH provider conversation holds it.
+   */
+  private migrateDeliveryConversationColumn(): void {
+    const columns = this.db.prepare('PRAGMA table_info(queue_delivery_tombstones)').all() as { name?: unknown }[];
+    if (!columns.some((column) => String(column.name ?? '') === 'provider_conversation_key')) {
+      this.db.exec('ALTER TABLE queue_delivery_tombstones ADD COLUMN provider_conversation_key TEXT');
+    }
+  }
+
+  /**
+   * The provider conversation the named session holds at the moment a delivery
+   * is recorded. Runtime epochs are relabeled across same-instance relaunches
+   * (see rebindRecipientRuntimeEpoch) and cannot tell a resumed conversation
+   * from a reset one; this stamp is written once and never relabeled. Unknown
+   * (no live record, or the provider has not reported its id yet) stays NULL,
+   * which never proves a conversation.
+   */
+  private deliveryConversationKey(sessionName: string): string | null {
+    try {
+      return resolveTransportConversationKey(getSession(sessionName)) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private migrateSupervisionReferenceColumn(): void {
@@ -915,20 +946,23 @@ export class TransportQueueStore {
       const insertTombstone = this.db.prepare(`
         INSERT OR REPLACE INTO queue_delivery_tombstones (
           session_name, queue_epoch, client_message_id, delivery_frame_id, created_at,
-          recipient_session_instance_id, recipient_runtime_epoch
+          recipient_session_instance_id, recipient_runtime_epoch, provider_conversation_key
         ) VALUES (?, ?, ?, ?, ?, (
           SELECT recipient_session_instance_id FROM queue_meta WHERE session_name = ?
         ), (
           SELECT recipient_runtime_epoch FROM queue_meta WHERE session_name = ?
-        ))
+        ), ?)
       `);
+      const conversationKey = this.deliveryConversationKey(sessionName);
       for (const clientMessageId of clientMessageIds) {
         // Delete first: its row count is the authorization answer. A tombstone is
         // only written for a row this caller was actually entitled to finalize.
         const removed = Number(deleteEntry.run(sessionName, clientMessageId, ...gate.params).changes ?? 0);
         if (removed === 0) continue;
         deletePrivateMaterial.run(sessionName, clientMessageId, ...gate.params);
-        insertTombstone.run(sessionName, meta.queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName);
+        insertTombstone.run(
+          sessionName, meta.queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName, conversationKey,
+        );
         finalized.push(clientMessageId);
       }
       const version = this.bumpVersion(sessionName, now);
@@ -1013,13 +1047,16 @@ export class TransportQueueStore {
     this.db.prepare(`
       INSERT OR IGNORE INTO queue_delivery_tombstones (
         session_name, queue_epoch, client_message_id, delivery_frame_id, created_at,
-        recipient_session_instance_id, recipient_runtime_epoch
+        recipient_session_instance_id, recipient_runtime_epoch, provider_conversation_key
       ) VALUES (?, ?, ?, ?, ?, (
         SELECT recipient_session_instance_id FROM queue_meta WHERE session_name = ?
       ), (
         SELECT recipient_runtime_epoch FROM queue_meta WHERE session_name = ?
-      ))
-    `).run(sessionName, queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName);
+      ), ?)
+    `).run(
+      sessionName, queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName,
+      this.deliveryConversationKey(sessionName),
+    );
     return true;
   }
 
@@ -1049,6 +1086,53 @@ export class TransportQueueStore {
       LIMIT 1
     `).get(sessionName, clientMessageId);
     return !!row;
+  }
+
+  /**
+   * Every runtime recipient a message was durably handed to, newest first.
+   *
+   * Unlike `hasDeliveryTombstone` this is not limited to the current queue
+   * epoch: a delivery to a runtime that has since been replaced is exactly the
+   * fact a caller needs to tell "reached the live runtime" from "reached a dead
+   * one". A tombstone written without a recorded recipient yields
+   * `recipient: null` -- proof of delivery, but not of which runtime -- and one
+   * written without a known provider conversation yields `conversationKey: null`.
+   */
+  listDeliveryRecipients(sessionNameInput: string, clientMessageIdInput: string): Array<{
+    queueEpoch: string;
+    recipient: QueueRecipientIdentity | null;
+    /** The provider conversation that received the message; see deliveryConversationKey. */
+    conversationKey: string | null;
+    deliveredAt: number;
+  }> {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const clientMessageId = clientMessageIdInput.trim();
+    if (!clientMessageId) return [];
+    const rows = this.db.prepare(`
+      SELECT queue_epoch AS queueEpoch, created_at AS deliveredAt,
+        recipient_session_instance_id AS sessionInstanceId, recipient_runtime_epoch AS runtimeEpoch,
+        provider_conversation_key AS conversationKey
+      FROM queue_delivery_tombstones
+      WHERE session_name = ? AND client_message_id = ?
+      ORDER BY created_at DESC
+    `).all(sessionName, clientMessageId) as Array<{
+      queueEpoch?: unknown;
+      deliveredAt?: unknown;
+      sessionInstanceId?: unknown;
+      runtimeEpoch?: unknown;
+      conversationKey?: unknown;
+    }>;
+    return rows.map((row) => {
+      const sessionInstanceId = typeof row.sessionInstanceId === 'string' ? row.sessionInstanceId.trim() : '';
+      const runtimeEpoch = typeof row.runtimeEpoch === 'string' ? row.runtimeEpoch.trim() : '';
+      const conversationKey = typeof row.conversationKey === 'string' ? row.conversationKey.trim() : '';
+      return {
+        queueEpoch: String(row.queueEpoch ?? ''),
+        recipient: sessionInstanceId && runtimeEpoch ? { sessionInstanceId, runtimeEpoch } : null,
+        conversationKey: conversationKey || null,
+        deliveredAt: Number(row.deliveredAt ?? 0),
+      };
+    });
   }
 
   hasDeliveryTombstone(sessionNameInput: string, clientMessageIdInput: string, queueEpochInput?: string): boolean {

@@ -26,6 +26,8 @@ import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { clearResend } from './transport-resend-queue.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { isNativeAgentFenceRequiredForLaunch } from './native-collaboration-guard.js';
+import { processLaunchFence } from '../agent/native-agent-fence.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -259,8 +261,16 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     if (existsSync(jsonlPath)) useResume = true;
   }
 
+  // Decided from managed authority (a Brain's child, a marker, a live
+  // assignment) on the path that launches the process.
+  const nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({
+    sessionName,
+    role: 'w1',
+    parentSession: sub.parentSession ?? undefined,
+  });
   const launchOpts = {
     cwd: sub.cwd ?? undefined,
+    nativeAgentsFenced,
     ...(sub.shellBin ? { shellBin: sub.shellBin } : {}),
     ...(sub.ccSessionId ? { ccSessionId: sub.ccSessionId } : {}),
     ...(sub.codexModel ? { codexModel: sub.codexModel } : {}),
@@ -363,6 +373,15 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     // not identity.
     ...((agentType === 'shell' || agentType === 'script') && sub.shellBin ? { shellBin: sub.shellBin } : {}),
     ...(sub.effort ? { effort: sub.effort } : {}),
+    nativeAgentLaunchFence: {
+      fence: processLaunchFence(agentType, {
+        nativeAgentsFenced,
+        resumesExistingConversation: useResume || Boolean(sub.codexSessionId) || !sub.fresh,
+      }),
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+      decidedAt: Date.now(),
+    },
     restarts: 0, restartTimestamps: [], createdAt: storedBeforeLaunch?.createdAt ?? Date.now(), updatedAt: Date.now()
   });
   try {

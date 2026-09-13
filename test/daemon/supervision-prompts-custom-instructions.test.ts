@@ -66,7 +66,19 @@ describe('supervision prompt custom-instructions merge', () => {
           eligible: { availability: ['ready', 'busy_queueable'], replyCapable: true, prefer: 'ready' },
           selectBy: ['availability', 'limitGroup', 'replyCapable', 'executionPool', 'providerFamily', 'auditPolicy'],
           mainWindow: 'coordinate_not_implement',
-          forbid: ['provider_native_spawn', 'provider_native_collaboration'],
+          forbid: ['provider_native_task_participation'],
+          nativeCollaboration: {
+            allowed: 'ephemeral_read_only_analysis',
+            neverAs: [
+              'task_participant',
+              'implementer',
+              'auditor',
+              'waiting_target',
+              'arranged_task_claim',
+              'durable_progress_owner',
+              'git_or_deploy_gate',
+            ],
+          },
         },
         // Continuing a task and starting one are different routing questions;
         // collapsing them piled separate audits onto a single ready peer.
@@ -81,18 +93,21 @@ describe('supervision prompt custom-instructions merge', () => {
             route: 'imcodes_send_message_durable_fifo',
             brain: 'waiting',
             isNot: ['capability_unavailable', 'delegation_exception'],
-            forbid: ['main_window_execution', 'provider_native_spawn', 'provider_native_collaboration'],
+            forbid: ['main_window_execution', 'provider_native_task_participation'],
           },
           noGlobalAgentCap: true,
         },
-        // The prohibition only lifts when IM.codes delegation is genuinely
-        // unavailable, and taking the host route is a recorded degradation.
+        // A genuine IM.codes outage is a recorded degradation that blocks the
+        // task on a structured report; it never relocates task work into a
+        // provider-native agent (read-only analysis of the outage stays allowed).
         // Busy targets and a saturated pool are scheduling facts about WHEN
         // work runs, not evidence that this project cannot delegate at all.
         fallback: {
           when: 'imcodes_delegation_capability_genuinely_unavailable',
           notWhen: ['pool_concurrency_saturated', 'targets_busy', 'host_subagent_slot_limit'],
-          then: 'host_provider_native_collaboration',
+          then: 'report_structured_blocker',
+          nativeCollaboration: 'ephemeral_read_only_analysis_only',
+          forbid: ['provider_native_task_participation'],
           record: 'degraded_with_reason',
         },
         exceptions: [
@@ -465,7 +480,10 @@ describe('Brain work-delegation contract placement and budget', () => {
       expect(contract.default.selectBy).toEqual([
         'availability', 'limitGroup', 'replyCapable', 'executionPool', 'providerFamily', 'auditPolicy',
       ]);
-      expect(contract.default.forbid).toContain('provider_native_collaboration');
+      expect(contract.default.forbid).toContain('provider_native_task_participation');
+      // No fallback ever hands task work to a provider-native agent.
+      expect(contract.fallback.then).toBe('report_structured_blocker');
+      expect(JSON.stringify(contract)).not.toContain('host_provider_native_collaboration');
       expect(contract.fallback.when).toBe('imcodes_delegation_capability_genuinely_unavailable');
       expect(contract.fallback.record).toBe('degraded_with_reason');
       // A saturated pool or a host subagent ceiling schedules work later; it
@@ -511,7 +529,7 @@ describe('Brain work-delegation contract placement and budget', () => {
       expect(allBusy.brain).toBe('waiting');
       expect(allBusy.isNot).toEqual(['capability_unavailable', 'delegation_exception']);
       expect(allBusy.forbid).toEqual([
-        'main_window_execution', 'provider_native_spawn', 'provider_native_collaboration',
+        'main_window_execution', 'provider_native_task_participation',
       ]);
     }
   });

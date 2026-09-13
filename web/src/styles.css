@@ -4902,6 +4902,9 @@ html.native-ios-mac .chat-dl-btn {
 }
 /* Present, quotable, and quiet. */
 .delegation-claim-secondary { opacity: 0.7; }
+/* The formal task identity: readable title first, then the exact ids. */
+.delegation-claim-task { display: flex; flex: 1 1 100%; flex-wrap: wrap; gap: 2px 12px; }
+.delegation-claim-task-title { flex: 1 1 100%; color: #e2e8f0; font-weight: 600; overflow-wrap: anywhere; }
 .delegation-claim-diagnostics { flex: 1 1 100%; opacity: 0.6; }
 .delegation-claim-diagnostics > summary {
   cursor: pointer;

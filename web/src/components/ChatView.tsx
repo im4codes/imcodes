@@ -104,6 +104,11 @@ import {
   type SdkSubagentDiagnostic,
   type SdkSubagentStatusRow,
 } from '../timeline/sdk-subagent-aggregator.js';
+import {
+  deriveLiveAssignmentStatuses,
+  liveAssignmentStatusesKey,
+  type LiveAssignmentStatus,
+} from '../timeline/supervision-assignment-status.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
@@ -196,6 +201,8 @@ interface AssistantBlockProps {
   /** Completed assistant message metadata carrying the delegation-claim
    *  projection, when the runtime attached one. */
   delegationMetadata?: Record<string, unknown>;
+  /** Daemon-announced per-assignment lifecycle status for the dispatch card. */
+  liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
   /** Stable identifier for this merged block. Wired through to a
    *  `data-event-id` attribute so the mobile double-tap detector can pair
    *  taps by event id instead of HTMLElement reference — DOM nodes are
@@ -2362,6 +2369,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [showToolCallsPref]);
   const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
   const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
+  // Keyed by content so assistant blocks re-render only when a status changes.
+  const liveAssignmentStatusesSignature = useMemo(
+    () => liveAssignmentStatusesKey(deriveLiveAssignmentStatuses(events)),
+    [events],
+  );
+  const liveAssignmentStatuses = useMemo(
+    () => new Map<string, LiveAssignmentStatus>(JSON.parse(liveAssignmentStatusesSignature) as Array<[string, LiveAssignmentStatus]>),
+    [liveAssignmentStatusesSignature],
+  );
   useEffect(() => {
     if (!hasSdkAgentEvents) return;
     setSdkAgentsNow(Date.now());
@@ -3679,6 +3695,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   text={item.text!}
                   automation={item.assistantAutomation === true}
                   delegationMetadata={item.delegationMetadata}
+                  liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
                   onUrlClick={urlClickHandler}
@@ -4473,6 +4490,7 @@ const AssistantBlock = memo(function AssistantBlock({
   ts,
   eventId,
   delegationMetadata,
+  liveAssignmentStatuses,
   onPathClick,
   onUrlClick,
   onDownload,
@@ -4486,7 +4504,7 @@ const AssistantBlock = memo(function AssistantBlock({
       data-event-id={eventId}
     >
       <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
-      <DelegationClaimBadge metadata={delegationMetadata} />
+      <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
       <ChatTime ts={ts} />
     </div>
   );

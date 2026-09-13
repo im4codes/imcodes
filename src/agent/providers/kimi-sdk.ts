@@ -124,6 +124,7 @@ import {
   type SdkSubagentProvider,
   type SdkSubagentProviderKind,
 } from '../../../shared/sdk-subagent-status.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const KIMI_BIN = 'kimi';
 /** Kimi ACP currently advertises one mode named `default`. */
@@ -316,6 +317,10 @@ export class KimiSdkProvider implements TransportProvider {
       backgroundSubagentWake: profile.runtimeSubagent
         ? BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME
         : BACKGROUND_SUBAGENT_WAKE_MODES.UNSUPPORTED,
+      // ACP exposes no per-call veto and no per-session disable for the
+      // agent's native sub-agents (Kimi, Hermes, Grok, CodeBuddy): these
+      // runtimes cannot send or receive supervised work.
+      nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
       compact: profile.compact,
     };
   }

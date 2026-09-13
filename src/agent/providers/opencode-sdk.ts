@@ -36,6 +36,13 @@ import {
 import { composeProviderSystemText } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import logger from '../../util/logger.js';
+import { NativeAgentFenceSlot, OPENCODE_NATIVE_AGENT_TOOLS, fenceOf } from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -175,6 +182,8 @@ interface OpenCodeSessionState {
   eventLoop: Promise<void>;
   pendingPermissions: Map<string, PendingOpenCodePermission>;
   runtimeConfig: SessionConfig;
+  /** The native-agent fence this session's own OpenCode server was started with. */
+  nativeAgentFence: NativeAgentFence;
 }
 
 class OpenCodeRequestTimeoutError extends Error {
@@ -373,12 +382,16 @@ export class OpenCodeSdkProvider implements TransportProvider {
       restartDurable: true,
       replayAfterAcceptance: 'deduplicated',
     },
+    // Every session runs its own OpenCode server; a managed session's server
+    // starts with `tools.task=false`.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
   };
 
   private client: OpenCodeClientLike | null = null;
   private server: OpenCodeServerLike | null = null;
   private lifecycleAbort: AbortController | null = null;
   private sessions = new Map<string, OpenCodeSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot('opencode-sdk');
   private providerToRoute = new Map<string, string>();
   private providerRouteOrder = new Map<string, string[]>();
   private modelCache: { at: number; value: ProviderModelList } | null = null;
@@ -471,7 +484,10 @@ export class OpenCodeSdkProvider implements TransportProvider {
     if (existing) await this.endSession(routeId);
 
     const cwd = safeString(config.cwd) ?? process.cwd();
-    const sessionRuntime = await this.startSessionRuntime(config, cwd);
+    // Decided on the launch path, before the server exists: the route is not
+    // registered with the daemon yet, so the IM.codes session name is passed.
+    const nativeAgentsFenced = this.nativeAgentFence.required(routeId, config.sessionName);
+    const sessionRuntime = await this.startSessionRuntime(config, cwd, nativeAgentsFenced);
     let info: Record<string, any>;
     if (config.skipCreate && safeString(config.resumeId)) {
       try {
@@ -530,6 +546,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
       eventLoop: Promise.resolve(),
       pendingPermissions: new Map(),
       runtimeConfig: { ...config },
+      nativeAgentFence: fenceOf(nativeAgentsFenced),
     };
     this.sessions.set(routeId, state);
     this.registerProviderRoute(providerSessionId, routeId);
@@ -917,7 +934,19 @@ export class OpenCodeSdkProvider implements TransportProvider {
     }
   }
 
-  private async startSessionRuntime(config: SessionConfig, cwd: string): Promise<{
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * The fence of the live server serving this route: fixed when that server
+   * started. A relaunch starts a new server and decides again.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    return this.sessions.get(providerSessionId)?.nativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+  }
+
+  private async startSessionRuntime(config: SessionConfig, cwd: string, nativeAgentsFenced: boolean): Promise<{
     client: OpenCodeClientLike;
     server: OpenCodeServerLike;
     abort: AbortController;
@@ -939,7 +968,13 @@ export class OpenCodeSdkProvider implements TransportProvider {
         port,
         timeout: 10_000,
         signal: abort.signal,
-        config: { share: 'disabled', mcp },
+        config: {
+          share: 'disabled',
+          mcp,
+          ...(nativeAgentsFenced
+            ? { tools: Object.fromEntries(OPENCODE_NATIVE_AGENT_TOOLS.map((tool) => [tool, false])) }
+            : {}),
+        },
       });
       const url = new URL(started.server.url);
       if (url.hostname !== LOOPBACK_HOST && url.hostname !== 'localhost' && url.hostname !== '::1') {
@@ -1436,7 +1471,11 @@ export class OpenCodeSdkProvider implements TransportProvider {
   }
 
   private async restartSessionRuntime(state: OpenCodeSessionState, generation: number): Promise<boolean> {
-    const replacement = await this.startSessionRuntime(state.runtimeConfig, state.cwd);
+    // A replacement server never drops a fence the session already had, and
+    // picks one up when managed authority requires it now.
+    const nativeAgentsFenced = state.nativeAgentFence === NATIVE_AGENT_FENCES.DISABLED
+      || this.nativeAgentFence.required(state.routeId, state.runtimeConfig.sessionName);
+    const replacement = await this.startSessionRuntime(state.runtimeConfig, state.cwd, nativeAgentsFenced);
     try {
       await withOpenCodeRequestTimeout(replacement.client.session.get({
         path: { id: state.providerSessionId },
@@ -1463,6 +1502,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state.client = replacement.client;
     state.server = replacement.server;
     state.abort = replacement.abort;
+    state.nativeAgentFence = fenceOf(nativeAgentsFenced);
     state.eventLoop = this.consumeEvents(replacement.stream, replacement.abort.signal);
     previous.abort.abort();
     previous.server.close();

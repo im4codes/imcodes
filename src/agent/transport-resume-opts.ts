@@ -19,6 +19,35 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || isCodeBuddyProviderId(agentType);
 }
 
+/**
+ * The durable identity of the provider CONVERSATION a transport session record
+ * points at: the history a delivered message actually lives in.
+ *
+ * Where the provider resumes through a resume id (Claude/Codex SDK and the
+ * providerResumeId providers) that id is the conversation: it survives a
+ * resumed relaunch, while a fresh/reset launch mints a new one or leaves it
+ * unset until the provider reports it. Every other transport resumes by binding
+ * its route key (qwen, openclaw) or never resumes (qoder), so the route key is
+ * the conversation. A runtime epoch is NOT a conversation: SDK providers rotate
+ * it on every relaunch, resumed or not.
+ */
+export function resolveTransportConversationKey(
+  record: Pick<SessionRecord, 'agentType' | 'ccSessionId' | 'codexSessionId' | 'providerResumeId' | 'providerSessionId'>
+    | null
+    | undefined,
+): string | undefined {
+  if (!record) return undefined;
+  const key = record.agentType === 'claude-code-sdk'
+    ? record.ccSessionId
+    : record.agentType === 'codex-sdk'
+      ? record.codexSessionId
+      : usesProviderResumeId(record.agentType)
+        ? record.providerResumeId
+        : record.providerSessionId;
+  const normalized = typeof key === 'string' ? key.trim() : '';
+  return normalized || undefined;
+}
+
 /** Providers whose remote session namespace is partitioned by working directory. */
 export function usesDirectoryScopedSessionListing(agentType: string | undefined): boolean {
   return agentType === 'opencode-sdk'

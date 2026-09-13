@@ -78,6 +78,13 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { NativeAgentFenceSlot, fenceOf } from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_STATUS,
@@ -146,6 +153,10 @@ interface DeepseekHarnessSessionState {
   pendingSessionSystemText?: string;
   lastStatusSignature: string | null;
   disposed: boolean;
+  /** The native-agent fence the live `child` was spawned with. */
+  childNativeAgentFence?: NativeAgentFence;
+  /** The fence of a child spawn in flight (overlay written, no child yet). */
+  pendingChildNativeAgentFence?: NativeAgentFence;
   /** IM.codes memory MCP server mounted into this harness session. */
   memoryMcp?: { command: string; args: readonly string[]; env: Record<string, string> };
 }
@@ -170,10 +181,14 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // context rides in the message body rather than a system slot.
     contextSupport: 'degraded-message-side-context-mapping',
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // A managed session's dsh child is spawned with the sub-agent, workflow
+    // and Ralph rows disabled in its overlay.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
   };
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, DeepseekHarnessSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot(MEMORY_MCP_PROVIDER_ID.DEEPSEEK_HARNESS);
 
   /**
    * Teardowns started from `failStartup`, which is synchronous by contract and
@@ -447,11 +462,22 @@ export class DeepseekHarnessProvider implements TransportProvider {
     }
     if (state.child) this.detachChild(state);
 
-    const overlayPath = await writeDshOverlay({
-      sessionKey: state.routeId,
-      ...(state.memoryMcp ? { memoryMcp: state.memoryMcp } : {}),
-      ...(state.llmConfig ? { llm: state.llmConfig } : {}),
-    });
+    // Decided on the spawn path before the overlay is written; recorded as
+    // pending so an admission check during the write sees this spawn's fence.
+    const nativeAgentsFenced = this.nativeAgentFence.required(state.routeId, state.sessionName);
+    state.pendingChildNativeAgentFence = fenceOf(nativeAgentsFenced);
+    let overlayPath: string;
+    try {
+      overlayPath = await writeDshOverlay({
+        sessionKey: state.routeId,
+        ...(state.memoryMcp ? { memoryMcp: state.memoryMcp } : {}),
+        ...(state.llmConfig ? { llm: state.llmConfig } : {}),
+        nativeAgentsFenced,
+      });
+    } catch (error) {
+      state.pendingChildNativeAgentFence = undefined;
+      throw error;
+    }
     const resumeId = state.harnessSessionId;
     // On Windows `dsh` is an npm .cmd shim, which bare spawn() cannot execute;
     // this resolves it to `node <script>` the same way every other local-SDK
@@ -481,6 +507,8 @@ export class DeepseekHarnessProvider implements TransportProvider {
       windowsHide: true,
     });
     state.child = child;
+    state.childNativeAgentFence = fenceOf(nativeAgentsFenced);
+    state.pendingChildNativeAgentFence = undefined;
     // Crash coverage: if the daemon dies without running teardown, the startup
     // sweep reaps this group using the registry's process-start fingerprint.
     state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
@@ -552,9 +580,27 @@ export class DeepseekHarnessProvider implements TransportProvider {
     await readyPromise;
   }
 
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * A live dsh child has exactly the fence it was spawned with, and receives
+   * appended messages, so an unfenced live child proves nothing. With no child
+   * (and none being spawned), the next send's spawn decides the fence.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (!state) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    if (state.child) return state.childNativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    if (state.pendingChildNativeAgentFence) return state.pendingChildNativeAgentFence;
+    return this.nativeAgentFence.nextLaunchFence(providerSessionId, state.sessionName);
+  }
+
   /** Drop this session's references to its child without terminating it. */
   private detachChild(state: DeepseekHarnessSessionState): void {
     state.child = null;
+    state.childNativeAgentFence = undefined;
     state.reader?.close();
     state.reader = null;
     state.readyPromise = null;

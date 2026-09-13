@@ -57,6 +57,14 @@ import {
 } from '../../../shared/agent-delegation.js';
 import { CLAUDE_SYNTHETIC_SEED_TEXT } from '../../shared/claude-synthetic-seed.js';
 import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  collectNativeAgentRequestStrings,
+  denyNativeCollaborationGateUnavailable,
+  type NativeCollaborationGate,
+  type NativeCollaborationGateDecision,
+} from '../../../shared/native-collaboration-policy.js';
+import { CLAUDE_NATIVE_AGENT_TOOLS } from '../native-agent-fence.js';
+import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDERS,
@@ -100,6 +108,11 @@ const CLAUDE_SDK_INPUT_PRIORITIES = {
 // the native ones to force the agent through our cron (one source of truth,
 // pod-routed, visible in our cron UI).
 const DISALLOWED_NATIVE_TOOLS = ['RemoteTrigger', 'CronCreate', 'CronList', 'CronUpdate', 'CronDelete'];
+// Native agent tools (spawn, workflow orchestration, send-more-work) stay
+// available; every call is routed through the daemon's supervision-authority
+// gate BEFORE it runs, which admits only proven analysis in managed sessions.
+const CLAUDE_NATIVE_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set(CLAUDE_NATIVE_AGENT_TOOLS);
+const CLAUDE_NATIVE_AGENT_TOOL_MATCHER = CLAUDE_NATIVE_AGENT_TOOLS.join('|');
 const CLAUDE_TASK_SYSTEM_SUBTYPES = new Set([
   'task_started',
   'task_progress',
@@ -469,6 +482,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     contextSupport: 'full-normalized-context-injection',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.NATIVE,
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.PRE_EXECUTION_GATE,
     compact: {
       execution: 'slash-command',
       providerCommand: '/compact',
@@ -496,6 +510,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
+  private nativeCollaborationGate?: NativeCollaborationGate;
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
@@ -746,6 +761,53 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     this.toolCallCallbacks.push(cb);
   }
 
+  setNativeCollaborationGate(gate: NativeCollaborationGate): void {
+    this.nativeCollaborationGate = gate;
+  }
+
+  /**
+   * PreToolUse hook for native agent tools (Agent/Task spawn, Workflow
+   * orchestration, SendMessage follow-up work). It runs for every permission
+   * mode (hook denials bypass canUseTool). The daemon gate admits everything in
+   * an unmanaged session and only proven analysis in a managed one; a refusal
+   * reason reaches the model in the same turn so it can use IM.codes instead.
+   */
+  private evaluateNativeAgentToolHook(state: ClaudeSdkSessionState, input: unknown): Record<string, unknown> {
+    const hookInput = this.asRecord(input);
+    if (!hookInput || hookInput.hook_event_name !== 'PreToolUse') return {};
+    const toolName = typeof hookInput.tool_name === 'string' ? hookInput.tool_name : '';
+    if (!CLAUDE_NATIVE_AGENT_TOOL_NAMES.has(toolName)) return {};
+    const gate = this.nativeCollaborationGate;
+    if (!gate) return {};
+    // Every request string the tool carries: prompt and description, a
+    // workflow's script, name and args, a follow-up message.
+    const requestText = collectNativeAgentRequestStrings(hookInput.tool_input).join('\n');
+    let decision: NativeCollaborationGateDecision;
+    try {
+      decision = gate(state.routeId, {
+        provider: this.id,
+        toolName,
+        requestText,
+        ...(typeof hookInput.tool_use_id === 'string' ? { toolUseId: hookInput.tool_use_id } : {}),
+      });
+    } catch (error) {
+      // An installed gate is the only enforcement for this provider (the relay
+      // skips post-start correction for pre-execution providers), so a gate
+      // that cannot answer fails closed for this one call. The gate is
+      // installed only inside IM.codes-managed sessions.
+      logger.warn({ provider: this.id, error }, 'Claude SDK native collaboration gate failed; denying tool');
+      decision = denyNativeCollaborationGateUnavailable({ provider: this.id, toolName });
+    }
+    if (decision.allow) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: decision.reason,
+      },
+    };
+  }
+
   onSessionInfo(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void {
     this.sessionInfoCallbacks.push(cb);
     return () => {
@@ -938,6 +1000,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
       permissionMode: state.permissionMode,
       disallowedTools: DISALLOWED_NATIVE_TOOLS,
+      hooks: {
+        PreToolUse: [{
+          matcher: CLAUDE_NATIVE_AGENT_TOOL_MATCHER,
+          hooks: [async (input: unknown) => this.evaluateNativeAgentToolHook(state, input)],
+        }],
+      },
       pathToClaudeCodeExecutable: resolvedBinary,
       includePartialMessages: true,
       agentProgressSummaries: false,

@@ -2753,11 +2753,12 @@ describe('CodexSdkProvider', () => {
       // Same authoritative readiness, then exactly one turn, for every model.
       expect(methods, `${model} must consult the authoritative inventory`).toContain('mcpServerStatus/list');
       expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
-      // The app-server this model runs on has native multi-agent removed, and
-      // still publishes the full IM MCP catalog.
+      // The app-server this model runs on keeps native multi-agent available
+      // (Brain task participation is enforced by the daemon relay) and still
+      // publishes the full IM MCP catalog.
       const argv = (childProcessMock.spawn.mock.calls.at(-1)?.[1] ?? []) as string[];
       const serialized = JSON.stringify(argv);
-      expect(serialized, `${model} app-server must disable native multi-agent`).toContain('multi_agent');
+      expect(serialized, `${model} app-server must not disable native multi-agent`).not.toContain('multi_agent');
       expect(serialized, `${model} must keep the IM MCP catalog`).toContain('static_full');
     });
 
@@ -2780,8 +2781,9 @@ describe('CodexSdkProvider', () => {
     // list_agents and followup_task x3, but handleRawResponseItem only forwarded
     // checklist and spawn_agent, so timeline had NO tool.call and the UI showed
     // nothing. That absence was then mistaken for "the model fabricated it".
-    // These calls are observability only -- the hard gate is --disable
-    // multi_agent at app-server start -- so they must be projected honestly:
+    // The adapter observes these calls only after they ran (Brain task
+    // participation is re-routed by the daemon relay), so they must be
+    // projected honestly:
     // labelled non-durable, and an EMPTY function_call_output must terminate the
     // card as accepted/unknown, never as a successful delivery.
     const provider = createCodexProvider();
@@ -2837,6 +2839,68 @@ describe('CodexSdkProvider', () => {
       'an empty collaboration output must be accepted_unknown, never a delivery claim',
     ).toBe('accepted_unknown');
     expect(meta.durability, 'native collaboration must be labelled non-durable').toBe('non_durable');
+  });
+
+  it.each([
+    {
+      label: 'task work beyond the display preview',
+      message: `${'Background context for the helper. '.repeat(10)}Please implement the retry queue, then git push the branch.`,
+      participation: 'task',
+      signals: 'repository_gate,implementation',
+    },
+    {
+      label: 'read-only analysis',
+      message: 'Summarize how the restore path rebinds the provider thread',
+      participation: 'analysis',
+      signals: '',
+    },
+  ])('keeps native spawn_agent available and classifies $label from the full request', async ({ message, participation, signals }) => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-native-classify', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-native-classify', 'use a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: 'call-classify-1',
+          arguments: JSON.stringify({ agent_type: 'worker', message }),
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call_output',
+          call_id: 'call-classify-1',
+          output: JSON.stringify({ agent_id: '019e8422-0fed-7c12-ad2a-34da47e4e799', nickname: 'Noether' }),
+        },
+      },
+    });
+    await flush();
+
+    // Native collaboration is projected (available), not suppressed.
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.name).toBe('Codex Sub-agent');
+    const detail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(detail.meta.taskParticipation).toBe(participation);
+    expect(detail.meta.taskParticipationSignals).toBe(signals);
+    // The preview is bounded; the classification was made before truncation.
+    const preview = String((tools[0]!.input as { description?: string }).description ?? '');
+    expect(preview.length).toBeLessThanOrEqual(240);
+    if (participation === 'task') expect(preview).not.toMatch(/implement|git push/);
   });
 
   it('emits backgrounded SDK sub-agent snapshots for raw spawn_agent response items', async () => {

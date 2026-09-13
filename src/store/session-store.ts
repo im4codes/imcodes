@@ -191,6 +191,25 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  Persisted in the FIRST session-store upsert so a crash between create and
    *  sync still leaves a sweepable record. */
   executionCloneMetadata?: ExecutionCloneMetadata;
+  /**
+   * Durable, instance-bound demand that every runtime serving this session
+   * withholds provider-native agent tools (shared/native-collaboration-policy.ts
+   * SESSION_FENCE). Set when the session takes supervised authority it could not
+   * yet prove; never cleared by an incidental record rebuild, and meaningless
+   * for any other instance that reuses the name.
+   */
+  nativeAgentFenceRequired?: { sessionInstanceId: string; requiredAt: number };
+  /**
+   * The native-agent fence a PROCESS runtime was actually launched with, bound
+   * to the exact instance and runtime epoch it was decided for. A proof from an
+   * older epoch or another instance proves nothing about the live runtime.
+   */
+  nativeAgentLaunchFence?: {
+    fence: 'disabled' | 'provider_default';
+    sessionInstanceId: string;
+    runtimeEpoch: string;
+    decidedAt: number;
+  };
 }
 
 export interface SessionStore {
@@ -451,6 +470,8 @@ export function upsertSession(record: SessionRecord): void {
     ?? (existing?.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND
       ? existing.executionCloneMetadata
       : undefined);
+  // The native-agent fence demand is sticky exactly like the clone marker: an
+  // incidental rebuild that omits it must not silently re-open native agents.
   const normalizedError = record.state === 'error' && typeof record.error === 'string' && record.error.trim()
     ? record.error.trim()
     : undefined;
@@ -473,10 +494,19 @@ export function upsertSession(record: SessionRecord): void {
     : !runtimeAuthorityChanged && isUsableSessionIdentity(existing.runtimeEpoch)
       ? existing.runtimeEpoch
       : createRuntimeEpoch();
+  const nativeAgentFenceRequired = [record.nativeAgentFenceRequired, existing?.nativeAgentFenceRequired]
+    .find((marker) => marker?.sessionInstanceId === sessionInstanceId);
+  // A launch-fence proof survives only for the exact instance AND epoch it was
+  // decided for; any other value is dropped rather than carried forward.
+  const nativeAgentLaunchFence = [record.nativeAgentLaunchFence, existing?.nativeAgentLaunchFence]
+    .find((proof) => proof?.sessionInstanceId === sessionInstanceId && proof.runtimeEpoch === runtimeEpoch);
+  const { nativeAgentFenceRequired: _requestedMarker, nativeAgentLaunchFence: _requestedProof, ...incoming } = record;
   store.sessions[record.name] = {
-    ...record,
+    ...incoming,
     sessionInstanceId,
     runtimeEpoch,
+    ...(nativeAgentFenceRequired ? { nativeAgentFenceRequired } : {}),
+    ...(nativeAgentLaunchFence ? { nativeAgentLaunchFence } : {}),
     ...(normalizedError ? { error: normalizedError } : { error: undefined }),
     ...(executionCloneMetadata !== undefined ? { executionCloneMetadata } : {}),
     updatedAt: Date.now(),

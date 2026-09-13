@@ -92,6 +92,8 @@ import { clearResend, drainResend, getResendCount, getResendEntries, listFreshRe
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { deliverTransportResendEntry } from './transport-resend-delivery.js';
 import { resolveQueuedSupervisionHeartbeatDelivery } from '../daemon/supervision-participant-delivery.js';
+import { isNativeAgentFenceRequiredForLaunch } from '../daemon/native-collaboration-guard.js';
+import { processLaunchFence } from './native-agent-fence.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
@@ -889,18 +891,26 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   const driver = getDriver(effectiveRecord.agentType as AgentType);
   const ccSessionId = effectiveRecord.ccSessionId;
   const projectDir = effectiveRecord.projectDir;
+  // Decided from managed authority on the path that launches the process.
+  const nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({
+    sessionName: record.name,
+    role: record.role,
+    parentSession: record.parentSession,
+  });
   const cmd = driver.buildResumeCommand(record.name, {
     cwd: projectDir,
     ccSessionId,
     codexSessionId: effectiveRecord.codexSessionId,
     geminiSessionId: effectiveRecord.geminiSessionId,
     opencodeSessionId: effectiveRecord.opencodeSessionId,
+    nativeAgentsFenced,
   }) ?? driver.buildLaunchCommand(record.name, {
     cwd: projectDir,
     ccSessionId,
     codexSessionId: effectiveRecord.codexSessionId,
     geminiSessionId: effectiveRecord.geminiSessionId,
     opencodeSessionId: effectiveRecord.opencodeSessionId,
+    nativeAgentsFenced,
   });
 
   const resourceSessionInstanceId = record.sessionInstanceId?.trim() || randomUUID();
@@ -943,6 +953,13 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     state: 'idle',
     sessionInstanceId: resourceSessionInstanceId,
     runtimeEpoch: resourceRuntimeEpoch,
+    // The proof names exactly the instance and epoch this process was launched for.
+    nativeAgentLaunchFence: {
+      fence: processLaunchFence(effectiveRecord.agentType, { nativeAgentsFenced, resumesExistingConversation: true }),
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+      decidedAt: now,
+    },
     updatedAt: now,
   };
   upsertSession(updated);
@@ -3641,6 +3658,8 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     geminiSessionId,
   }));
 
+  let nativeAgentsFenced = false;
+  let launchedNativeAgentFence: SessionRecord['nativeAgentLaunchFence'];
   if (!exists) {
     if (storedBeforeLaunch) {
       const previousResources = await releaseSessionResources(storedBeforeLaunch);
@@ -3657,8 +3676,19 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       knownOpenCodeSessionIds = (await listOpenCodeSessions(projectDir, 50)).map((session) => session.id);
     }
     const launchStart = Date.now();
-    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
+    nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({ sessionName: name, role, parentSession: opts.parentSession });
+    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId, nativeAgentsFenced });
     await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
+    launchedNativeAgentFence = {
+      fence: processLaunchFence(agentType, {
+        nativeAgentsFenced,
+        // Only an explicit fresh launch without a stored thread id creates a new conversation.
+        resumesExistingConversation: !fresh || Boolean(codexSessionId),
+      }),
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+      decidedAt: Date.now(),
+    };
     if (agentType === 'opencode' && !opencodeSessionId) {
       const { waitForOpenCodeSessionId } = await import('../daemon/opencode-history.js');
       opencodeSessionId = await waitForOpenCodeSessionId(projectDir, {
@@ -3719,6 +3749,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.userCreated ? { userCreated: true } : {}),
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
+      ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
     };
     try {
       await registerTmuxSessionResource(record);
@@ -3745,6 +3776,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(opts.identityPrompt ? { identityPrompt: opts.identityPrompt } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
+        ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
         updatedAt: Date.now(),
       };
       upsertSession(merged);

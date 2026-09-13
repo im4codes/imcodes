@@ -33,6 +33,7 @@ import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { OPENCLAW_THINKING_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 // ── Internal frame types ─────────────────────────────────────────────────────
 
@@ -117,6 +118,9 @@ export class OpenClawProvider implements TransportProvider {
       cancellation: 'none',
       reason: 'Verified in this adapter/environment: OpenClaw exposes no compact RPC/command path here, and no local openclaw CLI is installed to test a provider slash command.',
     },
+    // The gateway exposes no per-call veto or per-session disable for native
+    // agents: this runtime cannot send or receive supervised work.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   // ── Private state ──────────────────────────────────────────────────────────

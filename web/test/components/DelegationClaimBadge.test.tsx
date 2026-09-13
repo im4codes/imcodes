@@ -310,7 +310,7 @@ describe('DelegationClaimBadge', () => {
     expect(fields[0]).toBe('execution');
   });
 
-  it('demotes taskId and hides the dispatch/assignment ids behind diagnostics', () => {
+  it('always shows the formal task identity and keeps only the dispatch id behind diagnostics', () => {
     const { container } = render(h(DelegationClaimBadge, {
       metadata: withClaim({
         status: 'substantiated',
@@ -318,6 +318,7 @@ describe('DelegationClaimBadge', () => {
           dispatchId: 'dsp_9f21',
           taskId: 'task_4410',
           assignmentId: 'asg_5gl',
+          taskTitle: 'Enforce formal IM.codes delegation',
           deliveries: [{
             target: 'deck_imcodes_w1',
             status: 'delivered',
@@ -332,21 +333,41 @@ describe('DelegationClaimBadge', () => {
       }),
     }));
 
-    // taskId stays visible but secondary: it is the one id a person quotes.
-    const task = container.querySelector('[data-delegation-field="taskId"]');
-    expect(task?.textContent).toContain('task_4410');
-    expect(task?.className).toContain('delegation-claim-secondary');
+    // The readable registry title and BOTH exact authority ids are on the card
+    // itself, never collapsed: a recipient verifies the whole formal identity.
+    const identity = container.querySelector('[data-delegation-field="taskIdentity"]');
+    expect(identity).not.toBeNull();
+    expect(identity?.closest('details')).toBeNull();
+    expect(identity?.querySelector('[data-delegation-field="taskTitle"]')?.textContent)
+      .toContain('Enforce formal IM.codes delegation');
+    expect(identity?.querySelector('[data-delegation-field="taskId"] code')?.textContent).toBe('task_4410');
+    expect(identity?.querySelector('[data-delegation-field="assignmentId"] code')?.textContent).toBe('asg_5gl');
 
-    // The other two are diagnostics, collapsed and not open by default, so a
-    // normal turn reads as one line instead of a wall of opaque ids.
+    // Only the dispatch id stays in the collapsed diagnostics.
     const details = container.querySelector('details[data-delegation-field="diagnostics"]');
     expect(details).not.toBeNull();
     expect(details?.hasAttribute('open')).toBe(false);
-    expect(details?.textContent).toContain('dsp_9f21');
-    expect(details?.textContent).toContain('asg_5gl');
-    // Still copyable as exact text, which is the only reason they are kept.
     expect(details?.querySelector('[data-delegation-field="dispatchId"] code')?.textContent).toBe('dsp_9f21');
-    expect(details?.querySelector('[data-delegation-field="assignmentId"] code')?.textContent).toBe('asg_5gl');
+    expect(details?.querySelector('[data-delegation-field="assignmentId"]')).toBeNull();
+  });
+
+  it('bounds a reloaded title and labels a legacy receipt without one as untitled', () => {
+    const longTitle = `${'Enforce formal delegation '.repeat(20)}\nsecond line`;
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [
+          { dispatchId: 'dsp_long', taskId: 'task_long', assignmentId: 'asg_long', taskTitle: longTitle, deliveries: [{ target: 'deck_x_w1', status: 'delivered' }] },
+          { dispatchId: 'dsp_old', taskId: 'task_old', assignmentId: 'asg_old', deliveries: [{ target: 'deck_x_w1', status: 'delivered' }] },
+        ],
+      }),
+    }));
+    const titles = Array.from(container.querySelectorAll('[data-delegation-field="taskTitle"]')).map((node) => node.textContent ?? '');
+    expect(titles[0]).not.toContain('second line');
+    expect(titles[0]!.length).toBeLessThanOrEqual('Task: '.length + 120);
+    expect(titles[0]).toMatch(/…$/);
+    expect(titles[1]).toContain('Untitled task');
+    expect(container.querySelectorAll('[data-delegation-field="assignmentId"] code')[1]?.textContent).toBe('asg_old');
   });
 
   it('keeps a queued receipt as readable as a delivered one', () => {

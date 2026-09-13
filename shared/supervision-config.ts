@@ -1,4 +1,3 @@
-import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
@@ -300,6 +299,13 @@ export type SupervisionUnavailableReason =
  */
 /** Automation note kind for a supervisor call that will be retried by the heartbeat. */
 export const SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND = 'supervision-supervisor-retry';
+
+/**
+ * Automation note kind for a Brain WAITING park refused because no
+ * authoritative IM.codes delegation (non-self participant or pending reply)
+ * exists to wait on.
+ */
+export const SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND = 'supervision-waiting-refused';
 
 export const SUPERVISION_PAUSE_CATEGORIES = {
   /** Blocked on an action only Brain may perform and cannot delegate. */
@@ -1085,20 +1091,7 @@ export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   /** Present only with a canonical target + fingerprint. */
   peerAuditPromptVersion?: typeof PEER_AUDIT_PROMPT_VERSION;
   maxAuditLoops: number;
-  /**
-   * Severities whose findings block an audit (REWORK). Missing on legacy
-   * snapshots; readers must resolve it through
-   * resolveSupervisionAuditBlockingSeverities, which defaults to P0 only.
-   */
-  auditBlockingSeverities?: AuditSeverity[];
   taskRunPromptVersion: string;
-}
-
-/** Configured blocking severities for a snapshot; legacy/missing/invalid values mean P0 only. */
-export function resolveSupervisionAuditBlockingSeverities(
-  snapshot: Pick<SessionSupervisionSnapshot, 'auditBlockingSeverities'> | null | undefined,
-): AuditSeverity[] {
-  return normalizeAuditBlockingSeverities(snapshot?.auditBlockingSeverities);
 }
 
 export type SupervisionSessionSnapshot = SessionSupervisionSnapshot;
@@ -1422,11 +1415,6 @@ export function normalizeSessionSupervisionSnapshot(
       peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
     } : {}),
     maxAuditLoops,
-    // Persist only an explicit choice so legacy snapshots stay byte-stable and
-    // keep resolving to the P0-only default.
-    ...(merged.auditBlockingSeverities !== undefined
-      ? { auditBlockingSeverities: normalizeAuditBlockingSeverities(merged.auditBlockingSeverities) }
-      : {}),
     taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   };
 }

@@ -8,7 +8,7 @@
  * surface, but every call answered `unavailable: supervision registry not
  * bound` -- a feature that looked present and was permanently inert.
  */
-import { getSupervisionTaskRegistry } from './supervision-state-store.js';
+import { getSupervisionTaskRegistry, SUPERVISION_REVISION_AUTHORITATIVE_INTENTS } from './supervision-state-store.js';
 import { listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
 import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
@@ -34,6 +34,8 @@ import { setSupervisionLiveParticipantsResolver } from './supervision-state-stor
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
 import { getTransportQueueStore, type TransportQueueStore } from './transport-queue-store.js';
 import { resolveSelectedSupervisionExecutionBinding } from './send-tool.js';
+import { autoStartAssignmentFromAck } from './assignment-auto-start.js';
+import { SUPERVISION_ASSIGNMENT_START_EVIDENCE } from '../../shared/supervision-assignment-start.js';
 
 export function retireExactSupersededAuditDelivery(
   store: Pick<TransportQueueStore, 'cancelQueuedMessage'>,
@@ -97,6 +99,31 @@ function liveCallerIdentity(callerSessionName: string | undefined) {
 export function createSupervisionRegistryPort(): SupervisionRegistryPort {
   return {
     getStatus: (taskId) => getSupervisionTaskRegistry().get(taskId)?.status,
+    startAssignmentFromAck: ({ taskId, assignmentId, callerSessionName, evidenceEventId, intent, expectedRevision }) => {
+      const sessions = listSessions();
+      const session = sessions.find((candidate) => candidate.name === callerSessionName);
+      const callerIdentity = liveCallerIdentity(callerSessionName);
+      const projectName = session ? resolveEffectiveProjectName(session, sessions) : undefined;
+      // Converging onto a runtime needs a complete live identity to converge to.
+      if (!callerIdentity?.sessionInstanceId || !callerIdentity.runtimeEpoch || !projectName) return { status: 'ignored' };
+      const outcome = autoStartAssignmentFromAck({
+        taskId,
+        assignmentId,
+        projectName,
+        callerIdentity,
+        evidence: SUPERVISION_ASSIGNMENT_START_EVIDENCE.ASSIGNMENT_ACK,
+        evidenceEventId,
+        // A revision-authoritative intent carries its revision into the start's
+        // lock: when the registry would refuse that intent, nothing starts first.
+        // An omitted revision is refused there too, never skipped.
+        ...(intent && SUPERVISION_REVISION_AUTHORITATIVE_INTENTS.includes(intent)
+          ? { expectedRevision: expectedRevision ?? '' }
+          : {}),
+      });
+      if (outcome.status === 'refused') return { status: 'refused', refusal: outcome.refusal };
+      if (outcome.status === 'revision_refused') return { status: 'revision_refused', reason: outcome.reason };
+      return { status: outcome.status };
+    },
     applyIntent: (input) => getSupervisionTaskRegistry().applyTaskIntent(input),
     finishAssignment: ({
       assignmentId, callerSessionName, callerProjectName, projectBrain,

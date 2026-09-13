@@ -58,13 +58,13 @@ import {
   parseSupervisionExecutionStateDetailsFromText,
   resolveSupervisionCustomInstructionsDetail,
   normalizeSupervisionUiLocale,
-  resolveSupervisionAuditBlockingSeverities,
   type SessionSupervisionSnapshot,
   type SupervisionExecutionState,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
   classifySupervisionInterruption,
   SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND,
+  SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND,
 } from '../../shared/supervision-config.js';
 import {
   buildSupervisionContinuePrompt,
@@ -80,6 +80,7 @@ import {
   getSupervisionStateStore,
   getSupervisionTaskRegistry,
   isSupervisionAssignmentContinuable,
+  matchesDurableSupervisionParticipant,
   SUPERVISION_STATE_VERSION,
   type PersistedSupervisionSessionIdentity,
   type PersistedSupervisionTaskAssignmentIdentity,
@@ -121,6 +122,11 @@ import {
   type DelegationReplyRecord,
 } from './delegation-reply-store.js';
 import { onDelegationReplyDelivered } from './delegation-reply-events.js';
+import { readBrainImcodesDelegationEvidence } from './brain-delegation-evidence.js';
+import { announceAssignmentStatus, autoStartDelegatedAssignmentsFromActivity } from './assignment-auto-start.js';
+import { resolveTransportConversationKey } from '../agent/transport-resume-opts.js';
+import { deriveSupervisionTaskTitle } from '../../shared/supervision-task-identity.js';
+import { isNativeCollaborationTimelineEvent } from './native-collaboration-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import {
   localizeSupervisionAutomationNote,
@@ -994,8 +1000,7 @@ function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string 
   return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText, {
     attempt: run.reworkDispatches,
     limit: run.snapshot.maxAuditLoops,
-  }, run.snapshot.auditTargetSessionName, run.snapshot.uiLocale,
-  resolveSupervisionAuditBlockingSeverities(run.snapshot));
+  }, run.snapshot.auditTargetSessionName, run.snapshot.uiLocale);
 }
 
 function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
@@ -1608,7 +1613,7 @@ class SupervisionAutomation {
         // worker has no authority to clear it, so another heartbeat cannot
         // produce progress -- it only burns quota and hides the blocker behind
         // reminder noise. Leave the single blocker standing instead.
-        if (normalizeBlockerText(assignment.blocker) || normalizeBlockerText(task.blocker)) continue;
+        if (normalizeBlockerText(assignment.blocker)) continue;
         const assignmentEvents = events.filter((event) => event.assignmentId === assignment.assignmentId);
         // While work is only delegated, runtime identity repair is
         // observational rather than substantive implementation progress. Use
@@ -1846,11 +1851,15 @@ class SupervisionAutomation {
               now,
             });
         if (!recorded.ok) continue;
+        // A continuation names the formal task the same way a dispatch does: the
+        // registry title beside the exact ids (single-line JSON stays parseable).
+        const taskTitle = deriveSupervisionTaskTitle(task.objective);
         const prompt = watchdogKind === 'audit'
           ? JSON.stringify({
               contractRefs: [SUPERVISION_CONTRACT_IDS.AUDIT_HEARTBEAT, SUPERVISION_CONTRACT_IDS.MESSAGING],
               binding: {
                 mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId,
+                ...(taskTitle ? { title: taskTitle } : {}),
                 auditAttemptId: assignment.auditAttemptId, auditRevision: assignment.auditRevision,
               },
               action: 'complete_exact_audit',
@@ -1863,6 +1872,7 @@ class SupervisionAutomation {
               ],
               binding: {
                 mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId,
+                ...(taskTitle ? { title: taskTitle } : {}),
                 ...(expectedRevision ? { revision: expectedRevision } : {}),
               },
               action: 'advance_safe_unfinished',
@@ -3375,11 +3385,52 @@ class SupervisionAutomation {
     const observedAt = Math.max(Math.min(event.ts, receivedAt), providerOutputAt);
 
     const registry = getSupervisionTaskRegistry();
-    const candidates = registry.list({
+    const listOwnedTasks = () => registry.list({
       projectName,
       ownerSessionName: event.sessionId,
       includeArchived: true,
-    }).flatMap((task) => task.assignments
+    });
+    let ownedTasks = listOwnedTasks();
+    // First authoritative activity of a formal participant starts its delegated
+    // assignment in the daemon (no model start/claim, no Brain reminder). Rows
+    // produced by provider-native collaboration agents are never that evidence.
+    if (!isNativeCollaborationTimelineEvent(event)) {
+      const delegated = ownedTasks.flatMap((task) => task.assignments
+        .filter((assignment) => (
+          assignment.role === 'implementer'
+          && assignment.required
+          && assignment.status === 'delegated'
+          && matchesDurableSupervisionParticipant({
+            taskProjectName: task.projectName,
+            assignmentSessionName: assignment.identity.sessionName,
+            candidateProjectName: projectName,
+            candidateSessionName: liveIdentity.sessionName,
+          })
+          && event.ts >= assignment.createdAt
+        ))
+        .map((assignment) => ({ task, assignment })));
+      if (delegated.length > 0) {
+        // The provider conversation this runtime holds right now: a delivery
+        // tombstone proves this runtime received the task only when stamped with it.
+        const liveConversationKey = resolveTransportConversationKey(session);
+        try {
+          const outcomes = autoStartDelegatedAssignmentsFromActivity({
+            eventId: event.eventId,
+            signal,
+            sessionName: event.sessionId,
+            projectName,
+            liveIdentity,
+            ...(liveConversationKey ? { liveConversationKey } : {}),
+            activeDispatchMessageIds: new Set((runtime.activeDispatchEntries ?? []).map((entry) => entry.clientMessageId)),
+            candidates: delegated,
+          });
+          if (outcomes.some((outcome) => outcome.status === 'started')) ownedTasks = listOwnedTasks();
+        } catch (error) {
+          logger.warn({ err: error, sessionName: event.sessionId }, 'Supervision assignment auto-start failed');
+        }
+      }
+    }
+    const candidates = ownedTasks.flatMap((task) => task.assignments
       .filter((assignment) => (
         assignment.role === 'implementer'
         && assignment.status === 'implementing'
@@ -3397,6 +3448,9 @@ class SupervisionAutomation {
       .map((assignment) => ({ task, assignment })));
     if (candidates.length !== 1) return;
     const { task, assignment } = candidates[0]!;
+    // An explicit start/claim also reaches the Brain's dispatch card without a
+    // manual message; the announcement is idempotent per assignment status.
+    announceAssignmentStatus({ task, assignment, source: 'implementation_activity' });
     const turnId = typeof event.payload.turnId === 'string' && event.payload.turnId.trim()
       ? event.payload.turnId.trim()
       : undefined;
@@ -4055,6 +4109,11 @@ class SupervisionAutomation {
         // next assistant turn — which happens when the awaited reply arrives —
         // re-enters evaluation naturally. Re-prompting here is exactly the loop
         // this decision exists to break.
+        //
+        // ...unless there is nothing authoritative to wait for. A Brain parked
+        // on a provider-native agent (or on nothing) would never be woken by
+        // IM.codes, so that WAITING is refused and re-routed instead.
+        if (await this.refuseUnsubstantiatedWaiting(latest)) return;
         this.emitStatus(latest.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
         this.emitAutomationNote(
           latest.sessionName,
@@ -4134,6 +4193,7 @@ class SupervisionAutomation {
         this.finishRun(current.sessionName, 'needs_input', { preserveStatus: true });
         return;
       case 'waiting':
+        if (await this.refuseUnsubstantiatedWaiting(current)) return;
         this.emitStatus(current.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
         this.emitAutomationNote(current.sessionName, 'Auto: parked on the executing session\'s reported external reply.', 'supervision-parked');
         this.clearCompletionGrace(current);
@@ -4145,6 +4205,49 @@ class SupervisionAutomation {
         this.armWaitingTimers(current, { preserveSchedule: true });
         return;
     }
+  }
+
+  /**
+   * WAITING is legitimate only while IM.codes owns something the Brain waits
+   * on: a non-self, non-terminal participant with an authoritative
+   * taskId/assignmentId on a task this Brain coordinates, or a durable
+   * delegation reply still owed to it. Provider-native agents never qualify.
+   * Otherwise the park is refused and the Brain is re-routed through the
+   * bounded continue channel. Unreadable evidence cannot prove a delegation,
+   * so it is refused the same way.
+   */
+  private async refuseUnsubstantiatedWaiting(run: ActiveTaskRunState): Promise<boolean> {
+    let unavailable = false;
+    let held: Array<{ taskId: string; assignmentId: string }> = [];
+    try {
+      const evidence = readBrainImcodesDelegationEvidence(run.sessionName);
+      if (evidence.hasAuthoritativeDelegation) return false;
+      held = evidence.heldParticipants ?? [];
+    } catch (error) {
+      unavailable = true;
+      logger.warn({ error, sessionName: run.sessionName }, 'supervision waiting delegation evidence unavailable; refusing park');
+    }
+    this.emitAutomationNote(
+      run.sessionName,
+      'Auto: WAITING refused — no authoritative IM.codes delegation is pending; re-routing.',
+      SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND,
+    );
+    if (!unavailable && held.length > 0) {
+      await this.dispatchContinueWithinLimits(run, {
+        reason: `WAITING refused: IM.codes participant(s) are held on a structured blocker that only this Brain can resolve: ${held.map((participant) => `${participant.taskId}/${participant.assignmentId}`).join(', ')}.`,
+        nextAction: 'Repair each held assignment in place (rebind its runtime, move it to the current revision, or re-dispatch the exact task) so it can continue; do not wait on it.',
+        gap: 'participant_held_for_brain',
+      });
+      return true;
+    }
+    await this.dispatchContinueWithinLimits(run, {
+      reason: unavailable
+        ? 'WAITING refused: IM.codes delegation evidence could not be read, so no pending delegation is proven.'
+        : 'WAITING refused: this Brain has no authoritative IM.codes delegation to wait on (no non-self participant with a taskId/assignmentId and no pending IM.codes reply). Provider-native agents and their replies are not delegation facts.',
+      nextAction: 'Dispatch project task work through IM.codes (send_list_targets, then send_message with task {objective, acceptance}); otherwise continue the remaining work yourself, or report NEEDS_INPUT only for a genuine human blocker. Never wait on a provider-native agent.',
+      gap: unavailable ? 'delegation_evidence_unavailable' : 'no_authoritative_imcodes_delegation',
+    });
+    return true;
   }
 
   private async dispatchContinueWithinLimits(
@@ -4348,7 +4451,6 @@ class SupervisionAutomation {
       ...(baseline.changeDir ? { changeDir: baseline.changeDir } : {}),
       changedPaths: baseline.fileContents.map((entry) => entry.path),
       uiLocale: current.snapshot.uiLocale,
-      blockingSeverities: resolveSupervisionAuditBlockingSeverities(current.snapshot),
     });
     const orchestrationPrompt = buildAgentDelegationOrchestrationPrompt({
       targetSession: targetName,

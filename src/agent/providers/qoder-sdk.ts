@@ -49,6 +49,13 @@ import {
 import { normalizeTransportCwd } from '../transport-paths.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { composeProviderSystemText } from '../provider-context-routing.js';
+import { NativeAgentFenceSlot, QODER_NATIVE_AGENT_TOOLS, fenceOf } from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../../shared/imcodes-send.js';
 import logger from '../../util/logger.js';
 import {
@@ -114,6 +121,11 @@ interface QoderSessionState {
   activeTurnSettled: Promise<void> | null;
   resolveActiveTurnSettled: (() => void) | null;
   activeNotificationAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
+  /**
+   * The native-agent fence the in-flight query was started with. Qoder
+   * appends later messages into that live query, so it governs them too.
+   */
+  turnNativeAgentFence?: NativeAgentFence;
 }
 
 interface QoderSendOptions {
@@ -285,6 +297,9 @@ export class QoderSdkProvider implements TransportProvider {
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // Every send starts its own query; a managed session's query runs with
+    // `disallowedTools: ['Agent']`.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
     compact: {
       execution: 'slash-command',
       providerCommand: '/compact',
@@ -300,6 +315,7 @@ export class QoderSdkProvider implements TransportProvider {
   private sdkImportError: ProviderError | null = null;
   private packageMetadata: QoderSdkPackageMetadata | null = null;
   private sessions = new Map<string, QoderSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot(QODER_PROVIDER_ID);
   private providerReadiness: QoderLayeredReadiness = createDefaultReadiness(false);
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -809,7 +825,26 @@ export class QoderSdkProvider implements TransportProvider {
     }
   }
 
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * An in-flight query has exactly the fence it was started with, and Qoder
+   * appends later messages INTO it, so an unfenced live query proves nothing.
+   * With nothing in flight, the next send decides the fence on this path.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (!state) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    if (state.inFlight) return state.turnNativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    return this.nativeAgentFence.nextLaunchFence(providerSessionId, state.sessionName);
+  }
+
   private buildSendOptions(state: QoderSessionState, payload: ProviderContextPayload): QoderSendOptions {
+    // Decided on the send path that starts the query, before any bytes.
+    const nativeAgentsFenced = this.nativeAgentFence.required(state.routeId, state.sessionName);
+    state.turnNativeAgentFence = fenceOf(nativeAgentsFenced);
     const options: QoderOptions = {
       auth: this.buildAuthOptions(state),
       cwd: state.cwd,
@@ -853,6 +888,7 @@ export class QoderSdkProvider implements TransportProvider {
     if (systemPrompt) options.systemPrompt = systemPrompt;
     const mcpServers = this.buildMcpServers(state);
     if (mcpServers) options.mcpServers = mcpServers;
+    if (nativeAgentsFenced) options.disallowedTools = [...QODER_NATIVE_AGENT_TOOLS];
     return {
       prompt: payload.assembledMessage,
       options,

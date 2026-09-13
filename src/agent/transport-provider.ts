@@ -11,6 +11,10 @@
  */
 
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import type { NativeAgentAdmissionMode, NativeAgentFence, NativeCollaborationGate } from '../../shared/native-collaboration-policy.js';
+
+/** Must the IM.codes session behind this provider session run with native agent tools withheld? */
+export type NativeAgentFenceResolver = (providerSessionId: string, sessionName?: string) => boolean;
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { ProviderLimitSignal } from '../../shared/delegation-availability.js';
@@ -253,6 +257,13 @@ export interface ProviderCapabilities {
   activeDelegationNotification?: AgentDelegationActiveNotificationMode;
   /** Proof-backed restart-stable delivery-id acceptance. Never infer this capability. */
   restartDurableDeliveryId?: ProviderRestartDurableDeliveryIdCapability;
+  /**
+   * How this provider keeps task-bearing native agent tools out of IM.codes
+   * managed work (shared/native-collaboration-policy.ts). Required: a provider
+   * that cannot state it does not compile, and `unenforceable` providers cannot
+   * host supervised work.
+   */
+  nativeAgentAdmission: NativeAgentAdmissionMode;
 }
 
 export interface ProviderDelegationNotification {
@@ -672,6 +683,33 @@ export interface TransportProvider {
    * Only call when capabilities.toolCalling is true.
    */
   onToolCall?(cb: (sessionId: string, tool: ToolCallEvent) => void): void;
+
+  /**
+   * Install the daemon's native-collaboration gate. Only providers declaring
+   * `capabilities.nativeAgentAdmission === 'pre_execution_gate'` consult it,
+   * before every native agent tool call.
+   */
+  setNativeCollaborationGate?(gate: NativeCollaborationGate): void;
+
+  /**
+   * Install the daemon's fence resolver: does the IM.codes session served by
+   * this provider session currently require native agent tools withheld?
+   * `session_fence` providers consult it on the same authoritative path that
+   * launches, loads or sends, BEFORE any user/task bytes reach the agent, and
+   * pass the IM.codes session name whenever they know it (a launch that runs
+   * before the daemon registers the provider route). A resolver that throws
+   * means fenced.
+   */
+  setNativeAgentFenceResolver?(resolver: NativeAgentFenceResolver): void;
+
+  /**
+   * The native-agent fence of the live runtime serving this provider session
+   * (`session_fence` providers). `decided_at_next_launch` may be returned only
+   * when nothing is loaded or running AND this provider's own send path will
+   * install the fence from the resolver before any bytes are sent; otherwise
+   * report the fence actually live. Anything unknown is `provider_default`.
+   */
+  getNativeAgentFence?(providerSessionId: string): Promise<NativeAgentFence>;
 
   /**
    * Register a callback for provider session metadata changes.

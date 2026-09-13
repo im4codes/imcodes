@@ -131,6 +131,8 @@ describe('OpenClawProvider', () => {
         cancellation: 'none',
         reason: 'Verified in this adapter/environment: OpenClaw exposes no compact RPC/command path here, and no local openclaw CLI is installed to test a provider slash command.',
       },
+      // No per-call veto and no per-session disable: refused for supervised work.
+      nativeAgentAdmission: 'unenforceable',
     });
   });
 

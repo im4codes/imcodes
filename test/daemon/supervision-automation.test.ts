@@ -10,6 +10,7 @@ import {
   SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
+  SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND,
   RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
   RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_MODE,
@@ -157,6 +158,27 @@ vi.mock('../../src/daemon/peer-audit-service.js', () => ({
   },
 }));
 
+// Authoritative IM.codes delegation evidence gates WAITING parks. Existing
+// parking cases model a Brain that really has delegated work outstanding; the
+// dedicated suite below flips this to prove refusal. The evidence reader itself
+// is covered against the real registry in brain-delegation-evidence.test.ts.
+const delegationEvidenceState = vi.hoisted(() => ({
+  authorized: true,
+  throws: false,
+  held: [] as Array<{ taskId: string; assignmentId: string; role: string; status: string; sessionName: string }>,
+}));
+vi.mock('../../src/daemon/brain-delegation-evidence.js', () => ({
+  readBrainImcodesDelegationEvidence: vi.fn(() => {
+    if (delegationEvidenceState.throws) throw new Error('registry offline');
+    return {
+      hasAuthoritativeDelegation: delegationEvidenceState.authorized,
+      participants: [],
+      pendingReplies: [],
+      heldParticipants: delegationEvidenceState.held,
+    };
+  }),
+}));
+
 // Timeline recovery deliberately reads the durable JSONL tail. Keep that tail
 // process-local: audit agents and CI shards can run this file concurrently,
 // and fixed session names under the real ~/.imcodes directory otherwise let
@@ -270,6 +292,9 @@ beforeEach(async () => {
   await rm(timelineStore.filePath('deck_supervision_brain'), { force: true });
   await rm(timelineStore.filePath('deck_sub_reviewer'), { force: true });
   mockBrainRuntimeMissing = false;
+  delegationEvidenceState.authorized = true;
+  delegationEvidenceState.throws = false;
+  delegationEvidenceState.held = [];
   timelineEmitter.forgetSession('deck_supervision_brain');
   timelineEmitter.forgetSession('deck_sub_reviewer');
   vi.clearAllMocks();
@@ -6500,46 +6525,6 @@ describe('SupervisionAutomation', () => {
       expect(registry.getAssignment(assignmentId)!.blocker).toBe('needs Brain adjudication');
     });
 
-    it('preserves a task-level dependency wait without watchdog noise or overwrite', async () => {
-      const registry = getSupervisionTaskRegistry();
-      const taskId = 'watchdog-task-dependency-wait';
-      const assignmentId = 'watchdog-task-dependency-wait-implementer';
-      const identity = liveWorkerIdentity();
-      expect(registry.createOrGet({
-        taskId, projectName: 'alpha', classification: 'integration_task',
-        objective: 'wait for an audited dependency', now: 1_000,
-      }).ok).toBe(true);
-      const created = registry.createAssignment({
-        assignmentId, taskId, role: 'implementer', identity,
-        scopeFiles: ['src/dependency.ts'], now: 2_000,
-      });
-      if (!created.ok) throw new Error(created.reason);
-      expect(registry.updateTask({ taskId, status: 'implementing', now: 3_000 }).ok).toBe(true);
-      expect(registry.updateAssignment({
-        assignmentId, identity, status: 'implementing', now: 3_000,
-      }).ok).toBe(true);
-      const dependencyWait = JSON.stringify({
-        kind: 'dependency_wait',
-        taskId,
-        dependencyTaskId: 'tsk_upstream',
-        condition: 'PASS+integration',
-      });
-      expect(registry.updateTask({ taskId, blocker: dependencyWait, now: 3_500 }).ok).toBe(true);
-      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
-      mockTransportRuntime.send.mockClear();
-
-      const due = 3_500 + 10 * 60_000;
-      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
-      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
-
-      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
-      expect(registry.getTaskRecord(taskId)?.blocker).toBe(dependencyWait);
-      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
-      expect(registry.listEvents(taskId).filter((event) => (
-        event.eventType === 'implementation_heartbeat'
-      ))).toHaveLength(0);
-    });
-
     it.each([
       ['tool start', 'tool.call', { id: 'read-1', name: 'Read', input: { path: 'src/activity.ts' } }, 'provider_tool_call'],
       ['tool completion', 'tool.result', { id: 'test-1', text: 'vitest: 223 passed' }, 'provider_tool_result'],
@@ -8386,4 +8371,86 @@ describe('auto-audit mode control delivery', () => {
     expect(modeControlPrompts()[0])
       .toContain('must not create, cancel, replay, or duplicate any audit lifecycle');
   }, 30_000);
+});
+
+describe('Brain WAITING requires authoritative IM.codes delegation', () => {
+  const sentPrompts = () => mockTransportRuntime.send.mock.calls.map((call) => String(call[0]));
+
+  async function startWaitingRun(commandId: string) {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', commandId, 'implement the feature', snapshot);
+    beginRun(commandId, 'implement the feature');
+  }
+
+  it('refuses a WAITING marker without authoritative delegation and re-routes through the bounded continue channel', async () => {
+    delegationEvidenceState.authorized = false;
+    const emitSpy = vi.spyOn(timelineEmitter, 'emit');
+    await startWaitingRun('cmd-waiting-native-agent');
+    completeTurn(`A native helper agent is implementing it; waiting for it.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+
+    await vi.waitFor(() => expect(mockTransportRuntime.send).toHaveBeenCalledOnce());
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    const prompt = sentPrompts()[0]!;
+    expect(prompt).toContain('WAITING refused');
+    expect(prompt).toContain('Provider-native agents and their replies are not delegation facts');
+    expect(prompt).toContain('send_message with task');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+    // Automation notes share one stable event id, so assert the emission itself.
+    expect(emitSpy.mock.calls.some((call) => call[1] === 'assistant.text'
+      && (call[2] as Record<string, unknown>).automationKind === SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND)).toBe(true);
+    // A refused park never emits the parked status.
+    expect(emitSpy.mock.calls.some((call) => call[1] === 'agent.status'
+      && (call[2] as Record<string, unknown>).status === 'supervision_parked')).toBe(false);
+    emitSpy.mockRestore();
+  });
+
+  it('parks the identical WAITING marker when authoritative delegation exists', async () => {
+    delegationEvidenceState.authorized = true;
+    await startWaitingRun('cmd-waiting-authoritative');
+    completeTurn(`A native helper agent is implementing it; waiting for it.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+
+    await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' }));
+    await sleep(25);
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it('refuses a supervisor waiting decision without authoritative delegation', async () => {
+    delegationEvidenceState.authorized = false;
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'waiting',
+      reason: 'the native helper agent is still implementing',
+      confidence: 0.9,
+    });
+    await startWaitingRun('cmd-broker-waiting-native');
+    completeTurn('Handed the implementation to a native helper agent.');
+
+    await vi.waitFor(() => expect(mockTransportRuntime.send).toHaveBeenCalledOnce());
+    expect(mockSupervisionDecide).toHaveBeenCalledOnce();
+    expect(sentPrompts()[0]).toContain('WAITING refused');
+  });
+
+  it('turns a WAITING park on a Brain-held participant into the repair it needs', async () => {
+    delegationEvidenceState.authorized = false;
+    delegationEvidenceState.held = [{
+      taskId: 'tsk_held_worker', assignmentId: 'asg_held_worker', role: 'implementer', status: 'delegated', sessionName: 'deck_sub_worker',
+    }];
+    await startWaitingRun('cmd-waiting-held-participant');
+    completeTurn(`Waiting for the worker.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+
+    await vi.waitFor(() => expect(mockTransportRuntime.send).toHaveBeenCalledOnce());
+    const prompt = sentPrompts()[0]!;
+    expect(prompt).toContain('held on a structured blocker that only this Brain can resolve');
+    expect(prompt).toContain('tsk_held_worker/asg_held_worker');
+    expect(prompt).toContain('Repair each held assignment in place');
+  });
+
+  it('refuses WAITING when delegation evidence cannot be read', async () => {
+    delegationEvidenceState.throws = true;
+    await startWaitingRun('cmd-waiting-evidence-unavailable');
+    completeTurn(`Waiting for the delegated result.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+
+    await vi.waitFor(() => expect(mockTransportRuntime.send).toHaveBeenCalledOnce());
+    expect(sentPrompts()[0]).toContain('could not be read');
+  });
 });

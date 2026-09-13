@@ -793,16 +793,6 @@
       "presetHelp": "让监督流量走某个预设的 endpoint（独立的 base URL、API key 与固定模型）。预设在共享上下文面板里管理。",
       "presetNone": "（无）",
       "maxAuditLoops": "最大审计循环",
-      "auditBlockingSeverities": "审计阻断等级",
-      "auditBlockingSeveritiesHelp": "仅勾选等级的问题会阻断（REWORK）；未勾选等级为非阻断的后续改进。默认仅 P0，至少保留一项。",
-      "auditBlockingSeveritiesAtLeastOne": "至少需要保留一个阻断等级",
-      "auditSeverity": {
-        "P0": "数据丢失或损坏、安全漏洞、生产不可用或不可恢复",
-        "P1": "违反明确验收标准、回归、挂起或永久阻塞、部分写入",
-        "P2": "边界、并发或错误路径缺陷；变更行为缺少关键测试",
-        "P3": "不影响正确性的可维护性问题",
-        "P4": "风格、命名、措辞或可选改进"
-      },
       "maxAutoContinueStreak": "同类自动继续上限",
       "maxAutoContinueStreakHelp": "同一种 continue 类型连续命中到这个次数后停止自动继续。0 表示不限制。",
       "maxAutoContinueTotal": "自动继续硬上限",
@@ -817,7 +807,6 @@
       "summaryCustomInstructions": "自定义提示词：{{value}}",
       "summaryCustomInstructionsSet": "已设置",
       "summaryAudit": "自动路由 · 循环 {{loops}} 次",
-      "summaryAuditBlocking": "阻断 {{value}}",
       "summaryMeta": "提示词 {{promptVersion}}，修复 {{repairVersion}}，解析重试 {{parseRetries}}，任务运行 {{taskRunVersion}}",
       "disabledHint": "仅 transport 会话支持监督。",
       "unsupported": "process 会话不支持监督设置。",
@@ -3068,6 +3057,8 @@
       "dispatch_id": "派发 ID",
       "task_id": "任务 ID",
       "assignment_id": "分配 ID",
+      "task_title": "任务",
+      "task_title_unavailable": "未命名任务",
       "execution": "执行于",
       "execution_identity": "{{label}}（{{sessionName}}）",
       "diagnostics": "诊断信息"

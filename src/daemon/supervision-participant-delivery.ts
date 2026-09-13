@@ -7,6 +7,7 @@ import {
   SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
 } from '../../shared/agent-delegation.js';
 import { deterministicSendMessageId } from '../../shared/send-message-id.js';
+import { isAssignmentStartRefusalError } from '../../shared/supervision-assignment-start.js';
 import type { QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
@@ -351,9 +352,16 @@ export function resolveQueuedSupervisionHeartbeatDelivery(input: {
           assignment: durableCoordinators[0]!,
           target,
         })) return 'stale';
-        if (reference.exactError === SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR
+        // Implementer dispositions persisted on the assignment itself. A refused
+        // automatic start holds a still-delegated assignment; the no-progress
+        // dispositions describe work that started. Each is admitted only while
+        // its exact durable blocker still stands under its own lifecycle status.
+        const startRefusal = isAssignmentStartRefusalError(reference.exactError);
+        if (startRefusal
+          || reference.exactError === SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR
           || reference.exactError === SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR) {
-          if (assignment.role !== 'implementer' || assignment.status !== 'implementing'
+          const heldStatus = startRefusal ? 'delegated' : 'implementing';
+          if (assignment.role !== 'implementer' || assignment.status !== heldStatus
             || !assignment.blocker) return 'stale';
           const blocker = parseAuthorityRecord(assignment.blocker);
           if (!blocker) return 'stale';

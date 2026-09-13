@@ -26,23 +26,18 @@ export function getDefaultCodexMcpArgs(): string[] {
 /**
  * Full argv for the IM.codes-managed Codex app-server.
  *
- * Native multi-agent collaboration is disabled at PROCESS START. This is the
- * only pre-execution capability removal the current CLI supports: thread-level
- * `multiAgentMode` is deprecated/ignored and `collaborationMode` only selects
- * instruction presets, so neither can veto a call. `handleRawResponseItem` sees
- * an item only AFTER the tool ran, so it cannot gate either. Verified against
- * codex-cli 0.152.1: `codex features list` reports multi_agent stable=true, and
- * `--disable multi_agent` flips it to false so a turn asked to call spawn_agent
- * returns NATIVE_COLLAB_UNAVAILABLE with no collaboration item emitted at all.
- *
- * This is deliberately process-wide for the provider, not Brain-only: native
- * ephemeral collaboration is sacrificed so user delegation cannot bypass
- * IM.codes authority. The MCP catalog stays static_full, so IM send_message and
- * the supervision tools are unaffected.
+ * No process-wide feature flag here. The app-server is ONE process for every
+ * session, so a flag could only remove native multi-agent from all sessions at
+ * once, genuinely unmanaged ones included. The fence is per session instead:
+ * `CodexSdkProvider.startNewThread` creates a managed session's thread with
+ * `config.features.{multi_agent,multi_agent_v2}=false`, which Codex keeps for
+ * that thread's whole life (verified against codex-cli 0.153: neither resume
+ * config nor `--disable` process flags change an existing thread, and every
+ * turn records `turn_context.multi_agent_version`). Supervised dispatch is
+ * admitted only for a thread whose fence is proven
+ * (src/daemon/native-agent-admission.ts). The MCP catalog stays static_full,
+ * so IM send_message and the supervision tools remain the authoritative route.
  */
-export const CODEX_DISABLED_FEATURES = ['multi_agent'] as const;
-
 export function getCodexAppServerArgs(): string[] {
-  const disable = CODEX_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]);
-  return [...getDefaultCodexMcpArgs(), ...disable, 'app-server'];
+  return [...getDefaultCodexMcpArgs(), 'app-server'];
 }

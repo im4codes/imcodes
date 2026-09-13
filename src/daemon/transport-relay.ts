@@ -25,6 +25,12 @@ import { readDelegationClaim } from '../../shared/delegation-claim.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import {
+  enforceObservedNativeCollaboration,
+  evaluateNativeCollaborationPreExecution,
+  isNativeAgentFenceRequired,
+} from './native-collaboration-guard.js';
+import { readNativeAgentAdmissionMode } from '../../shared/native-collaboration-policy.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 import { TrailingThrottle } from '../util/trailing-throttle.js';
@@ -392,6 +398,20 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
  *  Provider callbacks use providerSessionId; we resolve to IM.codes sessionName
  *  via the routing map before emitting. Unresolved routes are dropped + warned. */
 export function wireProviderToRelay(provider: TransportProvider): void {
+  // Supervision-authority gate for `pre_execution_gate` providers, asked
+  // before a native agent tool runs. Unresolved/ephemeral routes (broker,
+  // compressor) serve no IM.codes session and keep provider defaults.
+  provider.setNativeCollaborationGate?.((providerSid, request) => {
+    const sessionName = resolveSessionName(providerSid);
+    return sessionName ? evaluateNativeCollaborationPreExecution(sessionName, request) : { allow: true };
+  });
+  // Per-session fence resolver for `session_fence` providers, asked on the
+  // path that launches, loads or sends. A provider that launches before the
+  // route is registered passes the IM.codes session name itself.
+  provider.setNativeAgentFenceResolver?.((providerSid, sessionName) => (
+    isNativeAgentFenceRequired(sessionName ?? resolveSessionName(providerSid))
+  ));
+
   provider.onDelta((providerSid: string, delta: MessageDelta) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) {
@@ -666,6 +686,18 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     if (sdkDetail.kind === 'malformed-sdk') {
       logger.warn({ toolId: tool.id, reason: sdkDetail.reason }, 'transport-relay: dropping malformed sdk sub-agent detail');
       return;
+    }
+
+    // Post-start EVIDENCE for providers without a pre-execution gate: a
+    // task-bearing native agent in a managed session is recorded and its turn
+    // stopped. It is never the enforcing boundary; the tool event below is
+    // still projected unchanged.
+    try {
+      enforceObservedNativeCollaboration(sessionName, provider.id, tool, {
+        admissionMode: readNativeAgentAdmissionMode(provider.capabilities?.nativeAgentAdmission),
+      });
+    } catch (error) {
+      logger.warn({ error, sessionName, toolId: tool.id }, 'transport-relay: native collaboration enforcement failed');
     }
     if (sdkDetail.kind === 'ok') {
       const sdkPayload = buildSdkSubagentTimelinePayload({

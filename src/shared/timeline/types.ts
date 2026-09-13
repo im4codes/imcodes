@@ -14,6 +14,8 @@ import type {
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
+import { NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT } from '../../../shared/native-collaboration-policy.js';
+import { SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT } from '../../../shared/supervision-assignment-start.js';
 import type { TimelineDetailRef, TimelineEventCompleteness } from '../../../shared/timeline-protocol.js';
 import type {
   PeerAuditRuntimeDisposition,
@@ -51,6 +53,11 @@ export type TimelineEventType =
   // provider notification remains separate so this event never becomes model
   // input or a supervision task candidate.
   | typeof AGENT_DELEGATION_REPLY_TIMELINE_EVENT
+  // Hidden durable evidence that a project Brain's native-agent request was
+  // refused or re-routed because it tried to hand project task work to a
+  // provider-native agent. Never model input and never a task candidate.
+  | typeof NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT
+  | typeof SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT
   // Emitted once per memory-compression call (NOT manual /compact, which is
   // forwarded to the SDK transport unchanged). Carries the backend+model that
   // did the compression plus token telemetry. Persisted to JSONL history for
@@ -213,6 +220,9 @@ export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'peer_audit.result',
   'peer_audit.status',
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  // Hidden, but restored with history so a reloaded dispatch card still shows
+  // the assignment's live status instead of the status frozen at send time.
+  SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT,
   'memory.compression',
 ] as const satisfies readonly TimelineEventType[];
 

@@ -1,7 +1,10 @@
 import path from 'path';
-import { buildAuditSeverityPolicyLines, type AuditSeverity } from '../../shared/audit-convergence.js';
 import logger from '../util/logger.js';
 import { existsSync } from 'node:fs';
+import {
+  deriveSupervisionTaskTitle,
+  formatSupervisionTaskIdentityHeader,
+} from '../../shared/supervision-task-identity.js';
 import { createHash } from 'node:crypto';
 import {
   createSendDispatchId,
@@ -66,7 +69,6 @@ import {
   isTerminalSupervisionTaskStatus,
   isSupervisionTaskAuditPolicy,
   readSupervisionSnapshotFromTransportConfig,
-  resolveSupervisionAuditBlockingSeverities,
   supervisionTaskAuditPolicyFromSnapshot,
   type SessionSupervisionSnapshot,
   type SupervisionTaskMetadata,
@@ -126,6 +128,7 @@ import {
   type SupervisionLifecycleConvergenceAction,
   type PersistedSupervisionTaskAssignment,
   type PersistedSupervisionTaskAssignmentIdentity,
+  type SupervisionTaskRegistryResult,
   type SupervisionTaskSnapshot,
 } from './supervision-state-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
@@ -342,6 +345,8 @@ export interface SendMessageDelivery {
   delegationId?: string;
   taskId?: string;
   assignmentId?: string;
+  /** Registry-derived readable title of the bound task (shared/supervision-task-identity.ts). */
+  taskTitle?: string;
   status: 'delivered' | 'queued' | 'failed';
   error?: string;
   /**
@@ -367,6 +372,8 @@ export type SendMessageResult =
       clone?: { target: string; sessionName: string; hardTimeoutAt: number };
       taskId?: string;
       assignmentId?: string;
+      /** Registry-derived readable title of the bound task. */
+      taskTitle?: string;
       auditRoutingReason?: SupervisionAuditRoutingReason;
       auditDegradedReason?: SupervisionAuditDegradedReason;
       provisioning?: SupervisionProvisioningEvidence;
@@ -1615,6 +1622,10 @@ export async function dispatchSendMessage(
 
   let supervisedTaskId: string | undefined;
   let supervisedAssignmentId: string | undefined;
+  /** Readable title derived from the registry objective at dispatch time. */
+  let supervisedTaskTitle: string | undefined;
+  /** The dispatch continues an assignment that already existed. */
+  let supervisedAssignmentReused = false;
   let supervisedAssignmentGeneration: number | undefined;
   /** The task's ORIGINAL coordinator assignment, stamped onto the durable return
    *  authority so the reply is bound to that assignment rather than to whoever
@@ -2239,6 +2250,10 @@ export async function dispatchSendMessage(
 
     supervisedTaskId = taskId;
     supervisedAssignmentId = assignment.value.assignmentId;
+    // The registry objective, never the caller's prose, names the task on every
+    // surface: the delivered body, the accepted receipt and the dispatch card.
+    supervisedTaskTitle = deriveSupervisionTaskTitle(registry.get(taskId)?.objective);
+    supervisedAssignmentReused = Boolean(reusedAssignment);
     supervisedAssignmentGeneration = assignment.value.generation;
     // Resolve the task's coordinator assignment ONCE, from the registry, and by
     // exact identity where the caller is that coordinator. This is the authority
@@ -2424,17 +2439,42 @@ export async function dispatchSendMessage(
           assignmentId: supervisedAssignmentId,
         })
       : '';
+    // Every supervised dispatch -- a new assignment or a continuation of an
+    // existing one -- opens with the formal identity the recipient must be able
+    // to verify: the registry title and the exact taskId and assignmentId.
+    const newAssignmentBinding = Boolean(supervisedExecutionBinding && !reusedContinuationAssignment);
     const assignmentMessage = [
-      ...(supervisedExecutionBinding && !reusedContinuationAssignment ? [
+      ...(supervisedTaskId && supervisedAssignmentId ? [
+        formatSupervisionTaskIdentityHeader({
+          ...(supervisedTaskTitle ? { title: supervisedTaskTitle } : {}),
+          taskId: supervisedTaskId,
+          assignmentId: supervisedAssignmentId,
+        }),
+        '',
+      ] : []),
+      ...(supervisedExecutionBinding && newAssignmentBinding ? [
           JSON.stringify({
             contractRefs: [SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY, SUPERVISION_CONTRACT_IDS.MESSAGING],
             binding: {
               mode: 'new_assignment',
               taskId: supervisedTaskId,
               assignmentId: supervisedAssignmentId,
+              ...(supervisedTaskTitle ? { title: supervisedTaskTitle } : {}),
               pool: supervisedExecutionBinding.pool,
               requested: supervisedExecutionBinding.requested,
               actual: supervisedExecutionBinding.actual,
+            },
+          }),
+          '',
+        ] : []),
+      ...(supervisedTaskId && supervisedAssignmentId && !newAssignmentBinding ? [
+          JSON.stringify({
+            contractRefs: [SUPERVISION_CONTRACT_IDS.MESSAGING],
+            binding: {
+              mode: supervisedAssignmentReused ? 'continue_existing' : 'new_assignment',
+              taskId: supervisedTaskId,
+              assignmentId: supervisedAssignmentId,
+              ...(supervisedTaskTitle ? { title: supervisedTaskTitle } : {}),
             },
           }),
           '',
@@ -2484,6 +2524,7 @@ export async function dispatchSendMessage(
         ...(replyAuthority ? { delegationId: replyAuthority.record.delegationId } : {}),
         ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
         ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
+        ...(supervisedTaskId && supervisedTaskTitle ? { taskTitle: supervisedTaskTitle } : {}),
         status: dispatchResult === 'queued' ? 'queued' : 'delivered',
         ...(execution ? { execution } : {}),
       });
@@ -2510,6 +2551,7 @@ export async function dispatchSendMessage(
     deliveries,
     ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
     ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
+    ...(supervisedTaskId && supervisedTaskTitle ? { taskTitle: supervisedTaskTitle } : {}),
     ...(auditRoutingReason ? { auditRoutingReason } : {}),
     ...(auditDegradedReason ? { auditDegradedReason } : {}),
     ...(provisioning ? { provisioning } : {}),
@@ -2551,31 +2593,61 @@ function readMatchingBlockerEscalation(
   }
 }
 
+/** What one fail-closed implementer disposition says and how it is persisted. */
+export interface ImplementationBlockerEscalationSpec {
+  taskId: string;
+  assignmentId: string;
+  /** The exact implementer must be in this status; otherwise nothing is escalated. */
+  eligibleStatus: 'implementing' | 'delegated';
+  /** Reported when the implementer is not in `eligibleStatus`. */
+  ineligibleReason: string;
+  exactError: string;
+  completedSafeWork: string;
+  /** Options when a live reporter and one authoritative Brain exist. */
+  brainOptions: readonly string[];
+  brainRecommendedNextAction: string;
+  persist: (input: {
+    assignmentId: string;
+    blocker: string;
+    blockerFingerprint: string;
+    replaceMatching?: boolean;
+    now: number;
+  }) => SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment>;
+  /**
+   * Re-send the deterministic Brain report when the disposition is already
+   * durable but no durable delivery evidence exists (a crash between persist
+   * and dispatch). Delivery stays at-most-once per message id.
+   */
+  redeliverOnReplay?: boolean;
+  /**
+   * `false` persists the disposition only. Used where no daemon send path
+   * exists (the recipient's own MCP process); the daemon delivers it later
+   * with `redeliverOnReplay`. Defaults to true.
+   */
+  deliver?: boolean;
+}
+
 /**
- * Convert exhaustion of the bounded same-object continuation budget into one
- * durable, actionable disposition. Persistence happens before delivery, so a
- * daemon restart or a later watchdog tick cannot emit another refusal/no-op
- * for the same state. A single quiet heartbeat never calls this boundary.
+ * Persist one durable, actionable implementer disposition and hand it to the
+ * authoritative Brain. Persistence happens before delivery, so a daemon
+ * restart or a later tick cannot emit another report for the same state; the
+ * deterministic message id keeps any redelivery idempotent.
  */
-export async function reportImplementationNoProgressBlocker(
-  input: { taskId: string; assignmentId: string },
+export async function escalateImplementationBlocker(
+  spec: ImplementationBlockerEscalationSpec,
   deps: SendToolDeps = {},
 ): Promise<ImplementationBlockerEscalationResult> {
   const registry = getSupervisionTaskRegistry();
-  const task = registry.get(input.taskId);
-  const assignment = task?.assignments.find((candidate) => candidate.assignmentId === input.assignmentId);
+  const task = registry.get(spec.taskId);
+  const assignment = task?.assignments.find((candidate) => candidate.assignmentId === spec.assignmentId);
   if (!task || !assignment || assignment.role !== 'implementer') {
     return { status: 'ignored', reason: 'exact_implementer_not_found' };
   }
   if (isTerminalSupervisionTaskStatus(task.status) || isTerminalSupervisionTaskStatus(assignment.status)) {
     return { status: 'ignored', reason: 'terminal' };
   }
-  // No-progress escalation describes work that actually started. A delegated
-  // assignment may merely be waiting behind the original durable FIFO
-  // delivery, so treating it as failed implementation fabricates progress and
-  // blocks the same object before the worker can claim it.
-  if (assignment.status !== 'implementing') {
-    return { status: 'ignored', reason: 'implementation_not_started' };
+  if (assignment.status !== spec.eligibleStatus) {
+    return { status: 'ignored', reason: spec.ineligibleReason };
   }
 
   const sessions = (deps.listSessions ?? listSessions)();
@@ -2585,39 +2657,44 @@ export async function reportImplementationNoProgressBlocker(
     && resolveEffectiveProjectName(session, sessions) === task.projectName
   ));
   const brain = uniqueAuthoritativeProjectBrain(task.projectName, sessions);
+  const revision = task.currentRevision ?? assignment.auditRevision ?? '';
   const fingerprint = createHash('sha256').update(JSON.stringify({
     taskId: task.taskId,
     assignmentId: assignment.assignmentId,
-    revision: task.currentRevision ?? assignment.auditRevision ?? '',
+    revision,
     status: assignment.status,
-    exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
+    exactError: spec.exactError,
   })).digest('hex');
   const messageId = deterministicSendMessageId(`implementation-blocker:${fingerprint}`);
-  if (brain) {
-    bindExistingQueueSupervisionReference(brain.name, messageId, {
-      kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
-      revision: task.currentRevision ?? assignment.auditRevision ?? '',
-      exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
-    });
-  }
+  const queueReference: QueueSupervisionReference = {
+    kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
+    revision,
+    exactError: spec.exactError,
+  };
+  if (brain) bindExistingQueueSupervisionReference(brain.name, messageId, queueReference);
+  const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
+  const brainCanResolve = Boolean(reporter && brain);
+  const replayResult = (durable: SupervisionBlockerEscalationReport): ImplementationBlockerEscalationResult => (
+    durable.disposition === SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
+      ? { status: 'waiting', report: durable, replay: true }
+      : { status: 'needs_input', report: durable, replay: true }
+  );
+  const deliver = spec.deliver !== false;
   const replay = readMatchingBlockerEscalation(assignment.blocker, fingerprint);
-  if (replay) {
-    return replay.disposition === SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
-      ? { status: 'waiting', report: replay, replay: true }
-      : { status: 'needs_input', report: replay, replay: true };
+  if (replay && !(deliver && spec.redeliverOnReplay && brainCanResolve && brain && !hasEvidence(brain.name, messageId))) {
+    return replayResult(replay);
   }
 
-  const brainCanResolve = Boolean(reporter && brain);
   const report: SupervisionBlockerEscalationReport = {
     taskId: task.taskId,
     assignmentId: assignment.assignmentId,
-    exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
-    completedSafeWork: 'the bounded same-assignment continuation budget completed without authoritative provider/runtime or lifecycle progress; no Git or replacement object was created',
+    exactError: spec.exactError,
+    completedSafeWork: spec.completedSafeWork,
     options: brainCanResolve
-      ? ['repair_same_object_authority', 'resume_exact_assignment']
+      ? [...spec.brainOptions]
       : ['provide_missing_external_authority', 'select_one_authoritative_project_brain'],
     recommendedNextAction: brainCanResolve
-      ? 'the authoritative Brain must repair and resume this same task and assignment in place'
+      ? spec.brainRecommendedNextAction
       : 'provide the missing external authority or identify one authoritative Brain for this project',
     blockerFingerprint: fingerprint,
     disposition: brainCanResolve
@@ -2630,30 +2707,32 @@ export async function reportImplementationNoProgressBlocker(
     ...(brain ? { brain: { label: brain.label?.trim() || brain.name, sessionName: brain.name } } : {}),
     ...(brainCanResolve ? {} : { missing: 'one live authoritative same-project Brain or external authorization' }),
   };
-  const persisted = registry.recordImplementationNoProgressBlocker({
-    assignmentId: assignment.assignmentId,
-    blocker: JSON.stringify(report),
-    blockerFingerprint: fingerprint,
-    now: (deps.now ?? Date.now)(),
-  });
-  if (!persisted.ok) {
-    if (persisted.reason === 'invalid_transition') {
-      return { status: 'ignored', reason: 'terminal' };
+  const redelivering = Boolean(replay);
+  if (!redelivering) {
+    const persisted = spec.persist({
+      assignmentId: assignment.assignmentId,
+      blocker: JSON.stringify(report),
+      blockerFingerprint: fingerprint,
+      now: (deps.now ?? Date.now)(),
+    });
+    if (!persisted.ok) {
+      if (persisted.reason === 'invalid_transition') {
+        return { status: 'ignored', reason: 'terminal' };
+      }
+      return { status: 'ignored', reason: `blocker_persist_failed:${persisted.reason}` };
     }
-    return { status: 'ignored', reason: `blocker_persist_failed:${persisted.reason}` };
-  }
-  if (persisted.replay) {
-    const durable = readMatchingBlockerEscalation(persisted.value.blocker, fingerprint);
-    if (!durable) return { status: 'ignored', reason: 'blocker_replay_mismatch' };
-    return durable.disposition === SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.WAITING_FOR_BRAIN
-      ? { status: 'waiting', report: durable, replay: true }
-      : { status: 'needs_input', report: durable, replay: true };
+    if (persisted.replay) {
+      const durable = readMatchingBlockerEscalation(persisted.value.blocker, fingerprint);
+      if (!durable) return { status: 'ignored', reason: 'blocker_replay_mismatch' };
+      return replayResult(durable);
+    }
   }
 
   if (!brainCanResolve || !reporter || !brain) {
-    return { status: 'needs_input', report, replay: false };
+    return { status: 'needs_input', report, replay: redelivering };
   }
-  if (!(deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence)(brain.name, messageId)) {
+  if (!deliver) return { status: 'waiting', report, replay: false };
+  if (!hasEvidence(brain.name, messageId)) {
     const dispatched = await dispatchSendMessage({
       userId: reporter.name,
       sessionName: reporter.name,
@@ -2665,11 +2744,7 @@ export async function reportImplementationNoProgressBlocker(
       idempotencyKey: `implementation-blocker:${fingerprint}`,
       internalMessageId: messageId,
       internalDurableQueue: true,
-      internalQueueSupervisionReference: {
-        kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
-        revision: task.currentRevision ?? assignment.auditRevision ?? '',
-        exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
-      },
+      internalQueueSupervisionReference: queueReference,
     }, deps);
     if (dispatched.status !== 'accepted') {
       const failedReport: SupervisionBlockerEscalationReport = {
@@ -2677,7 +2752,7 @@ export async function reportImplementationNoProgressBlocker(
         disposition: SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS.NEEDS_INPUT,
         missing: `Brain escalation delivery failed: ${dispatched.status === 'error' ? dispatched.error : dispatched.reason}`,
       };
-      const failedPersist = registry.recordImplementationNoProgressBlocker({
+      const failedPersist = spec.persist({
         assignmentId: assignment.assignmentId,
         blocker: JSON.stringify(failedReport),
         blockerFingerprint: fingerprint,
@@ -2687,10 +2762,47 @@ export async function reportImplementationNoProgressBlocker(
       if (!failedPersist.ok && failedPersist.reason === 'invalid_transition') {
         return { status: 'ignored', reason: 'terminal' };
       }
-      return { status: 'needs_input', report: failedReport, replay: false };
+      return { status: 'needs_input', report: failedReport, replay: redelivering };
+    }
+    if (redelivering && replay?.disposition !== report.disposition) {
+      // The durable copy recorded an earlier failed delivery; the report now
+      // reached the Brain, so the standing disposition is waiting again.
+      spec.persist({
+        assignmentId: assignment.assignmentId,
+        blocker: JSON.stringify(report),
+        blockerFingerprint: fingerprint,
+        replaceMatching: true,
+        now: (deps.now ?? Date.now)(),
+      });
     }
   }
-  return { status: 'waiting', report, replay: false };
+  return { status: 'waiting', report, replay: redelivering };
+}
+
+/**
+ * Convert exhaustion of the bounded same-object continuation budget into one
+ * durable, actionable disposition. A single quiet heartbeat never calls this
+ * boundary.
+ */
+export async function reportImplementationNoProgressBlocker(
+  input: { taskId: string; assignmentId: string },
+  deps: SendToolDeps = {},
+): Promise<ImplementationBlockerEscalationResult> {
+  const registry = getSupervisionTaskRegistry();
+  return escalateImplementationBlocker({
+    ...input,
+    // No-progress escalation describes work that actually started. A delegated
+    // assignment may merely be waiting behind the original durable FIFO
+    // delivery, so treating it as failed implementation fabricates progress and
+    // blocks the same object before the worker can claim it.
+    eligibleStatus: 'implementing',
+    ineligibleReason: 'implementation_not_started',
+    exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
+    completedSafeWork: 'the bounded same-assignment continuation budget completed without authoritative provider/runtime or lifecycle progress; no Git or replacement object was created',
+    brainOptions: ['repair_same_object_authority', 'resume_exact_assignment'],
+    brainRecommendedNextAction: 'the authoritative Brain must repair and resume this same task and assignment in place',
+    persist: (record) => registry.recordImplementationNoProgressBlocker(record),
+  }, deps);
 }
 
 export type ReadyAuditDispatchResult =
@@ -2733,10 +2845,6 @@ export interface ReadyAuditDispatchDeps {
     | Promise<import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined>;
   /** Test seam for the existing bounded, persistent housekeeping scheduler. */
   runScheduledWorktreeGcBatch?: (now: number) => Promise<unknown>;
-  /** Test/host seam for exact immutable-bundle integration provisioning. */
-  ensureIntegrationWorktree?: typeof defaultEnsureSupervisionAssignmentWorktree;
-  /** Test seam; production always applies through the verified bundle helper. */
-  applyIntegrationBundle?: typeof applySupervisionIntegrationBundle;
 }
 
 function automaticAuditAttemptId(taskId: string, revision: string): string {
@@ -3108,16 +3216,9 @@ function boundedAuditBrief(
   revision: string,
   authoritativeBundle: string,
   authoritativeFiles: readonly import('./supervision-worktree-inspector.js').SupervisionWorktreeFileSnapshot[],
-  scope: {
-    /** Current durable scope of the audited implementer, independent of touchedFiles/bundle rows. */
-    scopeFiles: readonly string[];
-    /** Blocking severities from the project Brain's current supervision configuration. */
-    blockingSeverities: readonly AuditSeverity[];
-  },
 ): string {
   const shorten = (value: string, max = 800) => value.length <= max ? value : `${value.slice(0, max - 1)}…`;
   const files = authoritativeFiles.map((file) => file.path);
-  const scopeFiles = [...new Set(scope.scopeFiles.map((file) => file.trim()).filter(Boolean))].sort();
   return [
     '[Daemon-resolved automatic matching audit]',
     `taskId=${task.taskId}`,
@@ -3133,14 +3234,6 @@ function boundedAuditBrief(
     'Inspect the manifest and frozen files from the immutable bundle above. Do not inspect the auditor worktree or substitute a mutable implementer worktree.',
     'Do not edit code, stage, commit, push, deploy, install, upgrade, restart, or create a replacement task/audit.',
     'On PASS, integrationOwner is the same-project Brain; on failure report bounded concrete findings.',
-    '',
-    ...buildAuditSeverityPolicyLines(scope.blockingSeverities),
-    '',
-    'Assignment scopeFiles (current durable scope):',
-    ...(scopeFiles.length > 0
-      ? scopeFiles.slice(0, 60).map((file) => `- ${file}`)
-      : ['- (none recorded)']),
-    ...(scopeFiles.length > 60 ? [`- … ${scopeFiles.length - 60} more`] : []),
     ...(files.length > 0 ? ['', 'Referenced files:', ...[...new Set(files)].sort().slice(0, 40).map((file) => `- ${file}`)] : []),
   ].join('\n');
 }
@@ -3645,12 +3738,7 @@ export async function dispatchReadyAudit(
   let repairingUnselectedExisting = false;
   const buildInput = (target?: string, autoProvision = false): SendMessageInput => ({
     ...(target ? { target } : {}),
-    message: boundedAuditBrief(task, revision, integrationArtifact.path, integrationArtifact.files, {
-      scopeFiles: implementer.scopeFiles,
-      blockingSeverities: resolveSupervisionAuditBlockingSeverities(
-        resolveProjectAuthoritativeSupervisionSnapshot(task.projectName, sessions),
-      ),
-    }),
+    message: boundedAuditBrief(task, revision, integrationArtifact.path, integrationArtifact.files),
     reply: true,
     idempotencyKey: `auto-audit:${task.taskId}:${revision}`,
     ...(existingAudit ? {} : { newWorkload: true }),
@@ -4073,39 +4161,6 @@ export async function dispatchReadyIntegration(
   ));
   if (existingOwners.length > 1) return { status: 'blocked', reason: 'multiple live integration owners', reported: false };
   let owner = existingOwners[0];
-  // Task snapshots intentionally omit terminal assignments. Resolve the
-  // persisted pointer through the registry so a cancelled historical owner is
-  // recovered in place instead of becoming invisible and causing a replacement
-  // owner to be minted.
-  const pointedOwner = task.integrationOwnerAssignmentId
-    ? registry.getAssignment(task.integrationOwnerAssignmentId)
-    : undefined;
-  const staleOwnerPointer = pointedOwner?.taskId === task.taskId
-    && pointedOwner.role === 'integration_owner'
-    && pointedOwner.status === 'cancelled'
-    ? pointedOwner
-    : undefined;
-  if (!owner && staleOwnerPointer) {
-    const recovered = registry.recoverCancelledIntegrationOwner({
-      taskId: task.taskId,
-      assignmentId: staleOwnerPointer.assignmentId,
-      identity: coordinator.identity,
-      expectedRevision: revision,
-      expectedAttemptId: implementer.auditAttemptId!,
-      expectedGeneration: staleOwnerPointer.generation,
-      scopeFiles: integrationArtifact.files.map((file) => file.path),
-      reason: 'materialize the exact current PASS on the same historical integration owner',
-      now: (deps.now ?? Date.now)(),
-    });
-    if (!recovered.ok) {
-      return {
-        status: 'blocked',
-        reason: `integration owner recovery rejected: ${recovered.reason}`,
-        reported: false,
-      };
-    }
-    owner = recovered.value;
-  }
   if (!owner) {
     const created = registry.createAssignment({
       taskId: task.taskId,
@@ -4123,11 +4178,11 @@ export async function dispatchReadyIntegration(
   }
   let integrationWorktree: string | undefined;
   if (integrationArtifact.bundle) {
-    const ensured = await (deps.ensureIntegrationWorktree ?? defaultEnsureSupervisionAssignmentWorktree)({
+    const ensured = await defaultEnsureSupervisionAssignmentWorktree({
       projectRoot: brain.projectDir,
       sessionName: brain.name,
       assignmentId: owner.assignmentId,
-      baseRevision: integrationArtifact.bundle.headSha,
+      baseRevision: task.baseRevision ?? integrationArtifact.bundle.headSha,
     });
     if (!ensured.ok) {
       return {
@@ -4136,7 +4191,7 @@ export async function dispatchReadyIntegration(
         reported: false,
       };
     }
-    const applied = (deps.applyIntegrationBundle ?? applySupervisionIntegrationBundle)({
+    const applied = applySupervisionIntegrationBundle({
       bundle: integrationArtifact.bundle,
       worktreePath: ensured.worktreePath,
     });
@@ -4197,7 +4252,7 @@ export async function dispatchReadyIntegration(
       'Exact pathspec:',
       ...integrationArtifact.files.map((file) => `- ${file.path}`),
       '',
-      'Before any Git side effect, call supervision_integration_preflight with this exact task/revision/attempt/owner and destination ref; retain its preflightToken. Integrate only the verified bundle bytes already materialized in the prepared integration worktree. Record real commit/push evidence; if recovering an exact verified bundle commit that is already reachable from that ref, use already_present without repeating Git and the pre-Git token may be omitted. Otherwise call supervision_integration_finalize once with the same metadata and preflightToken. Field-level refusals are recoverable inputs, not a request for Brain to guess an extra task_finish. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
+      'Integrate only the verified bundle bytes already materialized in the prepared integration worktree. Record real commit/push evidence; if already present, record that fact. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
     ].join('\n'),
     idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
     internalMessageId: messageId,

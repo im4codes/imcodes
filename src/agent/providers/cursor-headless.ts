@@ -53,6 +53,7 @@ import {
   MEMORY_MCP_STATUS,
   type MemoryMcpProviderStatusView,
 } from '../../../shared/memory-ws.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const CURSOR_BIN = 'cursor-agent';
 const CONNECT_PROBE_TIMEOUT_MS = 15_000;
@@ -155,6 +156,9 @@ export class CursorHeadlessProvider implements TransportProvider {
       cancellation: 'none',
       reason: 'Verified with cursor-agent 2026.05.05-84a231c: CLI help exposes no compact/compress command or compact API for the headless adapter.',
     },
+    // No per-call veto and no per-session disable for native agents: this
+    // runtime cannot send or receive supervised work.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   private config: ProviderConfig | null = null;
