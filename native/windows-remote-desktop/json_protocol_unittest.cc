@@ -61,6 +61,42 @@ TEST(JsonProtocolTest, LegacyPrepareWithoutRouteGenerationRemainsParseable) {
   EXPECT_FALSE(parsed->authority.route_generation.has_value());
 }
 
+TEST(JsonProtocolTest, AcceptsCredentialLessIceObjectsOnlyWhenWhole) {
+  const auto prepare_with = [](const Json::Value& entry) {
+    Json::Value root = AuthorityBase(kPrepareType);
+    root["expiresAt"] = Json::Int64(kNowMs + 60'000);
+    root["leaseExpiresAt"] = Json::Int64(kNowMs + 30'000);
+    root["daemonGeneration"] = 7;
+    root["mode"] = kControlMode;
+    root["inputEpoch"] = 1;
+    Json::Value ice(Json::arrayValue);
+    ice.append(entry);
+    root["iceServers"] = ice;
+    return ParseServiceSignal(root, kNowMs);
+  };
+
+  // A STUN object carries no credentials; the shared contract accepts it.
+  Json::Value stun(Json::objectValue);
+  stun["urls"] = Json::Value(Json::arrayValue);
+  stun["urls"].append("stun:stun.example.test:3478");
+  const auto accepted = prepare_with(stun);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_EQ(accepted->authority.ice_servers.size(), 1u);
+  EXPECT_TRUE(accepted->authority.ice_servers[0].username.empty());
+
+  // TURN with both credentials still parses.
+  Json::Value turn = stun;
+  turn["urls"][0] = "turn:turn.example.test:3478";
+  turn["username"] = "user";
+  turn["credential"] = "pass";
+  EXPECT_TRUE(prepare_with(turn).has_value());
+
+  // Half a credential pair is malformed.
+  Json::Value half = stun;
+  half["username"] = "user";
+  EXPECT_FALSE(prepare_with(half).has_value());
+}
+
 TEST(JsonProtocolTest, RejectsMalformedRouteGeneration) {
   Json::Value root = AuthorityBase(kPrepareType);
   root["expiresAt"] = Json::Int64(kNowMs + 120'000);

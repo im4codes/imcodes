@@ -36,11 +36,13 @@ export type MacosRemoteDesktopReadinessMode = typeof MACOS_REMOTE_DESKTOP_READIN
 
 /**
  * Whether the macOS management-privacy shield is qualified on real hardware.
- * The worker and host implement it end to end; it is advertised only once a
- * real Mac has proven the shield, so a regression there cannot silently hide or
- * leak a secret-bearing flow. Flip after qualification.
+ *
+ * Qualified on a Mac mini (macOS 26.2) through the real node host, LaunchAgent
+ * and signed worker: SHIELDED carried the exact route and released input, no
+ * real frame was encoded across 5.5 s of shielded capture, and RELEASED proved
+ * the first real frame after the lift. Set false to withdraw the capability.
  */
-export const MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED = false;
+export const MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED = true;
 
 export interface MacosRemoteDesktopReadinessInput {
   /** Advertise the management-privacy shield. Defaults to the qualification flag. */

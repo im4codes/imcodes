@@ -47,10 +47,16 @@ bool ParseIceServers(const Json::Value& value,
       const std::string url = entry.asString();
       if (url.empty() || url.size() > 2048) return false;
       server.urls.push_back(url);
-    } else if (ExactKeys(entry, {"urls", "username", "credential"}) &&
+    } else if (ExactKeys(entry, {"urls"}, {"username", "credential"}) &&
                entry["urls"].isArray() && !entry["urls"].empty() &&
-               entry["urls"].size() <= 8 && entry["username"].isString() &&
-               entry["credential"].isString()) {
+               entry["urls"].size() <= 8 &&
+               // STUN entries carry no credentials; TURN entries carry both.
+               // The shared contract accepts exactly that, so a credential-less
+               // object must not terminate the worker as a malformed command.
+               entry.isMember("username") == entry.isMember("credential") &&
+               (!entry.isMember("username") ||
+                (entry["username"].isString() &&
+                 entry["credential"].isString()))) {
       for (const Json::Value& url : entry["urls"]) {
         if (!url.isString() || url.asString().empty() ||
             url.asString().size() > 2048) {
@@ -58,8 +64,10 @@ bool ParseIceServers(const Json::Value& value,
         }
         server.urls.push_back(url.asString());
       }
-      server.username = entry["username"].asString();
-      server.credential = entry["credential"].asString();
+      if (entry.isMember("username")) {
+        server.username = entry["username"].asString();
+        server.credential = entry["credential"].asString();
+      }
       if (server.username.size() > 1024 || server.credential.size() > 1024) {
         return false;
       }

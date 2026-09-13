@@ -36,11 +36,13 @@ const READY: MacosRemoteDesktopReadinessInput = {
 };
 
 describe('macOS remote-desktop runtime readiness', () => {
-  it('does not advertise the privacy shield until it is qualified', () => {
-    const { capturePrivacy: _qualified, ...unqualified } = READY;
-    expect(MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED).toBe(false);
-    expect(resolveMacosRemoteDesktopRuntimeProfile(unqualified).adapterCapabilities)
-      .not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+  it('advertises the qualified privacy shield by default and can withdraw it', () => {
+    const { capturePrivacy: _explicit, ...byDefault } = READY;
+    expect(MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED).toBe(true);
+    expect(resolveMacosRemoteDesktopRuntimeProfile(byDefault).adapterCapabilities)
+      .toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+    expect(resolveMacosRemoteDesktopRuntimeProfile({ ...READY, capturePrivacy: false })
+      .adapterCapabilities).not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
   });
 
   it.each([
