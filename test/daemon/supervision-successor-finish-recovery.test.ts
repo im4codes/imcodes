@@ -189,14 +189,22 @@ function r1ReworkThenBoundR2(
 
   // Exact field shape from the interrupted transition: the durable validation
   // and exact R2 bindings survived, while the lifecycle columns/payloads still
-  // project the preceding implementing/rework pair.
+  // project the preceding implementing/rework pair. Public revision updates now
+  // clear an exact predecessor bundle, so seed that legacy persisted split
+  // directly when a recovery test needs to exercise it.
+  const taskProjection = registry.getTaskRecord(taskId)!;
   rewriteStatus(
     database,
     'supervision_tasks',
     'task_id',
     taskId,
     staleTaskStatus,
-    registry.getTaskRecord(taskId)!,
+    {
+      ...taskProjection,
+      ...(bindStaleBundle
+        ? { integrationBundle: integrationBundle(taskId, implementerId, R1) }
+        : {}),
+    },
   );
   rewriteStatus(
     database,
