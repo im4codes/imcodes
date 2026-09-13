@@ -377,3 +377,82 @@ export default defineConfig({
     }
   }, 360_000);
 });
+
+describe('harness-owned probe fixtures never leak into a standing Vitest config', () => {
+  // CI run 34745118391: `npm run test:integration` collected the probes below
+  // because they end in `.integration.test.ts`, the very suffix that kept them
+  // out of the daemon project. Outside their harness IMCODES_HOME is unset, so
+  // both write probes threw ERR_INVALID_ARG_TYPE. Every standing config must
+  // exclude them by LOCATION; only the throwaway configs above may run them.
+  const repoRoot = process.cwd();
+  const fixturesDir = join(repoRoot, 'test', 'setup', 'fixtures');
+  const vitestBin = join(repoRoot, 'node_modules', '.bin', 'vitest');
+  // Discovered, not hard-coded, so a config added later is guarded automatically.
+  // Configs under web/ and server/ are rooted in those directories and cannot
+  // reach test/setup; the root config still loads web's as one of its projects.
+  const standingConfigs = readdirSync(repoRoot)
+    .filter((name) => /^vitest(?:\.[\w-]+)?\.config\.(?:ts|mts|js|mjs)$/u.test(name))
+    .sort();
+
+  function collectedFiles(configPath: string): string[] {
+    const result = spawnSync(vitestBin, ['list', '--filesOnly', '--json', '--config', configPath], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 120_000,
+      env: { ...process.env, CI: '1' },
+    });
+    expect(result.status, `vitest list failed for ${configPath}:\n${result.stderr}`).toBe(0);
+    return (JSON.parse(result.stdout) as Array<{ file: string }>).map((entry) => entry.file);
+  }
+
+  it('guards every repo-root Vitest config, including the integration one', () => {
+    expect(standingConfigs).toEqual(expect.arrayContaining(['vitest.config.ts', 'vitest.integration.config.ts']));
+  });
+
+  it.each(standingConfigs.map((name) => [name]))(
+    '%s collects no probe fixture, whatever the fixture is named',
+    (name) => {
+      // A probe that does NOT carry the integration suffix: if only the filename
+      // kept fixtures out, this one would be collected by the daemon project.
+      const ordinaryProbe = join(fixturesDir, `leak-canary.${randomUUID()}.test.ts`);
+      writeFileSync(ordinaryProbe, "import { it } from 'vitest';\nit('is never collected by a standing config', () => {});\n");
+      try {
+        const files = collectedFiles(join(repoRoot, name));
+        expect(files.length, `${name} collected nothing; the listing itself is broken`).toBeGreaterThan(0);
+        expect(files.filter((file) => file.startsWith(`${fixturesDir}/`)), `${name} collected harness-owned probes`)
+          .toEqual([]);
+      } finally {
+        rmSync(ordinaryProbe, { force: true });
+      }
+    },
+    180_000,
+  );
+
+  it('still lets the owning harness collect the probes it runs', () => {
+    // The exclusion must not reach the throwaway configs: they name the probes
+    // explicitly and carry no exclude, which is how the tests above run them.
+    const configPath = join(fixturesDir, `collection-probe.${randomUUID()}.config.ts`);
+    writeFileSync(configPath, `import { defineConfig } from 'vitest/config';
+export default defineConfig({
+  root: ${JSON.stringify(repoRoot)},
+  test: {
+    name: 'collection-probe',
+    include: [
+      'test/setup/fixtures/writes-home-a.integration.test.ts',
+      'test/setup/fixtures/writes-home-b.integration.test.ts',
+      'test/setup/fixtures/leaks-real-home.integration.test.ts',
+    ],
+  },
+});
+`);
+    try {
+      expect(collectedFiles(configPath).map((file) => file.slice(fixturesDir.length + 1)).sort()).toEqual([
+        'leaks-real-home.integration.test.ts',
+        'writes-home-a.integration.test.ts',
+        'writes-home-b.integration.test.ts',
+      ]);
+    } finally {
+      rmSync(configPath, { force: true });
+    }
+  }, 180_000);
+});
