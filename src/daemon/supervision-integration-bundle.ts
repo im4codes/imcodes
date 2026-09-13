@@ -22,6 +22,7 @@ import type {
   SupervisionWorktreeFileSnapshot,
   SupervisionWorktreeSnapshot,
 } from './supervision-worktree-inspector.js';
+import { isCanonicalSupervisionRepoPath } from './supervision-integration-scope.js';
 
 const BUNDLE_VERSION = 1 as const;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -36,6 +37,8 @@ export interface SupervisionIntegrationBundle {
   manifestSha256: string;
   bundleRoot: string;
   bundlePath: string;
+  /** Exact durable assignment scope that authorized this projection. */
+  scopeFiles?: string[];
   files: SupervisionIntegrationBundleFile[];
 }
 
@@ -50,6 +53,8 @@ interface BundleManifest {
   sourceAssignmentId: string;
   revision: string;
   headSha: string;
+  /** Absent only on legacy manifests frozen before scope binding existed. */
+  scopeFiles?: string[];
   files: SupervisionIntegrationBundleFile[];
 }
 
@@ -60,11 +65,6 @@ export type SupervisionIntegrationBundleResult<T> =
 function within(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
-}
-
-function validRepoPath(path: string): boolean {
-  return Boolean(path) && !path.startsWith('/') && !path.split('/').includes('..')
-    && !/[\u0000-\u001f\u007f]/.test(path);
 }
 
 function sha256(value: Buffer | string): string {
@@ -88,23 +88,36 @@ function canonicalManifest(input: {
   assignmentId: string;
   revision: string;
   headSha: string;
+  scopeFiles?: readonly string[];
   files: SupervisionIntegrationBundleFile[];
 }): BundleManifest | undefined {
   const taskId = input.taskId.trim();
   const sourceAssignmentId = input.assignmentId.trim();
   const revision = input.revision.trim();
   const headSha = input.headSha.trim().toLowerCase();
+  const scopeFiles = input.scopeFiles === undefined
+    ? undefined
+    : [...input.scopeFiles].sort((left, right) => left.localeCompare(right));
   const files = canonicalFiles(input.files);
+  const scopeSet = scopeFiles ? new Set(scopeFiles) : undefined;
   if (!taskId || !sourceAssignmentId || !revision || !COMMIT_RE.test(headSha)
+    || (scopeFiles !== undefined && (scopeFiles.length === 0
+      || scopeFiles.length !== new Set(scopeFiles).size
+      || !scopeFiles.every(isCanonicalSupervisionRepoPath)))
     || files.length === 0 || files.length !== new Set(files.map((file) => file.path)).size
-    || !files.every((file) => validRepoPath(file.path)
+    || !files.every((file) => isCanonicalSupervisionRepoPath(file.path)
+      && (!scopeSet || scopeSet.has(file.path))
       && (file.deleted === true
         ? !file.sha256 && file.mode === undefined
         : Boolean(file.sha256 && SHA256_RE.test(file.sha256)
           && (file.mode === 0o644 || file.mode === 0o755))))) {
     return undefined;
   }
-  return { version: BUNDLE_VERSION, taskId, sourceAssignmentId, revision, headSha, files };
+  return {
+    version: BUNDLE_VERSION, taskId, sourceAssignmentId, revision, headSha,
+    ...(scopeFiles ? { scopeFiles } : {}),
+    files,
+  };
 }
 
 function manifestText(manifest: BundleManifest): string {
@@ -128,6 +141,7 @@ function verifyManifestBinding(bundle: SupervisionIntegrationBundle): BundleMani
     assignmentId: bundle.sourceAssignmentId,
     revision: bundle.revision,
     headSha: bundle.headSha,
+    ...(bundle.scopeFiles !== undefined ? { scopeFiles: bundle.scopeFiles } : {}),
     files: canonicalFiles(bundle.files),
   });
   if (!manifest) return undefined;
@@ -192,6 +206,7 @@ export function freezeSupervisionIntegrationBundle(input: {
   assignmentId: string;
   revision: string;
   snapshot: SupervisionWorktreeSnapshot;
+  scopeFiles: readonly string[];
   bundleRoot?: string;
   now?: number;
 }): SupervisionIntegrationBundleResult<{ bundle: SupervisionIntegrationBundle; replay: boolean }> {
@@ -220,6 +235,7 @@ export function freezeSupervisionIntegrationBundle(input: {
     assignmentId: input.assignmentId,
     revision: input.revision,
     headSha: input.snapshot.headSha,
+    scopeFiles: input.scopeFiles,
     files,
   });
   if (!manifest) return { ok: false, reason: 'invalid' };

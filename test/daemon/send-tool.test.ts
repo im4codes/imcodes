@@ -526,7 +526,7 @@ describe('send-tool', () => {
       },
     })).toMatchObject({ ok: true });
     expect(registry.createAssignment({
-      assignmentId, taskId, role: 'implementer', scopeFiles: [], auditRevision: r1,
+      assignmentId, taskId, role: 'implementer', scopeFiles: ['authority.txt'], auditRevision: r1,
       identity: {
         sessionName: oldWorker.name, sessionInstanceId: oldWorker.sessionInstanceId!, runtimeEpoch: oldWorker.runtimeEpoch!,
         agentType: oldWorker.agentType, providerFamily: 'anthropic',
@@ -550,6 +550,7 @@ describe('send-tool', () => {
     await writeFile(join(bundleSource, 'authority.txt'), 'r1 frozen authority\n');
     const frozen = freezeSupervisionIntegrationBundle({
       taskId, assignmentId, revision: r1,
+      scopeFiles: ['authority.txt'],
       snapshot: {
         worktreePath: bundleSource,
         headSha: 'a'.repeat(40),

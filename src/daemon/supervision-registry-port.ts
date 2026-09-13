@@ -28,6 +28,7 @@ import {
   freezeSupervisionIntegrationBundle,
   verifySupervisionIntegrationBundle,
 } from './supervision-integration-bundle.js';
+import { projectSupervisionSnapshotToAssignmentScope } from './supervision-integration-scope.js';
 import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-ingress.js';
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
@@ -150,22 +151,34 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
         || (task.currentRevision && task.currentRevision !== revision)) {
         return { ok: false, reason: 'old_revision' };
       }
+      const validationAuthority = registry.readyAuditValidationAuthoritySnapshot({
+        taskId, assignmentId, revision, allowLegacy: true,
+      });
+      if (!validationAuthority) return { ok: false, reason: 'stale_audit_revision' };
       const inspected = await inspectSupervisionAssignmentWorktree({
         sessionName: assignment.identity.sessionName,
         assignmentId: assignment.assignmentId,
       });
-      if (!inspected.ok || inspected.snapshot.stagedPaths.length > 0
-        || inspected.snapshot.conflictedPaths.length > 0) {
-        return { ok: false, reason: inspected.ok ? 'manifest_mismatch' : inspected.reason };
+      if (!inspected.ok) return { ok: false, reason: inspected.reason };
+      const projected = projectSupervisionSnapshotToAssignmentScope({
+        snapshot: inspected.snapshot,
+        scopeFiles: assignment.scopeFiles,
+      });
+      if (!projected.ok || projected.snapshot.stagedPaths.length > 0
+        || projected.snapshot.conflictedPaths.length > 0) {
+        return { ok: false, reason: projected.ok ? 'manifest_mismatch' : projected.reason };
       }
       const frozen = freezeSupervisionIntegrationBundle({
-        taskId, assignmentId, revision, snapshot: inspected.snapshot,
+        taskId, assignmentId, revision,
+        snapshot: projected.snapshot,
+        scopeFiles: projected.scopeFiles,
       });
       if (!frozen.ok) return { ok: false, reason: frozen.reason };
       const verified = verifySupervisionIntegrationBundle(frozen.bundle);
       if (!verified.ok) return { ok: false, reason: verified.reason };
       const bound = registry.bindIntegrationBundle({
         taskId, assignmentId, identity: assignment.identity, revision, bundle: frozen.bundle,
+        validationAuthority,
       });
       if (!bound.ok) return { ok: false, reason: bound.reason };
       return registry.convergeValidatedAssignment(assignmentId, Date.now(), async (candidate) => {

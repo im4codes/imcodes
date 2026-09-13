@@ -34,7 +34,10 @@ import { createSupervisionRegistryPort } from '../../src/daemon/supervision-regi
 import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervision-worktree-inspector.js';
-import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
+import {
+  freezeSupervisionIntegrationBundle,
+  type SupervisionIntegrationBundle,
+} from '../../src/daemon/supervision-integration-bundle.js';
 
 /** Adapts the real registry to the audited handler port. */
 function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
@@ -245,6 +248,158 @@ describe('successor bundle authority convergence', () => {
     } finally {
       shape.registry.close();
       shape.database.close();
+    }
+  });
+
+  it('atomically replaces a same-revision polluted bundle after a no-verdict audit cancellation without consuming validation again', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-scope-refreeze-'));
+    const source = join(root, 'source');
+    const bundleRoot = join(root, 'bundles');
+    const taskId = 'scope-refreeze-same-revision';
+    const assignmentId = `${taskId}-implementer`;
+    const auditorId = `${taskId}-auditor`;
+    const revision = 'scope-refreeze-r1';
+    const ownedPath = 'src/owned.ts';
+    const noisePath = 'native/windows/noise.ps1';
+    const owner = identity('deck_alpha_scope_refreeze_owner');
+    const auditorIdentity = identity('deck_alpha_scope_refreeze_auditor', 'claude-code-sdk');
+    mkdirSync(join(source, 'src'), { recursive: true });
+    mkdirSync(join(source, 'native/windows'), { recursive: true });
+    writeFileSync(join(source, ownedPath), 'owned after bytes\n');
+    writeFileSync(join(source, noisePath), 'byte-identical CRLF noise\r\n');
+    const file = (path: string, text: string) => ({
+      path, sha256: createHash('sha256').update(text).digest('hex'),
+    });
+    const pollutedSnapshot = {
+      worktreePath: source,
+      headSha: '9'.repeat(40),
+      files: [file(ownedPath, 'owned after bytes\n'), file(noisePath, 'byte-identical CRLF noise\r\n')],
+      stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+    };
+    const database = new DatabaseSync(':memory:');
+    let registry = new SupervisionTaskRegistry({ database });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'repair manifest scope widening', currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const implementer = registry.createAssignment({
+        taskId, assignmentId, role: 'implementer', required: true, identity: owner,
+        scopeFiles: [ownedPath], auditRevision: revision,
+      });
+      if (!implementer.ok) throw new Error(implementer.reason);
+      const auditor = registry.createAssignment({
+        taskId, assignmentId: auditorId, role: 'auditor', required: false,
+        identity: auditorIdentity, scopeFiles: [ownedPath],
+        auditAttemptId: 'polluted-attempt', auditRevision: revision,
+      });
+      if (!auditor.ok) throw new Error(auditor.reason);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId, intent: 'start', toStatus: 'implementing',
+      })).toMatchObject({ ok: true });
+      const polluted = freezeSupervisionIntegrationBundle({
+        taskId, assignmentId, revision, snapshot: pollutedSnapshot,
+        scopeFiles: [ownedPath, noisePath], bundleRoot,
+      });
+      const repaired = freezeSupervisionIntegrationBundle({
+        taskId, assignmentId, revision,
+        snapshot: { ...pollutedSnapshot, files: [pollutedSnapshot.files[0]!] },
+        scopeFiles: [ownedPath], bundleRoot,
+      });
+      if (!polluted.ok || !repaired.ok) throw new Error('fixture freeze failed');
+      expect(registry.bindIntegrationBundle({
+        taskId, assignmentId, identity: owner, revision, bundle: polluted.bundle,
+      }), 'bind rejects a manifest carrying an outside-scope row').toEqual({
+        ok: false, reason: 'manifest_mismatch',
+      });
+      rewritePersistedAssignment(database, {
+        ...implementer.value, status: 'ready_for_audit', leaseId: '',
+        validationState: 'passed', validatedRevision: revision,
+        auditAttemptId: 'polluted-attempt', updatedAt: 20,
+      });
+      rewritePersistedTask(database, {
+        ...registry.getTaskRecord(taskId)!, status: 'ready_for_audit',
+        validationState: 'passed', validatedRevision: revision,
+        integrationBundle: polluted.bundle, updatedAt: 22,
+      });
+      rewritePersistedAssignment(database, {
+        ...auditor.value, status: 'auditing', updatedAt: 22,
+      });
+      expect(registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditorId, attemptId: 'polluted-attempt', revision,
+        receiptKind: 'final', verdict: 'PASS', auditedSessionName: owner.sessionName,
+        auditorSessionName: auditorIdentity.sessionName, auditorIdentity,
+        findings: 'must not attest widened scope', validations: [], now: 22,
+      })).toMatchObject({ ok: true });
+      expect(registry.finishAssignment({
+        assignmentId: auditorId, identity: auditorIdentity, revision,
+      })).toEqual({ ok: false, reason: 'old_audit_attempt' });
+      database.prepare('DELETE FROM supervision_audit_receipts WHERE task_id = ?').run(taskId);
+      rewritePersistedAssignment(database, {
+        ...registry.getAssignment(auditorId)!, status: 'auditing', verdict: undefined, updatedAt: 22,
+      });
+      expect(registry.canRefreezeScopeMismatchedBundle({
+        taskId, assignmentId, identity: owner, revision,
+      }), 'a live old auditor still owns the frozen bytes').toBe(false);
+      rewritePersistedAssignment(database, {
+        ...auditor.value, status: 'cancelled', leaseId: '', verdict: undefined, updatedAt: 23,
+      });
+      rewritePersistedTask(database, {
+        ...registry.getTaskRecord(taskId)!, validationState: 'failed', updatedAt: 23,
+      });
+      expect(registry.canRefreezeScopeMismatchedBundle({
+        taskId, assignmentId, identity: owner, revision,
+      }), 'refreeze reuses only the existing passed validation authority').toBe(false);
+      rewritePersistedTask(database, {
+        ...registry.getTaskRecord(taskId)!, validationState: 'passed', updatedAt: 23,
+      });
+      rewritePersistedAssignment(database, {
+        ...registry.getAssignment(assignmentId)!, verdict: 'REWORK', updatedAt: 23,
+      });
+      expect(registry.canRefreezeScopeMismatchedBundle({
+        taskId, assignmentId, identity: owner, revision,
+      }), 'an existing implementer verdict permanently closes same-revision replacement').toBe(false);
+      rewritePersistedAssignment(database, {
+        ...registry.getAssignment(assignmentId)!, verdict: undefined, updatedAt: 23,
+      });
+      seedFinalAuditReceipt(database, {
+        receiptId: 'polluted-final-must-close-refreeze', taskId, assignmentId: auditorId,
+        attemptId: 'polluted-attempt', revision, verdict: 'PASS',
+        senderIdentity: auditorIdentity, createdAt: 24,
+      });
+      expect(registry.canRefreezeScopeMismatchedBundle({
+        taskId, assignmentId, identity: owner, revision,
+      }), 'an accepted final receipt permanently closes same-revision replacement').toBe(false);
+      database.prepare('DELETE FROM supervision_audit_receipts WHERE receipt_id = ?')
+        .run('polluted-final-must-close-refreeze');
+      const validationAuthority = registry.readyAuditValidationAuthoritySnapshot({
+        taskId, assignmentId, revision, allowLegacy: true,
+      });
+      expect(validationAuthority).toBeTypeOf('string');
+      expect(registry.canRefreezeScopeMismatchedBundle({
+        taskId, assignmentId, identity: owner, revision,
+      })).toBe(true);
+      expect(registry.bindIntegrationBundle({
+        taskId, assignmentId, identity: owner, revision,
+        bundle: repaired.bundle, validationAuthority,
+      })).toMatchObject({ ok: true });
+      expect(registry.getTaskRecord(taskId)?.integrationBundle).toEqual(repaired.bundle);
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        status: 'ready_for_audit', validationState: 'passed', validatedRevision: revision,
+      });
+      expect(registry.getAssignment(assignmentId)?.auditAttemptId).toBeUndefined();
+      expect(registry.getAssignment(auditorId)).toMatchObject({ status: 'cancelled' });
+      expect(registry.getAssignment(auditorId)).not.toHaveProperty('verdict');
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(0);
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ database });
+      expect(registry.getTaskRecord(taskId)?.integrationBundle).toEqual(repaired.bundle);
+      expect(registry.getTaskRecord(taskId)?.validationState).toBe('passed');
+    } finally {
+      registry.close();
+      database.close();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -592,6 +747,27 @@ function prepareStructuredFinalizationShape(
     taskId, revision, attemptId, files, scopeFiles,
     owner: owner.value, implementer: implementer.value,
     coordinator: coordinator.value, auditor: auditor.value, finalization,
+  };
+}
+
+function legacyBundleForFinalizationShape(
+  shape: ReturnType<typeof prepareStructuredFinalizationShape>,
+  bundleRoot: string,
+): SupervisionIntegrationBundle {
+  const manifest = {
+    version: 1 as const,
+    taskId: shape.taskId,
+    sourceAssignmentId: shape.implementer.assignmentId,
+    revision: shape.revision,
+    headSha: shape.finalization.commitSha,
+    files: shape.finalization.integrationManifest.map((file) => ({ ...file, mode: 0o644 as const })),
+  };
+  const manifestSha256 = createHash('sha256').update(`${JSON.stringify(manifest)}\n`).digest('hex');
+  return {
+    ...manifest,
+    manifestSha256,
+    bundleRoot,
+    bundlePath: join(bundleRoot, manifestSha256.slice(0, 2), manifestSha256),
   };
 }
 
@@ -1402,6 +1578,61 @@ describe('SupervisionTaskRegistry', () => {
     })).toMatchObject({ ok: true, replay: true });
     expect(registry.listEvents(shape.taskId)).toHaveLength(finalizedEventCount);
     registry.close();
+  });
+
+  it('finalizes an already-PASSed legacy bundle whose changed files are a strict subset of assignment scope', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      const changedFiles = Array.from({ length: 11 }, (_, index) => `src/legacy-changed-${index}.ts`);
+      const untouchedScope = Array.from({ length: 3 }, (_, index) => `src/legacy-unchanged-${index}.ts`);
+      const shape = prepareStructuredFinalizationShape(registry, 'legacy-subset-finalization', {
+        files: changedFiles,
+        authorizedUntouchedFiles: untouchedScope,
+        leaveAuditorUnfinalized: true,
+      });
+      const legacyBundle = legacyBundleForFinalizationShape(shape, '/tmp/legacy-subset-bundles');
+      expect(legacyBundle.files).toHaveLength(11);
+      expect(shape.implementer.scopeFiles).toHaveLength(14);
+      expect(legacyBundle).not.toHaveProperty('scopeFiles');
+      rewritePersistedTask(database, {
+        ...registry.getTaskRecord(shape.taskId)!,
+        integrationBundle: legacyBundle,
+      });
+
+      expect(registry.appendMatchingAuditReceipt({
+        taskId: shape.taskId,
+        auditorAssignmentId: shape.auditor.assignmentId,
+        attemptId: shape.attemptId,
+        revision: shape.revision,
+        receiptKind: 'final',
+        verdict: 'PASS',
+        auditedSessionName: shape.implementer.identity.sessionName,
+        auditorSessionName: shape.auditor.identity.sessionName,
+        auditorIdentity: shape.auditor.identity,
+        findings: 'legacy subset is fully contained by durable assignment scope',
+        validations: [],
+      })).toMatchObject({ ok: true, value: { verdict: 'PASS' } });
+      expect(registry.finishAssignment({
+        assignmentId: shape.auditor.assignmentId,
+        identity: shape.auditor.identity,
+        revision: shape.revision,
+      })).toMatchObject({ ok: true, value: { status: 'finalized' } });
+
+      expect(registry.finalizeIntegration({
+        ...shape.finalization,
+        identity: shape.owner.identity,
+      })).toMatchObject({
+        ok: true,
+        value: {
+          status: 'finalized',
+          finalization: { ownedFiles: changedFiles.sort() },
+        },
+      });
+    } finally {
+      registry.close();
+      database.close();
+    }
   });
 
   it('finalizes and archives from exact PASS/Git/push authority when no CI provider is configured', () => {
@@ -4366,6 +4597,7 @@ describe('SupervisionTaskRegistry', () => {
       })).toMatchObject({ ok: true });
       const frozen = freezeSupervisionIntegrationBundle({
         taskId, assignmentId: implementerId, revision, snapshot,
+        scopeFiles: snapshot.files.map((file) => file.path),
         bundleRoot: join(root, 'bundles'),
       });
       if (!frozen.ok) throw new Error(frozen.reason);
@@ -4726,6 +4958,7 @@ describe('SupervisionTaskRegistry', () => {
       })).toMatchObject({ ok: true });
       const frozen = freezeSupervisionIntegrationBundle({
         taskId, assignmentId: implementerId, revision, snapshot,
+        scopeFiles: snapshot.files.map((file) => file.path),
         bundleRoot: join(root, 'bundles'),
       });
       if (!frozen.ok) throw new Error(frozen.reason);

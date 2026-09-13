@@ -234,6 +234,7 @@ function makeReadyTask(options: {
     taskId,
     assignmentId: worker.value.assignmentId,
     revision,
+    scopeFiles: ['src/exact.ts'],
     bundleRoot: join(bundleRoot, 'bundles'),
     snapshot: {
       worktreePath: source,
@@ -6195,14 +6196,19 @@ describe('freeze/open-audit boundary requires exact current-revision validation 
     registry: SupervisionTaskRegistry,
     taskId: string,
     revision: string,
-    hooks: { onInspect?: () => void; onAuditDispatch?: () => void; onListTargets?: () => void } = {},
+    hooks: {
+      onInspect?: () => void;
+      onAuditDispatch?: () => void;
+      onListTargets?: () => void;
+      snapshotFiles?: Array<{ path: string; sha256: string }>;
+    } = {},
   ) {
     let evidence = false;
     const inspect = vi.fn(() => {
       hooks.onInspect?.();
       return {
         worktreePath: `/tmp/${taskId}/repo`, headSha: 'a'.repeat(40),
-        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        files: hooks.snapshotFiles ?? [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
         stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
       };
     });
@@ -6321,6 +6327,24 @@ describe('freeze/open-audit boundary requires exact current-revision validation 
     const sweepHarness = harness(swept.registry, swept.taskId, R2);
     const audits = await dispatchReadyAuditSweep(sweepHarness.deps);
     expect(audits).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'dispatched' })]));
+  });
+
+  it('projects the audit artifact onto assignment scope before composing the immutable handoff', async () => {
+    const shape = validatedPredecessor('freeze-scope-projection');
+    stampValidation(shape.database, shape.taskId, shape.worker.assignmentId, R2, R2, {
+      taskStatus: 'ready_for_audit', ownerStatus: 'ready_for_audit', revision: R2,
+    });
+    const h = harness(shape.registry, shape.taskId, R2, {
+      snapshotFiles: [
+        { path: 'src/exact.ts', sha256: '1'.repeat(64) },
+        { path: 'native/windows/unclaimed.ps1', sha256: '2'.repeat(64) },
+      ],
+    });
+    await expect(dispatchReadyAudit(shape.taskId, h.deps))
+      .resolves.toMatchObject({ status: 'dispatched' });
+    const auditCall = h.dispatch.mock.calls.find((call) => Boolean(call[1].audit));
+    expect(auditCall?.[1].message).toContain('- src/exact.ts');
+    expect(auditCall?.[1].message).not.toContain('native/windows/unclaimed.ps1');
   });
 
   const revoke = (registry: SupervisionTaskRegistry, taskId: string, assignmentId: string) => () => {

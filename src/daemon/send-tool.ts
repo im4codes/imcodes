@@ -150,6 +150,10 @@ import {
   verifySupervisionIntegrationBundle,
   type SupervisionIntegrationBundle,
 } from './supervision-integration-bundle.js';
+import {
+  projectSupervisionSnapshotToAssignmentScope,
+  supervisionBundleMatchesAssignmentScope,
+} from './supervision-integration-scope.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import {
@@ -3097,11 +3101,10 @@ function boundedAuditBrief(
   task: SupervisionTaskSnapshot,
   revision: string,
   authoritativeBundle: string,
+  authoritativeFiles: readonly import('./supervision-worktree-inspector.js').SupervisionWorktreeFileSnapshot[],
 ): string {
   const shorten = (value: string, max = 800) => value.length <= max ? value : `${value.slice(0, max - 1)}…`;
-  const files = task.touchedFiles.length > 0
-    ? task.touchedFiles
-    : task.assignments.flatMap((assignment) => assignment.scopeFiles);
+  const files = authoritativeFiles.map((file) => file.path);
   return [
     '[Daemon-resolved automatic matching audit]',
     `taskId=${task.taskId}`,
@@ -3621,7 +3624,7 @@ export async function dispatchReadyAudit(
   let repairingUnselectedExisting = false;
   const buildInput = (target?: string, autoProvision = false): SendMessageInput => ({
     ...(target ? { target } : {}),
-    message: boundedAuditBrief(task, revision, integrationArtifact.path),
+    message: boundedAuditBrief(task, revision, integrationArtifact.path, integrationArtifact.files),
     reply: true,
     idempotencyKey: `auto-audit:${task.taskId}:${revision}`,
     ...(existingAudit ? {} : { newWorkload: true }),
@@ -3770,18 +3773,33 @@ async function resolveIntegrationArtifact(
 ): Promise<ResolvedIntegrationArtifact | undefined> {
   const revision = task.currentRevision?.trim();
   if (!revision) return undefined;
+  const persisted = task.integrationBundle;
   if (deps.inspectAssignmentWorktree) {
     const snapshot = await inspectAssignmentForConvergence(implementer, deps);
-    return snapshot && snapshot.files.length > 0
-      && snapshot.stagedPaths.length === 0 && snapshot.conflictedPaths.length === 0
-      ? { path: snapshot.worktreePath, files: snapshot.files }
+    const authorityScope = implementer.role === 'integration_owner' && persisted
+      ? (persisted.scopeFiles ?? persisted.files.map((file) => file.path))
+      : implementer.scopeFiles;
+    const projected = snapshot ? projectSupervisionSnapshotToAssignmentScope({
+      snapshot, scopeFiles: authorityScope,
+    }) : undefined;
+    return projected?.ok
+      && projected.snapshot.stagedPaths.length === 0
+      && projected.snapshot.conflictedPaths.length === 0
+      ? { path: projected.snapshot.worktreePath, files: projected.snapshot.files }
       : undefined;
   }
-  const persisted = task.integrationBundle;
   if (persisted) {
+    const sourceAssignment = task.assignments.find((candidate) => (
+      candidate.assignmentId === persisted.sourceAssignmentId
+    ));
     if (persisted.taskId === task.taskId
-      && persisted.sourceAssignmentId === implementer.assignmentId
+      && sourceAssignment
       && persisted.revision === revision
+      && supervisionBundleMatchesAssignmentScope({
+        assignmentScopeFiles: sourceAssignment.scopeFiles,
+        bundleScopeFiles: persisted.scopeFiles,
+        bundleFiles: persisted.files,
+      })
       && verifySupervisionIntegrationBundle(persisted).ok) {
       return { path: persisted.bundlePath, files: persisted.files, bundle: persisted };
     }
@@ -3790,7 +3808,13 @@ async function resolveIntegrationArtifact(
     // decides whether this exact stale binding may be replaced; all unrelated
     // or unaudited mismatches still fail closed there.
     if (!allowFreeze) return undefined;
-    if (!(deps.registry ?? getSupervisionTaskRegistry()).canRefreezeSupersededReworkBundle({
+    const registry = deps.registry ?? getSupervisionTaskRegistry();
+    if (!registry.canRefreezeSupersededReworkBundle({
+      taskId: task.taskId,
+      assignmentId: implementer.assignmentId,
+      identity: implementer.identity,
+      revision,
+    }) && !registry.canRefreezeScopeMismatchedBundle({
       taskId: task.taskId,
       assignmentId: implementer.assignmentId,
       identity: implementer.identity,
@@ -3799,13 +3823,18 @@ async function resolveIntegrationArtifact(
   }
   if (!allowFreeze) return undefined;
   const snapshot = await inspectAssignmentForConvergence(implementer, deps);
-  if (!snapshot || snapshot.files.length === 0
-    || snapshot.stagedPaths.length > 0 || snapshot.conflictedPaths.length > 0) return undefined;
+  if (!snapshot) return undefined;
+  const projected = projectSupervisionSnapshotToAssignmentScope({
+    snapshot, scopeFiles: implementer.scopeFiles,
+  });
+  if (!projected.ok || projected.snapshot.stagedPaths.length > 0
+    || projected.snapshot.conflictedPaths.length > 0) return undefined;
   const frozen = freezeSupervisionIntegrationBundle({
     taskId: task.taskId,
     assignmentId: implementer.assignmentId,
     revision,
-    snapshot,
+    snapshot: projected.snapshot,
+    scopeFiles: projected.scopeFiles,
   });
   if (!frozen.ok || !verifySupervisionIntegrationBundle(frozen.bundle).ok) return undefined;
   const bound = (deps.registry ?? getSupervisionTaskRegistry()).bindIntegrationBundle({

@@ -633,6 +633,7 @@ describe('validation-authority snapshot is enforced under the writer locks', () 
     writeFileSync(join(source, 'src/exact.ts'), 'exact-r2-bytes\n');
     const frozen = freezeSupervisionIntegrationBundle({
       taskId, assignmentId, revision: R2, bundleRoot: join(root, 'bundles'),
+      scopeFiles: ['src/exact.ts'],
       snapshot: {
         worktreePath: source, headSha: 'a'.repeat(40),
         files: [{ path: 'src/exact.ts', sha256: createHash('sha256').update('exact-r2-bytes\n').digest('hex') }],

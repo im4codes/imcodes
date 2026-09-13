@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -73,10 +73,14 @@ describe('immutable supervision integration bundle', () => {
     const shape = await productionShape();
     const frozen = freezeSupervisionIntegrationBundle({
       taskId: 'tsk_f1x', assignmentId: 'asg_f40', revision: 'daemon-preview-drain-order-r1',
-      snapshot: shape.snapshot, bundleRoot: shape.bundleRoot, now: 100,
+      snapshot: shape.snapshot, scopeFiles: shape.snapshot.files.map((file) => file.path),
+      bundleRoot: shape.bundleRoot, now: 100,
     });
     expect(frozen).toMatchObject({ ok: true, replay: false });
     if (!frozen.ok) throw new Error(frozen.reason);
+    expect(frozen.bundle.scopeFiles).toEqual(
+      shape.snapshot.files.map((file) => file.path).sort(),
+    );
 
     git(shape.implementer, 'reset', '--hard', 'HEAD');
     git(shape.implementer, 'clean', '-fd');
@@ -112,7 +116,8 @@ describe('immutable supervision integration bundle', () => {
     const shape = await productionShape();
     const input = {
       taskId: 'tsk_exact', assignmentId: 'asg_exact', revision: 'exact-r1',
-      snapshot: shape.snapshot, bundleRoot: shape.bundleRoot, now: 100,
+      snapshot: shape.snapshot, scopeFiles: shape.snapshot.files.map((file) => file.path),
+      bundleRoot: shape.bundleRoot, now: 100,
     } as const;
     const first = freezeSupervisionIntegrationBundle(input);
     const replay = freezeSupervisionIntegrationBundle({ ...input, now: 200 });
@@ -124,6 +129,10 @@ describe('immutable supervision integration bundle', () => {
     expect(verifySupervisionIntegrationBundle({
       ...first.bundle,
       bundleRoot: join(shape.root, 'attacker-controlled-root'),
+    })).toEqual({ ok: false, reason: 'invalid' });
+    expect(verifySupervisionIntegrationBundle({
+      ...first.bundle,
+      scopeFiles: [...first.bundle.scopeFiles!, 'src/attacker.ts'],
     })).toEqual({ ok: false, reason: 'invalid' });
 
     writeFileSync(join(shape.integration, 'test/a.test.ts'), 'unrelated-owner-change\n');
@@ -138,6 +147,45 @@ describe('immutable supervision integration bundle', () => {
     });
     expect(first.bundle.files.find((file) => file.path === 'test/a.test.ts')?.sha256)
       .toBe(sha('after-a\n'));
+  });
+
+  it('refuses to freeze a manifest row outside the explicitly bound assignment scope', async () => {
+    const shape = await productionShape();
+    expect(freezeSupervisionIntegrationBundle({
+      taskId: 'tsk_scoped', assignmentId: 'asg_scoped', revision: 'scope-r1',
+      snapshot: shape.snapshot,
+      scopeFiles: ['test/a.test.ts'],
+      bundleRoot: shape.bundleRoot,
+    })).toEqual({ ok: false, reason: 'invalid' });
+    expect(freezeSupervisionIntegrationBundle({
+      taskId: 'tsk_scoped', assignmentId: 'asg_scoped', revision: 'scope-r1',
+      snapshot: { ...shape.snapshot, files: [shape.snapshot.files[0]!] },
+      scopeFiles: [],
+      bundleRoot: shape.bundleRoot,
+    })).toEqual({ ok: false, reason: 'invalid' });
+  });
+
+  it('fails closed when source bytes change after inspection or an owned path becomes a symlink', async () => {
+    const shape = await productionShape();
+    writeFileSync(join(shape.implementer, 'test/a.test.ts'), 'changed-after-inspection\n');
+    expect(freezeSupervisionIntegrationBundle({
+      taskId: 'tsk_race', assignmentId: 'asg_race', revision: 'race-r1',
+      snapshot: shape.snapshot,
+      scopeFiles: shape.snapshot.files.map((file) => file.path),
+      bundleRoot: shape.bundleRoot,
+    })).toMatchObject({ ok: false, reason: 'source_mismatch' });
+
+    const symlinkPath = join(shape.implementer, 'test/owned-link.ts');
+    symlinkSync('../test/b.test.ts', symlinkPath);
+    expect(freezeSupervisionIntegrationBundle({
+      taskId: 'tsk_link', assignmentId: 'asg_link', revision: 'link-r1',
+      snapshot: {
+        ...shape.snapshot,
+        files: [{ path: 'test/owned-link.ts', sha256: sha('after-b\n') }],
+      },
+      scopeFiles: ['test/owned-link.ts'],
+      bundleRoot: shape.bundleRoot,
+    })).toEqual({ ok: false, reason: 'source_mismatch' });
   });
 
   it('persists one exact bundle binding across store reopen and refuses a conflicting hash', async () => {
@@ -163,7 +211,8 @@ describe('immutable supervision integration bundle', () => {
     })).toMatchObject({ ok: true });
     const frozen = freezeSupervisionIntegrationBundle({
       taskId: 'tsk_restart', assignmentId: 'asg_restart', revision: 'bundle-r1',
-      snapshot: shape.snapshot, bundleRoot: shape.bundleRoot,
+      snapshot: shape.snapshot, scopeFiles: shape.snapshot.files.map((file) => file.path),
+      bundleRoot: shape.bundleRoot,
     });
     if (!frozen.ok) throw new Error(frozen.reason);
     expect(registry.bindIntegrationBundle({

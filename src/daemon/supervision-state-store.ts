@@ -66,6 +66,7 @@ import {
   verifySupervisionIntegrationBundle,
   type SupervisionIntegrationBundle,
 } from './supervision-integration-bundle.js';
+import { supervisionBundleMatchesAssignmentScope } from './supervision-integration-scope.js';
 import { normalizeActivityGeneration, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 
 const require = createRequire(import.meta.url);
@@ -1065,6 +1066,7 @@ function sameIntegrationBundleBinding(
     && left.manifestSha256 === right.manifestSha256
     && left.bundleRoot === right.bundleRoot
     && left.bundlePath === right.bundlePath
+    && JSON.stringify(left.scopeFiles) === JSON.stringify(right.scopeFiles)
     && JSON.stringify(left.files) === JSON.stringify(right.files));
 }
 
@@ -5000,6 +5002,36 @@ export class SupervisionTaskRegistry {
     );
   }
 
+  /**
+   * Allow replacing one structurally valid but scope-mismatched bundle only
+   * while the same validated revision still owns the task and no audit verdict
+   * or integration/Git authority has consumed those bytes.
+   */
+  canRefreezeScopeMismatchedBundle(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: PersistedSupervisionTaskAssignmentIdentity;
+    revision: string;
+  }): boolean {
+    const task = this.getTaskRecord(input.taskId);
+    const assignment = this.getAssignment(input.assignmentId);
+    return Boolean(task && assignment
+      && assignment.taskId === task.taskId
+      && identityMatches(assignment.identity, input.identity)
+      && this.#scopeMismatchRefreezeEligible(task, assignment, input.revision));
+  }
+
+  #bundleMatchesPersistedSourceScope(bundle: SupervisionIntegrationBundle): boolean {
+    const source = this.getAssignment(bundle.sourceAssignmentId);
+    return Boolean(source
+      && source.taskId === bundle.taskId
+      && supervisionBundleMatchesAssignmentScope({
+        assignmentScopeFiles: source.scopeFiles,
+        bundleScopeFiles: bundle.scopeFiles,
+        bundleFiles: bundle.files,
+      }));
+  }
+
   bindIntegrationBundle(
     input: SupervisionIntegrationBundleBindInput,
   ): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
@@ -5018,11 +5050,19 @@ export class SupervisionTaskRegistry {
     if (!isValidSupervisionIntegrationBundleBinding(bundle)
       || bundle.taskId !== task.taskId
       || bundle.sourceAssignmentId !== assignment.assignmentId
-      || bundle.revision !== revision) return { ok: false, reason: 'manifest_mismatch' };
+      || bundle.revision !== revision
+      || !supervisionBundleMatchesAssignmentScope({
+        assignmentScopeFiles: assignment.scopeFiles,
+        bundleScopeFiles: bundle.scopeFiles,
+        bundleFiles: bundle.files,
+      })) return { ok: false, reason: 'manifest_mismatch' };
     const supersededReworkReceipt = task.integrationBundle
       ? this.#supersededReworkBundleReceipt(task, assignment, bundle)
       : undefined;
-    if (task.integrationBundle && !supersededReworkReceipt) {
+    const scopeMismatchRefreeze = task.integrationBundle
+      ? this.#scopeMismatchRefreezeEligible(task, assignment, revision)
+      : false;
+    if (task.integrationBundle && !supersededReworkReceipt && !scopeMismatchRefreeze) {
       return sameIntegrationBundleBinding(task.integrationBundle, bundle)
         ? { ok: true, value: task, replay: true }
         : { ok: false, reason: 'manifest_mismatch' };
@@ -5040,13 +5080,16 @@ export class SupervisionTaskRegistry {
       const lockedSupersededReceipt = lockedTask?.integrationBundle && lockedAssignment
         ? this.#supersededReworkBundleReceipt(lockedTask, lockedAssignment, bundle)
         : undefined;
+      const lockedScopeMismatchRefreeze = lockedTask?.integrationBundle && lockedAssignment
+        ? this.#scopeMismatchRefreezeEligible(lockedTask, lockedAssignment, revision)
+        : false;
       if (input.validationAuthority !== undefined
         && !this.validationAuthoritySnapshotHolds(input.validationAuthority, { taskId: task.taskId, revision })) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'stale_audit_revision' };
       }
       if (!lockedTask || !lockedAssignment
-        || (lockedTask.integrationBundle && !lockedSupersededReceipt)
+        || (lockedTask.integrationBundle && !lockedSupersededReceipt && !lockedScopeMismatchRefreeze)
         || lockedTask.currentRevision !== revision
         || lockedAssignment.auditRevision !== revision
         || !identityMatches(lockedAssignment.identity, input.identity)) {
@@ -5055,7 +5098,7 @@ export class SupervisionTaskRegistry {
           ? { ok: true, value: lockedTask!, replay: true }
           : { ok: false, reason: 'manifest_mismatch' };
       }
-      if (lockedSupersededReceipt) {
+      if (lockedSupersededReceipt || lockedScopeMismatchRefreeze) {
         // A crashed successor handoff can leave the predecessor bundle and its
         // REWORK projection attached after both revision columns already moved
         // forward. The old receipt remains immutable history, but none of its
@@ -5074,16 +5117,20 @@ export class SupervisionTaskRegistry {
           auditDegradedReason: undefined,
           updatedAt: now,
         }, 'recovered', {
-          source: 'superseded_rework_bundle_refreeze',
+          source: lockedSupersededReceipt
+            ? 'superseded_rework_bundle_refreeze'
+            : 'scope_mismatched_bundle_refreeze',
           priorRevision: lockedTask.integrationBundle!.revision,
           successorRevision: revision,
-          sourceReceiptId: lockedSupersededReceipt.receiptId,
+          ...(lockedSupersededReceipt ? { sourceReceiptId: lockedSupersededReceipt.receiptId } : {}),
         });
       }
       this.#writeTask(bound, this.#taskEventFor(bound.status), {
         source: lockedSupersededReceipt
           ? 'immutable_integration_bundle_refrozen_after_rework'
-          : 'immutable_integration_bundle_frozen',
+          : lockedScopeMismatchRefreeze
+            ? 'immutable_integration_bundle_refrozen_after_scope_repair'
+            : 'immutable_integration_bundle_frozen',
         assignmentId: assignment.assignmentId,
         revision,
         manifestSha256: bundle.manifestSha256,
@@ -5096,6 +5143,54 @@ export class SupervisionTaskRegistry {
       this.#db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /**
+   * Same-revision repair for bundles frozen before assignment scope was bound
+   * into the manifest. A cancelled/no-verdict audit may be retired, but any
+   * accepted receipt or integration/Git authority permanently closes repair.
+   */
+  #scopeMismatchRefreezeEligible(
+    task: PersistedSupervisionTaskRecord,
+    assignment: PersistedSupervisionTaskAssignment,
+    revisionInput: string,
+  ): boolean {
+    const revision = normalizeTaskString(revisionInput);
+    const predecessor = task.integrationBundle;
+    if (!revision || !predecessor
+      || predecessor.taskId !== task.taskId
+      || predecessor.sourceAssignmentId !== assignment.assignmentId
+      || predecessor.revision !== revision
+      || task.currentRevision !== revision
+      || assignment.auditRevision !== revision
+      || !isValidSupervisionIntegrationBundleBinding(predecessor)
+      || !verifySupervisionIntegrationBundle(predecessor).ok
+      || supervisionBundleMatchesAssignmentScope({
+        assignmentScopeFiles: assignment.scopeFiles,
+        bundleScopeFiles: predecessor.scopeFiles,
+        bundleFiles: predecessor.files,
+      })
+      || !this.hasReadyAuditValidationAuthority({
+        taskId: task.taskId,
+        assignmentId: assignment.assignmentId,
+        revision,
+        allowLegacy: true,
+      })
+      || !['implementing', 'validated', 'ready_for_audit'].includes(task.status)
+      || !['implementing', 'validated', 'ready_for_audit'].includes(assignment.status)
+      || assignment.verdict
+      || task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt
+      || task.integrationOwnerAssignmentId) return false;
+    if (this.listAuditReceipts(task.taskId).some((receipt) => (
+      receipt.revision === revision && receipt.receiptKind === 'final'
+    ))) return false;
+    return !this.listAssignments(task.taskId).some((candidate) => (
+      candidate.role === 'auditor'
+      && candidate.auditRevision === revision
+      && (!['cancelled', 'recovered'].includes(candidate.status)
+        || Boolean(candidate.leaseId)
+        || Boolean(candidate.verdict))
+    ));
   }
 
   /**
@@ -5397,6 +5492,15 @@ export class SupervisionTaskRegistry {
               : unbound;
         if (candidates.length !== 1) return { ok: false, reason: 'ambiguous_assignment' };
         authenticatedAuditTarget = candidates[0];
+      }
+      const auditBundle = task.integrationBundle;
+      if (authenticatedAuditTarget && auditBundle
+        && (!isValidSupervisionIntegrationBundleBinding(auditBundle)
+          || auditBundle.taskId !== task.taskId
+          || auditBundle.revision !== existing.auditRevision
+          || auditBundle.sourceAssignmentId !== authenticatedAuditTarget.assignmentId
+          || !this.#bundleMatchesPersistedSourceScope(auditBundle))) {
+        return { ok: false, reason: 'old_audit_attempt' };
       }
       targetStatus = 'finalized';
     } else if (existing.status === 'pushed') {
@@ -5838,6 +5942,7 @@ export class SupervisionTaskRegistry {
       if (!isValidSupervisionIntegrationBundleBinding(bundle)
         || bundle.taskId !== task.taskId
         || bundle.revision !== revision
+        || !this.#bundleMatchesPersistedSourceScope(bundle)
         || JSON.stringify(ownedFiles) !== JSON.stringify(bundlePaths)
         || JSON.stringify(manifest) !== JSON.stringify(bundleManifest)) {
         return { ok: false, reason: 'manifest_mismatch' };
@@ -6515,6 +6620,7 @@ export class SupervisionTaskRegistry {
         bundle
         && isValidSupervisionIntegrationBundleBinding(bundle)
         && verifySupervisionIntegrationBundle(bundle).ok
+        && this.#bundleMatchesPersistedSourceScope(bundle)
         && bundle.taskId === taskId
         && bundle.revision === expectedRevision
         && bundle.manifestSha256 === evidenceManifestSha256
@@ -7958,6 +8064,7 @@ export class SupervisionTaskRegistry {
         const claimedAssignmentIds = this.#claimedAssignmentIds(taskId);
         if (!bundle || !isValidSupervisionIntegrationBundleBinding(bundle)
           || !verifySupervisionIntegrationBundle(bundle).ok
+          || !this.#bundleMatchesPersistedSourceScope(bundle)
           || bundle.taskId !== taskId || bundle.revision !== revision
           || !source || bundle.sourceAssignmentId !== source.assignmentId
           || source.status !== (replayingCorrection ? 'ready_for_integration' : 'rework') || source.leaseId
