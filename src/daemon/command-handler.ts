@@ -8807,20 +8807,29 @@ if [ -z "$HEALTH_PID" ]; then
   log "[step 5] WARN: no live new daemon after 14s — service unit may have a stale path or the new binary crashes on startup"
   log "[step 5] WARN: check 'systemctl --user status imcodes' (linux) or 'log show --predicate \"subsystem == \\\"imcodes\\\"\"' (macos)"
   log "[step 5] WARN: if path-stale, manually fix ExecStart in $HOME/.config/systemd/user/imcodes.service then 'systemctl --user daemon-reload && systemctl --user restart imcodes'"
-else
-  # Drop the auto-upgrade cooldown sentinel — handleDaemonUpgrade
-  # consults this on the new daemon's next auto-upgrade attempt to
-  # rate-limit dev-tag-poll-driven restarts. Survives restart by
-  # design (the very transition we are throttling against).
-  # Epoch ms (matches Date.now in JS). MUST stay portable: BSD/macOS \`date\`
-  # has no %N, so \`date +%s%3N\` emits a bogus "<seconds>3N" there and corrupts
-  # the sentinel — which made the cooldown never apply and drove a macOS
-  # auto-upgrade thrash loop (stuck upgrade.sh + endless daemon restarts).
-  # seconds*1000 is ms-granular enough for a multi-minute cooldown and works on
-  # both GNU and BSD date. Best-effort: a missing sentinel means no cooldown.
-  printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
-  log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 fi
+
+# Drop the auto-upgrade cooldown sentinel UNCONDITIONALLY — an upgrade was just
+# attempted, and this rate-limits the NEXT attempt, not successes.
+#
+# It used to be written only on a confirmed-healthy restart within 14s. On a
+# busy node the new daemon writes its pid file later than that (heavy startup,
+# many restored sessions), so the health check timed out, the sentinel was
+# never written, the cooldown never engaged, and every dev-tag poll re-ran the
+# upgrade — an endless "preparing upgrade -> restart" thrash (stuck upgrade.sh,
+# hundreds of restarts) even though the daemon was actually coming up fine. A
+# genuinely dead daemon is still surfaced by the WARN lines above; throttling
+# its retries is correct too. handleDaemonUpgrade consults this on the new
+# daemon's next auto-upgrade attempt; it survives restart by design (the very
+# transition we are throttling against).
+# Epoch ms (matches Date.now in JS). MUST stay portable: BSD/macOS \`date\`
+# has no %N, so \`date +%s%3N\` emits a bogus "<seconds>3N" there and corrupts
+# the sentinel — which made the cooldown never apply and drove a macOS
+# auto-upgrade thrash loop. seconds*1000 is ms-granular enough for a
+# multi-minute cooldown and works on both GNU and BSD date. Best-effort: a
+# missing sentinel means no cooldown.
+printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
+log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 
 log "=== upgrade script done ==="
 
