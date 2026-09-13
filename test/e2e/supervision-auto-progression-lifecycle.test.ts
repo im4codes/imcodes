@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const live = vi.hoisted(() => ({ sessions: [] as Array<Record<string, unknown>> }));
@@ -169,6 +170,7 @@ afterEach(() => {
   resetTransportQueueStoreForTests();
   delete process.env.IMCODES_WORKTREES_ROOT;
   delete process.env.IMCODES_SUPERVISION_BUNDLES_ROOT;
+  delete process.env.IMCODES_SUPERVISION_STATE_DB_PATH;
   live.sessions = [];
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -178,6 +180,8 @@ describe('E2E: automatic supervision progression lifecycle', () => {
     const shape = createRepo();
     process.env.IMCODES_WORKTREES_ROOT = join(shape.root, 'worktrees');
     process.env.IMCODES_SUPERVISION_BUNDLES_ROOT = join(shape.root, 'bundles');
+    const registryDbPath = join(shape.root, 'supervision-state.sqlite');
+    process.env.IMCODES_SUPERVISION_STATE_DB_PATH = registryDbPath;
     const { brain, worker, auditor, sessions } = configureSessions(shape.repo);
     const delivered = vi.fn().mockResolvedValue('queued');
     const send = (from: SendRuntimeCaller, input: SendMessageInput) => dispatchSendMessage(from, input, {
@@ -301,18 +305,67 @@ describe('E2E: automatic supervision progression lifecycle', () => {
       sessionName: brain.name, assignmentId: owner.assignmentId,
     });
     expect(readFileSync(join(integrationWorktree, 'README.md'), 'utf8')).toContain('Automatic supervision progresses');
+    const bundle = registry.getTaskRecord(created.taskId)!.integrationBundle!;
+    const brainMemory = createMemoryMcpToolHandlers(caller(brain), {
+      sendDeps: { listSessions: () => sessions },
+    });
+    await expect(brainMemory[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]({
+      assignmentId: owner.assignmentId,
+      revision,
+      auditAttemptId: auditAssignment.auditAttemptId,
+      auditRevision: revision,
+      verdict: 'PASS',
+      ownedFiles: ['README.md'],
+      integrationManifest: [{ path: 'README.md', sha256: '0'.repeat(64) }],
+      integrationOwner: brain.name,
+      pushRemoteRef: 'refs/heads/e2e-delivery',
+      ciResult: 'ci_not_configured',
+    })).resolves.toMatchObject({
+      status: 'error',
+      refusals: [expect.objectContaining({ code: 'bundle_mismatch', field: 'integrationManifest' })],
+    });
+    const preflight = await brainMemory[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]({
+      assignmentId: owner.assignmentId,
+      revision,
+      auditAttemptId: auditAssignment.auditAttemptId,
+      auditRevision: revision,
+      verdict: 'PASS',
+      integrationOwner: brain.name,
+      pushRemoteRef: 'refs/heads/e2e-delivery',
+      ciResult: 'ci_not_configured',
+    });
+    expect(preflight).toMatchObject({
+      status: 'ok', preflightToken: expect.any(String), ownerPreparation: 'none',
+    });
+    const preflightToken = String(preflight.preflightToken);
+    expect(preflightToken).toMatch(/^sha256:[a-f0-9]{64}$/);
+
     git(integrationWorktree, 'config', 'user.name', 'IM.codes E2E');
     git(integrationWorktree, 'config', 'user.email', 'e2e@im.codes');
     git(integrationWorktree, 'add', '--', 'README.md');
     git(integrationWorktree, 'commit', '-qm', 'docs: e2e automatic supervision');
     const commitSha = git(integrationWorktree, 'rev-parse', 'HEAD');
+    expect(bundle.headSha).not.toBe(commitSha);
     git(integrationWorktree, 'push', '-q', 'origin', 'HEAD:refs/heads/e2e-delivery');
     expect(git(shape.remote, 'rev-parse', 'refs/heads/e2e-delivery')).toBe(commitSha);
 
-    const bundle = registry.getTaskRecord(created.taskId)!.integrationBundle!;
-    const brainMemory = createMemoryMcpToolHandlers(caller(brain), {
-      sendDeps: { listSessions: () => sessions },
+    // A crash/legacy flow may reach this point without retaining the pre-Git
+    // token. A new token cannot be minted at the post-commit HEAD, but exact
+    // commit + remote provenance must still support an idempotent backfill.
+    await expect(brainMemory[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]({
+      assignmentId: owner.assignmentId,
+      revision,
+      auditAttemptId: auditAssignment.auditAttemptId,
+      auditRevision: revision,
+      verdict: 'PASS',
+      integrationOwner: brain.name,
+      pushRemoteRef: 'refs/heads/e2e-delivery',
+      ciResult: 'ci_not_configured',
+    })).resolves.toMatchObject({
+      status: 'error',
+      refusals: [expect.objectContaining({ code: 'bundle_mismatch', field: 'bundle' })],
     });
+
     const finalization = {
       assignmentId: owner.assignmentId,
       revision,
@@ -323,7 +376,7 @@ describe('E2E: automatic supervision progression lifecycle', () => {
       integrationManifest: bundle.files.flatMap((file) => file.deleted || !file.sha256 ? [] : [{ path: file.path, sha256: file.sha256 }]),
       integrationOwner: brain.name,
       commitSha,
-      pushResult: 'pushed',
+      pushResult: 'already_present',
       pushRemoteRef: 'refs/heads/e2e-delivery',
       stagedPaths: ['README.md'],
       conflictedPaths: [],
@@ -331,8 +384,76 @@ describe('E2E: automatic supervision progression lifecycle', () => {
       ciResult: 'ci_not_configured',
       evidence: 'local bare-remote push verified',
     } as const;
+
+    // A rewritten/non-ancestor destination is not proof of this integration.
+    git(integrationWorktree, 'checkout', '--orphan', 'e2e-rewritten');
+    git(integrationWorktree, 'rm', '-qrf', '.');
+    writeFileSync(join(integrationWorktree, 'README.md'), '# Unrelated rewritten history\n');
+    git(integrationWorktree, 'add', '--', 'README.md');
+    git(integrationWorktree, 'commit', '-qm', 'test: unrelated rewrite');
+    git(integrationWorktree, 'push', '-qf', 'origin', 'HEAD:refs/heads/e2e-delivery');
     await expect(brainMemory[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](finalization))
+      .resolves.toMatchObject({
+        status: 'error',
+        refusals: [expect.objectContaining({ code: 'remote_drift', field: 'remoteCommit' })],
+      });
+    expect(registry.get(created.taskId)).toMatchObject({ status: 'ready_for_integration' });
+
+    // Restore the exact bundle commit, then let a later integration advance
+    // the shared destination. The exact commit is still already_present
+    // because it is an ancestor of the fetched current tip.
+    git(integrationWorktree, 'reset', '--hard', '-q', commitSha);
+    git(integrationWorktree, 'push', '-qf', 'origin', `${commitSha}:refs/heads/e2e-delivery`);
+    writeFileSync(join(integrationWorktree, 'AFTER.md'), 'A later integration advanced the branch.\n');
+    git(integrationWorktree, 'add', '--', 'AFTER.md');
+    git(integrationWorktree, 'commit', '-qm', 'test: advance destination after integration');
+    const advancedTip = git(integrationWorktree, 'rev-parse', 'HEAD');
+    git(integrationWorktree, 'push', '-q', 'origin', 'HEAD:refs/heads/e2e-delivery');
+    expect(git(integrationWorktree, 'merge-base', '--is-ancestor', commitSha, advancedTip)).toBe('');
+
+    // Production-shaped tsk_hnh recovery: Git side effects completed, the
+    // pre-Git token was lost, and the durable owner never received its PASS
+    // preparation edge.  The exact receipt/auditor/revision/bundle lineage is
+    // still present and must be consumed atomically by tokenless backfill.
+    const unpreparedOwner = {
+      ...registry.getAssignment(owner.assignmentId)!,
+      status: 'implementing' as const,
+      verdict: undefined,
+      crossVendorAuditPassed: undefined,
+      leaseId: 'lse_e2e_post_push_owner',
+      updatedAt: Date.now(),
+    };
+    const database = new DatabaseSync(registryDbPath);
+    database.prepare(`
+      UPDATE supervision_task_assignments
+      SET status = ?, lease_id = ?, verdict = NULL, blocker = NULL,
+          payload_json = ?, updated_at = ?
+      WHERE assignment_id = ?
+    `).run(
+      unpreparedOwner.status,
+      unpreparedOwner.leaseId,
+      JSON.stringify(unpreparedOwner),
+      unpreparedOwner.updatedAt,
+      unpreparedOwner.assignmentId,
+    );
+    database.close();
+    expect(registry.getAssignment(owner.assignmentId)).toMatchObject({
+      status: 'implementing', leaseId: 'lse_e2e_post_push_owner',
+    });
+    expect(registry.getAssignment(owner.assignmentId)).not.toHaveProperty('verdict');
+    const beforeBackfillEvents = registry.listEvents(created.taskId).length;
+
+    const firstFinalization = await brainMemory[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](finalization);
+    await expect(Promise.resolve(firstFinalization))
       .resolves.toMatchObject({ status: 'ok', idempotentReplay: false, item: { status: 'finalized', commitSha } });
+    const backfillEvents = registry.listEvents(created.taskId).slice(beforeBackfillEvents);
+    expect(backfillEvents.some((event) => (
+      event.assignmentId === owner.assignmentId && event.status === 'ready_for_integration'
+    ))).toBe(false);
+    expect(registry.getAssignment(owner.assignmentId)).toMatchObject({
+      status: 'finalized', verdict: 'PASS', crossVendorAuditPassed: true, leaseId: '',
+    });
+    renameSync(integrationWorktree, `${integrationWorktree}.terminal-cleanup`);
     await expect(brainMemory[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](finalization))
       .resolves.toMatchObject({ status: 'ok', idempotentReplay: true, item: { status: 'finalized', commitSha } });
     expect(registry.list({ projectName: 'alpha' }).some((task) => task.taskId === created.taskId)).toBe(false);

@@ -5,6 +5,7 @@ import {
   MEMORY_MCP_TOOL_CONTRACTS,
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
+  SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS,
   SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
   SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
   buildMcpDisabledResult,
@@ -54,6 +55,10 @@ describe('memory MCP shared contracts', () => {
     expect(finalization.required).not.toContain('externalRunId');
     expect(finalization.required).not.toContain('externalHeadSha');
     expect(finalization.properties?.pushResult?.enum).toEqual(['pushed', 'already_present']);
+    expect(finalization.required).not.toContain('preflightToken');
+    expect(finalization.properties?.preflightToken?.description).toContain(
+      'exact verified already_present backfill may omit it',
+    );
     for (const field of SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS) {
       expect(finalization.required).not.toContain(field);
       expect(finalization.properties).toHaveProperty(field);
@@ -96,6 +101,7 @@ describe('memory MCP shared contracts', () => {
       'supervision_task_start',
       'supervision_task_update',
       'supervision_task_finish',
+      'supervision_integration_preflight',
       'supervision_integration_finalize',
       'supervision_task_file_event',
       'send_stop',
@@ -433,3 +439,15 @@ describe('memory MCP shared contracts', () => {
     expect(stripped).toEqual({ projectionId: 'p1' });
   });
 });
+    const preflight = MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT
+    ].inputSchema;
+    expect(preflight).toMatchObject({
+      additionalProperties: false,
+      required: [...SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS],
+    });
+    expect(preflight.properties).not.toHaveProperty('commitSha');
+    expect(preflight.properties).not.toHaveProperty('pushResult');
+    expect(MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT
+    ].description).toContain('before Git side effects');

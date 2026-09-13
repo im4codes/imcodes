@@ -120,7 +120,10 @@ describe('memory MCP tool schema firewall', () => {
     })).resolves.toMatchObject({
       status: 'error',
       reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
-      message: expect.stringContaining('invalid structured finalization'),
+      message: 'integration_finalize rejected',
+      refusals: expect.arrayContaining([
+        expect.objectContaining({ code: 'missing_field', field: 'auditRevision' }),
+      ]),
     });
   });
 

@@ -24,25 +24,18 @@ export const MCP_INJECTED_SCHEMA_DIALECT = 'http://json-schema.org/draft-07/sche
 /** Injected per-tool by the MCP SDK. `forbidden` is already the protocol default. */
 export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbidden' });
 
-// The synchronized identity surface adds four bounded CRUD/refresh contracts.
-// Keep explicit headroom over the measured full catalog rather than
-// silently dropping these tools from STATIC_FULL hosts.
+// The integration preflight adds one bounded contract to the synchronized
+// control-plane surface. Keep explicit headroom over the measured full catalog
+// rather than silently hiding it from STATIC_FULL hosts or trimming unrelated
+// safety descriptions merely to make the number go down.
 //
-// Measured at 45,019 authored bytes across 62 tools. The previous 45,000
-// ceiling was set when the catalog measured 44,940, leaving 60 bytes of
-// headroom -- less than one optional schema field. Adding the
-// `expectedGeneration` execution-authority fence to supervision_task_recover
-// cost 79 bytes and broke it. That is a ratchet at its limit, not bloat: the
-// tool count did not change, and trimming description prose to buy back 35
-// bytes would be exactly the "make the number go down" move this file exists
-// to prevent. So the ceiling moves deliberately, with roughly the same ~700
-// bytes of reviewable headroom the earlier figures were given.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 45_700;
-// Raw = authored + per-tool MCP SDK framing, which currently costs 6,016 bytes
-// across the 62 published tools (~97 each). Held at the authored ceiling plus
-// that framing plus a little room, so protocol growth still cannot hide behind
-// the authored figure. Measured 51,035.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 51_800;
+// Measured at 46,199 authored bytes across 63 tools after adding the exact
+// pre-Git authority snapshot contract. The ceiling moves deliberately with
+// roughly the same ~700 bytes of reviewable headroom as before.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 46_900;
+// Raw = authored + the MCP SDK framing, currently 6,108 bytes across 63 tools.
+// Keep a bounded allowance above the measured 52,307-byte wire payload.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 53_100;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

@@ -106,6 +106,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SUPERVISION_TASK_START: 'supervision_task_start',
   SUPERVISION_TASK_UPDATE: 'supervision_task_update',
   SUPERVISION_TASK_FINISH: 'supervision_task_finish',
+  SUPERVISION_INTEGRATION_PREFLIGHT: 'supervision_integration_preflight',
   SUPERVISION_INTEGRATION_FINALIZE: 'supervision_integration_finalize',
   SUPERVISION_TASK_FILE_EVENT: 'supervision_task_file_event',
   SEND_STOP: 'send_stop',
@@ -156,6 +157,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
@@ -175,9 +177,14 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
 ] as const satisfies readonly MemoryMcpToolName[];
 
-export const SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS = [
+export const SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS = [
   'assignmentId', 'revision', 'auditAttemptId', 'auditRevision', 'verdict',
-  'integrationOwner', 'commitSha', 'pushResult', 'pushRemoteRef',
+  'integrationOwner', 'pushRemoteRef',
+] as const;
+
+export const SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS = [
+  ...SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS,
+  'commitSha', 'pushResult',
 ] as const;
 
 export const SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS = [
@@ -763,6 +770,33 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }, ['assignmentId', 'revision']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT,
+    description: 'Validate an exact audited integration before Git side effects; return its finalize token.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Integration owner assignment.'),
+      revision: stringSchema('Exact revision.'),
+      auditAttemptId: stringSchema('Exact audit attempt.'),
+      auditRevision: stringSchema('Exact audited revision.'),
+      verdict: { type: 'string', enum: ['PASS'] },
+      ownedFiles: { description: 'Optional attribution.' },
+      integrationManifest: { description: 'Optional attribution.' },
+      integrationOwner: stringSchema('Owner session.'),
+      pushRemoteRef: stringSchema('Destination remote ref.'),
+      stagedPaths: { description: 'Optional staged paths.' },
+      conflictedPaths: { description: 'Optional conflicts.' },
+      untrackedOtherOwnerPaths: { description: 'Optional foreign paths.' },
+      externalRunId: stringSchema('Exact CI run id.'),
+      externalHeadSha: stringSchema('Exact CI head SHA.', { pattern: '^[0-9a-f]{40}$' }),
+      externalTaskId: stringSchema('Exact CI task id.'),
+      ciResult: { type: 'string', enum: [...SUPERVISION_CI_SMOKE_STATUSES] },
+    }, SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS),
+    outputSchema: objectSchema({
+      status: stringSchema('Result.'),
+      preflightToken: stringSchema('Authority token.'),
+      refusals: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    }),
+  },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
     description: 'Atomically finalize one exact audited integration. PASS plus exact Git/push evidence is the finalization authority; CI is optional descriptive smoke.',
@@ -775,6 +809,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       ownedFiles: { description: 'Caller-reported attribution data; unusable values are ignored.' },
       integrationManifest: { description: 'Caller-reported manifest data; unusable values are ignored.' },
       integrationOwner: stringSchema('Canonical integration owner session.'),
+      preflightToken: stringSchema('Pre-Git authority token. Required for pushResult=pushed; an exact verified already_present backfill may omit it.', {
+        pattern: '^sha256:[a-f0-9]{64}$',
+      }),
       commitSha: stringSchema('Exact pushed commit.', { pattern: '^[0-9a-f]{40}$' }),
       pushResult: { type: 'string', enum: ['pushed', 'already_present'] },
       pushRemoteRef: stringSchema('Exact pushed remote ref.'),

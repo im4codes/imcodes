@@ -441,12 +441,19 @@ describe('memory MCP stdio server', () => {
       expect(Object.keys(finishSchema?.properties ?? {}).sort()).toEqual([
         ...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
         ...SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
+        'preflightToken',
         'externalRunId',
         'externalHeadSha',
         'externalTaskId',
         'ciResult',
         'evidence',
       ].sort());
+      expect(listed.tools.find(
+        (tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT,
+      )?.inputSchema).toMatchObject({
+        required: expect.arrayContaining(['assignmentId', 'revision', 'auditAttemptId', 'pushRemoteRef']),
+        additionalProperties: false,
+      });
       const sendSchema = listed.tools.find(
         (tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
       )?.inputSchema as { properties?: { task?: { properties?: Record<string, unknown> } } } | undefined;
