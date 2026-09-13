@@ -2,6 +2,12 @@ import {
   SUPERVISION_CONTRACT_IDS,
   isTerminalSupervisionTaskStatus,
 } from '../../shared/supervision-config.js';
+import {
+  SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
+  SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+} from '../../shared/agent-delegation.js';
+import { deterministicSendMessageId } from '../../shared/send-message-id.js';
+import type { QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import {
@@ -19,6 +25,7 @@ export type ImplementationHeartbeatAuthorityResult =
   | { status: 'authorized' }
   | { status: 'transient_unavailable' }
   | { status: 'quarantined' };
+export type QueuedSupervisionAdmission = QueueSupervisionAdmission;
 
 /** One durable project+session visibility predicate shared by sends and delivery. */
 export function isExactContinuationEligible(input: {
@@ -50,6 +57,22 @@ export function liveSupervisionIdentity(session: SessionRecord): PersistedSuperv
     agentType: session.agentType,
     providerFamily: resolvePeerAuditProviderFamily(session),
   };
+}
+
+function assignmentOwnsDurableTarget(input: {
+  taskProjectName: string;
+  taskCurrentRevision?: string;
+  assignment: PersistedSupervisionTaskAssignment;
+  target: SessionRecord;
+}): boolean {
+  const targetIdentity = liveSupervisionIdentity(input.target);
+  return Boolean(targetIdentity) && isExactContinuationEligible({
+    taskProjectName: input.taskProjectName,
+    taskCurrentRevision: input.taskCurrentRevision,
+    assignment: input.assignment,
+    targetProjectName: input.target.projectName,
+    targetIdentity: targetIdentity ?? {},
+  });
 }
 
 function parkUnresolvedOnce(
@@ -270,46 +293,157 @@ function parseHeartbeatBinding(text: string): HeartbeatBinding | undefined {
   }
 }
 
-/** Gate both live FIFO drains and restart resend drains. Non-heartbeat traffic is untouched. */
-export function authorizeQueuedSupervisionHeartbeatDelivery(input: {
+function parseAuthorityRecord(text: string): Record<string, unknown> | undefined {
+  try {
+    const value = JSON.parse(text) as unknown;
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Classify the final delivery edge. `stale` is an irreversible authority
+ * mismatch and may be discarded; `retry` means durable authority still exists
+ * but its live/runtime projection is temporarily unavailable.
+ */
+export function resolveQueuedSupervisionHeartbeatDelivery(input: {
   targetSessionName: string;
   clientMessageId: string;
   text: string;
+  supervisionReference?: QueueSupervisionReference;
   now?: number;
-}): boolean {
+}): QueuedSupervisionAdmission {
+  if (input.supervisionReference) {
+    try {
+      const registry = getSupervisionTaskRegistry();
+      const reference = input.supervisionReference;
+      const task = registry.getTaskRecord(reference.taskId);
+      const snapshot = registry.get(reference.taskId);
+      const assignment = registry.getAssignment(reference.assignmentId);
+      if (!task || !snapshot || !assignment || assignment.taskId !== task.taskId) return 'stale';
+      const durableRevision = task.currentRevision ?? assignment.auditRevision ?? '';
+      if (durableRevision !== reference.revision) return 'stale';
+      if (isTerminalSupervisionTaskStatus(task.status)
+        || isTerminalSupervisionTaskStatus(assignment.status)) return 'stale';
+
+      if (reference.kind === 'implementation_blocker') {
+        // Prove durable structural ownership before consulting its transient
+        // live projection. A lagging/terminal/missing owner can never converge
+        // through retry; only an otherwise-eligible owner's absent runtime can.
+        const durableCoordinators = snapshot.assignments.filter((candidate) => (
+          candidate.role === 'coordinator'
+          && candidate.identity.sessionName === input.targetSessionName
+          && isSupervisionAssignmentContinuable({
+            taskCurrentRevision: task.currentRevision,
+            assignment: candidate,
+          })
+        ));
+        if (durableCoordinators.length !== 1) return 'stale';
+        const target = getSession(input.targetSessionName);
+        if (!target || target.state === 'stopped') return 'retry';
+        if (target.role !== 'brain') return 'stale';
+        if (!assignmentOwnsDurableTarget({
+          taskProjectName: task.projectName,
+          taskCurrentRevision: task.currentRevision,
+          assignment: durableCoordinators[0]!,
+          target,
+        })) return 'stale';
+        if (reference.exactError === SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR
+          || reference.exactError === SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR) {
+          if (assignment.role !== 'implementer' || assignment.status !== 'implementing'
+            || !assignment.blocker) return 'stale';
+          const blocker = parseAuthorityRecord(assignment.blocker);
+          if (!blocker) return 'stale';
+          if (blocker.taskId !== reference.taskId
+            || blocker.assignmentId !== reference.assignmentId
+            || blocker.exactError !== reference.exactError
+            || typeof blocker.blockerFingerprint !== 'string'
+            || deterministicSendMessageId(`implementation-blocker:${blocker.blockerFingerprint}`)
+              !== input.clientMessageId) return 'stale';
+          return 'authorized';
+        }
+
+        if (task.blocker !== assignment.blocker || !task.blocker) return 'stale';
+        const blocker = parseAuthorityRecord(task.blocker);
+        if (!blocker) return 'stale';
+        if (blocker.kind !== 'automatic_audit_routing'
+          || blocker.taskId !== reference.taskId
+          || blocker.assignmentId !== reference.assignmentId
+          || (typeof blocker.revision === 'string' ? blocker.revision : '') !== durableRevision
+          || blocker.exactError !== reference.exactError) return 'stale';
+        return 'authorized';
+      }
+
+      if (reference.kind === 'exact_integration') {
+        if (task.status !== 'ready_for_integration'
+          || task.integrationOwnerAssignmentId !== assignment.assignmentId
+          || assignment.role !== 'integration_owner'
+          || assignment.status !== 'ready_for_integration') return 'stale';
+        const target = getSession(input.targetSessionName);
+        if (!target || target.state === 'stopped') return 'retry';
+        if (target.role !== 'brain') return 'stale';
+        return assignmentOwnsDurableTarget({
+          taskProjectName: task.projectName,
+          taskCurrentRevision: task.currentRevision,
+          assignment,
+          target,
+        }) ? 'authorized' : 'stale';
+      }
+      return 'stale';
+    } catch {
+      // Only failures thrown by registry/session storage reach this boundary.
+      // Malformed durable blocker bytes are parsed above and classified stale,
+      // because no amount of retry can recreate the superseded authority.
+      return 'retry';
+    }
+  }
+
   const looksLikeImplementation = input.clientMessageId.startsWith(IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX);
   const looksLikeAudit = input.clientMessageId.startsWith(AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX);
   const looksLikeHeartbeat = looksLikeImplementation || looksLikeAudit;
   const binding = parseHeartbeatBinding(input.text);
-  if (!looksLikeHeartbeat && !binding) return true;
-  if (!looksLikeHeartbeat || !binding) return false;
+  if (!looksLikeHeartbeat && !binding) return 'authorized';
+  if (!looksLikeHeartbeat || !binding) return 'stale';
   try {
     const registry = getSupervisionTaskRegistry();
     const assignment = registry.getAssignment(binding.assignmentId);
     const task = registry.getTaskRecord(binding.taskId);
-    if (!assignment || !task || assignment.taskId !== task.taskId) return false;
+    if (!assignment || !task || assignment.taskId !== task.taskId) return 'stale';
     if (binding.kind === 'implementation') {
-      if (!looksLikeImplementation || assignment.role !== 'implementer') return false;
+      if (!looksLikeImplementation || assignment.role !== 'implementer') return 'stale';
       const durableRevision = task.currentRevision ?? assignment.auditRevision;
-      if (binding.revision !== durableRevision) return false;
+      if (binding.revision !== durableRevision) return 'stale';
     } else if (!looksLikeAudit
       || assignment.role !== 'auditor'
       || assignment.auditAttemptId !== binding.auditAttemptId
-      || assignment.auditRevision !== binding.auditRevision) return false;
+      || assignment.auditRevision !== binding.auditRevision) return 'stale';
     // The shared continuation predicate in the authority resolver below is
     // the single task-current-revision fence. Keeping a second copy here made
     // one of the two guards mutation-invisible and allowed the two call sites
     // to drift without a load-bearing test.
-    return authorizeImplementationHeartbeatDelivery({
+    const resolved = resolveImplementationHeartbeatDelivery({
       taskId: binding.taskId,
       assignmentId: binding.assignmentId,
       targetSessionName: input.targetSessionName,
       ...(binding.kind === 'implementation' ? { requireExactIdentity: true } : {}),
       now: input.now,
     });
+    return resolved.status === 'authorized'
+      ? 'authorized'
+      : resolved.status === 'transient_unavailable' ? 'retry' : 'stale';
   } catch {
     // A registry outage is not authority. Preserve fail-closed delivery for the
     // control message while leaving ordinary queued user traffic untouched.
-    return false;
+    return 'retry';
   }
+}
+
+/** Boolean compatibility wrapper for callers that cannot retain retry state. */
+export function authorizeQueuedSupervisionHeartbeatDelivery(
+  input: Parameters<typeof resolveQueuedSupervisionHeartbeatDelivery>[0],
+): boolean {
+  return resolveQueuedSupervisionHeartbeatDelivery(input) === 'authorized';
 }

@@ -1,21 +1,24 @@
 import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
 } from '../../shared/memory-mcp-contracts.js';
-import type { ResendEntry } from '../daemon/transport-resend-queue.js';
+import type { ResendEntry, ResendHandoffOwnership } from '../daemon/transport-resend-queue.js';
 import type {
   ExternalAppendResult,
   TransportSendMetadata,
   TransportSessionRuntime,
 } from './transport-session-runtime.js';
 
-export type TransportResendDeliveryResult = 'sent' | 'appended' | 'queued';
+export type TransportResendDeliveryResult = 'sent' | 'appended' | 'queued' | 'retry';
 
 type ResendDeliveryRuntime = Pick<
   TransportSessionRuntime,
   'appendExternalMessageToActiveTurn' | 'send'
 >;
 
-function buildResendMetadata(entry: ResendEntry): TransportSendMetadata {
+function buildResendMetadata(
+  entry: ResendEntry,
+  ownership?: ResendHandoffOwnership,
+): TransportSendMetadata {
   return {
     ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
     ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
@@ -23,10 +26,32 @@ function buildResendMetadata(entry: ResendEntry): TransportSendMetadata {
     ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
     ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
     ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+    ...(entry.activeTurnDeliveryKind
+      ? { activeTurnDeliveryKind: entry.activeTurnDeliveryKind }
+      : {}),
+    ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
+    ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+    ...(entry.supervisionReference
+      ? { supervisionReference: entry.supervisionReference }
+      : {}),
     ...(entry.registeredSystemContract
       ? { registeredSystemContract: entry.registeredSystemContract }
       : {}),
+    ...(ownership ? { queueHandoff: ownership } : {}),
   };
+}
+
+function buildAppendPrivateMetadata(
+  entry: ResendEntry,
+): Pick<TransportSendMetadata, 'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply'> | undefined {
+  const metadata = {
+    ...(entry.activeTurnDeliveryKind
+      ? { activeTurnDeliveryKind: entry.activeTurnDeliveryKind }
+      : {}),
+    ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
+    ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+  };
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 function canUseNativeAppend(entry: ResendEntry): boolean {
@@ -48,21 +73,63 @@ function canUseNativeAppend(entry: ResendEntry): boolean {
 export async function deliverTransportResendEntry(
   runtime: ResendDeliveryRuntime,
   entry: ResendEntry,
+  ownership?: ResendHandoffOwnership,
 ): Promise<TransportResendDeliveryResult> {
   if (canUseNativeAppend(entry)) {
-    const appendResult: ExternalAppendResult = await runtime.appendExternalMessageToActiveTurn(
-      entry.providerText ?? entry.text,
-      entry.clientMessageId ?? entry.commandId,
-    );
-    if (appendResult === 'sent' || appendResult === 'appended') return appendResult;
+    let appendResult: ExternalAppendResult;
+    const privateMetadata = buildAppendPrivateMetadata(entry);
+    if (ownership) {
+      appendResult = privateMetadata
+        ? await runtime.appendExternalMessageToActiveTurn(
+            entry.providerText ?? entry.text,
+            entry.clientMessageId ?? entry.commandId,
+            entry.supervisionReference,
+            ownership,
+            privateMetadata,
+          )
+        : await runtime.appendExternalMessageToActiveTurn(
+            entry.providerText ?? entry.text,
+            entry.clientMessageId ?? entry.commandId,
+            entry.supervisionReference,
+            ownership,
+          );
+    } else if (entry.supervisionReference) {
+      appendResult = privateMetadata
+        ? await runtime.appendExternalMessageToActiveTurn(
+            entry.providerText ?? entry.text,
+            entry.clientMessageId ?? entry.commandId,
+            entry.supervisionReference,
+            undefined,
+            privateMetadata,
+          )
+        : await runtime.appendExternalMessageToActiveTurn(
+            entry.providerText ?? entry.text,
+            entry.clientMessageId ?? entry.commandId,
+            entry.supervisionReference,
+          );
+    } else if (privateMetadata) {
+      appendResult = await runtime.appendExternalMessageToActiveTurn(
+        entry.providerText ?? entry.text,
+        entry.clientMessageId ?? entry.commandId,
+        undefined,
+        undefined,
+        privateMetadata,
+      );
+    } else {
+      appendResult = await runtime.appendExternalMessageToActiveTurn(
+        entry.providerText ?? entry.text,
+        entry.clientMessageId ?? entry.commandId,
+      );
+    }
+    if (appendResult === 'sent' || appendResult === 'appended' || appendResult === 'retry') return appendResult;
   }
 
   const attachments = entry.attachments ?? [];
   return runtime.send(
     entry.text,
-    entry.commandId,
+    entry.clientMessageId ?? entry.commandId,
     attachments.length > 0 ? attachments : undefined,
     entry.messagePreamble,
-    buildResendMetadata(entry),
+    buildResendMetadata(entry, ownership),
   );
 }

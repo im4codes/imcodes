@@ -19,6 +19,20 @@ import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import {
+  clearAllResend,
+  drainResend,
+  enqueueResend,
+  getResendCount,
+  getResendEntries,
+  RESEND_DISPATCH_CONTROL,
+} from '../../src/daemon/transport-resend-queue.js';
+import {
+  authorizeQueuedSupervisionHeartbeatDelivery,
+  resolveQueuedSupervisionHeartbeatDelivery,
+} from '../../src/daemon/supervision-participant-delivery.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
+import { getSession, removeSession, upsertSession } from '../../src/store/session-store.js';
+import {
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
 } from '../../src/daemon/supervision-state-store.js';
@@ -903,6 +917,141 @@ describe('send-tool', () => {
       expect(report).not.toHaveProperty('missing');
       expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toEqual(report);
     } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('authorizes a no-progress escalation through durable dispatch and drain', async () => {
+    resetSupervisionTaskRegistryForTests();
+    clearAllResend();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'durable-no-progress-task';
+    const assignmentId = 'durable-no-progress-worker';
+    const revision = 'durable-no-progress-r1';
+    const worker = session({
+      name: 'deck_durable_no_progress_worker', projectName: 'alpha', role: 'w1', label: 'Worker',
+      agentType: 'codex-sdk', runtimeType: 'transport', providerId: 'codex-sdk',
+    } as never);
+    const brain = session({
+      name: 'deck_durable_no_progress_brain', projectName: 'alpha', role: 'brain', label: 'Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', providerId: 'codex-sdk',
+    } as never);
+    upsertSession(worker);
+    upsertSession(brain);
+    const liveWorker = getSession(worker.name)!;
+    const liveBrain = getSession(brain.name)!;
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        // Production can legitimately have no task.currentRevision yet; the
+        // producer binds the row to assignment.auditRevision in that shape.
+        objective: 'deliver no-progress escalation',
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId, role: 'coordinator', required: false, identity: {
+          sessionName: liveBrain.name,
+          sessionInstanceId: liveBrain.sessionInstanceId!,
+          runtimeEpoch: liveBrain.runtimeEpoch!,
+          agentType: liveBrain.agentType,
+          providerFamily: 'openai',
+        },
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: {
+          sessionName: liveWorker.name,
+          sessionInstanceId: liveWorker.sessionInstanceId!,
+          runtimeEpoch: liveWorker.runtimeEpoch!,
+          agentType: liveWorker.agentType,
+          providerFamily: 'openai',
+        }, auditRevision: revision,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId,
+        identity: registry.getAssignment(assignmentId)!.identity,
+        status: 'implementing',
+      })).toMatchObject({ ok: true });
+
+      const result = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, {
+        listSessions: () => [liveBrain, liveWorker],
+        hasDeliveryEvidence: () => false,
+        dispatchMessage: async (target, message, options) => {
+          const queued = enqueueResend(target.name, {
+            text: message,
+            commandId: options.messageId,
+            clientMessageId: options.messageId,
+            deliveryMode: options.deliveryMode,
+            supervisionReference: options.queueSupervisionReference,
+            queuedAt: Date.now(),
+          });
+          if (!queued.accepted) throw new Error('queue rejected');
+          return 'queued';
+        },
+      });
+      expect(result).toMatchObject({ status: 'waiting', replay: false });
+      expect(getResendCount(liveBrain.name)).toBe(1);
+      const queuedMessageId = getResendEntries(liveBrain.name)[0]!.clientMessageId!;
+
+      let deliveredReference: unknown;
+      let deliveredCount = 0;
+      const deliver = async (entry: Parameters<typeof enqueueResend>[1]) => {
+        deliveredReference = entry.supervisionReference;
+        const delivery = {
+          targetSessionName: liveBrain.name,
+          clientMessageId: entry.clientMessageId ?? entry.commandId ?? '',
+          text: entry.text,
+          supervisionReference: entry.supervisionReference,
+        };
+        const initialAdmission = resolveQueuedSupervisionHeartbeatDelivery(delivery);
+        if (initialAdmission === 'retry') return RESEND_DISPATCH_CONTROL.RETRY;
+        if (initialAdmission === 'stale') return RESEND_DISPATCH_CONTROL.STALE;
+        // The deterministic id is part of the durable blocker authority, not
+        // optional dedupe metadata. A replay under a different id is stale.
+        expect(resolveQueuedSupervisionHeartbeatDelivery({
+          ...delivery,
+          clientMessageId: 'send_message_wrong_blocker_fingerprint',
+        })).toBe('stale');
+        const durableBlocker = registry.getAssignment(assignmentId)!.blocker!;
+        expect(registry.updateAssignment({
+          assignmentId,
+          identity: registry.getAssignment(assignmentId)!.identity,
+          blocker: 'waiting on CI logs; will retry',
+        })).toMatchObject({ ok: true });
+        expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('stale');
+        expect(registry.updateAssignment({
+          assignmentId,
+          identity: registry.getAssignment(assignmentId)!.identity,
+          blocker: durableBlocker,
+        })).toMatchObject({ ok: true });
+        expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('authorized');
+        deliveredCount += 1;
+        return 'sent' as const;
+      };
+
+      removeSession(liveBrain.name);
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(0);
+      expect(getResendCount(liveBrain.name)).toBe(1);
+      expect(getTransportQueueStore().hasDeliveryTombstone(liveBrain.name, queuedMessageId))
+        .toBe(false);
+
+      upsertSession({ ...liveBrain, state: 'stopped', updatedAt: liveBrain.updatedAt + 1 });
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(0);
+      expect(getResendCount(liveBrain.name)).toBe(1);
+      expect(getTransportQueueStore().hasDeliveryTombstone(liveBrain.name, queuedMessageId))
+        .toBe(false);
+
+      upsertSession({ ...liveBrain, state: 'idle', updatedAt: liveBrain.updatedAt + 2 });
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(1);
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(0);
+      expect(deliveredCount).toBe(1);
+      expect(deliveredReference).toMatchObject({
+        kind: 'implementation_blocker', taskId, assignmentId, revision,
+      });
+      expect(getResendCount(liveBrain.name)).toBe(0);
+    } finally {
+      clearAllResend();
+      removeSession(worker.name);
+      removeSession(brain.name);
       resetSupervisionTaskRegistryForTests();
     }
   });

@@ -20,6 +20,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { AliasSendAudit } from '../../shared/alias-types.js';
 import type { MemoryMcpSendDeliveryMode } from '../../shared/memory-mcp-contracts.js';
 import logger from '../util/logger.js';
@@ -32,6 +33,7 @@ import {
 } from './transport-queue-revision.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from './transport-queue-store.js';
 import type { QueueRecipientIdentity } from './transport-queue-store.js';
+import type { ProviderActiveTurnDeliveryKind } from '../agent/transport-provider.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
@@ -45,6 +47,17 @@ export interface ResendEntry {
    */
   recipient?: QueueRecipientIdentity;
   supervisionReference?: QueueSupervisionReference;
+  /** Runtime-private routing metadata; never reconstructed from visible text. */
+  activeTurnDeliveryKind?: ProviderActiveTurnDeliveryKind;
+  /** Peer-audit ownership remains valid only inside the current daemon process. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
+  /** Durable task-bound delegation completion marker. */
+  delegationReply?: {
+    delegationId: string;
+  };
   /** User-visible task text — the ORIGINAL marker text used for the timeline. */
   text: string;
   /**
@@ -83,6 +96,51 @@ export interface ResendEntry {
 }
 
 const queues = new Map<string, ResendEntry[]>();
+
+function supervisionReferencesMatch(
+  durable: QueueSupervisionReference | undefined,
+  replay: QueueSupervisionReference | undefined,
+): boolean {
+  return durable === undefined
+    ? replay === undefined
+    : replay !== undefined && isDeepStrictEqual(durable, replay);
+}
+
+/**
+ * R9 wrote supervision authority in the queue row but not its private material,
+ * and omitted an active delivery kind that can be inferred from the retained
+ * private delegation/supervision marker. Accept only that bounded legacy shape;
+ * a metadata-less replay of a stronger durable row remains a conflict.
+ */
+function privateMaterialMatchesReplay(
+  durableJson: string | undefined,
+  replayJson: string,
+  durableReference: QueueSupervisionReference | undefined,
+  replayReference: QueueSupervisionReference | undefined,
+): boolean {
+  if (durableJson === replayJson) return true;
+  if (!durableJson || !supervisionReferencesMatch(durableReference, replayReference)) return false;
+  try {
+    const durable = JSON.parse(durableJson) as Record<string, unknown>;
+    const replay = JSON.parse(replayJson) as Record<string, unknown>;
+    if (durableReference && durable.supervisionReference === undefined) {
+      durable.supervisionReference = durableReference;
+    }
+    if (durable.activeTurnDeliveryKind === undefined) {
+      const delegationReply = durable.delegationReply;
+      if (delegationReply && typeof delegationReply === 'object'
+        && replay.activeTurnDeliveryKind === 'delegation_reply') {
+        durable.activeTurnDeliveryKind = 'delegation_reply';
+      } else if (durableReference && durable.deliveryMode === 'append'
+        && replay.activeTurnDeliveryKind === 'mcp_message') {
+        durable.activeTurnDeliveryKind = 'mcp_message';
+      }
+    }
+    return isDeepStrictEqual(durable, replay);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Append an entry. If the queue is already at MAX_RESEND_ENTRIES the oldest
@@ -148,8 +206,16 @@ function enqueueResendInternal(
     ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
     ...(normalizedEntry.sharedMachineAuthority ? { sharedMachineAuthority: normalizedEntry.sharedMachineAuthority } : {}),
     ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
+    ...(normalizedEntry.activeTurnDeliveryKind
+      ? { activeTurnDeliveryKind: normalizedEntry.activeTurnDeliveryKind }
+      : {}),
+    ...(normalizedEntry.peerAudit ? { peerAudit: normalizedEntry.peerAudit } : {}),
+    ...(normalizedEntry.delegationReply ? { delegationReply: normalizedEntry.delegationReply } : {}),
     ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
     ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
+    ...(normalizedEntry.supervisionReference
+      ? { supervisionReference: normalizedEntry.supervisionReference }
+      : {}),
     ...(normalizedEntry.registeredSystemContract
       ? { registeredSystemContract: normalizedEntry.registeredSystemContract }
       : {}),
@@ -173,13 +239,24 @@ function enqueueResendInternal(
         : undefined;
       const localMatches = !local || JSON.stringify({ ...local, queuedAt: normalizedEntry.queuedAt })
         === JSON.stringify(normalizedEntry);
-      const privateMaterialMatches = existingPrivateMaterial === privateMaterialJson
+      const durableReference = existing.supervisionReference;
+      const referenceMatches = supervisionReferencesMatch(
+        durableReference,
+        normalizedEntry.supervisionReference,
+      );
+      const privateMaterialMatches = privateMaterialMatchesReplay(
+        existingPrivateMaterial,
+        privateMaterialJson,
+        durableReference,
+        normalizedEntry.supervisionReference,
+      )
         // Legacy SQLite-only producers may not have written a private row.
         // Preserve the prior hydration behavior only for identity-less legacy
         // entries; recipient-bound work must match its private authority row.
         || (existingPrivateMaterial === undefined && !normalizedEntry.recipient);
       const exactReplay = existing.text === normalizedEntry.text
         && existing.commandId === normalizedEntry.commandId
+        && referenceMatches
         && privateMaterialMatches
         && localMatches;
       if (!exactReplay) {
@@ -260,8 +337,14 @@ function enqueueResendInternal(
       existing
       && existing.text === normalizedEntry.text
       && existing.commandId === normalizedEntry.commandId
+      && supervisionReferencesMatch(existing.supervisionReference, normalizedEntry.supervisionReference)
       && (
-        existingPrivateMaterial === privateMaterialJson
+        privateMaterialMatchesReplay(
+          existingPrivateMaterial,
+          privateMaterialJson,
+          existing.supervisionReference,
+          normalizedEntry.supervisionReference,
+        )
         || (existingPrivateMaterial === undefined && !normalizedEntry.recipient)
       ),
     );
@@ -464,7 +547,25 @@ export function clearAllResend(): void {
   if (process.env.VITEST) resetTransportQueueStoreForTests();
 }
 
-export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknown;
+/**
+ * The exact SQLite lease transferred with one resend row.  Dispatchers that
+ * stage the row in TransportSessionRuntime must pass this capability through;
+ * the runtime then owns the existing handoff instead of releasing/re-enqueuing
+ * the same clientMessageId through a second durable ownership cycle.
+ */
+export interface ResendHandoffOwnership {
+  clientMessageId: string;
+  handoffId: string;
+}
+
+export type ResendDispatcher = (
+  entry: ResendEntry,
+  ownership: ResendHandoffOwnership,
+) => Promise<unknown> | unknown;
+export const RESEND_DISPATCH_CONTROL = {
+  RETRY: 'retry',
+  STALE: 'stale',
+} as const;
 
 /**
  * Optional callback invoked once at the end of `drainResend` when one or more
@@ -524,6 +625,7 @@ export async function drainResend(
     logger.warn({ sessionName }, 'transport resend drain blocked: entry missing clientMessageId');
     return 0;
   }
+  let handoffs = new Map<string, string>();
   try {
     const leased = getTransportQueueStore().markHandoffInFlight(
       sessionName,
@@ -538,6 +640,7 @@ export async function drainResend(
       logger.warn({ sessionName, requested: freshEntries.length, leased: leased.length }, 'transport queue sqlite handoff lease incomplete for resend drain');
       return 0;
     }
+    handoffs = new Map(leased.map((item) => [item.entry.clientMessageId, item.handoffId]));
   } catch (err) {
     logger.warn({ err, sessionName }, 'transport queue sqlite handoff mark failed for resend drain; preserving resend queue');
     return 0;
@@ -547,6 +650,7 @@ export async function drainResend(
   let dispatched = 0;
   let expiredCount = 0;
   let failedCount = 0;
+  const retryEntries: ResendEntry[] = [];
   for (const entry of list) {
     if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
       if (!entry.clientMessageId) {
@@ -566,14 +670,38 @@ export async function drainResend(
       continue;
     }
     try {
-      const dispatchResult = await dispatch(entry);
       const clientMessageId = entry.clientMessageId;
       if (!clientMessageId) {
         failedCount += 1;
         logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend dispatch finalized as failed: missing clientMessageId');
         continue;
       }
-      if (dispatchResult !== 'queued') {
+      const handoffId = handoffs.get(clientMessageId);
+      if (!handoffId) {
+        failedCount += 1;
+        logger.warn({ sessionName, commandId: entry.commandId, clientMessageId }, 'transport resend dispatch missing committed handoff ownership');
+        continue;
+      }
+      // This is the only ownership transfer edge.  The durable row stays
+      // handoff_inflight while the callback either delivers it directly or
+      // stages it in the runtime under this exact capability.  Making the row
+      // queued before dispatch lets restore/reconnect rehydrate it a second
+      // time; forcing the runtime to acquire another lease parks APPEND rows.
+      const dispatchResult = await dispatch(entry, { clientMessageId, handoffId });
+      if (dispatchResult === RESEND_DISPATCH_CONTROL.RETRY) {
+        getTransportQueueStore().releaseHandoff(sessionName, handoffId, [clientMessageId]);
+        handoffs.delete(clientMessageId);
+        retryEntries.push(entry);
+        continue;
+      }
+      if (dispatchResult === RESEND_DISPATCH_CONTROL.STALE) {
+        // Stale lifecycle authority is not delivery. Delete the live row and
+        // private material without creating a delivery tombstone/evidence.
+        getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared', now, recipient ?? null);
+        handoffs.delete(clientMessageId);
+        continue;
+      }
+      if (dispatchResult !== 'queued' && dispatchResult !== 'appended') {
         try {
           const result = getTransportQueueStore().finalizeSentBatch(
             sessionName,
@@ -587,6 +715,10 @@ export async function drainResend(
           logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite finalizeSent failed for resend entry');
         }
       }
+      // queued/appended means the runtime now owns this exact lease; sent was
+      // finalized above.  In either case the resend holder must never release
+      // or rehydrate the row again.
+      handoffs.delete(clientMessageId);
       dispatched++;
       logger.info(
         { sessionName, commandId: entry.commandId, dispatchResult },
@@ -603,6 +735,7 @@ export async function drainResend(
       }
       try {
         getTransportQueueStore().markFailed(sessionName, clientMessageId, 'dispatch_failed', now);
+        handoffs.delete(clientMessageId);
       } catch (storeErr) {
         logger.warn({ err: storeErr, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed failed for resend entry');
       }
@@ -611,6 +744,15 @@ export async function drainResend(
         'transport resend dispatch failed — dropping entry to avoid loops',
       );
     }
+  }
+  if (retryEntries.length > 0) {
+    const concurrent = queues.get(sessionName) ?? [];
+    const retriedIds = new Set(retryEntries.map((entry) => entry.clientMessageId));
+    queues.set(sessionName, [
+      ...retryEntries,
+      ...concurrent.filter((entry) => !retriedIds.has(entry.clientMessageId)),
+    ]);
+    bumpTransportQueueRevision(sessionName);
   }
   if (expiredCount > 0 && onExpired) {
     try {

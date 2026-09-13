@@ -88,10 +88,10 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
-import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues, recipientFromSessionRecord } from '../daemon/transport-resend-queue.js';
+import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues, recipientFromSessionRecord, RESEND_DISPATCH_CONTROL } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { deliverTransportResendEntry } from './transport-resend-delivery.js';
-import { authorizeQueuedSupervisionHeartbeatDelivery } from '../daemon/supervision-participant-delivery.js';
+import { resolveQueuedSupervisionHeartbeatDelivery } from '../daemon/supervision-participant-delivery.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
@@ -1065,6 +1065,7 @@ export async function stopTransportRuntimeSession(
   sessionName: string,
   options: { preserveTransportQueue?: boolean } = {},
 ): Promise<void> {
+  clearTransportResendAuthorityRetry(sessionName);
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
@@ -1144,6 +1145,14 @@ export async function relaunchSessionWithSettings(
 
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
+const TRANSPORT_RESEND_AUTHORITY_RETRY_BASE_MS = 100;
+const TRANSPORT_RESEND_AUTHORITY_RETRY_MAX_MS = 2_000;
+const TRANSPORT_RESEND_AUTHORITY_RETRY_LIMIT = 6;
+const transportResendAuthorityRetries = new Map<string, {
+  attempts: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  fingerprint: string;
+}>();
 const transportErrorRecoveryInFlight = new Map<string, Promise<boolean>>();
 
 function previewTransportQueueText(text: string): string {
@@ -1426,25 +1435,67 @@ async function recoverTransportRuntimeAfterError(
  * before dispatch, so the overlapping launch + provider-ready drains re-deliver
  * each entry at most once.
  */
+function clearTransportResendAuthorityRetry(sessionName: string): void {
+  const retry = transportResendAuthorityRetries.get(sessionName);
+  if (retry?.timer) clearTimeout(retry.timer);
+  transportResendAuthorityRetries.delete(sessionName);
+}
+
+function scheduleTransportResendAuthorityRetry(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+): void {
+  const fingerprint = getResendEntries(sessionName)
+    .map((entry) => entry.clientMessageId ?? entry.commandId)
+    .join('\n');
+  const existing = transportResendAuthorityRetries.get(sessionName);
+  if (existing && existing.fingerprint !== fingerprint) {
+    if (existing.timer) clearTimeout(existing.timer);
+    transportResendAuthorityRetries.delete(sessionName);
+  }
+  const current = transportResendAuthorityRetries.get(sessionName)
+    ?? { attempts: 0, timer: null, fingerprint };
+  if (current.timer || current.attempts >= TRANSPORT_RESEND_AUTHORITY_RETRY_LIMIT) return;
+  const attempts = current.attempts + 1;
+  const delayMs = Math.min(
+    TRANSPORT_RESEND_AUTHORITY_RETRY_BASE_MS * 2 ** (attempts - 1),
+    TRANSPORT_RESEND_AUTHORITY_RETRY_MAX_MS,
+  );
+  const timer = setTimeout(() => {
+    const state = transportResendAuthorityRetries.get(sessionName);
+    if (!state || state.timer !== timer) return;
+    state.timer = null;
+    void drainTransportResendQueueIntoRuntime(runtime, sessionName, 'authority-retry');
+  }, delayMs);
+  timer.unref?.();
+  transportResendAuthorityRetries.set(sessionName, { attempts, timer, fingerprint });
+}
+
 async function drainTransportResendQueueIntoRuntime(
   runtime: TransportSessionRuntime,
   sessionName: string,
-  context: 'reconnect' | 'launch' | 'provider-ready' | 'explicit-dispatch',
+  context: 'reconnect' | 'launch' | 'provider-ready' | 'explicit-dispatch' | 'authority-retry',
 ): Promise<void> {
   const pendingCount = getResendCount(sessionName);
-  if (pendingCount === 0) return;
+  if (pendingCount === 0) {
+    clearTransportResendAuthorityRetry(sessionName);
+    return;
+  }
   logger.info({ session: sessionName, pendingCount, context }, 'Draining transport resend queue');
   try {
     await drainResend(
       sessionName,
-      async (entry) => {
-        if (!authorizeQueuedSupervisionHeartbeatDelivery({
+      async (entry, ownership) => {
+        const admission = resolveQueuedSupervisionHeartbeatDelivery({
           targetSessionName: sessionName,
           clientMessageId: entry.clientMessageId ?? entry.commandId ?? '',
           text: entry.text,
-        })) return 'failed';
+          supervisionReference: entry.supervisionReference,
+        });
+        if (admission === 'stale') return RESEND_DISPATCH_CONTROL.STALE;
+        if (admission === 'retry') return RESEND_DISPATCH_CONTROL.RETRY;
         const attachments = entry.attachments ?? [];
-        const result = await deliverTransportResendEntry(runtime, entry);
+        const result = await deliverTransportResendEntry(runtime, entry, ownership);
         if ((result === 'sent' || result === 'appended') && !entry.timelineCommitted) {
           const clientMessageId = entry.clientMessageId;
           if (!clientMessageId) {
@@ -1545,8 +1596,14 @@ async function drainTransportResendQueueIntoRuntime(
       ),
       { source: 'daemon', confidence: 'high' },
     );
+    if (getResendCount(sessionName) > 0) {
+      scheduleTransportResendAuthorityRetry(runtime, sessionName);
+    } else {
+      clearTransportResendAuthorityRetry(sessionName);
+    }
   } catch (err) {
     logger.warn({ err, session: sessionName, context }, 'transport resend drain failed');
+    if (getResendCount(sessionName) > 0) scheduleTransportResendAuthorityRetry(runtime, sessionName);
   }
 }
 
@@ -1828,10 +1885,11 @@ function wireTransportCallbacks(
       { source: 'daemon', confidence: 'high' },
     );
   };
-  runtime.pendingDrainAdmission = (entry) => authorizeQueuedSupervisionHeartbeatDelivery({
+  runtime.pendingDrainAdmission = (entry) => resolveQueuedSupervisionHeartbeatDelivery({
     targetSessionName: sessionName,
     clientMessageId: entry.clientMessageId,
     text: entry.text,
+    supervisionReference: entry.supervisionReference,
   });
   runtime.onActiveAppend = (messages, snapshot) => {
     const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);

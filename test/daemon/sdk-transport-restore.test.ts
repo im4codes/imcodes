@@ -1745,9 +1745,15 @@ describe('sdk transport session restore', () => {
     // Pre-populate the resend queue with messages that arrived while
     // the runtime was offline.
     const queuedAt = Date.now();
-    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-1', commandId: 'cmd-q1', queuedAt });
-    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-2', commandId: 'cmd-q2', queuedAt });
-    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-3', commandId: 'cmd-q3', queuedAt });
+    enqueueResend('deck_sdk_drain_brain', {
+      text: 'offline-msg-1', commandId: 'cmd-q1', clientMessageId: 'offline-id-1', queuedAt,
+    });
+    enqueueResend('deck_sdk_drain_brain', {
+      text: 'offline-msg-2', commandId: 'cmd-q2', clientMessageId: 'offline-id-2', queuedAt,
+    });
+    enqueueResend('deck_sdk_drain_brain', {
+      text: 'offline-msg-3', commandId: 'cmd-q3', clientMessageId: 'offline-id-3', queuedAt,
+    });
 
     expect(getResendCount('deck_sdk_drain_brain')).toBe(3);
 
@@ -1801,6 +1807,16 @@ describe('sdk transport session restore', () => {
         && (call[2] as { text?: unknown } | undefined)?.text === text
       ));
       expect(matchingUserEvents, `${text} should have exactly one timeline owner after restore drain`).toHaveLength(1);
+    }
+    // Each durable queue identity has one owner throughout resend -> runtime
+    // transfer. A second SQLite rehydrate would duplicate the payload above;
+    // retaining the original handoff until runtime finalization instead leaves
+    // one tombstone per id and no live row.
+    const queueSnapshot = getTransportQueueStore().readSnapshot('deck_sdk_drain_brain');
+    expect(queueSnapshot.pendingMessageEntries).toEqual([]);
+    for (const clientMessageId of ['offline-id-1', 'offline-id-2', 'offline-id-3']) {
+      expect(getTransportQueueStore().hasDeliveryTombstone('deck_sdk_drain_brain', clientMessageId))
+        .toBe(true);
     }
   });
 

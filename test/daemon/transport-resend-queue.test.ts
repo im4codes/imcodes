@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   enqueueResend,
+  enqueueDurableResend,
   getFreshResendEntries,
   getResendEntries,
   getResendCount,
@@ -11,6 +12,7 @@ import {
   drainResend,
   RESEND_EXPIRY_MS,
   MAX_RESEND_ENTRIES,
+  RESEND_DISPATCH_CONTROL,
 } from '../../src/daemon/transport-resend-queue.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
@@ -19,6 +21,58 @@ beforeEach(() => {
 });
 
 describe('transport-resend-queue', () => {
+  it.each([
+    ['stale', RESEND_DISPATCH_CONTROL.STALE, 0, 0],
+    ['temporary', RESEND_DISPATCH_CONTROL.RETRY, 1, 1],
+  ] as const)('keeps %s authority rejection distinct from delivery evidence', async (
+    _label, decision, expectedMemory, expectedDurable,
+  ) => {
+    const sessionName = `authority-${decision}`;
+    const messageId = `message-${decision}`;
+    expect(enqueueResend(sessionName, {
+      text: 'daemon control', commandId: messageId, clientMessageId: messageId, queuedAt: Date.now(),
+    }).accepted).toBe(true);
+
+    await expect(drainResend(sessionName, () => decision)).resolves.toBe(0);
+
+    expect(getResendCount(sessionName)).toBe(expectedMemory);
+    expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries)
+      .toHaveLength(expectedDurable);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, messageId)).toBe(false);
+  });
+
+  it('retries a transient supervision row without blocking its ordinary FIFO tail', async () => {
+    const sessionName = 'authority-retry-no-hol';
+    const supervisionId = 'supervision-retry-head';
+    const ordinaryId = 'ordinary-tail';
+    expect(enqueueResend(sessionName, {
+      text: 'transient supervision', commandId: supervisionId,
+      clientMessageId: supervisionId, queuedAt: Date.now(),
+    }).accepted).toBe(true);
+    expect(enqueueResend(sessionName, {
+      text: 'ordinary user message', commandId: ordinaryId,
+      clientMessageId: ordinaryId, queuedAt: Date.now(),
+    }).accepted).toBe(true);
+
+    const firstDispatch = vi.fn((entry: { clientMessageId?: string }) => (
+      entry.clientMessageId === supervisionId ? RESEND_DISPATCH_CONTROL.RETRY : 'sent'
+    ));
+    await expect(drainResend(sessionName, firstDispatch)).resolves.toBe(1);
+    expect(firstDispatch.mock.calls.map(([entry]) => entry.clientMessageId))
+      .toEqual([supervisionId, ordinaryId]);
+    expect(getResendEntries(sessionName).map((entry) => entry.clientMessageId)).toEqual([supervisionId]);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, supervisionId)).toBe(false);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, ordinaryId)).toBe(true);
+
+    await expect(drainResend(sessionName, () => RESEND_DISPATCH_CONTROL.RETRY)).resolves.toBe(0);
+    expect(getResendEntries(sessionName).map((entry) => entry.clientMessageId)).toEqual([supervisionId]);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, supervisionId)).toBe(false);
+
+    await expect(drainResend(sessionName, () => 'sent')).resolves.toBe(1);
+    expect(getResendCount(sessionName)).toBe(0);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, supervisionId)).toBe(true);
+  });
+
   it('stores appended entries in FIFO order', () => {
     enqueueResend('s1', { text: 'a', commandId: 'c1', queuedAt: 10 });
     enqueueResend('s1', { text: 'b', commandId: 'c2', queuedAt: 20 });
@@ -44,6 +98,47 @@ describe('transport-resend-queue', () => {
     expect(JSON.parse(
       getTransportQueueStore().readPrivateDispatchMaterial('s-append', 'msg-append') ?? '{}',
     )).toMatchObject({ deliveryMode: 'append' });
+  });
+
+  it('rejects a weaker metadata-less replay of an existing private-authority row', () => {
+    const supervisionReference = {
+      kind: 'implementation_blocker' as const,
+      taskId: 'tsk-strong-replay',
+      assignmentId: 'asg-strong-replay',
+      exactError: 'automatic audit routing blocked',
+      revision: 'strong-replay-r1',
+    };
+    const strong = {
+      text: 'authorized control wake',
+      commandId: 'cmd-strong-replay',
+      clientMessageId: 'msg-strong-replay',
+      deliveryMode: 'append' as const,
+      activeTurnDeliveryKind: 'mcp_message' as const,
+      delegationReply: { delegationId: 'delegation-strong-replay' },
+      supervisionReference,
+      queuedAt: Date.now(),
+    };
+    // Seed SQLite only so the durable idempotency gate—not a coincidental
+    // in-memory copy—must reject the weaker replay.
+    expect(enqueueDurableResend('s-strong-replay', strong)).toMatchObject({ accepted: true });
+
+    const weaker = enqueueResend('s-strong-replay', {
+      text: strong.text,
+      commandId: strong.commandId,
+      clientMessageId: strong.clientMessageId,
+      queuedAt: strong.queuedAt + 2,
+    });
+    expect(weaker).toMatchObject({ accepted: false, reason: 'idempotency_conflict' });
+    expect(enqueueResend('s-strong-replay', { ...strong, queuedAt: strong.queuedAt + 1 }))
+      .toMatchObject({ accepted: true });
+    expect(getResendEntries('s-strong-replay')).toEqual([
+      expect.objectContaining({
+        clientMessageId: strong.clientMessageId,
+        activeTurnDeliveryKind: 'mcp_message',
+        delegationReply: strong.delegationReply,
+        supervisionReference,
+      }),
+    ]);
   });
 
   it('persists typed supervision authority separately from display text', () => {
@@ -228,6 +323,8 @@ describe('transport-resend-queue', () => {
       expect.objectContaining({
         clientMessageId: 'msg-runtime-queued',
         commandId: 'cmd-runtime-queued',
+        // The live runtime owns the exact outer reconnect lease. Keeping the row
+        // handoff_inflight prevents a restore rehydrate from staging it twice.
         status: 'handoff_inflight',
       }),
     ]);
@@ -256,7 +353,10 @@ describe('transport-resend-queue', () => {
 
     expect(count).toBe(1);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ commandId: 'c-fresh' }));
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'c-fresh' }),
+      expect.objectContaining({ clientMessageId: expect.any(String), handoffId: expect.any(String) }),
+    );
     expect(getResendCount('s1')).toBe(0);
   });
 

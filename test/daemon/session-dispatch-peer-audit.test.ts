@@ -212,6 +212,25 @@ describe('peer-audit dedicated dispatch', () => {
     expect(enqueueResendMock).not.toHaveBeenCalled();
   });
 
+  it('returns temporary supervision authority to the durable producer without FIFO fallback', async () => {
+    appendExternalMock.mockResolvedValue('retry');
+    const queueSupervisionReference = {
+      kind: 'exact_integration' as const,
+      taskId: 'tsk_retry', assignmentId: 'asg_retry', revision: 'r1',
+    };
+
+    await expect(dispatchSessionMessage(target(), 'retry later', {
+      dispatchId: 'send_dispatch_retry' as never,
+      messageId: 'send_message_retry' as never,
+      deliveryMode: 'append',
+      queueSupervisionReference,
+    })).rejects.toThrow('transport supervision authority temporarily unavailable');
+    expect(appendExternalMock).toHaveBeenCalledWith(
+      'retry later', 'send_message_retry', queueSupervisionReference,
+    );
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
   it('keeps explicit queue delivery in ordinary FIFO without active-turn append', async () => {
     sendMock.mockReturnValue('queued');
 
@@ -230,6 +249,7 @@ describe('peer-audit dedicated dispatch', () => {
       dispatchId: 'send_dispatch_12345678' as never,
       messageId: 'send_message_12345678' as never,
       durableQueue: true,
+      deliveryMode: 'append',
       suppressTimeline: true,
       queueSupervisionReference: {
         kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
@@ -243,6 +263,7 @@ describe('peer-audit dedicated dispatch', () => {
       supervisionReference: {
         kind: 'exact_integration', taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'r1',
       },
+      deliveryMode: 'append',
       timelineCommitted: true,
     }));
     expect(drainTransportResendQueueForDispatchMock).toHaveBeenCalledWith('deck_sub_audit123');

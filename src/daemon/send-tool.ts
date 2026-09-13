@@ -2739,7 +2739,11 @@ function hasDurableDeliveryEvidence(sessionName: string, messageId: SendMessageI
     const store = getTransportQueueStore();
     if (store.hasDeliveryTombstone(sessionName, messageId)) return true;
     return store.readSnapshot(sessionName).pendingMessageEntries.some(
-      (entry) => entry.clientMessageId === messageId && entry.status === 'queued',
+      // A committed handoff may already be inside an irreversible provider
+      // admission. Treat every pending projection for the deterministic id as
+      // delivery evidence; replaying merely because it is no longer `queued`
+      // duplicates automatic control traffic in the unknown-outcome window.
+      (entry) => entry.clientMessageId === messageId,
     );
   } catch {
     return false;
@@ -3146,11 +3150,12 @@ function matchingAutomaticAuditRoutingBlocker(
   if (!task.blocker || task.blocker !== implementer.blocker) return undefined;
   try {
     const parsed = JSON.parse(task.blocker) as Record<string, unknown>;
+    const revision = task.currentRevision ?? implementer.auditRevision ?? '';
     return parsed.kind === AUTOMATIC_AUDIT_ROUTING_BLOCKER_KIND
       && parsed.taskId === task.taskId
       && parsed.assignmentId === implementer.assignmentId
-      && parsed.revision === task.currentRevision
-      && parsed.attemptId === automaticAuditAttemptId(task.taskId, task.currentRevision ?? '')
+      && (typeof parsed.revision === 'string' ? parsed.revision : '') === revision
+      && (parsed.attemptId === undefined || parsed.attemptId === automaticAuditAttemptId(task.taskId, revision))
       ? task.blocker
       : undefined;
   } catch {
@@ -3169,11 +3174,28 @@ async function reportAutomaticAuditBlocker(
   const origin = exactLiveSessionForAssignment(implementer, sessions);
   const target = exactLiveSessionForAssignment(coordinator, sessions);
   if (!origin || !target || target.role !== 'brain') return false;
-  const messageId = deterministicSendMessageId(`auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`);
+  const durableRevision = task.currentRevision ?? implementer.auditRevision ?? '';
+  const messageId = deterministicSendMessageId(`auto-audit-blocker:${task.taskId}:${durableRevision}:${exactError}`);
   const queueReference: QueueSupervisionReference = {
     kind: 'implementation_blocker', taskId: task.taskId, assignmentId: implementer.assignmentId, exactError,
-    revision: task.currentRevision ?? implementer.auditRevision ?? '',
+    revision: durableRevision,
   };
+  const blocker = automaticBlockerMessage({
+    taskId: task.taskId,
+    assignmentId: implementer.assignmentId,
+    revision: durableRevision || undefined,
+    attemptId: task.currentRevision
+      ? automaticAuditAttemptId(task.taskId, task.currentRevision)
+      : undefined,
+    exactError,
+  });
+  const persisted = (deps.registry ?? getSupervisionTaskRegistry()).recordAutomaticAuditRoutingBlocker({
+    taskId: task.taskId,
+    assignmentId: implementer.assignmentId,
+    blocker,
+    now: deps.now?.() ?? Date.now(),
+  });
+  if (!persisted.ok) return false;
   if (bindExistingQueueSupervisionReference(target.name, messageId, queueReference)) return true;
   const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
   if (hasEvidence(target.name, messageId)) return true;
@@ -3184,16 +3206,8 @@ async function reportAutomaticAuditBlocker(
     projectRoot: origin.projectDir,
   }, {
     target: target.name,
-    message: automaticBlockerMessage({
-      taskId: task.taskId,
-      assignmentId: implementer.assignmentId,
-      revision: task.currentRevision,
-      attemptId: task.currentRevision
-        ? automaticAuditAttemptId(task.taskId, task.currentRevision)
-        : undefined,
-      exactError,
-    }),
-    idempotencyKey: `auto-audit-blocker:${task.taskId}:${task.currentRevision ?? ''}:${exactError}`,
+    message: blocker,
+    idempotencyKey: `auto-audit-blocker:${task.taskId}:${durableRevision}:${exactError}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
     internalQueueSupervisionReference: queueReference,

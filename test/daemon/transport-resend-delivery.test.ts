@@ -79,6 +79,38 @@ describe('transport resend delivery policy', () => {
     expect(harness.send).not.toHaveBeenCalled();
   });
 
+  it('threads delegation/private routing authority through native append and FIFO fallback', async () => {
+    const harness = runtimeHarness();
+    harness.appendExternalMessageToActiveTurn.mockResolvedValue('unsupported');
+    harness.send.mockReturnValue('queued');
+    const delegationReply = { delegationId: 'delegation-resend-private' };
+    const entry = {
+      text: 'delegation completed',
+      commandId: 'cmd-delegation-private',
+      clientMessageId: 'msg-delegation-private',
+      deliveryMode: 'append' as const,
+      activeTurnDeliveryKind: 'delegation_reply' as const,
+      delegationReply,
+      queuedAt: Date.now(),
+    };
+
+    await expect(deliverTransportResendEntry(harness.runtime, entry)).resolves.toBe('queued');
+    expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+      entry.text,
+      entry.clientMessageId,
+      undefined,
+      undefined,
+      { activeTurnDeliveryKind: 'delegation_reply', delegationReply },
+    );
+    expect(harness.send).toHaveBeenCalledWith(
+      entry.text,
+      entry.clientMessageId,
+      undefined,
+      undefined,
+      { activeTurnDeliveryKind: 'delegation_reply', delegationReply },
+    );
+  });
+
   it.each(['stale', 'unsupported'] as const)(
     'falls back to the durable runtime FIFO when native append returns %s',
     async (appendResult) => {
@@ -91,19 +123,57 @@ describe('transport resend delivery policy', () => {
         commandId: 'cmd-fallback',
         clientMessageId: 'msg-fallback',
         deliveryMode: 'append',
+        supervisionReference: {
+          kind: 'implementation_blocker',
+          taskId: 'tsk_wake',
+          assignmentId: 'asg_worker',
+          revision: 'wake-r1',
+          exactError: 'auditor unavailable',
+        },
         queuedAt: Date.now(),
       })).resolves.toBe('queued');
 
       expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledOnce();
+      expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+        'keep me durable',
+        'msg-fallback',
+        expect.objectContaining({
+          kind: 'implementation_blocker',
+          taskId: 'tsk_wake',
+          assignmentId: 'asg_worker',
+        }),
+      );
       expect(harness.send).toHaveBeenCalledWith(
         'keep me durable',
-        'cmd-fallback',
+        'msg-fallback',
         undefined,
         undefined,
-        {},
+        {
+          supervisionReference: {
+            kind: 'implementation_blocker',
+            taskId: 'tsk_wake',
+            assignmentId: 'asg_worker',
+            revision: 'wake-r1',
+            exactError: 'auditor unavailable',
+          },
+        },
       );
     },
   );
+
+  it('propagates temporary authority unavailability without falling back or fabricating delivery', async () => {
+    const harness = runtimeHarness();
+    harness.appendExternalMessageToActiveTurn.mockResolvedValue('retry');
+
+    await expect(deliverTransportResendEntry(harness.runtime, {
+      text: 'retry exact control row',
+      commandId: 'cmd-retry',
+      clientMessageId: 'msg-retry',
+      deliveryMode: 'append',
+      queuedAt: Date.now(),
+    })).resolves.toBe('retry');
+    expect(harness.send).not.toHaveBeenCalled();
+  });
 
   it('keeps attachment-bearing restore entries on the ordinary supported path', async () => {
     const harness = runtimeHarness();
@@ -154,7 +224,7 @@ describe('transport resend delivery policy', () => {
     expect(harness.appendExternalMessageToActiveTurn).not.toHaveBeenCalled();
     expect(harness.send).toHaveBeenCalledWith(
       'compact cron ref',
-      'cron-command',
+      'cron-message',
       undefined,
       undefined,
       { registeredSystemContract },

@@ -35,6 +35,8 @@ import logger from '../util/logger.js';
 import { advanceSupervisionTaskAfterAuditReceipt } from './supervision-convergence-wire.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
+import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../agent/transport-provider.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const inFlight = new Map<string, Promise<DelegationReplyIngressResult>>();
@@ -429,14 +431,12 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
     // so neither a timer nor a user reminder can duplicate the wake.
     if (taskBound) {
       const queueStore = getTransportQueueStore();
+      const durableQueueOwnsNotification = () => queueStore.readSnapshot(record.origin.sessionName)
+        .pendingMessageEntries.some((entry) => entry.clientMessageId === record.notificationId);
       const alreadyCommitted = queueStore.hasDeliveryTombstone(
         record.origin.sessionName,
         record.notificationId,
-      ) || queueStore.readSnapshot(record.origin.sessionName)
-        .pendingMessageEntries.some((entry) => (
-          entry.clientMessageId === record.notificationId
-          && entry.status === 'queued'
-        ));
+      ) || durableQueueOwnsNotification();
       if (alreadyCommitted) {
         if (getDelegationReplyStore().markDelivered(record.delegationId, record.notificationId)) {
           const delivered = getDelegationReplyStore().getMessage(
@@ -456,15 +456,18 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
           {
             timelineCommitted: true,
             historyCommitted: true,
+            // A task-bound completion is actionable coordinator input. Stage it
+            // in the exact durable FIFO as before, but ask the runtime to admit
+            // it at the provider's next safe boundary so a Brain parked in
+            // wait_agent resumes without a human Append click. Unsupported
+            // providers retain the ordinary completion-drain fallback.
+            deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+            activeTurnDeliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
             delegationReply: { delegationId: record.delegationId },
           },
         );
         const durablyQueued = disposition === 'queued'
-          && queueStore.readSnapshot(record.origin.sessionName)
-            .pendingMessageEntries.some((entry) => (
-              entry.clientMessageId === record.notificationId
-              && entry.status === 'queued'
-            ));
+          && durableQueueOwnsNotification();
         if (disposition === 'sent' || durablyQueued) {
           if (getDelegationReplyStore().markDelivered(record.delegationId, record.notificationId)) {
             const delivered = getDelegationReplyStore().getMessage(

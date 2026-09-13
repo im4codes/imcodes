@@ -2607,7 +2607,7 @@ export class SupervisionTaskRegistry {
         return { ok: false, reason: 'not_found' };
       }
       if (task.status !== 'ready_for_audit'
-        || assignment.status !== 'ready_for_audit'
+        || isTerminalSupervisionTaskStatus(assignment.status)
         || !assignment.required
         || (assignment.role !== 'implementer' && assignment.role !== 'integration_owner')) {
         this.#db.exec('ROLLBACK');

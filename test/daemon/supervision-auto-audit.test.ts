@@ -18,7 +18,11 @@ import {
   deterministicSendMessageId,
   type SendMessageId,
 } from '../../shared/send-message-id.js';
-import type { SessionRecord } from '../../src/store/session-store.js';
+import { removeSession, upsertSession, type SessionRecord } from '../../src/store/session-store.js';
+import {
+  authorizeQueuedSupervisionHeartbeatDelivery,
+  resolveQueuedSupervisionHeartbeatDelivery,
+} from '../../src/daemon/supervision-participant-delivery.js';
 import {
   clearSendIdempotencyCacheForTests,
   dispatchReadyAudit,
@@ -42,6 +46,13 @@ import {
   getTransportQueueStore,
   resetTransportQueueStoreForTests,
 } from '../../src/daemon/transport-queue-store.js';
+import {
+  clearAllResend,
+  drainResend,
+  enqueueResend,
+  getResendCount,
+  RESEND_DISPATCH_CONTROL,
+} from '../../src/daemon/transport-resend-queue.js';
 import {
   getDelegationReplyStore,
   resetDelegationReplyStoreForTests,
@@ -473,6 +484,108 @@ describe('automatic supervision audit materialization', () => {
       status: 'ready_for_integration', auditAttemptId: shape.attemptId,
       auditRevision: shape.revision, verdict: 'PASS', crossVendorAuditPassed: true,
     });
+  });
+
+  it('authorizes an exact integration wake across the Brain runtime epoch rotation', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const shape = settleReadyTask('PASS', 'integration-epoch-rotation', registry);
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    upsertSession(brain);
+    upsertSession(worker);
+    const dispatch = vi.fn().mockResolvedValue({
+      status: 'accepted',
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000e1',
+      messageId: 'send_message_00000000-0000-5000-a000-0000000000e1',
+      deliveries: [{ target: brain.name, status: 'queued' }],
+    });
+    try {
+      await expect(dispatchReadyIntegration(shape.taskId, {
+        registry,
+        listSessions: () => [brain, worker],
+        dispatch,
+        hasDeliveryEvidence: () => false,
+        inspectAssignmentWorktree: () => ({
+          worktreePath: '/tmp/integration-epoch-rotation/repo', headSha: 'a'.repeat(40),
+          files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+          stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+        }),
+      })).resolves.toMatchObject({ status: 'dispatched' });
+      const sent = dispatch.mock.calls[0]![1];
+      const reference = sent.internalQueueSupervisionReference;
+      const messageId = sent.internalMessageId!;
+      const owner = registry.get(shape.taskId)!.assignments.find(
+        (assignment) => assignment.role === 'integration_owner',
+      )!;
+      upsertSession({ ...brain, runtimeEpoch: `${brain.runtimeEpoch}-rotated`, updatedAt: brain.updatedAt + 1 });
+
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: brain.name,
+        clientMessageId: sent.internalMessageId,
+        text: sent.message,
+        supervisionReference: reference,
+      })).toBe(true);
+      expect(registry.getAssignment(owner.assignmentId)?.identity.runtimeEpoch)
+        .toBe(brain.runtimeEpoch);
+
+      const queued = enqueueResend(brain.name, {
+        text: sent.message,
+        commandId: messageId,
+        clientMessageId: messageId,
+        supervisionReference: reference,
+        queuedAt: Date.now(),
+      });
+      expect(queued).toMatchObject({ accepted: true });
+      const delivered: string[] = [];
+      const deliver = async (entry: Parameters<typeof enqueueResend>[1]) => {
+        const admission = resolveQueuedSupervisionHeartbeatDelivery({
+          targetSessionName: brain.name,
+          clientMessageId: entry.clientMessageId ?? entry.commandId ?? '',
+          text: entry.text,
+          supervisionReference: entry.supervisionReference,
+        });
+        if (admission === 'retry') return RESEND_DISPATCH_CONTROL.RETRY;
+        if (admission === 'stale') return RESEND_DISPATCH_CONTROL.STALE;
+        delivered.push(entry.clientMessageId ?? entry.commandId ?? '');
+        return 'sent' as const;
+      };
+
+      removeSession(brain.name);
+      await expect(drainResend(brain.name, deliver)).resolves.toBe(0);
+      expect(getResendCount(brain.name)).toBe(1);
+      expect(getTransportQueueStore().hasDeliveryTombstone(brain.name, messageId))
+        .toBe(false);
+
+      upsertSession({ ...brain, state: 'stopped', updatedAt: brain.updatedAt + 2 });
+      await expect(drainResend(brain.name, deliver)).resolves.toBe(0);
+      expect(getResendCount(brain.name)).toBe(1);
+      expect(getTransportQueueStore().hasDeliveryTombstone(brain.name, messageId))
+        .toBe(false);
+
+      upsertSession({ ...brain, state: 'idle', updatedAt: brain.updatedAt + 3 });
+      await expect(drainResend(brain.name, deliver)).resolves.toBe(1);
+      await expect(drainResend(brain.name, deliver)).resolves.toBe(0);
+      expect(delivered).toEqual([messageId]);
+      expect(getResendCount(brain.name)).toBe(0);
+      expect(registry.applyTaskIntent({
+        taskId: shape.taskId,
+        assignmentId: owner.assignmentId,
+        intent: 'cancel',
+        toStatus: 'cancelled',
+        note: 'terminal owner cannot retain queued integration authority',
+      })).toMatchObject({ ok: true });
+      upsertSession({ ...brain, state: 'stopped', updatedAt: brain.updatedAt + 2 });
+      expect(resolveQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: brain.name,
+        clientMessageId: sent.internalMessageId,
+        text: sent.message,
+        supervisionReference: reference,
+      })).toBe('stale');
+    } finally {
+      clearAllResend();
+      removeSession(brain.name);
+      removeSession(worker.name);
+    }
   });
 
   it.each(['start', 'heartbeat', 'checkpoint'] as const)(
@@ -2152,6 +2265,46 @@ describe('automatic supervision audit materialization', () => {
     }
   });
 
+  it('classifies a mirrored non-JSON automatic-audit blocker as stale authority', () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({
+      taskId: 'malformed-automatic-audit-authority',
+      revision: 'malformed-automatic-audit-authority-r1',
+      auditPolicy: 'auto_strict_cross_vendor',
+      registry,
+    });
+    const brain = session('deck_alpha_brain', 'brain');
+    const malformedBlocker = 'waiting on CI logs; will retry';
+    upsertSession(brain);
+    try {
+      expect(registry.recordAutomaticAuditRoutingBlocker({
+        taskId: ready.taskId,
+        assignmentId: ready.worker.assignmentId,
+        blocker: malformedBlocker,
+        now: 100,
+      })).toMatchObject({ ok: true });
+      expect(registry.getTaskRecord(ready.taskId)?.blocker).toBe(malformedBlocker);
+      expect(registry.getAssignment(ready.worker.assignmentId)?.blocker).toBe(malformedBlocker);
+
+      expect(resolveQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: brain.name,
+        clientMessageId: deterministicSendMessageId(
+          `automatic-audit-blocker:${ready.taskId}:${ready.revision}:malformed`,
+        ),
+        text: malformedBlocker,
+        supervisionReference: {
+          kind: 'implementation_blocker',
+          taskId: ready.taskId,
+          assignmentId: ready.worker.assignmentId,
+          revision: ready.revision,
+          exactError: 'automatic audit routing is blocked',
+        },
+      })).toBe('stale');
+    } finally {
+      removeSession(brain.name);
+    }
+  });
+
   it('selects an authorized ready transport before spawn or a busy FIFO', async () => {
     const { registry, taskId } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });
     const worker = session('deck_alpha_worker', 'w1');
@@ -2848,7 +3001,13 @@ describe('automatic supervision audit materialization', () => {
       hasDeliveryEvidence: (_s: string, messageId: SendMessageId) => delivered.has(String(messageId)),
     };
 
-    const before = JSON.stringify(registry.get(taskId));
+    const beforeAssignments = registry.listAssignments(taskId).map((assignment) => ({
+      assignmentId: assignment.assignmentId,
+      role: assignment.role,
+      status: assignment.status,
+      identity: assignment.identity,
+      auditRevision: assignment.auditRevision,
+    }));
     const first = await dispatchReadyAudit(taskId, deps);
     const secondRun = await dispatchReadyAudit(taskId, deps);
     const third = await dispatchReadyAudit(taskId, deps);
@@ -2859,8 +3018,23 @@ describe('automatic supervision audit materialization', () => {
     // ONE question, not one per tick.
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(delivered.size).toBe(1);
-    // And nothing was decided while waiting for the answer.
-    expect(JSON.stringify(registry.get(taskId))).toBe(before);
+    // The question itself is now durable authority for its queued row, while
+    // role/status/identity/revision ownership remains unchanged.
+    expect(registry.listAssignments(taskId).map((assignment) => ({
+      assignmentId: assignment.assignmentId,
+      role: assignment.role,
+      status: assignment.status,
+      identity: assignment.identity,
+      auditRevision: assignment.auditRevision,
+    }))).toEqual(beforeAssignments);
+    const durable = registry.get(taskId)!;
+    expect(durable.blocker).toBe(durable.assignments.find(
+      (assignment) => assignment.assignmentId !== second.value.assignmentId && assignment.role === 'implementer',
+    )?.blocker);
+    expect(JSON.parse(durable.blocker!)).toMatchObject({
+      kind: 'automatic_audit_routing', taskId, revision,
+      exactError: 'automatic audit requires one exact ready implementer revision',
+    });
   });
 
   it('leaves process-only candidates unmaterialized and reports one durable Brain blocker', async () => {
@@ -4185,7 +4359,18 @@ describe('R5: deterministic implementer/revision alignment before materializatio
       hasDeliveryEvidence: () => false,
     });
     expect(result).toMatchObject({ status: 'blocked' });
-    expect(registry.getAssignment(worker.assignmentId)).toEqual(before);
+    // n23 caller-revision authority persists the deterministic routing
+    // blocker before dispatch.  That is the only permitted mutation here;
+    // the unvalidated owner must not be lifecycle-aligned or materialized.
+    const after = registry.getAssignment(worker.assignmentId)!;
+    expect({ ...after, blocker: before.blocker, updatedAt: before.updatedAt }).toEqual(before);
+    expect(JSON.parse(after.blocker!)).toMatchObject({
+      kind: 'automatic_audit_routing',
+      taskId,
+      assignmentId: worker.assignmentId,
+      revision: 'r5-unvalidated',
+      exactError: 'automatic audit requires one exact ready implementer revision',
+    });
     expect(registry.listAssignments(taskId).filter((a) => a.role === 'auditor')).toEqual([]);
   });
 

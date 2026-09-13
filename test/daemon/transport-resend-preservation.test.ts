@@ -1,23 +1,12 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import type { PendingTransportMessage, TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import { clearAllResend, enqueueResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../../src/daemon/transport-resend-preservation.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
 function runtimeSnapshot(
-  activeDispatchEntries: Array<{
-    clientMessageId: string;
-    text: string;
-    messagePreamble?: string;
-    sharedActor?: Record<string, unknown>;
-    registeredSystemContract?: { contractId: string; signature: string; body: string };
-  }>,
-  pendingEntries: Array<{
-    clientMessageId: string;
-    text: string;
-    messagePreamble?: string;
-    sharedActor?: Record<string, unknown>;
-    registeredSystemContract?: { contractId: string; signature: string; body: string };
-  }>,
+  activeDispatchEntries: PendingTransportMessage[],
+  pendingEntries: PendingTransportMessage[],
 ): TransportSessionRuntime {
   return {
     activeDispatchEntries,
@@ -106,6 +95,7 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
       preservedCount: 1,
       activeCount: 1,
       pendingCount: 2,
+      rejectedCount: 1,
     });
     expect(getResendEntries('deck_preserve_brain').map((entry) => entry.commandId)).toEqual([
       'cmd-active',
@@ -115,5 +105,70 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
       'already queued',
       'queued once',
     ]);
+  });
+
+  it('preserves every private authority field while making peer-audit lifetime explicit', () => {
+    const supervisionReference = {
+      kind: 'implementation_blocker' as const,
+      taskId: 'tsk-private-authority',
+      assignmentId: 'asg-private-authority',
+      exactError: 'automatic audit routing blocked',
+      revision: 'private-authority-r1',
+    };
+    const runtime = runtimeSnapshot([], [
+      {
+        clientMessageId: 'private-supervision',
+        text: 'supervision wake',
+        deliveryMode: 'append',
+        activeTurnDeliveryKind: 'mcp_message',
+        supervisionReference,
+      },
+      {
+        clientMessageId: 'private-delegation',
+        text: 'delegation completed',
+        deliveryMode: 'append',
+        activeTurnDeliveryKind: 'delegation_reply',
+        delegationReply: { delegationId: 'delegation-private-1' },
+      },
+      {
+        clientMessageId: 'private-peer-audit',
+        text: 'peer audit brief',
+        peerAudit: { contractVersion: 'v1', attemptHash: 'attempt-private-1' },
+      },
+    ]);
+
+    expect(preserveTransportRuntimeQueuesToResend('deck_preserve_private', runtime))
+      .toMatchObject({ preservedCount: 3, rejectedCount: 0 });
+    expect(getResendEntries('deck_preserve_private')).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'private-supervision',
+        activeTurnDeliveryKind: 'mcp_message',
+        supervisionReference,
+      }),
+      expect.objectContaining({
+        clientMessageId: 'private-delegation',
+        activeTurnDeliveryKind: 'delegation_reply',
+        delegationReply: { delegationId: 'delegation-private-1' },
+      }),
+      expect.objectContaining({
+        clientMessageId: 'private-peer-audit',
+        peerAudit: { contractVersion: 'v1', attemptHash: 'attempt-private-1' },
+      }),
+    ]);
+    for (const clientMessageId of ['private-supervision', 'private-delegation', 'private-peer-audit']) {
+      const material = JSON.parse(
+        getTransportQueueStore().readPrivateDispatchMaterial('deck_preserve_private', clientMessageId) ?? '{}',
+      ) as Record<string, unknown>;
+      expect(material).toMatchObject(
+        clientMessageId === 'private-supervision'
+          ? { activeTurnDeliveryKind: 'mcp_message', supervisionReference }
+          : clientMessageId === 'private-delegation'
+            ? { activeTurnDeliveryKind: 'delegation_reply', delegationReply: { delegationId: 'delegation-private-1' } }
+            : { peerAudit: { contractVersion: 'v1', attemptHash: 'attempt-private-1' } },
+      );
+    }
+    // Peer-audit rows deliberately remain process-local authority: persistence
+    // lets an in-process relaunch preserve them, while restart rehydration's
+    // existing scrubPeerAuditOrphans gate removes them if the controller died.
   });
 });

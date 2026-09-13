@@ -196,6 +196,7 @@ const { resolveLiveSupervisionParticipants } = await import('../../src/daemon/su
 const {
   authorizeQueuedSupervisionHeartbeatDelivery,
   isExactContinuationEligible,
+  resolveQueuedSupervisionHeartbeatDelivery,
 } = await import('../../src/daemon/supervision-participant-delivery.js');
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -6208,6 +6209,248 @@ describe('SupervisionAutomation', () => {
       setSupervisionLiveParticipantsResolver(undefined);
       mockTransportRuntime.pendingEntries.length = 0;
     });
+
+    it.each([
+      'missing_current_revision',
+      'missing_audit_policy',
+      'automatic audit requires one exact ready implementer revision',
+      'authoritative immutable integration bundle unavailable or mismatched',
+      'multiple live auditors exist for the exact revision',
+      'multiple durable audit deliveries claim the exact attempt and revision',
+      'durable audit delivery binding conflicts with the task registry',
+      'durable audit delivery origin is not an exact task participant',
+      'durable audit delivery target is not the exact live transport auditor',
+      'durable audit delivery message id does not match its exact binding',
+      'durable audit delivery violates strict cross-vendor routing',
+      'existing automatic auditor identity is no longer live',
+      'existing automatic auditor is not a transport runtime target',
+      'automatic audit requires one live same-project session to scope the auditor pool',
+      'task execution pool rejected target: no_selected_config',
+    ])('live-revalidates durable automatic-audit blocker reason %s and invalidates it after recovery', (exactError) => {
+      const registry = getSupervisionTaskRegistry();
+      const suffix = Buffer.from(exactError).toString('hex').slice(0, 18);
+      const taskId = `automatic-routing-wake-task-${suffix}`;
+      const assignmentId = `automatic-routing-wake-worker-${suffix}`;
+      const revision = 'automatic-routing-wake-r1';
+      const worker = liveWorkerIdentity('deck_automatic_routing_worker');
+      const brainName = 'deck_automatic_routing_brain';
+      upsertSession({
+        name: brainName,
+        label: brainName,
+        projectName: 'alpha',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: `${brainName}-provider`,
+        projectDir: '/work/watchdog',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      } as never);
+      workerSessionNames.add(brainName);
+      const brain = getSession(brainName)!;
+      expect(brain.sessionInstanceId && brain.runtimeEpoch).toBeTruthy();
+      expect(registry.createOrGet({
+        taskId,
+        projectName: 'alpha',
+        classification: 'independent_top_level',
+        objective: 'wake Brain once',
+        currentRevision: revision,
+      }).ok).toBe(true);
+      const coordinatorAssignmentId = `automatic-routing-coordinator-${suffix}`;
+      expect(registry.createAssignment({
+        assignmentId: coordinatorAssignmentId,
+        taskId,
+        role: 'coordinator',
+        required: false,
+        identity: {
+          sessionName: brainName,
+          sessionInstanceId: brain.sessionInstanceId!,
+          runtimeEpoch: brain.runtimeEpoch!,
+          agentType: brain.agentType,
+          providerFamily: 'openai',
+        },
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId,
+        taskId,
+        role: 'implementer',
+        identity: worker,
+        auditRevision: revision,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      for (const [intent, toStatus, validationState] of [
+        ['start', 'implementing', undefined],
+        ['record_validation', 'validated', 'passed'],
+        ['open_audit', 'ready_for_audit', undefined],
+      ] as const) {
+        expect(registry.applyTaskIntent({
+          taskId,
+          assignmentId,
+          intent,
+          toStatus,
+          ...(intent === 'record_validation' ? { expectedRevision: revision } : {}),
+          ...(validationState ? { validationState } : {}),
+        })).toMatchObject({ ok: true });
+      }
+      const blocker = JSON.stringify({
+        kind: 'automatic_audit_routing', taskId, assignmentId, revision, exactError,
+      });
+      expect(registry.recordAutomaticAuditRoutingBlocker({
+        taskId, assignmentId, blocker,
+      })).toMatchObject({ ok: true });
+      const delivery = {
+        targetSessionName: brainName,
+        clientMessageId: 'send_message_automatic_routing_wake',
+        text: blocker,
+        supervisionReference: {
+          kind: 'implementation_blocker' as const,
+          taskId,
+          assignmentId,
+          revision,
+          exactError,
+        },
+      };
+
+      expect(authorizeQueuedSupervisionHeartbeatDelivery(delivery)).toBe(true);
+      // Runtime epochs are observational metadata. A live same-project Brain
+      // with the same durable session name remains the coordinator after a
+      // daemon/provider restart even before lifecycle convergence rewrites it.
+      upsertSession({ ...brain, runtimeEpoch: `${brain.runtimeEpoch}-rotated`, updatedAt: Date.now() + 1 });
+      expect(authorizeQueuedSupervisionHeartbeatDelivery(delivery)).toBe(true);
+
+      // A live-eligible durable coordinator whose runtime is temporarily gone
+      // must retain the row for retry. Treating either absence or `stopped` as
+      // stale recreates the R2 permanent-loss class.
+      removeSession(brainName);
+      expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('retry');
+      upsertSession({ ...brain, state: 'stopped', updatedAt: Date.now() + 2 });
+      expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('retry');
+      upsertSession({ ...brain, state: 'idle', updatedAt: Date.now() + 3 });
+      expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('authorized');
+
+      expect(registry.updateAssignment({
+        assignmentId: coordinatorAssignmentId,
+        identity: registry.getAssignment(coordinatorAssignmentId)!.identity,
+        auditRevision: 'previous-revision-r0',
+      })).toMatchObject({ ok: true });
+      expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('stale');
+      expect(registry.updateAssignment({
+        assignmentId: coordinatorAssignmentId,
+        identity: registry.getAssignment(coordinatorAssignmentId)!.identity,
+        auditRevision: revision,
+      })).toMatchObject({ ok: true });
+      expect(registry.clearAutomaticAuditRoutingBlocker({
+        taskId, assignmentId, blocker,
+      })).toMatchObject({ ok: true });
+      expect(authorizeQueuedSupervisionHeartbeatDelivery(delivery)).toBe(false);
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        ...delivery,
+        targetSessionName: 'deck_supervision_brain',
+      })).toBe(false);
+    });
+
+    it.each(['task', 'assignment'] as const)(
+      'discards an automatic-audit blocker wake after the %s becomes terminal',
+      (terminalObject) => {
+        const registry = getSupervisionTaskRegistry();
+        const taskId = `terminal-routing-${terminalObject}`;
+        const assignmentId = `terminal-routing-worker-${terminalObject}`;
+        const revision = 'terminal-routing-r1';
+        const brainName = `deck_terminal_routing_${terminalObject}_brain`;
+        upsertSession({
+          name: brainName,
+          label: brainName,
+          projectName: 'alpha',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          providerId: 'codex-sdk',
+          providerSessionId: `${brainName}-provider`,
+          projectDir: '/work/watchdog',
+          state: 'idle',
+          restarts: 0,
+          restartTimestamps: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        } as never);
+        workerSessionNames.add(brainName);
+        const brain = getSession(brainName)!;
+        expect(registry.createOrGet({
+          taskId,
+          projectName: 'alpha',
+          classification: 'independent_top_level',
+          objective: 'discard terminal automatic-audit wake',
+          currentRevision: revision,
+        })).toMatchObject({ ok: true });
+        expect(registry.createAssignment({
+          taskId,
+          role: 'coordinator',
+          required: false,
+          identity: {
+            sessionName: brainName,
+            sessionInstanceId: brain.sessionInstanceId!,
+            runtimeEpoch: brain.runtimeEpoch!,
+            agentType: brain.agentType,
+            providerFamily: 'openai',
+          },
+        })).toMatchObject({ ok: true });
+        expect(registry.createAssignment({
+          assignmentId,
+          taskId,
+          role: 'implementer',
+          identity: liveWorkerIdentity(`deck_terminal_routing_${terminalObject}_worker`),
+          auditRevision: revision,
+        })).toMatchObject({ ok: true });
+        for (const [intent, toStatus, validationState] of [
+          ['start', 'implementing', undefined],
+          ['record_validation', 'validated', 'passed'],
+          ['open_audit', 'ready_for_audit', undefined],
+        ] as const) {
+          expect(registry.applyTaskIntent({
+            taskId,
+            assignmentId,
+            intent,
+            toStatus,
+            ...(intent === 'record_validation' ? { expectedRevision: revision } : {}),
+            ...(validationState ? { validationState } : {}),
+          })).toMatchObject({ ok: true });
+        }
+        const exactError = 'missing_current_revision';
+        const blocker = JSON.stringify({
+          kind: 'automatic_audit_routing', taskId, assignmentId, revision, exactError,
+        });
+        expect(registry.recordAutomaticAuditRoutingBlocker({
+          taskId, assignmentId, blocker,
+        })).toMatchObject({ ok: true });
+        const delivery = {
+          targetSessionName: brainName,
+          clientMessageId: 'send_message_terminal_routing_wake',
+          text: blocker,
+          supervisionReference: {
+            kind: 'implementation_blocker' as const,
+            taskId,
+            assignmentId,
+            revision,
+            exactError,
+          },
+        };
+        expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('authorized');
+        if (terminalObject === 'task') {
+          expect(registry.updateTask({ taskId, status: 'cancelled' })).toMatchObject({ ok: true });
+        } else {
+          expect(registry.updateAssignment({
+            assignmentId,
+            identity: registry.getAssignment(assignmentId)!.identity,
+            status: 'cancelled',
+          })).toMatchObject({ ok: true });
+        }
+        expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('stale');
+      },
+    );
 
     it('drives forward convergence from the periodic tick, not only the boot sweep', async () => {
       // Pins the WIRING: a boot-only sweep cannot close a window that opens

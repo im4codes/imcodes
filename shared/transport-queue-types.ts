@@ -34,6 +34,9 @@ export type QueueSupervisionReference =
       exactError: string;
     };
 
+/** Final daemon authority decision for a supervision queue row. */
+export type QueueSupervisionAdmission = 'authorized' | 'stale' | 'retry';
+
 export type QueueDropReason =
   | 'expired'
   | 'capacity_evicted'
@@ -81,6 +84,14 @@ export interface QueuePrivateDispatchMaterial {
   providerRouting?: Record<string, unknown>;
   timelineCommitted?: boolean;
   historyCommitted?: boolean;
+  /** Daemon-owned lifecycle authority revalidated at every delivery edge. */
+  supervisionReference?: QueueSupervisionReference;
+  /** Runtime-private active-turn routing; never inferred from visible text. */
+  activeTurnDeliveryKind?: 'delegation_reply' | 'queued_message' | 'mcp_message';
+  /** Private delegation completion ownership retained across relaunch/restart. */
+  delegationReply?: {
+    delegationId: string;
+  };
   /** Private peer-audit ownership marker. Never expose through queue projections. */
   peerAudit?: {
     contractVersion: string;

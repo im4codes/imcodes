@@ -192,6 +192,15 @@ export async function dispatchSessionMessage(
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
+        // Daemon-owned supervision traffic is persisted before delivery. Keep
+        // its append policy on that durable row: otherwise the immediate drain
+        // silently converts an automatic Brain wake into an ordinary FIFO item,
+        // which cannot resume a turn currently parked in wait_agent. The resend
+        // handoff owns exactly-once provider admission and falls back to FIFO
+        // only when native append is unavailable.
+        ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+          : {}),
         queuedAt: Date.now(),
       });
       if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
@@ -233,10 +242,16 @@ export async function dispatchSessionMessage(
       return 'queued';
     }
     if (options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
-      const result = await runtime.appendExternalMessageToActiveTurn(
-        message,
-        options.messageId,
-      );
+      const result = options.queueSupervisionReference
+        ? await runtime.appendExternalMessageToActiveTurn(
+            message,
+            options.messageId,
+            options.queueSupervisionReference,
+          )
+        : await runtime.appendExternalMessageToActiveTurn(message, options.messageId);
+      if (result === 'retry') {
+        throw new Error('transport supervision authority temporarily unavailable');
+      }
       if (result !== 'sent' && result !== 'appended') {
         // Unsupported providers and active-turn races retain the old durable
         // delivery guarantee. Prefer append, but never drop a peer message.
@@ -244,10 +259,20 @@ export async function dispatchSessionMessage(
           ? runtime.send(message, options.messageId, undefined, undefined, {
               ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
               timelineCommitted: true,
+              ...(options.queueSupervisionReference
+                ? { supervisionReference: options.queueSupervisionReference }
+                : {}),
             })
           : options.sharedActor
           ? runtime.send(message, options.messageId, undefined, undefined, {
               sharedActor: options.sharedActor,
+              ...(options.queueSupervisionReference
+                ? { supervisionReference: options.queueSupervisionReference }
+                : {}),
+            })
+          : options.queueSupervisionReference
+          ? runtime.send(message, options.messageId, undefined, undefined, {
+              supervisionReference: options.queueSupervisionReference,
             })
           : runtime.send(message, options.messageId);
         if (fallback === 'sent' && !options.suppressTimeline) {
