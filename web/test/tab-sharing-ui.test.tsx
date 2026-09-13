@@ -11,7 +11,12 @@ import { ShareSessionDialog } from '../src/components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from '../src/components/SharedEntriesPanel.js';
 import { SessionControls } from '../src/components/SessionControls.js';
 import { discoverSharedEntries, openSharedEntry } from '../src/api.js';
-import { formatSharedActorLabel, sharedActorRoleLabelKey } from '../src/tab-sharing-ui.js';
+import {
+  canSharedActorControlSession,
+  canSharedActorManageServer,
+  formatSharedActorLabel,
+  sharedActorRoleLabelKey,
+} from '../src/tab-sharing-ui.js';
 import type { SessionInfo } from '../src/types.js';
 
 const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
@@ -108,6 +113,23 @@ const messages: Record<string, string> = {
   'session.clone.menu': 'Copy session',
   'session.unpin_to_stop': 'Unpin to stop',
 };
+
+describe('share provenance permission matrix', () => {
+  it('keeps session participants session-scoped and grants server participants server operations only', () => {
+    const sessionParticipant = { targetKind: 'main' as const, effectiveRole: 'participant' as const, status: 'active' as const };
+    const serverParticipant = { targetKind: 'server' as const, effectiveRole: 'participant' as const, status: 'active' as const };
+    const serverViewer = { targetKind: 'server' as const, effectiveRole: 'viewer' as const, status: 'active' as const };
+
+    expect(canSharedActorControlSession(sessionParticipant)).toBe(true);
+    expect(canSharedActorManageServer(sessionParticipant)).toBe(false);
+    expect(canSharedActorControlSession(serverParticipant)).toBe(true);
+    expect(canSharedActorManageServer(serverParticipant)).toBe(true);
+    expect(canSharedActorControlSession(serverViewer)).toBe(false);
+    expect(canSharedActorManageServer(serverViewer)).toBe(false);
+    expect(canSharedActorControlSession(null)).toBe(true);
+    expect(canSharedActorManageServer(null)).toBe(true);
+  });
+});
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({

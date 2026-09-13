@@ -7456,7 +7456,7 @@ afterEach(() => {
     });
   });
 
-  it('opens Settings instead of inferring an auditor when enabling audit mode', async () => {
+  it('enables automatic audit without a remembered manual auditor', async () => {
     const ws = makeWs();
     const onSettings = vi.fn();
     render(
@@ -7486,15 +7486,15 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
-    // Auto now opens supervision settings with the mode only: the manual
-    // auditor picker is retired, so there is no focus target to request.
-    await waitFor(() => expect(onSettings).toHaveBeenCalledWith({
-      supervisionMode: 'supervised_audit',
-    }));
-    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
+      'srv1',
+      'codex-sdk-session',
+      expect.objectContaining({ mode: 'supervised_audit' }),
+    ));
+    expect(onSettings).not.toHaveBeenCalled();
   });
 
-  it('falls back to Settings when heavy mode snapshot is present but audit config is invalid', async () => {
+  it('enables automatic audit without requiring the retired manual auditor fields', async () => {
     const ws = makeWs();
     const onSettings = vi.fn();
     render(
@@ -7526,13 +7526,15 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
-    await waitFor(() => {
-      expect(onSettings).toHaveBeenCalled();
-    });
-    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
+      'srv1',
+      'codex-sdk-session',
+      expect.objectContaining({ mode: 'supervised_audit' }),
+    ));
+    expect(onSettings).not.toHaveBeenCalled();
   });
 
-  it('reuses a saved name-only auditor without local model or authority gating', async () => {
+  it('retires a saved name-only auditor when automatic audit is enabled', async () => {
     const onSettings = vi.fn();
     render(
       <SessionControls
@@ -7564,12 +7566,13 @@ afterEach(() => {
     await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
       'srv1',
       'deck_proj_brain',
-      expect.objectContaining({ mode: 'supervised_audit', auditTargetSessionName: 'deck_sub_peer' }),
+      expect.not.objectContaining({ auditTargetSessionName: 'deck_sub_peer' }),
     ));
+    expect(patchSessionSupervisionMock.mock.calls.at(-1)?.[2]).toMatchObject({ mode: 'supervised_audit' });
     expect(onSettings).not.toHaveBeenCalled();
   });
 
-  it('keeps the current session auditor when quick mode is turned off and reuses it on audit', async () => {
+  it('strips the current manual auditor when quick mode changes', async () => {
     const onSettings = vi.fn();
     render(
       <SessionControls
@@ -7601,16 +7604,18 @@ afterEach(() => {
     await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenLastCalledWith(
       'srv1',
       'deck_proj_brain',
-      expect.objectContaining({ mode: 'off', auditTargetSessionName: 'deck_sub_peer' }),
+      expect.not.objectContaining({ auditTargetSessionName: 'deck_sub_peer' }),
     ));
+    expect(patchSessionSupervisionMock.mock.calls.at(-1)?.[2]).toMatchObject({ mode: 'off' });
 
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
     await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenLastCalledWith(
       'srv1',
       'deck_proj_brain',
-      expect.objectContaining({ mode: 'supervised_audit', auditTargetSessionName: 'deck_sub_peer' }),
+      expect.not.objectContaining({ auditTargetSessionName: 'deck_sub_peer' }),
     ));
+    expect(patchSessionSupervisionMock.mock.calls.at(-1)?.[2]).toMatchObject({ mode: 'supervised_audit' });
     expect(onSettings).not.toHaveBeenCalled();
   });
 

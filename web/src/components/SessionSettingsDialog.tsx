@@ -56,14 +56,10 @@ import {
   type SupervisionExecutionPoolsConfig,
 } from '@shared/supervision-execution-pool.js';
 import {
-  PEER_AUDIT_CANDIDATE_REASONS,
-  PEER_AUDIT_PROMPT_VERSION,
   PEER_AUDIT_UNKNOWN_IDENTITY,
   resolvePeerAuditNormalizedModelId,
   resolvePeerAuditProviderFamily,
-  type PeerAuditCandidate,
 } from '@shared/peer-audit.js';
-import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from '../peerAudit/types.js';
 import {
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
@@ -140,67 +136,6 @@ export interface PeerAuditSettingsSession {
   ownerCatalog?: true;
 }
 
-export type PeerAuditSettingsCandidate = PeerAuditCandidate;
-
-export function buildPeerAuditSettingsCandidates(input: {
-  auditedSessionName: string;
-  parentSession?: string | null;
-  sessions: readonly PeerAuditSettingsSession[];
-}): PeerAuditSettingsCandidate[] {
-  const owningMainSession = input.parentSession?.trim() || input.auditedSessionName;
-  const seen = new Set<string>();
-  const candidates: PeerAuditSettingsCandidate[] = [];
-
-  for (const session of input.sessions) {
-    if (session.sessionName === input.auditedSessionName
-      || session.parentSession !== owningMainSession
-      || seen.has(session.sessionName)
-      || !isDelegationReplyCapableAgentType(session.type)) {
-      continue;
-    }
-    seen.add(session.sessionName);
-
-    const sessionInstanceId = session.sessionInstanceId?.trim();
-    const runtimeEpoch = session.runtimeEpoch?.trim();
-    const knownModelIds = [session.activeModel, session.requestedModel, session.modelDisplay]
-      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
-    const normalizedModelId = resolvePeerAuditNormalizedModelId({
-      activeModel: session.activeModel,
-      requestedModel: session.requestedModel,
-      configuredModel: session.modelDisplay,
-    }, { knownModelIds });
-    const providerFamily = resolvePeerAuditProviderFamily({
-      providerId: session.providerId,
-      agentType: session.type,
-    });
-    const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.type);
-    candidates.push({
-      name: session.sessionName,
-      label: session.label?.trim()
-        || (providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY
-          ? session.type
-          : peerAuditProviderTypeLabel(providerFamily)),
-      // Candidate identity is presentation-only in settings. Automatic audit
-      // persists the selected session name and resolves the live target when
-      // the audit starts, exactly like ordinary reply-enabled delegation.
-      sessionInstanceId: sessionInstanceId || session.sessionName,
-      runtimeEpoch: runtimeEpoch || session.sessionName,
-      normalizedModelId,
-      providerFamily,
-      liveState: session.state ?? PEER_AUDIT_UNKNOWN_IDENTITY,
-      dispositionCapability: runtimeType === 'process'
-        ? 'sent_unrevocable'
-        : session.state === 'idle' ? 'sent' : 'queued',
-      eligible: true,
-      reason: PEER_AUDIT_CANDIDATE_REASONS.ELIGIBLE,
-    });
-  }
-
-  return candidates.sort((left, right) => left.label.localeCompare(right.label)
-    || left.normalizedModelId.localeCompare(right.normalizedModelId)
-    || left.name.localeCompare(right.name));
-}
-
 type SupervisionDraft = {
   mode: SupervisionMode;
   backend?: SharedContextRuntimeBackend;
@@ -223,13 +158,6 @@ type SupervisionDraft = {
   maxParseRetries?: number;
   maxAutoContinueStreak?: number;
   maxAutoContinueTotal?: number;
-  auditTargetSessionName?: string;
-  auditTargetFingerprint?: {
-    sessionInstanceId: string;
-    normalizedModelId: string;
-    providerFamily: string;
-  };
-  peerAuditPromptVersion?: string;
   maxAuditLoops?: number;
   taskRunPromptVersion?: string;
 };
@@ -831,9 +759,6 @@ export function SessionSettingsDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
-  const [peerAuditTargetName, setPeerAuditTargetName] = useState<string | null>(
-    initialSupervision.auditTargetSessionName ?? null,
-  );
   const ccPresetListRequestIdRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
@@ -854,7 +779,6 @@ export function SessionSettingsDialog({
     setDescription(initDesc);
     setAgentType(type);
     setSupervision(initialSupervision);
-    setPeerAuditTargetName(initialSupervision.auditTargetSessionName ?? null);
   }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
 
   const hasSupervision = supervision.mode !== 'off';
@@ -992,12 +916,6 @@ export function SessionSettingsDialog({
   const supervisionAutoContinueStreak = supervision.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
-  const loadedPeerAuditCandidates = useMemo(() => buildPeerAuditSettingsCandidates({
-    auditedSessionName: sessionName,
-    parentSession,
-    sessions: peerAuditSessions,
-  }), [parentSession, peerAuditSessions, sessionName]);
-  const peerAuditCandidates = loadedPeerAuditCandidates;
   const executionPoolSessions = useMemo(() => {
     const merged = new Map(peerAuditSessions.map((session) => [session.sessionName, session]));
     for (const session of supervisorDefaultsPref.executionPoolSessions) {
@@ -1015,20 +933,6 @@ export function SessionSettingsDialog({
     parentSession: executionPoolParentSession,
     sessions: executionPoolSessions,
   }), [executionPoolParentSession, executionPoolSessions, sessionName]);
-  const selectedPeerAuditCandidate = peerAuditCandidates.find((candidate) => candidate.name === peerAuditTargetName);
-  const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
-    ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)
-    : null;
-  const selectedPeerAuditTypeLabel = selectedPeerAuditCandidate
-    ? peerAuditProviderTypeLabel(selectedPeerAuditCandidate.providerFamily)
-    : null;
-  const selectedPeerAuditVisibleIdentity = selectedPeerAuditCandidate
-    ? [
-      selectedPeerAuditTypeLabel,
-      selectedPeerAuditDisplayLabel !== selectedPeerAuditTypeLabel ? selectedPeerAuditDisplayLabel : null,
-      selectedPeerAuditCandidate.normalizedModelId,
-    ].filter(Boolean).join(' · ')
-    : null;
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
   const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
   const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
@@ -1144,17 +1048,9 @@ export function SessionSettingsDialog({
     maxParseRetries: supervisionParseRetries,
     maxAutoContinueStreak: supervisionAutoContinueStreak,
     maxAutoContinueTotal: supervisionAutoContinueTotal,
-    // Remember the auditor on this session even while audit mode is not
-    // selected, so switching back to audit can reuse it without prompting.
-    // Legacy manual-auditor fields are never persisted from supervision mode:
-    // the auditor comes from auditPolicy + the live pool. Any inherited value is
-    // stripped so a stale target cannot survive a save.
-    ...(!hasSupervision && (selectedPeerAuditCandidate?.name ?? peerAuditTargetName)
-      ? {
-          auditTargetSessionName: selectedPeerAuditCandidate?.name ?? peerAuditTargetName ?? undefined,
-          peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
-        }
-      : {}),
+    // Automatic audit routing is resolved from auditPolicy + the live pool.
+    // Omitting all legacy manual-auditor fields retires stale target data on
+    // every save instead of preserving an invisible picker.
     ...(isAuditMode
       ? {
           maxAuditLoops: supervisionAuditLoops,
@@ -1169,8 +1065,6 @@ export function SessionSettingsDialog({
     defaultsSupportsPreset,
     supervision.mode,
     supervisionAuditLoops,
-    selectedPeerAuditCandidate,
-    peerAuditTargetName,
     supervisionAutoContinueStreak,
     supervisionAutoContinueTotal,
     supervisionCustomInstructions,
@@ -1252,9 +1146,6 @@ export function SessionSettingsDialog({
           maxAutoContinueStreak: prev.maxAutoContinueStreak ?? supervisorDefaultsAutoContinueStreak,
           maxAutoContinueTotal: prev.maxAutoContinueTotal ?? supervisorDefaultsAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-          auditTargetSessionName: prev.auditTargetSessionName,
-          auditTargetFingerprint: prev.auditTargetFingerprint,
-          peerAuditPromptVersion: prev.peerAuditPromptVersion,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
         };
@@ -1274,9 +1165,6 @@ export function SessionSettingsDialog({
             ? supervisorDefaultsAutoContinueTotal
             : prev.maxAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-          auditTargetSessionName: prev.auditTargetSessionName,
-          auditTargetFingerprint: prev.auditTargetFingerprint,
-          peerAuditPromptVersion: prev.peerAuditPromptVersion,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
         };
@@ -1762,16 +1650,8 @@ export function SessionSettingsDialog({
               {isAuditMode && (
                 <div style={{ fontSize: 12, color: '#94a3b8' }}>
                   {t('session.supervision.summaryAudit', {
-                    auditor: selectedPeerAuditVisibleIdentity ?? t('session.supervision.summaryUnset'),
                     loops: supervisionAuditLoops,
                   })}
-                  {selectedPeerAuditCandidate && (
-                    <span>
-                      {' · '}{selectedPeerAuditCandidate.normalizedModelId}
-                      {' · '}{selectedPeerAuditCandidate.providerFamily}
-                      {' · '}{t(`peerAuditQuick.disposition.${selectedPeerAuditCandidate.dispositionCapability}`)}
-                    </span>
-                  )}
                 </div>
               )}
               <div style={{ fontSize: 11, color: '#64748b' }}>
@@ -1799,11 +1679,6 @@ export function SessionSettingsDialog({
         </div>
       )}
 
-      {isAuditMode && !peerAuditTargetName && (
-        <div style={{ color: '#fbbf24', fontSize: 12 }}>
-          {t('session.supervision.validation.auditTargetRequired')}
-        </div>
-      )}
     </div>
   ) : (
     <div style={{ color: '#fca5a5', fontSize: 12 }}>
@@ -1823,7 +1698,7 @@ export function SessionSettingsDialog({
       if (supervisionAuditLoops < 0) return false;
     }
     return true;
-  }, [globalDefaultsValid, hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops]);
+  }, [globalDefaultsValid, hasSupervision, isAuditMode, isSupportedTransport, supervisionAuditLoops]);
 
   const dialog = (
     <div class={`dialog-overlay session-settings-overlay${poolSessionDialogOpen ? ' has-child-dialog' : ''}`} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

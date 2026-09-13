@@ -757,7 +757,7 @@
       "poolChangeBudget": "Change budget",
       "poolAuditHeadroom": "Audit headroom / provider",
       "sessionConfigTitle": "This session",
-      "sessionConfigHelp": "Mode, peer auditor, loop limits, and custom instructions apply only to this session.",
+      "sessionConfigHelp": "Mode, loop limits, and custom instructions apply only to this session.",
       "usesGlobalRuntime": "Backend, model, preset, timeout, and backup runtime use the global configuration above.",
       "intro": {
         "title": "What Auto does",
@@ -806,15 +806,14 @@
       "summaryContinueLimits": "Continue limits: streak {{streak}} · hard {{total}}",
       "summaryCustomInstructions": "Custom instructions: {{value}}",
       "summaryCustomInstructionsSet": "set",
-      "summaryAudit": "Peer auditor: {{auditor}} · loops {{loops}}",
+      "summaryAudit": "Automatic routing · loops {{loops}}",
       "summaryMeta": "Prompt {{promptVersion}}, repair {{repairVersion}}, parse retries {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "Supervision is only available for transport sessions.",
       "unsupported": "Supervision settings are not available for process sessions.",
       "validation": {
         "backendRequired": "Select a supervision backend.",
         "modelRequired": "Select or enter a supervision model.",
-        "modelInvalid": "Model is not valid for {{backend}}.",
-        "auditTargetRequired": "Select and confirm an eligible peer auditor."
+        "modelInvalid": "Model is not valid for {{backend}}."
       },
       "modeLabel": "Mode",
       "invalidStoredConfig": "Stored supervision config is invalid. Automation is disabled until you repair and save it.",

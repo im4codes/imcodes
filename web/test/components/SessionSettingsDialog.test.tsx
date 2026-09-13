@@ -29,6 +29,7 @@ vi.mock('react-i18next', () => ({
       if (params?.value && typeof params.value === 'string') return `${leaf}:${params.value}`;
       if (params?.backend && params?.model) return `${leaf}:${params.backend}:${params.model}`;
       if (params?.auditor && params?.loops != null) return `${leaf}:${params.auditor}:${params.loops}`;
+      if (params?.loops != null) return `${leaf}:${params.loops}`;
       if (params?.streak != null && params?.total != null) return `${leaf}:${params.streak}:${params.total}`;
       if (params?.promptVersion) return `${leaf}:${params.promptVersion}`;
       return leaf;
@@ -1200,7 +1201,7 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('summaryTimeout:30 s')).toBeDefined();
     expect(screen.getByText('summaryContinueLimits:2:8')).toBeDefined();
     expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
-    expect(screen.getByText('summaryAudit:summaryUnset:3')).toBeDefined();
+    expect(screen.getByText('summaryAudit:3')).toBeDefined();
     expect(document.body.textContent).not.toContain('deck_sub_peer');
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
   });

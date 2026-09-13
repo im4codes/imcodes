@@ -35,6 +35,7 @@ import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-co
 import { CC_PRESET_MSG } from '../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -263,6 +264,135 @@ describe('WsBridge share-scoped sockets', () => {
     })).toEqual({ allowed: true });
   });
 
+  it('distinguishes server-share owner-equivalent commands from tab-share participant limits', () => {
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const tabTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const decide = (target: ShareTarget, role: 'viewer' | 'participant', msg: Record<string, unknown>) => evaluateShareCommand({
+      msg,
+      state: {
+        userId: 'shared-user',
+        actorDisplayName: 'Shared User',
+        ticketId: `ticket-${target.kind}-${role}`,
+        target,
+        snapshot: coverage(target, role, now),
+        connectedAt: now,
+      },
+      now,
+      runtimeType: 'transport',
+      activeDispatchId: null,
+    });
+
+    for (const msg of [
+      { type: 'session.stop', sessionName: 'deck_proj_brain' },
+      { type: 'subsession.stop', sessionName: 'deck_sub_child' },
+      { type: TRANSPORT_MSG.PROVIDER_STATUS },
+      { type: TRANSPORT_MSG.LIST_SESSIONS },
+      { type: SESSION_GROUP_CLONE_MSG.START, serverId, idempotencyKey: 'clone-1' },
+    ]) {
+      expect(decide(serverTarget, 'participant', msg), String(msg.type)).toMatchObject({
+        allowed: true,
+        stampedMessage: {
+          sharedActor: { origin: 'shared-server', effectiveActorRole: 'participant' },
+        },
+      });
+      expect(decide(tabTarget, 'participant', msg), String(msg.type)).toMatchObject({ allowed: false });
+      expect(decide(serverTarget, 'viewer', msg), String(msg.type)).toMatchObject({ allowed: false });
+    }
+
+    expect(decide(serverTarget, 'participant', { type: 'future.unclassified.command' }))
+      .toEqual({ allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED });
+  });
+
+  it('projects daemon status to participants without widening tab scope or leaking unknown fields', () => {
+    const stats = {
+      type: 'daemon.stats',
+      daemonVersion: '1.2.3',
+      cpu: 12,
+      memUsed: 20,
+      memTotal: 100,
+      load1: 1,
+      load5: 2,
+      load15: 3,
+      uptime: 45,
+      disks: [{ mount: '/', totalBytes: 100, usedBytes: 20, usedPercent: 20, secret: 'nested-secret' }],
+      shortRefHealth: {
+        stage: 'persist_store', failures: 1, lastFailureAt: 123, lastError: 'token=nested-secret',
+      },
+      token: 'must-not-leak',
+      secret: { value: 'must-not-leak' },
+    };
+    const project = (target: ShareTarget, role: 'viewer' | 'participant') => filterShareDaemonMessage(stats, {
+      userId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      ticketId: `ticket-${target.kind}-${role}`,
+      target,
+      snapshot: coverage(target, role, now),
+      connectedAt: now,
+    });
+
+    const tabProjection = project({ kind: 'main', serverId, sessionName: 'deck_proj_brain' }, 'participant');
+    expect(tabProjection).toMatchObject({ type: 'daemon.stats', daemonVersion: '1.2.3', cpu: 12, uptime: 45 });
+    expect(tabProjection).not.toHaveProperty('disks');
+    expect(tabProjection).not.toHaveProperty('token');
+    expect(tabProjection).not.toHaveProperty('secret');
+
+    const serverProjection = project({ kind: 'server', serverId }, 'participant');
+    expect(serverProjection).toMatchObject({
+      type: 'daemon.stats',
+      disks: [{ mount: '/', totalBytes: 100, usedBytes: 20, usedPercent: 20 }],
+      shortRefHealth: { stage: 'persist_store', failures: 1, lastFailureAt: 123 },
+    });
+    expect(JSON.stringify(serverProjection)).not.toContain('secret');
+    expect(serverProjection).not.toHaveProperty('token');
+    expect(serverProjection).not.toHaveProperty('secret');
+    expect(project({ kind: 'server', serverId }, 'viewer')).toBeNull();
+    expect(project({ kind: 'main', serverId, sessionName: 'deck_proj_brain' }, 'viewer')).toBeNull();
+  });
+
+  it('forwards whole-server lifecycle control even when its ticket requested one session', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const serverCoverage = { ...coverage(target, 'participant', now), serverParticipantAuthority: true };
+    bridge.setShareCoverageResolverForTests(async () => serverCoverage);
+    const db = makeDb();
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'shared-user', db, {
+      ticketId: 'server-operator-ticket',
+      target,
+      snapshot: serverCoverage,
+    });
+    shared.emit('message', JSON.stringify({ type: 'session.stop', project: 'proj', commandId: 'stop-1' }));
+    shared.emit('message', JSON.stringify({
+      type: 'fs.git_status',
+      requestId: 'other-session-status',
+      sessionName: 'deck_other_brain',
+      path: '/other',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toContainEqual(expect.objectContaining({
+      type: 'session.stop',
+      project: 'proj',
+      sharedActor: expect.objectContaining({
+        actorUserId: 'shared-user',
+        origin: 'shared-server',
+        effectiveActorRole: 'participant',
+        actionId: 'stop-1',
+      }),
+    }));
+    expect(daemon.sentJson).toContainEqual(expect.objectContaining({
+      type: 'fs.git_status',
+      requestId: 'other-session-status',
+      sessionName: 'deck_other_brain',
+    }));
+  });
+
   afterEach(() => {
     WsBridge.getAll().clear();
     __setShareBridgeClockForTests(null);
@@ -290,9 +420,42 @@ describe('WsBridge share-scoped sockets', () => {
       target,
       snapshot: coverage(target, 'viewer', now),
     });
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb(), {
+      ticketId: 'share-ticket-status-1',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
 
     expect(member.sentJson.some((msg) => msg.type === TRANSPORT_MSG.PROVIDER_STATUS)).toBe(true);
     expect(shared.sentJson.some((msg) => msg.type === TRANSPORT_MSG.PROVIDER_STATUS)).toBe(false);
+
+    daemon.emit('message', JSON.stringify({
+      type: 'daemon.stats', daemonVersion: '1.2.3', cpu: 1, memUsed: 2, memTotal: 3,
+      load1: 4, load5: 5, load15: 6, uptime: 7, secret: 'never-forward',
+    }));
+    await flushAsync();
+    expect(participant.sentJson.find((msg) => msg.type === 'daemon.stats')).toEqual({
+      type: 'daemon.stats', daemonVersion: '1.2.3', cpu: 1, memUsed: 2, memTotal: 3,
+      load1: 4, load5: 5, load15: 6, uptime: 7,
+    });
+    expect(shared.sentJson.some((msg) => msg.type === 'daemon.stats')).toBe(false);
+
+    participant.close();
+    const reconnectedParticipant = new MockWs();
+    bridge.handleShareBrowserConnection(reconnectedParticipant as never, 'participant-user', makeDb(), {
+      ticketId: 'share-ticket-status-2',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    daemon.emit('message', JSON.stringify({
+      type: 'daemon.stats', daemonVersion: '1.2.4', cpu: 8, memUsed: 9, memTotal: 10,
+      load1: 11, load5: 12, load15: 13, uptime: 14,
+    }));
+    await flushAsync();
+    expect(reconnectedParticipant.sentJson.find((msg) => msg.type === 'daemon.stats')).toMatchObject({
+      type: 'daemon.stats', daemonVersion: '1.2.4', cpu: 8, uptime: 14,
+    });
 
     member.sent.length = 0;
     shared.sent.length = 0;
@@ -763,7 +926,9 @@ describe('WsBridge share-scoped sockets', () => {
       const sharedPolicy = getShareScopedCommandPolicy(entry.sharedCommand);
       expect(actualPolicy).toEqual(entry.policy);
 
-      if (actualPolicy?.kind === 'deny') {
+      if (actualPolicy?.kind === 'server-participant-action') {
+        expect(sharedPolicy.disposition).toBe('deny');
+      } else if (actualPolicy?.kind === 'deny') {
         if (sharedPolicy.disposition === 'deny') {
           expect(sharedPolicy.reason).toBe(actualPolicy.reason);
         } else {

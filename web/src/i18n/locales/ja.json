@@ -757,7 +757,7 @@
       "poolChangeBudget": "変更予算",
       "poolAuditHeadroom": "プロバイダー別監査余力",
       "sessionConfigTitle": "このセッション",
-      "sessionConfigHelp": "モード、ピア監査者、ループ上限、カスタム指示はこのセッションだけに適用されます。",
+      "sessionConfigHelp": "モード、ループ上限、カスタム指示はこのセッションにのみ適用されます。",
       "usesGlobalRuntime": "バックエンド、モデル、プリセット、タイムアウト、予備ランタイムは上のグローバル設定を使用します。",
       "intro": {
         "title": "Auto の役割",
@@ -806,15 +806,14 @@
       "summaryContinueLimits": "continue 制限: 同種 {{streak}} ・ ハード {{total}}",
       "summaryCustomInstructions": "カスタム指示: {{value}}",
       "summaryCustomInstructionsSet": "設定済み",
-      "summaryAudit": "ピア監査者: {{auditor}} · ループ {{loops}}",
+      "summaryAudit": "自動ルーティング · ループ {{loops}} 回",
       "summaryMeta": "プロンプト {{promptVersion}}、修復 {{repairVersion}}、解析再試行 {{parseRetries}}、task-run {{taskRunVersion}}",
       "disabledHint": "監督は transport セッションでのみ利用できます。",
       "unsupported": "process セッションでは監督設定を利用できません。",
       "validation": {
         "backendRequired": "監督バックエンドを選択してください。",
         "modelRequired": "監督モデルを選択または入力してください。",
-        "modelInvalid": "{{backend}} ではこのモデルは無効です。",
-        "auditTargetRequired": "適格なピア監査者を選択して確認してください。"
+        "modelInvalid": "{{backend}} ではこのモデルは無効です。"
       },
       "modeLabel": "モード",
       "invalidStoredConfig": "保存済みの監督設定が無効です。修正して保存するまで自動化は無効のままです。",

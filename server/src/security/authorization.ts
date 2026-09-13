@@ -13,6 +13,7 @@ import { NODE_ROLE, type NodeRole, NODE_ROLE_REFUSAL } from '../../../shared/rem
 import {
   resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
+import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { SHARED_MACHINE_AUTHORITY_TYPE } from '../../../shared/shared-machine-authority.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
@@ -263,7 +264,7 @@ export type ServerWebSocketAccess =
  * Resolve the user's role for a specific server.
  * Checks server ownership first, then team membership.
  */
-export async function resolveServerRole(
+export async function resolveServerMembershipRole(
   db: Database,
   serverId: string,
   userId: string,
@@ -298,6 +299,27 @@ export async function resolveServerRole(
 }
 
 /**
+ * Operational server authority. An active whole-server Participant is the
+ * owner's delegated operator for that server; a main/sub-session grant is not.
+ * Grant management must use resolveServerMembershipRole instead so delegated
+ * operators can never re-share or escalate access.
+ */
+export async function resolveServerRole(
+  db: Database,
+  serverId: string,
+  userId: string,
+): Promise<ServerRole> {
+  const membership = await resolveServerMembershipRole(db, serverId, userId);
+  if (membership !== 'none') return membership;
+  const coverage = await resolveEffectiveShareCoverage(db, {
+    userId,
+    target: { kind: 'server', serverId },
+    now: Date.now(),
+  });
+  return coverage?.effectiveRole === 'participant' ? 'owner' : 'none';
+}
+
+/**
  * WebSocket admission includes active Owner/Participant controlled-machine
  * grants, while keeping Viewers and unrelated users out. Returning the target
  * kind lets WsBridge default-deny every non-remote-desktop browser frame even
@@ -319,7 +341,10 @@ export async function resolveServerWebSocketAccess(
     if (!controlled) return null;
     return { kind: 'controlled', role: controlled.access_role };
   }
-  const role = await resolveServerRole(db, serverId, userId);
+  // Shared operators must enter through a share ticket so their provenance is
+  // retained and every relayed action is stamped. Never let the ordinary WS
+  // endpoint erase that authority boundary by treating them as a member.
+  const role = await resolveServerMembershipRole(db, serverId, userId);
   return role === 'none' ? null : { kind: 'standard', role };
 }
 

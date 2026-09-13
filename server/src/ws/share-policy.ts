@@ -10,6 +10,7 @@ import { isP2pSavedConfig, sanitizeP2pSavedConfig } from '../../../shared/p2p-mo
 import { collectRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
 import {
   SHARE_BROWSER_COMMANDS,
+  isSharedServerParticipant,
   rawSubSessionIdFromDisplayName,
   getShareScopedCommandPolicy,
   shareTargetKey,
@@ -30,10 +31,13 @@ import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
 import { CC_PRESET_MSG } from '../../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
+import { SESSION_GROUP_CLONE_MSG } from '../../../shared/session-group-clone.js';
 import {
   projectSharedSessionSupervisionMode,
   SUPERVISION_MODE_PROJECTION_KEY,
 } from '../../../shared/supervision-config.js';
+import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
+import { isDirectConnectivityRuntimeStatus } from '../../../shared/direct-file-transfer.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -57,6 +61,8 @@ export type ShareScopedSocketState = {
   actorDisplayName: string;
   ticketId: string;
   target: ShareTarget;
+  /** Original ticket target; target may be widened while a server grant is active. */
+  requestedTarget?: ShareTarget;
   snapshot: ShareAuthorizationSnapshot;
   connectedAt: number;
   coveredSessionNames?: readonly string[];
@@ -88,6 +94,8 @@ type ShareCommandPolicy =
   | { kind: 'participant-preset-list' }
   | { kind: 'participant-p2p-config-save' }
   | { kind: 'participant-cancel' }
+  /** Owner-equivalent only for a whole-server participant, never a tab share. */
+  | { kind: 'server-participant-action' }
   /** An inert lease contains no file authority and is deliberately role-neutral. */
   | { kind: 'direct-file-lease' }
   /** Direction selects FILE_WRITE (upload) or FILE_READ (preview download). */
@@ -161,6 +169,8 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.STOP, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
+  { bridgeCommand: SESSION_GROUP_CLONE_MSG.START, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_GROUP_CLONE, policy: { kind: 'server-participant-action' } },
+  { bridgeCommand: SESSION_GROUP_CLONE_MSG.CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_GROUP_CLONE, policy: { kind: 'server-participant-action' } },
   { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
   { bridgeCommand: TRANSPORT_MSG.LIST_MODELS, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST, policy: { kind: 'participant-model-list' } },
   { bridgeCommand: CC_PRESET_MSG.LIST, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST, policy: { kind: 'participant-preset-list' } },
@@ -229,6 +239,13 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
 ];
 
 function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntry): void {
+  if (entry.policy.kind === 'server-participant-action') {
+    const sharedPolicy = getShareScopedCommandPolicy(entry.sharedCommand);
+    if (sharedPolicy.disposition !== 'deny') {
+      throw new Error(`Whole-server-only command ${entry.sharedCommand} must remain denied to tab shares`);
+    }
+    return;
+  }
   if (entry.policy.kind === 'deny') return;
   const sharedPolicy = getShareScopedCommandPolicy(entry.sharedCommand);
   if (sharedPolicy.disposition !== 'allow') {
@@ -294,6 +311,14 @@ type DaemonMessagePolicy = {
 };
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessagePolicy>([
+  ['daemon.stats', {
+    target: serverFieldTarget,
+    redact: redactDaemonStatsForParticipant,
+    // Stats contain no session transcript and are rebuilt from a strict
+    // allowlist below, so a concrete tab participant may see the same status
+    // bar as the owner without gaining whole-server session visibility.
+    scopesServerTargetInRedact: true,
+  }],
   ['terminal.diff', { target: terminalDiffTarget }],
   ['terminal_update', { target: terminalUpdateTarget }],
   ['terminal.stream_reset', { target: sessionFieldTarget }],
@@ -407,7 +432,11 @@ export function buildSharedActorEnvelope(
     primaryShareId: state.snapshot.primaryShareId,
     effectiveActorRole: state.snapshot.effectiveRole,
     actionId,
-    origin: state.target.kind === 'server' ? 'shared-server' : 'shared-tab',
+    origin: isSharedServerParticipant(
+      state.target,
+      state.snapshot.effectiveRole,
+      state.snapshot.serverParticipantAuthority,
+    ) ? 'shared-server' : 'shared-tab',
     authorizedAt: state.snapshot.authorizedAt,
     queuedAt: now,
   };
@@ -423,7 +452,48 @@ export function evaluateShareCommand(input: {
   const type = typeof input.msg.type === 'string' ? input.msg.type : '';
   const policy = SHARE_SCOPED_COMMAND_POLICY.get(type);
   if (!policy) return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
-  if (policy.kind === 'deny') return { allowed: false, reason: policy.reason };
+  // A whole-server participant is an owner-equivalent delegated operator for
+  // every *registered* daemon command. Unknown commands still fail closed,
+  // while tab-share participants continue through the narrower policy below.
+  // Sharing/grant management is HTTP-only and is intentionally never present
+  // in this bridge inventory.
+  const serverParticipant = isSharedServerParticipant(
+    input.state.target,
+    input.state.snapshot.effectiveRole,
+    input.state.snapshot.serverParticipantAuthority,
+  );
+  if (policy.kind === 'server-participant-action') {
+    if (!serverParticipant) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const actionId = typeof input.msg.idempotencyKey === 'string' && input.msg.idempotencyKey.trim()
+      ? input.msg.idempotencyKey.trim()
+      : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
+        ? input.msg.commandId.trim()
+        : `share-action-${input.now}`;
+    return {
+      allowed: true,
+      stampedMessage: {
+        ...input.msg,
+        sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
+      },
+    };
+  }
+  if (policy.kind === 'deny') {
+    if (!serverParticipant) return { allowed: false, reason: policy.reason };
+    const actionId = typeof input.msg.actionId === 'string' && input.msg.actionId.trim()
+      ? input.msg.actionId.trim()
+      : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
+        ? input.msg.commandId.trim()
+        : `share-action-${input.now}`;
+    return {
+      allowed: true,
+      stampedMessage: {
+        ...input.msg,
+        sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
+      },
+    };
+  }
 
   const sessionName = commandSessionName(input.msg);
   if (policy.kind === 'allow-covered-read') {
@@ -437,6 +507,7 @@ export function evaluateShareCommand(input: {
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
   if (policy.kind === 'allow-main-covered-read') {
+    if (serverParticipant && sessionName) return { allowed: true };
     return input.state.target.kind === 'main'
       && !!sessionName
       && input.state.target.sessionName === sessionName
@@ -769,13 +840,23 @@ function normalizeSnapshot(value: unknown, expectedServerId: string): ShareAutho
     ? record.coveringShareIds.filter((item): item is string => typeof item === 'string')
     : [];
   const primaryShareId = typeof record.primaryShareId === 'string' ? record.primaryShareId : null;
+  const serverParticipantAuthority = record.serverParticipantAuthority === true;
   if (effectiveRole !== 'viewer' && effectiveRole !== 'participant') return null;
   if (typeof historyCutoffAt !== 'number' || !Number.isFinite(historyCutoffAt)) return null;
   if (typeof authorizedAt !== 'number' || !Number.isFinite(authorizedAt)) return null;
   if (nextCoverageRecheckAt !== null && (typeof nextCoverageRecheckAt !== 'number' || !Number.isFinite(nextCoverageRecheckAt))) {
     return null;
   }
-  return { target, effectiveRole, historyCutoffAt, nextCoverageRecheckAt, coveringShareIds, primaryShareId, authorizedAt };
+  return {
+    target,
+    effectiveRole,
+    serverParticipantAuthority,
+    historyCutoffAt,
+    nextCoverageRecheckAt,
+    coveringShareIds,
+    primaryShareId,
+    authorizedAt,
+  };
 }
 
 function parseSubSessionName(sessionName: string): string | null {
@@ -894,6 +975,69 @@ function subsessionCreatedTarget(msg: Record<string, unknown>): ShareTarget | nu
 
 function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | null {
   return subsessionCreatedTarget(msg);
+}
+
+function redactDaemonStatsForParticipant(
+  msg: Record<string, unknown>,
+  state: ShareScopedSocketState,
+): Record<string, unknown> | null {
+  if (state.snapshot.effectiveRole !== 'participant') return null;
+
+  // The status strip needs only operational health. Rebuild the frame instead
+  // of forwarding arbitrary daemon fields so a future token/secret field can
+  // never become visible merely because daemon.stats was expanded upstream.
+  const redacted: Record<string, unknown> = { type: 'daemon.stats' };
+  for (const key of ['daemonVersion', 'cpu', 'memUsed', 'memTotal', 'load1', 'load5', 'load15', 'uptime']) {
+    const value = msg[key];
+    if (typeof value === 'number' || typeof value === 'string' || value === null) {
+      redacted[key] = value;
+    }
+  }
+
+  // A session share gets the status bar without server diagnostics. A server
+  // participant is owner-equivalent for operational status and receives only
+  // an independently rebuilt diagnostic projection. Do not trust the upstream
+  // bridge as the sole validator: this policy is also an authority boundary,
+  // and a future producer must not smuggle new nested fields through it.
+  if (state.target.kind === 'server') {
+    if (isEmbeddingStatus(msg.embedding)) {
+      redacted.embedding = { state: msg.embedding.state, reason: msg.embedding.reason };
+    }
+    if (Array.isArray(msg.disks)) {
+      redacted.disks = msg.disks.flatMap((value) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+        const disk = value as Record<string, unknown>;
+        if (typeof disk.mount !== 'string'
+          || typeof disk.totalBytes !== 'number'
+          || typeof disk.usedBytes !== 'number'
+          || typeof disk.usedPercent !== 'number') return [];
+        return [{
+          mount: disk.mount,
+          totalBytes: disk.totalBytes,
+          usedBytes: disk.usedBytes,
+          usedPercent: disk.usedPercent,
+        }];
+      });
+    }
+    if (msg.shortRefHealth && typeof msg.shortRefHealth === 'object' && !Array.isArray(msg.shortRefHealth)) {
+      const health = msg.shortRefHealth as Record<string, unknown>;
+      if (typeof health.stage === 'string'
+        && typeof health.failures === 'number'
+        && typeof health.lastFailureAt === 'number') {
+        // `lastError` is arbitrary host text and is not needed by the status
+        // panel's health indicator, so it stays owner-only.
+        redacted.shortRefHealth = {
+          stage: health.stage,
+          failures: health.failures,
+          lastFailureAt: health.lastFailureAt,
+        };
+      }
+    }
+    if (isDirectConnectivityRuntimeStatus(msg.directConnectivity)) {
+      redacted.directConnectivity = { ...msg.directConnectivity };
+    }
+  }
+  return redacted;
 }
 
 /**

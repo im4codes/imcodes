@@ -365,6 +365,44 @@ describe('session-mgmt persistence routes', () => {
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
+  it('PATCH /sessions/:name gives a whole-server participant the owner settings path with stamped provenance', async () => {
+    const coverage = {
+      target: { kind: 'server', serverId: 'srv-1' } as const,
+      effectiveRole: 'participant' as const,
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['server-share-1'],
+      primaryShareId: 'server-share-1',
+      authorizedAt: Date.now(),
+    };
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+      shareProvenance: 'server',
+    });
+    const app = await buildApp();
+    const transportConfig = { provider: { mode: 'balanced' } };
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transportConfig }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSession).toHaveBeenCalledWith(mockDb, 'srv-1', 'deck_proj_brain', {
+      transport_config: transportConfig,
+    });
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls.at(-1)?.[0]))).toMatchObject({
+      type: 'session.update_transport_config',
+      sessionName: 'deck_proj_brain',
+      transportConfig,
+      sharedActor: {
+        origin: 'shared-server',
+        snapshot: { target: coverage.target },
+      },
+    });
+  });
+
   it('PATCH /sessions/:name relays session.restart when agentType changes', async () => {
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
@@ -744,7 +782,32 @@ describe('session-mgmt persistence routes', () => {
       });
       expect(persisted.transport_config?.supervision).not.toHaveProperty('auditTargetSessionName');
       expect(JSON.stringify(persisted.transport_config?.supervision?.executionPools)).toContain('gpt-5.6-sol');
+      const relayed = JSON.parse(String(sendToDaemonMock.mock.calls.at(-1)?.[0]));
+      expect(relayed.sharedActor).toMatchObject({
+        actorUserId: 'user-1',
+        origin: 'shared-tab',
+        effectiveActorRole: 'participant',
+        snapshot: { target: coverage.target },
+      });
     }
+
+    // The same mode-only operation through a whole-server grant keeps its
+    // distinct provenance all the way to the daemon.
+    const serverCoverage = { ...coverage, target: { kind: 'server', serverId: 'srv-1' } as const };
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
+      shareProvenance: 'server',
+    });
+    const serverShareResponse = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ supervision: { mode: 'off' } }),
+    });
+    expect(serverShareResponse.status).toBe(200);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls.at(-1)?.[0])).sharedActor).toMatchObject({
+      origin: 'shared-server',
+      snapshot: { target: serverCoverage.target },
+    });
   });
 
   it('PATCH /sessions/:name/supervision still denies a viewer', async () => {
@@ -779,6 +842,43 @@ describe('session-mgmt persistence routes', () => {
     await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
     expect(mockUpdateSession).not.toHaveBeenCalled();
     expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /sessions/:name/supervision lets a whole-server participant author owner-equivalent config', async () => {
+    const coverage = {
+      target: { kind: 'server', serverId: 'srv-1' } as const,
+      effectiveRole: 'participant' as const,
+      historyCutoffAt: 1_000,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['server-share-1'],
+      primaryShareId: 'server-share-1',
+      authorizedAt: 2_000,
+    };
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+      shareProvenance: 'server',
+    });
+    mockGetDbSessionByName.mockResolvedValue({
+      name: 'deck_proj_brain',
+      role: 'brain',
+      agent_type: 'codex-sdk',
+      transport_config: null,
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ supervision: { mode: 'off' } }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSession).toHaveBeenCalled();
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls.at(-1)?.[0]))).toMatchObject({
+      sharedActor: {
+        origin: 'shared-server',
+        snapshot: { target: coverage.target },
+      },
+    });
   });
 
   it('PATCH /sessions/:name/supervision accepts automatic audit routed from the live pool', async () => {

@@ -155,7 +155,7 @@ async function setup(
   daemon.clearSent();
   browserA.clearSent();
   browserB.clearSent();
-  return { serverId, bridge, daemon, browserA, browserB, auditRows, userPrefs };
+  return { serverId, bridge, daemon, browserA, browserB, auditRows, userPrefs, db };
 }
 
 describe('WsBridge session group clone routing', () => {
@@ -254,6 +254,49 @@ describe('WsBridge session group clone routing', () => {
     expect(JSON.stringify(auditRows)).toContain('session_group_clone.accepted');
     expect(JSON.stringify(auditRows)).toContain('p2p_design_review');
     expect(JSON.stringify(auditRows)).not.toContain('/do/not/audit');
+  });
+
+  it('preserves shared-server participant provenance on clone commands', async () => {
+    const { serverId, bridge, daemon, db } = await setup();
+    const target = { kind: 'server' as const, serverId };
+    const snapshot = {
+      target,
+      effectiveRole: 'participant' as const,
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['share-server-operator'],
+      primaryShareId: 'share-server-operator',
+      authorizedAt: 100,
+    };
+    bridge.setShareCoverageResolverForTests(async () => snapshot);
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'user-owner', db, {
+      ticketId: 'server-share-ticket',
+      target,
+      snapshot,
+    });
+    await flush();
+    daemon.clearSent();
+
+    shared.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: 'idem-shared-server',
+    }));
+    await flush();
+
+    expect(daemon.sentJson()).toContainEqual(expect.objectContaining({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId,
+      idempotencyKey: 'idem-shared-server',
+      sharedActor: expect.objectContaining({
+        actorUserId: 'user-owner',
+        origin: 'shared-server',
+        effectiveActorRole: 'participant',
+        actionId: 'idem-shared-server',
+      }),
+    }));
   });
 
   it('adds server-visible session names to browser clone commands for daemon default allocation', async () => {

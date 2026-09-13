@@ -88,11 +88,29 @@ describe('shared tab sharing contract', () => {
     expect(coverage).toMatchObject({
       target,
       effectiveRole: 'participant',
+      serverParticipantAuthority: false,
       historyCutoffAt: 0,
       nextCoverageRecheckAt: 80,
       coveringShareIds: ['server-view', 'tab-participant'],
       primaryShareId: 'tab-participant',
       authorizedAt: 60,
+    });
+  });
+
+  it('retains whole-server participant authority when resolving a concrete target', () => {
+    const target = { kind: 'main' as const, serverId: 'srv', sessionName: 'main' };
+    const coverage = resolveEffectiveCoverageForTarget(target, [{
+      id: 'server-participant',
+      target: { kind: 'server', serverId: 'srv' },
+      role: 'participant',
+      createdAt: 10,
+      expiresAt: null,
+    }], 20);
+
+    expect(coverage).toMatchObject({
+      target,
+      effectiveRole: 'participant',
+      serverParticipantAuthority: true,
     });
   });
 
@@ -249,7 +267,7 @@ describe('shared tab sharing contract', () => {
     expect(Object.keys(SHARE_SCOPED_COMMAND_POLICY).sort()).toEqual(Object.values(SHARE_BROWSER_COMMANDS).sort());
   });
 
-  it('classifies share-relevant HTTP routes as share-aware, share-denied, or not-applicable', () => {
+  it('classifies share-relevant HTTP routes including whole-server-only authority', () => {
     const ids = SHARE_HTTP_ROUTE_POLICY_INVENTORY.map((entry) => entry.id);
     expect(new Set(ids).size).toBe(ids.length);
     expect(SHARE_HTTP_ROUTE_POLICY_INVENTORY.length).toBeGreaterThan(25);
@@ -261,6 +279,9 @@ describe('shared tab sharing contract', () => {
       }
       if (entry.disposition === 'share-denied') {
         expect(entry.reason).toBe('share-direct-surface-denied');
+      }
+      if (entry.disposition === 'server-share-aware') {
+        expect(entry.reason).toBeUndefined();
       }
     }
 

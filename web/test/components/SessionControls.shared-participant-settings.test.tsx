@@ -73,7 +73,11 @@ function makeWs() {
   };
 }
 
-function sharedSession(role: 'participant' | 'viewer'): SessionInfo {
+function sharedSession(
+  role: 'participant' | 'viewer',
+  targetKind: 'server' | 'main' = 'main',
+  supervisionMode: 'off' | 'supervised_audit' = 'supervised_audit',
+): SessionInfo {
   return {
     name: 'deck_shared_brain',
     project: 'shared-project',
@@ -81,8 +85,8 @@ function sharedSession(role: 'participant' | 'viewer'): SessionInfo {
     agentType: 'codex-sdk',
     runtimeType: 'transport',
     state: 'idle',
-    supervisionMode: 'supervised_audit',
-    sharedState: { effectiveRole: role, status: 'active' },
+    supervisionMode,
+    sharedState: { targetKind, effectiveRole: role, status: 'active' },
   } as SessionInfo;
 }
 
@@ -134,15 +138,67 @@ describe('SessionControls shared participant settings entry points', () => {
       expect((option as HTMLButtonElement).disabled).toBe(false);
     }
 
-    // The session is a Brain, so supervision is ownable; the participant is a
-    // full actor on it, so the write goes out exactly as the owner's would.
+    // The projected share row contains no owner transport config. The client
+    // therefore sends only the requested mode; the server merges it into the
+    // existing owner-authoritative snapshot.
     fireEvent.click(options[0]!);
-    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
+      'server-shared',
+      'deck_shared_brain',
+      { mode: 'off' },
+    ));
   });
 
   it('never offers the control to a viewer', () => {
     renderControls('viewer', vi.fn());
     expect(screen.queryByRole('button', { name: 'Auto' })).toBeNull();
+  });
+
+  it('enables audit from the safe mode projection without reading owner defaults', async () => {
+    render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={sharedSession('participant', 'main', 'off')}
+        quickData={quickData}
+        onSettings={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(within(document.querySelector('.menu-dropdown-auto') as HTMLElement)
+      .getByRole('button', { name: /supervised_audit/i }));
+
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
+      'server-shared',
+      'deck_shared_brain',
+      { mode: 'supervised_audit' },
+    ));
+    expect(fetchSupervisorDefaultsMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps stop restricted for a session share but exposes it for a server-share participant', () => {
+    const view = renderControls('participant', vi.fn());
+    fireEvent.click(screen.getByTitle('Actions'));
+    expect(within(document.querySelector('.session-actions-menu') as HTMLElement)
+      .queryByRole('button', { name: /stop_plain/i })).toBeNull();
+
+    view.unmount();
+    const serverView = render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={sharedSession('participant', 'server')}
+        quickData={quickData}
+        onSettings={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    expect(within(document.querySelector('.session-actions-menu') as HTMLElement)
+      .getByRole('button', { name: /stop_plain/i })).toBeDefined();
+    serverView.unmount();
   });
 
   it('opens the same settings surface from the session action menu for an active participant', () => {

@@ -476,8 +476,12 @@ vi.mock('../src/components/SessionTree.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionTabs.js', () => ({
-  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
-    <div>
+  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, canStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
+    <div
+      data-testid="app-shell-session-tabs"
+      data-can-new-session={String(Boolean(onNewSession))}
+      data-can-stop-project={String(canStopProject !== false)}
+    >
       session-tabs
       <button onClick={() => onSelect?.(sessions?.[0]?.name)}>tabs-select</button>
       {sessions?.map((session: any) => (
@@ -511,6 +515,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onRenameSession,
     onScrollBottomFn,
     onSettings,
+    onShareSession,
     onStopProject,
     onTransportConfigSaved,
   }: any) => (
@@ -518,6 +523,8 @@ vi.mock('../src/components/SessionPane.js', () => ({
       data-testid={`session-pane-${session.name}`}
       data-active-dispatch-id={session.sharedState?.activeDispatchId ?? ''}
       data-supervision-mode={session.supervisionMode ?? ''}
+      data-share-target-kind={session.sharedState?.targetKind ?? ''}
+      data-can-share={String(Boolean(onShareSession))}
     >
       session-pane:{session.name}
       <button onClick={() => onFitFn?.(vi.fn())}>pane-fit-ref</button>
@@ -4317,6 +4324,10 @@ describe('App shell', () => {
     const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
     expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-open-1');
     expect(sharedPane.getAttribute('data-supervision-mode')).toBe('supervised_audit');
+    expect(sharedPane.getAttribute('data-share-target-kind')).toBe('main');
+    expect(sharedPane.getAttribute('data-can-share')).toBe('false');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-new-session')).toBe('false');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-stop-project')).toBe('false');
     fireEvent.click(within(sharedPane).getByRole('button', { name: 'pane-settings' }));
     const settings = await screen.findByTestId('session-settings-dialog');
     expect(settings.getAttribute('data-supervision-mode')).toBe('supervised_audit');
@@ -4345,6 +4356,59 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
     expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+  }, 20_000);
+
+  it('gives a shared-server participant owner operations while keeping every re-share entry absent', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-server-operator',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Whole Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: [sharedEntry.id],
+        primaryShareId: sharedEntry.id,
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        supervisionMode: 'supervised_audit',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click((await screen.findByText('Whole Shared Server')).closest('button')!);
+
+    const pane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(pane.getAttribute('data-share-target-kind')).toBe('server');
+    expect(pane.getAttribute('data-can-share')).toBe('false');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-new-session')).toBe('true');
+    expect(screen.getByTestId('app-shell-session-tabs').getAttribute('data-can-stop-project')).toBe('true');
+
+    // The ordinary server-management menu is available for the delegated
+    // operator. Share/invite is intentionally absent from both this menu and
+    // the session surface above.
+    fireEvent.click(screen.getByText('server-menu'));
+    expect(await screen.findByText('server-context-menu')).toBeTruthy();
+    expect(screen.queryByText('share-session-dialog')).toBeNull();
   }, 20_000);
 
   it('keeps an explicit server choice authoritative after a shared route has settled', async () => {

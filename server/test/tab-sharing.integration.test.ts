@@ -13,7 +13,7 @@ import {
 } from '../src/db/tab-sharing.js';
 import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
 import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from '../src/routes/share-http-auth.js';
-import { resolveServerRole } from '../src/security/authorization.js';
+import { resolveServerMembershipRole, resolveServerRole } from '../src/security/authorization.js';
 import { signJwt, verifyJwt } from '../src/security/crypto.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { WsBridge } from '../src/ws/bridge.js';
@@ -338,6 +338,55 @@ describe('tab sharing persistence helpers', () => {
 });
 
 describe('tab sharing APIs', () => {
+  it('gives only a server-share participant owner-equivalent operations while re-share stays member-only', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, outsiderId, serverId, sessionName } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('server-participant'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: Date.now(),
+    });
+
+    expect(await resolveServerMembershipRole(db, serverId, recipientId)).toBe('none');
+    expect(await resolveServerRole(db, serverId, recipientId)).toBe('owner');
+    const operationalShareAccess = await resolveHttpShareAccess(db, {
+      serverId,
+      userId: recipientId,
+      target: { kind: 'main', serverId, sessionName },
+    });
+    expect(operationalShareAccess.membership).toBe('none');
+    expect(operationalShareAccess.shareProvenance).toBe('server');
+    expect(operationalShareAccess.actor).toMatchObject({
+      kind: 'share',
+      effectiveActorRole: 'participant',
+      coverage: { target: { kind: 'main', serverId, sessionName } },
+    });
+
+    const reshared = await app.request(`/api/server/${serverId}/shares`, {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({
+        target: { kind: 'main', serverId, sessionName },
+        targetUserId: outsiderId,
+        role: 'participant',
+      }),
+    });
+    expect(reshared.status).toBe(403);
+
+    await createOrUpdateShare(db, {
+      id: id('session-participant'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: outsiderId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: Date.now(),
+    });
+    expect(await resolveServerRole(db, serverId, outsiderId)).toBe('none');
+  });
+
   it('enforces manager-only creation, self-share rejection, and sub-session normalization', async () => {
     const app = makeApp();
     const { ownerId, recipientId, outsiderId, serverId, subSessionId } = await seedShareTarget();

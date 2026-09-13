@@ -340,6 +340,7 @@ import {
 import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
 import {
   SHARE_REASONS,
+  buildSharedActorEnvelope,
   commandSessionName,
   evaluateShareCommand,
   filterShareDaemonMessage,
@@ -5062,14 +5063,18 @@ export class WsBridge {
       isMobile?: boolean;
     },
   ): void {
+    const effectiveTarget = options.snapshot.serverParticipantAuthority === true
+      ? { kind: 'server' as const, serverId: options.target.serverId }
+      : options.target;
     this.browserShareStates.set(ws, {
       userId,
       actorDisplayName: userId,
       ticketId: options.ticketId,
-      target: options.target,
+      target: effectiveTarget,
+      requestedTarget: options.target,
       snapshot: options.snapshot,
       connectedAt: shareClockNow(),
-      coveredSessionNames: this.baseCoveredSessionNames(options.target),
+      coveredSessionNames: this.baseCoveredSessionNames(effectiveTarget),
     });
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
     void this.refreshShareActorDisplayName(ws);
@@ -6070,7 +6075,7 @@ export class WsBridge {
       db: this.db,
       serverId: this.serverId,
       userId: state.userId,
-      target: state.target,
+      target: state.requestedTarget ?? state.target,
       now: shareClockNow(),
     });
   }
@@ -6080,11 +6085,14 @@ export class WsBridge {
     state: ShareScopedSocketState,
     coverage: EffectiveCoverage,
   ): Promise<ShareScopedSocketState> {
+    const effectiveTarget = coverage.serverParticipantAuthority === true
+      ? { kind: 'server' as const, serverId: coverage.target.serverId }
+      : coverage.target;
     const next: ShareScopedSocketState = {
       ...state,
-      target: coverage.target,
+      target: effectiveTarget,
       snapshot: coverage,
-      coveredSessionNames: await this.resolveShareCoveredSessionNames(coverage.target),
+      coveredSessionNames: await this.resolveShareCoveredSessionNames(effectiveTarget),
     };
     if (state.snapshot.effectiveRole !== coverage.effectiveRole) {
       safeSend(ws, JSON.stringify({
@@ -6273,6 +6281,7 @@ export class WsBridge {
       sendError('forbidden');
       return;
     }
+    const shareState = this.browserShareStates.get(ws);
 
     const role = await resolveServerRole(db, this.serverId, userId);
     if (role !== 'owner' && role !== 'admin') {
@@ -6318,6 +6327,13 @@ export class WsBridge {
         serverId: this.serverId,
         ...(operationId ? { operationId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(shareState ? {
+          sharedActor: buildSharedActorEnvelope(
+            shareState,
+            idempotencyKey || operationId || `share-action-${shareClockNow()}`,
+            shareClockNow(),
+          ),
+        } : {}),
       }));
       return;
     }
@@ -6365,6 +6381,9 @@ export class WsBridge {
       serverId: this.serverId,
       sourceMainSessionName,
       idempotencyKey,
+      ...(shareState ? {
+        sharedActor: buildSharedActorEnvelope(shareState, idempotencyKey, shareClockNow()),
+      } : {}),
     };
     if (targetProjectName.value !== undefined) payload.targetProjectName = targetProjectName.value;
     if (cwdOverride.value !== undefined) payload.cwdOverride = cwdOverride.value;

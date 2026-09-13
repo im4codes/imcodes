@@ -757,7 +757,7 @@
       "poolChangeBudget": "变更预算",
       "poolAuditHeadroom": "每厂商审计预留",
       "sessionConfigTitle": "当前会话配置",
-      "sessionConfigHelp": "模式、对等审计者、循环上限和自定义提示词只作用于当前会话。",
+      "sessionConfigHelp": "模式、循环限制和自定义指令仅应用于此会话。",
       "usesGlobalRuntime": "后端、模型、预设、超时和备用运行时均使用上方全局配置。",
       "intro": {
         "title": "Auto 是做什么的",
@@ -806,15 +806,14 @@
       "summaryContinueLimits": "继续限制：同类 {{streak}} · 硬上限 {{total}}",
       "summaryCustomInstructions": "自定义提示词：{{value}}",
       "summaryCustomInstructionsSet": "已设置",
-      "summaryAudit": "对等审计者：{{auditor}} · 循环 {{loops}} 次",
+      "summaryAudit": "自动路由 · 循环 {{loops}} 次",
       "summaryMeta": "提示词 {{promptVersion}}，修复 {{repairVersion}}，解析重试 {{parseRetries}}，任务运行 {{taskRunVersion}}",
       "disabledHint": "仅 transport 会话支持监督。",
       "unsupported": "process 会话不支持监督设置。",
       "validation": {
         "backendRequired": "请选择监督后端。",
         "modelRequired": "请选择或输入监督模型。",
-        "modelInvalid": "{{backend}} 的模型无效。",
-        "auditTargetRequired": "请选择并确认一个合格的对等审计者。"
+        "modelInvalid": "{{backend}} 的模型无效。"
       },
       "modeLabel": "模式",
       "invalidStoredConfig": "已保存的监督配置无效。修复并保存前，自动化将保持禁用。",

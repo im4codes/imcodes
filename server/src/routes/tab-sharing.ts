@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { randomHex, signJwt } from '../security/crypto.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveServerMembershipRole } from '../security/authorization.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -173,7 +173,10 @@ async function requireShareManager(db: Env['DB'], serverId: string, userId: stri
   if (server.node_role === NODE_ROLE.CONTROLLED) {
     return server.user_id === userId;
   }
-  const role = await resolveServerRole(db, serverId, userId);
+  // Re-share is the single deliberate exception to whole-server participant
+  // authority. Resolve durable membership only; an incoming share can never
+  // bootstrap another grant.
+  const role = await resolveServerMembershipRole(db, serverId, userId);
   return role === 'owner' || role === 'admin';
 }
 

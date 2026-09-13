@@ -757,7 +757,7 @@
       "poolChangeBudget": "변경 예산",
       "poolAuditHeadroom": "공급자별 감사 여유",
       "sessionConfigTitle": "현재 세션",
-      "sessionConfigHelp": "모드, 피어 감사자, 반복 한도 및 사용자 지침은 이 세션에만 적용됩니다.",
+      "sessionConfigHelp": "모드, 루프 제한 및 사용자 지정 지침은 이 세션에만 적용됩니다.",
       "usesGlobalRuntime": "백엔드, 모델, 프리셋, 타임아웃 및 백업 런타임은 위의 전역 설정을 사용합니다.",
       "intro": {
         "title": "Auto의 역할",
@@ -806,15 +806,14 @@
       "summaryContinueLimits": "continue 제한: 동일 유형 {{streak}} · 하드 {{total}}",
       "summaryCustomInstructions": "사용자 지정 지침: {{value}}",
       "summaryCustomInstructionsSet": "설정됨",
-      "summaryAudit": "피어 감사자: {{auditor}} · 루프 {{loops}}회",
+      "summaryAudit": "자동 라우팅 · 루프 {{loops}}회",
       "summaryMeta": "프롬프트 {{promptVersion}}, 복구 {{repairVersion}}, 파싱 재시도 {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "감독은 transport 세션에서만 사용할 수 있습니다.",
       "unsupported": "process 세션에서는 감독 설정을 사용할 수 없습니다.",
       "validation": {
         "backendRequired": "감독 백엔드를 선택하세요.",
         "modelRequired": "감독 모델을 선택하거나 입력하세요.",
-        "modelInvalid": "{{backend}}에서는 이 모델을 사용할 수 없습니다.",
-        "auditTargetRequired": "적격한 피어 감사자를 선택하고 확인하세요."
+        "modelInvalid": "{{backend}}에서는 이 모델을 사용할 수 없습니다."
       },
       "modeLabel": "모드",
       "invalidStoredConfig": "저장된 감독 설정이 잘못되었습니다. 수정하고 저장할 때까지 자동화는 비활성화됩니다.",

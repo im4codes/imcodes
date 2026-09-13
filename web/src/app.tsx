@@ -3045,6 +3045,7 @@ export function App() {
           label: session.title,
           supervisionMode: session.supervisionMode ?? null,
           sharedState: {
+            targetKind: opened.target.kind,
             effectiveRole: opened.coverage.effectiveRole,
             status: 'active',
             scopeLabel: entry.targetLabel,
@@ -5362,8 +5363,16 @@ export function App() {
     setShowMobileServerMenu(false);
   }, [setActiveSession]);
 
+  const canStopProjectForCurrentShare = !selectedShareTarget || (
+    selectedShareTarget.kind === 'server'
+    && sessions.find((session) => session.name === activeSession)?.sharedState?.effectiveRole === 'participant'
+  );
+
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
+    // A concrete tab share never owns the whole project lifecycle. Whole-
+    // server participants are the explicit owner-equivalent exception.
+    if (!canStopProjectForCurrentShare) return;
     // Pinned tabs are protected — refuse to stop a project that has any
     // pinned session. User must unpin first. Defense-in-depth so all stop
     // paths (tab context menu, session-controls menu) honor this.
@@ -5376,7 +5385,7 @@ export function App() {
     ));
     wsRef.current.sendSessionCommand('stop', { project });
     requestActiveTimelineRefreshAfterUserAction();
-  }, [pinnedTabs, sessions, trans]);
+  }, [canStopProjectForCurrentShare, pinnedTabs, sessions, trans]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
@@ -5469,6 +5478,9 @@ export function App() {
     );
   }
 
+  const isSharedServerParticipant = selectedShareTarget?.kind === 'server'
+    && sharedAccessRole === 'participant';
+  const canCreateMainSession = !selectedShareTarget || isSharedServerParticipant;
   const canCreateSubSession = !selectedShareTarget
     || (sharedAccessRole === 'participant' && selectedShareTarget.kind !== 'subsession');
 
@@ -6070,7 +6082,7 @@ export function App() {
               onSelectSubSession={(sub) => {
                 selectSubSessionFromTree(sub);
               }}
-              onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
+              onNewSession={canCreateMainSession ? () => setShowNewSession(true) : undefined}
               onNewSubSession={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
             />}
 
@@ -6395,8 +6407,9 @@ export function App() {
               p2pSessionLabels={p2pSessionLabels}
               onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
               onSelect={selectMainSessionTab}
-              onNewSession={() => setShowNewSession(true)}
+              onNewSession={canCreateMainSession ? () => setShowNewSession(true) : undefined}
               onStopProject={handleStopProject}
+              canStopProject={!selectedShareTarget || isSharedServerParticipant}
               onRestartProject={handleRestartProject}
               onOpenSessionSettings={(session) => setSettingsTarget({
                 sessionName: session.name,
@@ -6416,7 +6429,7 @@ export function App() {
                   && canSessionRoleOwnAutomaticSupervision(session.role),
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
-              onShareSession={openShareDialogForSession}
+              onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
@@ -6532,7 +6545,7 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, supervisionMode: s.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: canSharedActorControlSession(s.sharedState) && canSessionRoleOwnAutomaticSupervision(s.role) })}
-                onShareSession={openShareDialogForSession}
+                onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
                 onToggleSessionPin={togglePinnedTab}
@@ -6572,9 +6585,11 @@ export function App() {
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div style={{ fontSize: 32 }}>⌨</div>
                 <div>Select a session or start a new one</div>
-                <button class="btn btn-primary" onClick={() => setShowNewSession(true)}>
-                  + New Session
-                </button>
+                {canCreateMainSession && (
+                  <button class="btn btn-primary" onClick={() => setShowNewSession(true)}>
+                    + New Session
+                  </button>
+                )}
               </div>
               )}
               </div>
@@ -6885,7 +6900,7 @@ export function App() {
                   selectSubSessionFromTree(sub);
                   closeSidebar();
                 }}
-                onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
+                onNewSession={canCreateMainSession ? () => { setShowNewSession(true); closeSidebar(); } : undefined}
                 onNewSubSession={canCreateSubSession ? () => { setShowSubDialog(true); closeSidebar(); } : undefined}
                 height={sessionTreeHeight}
                 onResizeHeight={saveSessionTreeHeight}
@@ -7471,7 +7486,7 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, supervisionMode: sub.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: false })}
-              onShareSession={openShareDialogForSession}
+              onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}

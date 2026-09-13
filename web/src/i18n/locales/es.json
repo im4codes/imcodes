@@ -757,7 +757,7 @@
       "poolChangeBudget": "Presupuesto de cambios",
       "poolAuditHeadroom": "Reserva de auditoría por proveedor",
       "sessionConfigTitle": "Esta sesión",
-      "sessionConfigHelp": "El modo, auditor, límites de bucle e instrucciones personalizadas solo se aplican a esta sesión.",
+      "sessionConfigHelp": "El modo, los límites de ciclos y las instrucciones personalizadas solo se aplican a esta sesión.",
       "usesGlobalRuntime": "Backend, modelo, preset, timeout y respaldo usan la configuración global anterior.",
       "intro": {
         "title": "Qué hace Auto",
@@ -806,15 +806,14 @@
       "summaryContinueLimits": "Límites de continue: racha {{streak}} · duro {{total}}",
       "summaryCustomInstructions": "Instrucciones personalizadas: {{value}}",
       "summaryCustomInstructionsSet": "configuradas",
-      "summaryAudit": "Auditor par: {{auditor}} · ciclos {{loops}}",
+      "summaryAudit": "Enrutamiento automático · ciclos {{loops}}",
       "summaryMeta": "Prompt {{promptVersion}}, reparación {{repairVersion}}, reintentos de parseo {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "La supervisión solo está disponible para sesiones transport.",
       "unsupported": "La configuración de supervisión no está disponible para sesiones process.",
       "validation": {
         "backendRequired": "Selecciona un backend de supervisión.",
         "modelRequired": "Selecciona o introduce un modelo de supervisión.",
-        "modelInvalid": "El modelo no es válido para {{backend}}.",
-        "auditTargetRequired": "Selecciona y confirma un auditor par elegible."
+        "modelInvalid": "El modelo no es válido para {{backend}}."
       },
       "modeLabel": "Modo",
       "invalidStoredConfig": "La configuración guardada de supervisión no es válida. La automatización seguirá desactivada hasta que la repares y la guardes.",

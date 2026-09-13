@@ -86,7 +86,7 @@ import {
   hasTransportPendingSyncSnapshot,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
-import { canSharedActorControlSession, formatSharedActorLabel } from '../tab-sharing-ui.js';
+import { canSharedActorControlSession, canSharedActorManageServer, formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
@@ -1477,6 +1477,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isShareScopedSession = !!sharedState && sharedState.outgoing !== true;
   const canSharedSessionSend = !isShareScopedSession
     || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
+  const canManageSharedServer = canSharedActorManageServer(sharedState);
   // Session settings mutate the owner session, so shared access is a positive
   // role grant rather than a consequence of the menu being reachable. Active
   // participants use the owner's existing settings surface; viewers and stale
@@ -1907,10 +1908,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ? activeSession?.supervisionMode ?? SUPERVISION_MODE.OFF
     : supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
   const auditedSessionName = activeSession?.name ?? null;
-  const hasSavedAuditTarget = Boolean(
-    supervisionSnapshot?.auditTargetSessionName
-    && supervisionSnapshot.auditTargetSessionName !== auditedSessionName,
-  );
   const canQuickPeerAudit = !!(
     activeSession
     && serverId
@@ -1925,7 +1922,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ));
   const canQuickControlSupervision = canQuickViewSupervision && canSharedActorControlSession(sharedState);
   const supervisorDefaultsPref = useSupervisorDefaults(
-    canQuickControlSupervision,
+    canQuickControlSupervision && !isShareScopedSession,
     serverId && activeSession?.name ? { serverId, sessionName: activeSession.name } : null,
   );
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
@@ -2767,10 +2764,34 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     if (nextMode === SUPERVISION_MODE.OFF) {
       const nextSnapshot = supervisionSnapshot
-        ? { ...supervisionSnapshot, mode: SUPERVISION_MODE.OFF }
+        ? (() => {
+            const {
+              auditTargetSessionName: _legacyTarget,
+              auditTargetFingerprint: _legacyFingerprint,
+              peerAuditPromptVersion: _legacyPrompt,
+              ...automaticSnapshot
+            } = supervisionSnapshot;
+            return { ...automaticSnapshot, mode: SUPERVISION_MODE.OFF };
+          })()
         : { mode: SUPERVISION_MODE.OFF };
       try {
         await persistTransportConfig(nextSnapshot);
+        setAutoOpen(false);
+        showSupervisionModeNotice(nextMode);
+      } catch {
+        showSendWarning(t('session.supervision.modeSaveFailed'));
+      }
+      return;
+    }
+
+    // Share-scoped rows intentionally expose only the current mode, never the
+    // owner's provider/runtime configuration. Persist a mode-only patch and
+    // let the server merge it into the already-authoritative snapshot. This
+    // keeps both session-share and server-share actors functional without
+    // projecting credentials or making their personal defaults authoritative.
+    if (isShareScopedSession) {
+      try {
+        await persistTransportConfig({ mode: nextMode });
         setAutoOpen(false);
         showSupervisionModeNotice(nextMode);
       } catch {
@@ -2784,23 +2805,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    // Settings persist the user's exact auditor choice. Live availability and
-    // delivery remain daemon/ordinary-delegation concerns at audit time.
-    if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !hasSavedAuditTarget) {
-      openSettingsForMode();
-      return;
-    }
-
     let nextSnapshot: Partial<SessionSupervisionSnapshot> | null = null;
     if (supervisionSnapshot) {
-      nextSnapshot = { ...supervisionSnapshot, mode: nextMode };
+      const {
+        auditTargetSessionName: _legacyTarget,
+        auditTargetFingerprint: _legacyFingerprint,
+        peerAuditPromptVersion: _legacyPrompt,
+        ...automaticSnapshot
+      } = supervisionSnapshot;
+      nextSnapshot = { ...automaticSnapshot, mode: nextMode };
     } else {
       const defaults = supervisorDefaultsPref.value ?? (supervisorDefaultsPref.loaded ? null : await supervisorDefaultsPref.reload());
       if (!defaults) {
-        openSettingsForMode();
-        return;
-      }
-      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
         openSettingsForMode();
         return;
       }
@@ -2846,9 +2862,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     canQuickControlSupervision,
     currentTransportConfig,
     hasInvalidSupervisionConfig,
+    isShareScopedSession,
     onSettings,
     persistTransportConfig,
-    hasSavedAuditTarget,
     serverId,
     showSendWarning,
     showSupervisionModeNotice,
@@ -7246,7 +7262,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
                 </button>
               )}
-              {!isShareScopedSession && (
+              {(!isShareScopedSession || canManageSharedServer) && (
                 <>
                   <div class="menu-divider" />
                   <button

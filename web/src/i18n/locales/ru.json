@@ -757,7 +757,7 @@
       "poolChangeBudget": "Бюджет изменений",
       "poolAuditHeadroom": "Резерв аудита на провайдера",
       "sessionConfigTitle": "Текущая сессия",
-      "sessionConfigHelp": "Режим, аудитор, лимиты циклов и пользовательские инструкции применяются только к этой сессии.",
+      "sessionConfigHelp": "Режим, ограничения циклов и пользовательские инструкции применяются только к этому сеансу.",
       "usesGlobalRuntime": "Backend, модель, preset, timeout и резервный runtime используют глобальную конфигурацию выше.",
       "intro": {
         "title": "Что делает Auto",
@@ -806,15 +806,14 @@
       "summaryContinueLimits": "Лимиты continue: серия {{streak}} · жесткий {{total}}",
       "summaryCustomInstructions": "Пользовательские инструкции: {{value}}",
       "summaryCustomInstructionsSet": "заданы",
-      "summaryAudit": "Партнёр-аудитор: {{auditor}} · циклов {{loops}}",
+      "summaryAudit": "Автоматическая маршрутизация · циклов: {{loops}}",
       "summaryMeta": "Промпт {{promptVersion}}, исправление {{repairVersion}}, повторы парсинга {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "Контроль доступен только для transport-сессий.",
       "unsupported": "Настройки контроля недоступны для process-сессий.",
       "validation": {
         "backendRequired": "Выберите бэкенд контроля.",
         "modelRequired": "Выберите или введите модель контроля.",
-        "modelInvalid": "Модель недопустима для {{backend}}.",
-        "auditTargetRequired": "Выберите и подтвердите подходящего партнёра-аудитора."
+        "modelInvalid": "Модель недопустима для {{backend}}."
       },
       "modeLabel": "Режим",
       "invalidStoredConfig": "Сохранённая конфигурация контроля недействительна. Автоматизация останется выключенной, пока вы её не исправите и не сохраните.",

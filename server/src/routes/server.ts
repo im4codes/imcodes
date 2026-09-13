@@ -3,7 +3,6 @@ import { authenticateDaemonServer, daemonAuthFailure } from '../security/daemon-
 import type { Env } from '../env.js';
 import {
   getFullServersByUserId,
-  getServersByUserId,
   updateServerHeartbeat,
   updateServerName,
   deleteServer,
@@ -14,6 +13,7 @@ import {
   getUserPref,
   setUserPref,
 } from '../db/queries.js';
+import { resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { sha256Hex, randomHex } from '../security/crypto.js';
 import { requireAuth } from '../security/authorization.js';
@@ -379,7 +379,10 @@ serverRoutes.patch('/:id/name', requireAuth(), async (c) => {
   const parsed = z.object({ name: z.string().min(1).max(64) }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const updated = await updateServerName(c.env.DB, serverId, userId, parsed.data.name.trim());
+  const server = await getServerById(c.env.DB, serverId);
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (!server || role !== 'owner') return c.json({ error: 'not_found' }, 404);
+  const updated = await updateServerName(c.env.DB, serverId, server.user_id, parsed.data.name.trim());
   if (!updated) return c.json({ error: 'not_found' }, 404);
   return c.json({ ok: true });
 });
@@ -389,7 +392,10 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id') ?? '';
 
-  const deleted = await deleteServer(c.env.DB, serverId, userId);
+  const server = await getServerById(c.env.DB, serverId);
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (!server || role !== 'owner') return c.json({ error: 'not_found' }, 404);
+  const deleted = await deleteServer(c.env.DB, serverId, server.user_id);
   if (!deleted) return c.json({ error: 'not_found' }, 404);
 
   // Notify daemon to self-destruct after DB ownership has been proven (best-effort — daemon may be offline)
@@ -403,8 +409,12 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
 serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id') ?? '';
-  const dbServers = await getServersByUserId(c.env.DB, userId);
-  if (!dbServers.find((s) => s.id === serverId)) return c.json({ error: 'not_found' }, 404);
+  // Preserve the existing machine-member upgrade surface while also admitting
+  // whole-server participants. Concrete-session shares still resolve to null.
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (!role || role === 'none') {
+    return c.json({ error: 'not_found' }, 404);
+  }
   const result = WsBridge.get(serverId).requestDaemonUpgrade({
     targetVersion: process.env.APP_VERSION,
     source: 'manual',

@@ -17,6 +17,8 @@ export interface SharedUserSummary {
 }
 
 export interface SharedStateSummary {
+  /** Provenance of an incoming grant; never infer this from participant role. */
+  targetKind?: ShareTarget['kind'];
   scopeLabel?: string | null;
   effectiveRole?: ShareRole | null;
   status?: ShareStatus | null;
@@ -46,6 +48,13 @@ export function isShareScopedState(shared: SharedStateSummary | null | undefined
 export function canSharedActorControlSession(shared: SharedStateSummary | null | undefined): boolean {
   if (!isShareScopedState(shared)) return true;
   return shared?.status === 'active' && shared.effectiveRole === 'participant';
+}
+
+export function canSharedActorManageServer(shared: SharedStateSummary | null | undefined): boolean {
+  if (!isShareScopedState(shared)) return true;
+  return shared?.status === 'active'
+    && shared.effectiveRole === 'participant'
+    && shared.targetKind === 'server';
 }
 
 export type SharedActorDisplaySummary = Pick<SharedActorEnvelope, 'actorDisplayName' | 'effectiveActorRole'>;

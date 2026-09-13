@@ -17,7 +17,12 @@ import {
   type ShareDenialReason,
   type ShareTarget,
 } from '../db/tab-sharing.js';
-import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import {
+  resolveHttpShareAccess,
+  resolveHttpShareAccessForCoveredSession,
+  resolveServerMemberAccessOrShareDeny,
+  type HttpShareAccess,
+} from './share-http-auth.js';
 import { buildCoversSessionPredicate, resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -295,10 +300,10 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
   }
 
-  // A share participant drives the session exactly like its owner — it already
-  // sends, restarts and edits settings — so it also controls supervision. A
-  // viewer does not. This is the same participant gate every other write on
-  // this router uses; the Brain-only rule below is separate and still applies.
+  // Both participant classes may control supervision for the covered session;
+  // viewers may not. Their configuration authority diverges below: a concrete
+  // session share is mode-only, while a whole-server participant follows the
+  // owner path. The Brain-only rule remains independent.
   if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
@@ -322,17 +327,25 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
 
   const existingTransportConfig = parseStoredTransportConfig(row.transport_config);
   const existingSnapshot = extractSessionSupervisionSnapshot(existingTransportConfig);
-  // A share participant may flip an already-configured supervision on or off.
-  // It may NOT author the configuration: without an existing snapshot the
-  // whole proposed payload would be persisted verbatim, which is how a forged
-  // `auditTargetSessionName` would reach a session the actor has no coverage
-  // for. Only the owner establishes the configuration; the participant then
-  // controls its mode, and every other field keeps coming from the stored one.
-  if (access.actor.kind === 'share' && !existingSnapshot) {
+  // A concrete-session share may flip an already-configured supervision mode,
+  // but may not author the configuration. A whole-server participant follows
+  // the owner path for server/session operations; provenance is retained in
+  // the daemon command below rather than collapsing both share classes.
+  const isSessionShareParticipant = access.actor.kind === 'share'
+    && !isWholeServerShareAccess(access);
+  if (isSessionShareParticipant && !existingSnapshot) {
     return c.json({ error: 'forbidden', reason: 'share_supervision_not_configured' }, 403);
   }
   const nextSnapshot: SessionSupervisionSnapshot = existingSnapshot
-    ? { ...existingSnapshot, mode: proposed.mode }
+    ? (() => {
+        const {
+          auditTargetSessionName: _legacyTarget,
+          auditTargetFingerprint: _legacyFingerprint,
+          peerAuditPromptVersion: _legacyPrompt,
+          ...automaticSnapshot
+        } = existingSnapshot;
+        return { ...automaticSnapshot, mode: proposed.mode };
+      })()
     : proposed;
   if (nextSnapshot.mode !== SUPERVISION_MODE.OFF && !canOwnAutomaticSupervision) {
     return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
@@ -354,7 +367,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   // configuration; deleting that configuration would make the first off
   // transition irreversible. Preserve it with mode=off so the same participant
   // can later turn it back on without gaining authority to author new fields.
-  const nextTransportConfig = access.actor.kind === 'share'
+  const nextTransportConfig = isSessionShareParticipant
     ? embedSessionSupervisionSnapshot(existingTransportConfig, nextSnapshot)
     : buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
 
@@ -365,12 +378,26 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   }
 
   try {
+    const now = Date.now();
+    const actionId = typeof body.actionId === 'string' && body.actionId.trim()
+      ? body.actionId.trim()
+      : `supervision-mode-${now}`;
+    const sharedActor = access.actor.kind === 'share'
+      ? await buildHttpSharedActor(c.env.DB, {
+          userId,
+          coverage: access.actor.coverage,
+          actionId,
+          now,
+          origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
+        })
+      : null;
     WsBridge.get(serverId).sendToDaemon(JSON.stringify({
       type: target.kind === 'subsession'
         ? DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG
         : DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
       sessionName,
       transportConfig: nextTransportConfig,
+      ...(sharedActor ? { sharedActor } : {}),
     }));
   } catch (err) {
     logger.error({ serverId, sessionName, err }, 'WsBridge session supervision relay failed');
@@ -557,9 +584,12 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
 
   // The dedicated supervision route is not the only way an owner can persist
   // transportConfig. Keep the generic settings route from becoming a bypass:
-  // shared participants may still edit their authorized presentation fields,
-  // but no transport config (including an apparent `off`) crosses this gate.
-  if (access.actor.kind === 'share' && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
+  // concrete-session participants may still edit their authorized presentation
+  // fields, but no transport config (including an apparent `off`) crosses this
+  // generic gate. Whole-server participants intentionally follow the owner path.
+  if (access.actor.kind === 'share'
+    && !isWholeServerShareAccess(access)
+    && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
@@ -598,6 +628,17 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
 
   await updateSession(c.env.DB, serverId, sessionName, fields);
 
+  const sharedActorNow = Date.now();
+  const sharedActor = access.actor.kind === 'share'
+    ? await buildHttpSharedActor(c.env.DB, {
+        userId,
+        coverage: access.actor.coverage,
+        actionId: `session-settings-${sharedActorNow}`,
+        now: sharedActorNow,
+        origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
+      })
+    : null;
+
   if (typeof body.agentType === 'string') {
     try {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
@@ -611,6 +652,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
         ...(body.effort !== undefined ? { effort: body.effort } : {}),
         ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, sessionName, err }, 'WsBridge session settings relay failed');
@@ -623,6 +665,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         type: 'session.relabel',
         sessionName,
         label: body.label ?? null,
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, sessionName, err }, 'WsBridge session relabel relay failed');
@@ -635,6 +678,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
         sessionName,
         transportConfig: body.transportConfig ?? null,
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, sessionName, err }, 'WsBridge session transportConfig relay failed');
@@ -956,6 +1000,7 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
           coverage: access.actor.coverage,
           actionId,
           now,
+          origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
         }),
       });
     }
@@ -1027,6 +1072,7 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         coverage: access.actor.coverage,
         actionId,
         now,
+        origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
       });
       const sharedMachineAuthority = await issueSharedMachineAuthorityForSession(c.env.DB, {
         actorUserId: userId,
@@ -1116,7 +1162,13 @@ function normalizeTrustedRuntimeType(value: string | null): TrustedRuntimeType {
 
 async function buildHttpSharedActor(
   db: Env['DB'],
-  params: { userId: string; coverage: EffectiveCoverage; actionId: string; now: number },
+  params: {
+    userId: string;
+    coverage: EffectiveCoverage;
+    actionId: string;
+    now: number;
+    origin?: SharedActorEnvelope['origin'];
+  },
 ): Promise<SharedActorEnvelope> {
   const user = await db.queryOne<{ display_name: string | null; username: string | null }>(
     'SELECT display_name, username FROM users WHERE id = $1',
@@ -1129,10 +1181,19 @@ async function buildHttpSharedActor(
     primaryShareId: params.coverage.primaryShareId,
     effectiveActorRole: params.coverage.effectiveRole,
     actionId: params.actionId,
-    origin: params.coverage.target.kind === 'server' ? 'shared-server' : 'shared-tab',
+    origin: params.origin ?? (params.coverage.target.kind === 'server' ? 'shared-server' : 'shared-tab'),
     authorizedAt: params.coverage.authorizedAt,
     queuedAt: params.now,
   };
+}
+
+function isWholeServerShareAccess(access: HttpShareAccess): boolean {
+  if (access.actor.kind !== 'share') return false;
+  // Production resolvers always set shareProvenance from covering grant ids.
+  // The fallback preserves old internal test fixtures that model a server
+  // grant directly as a server-target coverage snapshot.
+  return access.shareProvenance === 'server'
+    || (access.shareProvenance === undefined && access.actor.coverage.target.kind === 'server');
 }
 
 async function httpP2pScopeTarget(

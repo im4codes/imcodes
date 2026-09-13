@@ -757,7 +757,7 @@
       "poolChangeBudget": "變更預算",
       "poolAuditHeadroom": "每供應商審計預留",
       "sessionConfigTitle": "目前會話配置",
-      "sessionConfigHelp": "模式、對等審計者、循環上限和自訂提示詞只套用到目前會話。",
+      "sessionConfigHelp": "模式、循環限制和自訂指令僅套用於此工作階段。",
       "usesGlobalRuntime": "後端、模型、預設、逾時和備援執行環境均使用上方全域設定。",
       "intro": {
         "title": "Auto 是做什麼的",
@@ -806,15 +806,14 @@
       "summaryContinueLimits": "繼續限制：同類 {{streak}} · 硬上限 {{total}}",
       "summaryCustomInstructions": "自訂提示詞：{{value}}",
       "summaryCustomInstructionsSet": "已設定",
-      "summaryAudit": "對等稽核者：{{auditor}} · 循環 {{loops}} 次",
+      "summaryAudit": "自動路由 · 循環 {{loops}} 次",
       "summaryMeta": "提示 {{promptVersion}}，修復 {{repairVersion}}，解析重試 {{parseRetries}}，任務執行 {{taskRunVersion}}",
       "disabledHint": "只有 transport 工作階段支援監督。",
       "unsupported": "process 工作階段不支援監督設定。",
       "validation": {
         "backendRequired": "請選擇監督後端。",
         "modelRequired": "請選擇或輸入監督模型。",
-        "modelInvalid": "{{backend}} 的模型無效。",
-        "auditTargetRequired": "請選擇並確認合格的對等稽核者。"
+        "modelInvalid": "{{backend}} 的模型無效。"
       },
       "modeLabel": "模式",
       "invalidStoredConfig": "已儲存的監督設定無效。修復並儲存前，自動化會保持停用。",
