@@ -36,7 +36,12 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() },
 }));
 
-import { closeHookServer, startHookServer, HookStartupPublishError } from '../../src/daemon/hook-server.js';
+import {
+  closeHookServer,
+  startHookServer,
+  HookStartupPublishError,
+  DEFAULT_HOOK_PORT,
+} from '../../src/daemon/hook-server.js';
 import {
   fetchHookIdentity,
   probeHookPort,
@@ -57,6 +62,20 @@ import {
 
 const homes: string[] = [];
 const servers: http.Server[] = [];
+
+/** Bind an isolated test listener. Port zero delegates allocation atomically to
+ *  the OS, so concurrent workers cannot race over the daemon's production bind
+ *  window. `startHookServer` derives the published port from server.address(). */
+const bindEphemeral = vi.fn((target: http.Server): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error): void => reject(err);
+    target.once('error', onError);
+    target.listen(0, '127.0.0.1', () => {
+      target.removeListener('error', onError);
+      resolve();
+    });
+  });
+});
 
 /** The genuine owner-fenced publication, so a seam can fail N times and then
  *  hand over to the real production path rather than faking success. */
@@ -83,7 +102,11 @@ function tempHome(): string {
 }
 
 async function start(home: string, extra: Parameters<typeof startHookServer>[1] = {}) {
-  const result = await startHookServer(vi.fn(), { authorityHome: home, ...extra });
+  const result = await startHookServer(vi.fn(), {
+    authorityHome: home,
+    bindListener: bindEphemeral,
+    ...extra,
+  });
   servers.push(result.server);
   return result;
 }
@@ -131,6 +154,76 @@ afterEach(async () => {
 });
 
 describe('hook endpoint authority against a real listener', () => {
+  it('uses an OS-assigned test port when the production default is occupied', async () => {
+    const blocker = http.createServer((_req, response) => response.end('occupied'));
+    let ownsBlocker = false;
+    try {
+      ownsBlocker = await new Promise<boolean>((resolve, reject) => {
+        const onError = (error: NodeJS.ErrnoException): void => {
+          blocker.removeListener('listening', onListening);
+          if (error.code === 'EADDRINUSE') resolve(false);
+          else reject(error);
+        };
+        const onListening = (): void => {
+          blocker.removeListener('error', onError);
+          resolve(true);
+        };
+        blocker.once('error', onError);
+        blocker.once('listening', onListening);
+        blocker.listen(DEFAULT_HOOK_PORT, '127.0.0.1');
+      });
+
+      const home = tempHome();
+      bindEphemeral.mockClear();
+      const { server, port } = await start(home);
+      const address = server.address();
+
+      expect(bindEphemeral).toHaveBeenCalledOnce();
+      expect(bindEphemeral).toHaveBeenCalledWith(server, DEFAULT_HOOK_PORT);
+      expect(address).toMatchObject({ address: '127.0.0.1', port });
+      expect(port).not.toBe(DEFAULT_HOOK_PORT);
+      await expect(fetchHookIdentity(port)).resolves.toMatchObject({ port });
+    } finally {
+      if (ownsBlocker) {
+        await new Promise<void>((resolve, reject) => {
+          blocker.close((error) => (error ? reject(error) : resolve()));
+        });
+      }
+    }
+  });
+
+  it('keeps concurrent OS-assigned listeners and identities isolated', async () => {
+    const firstHome = tempHome();
+    const secondHome = tempHome();
+    const [first, second] = await Promise.all([start(firstHome), start(secondHome)]);
+
+    expect(first.port).not.toBe(second.port);
+    await expect(fetchHookIdentity(first.port)).resolves.toMatchObject({ port: first.port });
+    await expect(fetchHookIdentity(second.port)).resolves.toMatchObject({ port: second.port });
+    await expect(resolveHookAuthority({ home: firstHome }))
+      .resolves.toMatchObject({ ok: true, port: first.port });
+    await expect(resolveHookAuthority({ home: secondHome }))
+      .resolves.toMatchObject({ ok: true, port: second.port });
+  });
+
+  it('releases an OS-assigned test port after close', async () => {
+    const home = tempHome();
+    const { server, port } = await start(home);
+    await closeHookServer(server);
+
+    const replacement = http.createServer();
+    await new Promise<void>((resolve, reject) => {
+      replacement.once('error', reject);
+      replacement.listen(port, '127.0.0.1', () => {
+        replacement.removeListener('error', reject);
+        resolve();
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      replacement.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+
   it('publishes a legacy-compatible port file plus an identity sidecar', async () => {
     const home = tempHome();
     const { port } = await start(home);
@@ -232,12 +325,12 @@ describe('hook endpoint authority against a real listener', () => {
     let releaseRebind = (): void => {};
     const rebindGate = new Promise<void>((resolve) => { releaseRebind = resolve; });
     let initialBindDone = false;
-    const bindListener = async (target: http.Server, candidate: number): Promise<void> => {
+    const bindListener = async (target: http.Server, _candidate: number): Promise<void> => {
       if (initialBindDone) await rebindGate;
       await new Promise<void>((resolve, reject) => {
         const onError = (err: Error): void => reject(err);
         target.once('error', onError);
-        target.listen(candidate, '127.0.0.1', () => {
+        target.listen(0, '127.0.0.1', () => {
           target.removeListener('error', onError);
           resolve();
         });
@@ -341,19 +434,19 @@ describe('hook endpoint authority against a real listener', () => {
     // EADDRINUSE walks previously made the test depend on 51913 being free.
     let startupDone = false;
     let calls = 0;
-    const realBind = async (target: http.Server, port: number): Promise<void> => {
+    const realBind = async (target: http.Server, _port: number): Promise<void> => {
       await new Promise<void>((resolve, reject) => {
         const onError = (err: Error): void => reject(err);
         target.once('error', onError);
-        target.listen(port, '127.0.0.1', () => {
+        target.listen(0, '127.0.0.1', () => {
           target.removeListener('error', onError);
           resolve();
         });
       });
     };
-    const bindListener = async (target: http.Server, port: number): Promise<void> => {
+    const bindListener = async (target: http.Server, _port: number): Promise<void> => {
       if (!startupDone) {
-        await realBind(target, port);
+        await realBind(target, _port);
         return;
       }
       calls += 1;
@@ -363,7 +456,7 @@ describe('hook endpoint authority against a real listener', () => {
         error.code = 'EADDRINUSE';
         throw error;
       }
-      await realBind(target, port);
+      await realBind(target, _port);
     };
 
     const { server, port } = await start(home, {
@@ -396,7 +489,7 @@ describe('hook endpoint authority against a real listener', () => {
   it('gives up with an explicit error after the bounded retries are exhausted', async () => {
     const home = tempHome();
     let firstBindDone = false;
-    const bindListener = async (target: http.Server, port: number): Promise<void> => {
+    const bindListener = async (target: http.Server, _port: number): Promise<void> => {
       if (firstBindDone) {
         const error = new Error('listen EADDRINUSE') as NodeJS.ErrnoException;
         error.code = 'EADDRINUSE';
@@ -405,7 +498,7 @@ describe('hook endpoint authority against a real listener', () => {
       await new Promise<void>((resolve, reject) => {
         const onError = (err: Error): void => reject(err);
         target.once('error', onError);
-        target.listen(port, '127.0.0.1', () => {
+        target.listen(0, '127.0.0.1', () => {
           target.removeListener('error', onError);
           resolve();
         });
@@ -432,11 +525,10 @@ describe('hook endpoint authority against a real listener', () => {
     expect(await probeHookPort(port, 200)).toBe(false);
     // A failed rebind MUST NOT rewrite the record to a port it never bound.
     expect(readHookAuthorityState(home)).toEqual(before);
-    // And no unadvertised endpoint survives anywhere in the bind window.
-    for (let candidate = port; candidate < port + HOOK_BIND_RETRY_SPAN; candidate += 1) {
-      const identity = await fetchHookIdentity(candidate, 100);
-      expect(identity, `an unadvertised hook endpoint survived on ${candidate}`).toBeNull();
-    }
+    // The only real endpoint this test owned is also gone. Do not scan the
+    // daemon's production port window: a legitimate daemon may be serving
+    // there, and observing it is not evidence that this test leaked a socket.
+    expect(await fetchHookIdentity(port, 100)).toBeNull();
   });
 
   it('does NOT report recovery until the authority is actually published', async () => {
@@ -577,6 +669,7 @@ describe('hook endpoint authority against a real listener', () => {
     try {
       started = await startHookServer(vi.fn(), {
         authorityHome: home,
+        bindListener: bindEphemeral,
         rebindRetry: { maxAttempts: 3, baseDelayMs: 5, capDelayMs: 20 },
         publishRecord: async () => {
           attempts += 1;

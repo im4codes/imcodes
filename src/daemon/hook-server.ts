@@ -757,6 +757,8 @@ export interface HookServerOptions {
   /** Test seam performing the actual `listen`. Injected so the bounded rebind
    *  retry can be driven deterministically instead of racing the OS for ports;
    *  a real `EADDRINUSE` sequence is otherwise impossible to reproduce reliably.
+   *  Tests may bind port `0` to let the OS allocate an isolated endpoint; the
+   *  server always derives the authoritative port from the resulting listener.
    *  MUST reject with `code: 'EADDRINUSE'` to mean "try the next port". */
   bindListener?: (server: http.Server, port: number) => Promise<void>;
   /** Test seam; production lazily binds the daemon-local memory handlers. */
@@ -785,6 +787,11 @@ export async function startHookServer(
   options: HookServerOptions = {},
 ): Promise<{ server: http.Server; port: number }> {
   const preferredPort = loadPreferredPort(options.authorityHome);
+  // `activeHookPort` is the production singleton used by hook writers, but a
+  // test process can own multiple hook servers concurrently. Keep the route's
+  // identity on the instance so one server can never advertise another
+  // server's port when starts overlap.
+  let boundPort = preferredPort;
 
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') {
@@ -803,7 +810,7 @@ export async function startHookServer(
     if (url === HOOK_IDENTITY_HOOK_PATH) {
       const identity: HookIdentityResponse = {
         version: HOOK_AUTHORITY_RECORD_VERSION,
-        port: activeHookPort,
+        port: boundPort,
         pid: hookOwnerIdentity.pid,
         startToken: hookOwnerIdentity.startToken,
       };
@@ -1336,8 +1343,13 @@ export async function startHookServer(
       const port = from + attempt;
       try {
         await bind(server, port);
-        activeHookPort = port;
-        return port;
+        const address = server.address();
+        const actualPort = typeof address === 'object' && address !== null
+          ? address.port
+          : port;
+        boundPort = actualPort;
+        activeHookPort = actualPort;
+        return actualPort;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
         logger.debug({ port }, 'Hook server: port in use, trying next');
