@@ -107,7 +107,14 @@ const contracts: Contract[] = [
       },
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: "if (controlledNode && access.os !== 'win')",
+        // The platform gate is now the node's enrolled OS agreeing with the
+        // platform of the profile it advertises -- Windows or macOS -- rather
+        // than a Windows-only check that refused every Mac.
+        needle: "if (controlledNode && access.os !== CONTROLLED_NODE_OS_WIN && access.os !== CONTROLLED_NODE_OS_MAC)",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        needle: "if (access.os !== expectedOs) return 'unsupported_platform';",
       },
     ],
   },
