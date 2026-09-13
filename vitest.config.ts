@@ -16,6 +16,16 @@ export default defineConfig({
           exclude: ['test/e2e/**', 'test/**/*.integration.test.ts', '**/node_modules/**'],
           environment: 'node',
           globals: false,
+          // Runs before each test file is imported, which is the only point
+          // early enough: daemon modules resolve ~/.imcodes paths at import
+          // time (src/util/logger.ts even opens daemon.log there), so without
+          // this the suite appends to the developer's real production log.
+          // See test/setup/isolated-home.ts.
+          setupFiles: ['./test/setup/isolated-home.ts'],
+          // Owns the directory those per-worker homes live in and removes it once
+          // every worker has exited — including workers that were killed. See
+          // test/setup/isolated-home-global.ts.
+          globalSetup: ['./test/setup/isolated-home-global.ts'],
           // The context-store-worker-isolation change adds real-Worker-thread tests
           // (context-store-worker / context-store-production-owner / memory-recall-l3-*
           // / materialization warm-worker e2e) that spawn threads + do real SQLite work,
