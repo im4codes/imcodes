@@ -727,7 +727,22 @@ export function createControlledNodeRuntime(
           fetchImpl: fetch,
           expectedVersion: DAEMON_VERSION,
         });
-        if (!downloaded) return false;
+        if (!downloaded) {
+          // The server has no signed macOS component set for THIS daemon
+          // version (403/404/503). On a matched release this never happens; on
+          // a node whose version has drifted from the server image's bundled
+          // set it happens every retry. It used to return silently, so a Mac
+          // that could never install its worker -- and therefore never raised
+          // the permission prompt -- left no trace at all. Say so, throttled by
+          // the install retry window above.
+          logger.warn(
+            { expectedVersion: DAEMON_VERSION, arch: componentArch },
+            'macOS remote-desktop component set unavailable for this daemon version; '
+            + 'the server has no matching signed set, so the worker cannot install '
+            + '(auto-install will retry)',
+          );
+          return false;
+        }
         await promoteMacosRemoteDesktopArtifact({
           artifactDirectory: downloaded.componentDirectory,
           manifestPath: downloaded.manifestPath,
