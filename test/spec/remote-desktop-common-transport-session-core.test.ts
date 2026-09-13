@@ -107,13 +107,105 @@ describe("remote-desktop common transport/session core contract", () => {
     );
   });
 
+  // An incremental authority envelope may omit route fields. Every handler that
+  // checks one must first bind the omitted fields from the current authority,
+  // then check and act on the BOUND value -- never on the raw envelope.
+  //
+  // This used to pin a global occurrence count per file. The macOS worker then
+  // gained legitimate offer/ICE/stop paths and the count went from 2 to 5, which
+  // failed CI while proving nothing: a count also passes when one path drops its
+  // binding and an unrelated call site is added. The rule is stated per path
+  // instead, over every Authority-taking method that calls Matches(), plus the
+  // named paths that must exist.
   it("binds incremental lease and mode envelopes before platform authority checks", () => {
-    const windows = readFileSync(WINDOWS_PEER, "utf8");
-    const macos = readFileSync(MACOS_WORKER, "utf8");
-    expect(windows.match(/BindOmittedAuthorityFields\(authority_, (?:renewal|update)\)/g) ?? [])
-      .toHaveLength(2);
-    expect(macos.match(/BindOmittedAuthorityFields\(authority_, authority\)/g) ?? [])
-      .toHaveLength(2);
+    type Method = { name: string; param: string; body: string };
+    const methodsTakingAuthority = (text: string): Method[] => {
+      const methods: Method[] = [];
+      const signature = /(?:^|\n)[ \t]*(?:\[\[nodiscard\]\][ \t]+)?[\w:<>]+[ \t]+((?:\w+::)*\w+)\(([^;{}()]*(?:\([^()]*\)[^;{}()]*)*)\)[^;{}]*\{/g;
+      for (let match = signature.exec(text); match; match = signature.exec(text)) {
+        const param = /const (?:imcodes::rd::)?Authority& (\w+)/.exec(match[2])?.[1];
+        if (!param) continue;
+        const open = match.index + match[0].length - 1;
+        let depth = 0;
+        let end = open;
+        for (let index = open; index < text.length; index++) {
+          const character = text[index];
+          if (character === "/" && text[index + 1] === "/") { index = text.indexOf("\n", index); if (index < 0) break; continue; }
+          if (character === "/" && text[index + 1] === "*") { index = text.indexOf("*/", index + 2) + 1; continue; }
+          if (character === '"' || character === "'") {
+            for (index += 1; index < text.length && text[index] !== character; index++) if (text[index] === "\\") index++;
+            continue;
+          }
+          if (character === "{") depth++;
+          if (character === "}" && --depth === 0) { end = index; break; }
+        }
+        methods.push({ name: match[1].split("::").pop()!, param, body: text.slice(open, end + 1) });
+      }
+      return methods;
+    };
+    const checksAuthority = (body: string) => /(?<![\w])Matches\(/.test(body);
+    const bindingOf = (method: Method) => new RegExp(
+      `(?:const (?:imcodes::rd::)?Authority (\\w+)\\s*=\\s*)?(?:imcodes::rd::)?BindOmittedAuthorityFields\\(authority_, ${method.param}\\)`,
+    ).exec(method.body);
+
+    const files = { windows: readFileSync(WINDOWS_PEER, "utf8"), macos: readFileSync(MACOS_WORKER, "utf8") };
+    // The paths that must bind today. A new path is covered by the class rule
+    // below without editing this table; removing or unbinding one of these fails.
+    const intended: Record<keyof typeof files, Record<string, RegExp>> = {
+      windows: {
+        Renew: /transport_core_\.RenewLease\(/,
+        SetMode: /transport_core_\.UpdateMode\(/,
+      },
+      macos: {
+        NegotiateOffer: /session_->NegotiateOffer\(/,
+        AddRemoteIce: /session_->AddRemoteIceCandidate\(/,
+        RenewLease: /session_->RenewRouteAuthority\(/,
+        SetMode: /session_->ApplyModeAuthority\(/,
+        Stop: /session_->Stop\(\)/,
+      },
+    };
+
+    for (const platform of Object.keys(files) as Array<keyof typeof files>) {
+      const methods = methodsTakingAuthority(files[platform]).filter((method) => method.name !== "Matches");
+      const checked = methods.filter((method) => checksAuthority(method.body));
+
+      // Class rule: every authority-checking handler binds first and never uses the raw envelope.
+      for (const method of checked) {
+        const where = `${platform} ${method.name}(${method.param})`;
+        const binding = bindingOf(method);
+        expect(binding, `${where} must bind omitted authority fields`).not.toBeNull();
+        // What the first check actually receives: the bound variable, or the
+        // binding call itself inline (evaluated before the check either way).
+        const firstCheck = method.body.search(/(?<![\w])Matches\(/);
+        const argumentStart = method.body.indexOf("(", firstCheck) + 1;
+        let depth = 1;
+        let argumentEnd = argumentStart;
+        while (argumentEnd < method.body.length && depth > 0) {
+          if (method.body[argumentEnd] === "(") depth++;
+          if (method.body[argumentEnd] === ")") depth--;
+          argumentEnd++;
+        }
+        const checkedValue = method.body.slice(argumentStart, argumentEnd - 1).trim();
+        const inlineBinding = new RegExp(`^(?:imcodes::rd::)?BindOmittedAuthorityFields\\(authority_, ${method.param}\\)$`);
+        const checksBound = inlineBinding.test(checkedValue)
+          || (!!binding![1] && checkedValue === binding![1] && binding!.index < firstCheck);
+        expect(checksBound, `${where} must check the bound authority, got Matches(${checkedValue})`).toBe(true);
+        expect(method.body, `${where} must not check the raw envelope`)
+          .not.toMatch(new RegExp(`(?<![\\w])Matches\\(${method.param}\\)`));
+        expect(method.body, `${where} must not hand the raw envelope to the platform`)
+          .not.toMatch(new RegExp(`CommonAuthority\\(${method.param}\\)`));
+      }
+
+      // Every intended path exists, binds, and checks before its platform action.
+      for (const [name, action] of Object.entries(intended[platform])) {
+        const method = checked.find((candidate) => candidate.name === name);
+        expect(method, `${platform} ${name} must check a bound authority envelope`).toBeDefined();
+        const firstCheck = method!.body.search(/(?<![\w])Matches\(/);
+        const actionAt = method!.body.search(action);
+        expect(actionAt, `${platform} ${name} must still perform its platform action`).toBeGreaterThan(-1);
+        expect(firstCheck, `${platform} ${name} must check authority before acting`).toBeLessThan(actionAt);
+      }
+    }
   });
 
   it("pins every requested executable counterfactual", async () => {

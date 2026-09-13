@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -113,6 +113,70 @@ describe('windows remote-desktop build manifests', () => {
     const commonFiles = readdirSync(COMMON).sort();
     expect(expectedCommonSources.slice().sort()).toEqual(commonFiles);
     expect(['BUILD.gn', ...declaredCommonSources].sort()).toEqual(commonFiles);
+  });
+
+  // The GN build links every test against the whole common library, so it can
+  // never miss a common unit. The SDK build lists translation units per target
+  // by hand, and the rule above only compares against GN test sources -- which
+  // never name common units. So a production source that starts calling a common
+  // function (worker_policy.cc -> PresentedFrameCompatibleWithDisplay in
+  // common/value_types.cc) links in GN, passes every other check here, and fails
+  // with an unresolved symbol on the SDK job.
+  //
+  // Derived, not restated: follow each listed translation unit's includes through
+  // every spelling -- worker-local headers, the forwarding shims such as
+  // third_party/imcodes_remote_desktop/json_protocol.h, common headers, and the
+  // common units that get pulled in -- and require the implementation unit of every
+  // common header reached. C++ cannot call what it has not declared, so this never
+  // misses a link obligation. It may require a unit only used for its types; that
+  // costs one self-contained object, because every SDK target already links the
+  // same libwebrtc/jsoncpp archive.
+  it('links every remote-desktop-common unit reachable from its listed translation units', () => {
+    const commonUnitsReachableFrom = (translationUnit: string): Set<string> => {
+      const required = new Set<string>();
+      const start = translationUnit.startsWith('common\\')
+        ? resolve(COMMON, translationUnit.slice('common\\'.length))
+        : resolve(NATIVE, translationUnit);
+      expect(existsSync(start), `${translationUnit} exists on disk`).toBe(true);
+      const pending = [start];
+      const visited = new Set<string>();
+      while (pending.length > 0) {
+        const file = pending.pop()!;
+        if (visited.has(file)) continue;
+        visited.add(file);
+        const directory = file.startsWith(COMMON) ? COMMON : NATIVE;
+        for (const [, include] of readFileSync(file, 'utf8').matchAll(/#include "([^"]+)"/g)) {
+          const common = /^third_party\/imcodes_remote_desktop\/common\/(\w+\.h)$/.exec(include!)?.[1];
+          const local = /^third_party\/imcodes_remote_desktop\/(\w+\.h)$/.exec(include!)?.[1];
+          const relative = /^(\w+\.h)$/.exec(include!)?.[1];
+          const header = common ? resolve(COMMON, common)
+            : local ? resolve(NATIVE, local)
+              : relative ? resolve(directory, relative) : undefined;
+          if (!header || !existsSync(header)) continue;
+          pending.push(header);
+          if (!header.startsWith(COMMON)) continue;
+          const unit = header.slice(0, -'.h'.length) + '.cc';
+          if (!existsSync(unit)) continue;
+          required.add(`common\\${unit.slice(COMMON.length + 1)}`);
+          pending.push(unit);
+        }
+      }
+      return required;
+    };
+    const sdkTests = sdk.slice(sdk.indexOf('$Tests = [ordered]@{'), sdk.indexOf('$SystemLibraries'));
+    const targets = new Map<string, string[]>([
+      ['ProductionSources', productionSources],
+      ...[...sdkTests.matchAll(/(\w+) = @\(([\s\S]*?)\)/g)]
+        .map((match) => [match[1]!, [...match[2]!.matchAll(/'([^']+)'/g)].map((unit) => unit[1]!)] as [string, string[]]),
+    ]);
+    expect(targets.size, 'the SDK test table was parsed').toBeGreaterThan(1);
+    for (const [target, units] of targets) {
+      for (const unit of units) {
+        for (const required of commonUnitsReachableFrom(unit)) {
+          expect(units, `${target}: ${unit} reaches ${required.replace('.cc', '.h')}, so ${required} must be linked`).toContain(required);
+        }
+      }
+    }
   });
 
   it('has a unit-test target for every unit-test source on disk', () => {
