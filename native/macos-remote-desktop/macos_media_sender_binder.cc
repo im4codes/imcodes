@@ -61,6 +61,11 @@ std::uint64_t MacosMediaSenderBinder::dropped_before_bind() const noexcept {
   return dropped_before_bind_;
 }
 
+common::PixelSize MacosMediaSenderBinder::configured_pixels() const noexcept {
+  std::lock_guard lock(mutex_);
+  return configured_ ? configuration_.encoded_pixels : common::PixelSize{};
+}
+
 bool MacosMediaSenderBinder::Start(
     const H264SenderConfiguration& configuration) {
   if (!configuration.IsValid()) return false;
@@ -114,7 +119,14 @@ bool MacosMediaSenderBinder::Submit(H264SenderFrame frame,
   // while this call still holds a reference to it.
   const std::shared_ptr<H264SenderBackend> sender = sender_;
   lock.unlock();
-  return sender->Submit(std::move(frame), std::move(completion));
+  return sender->Submit(
+      std::move(frame),
+      [counter = accepted_bytes_, completion = std::move(completion)](
+          H264SenderCompletion result, std::size_t bytes) {
+        if (result == H264SenderCompletion::kAccepted)
+          counter->fetch_add(bytes, std::memory_order_relaxed);
+        if (completion) completion(result, bytes);
+      });
 }
 
 void MacosMediaSenderBinder::Cancel(

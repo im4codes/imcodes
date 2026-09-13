@@ -18,7 +18,7 @@ import {
   downloadControlledNodeMacosRemoteDesktopComponentSet,
   startControlledNodeSelfUpgrade,
 } from './self-upgrade.js';
-import { promoteMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
+import { promoteMacosRemoteDesktopArtifact, selectMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
 import { defaultMacosRemoteDesktopArtifactStoreRoot } from './macos-remote-desktop-production.js';
 import type { ControlledNodeCredential } from './enrollment.js';
 import {
@@ -75,6 +75,11 @@ import {
 } from '../../shared/remote-desktop-platform.js';
 import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
+import { CLOCK_SYNC_FIELD, ServerClockEstimator } from '../../shared/clock-sync.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+} from '../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
@@ -98,6 +103,7 @@ import {
   REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
   REMOTE_DESKTOP_CONSENT_MSG,
   REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   REMOTE_DESKTOP_NODE_CONTEXT_MSG,
   REMOTE_DESKTOP_PRIVACY_MSG,
   REMOTE_DESKTOP_SHELL_MSG,
@@ -129,6 +135,26 @@ export function controlledNodeWebSocketUrl(serverUrl: string, serverId: string):
   const url = new URL(`/api/server/${encodeURIComponent(serverId)}/ws`, serverUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
+}
+
+/**
+ * Rewrite the absolute Server times a remote-desktop command carries onto the
+ * local clock. Only the two authority deadlines; everything else is untouched,
+ * and without a clock sample nothing changes.
+ */
+export function translateServerDeadlines<T extends Record<string, unknown>>(
+  message: T,
+  clock: Pick<ServerClockEstimator, 'synchronized' | 'serverToLocal'>,
+): T {
+  if (!clock.synchronized) return message;
+  let translated: Record<string, unknown> | null = null;
+  for (const key of ['expiresAt', 'leaseExpiresAt'] as const) {
+    const value = message[key];
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) continue;
+    translated ??= { ...message };
+    translated[key] = clock.serverToLocal(value);
+  }
+  return (translated ?? message) as T;
 }
 
 export function isControlledNodeAuthAck(message: Record<string, unknown>): boolean {
@@ -249,6 +275,10 @@ export interface ControlledNodeRuntimeOptions {
    * release's component set and promotes it.
    */
   installMacosRemoteDesktopComponents?: () => Promise<boolean>;
+  /** Test seam: the Server clock estimate used to translate deadlines. */
+  serverClock?: ServerClockEstimator;
+  /** Test seam: whether the store already holds a verified set for this release. */
+  macosRemoteDesktopComponentsInstalled?: () => Promise<boolean>;
   /** Injected for the same reason: raising a real TCC prompt needs a real Mac. */
   requestMacosRemoteDesktopPermissions?: () => Promise<boolean>;
   onAuthenticated?: () => void | Promise<void>;
@@ -286,6 +316,13 @@ export interface ControlledNodeRuntimeOptions {
 
 const REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS = 5 * 60_000;
 const MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS = 5 * 60_000;
+/**
+ * How soon components that ARE installed but did not start are started again.
+ * Much shorter than the install back-off because the usual cause is a state a
+ * person changes in seconds -- the screen was locked when the node started --
+ * and nothing else would ever run start-up again.
+ */
+const MACOS_REMOTE_DESKTOP_START_RETRY_MS = 30_000;
 export const CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS = 60_000;
 // Server-side version convergence is deliberately scheduled five seconds after
 // authentication. Wait through that window before attempting a same-version
@@ -308,7 +345,13 @@ export function createControlledNodeRuntime(
     : createPlatformRemoteDesktopWorkerHost({
       platform,
       arch,
-      onMessage: (message) => { client.send(message); },
+      onMessage: (message) => {
+        logger.debug({
+          type: (message as { type?: unknown }).type,
+          reason: (message as { reason?: unknown }).reason,
+        }, 'remote-desktop worker message forwarded');
+        client.send(message);
+      },
       macos: options.macosRemoteDesktopWorker ? {
         ...options.macosRemoteDesktopWorker,
         onProfileChanged: () => {
@@ -359,6 +402,15 @@ export function createControlledNodeRuntime(
   let defaultShieldedRouteAvailable = false;
   let signedShellAvailable = false;
   let advertisedAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
+  /**
+   * A macOS worker that is running and authenticated but lacks Screen
+   * Recording advertises its capture-less profile, and nothing more. That set
+   * cannot open a session -- no capture capability, and `remoteDesktopEnabled`
+   * stays false -- but it is exactly what the browser reads as "one grant away"
+   * and turns into the 申请权限 button. Advertising nothing in this state is what
+   * left a Mac with a working worker showing no remote-desktop button at all.
+   */
+  let permissionRequiredCapabilities: readonly string[] = [];
 
   const refreshRemoteDesktopCapabilityState = (): void => {
     try {
@@ -406,6 +458,17 @@ export function createControlledNodeRuntime(
     remoteDesktopEnabled = remoteDesktopWorkerAvailable
       && remoteDesktopFeatureEnabled
       && profile !== null;
+    const captureCapabilities = Object.values(REMOTE_DESKTOP_CAPTURE_CAPABILITY) as readonly string[];
+    permissionRequiredCapabilities = remoteDesktopWorkerAvailable
+      && remoteDesktopFeatureEnabled
+      && profile === null
+      && workerSessionCapabilities.includes(REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS)
+      && !workerSessionCapabilities.some((capability) => captureCapabilities.includes(capability))
+      ? [
+        ...workerSessionCapabilities,
+        ...workerAdapterCapabilities.filter((capability) => capability === REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY),
+      ]
+      : [];
     const enabledAdapters = remoteDesktopEnabled ? workerAdapterCapabilities : [];
     remoteDesktopAutoUnlockAvailable = remoteDesktopEnabled
       && profile?.platform === 'windows';
@@ -450,6 +513,7 @@ export function createControlledNodeRuntime(
     && !remoteDesktopWorkerAvailable;
   let macosRemoteDesktopInstallInFlight = false;
   let macosRemoteDesktopInstallNextAttemptAt = 0;
+  let macosRemoteDesktopStartNextAttemptAt = 0;
   let upgradeInFlight = false;
   let upgradeHandoffDeadlineAt: number | null = null;
   const armUpgradeHandoffWatchdog = (): void => {
@@ -603,11 +667,48 @@ export function createControlledNodeRuntime(
     // flapping link into a request loop. An explicit click ignores the delay:
     // the person asking has new information the node does not.
     const now = options.now?.() ?? Date.now();
+    const componentArch = arch === 'arm64' ? 'arm64' : 'x64';
+    const storeRoot = defaultMacosRemoteDesktopArtifactStoreRoot(componentArch);
+    const isInstalledForThisRelease = options.macosRemoteDesktopComponentsInstalled
+      ?? (options.installMacosRemoteDesktopComponents ? async () => false : async () => {
+        const selected = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
+          runtime: { platform, arch: componentArch },
+        }).catch(() => null);
+        return selected?.manifest.workerVersion === DAEMON_VERSION;
+      });
+    // Already installed for THIS release: fetching it again cannot help. The
+    // components are present and not running, which is a start-up failure --
+    // most often a screen that was locked when the node started. Start-up ran
+    // once and never again, so the Mac stayed unoffered after it was unlocked,
+    // while the node re-downloaded the release every window and flipped the
+    // selector back over whatever set was installed.
+    if (force || now >= macosRemoteDesktopStartNextAttemptAt) {
+      // Claimed before the check: verifying the store is not free, and this
+      // runs on every heartbeat.
+      macosRemoteDesktopStartNextAttemptAt = now + MACOS_REMOTE_DESKTOP_START_RETRY_MS;
+      macosRemoteDesktopInstallInFlight = true;
+      let installedForThisRelease = false;
+      try {
+        installedForThisRelease = await isInstalledForThisRelease();
+        if (installedForThisRelease) {
+          try {
+            await remoteDesktopWorkerStartup?.();
+          } catch (error) {
+            logger.warn({ err: error }, 'installed macOS remote-desktop components did not start');
+          }
+          republishCapabilitiesIfChanged();
+        }
+      } finally {
+        macosRemoteDesktopInstallInFlight = false;
+      }
+      if (installedForThisRelease) return false;
+    } else {
+      return false;
+    }
     if (!force && now < macosRemoteDesktopInstallNextAttemptAt) return false;
     macosRemoteDesktopInstallNextAttemptAt = now + MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS;
     macosRemoteDesktopInstallInFlight = true;
     const install = options.installMacosRemoteDesktopComponents ?? (async () => {
-      const componentArch = arch === 'arm64' ? 'arm64' : 'x64';
       const staging = await mkdtemp(join(tmpdir(), 'imcodes-macos-rd-install-'));
       try {
         const downloaded = await downloadControlledNodeMacosRemoteDesktopComponentSet({
@@ -621,7 +722,7 @@ export function createControlledNodeRuntime(
         await promoteMacosRemoteDesktopArtifact({
           artifactDirectory: downloaded.componentDirectory,
           manifestPath: downloaded.manifestPath,
-          storeRoot: defaultMacosRemoteDesktopArtifactStoreRoot(componentArch),
+          storeRoot,
           expectedWorkerVersion: DAEMON_VERSION,
         });
         return true;
@@ -734,7 +835,7 @@ export function createControlledNodeRuntime(
           ...workerSessionCapabilities,
           ...(remoteDesktopAutoUnlockAvailable ? [CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY] : []),
         ]
-        : []),
+        : permissionRequiredCapabilities),
       ...(missingRemoteDesktopWorkerCanRepair ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] : []),
       ...(macosRemoteDesktopComponentsInstallable()
         ? [REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY]
@@ -751,6 +852,7 @@ export function createControlledNodeRuntime(
    * has to start a new connection or it is never seen.
    */
   let authenticatedCapabilities = '';
+  const serverClock = options.serverClock ?? new ServerClockEstimator();
   const republishCapabilitiesIfChanged = (): void => {
     refreshRemoteDesktopCapabilityState();
     refreshAuthCapabilities();
@@ -758,6 +860,14 @@ export function createControlledNodeRuntime(
     // cost a reconnect, and the reconnect itself re-samples and records the
     // new set, so this cannot loop.
     if (JSON.stringify(authFrame.capabilities) === authenticatedCapabilities) return;
+    // Named, because this is the only moment the server -- and so the browser
+    // -- learns what remote desktop this node can do. When a working worker
+    // never turned into a button, there was no line anywhere saying what had
+    // been offered.
+    logger.info({
+      remoteDesktopAvailable: remoteDesktopWorkerAvailable,
+      capabilities: (authFrame.capabilities ?? []).filter((capability) => capability.startsWith('remote')),
+    }, 'remote-desktop capabilities changed; reconnecting to publish them');
     client.reconnect();
   };
   onMacosRemoteDesktopProfileChanged = () => {
@@ -771,7 +881,11 @@ export function createControlledNodeRuntime(
   const clientOptions: AuthenticatedWebSocketOptions = {
     url: controlledNodeWebSocketUrl(credential.serverUrl, credential.serverId),
     auth: authFrame,
-    heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
+    heartbeatMessage: () => ({
+      type: 'heartbeat',
+      daemonVersion: DAEMON_VERSION,
+      [CLOCK_SYNC_FIELD.SENT_AT]: Date.now(),
+    }),
     heartbeatMs: 5_000,
     silenceTimeoutMs: 30_000,
     createSocket: (url) => {
@@ -784,7 +898,7 @@ export function createControlledNodeRuntime(
       return createSocket(url);
     },
     onOpen: () => {
-      client.send({ type: 'heartbeat', daemonVersion: DAEMON_VERSION });
+      client.send({ type: 'heartbeat', daemonVersion: DAEMON_VERSION, [CLOCK_SYNC_FIELD.SENT_AT]: Date.now() });
     },
     onClose: () => {
       worker.abortAll();
@@ -816,6 +930,9 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isControlledNodeAuthAck(message)) {
+        // Every ack from a clock-aware Server is one round-trip sample. Older
+        // Servers send neither field and the offset stays 0 (local clock).
+        serverClock.addSample(message[CLOCK_SYNC_FIELD.SENT_AT], message[CLOCK_SYNC_FIELD.SERVER_TIME], Date.now());
         reportStalledUpgradeHandoff();
         persistAuthentication();
         if (remoteDesktopWorkerRepairEligibleAt === null) {
@@ -982,6 +1099,18 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isRemoteDesktopMessageType(message.type)) {
+        // Server-stamped deadlines onto this host's clock BEFORE anything
+        // compares them: the worker host, the IPC authority and the native
+        // worker all check them against local time.
+        message = translateServerDeadlines(message, serverClock);
+        // One line per command -- type and route only, never SDP, candidates or
+        // capabilities. A session that sat on "connecting" forever left no
+        // trace of whether its prepare ever reached this node.
+        logger.info({
+          type: message.type,
+          sessionId: typeof message.sessionId === 'string' ? message.sessionId : undefined,
+          remoteDesktopEnabled,
+        }, 'remote-desktop command received');
         const requiresIndependentRouteGeneration = remoteDesktopEnabled
           && advertisedAdapterCapabilities.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
           && (message.type === REMOTE_DESKTOP_MSG.PREPARE || message.type === REMOTE_DESKTOP_MSG.LEASE);
@@ -1007,7 +1136,13 @@ export function createControlledNodeRuntime(
           message,
           enabled: remoteDesktopEnabled,
           target: remoteDesktopWorker,
-          send: (reply) => client.send(reply),
+          send: (reply) => {
+            logger.info({
+              type: (reply as { type?: unknown }).type,
+              reason: (reply as { reason?: unknown }).reason,
+            }, 'remote-desktop reply sent');
+            client.send(reply);
+          },
         });
         return;
       }

@@ -116,9 +116,12 @@ describe('macOS remote-desktop executable entry points', () => {
     expect(worker).toContain('macos_remote_desktop_worker_local_stop');
     // The child inherits no environment.
     expect(worker).toContain('char* empty_environment[] = {nullptr};');
-    // All three descriptors are multiplexed, so disclosure loss is observed
-    // while the host socket is idle.
-    expect(worker).toContain('std::array<pollfd, 3> poll_set{}');
+    // Host, control and disclosure descriptors -- plus the transport-event wake
+    // pipe -- are multiplexed, so disclosure loss is observed while the host
+    // socket is idle, and libwebrtc callbacks reach the loop without touching
+    // the session from their own threads.
+    expect(worker).toContain('std::array<pollfd, 4> poll_set{}');
+    expect(worker).toContain('poll_set[3] = {sink.wake_descriptor(), POLLIN, 0};');
     // Disclosure is examined before host frames are acted on.
     const disclosureAt = worker.indexOf('poll_set[2].revents');
     const hostAt = worker.indexOf('poll_set[0].revents');

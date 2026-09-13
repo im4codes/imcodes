@@ -25,7 +25,7 @@ export const MACOS_COMPUTER_USE_APP_NAME = 'Open Computer Use.app';
 export const MACOS_AIDESK_APP_NAME = 'aiDesk.to by IM.codes.app';
 
 const MACOS_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
-const MACOS_AIDESK_EXECUTABLE = 'aidesk-agent';
+export const MACOS_AIDESK_EXECUTABLE = 'aidesk-agent';
 const MACOS_COMPUTER_USE_BUNDLE_ID = 'com.ifuryst.opencomputeruse';
 const MACOS_COMPUTER_USE_TEAM_ID = 'J9P29FA5BX';
 export const MACOS_AIDESK_BUNDLE_ID = 'to.aidesk.app';

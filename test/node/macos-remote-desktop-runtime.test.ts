@@ -29,7 +29,9 @@ import type {
 import {
   createControlledNodeRuntime,
   createPlatformRemoteDesktopWorkerHost,
+  translateServerDeadlines,
 } from '../../src/node/runtime.js';
+import { ServerClockEstimator } from '../../shared/clock-sync.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
 
 const USER = {
@@ -38,6 +40,8 @@ const USER = {
 } as const;
 const TEAM_ID = 'ABCDE12345';
 const BUNDLE_ID = 'cc.imcodes.node.remote-desktop-agent';
+const WORKER_BUNDLE_ID = 'cc.imcodes.node.remote-desktop-worker';
+const WORKER_REQUIREMENT = `identifier "${WORKER_BUNDLE_ID}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${TEAM_ID}`;
 const REQUIREMENT = `identifier "${BUNDLE_ID}" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${TEAM_ID}`;
 
 class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
@@ -54,7 +58,15 @@ function verifiedArtifact(): VerifiedMacosRemoteDesktopArtifact {
     manifestPath: '/verified/release/imcodes-remote-desktop.manifest.json',
     setSha256: 'a'.repeat(64),
     components: {
-      worker: {} as never,
+      worker: {
+        kind: 'worker',
+        executablePath: '/verified/release/imcodes-remote-desktop-worker',
+        fileName: 'imcodes-remote-desktop-worker',
+        size: 1,
+        sha256: 'c'.repeat(64),
+        bundleIdentifier: WORKER_BUNDLE_ID,
+        designatedRequirement: WORKER_REQUIREMENT,
+      } as never,
       disclosure: {} as never,
       launchAgent: {
         kind: 'launchAgent',
@@ -72,7 +84,12 @@ function verifiedArtifact(): VerifiedMacosRemoteDesktopArtifact {
       codeSignature: {
         teamId: TEAM_ID,
         bundles: {
-          worker: {} as never,
+          // The per-user worker is the IPC peer, so its identity is required.
+          worker: {
+            bundleIdentifier: WORKER_BUNDLE_ID,
+            designatedRequirement: WORKER_REQUIREMENT,
+            hardenedRuntime: true,
+          },
           disclosure: {} as never,
           launchAgent: {
             bundleIdentifier: BUNDLE_ID,
@@ -188,7 +205,8 @@ describe('macOS controlled-node remote-desktop runtime', () => {
       REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
     ]));
     expect(advertised).not.toContain(REMOTE_DESKTOP_CAPABILITY);
-    expect(advertised).not.toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
+    // Control reaches the lock screen: the session survives the Mac locking.
+    expect(advertised).toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
     expect(advertised).not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
 
     const prepare = {
@@ -283,5 +301,28 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     expect(advertised).toContain(REMOTE_DESKTOP_SESSION_CAPABILITY);
     expect(advertised).not.toContain(REMOTE_DESKTOP_INPUT_CAPABILITY);
     runtime.stop();
+  });
+});
+
+describe('translateServerDeadlines', () => {
+  it('leaves messages untouched before the clock is synchronized', () => {
+    const message = { type: 'x', expiresAt: 5_000_000, leaseExpiresAt: 6_000_000 };
+    expect(translateServerDeadlines(message, new ServerClockEstimator())).toBe(message);
+  });
+
+  it('moves Server deadlines onto the local clock when the Mac is minutes behind', () => {
+    const clock = new ServerClockEstimator();
+    clock.addSample(1_000, 1_050 + 180_000, 1_100);
+    const message = { type: 'x', expiresAt: 5_000_000, leaseExpiresAt: 6_000_000, other: 7 };
+    const translated = translateServerDeadlines(message, clock);
+    expect(translated).toEqual({ type: 'x', expiresAt: 4_820_000, leaseExpiresAt: 5_820_000, other: 7 });
+    expect(message.expiresAt).toBe(5_000_000);
+  });
+
+  it('ignores absent or malformed deadline fields', () => {
+    const clock = new ServerClockEstimator();
+    clock.addSample(1_000, 1_050 + 1_000, 1_100);
+    const message = { type: 'x', expiresAt: 'soon', leaseExpiresAt: -1 };
+    expect(translateServerDeadlines(message, clock)).toBe(message);
   });
 });

@@ -249,6 +249,50 @@ async function normalizeTrustedStoreDirectoryMode(path: string): Promise<void> {
   }
 }
 
+/**
+ * How many directories above the store belong to the product. The store lives
+ * at `<node state>/remote-desktop-worker/darwin-<arch>`; both of those parents
+ * are created by the root daemon, and both came out 0700.
+ */
+const STORE_OWNED_ANCESTOR_DEPTH = 2;
+
+/**
+ * Let the console user WALK through the directories above the store -- search
+ * permission only, never read or write.
+ *
+ * Making the store itself 0755 fixed nothing on a real Mac: the two directories
+ * above it were still root-only, so the agent launchd started for the console
+ * user died with exit 126 before running a line, and the permission prompt never
+ * appeared. The node state directory also holds the server credential, so this
+ * adds execute bits alone (0700 -> 0711): a path can be traversed, but nothing
+ * in it can be listed, and the credential file keeps its own 0600.
+ *
+ * A directory whose owner or writability would fail the store's trust check is
+ * left untouched, as is anything that cannot be inspected.
+ */
+async function ensureStoreAncestorsTraversable(
+  storeRoot: string,
+  expectedUid: number | undefined,
+): Promise<void> {
+  let path = resolve(storeRoot);
+  for (let depth = 0; depth < STORE_OWNED_ANCESTOR_DEPTH; depth += 1) {
+    const parent = dirname(path);
+    if (parent === path) return;
+    path = parent;
+    try {
+      const stat = await lstat(path);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+      if ((stat.mode & 0o022) !== 0) return;
+      if (expectedUid !== undefined && stat.uid !== 0 && stat.uid !== expectedUid) return;
+      const mode = stat.mode & 0o7777;
+      if ((mode & 0o011) === 0o011) continue;
+      await chmod(path, mode | 0o011);
+    } catch {
+      return;
+    }
+  }
+}
+
 async function requireTrustedStoreForRead(
   storeRoot: string,
   expectedUid: number | undefined,
@@ -261,6 +305,7 @@ async function requireTrustedStoreForRead(
   // repairing one without the others fixes nothing.
   await normalizeTrustedStoreDirectoryMode(storeRoot);
   await normalizeTrustedStoreDirectoryMode(join(storeRoot, RELEASES_DIRECTORY));
+  await ensureStoreAncestorsTraversable(storeRoot, expectedUid);
 }
 
 async function sha256File(path: string): Promise<string> {
@@ -463,6 +508,7 @@ async function ensureStore(
   await mkdir(storeRoot, { recursive: true, mode: STORE_DIRECTORY_MODE });
   await requireTrustedStoreDirectory(storeRoot, 'store', expectedUid);
   await normalizeTrustedStoreDirectoryMode(storeRoot);
+  await ensureStoreAncestorsTraversable(storeRoot, expectedUid);
   const releasesDirectory = join(storeRoot, RELEASES_DIRECTORY);
   await mkdir(releasesDirectory, { recursive: true, mode: STORE_DIRECTORY_MODE });
   await requireTrustedStoreDirectory(releasesDirectory, 'releases', expectedUid);

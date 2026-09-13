@@ -157,6 +157,7 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
       return false;
     }
     started_ = true;
+    StartRepeatTimer();
     return true;
   }
 
@@ -174,6 +175,10 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
 
   void Stop(std::uint32_t timeout_ms) noexcept override {
     if (stream_ == nullptr) return;
+    if (repeat_timer_ != nullptr) {
+      dispatch_source_cancel(repeat_timer_);
+      repeat_timer_ = nullptr;
+    }
     if (started_) {
       (void)CGDisplayStreamStop(stream_);
       started_ = false;
@@ -196,11 +201,45 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
  private:
   static constexpr std::uint32_t kDestructorStopTimeoutMs = 2'000;
 
+  // CGDisplayStream delivers only on change. A static screen -- the lock
+  // screen above all -- then produces no frame at all, the encoder emits
+  // nothing, and the viewer declares the stream dead within seconds.
+  // ScreenCaptureKit keeps a steady cadence; this gives the same guarantee by
+  // re-delivering the last frame while the display is idle. It runs on the
+  // stream's own serial queue, so it never overlaps a real delivery.
+  static constexpr std::int64_t kRepeatIntervalUs = 500'000;
+
+  void StartRepeatTimer() {
+    if (queue_ == nullptr || repeat_timer_ != nullptr) return;
+    repeat_timer_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue_);
+    if (repeat_timer_ == nullptr) return;
+    dispatch_source_set_timer(
+        repeat_timer_,
+        dispatch_time(DISPATCH_TIME_NOW, kRepeatIntervalUs * NSEC_PER_USEC),
+        kRepeatIntervalUs * NSEC_PER_USEC, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(repeat_timer_, ^{ RepeatLastFrame(); });
+    dispatch_resume(repeat_timer_);
+  }
+
+  void RepeatLastFrame() {
+    if (!started_ || last_frame_.storage == nullptr || !frame_sink_) return;
+    const std::int64_t now = NowMicroseconds();
+    if (now - last_delivery_us_ < kRepeatIntervalUs) return;
+    if (pending_.load(std::memory_order_relaxed) >= max_pending_) return;
+    common::CapturedFrame frame = last_frame_;  // shares the immutable storage
+    frame.capture_time_us = now;
+    last_delivery_us_ = now;
+    pending_.fetch_add(1, std::memory_order_relaxed);
+    frame_sink_(std::move(frame));
+    pending_.fetch_sub(1, std::memory_order_relaxed);
+  }
+
   void HandleFrame(CGDisplayStreamFrameStatus status, IOSurfaceRef surface) {
     if (status == kCGDisplayStreamFrameStatusStopped) return;
     if (status == kCGDisplayStreamFrameStatusFrameBlank
         || status == kCGDisplayStreamFrameStatusFrameIdle) {
-      // Not an error and not a frame: the screen simply did not change.
+      // Not an error and not a frame: the screen simply did not change. The
+      // repeat timer keeps the stream alive.
       return;
     }
     if (surface == nullptr) {
@@ -222,6 +261,8 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
       saw_frame_ = true;
     }
     first_frame_.notify_all();
+    last_frame_ = frame;
+    last_delivery_us_ = frame.capture_time_us;
     if (frame_sink_) {
       pending_.fetch_add(1, std::memory_order_relaxed);
       frame_sink_(std::move(frame));
@@ -255,6 +296,10 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
   std::condition_variable first_frame_;
   bool saw_frame_ = false;
   bool failed_ = false;
+  // Owned by the serial queue: touched only from HandleFrame and the timer.
+  dispatch_source_t repeat_timer_ = nullptr;
+  common::CapturedFrame last_frame_;
+  std::int64_t last_delivery_us_ = 0;
 };
 
 class CgDisplayStreamBackend final : public ScreenCaptureKitBackend {

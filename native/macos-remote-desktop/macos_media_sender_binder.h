@@ -1,6 +1,7 @@
 #ifndef IMCODES_MACOS_REMOTE_DESKTOP_MACOS_MEDIA_SENDER_BINDER_H_
 #define IMCODES_MACOS_REMOTE_DESKTOP_MACOS_MEDIA_SENDER_BINDER_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -80,6 +81,11 @@ class MacosMediaSenderBinder final : public H264SenderBackend {
   // during negotiation; it is exported so a caller can tell "not yet wired"
   // from "wired but failing".
   [[nodiscard]] std::uint64_t dropped_before_bind() const noexcept;
+  [[nodiscard]] std::uint64_t accepted_bytes() const noexcept {
+    return accepted_bytes_->load(std::memory_order_relaxed);
+  }
+  // The encode size the session configured, or {0,0} before it has.
+  [[nodiscard]] common::PixelSize configured_pixels() const noexcept;
 
   bool Start(const H264SenderConfiguration& configuration) override;
   bool Submit(H264SenderFrame frame,
@@ -102,6 +108,12 @@ class MacosMediaSenderBinder final : public H264SenderBackend {
   H264SenderConfiguration configuration_{};
   bool configured_ = false;
   std::uint64_t dropped_before_bind_ = 0;
+  // Bytes upstream accepted onto the wire. Monotonic across rebinds: it is the
+  // outbound-media progress signal the transport watchdog and the Server's
+  // "connected" gate read, and a counter that resets would read as a stall.
+  // Shared so a completion that lands after the binder is gone stays safe.
+  std::shared_ptr<std::atomic<std::uint64_t>> accepted_bytes_ =
+      std::make_shared<std::atomic<std::uint64_t>>(0);
 };
 
 }  // namespace imcodes::remote_desktop::macos

@@ -247,17 +247,22 @@ async function authenticate(
 ): Promise<Socket> {
   const socket = await connect(launch.socketPath);
   socket.write(`${hello(launch)}\n`);
-  const acknowledgement = JSON.parse(await readLine(socket)) as Record<string, unknown>;
-  expect(acknowledgement).toEqual({
-    type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.AUTHENTICATED,
-    ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
-    workerGeneration: launch.workerGeneration,
-    uid: expectedPeer.uid,
-    auditSessionId: expectedPeer.auditSessionId,
-    pidVersion: expectedPeer.pidVersion,
-    sessionType: expectedPeer.sessionType,
-    launchChallenge: launch.challenge,
-  });
+  // Only a graphical-bootstrap worker waits for the acknowledgement; a per-user
+  // worker goes straight to its command loop, where that frame would arrive as
+  // an unparseable first command and end the worker.
+  if (graphical) {
+    const acknowledgement = JSON.parse(await readLine(socket)) as Record<string, unknown>;
+    expect(acknowledgement).toEqual({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.AUTHENTICATED,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: launch.workerGeneration,
+      uid: expectedPeer.uid,
+      auditSessionId: expectedPeer.auditSessionId,
+      pidVersion: expectedPeer.pidVersion,
+      sessionType: expectedPeer.sessionType,
+      launchChallenge: launch.challenge,
+    });
+  }
   if (graphical) {
     socket.write(`${JSON.stringify({
       type: MACOS_REMOTE_DESKTOP_GRAPHICAL_READINESS_MESSAGE,

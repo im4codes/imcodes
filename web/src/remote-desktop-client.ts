@@ -1,3 +1,4 @@
+import { oneWayServerOffsetMs } from '@shared/clock-sync.js';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_CAPABILITY,
@@ -965,7 +966,7 @@ export class RemoteDesktopClient {
       if (!this.matchesAuthority(message) || !this.peer) return;
       this.authorized = { ...message, type: REMOTE_DESKTOP_MSG.AUTHORIZED };
       this.daemonGeneration = message.daemonGeneration;
-      this.expiresAt = message.expiresAt;
+      this.expiresAt = this.serverDeadlineToLocal(message.expiresAt, message.serverTime);
       this.signalingReconnectAttempts = 0;
       this.signalingReconnectInFlight = false;
       this.signalingDisconnectedAt = null;
@@ -1096,11 +1097,21 @@ export class RemoteDesktopClient {
     if (message.type === REMOTE_DESKTOP_MSG.ERROR) this.fail(message.error);
   }
 
+  /**
+   * The Server's absolute deadline on this browser's clock. A browser clock
+   * minutes off otherwise ends the session early or keeps input enabled past
+   * the grant. Without a Server time (older Server) it is used as sent.
+   */
+  private serverDeadlineToLocal(serverDeadline: number, serverTime: number | undefined): number {
+    const offset = oneWayServerOffsetMs(serverTime, this.deps.now?.() ?? Date.now());
+    return serverDeadline - offset;
+  }
+
   private async preparePeer(authority: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }>): Promise<void> {
     this.sessionId = authority.sessionId;
     this.capability = authority.capability;
     this.daemonGeneration = authority.daemonGeneration;
-    this.expiresAt = authority.expiresAt;
+    this.expiresAt = this.serverDeadlineToLocal(authority.expiresAt, authority.serverTime);
     this.publish({
       state: REMOTE_DESKTOP_STATE.PREPARING,
       mode: authority.mode,

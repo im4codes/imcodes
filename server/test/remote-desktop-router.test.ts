@@ -901,6 +901,19 @@ describe('RemoteDesktopRouter', () => {
     expect(f.daemonMessages).toHaveLength(1);
   });
 
+  it('stamps authorization with the Server clock so peers can read its deadlines', async () => {
+    const f = fixture({ access: daemonHostAccess() });
+    const before = Date.now();
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    const after = Date.now();
+    const authority = f.messages(f.browserA)[0] as { serverTime?: unknown; expiresAt?: unknown };
+    expect(typeof authority.serverTime).toBe('number');
+    expect(authority.serverTime as number).toBeGreaterThanOrEqual(before);
+    expect(authority.serverTime as number).toBeLessThanOrEqual(after);
+    // The deadline is on the same clock as the stamp, so its distance is exact.
+    expect((authority.expiresAt as number) - (authority.serverTime as number)).toBeGreaterThan(0);
+  });
+
   it('admits a normal Windows daemon whose controlled-node columns are unset', async () => {
     const f = fixture({ access: daemonHostAccess() });
     await f.router.handleBrowser(f.browserA, 'owner-user', start);

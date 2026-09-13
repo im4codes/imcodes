@@ -357,6 +357,14 @@ export const REMOTE_DESKTOP_LIMITS = {
   // session as `lease_expired`.  Keep the bound short enough to contain an
   // orphaned session, while leaving three full renewal windows for recovery.
   LEASE_DURATION_MS: 60_000,
+  /**
+   * Slack for the host's clock trailing the Server's when a Server-stamped
+   * absolute deadline is checked against the local clock. The Server sets a
+   * renewal to exactly its own now + LEASE_DURATION_MS; a Mac 0.4 s behind saw
+   * that as further in the future than allowed and killed every session at its
+   * first renewal. Matches the native parser's kLeaseMaxFutureMs (75 s).
+   */
+  CLOCK_SKEW_TOLERANCE_MS: 15_000,
   LEASE_RENEW_INTERVAL_MS: 15_000,
   KEEPALIVE_TIMEOUT_MS: 15_000,
   DATA_KEEPALIVE_INTERVAL_MS: 30_000,
@@ -469,11 +477,15 @@ export interface RemoteDesktopAuthority {
 
 export interface RemoteDesktopAuthorized extends RemoteDesktopAuthority {
   type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED;
+  /** Server clock at send; lets the browser translate expiresAt onto its clock. */
+  serverTime?: number;
 }
 
 /** Server acknowledgement for an exact same-route signaling rebind. */
 export interface RemoteDesktopResumed extends RemoteDesktopAuthority {
   type: typeof REMOTE_DESKTOP_MSG.RESUMED;
+  /** Server clock at send; see RemoteDesktopAuthorized.serverTime. */
+  serverTime?: number;
 }
 
 export interface RemoteDesktopPrepare extends RemoteDesktopAuthority {
@@ -1067,7 +1079,10 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
 export function validateRemoteDesktopAuthorized(value: unknown): RemoteDesktopValidationResult<RemoteDesktopAuthorized> {
   if (!isRecord(value)
     || value.type !== REMOTE_DESKTOP_MSG.AUTHORIZED
-    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'])
+    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['serverTime'])
+    // The Server's clock at send, so the browser can place expiresAt on its own
+    // clock (shared/clock-sync.ts). Optional: older Servers omit it.
+    || (value.serverTime !== undefined && (!Number.isSafeInteger(value.serverTime) || (value.serverTime as number) <= 0))
     || !validateAuthority(value)) return invalid();
   return { ok: true, value: value as unknown as RemoteDesktopAuthorized };
 }
@@ -1075,7 +1090,10 @@ export function validateRemoteDesktopAuthorized(value: unknown): RemoteDesktopVa
 export function validateRemoteDesktopResumed(value: unknown): RemoteDesktopValidationResult<RemoteDesktopResumed> {
   if (!isRecord(value)
     || value.type !== REMOTE_DESKTOP_MSG.RESUMED
-    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'])
+    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['serverTime'])
+    // The Server's clock at send, so the browser can place expiresAt on its own
+    // clock (shared/clock-sync.ts). Optional: older Servers omit it.
+    || (value.serverTime !== undefined && (!Number.isSafeInteger(value.serverTime) || (value.serverTime as number) <= 0))
     || !validateAuthority(value)) return invalid();
   return { ok: true, value: value as unknown as RemoteDesktopResumed };
 }

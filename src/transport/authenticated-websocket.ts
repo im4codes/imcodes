@@ -20,7 +20,8 @@ export interface AuthenticatedWebSocketOptions {
   connectTimeoutMs?: number;
   heartbeatMs?: number;
   silenceTimeoutMs?: number;
-  heartbeatMessage?: Record<string, unknown>;
+  /** A function is evaluated per send, so each heartbeat can carry its own send time. */
+  heartbeatMessage?: Record<string, unknown> | (() => Record<string, unknown>);
 }
 
 /** Minimal authenticated reconnecting transport shared by thin clients. */
@@ -159,7 +160,10 @@ export class AuthenticatedWebSocketClient {
         this.failSocket(socket);
         return;
       }
-      if (socket.readyState === 1) socket.send(JSON.stringify(this.options.heartbeatMessage));
+      if (socket.readyState === 1) {
+        const heartbeat = this.options.heartbeatMessage;
+        socket.send(JSON.stringify(typeof heartbeat === 'function' ? heartbeat() : heartbeat));
+      }
     }, heartbeatMs);
     this.watchdogTimer.unref?.();
   }

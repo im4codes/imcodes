@@ -12,7 +12,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 import {
@@ -173,7 +173,7 @@ async function fixture(
     )),
     writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 }),
   ]);
-  return { root, storeRoot: join(root, 'store'), artifactDirectory, manifestPath, manifest, bytes };
+  return { root, storeRoot: join(root, 'node-state', 'remote-desktop-worker', 'store'), artifactDirectory, manifestPath, manifest, bytes };
 }
 
 type CommandOverride = string | Error;
@@ -550,6 +550,42 @@ describe('macOS remote-desktop multi-component artifact adapter', () => {
     expect(await traversable(selected!.artifactDirectory)).toBe(true);
   });
 
+  it('lets the console user walk through the directories above the store, and nothing more', async () => {
+    // On a real Mac the store was 0755 and the agent still died with exit 126:
+    // the two directories ABOVE it were root-only. The upper one holds the
+    // server credential, so only search permission is added -- never read.
+    const candidate = await fixture('arm64', '2026.8.4100');
+    const workerDirectory = dirname(candidate.storeRoot);
+    const stateDirectory = dirname(workerDirectory);
+    await mkdir(workerDirectory, { recursive: true });
+    await chmod(stateDirectory, 0o700);
+    await chmod(workerDirectory, 0o700);
+    await chmod(candidate.root, 0o700);
+    const deps = dependencies(trustedExecutor().execute);
+    await promoteMacosRemoteDesktopArtifact({
+      ...candidate,
+      expectedWorkerVersion: candidate.manifest.workerVersion,
+    }, deps);
+    const modeOf = async (path: string) => (await lstat(path)).mode & 0o777;
+    expect(await modeOf(workerDirectory)).toBe(0o711);
+    expect(await modeOf(stateDirectory)).toBe(0o711);
+    // Only the product's own two levels: the directory above is not touched.
+    expect(await modeOf(candidate.root)).toBe(0o700);
+
+    // An install from before this fix is repaired by merely reading it.
+    await chmod(stateDirectory, 0o700);
+    await chmod(workerDirectory, 0o700);
+    expect(await selectMacosRemoteDesktopArtifact(candidate.storeRoot, 'current', deps)).not.toBeNull();
+    expect(await modeOf(workerDirectory)).toBe(0o711);
+    expect(await modeOf(stateDirectory)).toBe(0o711);
+
+    // A writable ancestor is not ours to fix -- left exactly as found.
+    await chmod(workerDirectory, 0o770);
+    await selectMacosRemoteDesktopArtifact(candidate.storeRoot, 'current', deps).catch(() => null);
+    expect(await modeOf(workerDirectory)).toBe(0o770);
+    await chmod(workerDirectory, 0o700);
+  });
+
   it('refuses a pre-existing store that anyone but the owner can write', async () => {
     // The daemon that opens this store runs as root. `mkdir` with a mode is a
     // NO-OP on a path that already exists, so a store pre-created by an
@@ -778,6 +814,7 @@ describe('macOS remote-desktop multi-component artifact adapter', () => {
     const candidate = await fixture();
     const real = join(candidate.root, 'elsewhere');
     await mkdir(real, { mode: 0o700 });
+    await mkdir(dirname(candidate.storeRoot), { recursive: true });
     await symlink(real, candidate.storeRoot);
     await expect(promoteMacosRemoteDesktopArtifact({
       ...candidate,

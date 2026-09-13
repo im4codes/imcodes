@@ -1,4 +1,5 @@
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
+#include "third_party/imcodes_remote_desktop/common/value_types.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -330,19 +331,12 @@ bool PresentedFrameMatchesDisplay(int frame_width,
                                   int frame_height,
                                   int display_width,
                                   int display_height) {
-  constexpr int kMaximumDimension = 16'384;
-  if (frame_width <= 0 || frame_height <= 0 ||
-      display_width <= 0 || display_height <= 0 ||
-      frame_width > kMaximumDimension || frame_height > kMaximumDimension ||
-      display_width > kMaximumDimension || display_height > kMaximumDimension) {
+  // One rule for every worker, in remote-desktop-common.
+  if (frame_width <= 0 || frame_height <= 0 || display_width <= 0 || display_height <= 0)
     return false;
-  }
-  const int64_t first = static_cast<int64_t>(frame_width) * display_height;
-  const int64_t second = static_cast<int64_t>(frame_height) * display_width;
-  const int64_t maximum = std::max(first, second);
-  // Permit one percent for even-dimension scaling/codec alignment while
-  // rejecting stale landscape/portrait or materially different layouts.
-  return std::abs(first - second) * 100 <= maximum;
+  return imcodes::remote_desktop::common::PresentedFrameCompatibleWithDisplay(
+      {static_cast<std::uint32_t>(frame_width), static_cast<std::uint32_t>(frame_height)},
+      {static_cast<std::uint32_t>(display_width), static_cast<std::uint32_t>(display_height)});
 }
 
 bool EncoderQueueHasCapacity(size_t pending_frames, size_t maximum_frames) {

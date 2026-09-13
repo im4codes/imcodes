@@ -143,7 +143,12 @@ MacosPeerVerifierCommandResult MaybeRunMacosPeerVerifierCommand(
       std::string_view(argv[1]) != kMode) {
     return {.handled = false, .exit_code = 0};
   }
-  if (argc != 7) return {.handled = true, .exit_code = kUsageExit};
+  // Five required flags plus the optional audit session: argc is 7 without it
+  // and 8 with it. This used to demand exactly 7, which contradicted the
+  // optional parsing just below -- so every production call, which DOES bind
+  // the audit session, was refused as a usage error (64) before any peer was
+  // examined, and the LaunchAgent could never authenticate.
+  if (argc != 7 && argc != 8) return {.handled = true, .exit_code = kUsageExit};
 
   std::string socket_fd_text;
   std::string expected_uid_text;

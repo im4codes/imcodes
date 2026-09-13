@@ -49,7 +49,10 @@ import {
   type MacosRemoteDesktopReadinessInput,
   type MacosRemoteDesktopRuntimeProfile,
 } from './macos-remote-desktop-readiness.js';
-import { MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY } from './macos-user-session.js';
+import {
+  MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
+  MACOS_REMOTE_DESKTOP_WORKER_IDENTITY,
+} from './macos-user-session.js';
 import {
   RemoteDesktopWorkerHostCore,
 } from './remote-desktop-worker-host-core.js';
@@ -232,6 +235,8 @@ export interface MacosRemoteDesktopWorkerHostOptions {
   prepareReadyTimeoutMs?: number;
   offerAnswerTimeoutMs?: number;
   createIpcServer?: (options: MacosRemoteDesktopIpcServerOptions) => MacosRemoteDesktopIpcTransport;
+  /** Where the per-user agent is run from; see the supervisor dependency. */
+  resolveLaunchAgentExecutable?: MacosRemoteDesktopLaunchAgentSupervisorDependencies['resolveLauncherExecutable'];
   createLaunchAgentSupervisor?: (
     dependencies: MacosRemoteDesktopLaunchAgentSupervisorDependencies,
   ) => MacosRemoteDesktopLaunchSupervisor;
@@ -274,6 +279,28 @@ function readinessPollMs(value: number | undefined): number {
     throw new Error('macos_remote_desktop_worker_host_invalid_readiness_poll');
   }
   return interval;
+}
+
+/**
+ * The identity the per-session IPC socket must admit: the WORKER's. See
+ * MACOS_REMOTE_DESKTOP_WORKER_IDENTITY for why it is not the agent's.
+ */
+function expectedWorkerIdentity(
+  artifact: VerifiedMacosRemoteDesktopArtifact,
+): MacosRemoteDesktopExpectedCodeIdentity {
+  const manifest = artifact.manifest;
+  const identity = manifest.codeSignature.bundles.worker;
+  const component = artifact.components.worker;
+  if (identity.bundleIdentifier !== MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier
+    || component.bundleIdentifier !== identity.bundleIdentifier
+    || component.designatedRequirement !== identity.designatedRequirement) {
+    throw new Error('macos_remote_desktop_worker_host_invalid_artifact');
+  }
+  return Object.freeze({
+    bundleIdentifier: MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier,
+    teamId: manifest.codeSignature.teamId,
+    designatedRequirement: identity.designatedRequirement,
+  });
 }
 
 function expectedIdentity(
@@ -350,6 +377,8 @@ export class MacosRemoteDesktopWorkerHost {
   private lifecycleGeneration = 0;
   private connectionGeneration = 0;
   private activeWorkerGeneration = 0;
+  /** Never decreases: see `workerGenerationFloor`. */
+  private highestWorkerGeneration = 0;
   private serviceGeneration = 0;
   private authenticated = false;
   private closed = false;
@@ -407,8 +436,16 @@ export class MacosRemoteDesktopWorkerHost {
     const generation = this.lifecycleGeneration;
     const command = parsed.value;
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
-      if (!await this.revalidateReadinessForPrepare(command.mode, generation)) return false;
+      // Marked BEFORE the readiness re-check. That check launches a native
+      // process and takes seconds, and the browser sends its OFFER the moment it
+      // is authorized; arriving while no preparing marker existed, the OFFER
+      // found no session and was answered worker_failed. The Windows host
+      // already marks first.
       const finishPreparing = this.core.beginPreparing(command.sessionId);
+      if (!await this.revalidateReadinessForPrepare(command.mode, generation)) {
+        finishPreparing();
+        return false;
+      }
       try {
         this.core.track(command, null);
         const sent = await this.sendCurrent(command, generation);
@@ -452,11 +489,16 @@ export class MacosRemoteDesktopWorkerHost {
    */
   onDaemonDisconnected(): void {
     if (this.closed || !this.authenticated) return;
-    // No teardown here by design: the sidecar stays warm for the reconnecting
-    // socket, so nothing can race the cleanup to the control socket. The
-    // promise is still bounded and self-reporting inside runLocalCleanup.
-    void this.runLocalCleanup(MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON.DAEMON_DISCONNECTED);
+    // Nothing open: leave the warm worker alone. Sending it stop-capture with
+    // no session running stopped its session object for good, so the next
+    // PREPARE was refused -- and every capability change reconnects the link,
+    // so every session after the first failed.
+    if (this.core.authorities().size === 0) return;
+    // Routes were open: capture and input are released, and that worker's
+    // session cannot be started again, so a fresh generation replaces it.
+    const cleanupSettled = this.runLocalCleanup(MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON.DAEMON_DISCONNECTED);
     this.failTrackedRoutes();
+    this.invalidateForLifecycle(this.lifecycleGeneration, true, cleanupSettled);
   }
 
   close(): void {
@@ -517,6 +559,20 @@ export class MacosRemoteDesktopWorkerHost {
             : {}),
           expectedCodeIdentity: identity,
         });
+      // Per-user sessions: the resident agent spawns the worker, and the worker
+      // is the peer on the IPC socket. The global-bootstrap path (off by
+      // default, kept for later LoginWindow work) keeps its original contract.
+      const workerIdentity = principal ? identity : expectedWorkerIdentity(artifact);
+      const ipcPeerSeams = principal ? peerSeams : explicitPeerSeams
+        ?? (this.options.createPeerVerificationSeams
+          ?? createMacosRemoteDesktopNativePeerVerificationSeams)({
+          executablePath: artifact.components.launchAgent.executablePath,
+          expectedUid: principalBinding?.uid ?? user!.uid,
+          ...(principalBinding
+            ? { expectedAuditSessionId: principalBinding.auditSessionId }
+            : {}),
+          expectedCodeIdentity: workerIdentity,
+        });
       // PHASE 1 -- PREFLIGHT. Only the items that are independent of the
       // resident agent: TCC, encoder, disclosure, the verified artifact and the
       // qualified user. Display control is deliberately absent, because the
@@ -532,8 +588,19 @@ export class MacosRemoteDesktopWorkerHost {
           ...localReadiness,
           virtualDisplay: false,
         });
-        if (preflightProfile.mode === MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE
-          || !this.isCurrent(generation)) return;
+        if (preflightProfile.mode === MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE) {
+          // Said out loud. Returning here is correct -- nothing can be offered --
+          // but it returned silently, so a Mac whose worker could not see an
+          // encoder or its disclosure surface looked exactly like one that was
+          // still starting: no error, no capability, a reinstall every retry.
+          // Booleans only; readiness carries no identity or secret.
+          this.options.onBackgroundError?.(new Error(
+            `macos_remote_desktop_preflight_unavailable:${Object.entries(localReadiness)
+              .map(([key, value]) => `${key}=${String(value)}`).join(',')}`,
+          ));
+          return;
+        }
+        if (!this.isCurrent(generation)) return;
       }
       if (this.options.lifecycleSource && this.unsubscribeLifecycle === null) {
         this.unsubscribeLifecycle = this.options.lifecycleSource.subscribe((event) => {
@@ -543,8 +610,9 @@ export class MacosRemoteDesktopWorkerHost {
 
       const authority = new MacosRemoteDesktopIpcAuthorityHost({
         ...(principal ? { principal } : { user: user! }),
-        expectedCodeIdentity: identity,
+        expectedCodeIdentity: workerIdentity,
         runtimeRoot: this.options.runtimeRoot,
+        workerGenerationFloor: this.highestWorkerGeneration,
       });
       let resolveAuthenticated!: (launch: MacosRemoteDesktopIpcLaunch) => void;
       let rejectAuthenticated!: (error: unknown) => void;
@@ -564,10 +632,10 @@ export class MacosRemoteDesktopWorkerHost {
       this.pendingAuthentication = { generation, reject: rejectAuthenticated };
       const commonServerOptions = {
         authority,
-        expectedCodeIdentity: identity,
+        expectedCodeIdentity: workerIdentity,
         runtimeRoot: this.options.runtimeRoot,
-        inspectPeerUid: peerSeams.inspectPeerUid,
-        verifyPeerCodeIdentity: peerSeams.verifyPeerCodeIdentity,
+        inspectPeerUid: ipcPeerSeams.inspectPeerUid,
+        verifyPeerCodeIdentity: ipcPeerSeams.verifyPeerCodeIdentity,
         onPeerAuthenticated: (launch, session) => {
           if (!this.isCurrent(generation)) return;
           if (principalBinding
@@ -604,7 +672,7 @@ export class MacosRemoteDesktopWorkerHost {
         },
         onDisconnect: (reason, error) => {
           if (!this.isCurrent(generation)) return;
-          if (error) this.options.onBackgroundError?.(error);
+          this.options.onBackgroundError?.(error ?? new Error(`macos_remote_desktop_worker_disconnected:${reason}`));
           const restart = this.authenticated && (
             reason === 'peer_disconnected'
             || reason === 'write_failed'
@@ -666,6 +734,7 @@ export class MacosRemoteDesktopWorkerHost {
         if (!this.isCurrent(generation)) return;
       }
       const launch = await server.start();
+      this.highestWorkerGeneration = Math.max(this.highestWorkerGeneration, launch.workerGeneration);
       if (!this.isCurrent(generation)) return;
       this.activeWorkerGeneration = launch.workerGeneration;
 
@@ -686,6 +755,9 @@ export class MacosRemoteDesktopWorkerHost {
           releaseInput: () => ({ ok: true }),
           stopCapture: () => ({ ok: true }),
           invalidateRoutes: () => this.failTrackedRoutes(),
+          ...(this.options.resolveLaunchAgentExecutable
+            ? { resolveLauncherExecutable: this.options.resolveLaunchAgentExecutable }
+            : {}),
           onBackgroundError: this.options.onBackgroundError,
         });
         this.supervisor = supervisor;
@@ -731,7 +803,15 @@ export class MacosRemoteDesktopWorkerHost {
         ...localReadiness,
         virtualDisplay: this.displayReadiness,
       });
-      if (profile.mode === MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE) return;
+      if (profile.mode === MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE) {
+        // An authenticated worker that still offers nothing. Said, not silent:
+        // the worker is running and the button never appears.
+        this.options.onBackgroundError?.(new Error(
+          `macos_remote_desktop_profile_unavailable:${Object.entries(localReadiness)
+            .map(([key, value]) => `${key}=${String(value)}`).join(',')},virtualDisplay=${String(this.displayReadiness)}`,
+        ));
+        return;
+      }
       this.setAdvertisedProfile(profile);
       this.scheduleReadinessPoll(generation);
     } catch (error) {
@@ -818,7 +898,17 @@ export class MacosRemoteDesktopWorkerHost {
     const current = this.profile;
     const currentCanControl = current.adapterCapabilities.includes(REMOTE_DESKTOP_INPUT_CAPABILITY);
     const nextCanControl = next.adapterCapabilities.includes(REMOTE_DESKTOP_INPUT_CAPABILITY);
-    // Never widen a profile after the Server authenticated this connection.
+    // Never widen a profile after the Server authenticated this connection --
+    // but a grant that arrives while nobody is connected must not stay
+    // invisible either. Accessibility granted a few seconds after Screen
+    // Recording left the Mac view-only until the node happened to restart. With
+    // no route open, retiring this generation and starting a fresh one
+    // advertises the wider profile on a new authentication instead of widening
+    // the old one.
+    if (!currentCanControl && nextCanControl && this.core.authorities().size === 0) {
+      this.invalidateForLifecycle(generation, true);
+      return false;
+    }
     const effective = !currentCanControl && nextCanControl ? current : next;
     const changed = current.mode !== effective.mode
       || current.sessionCapabilities.join('\0') !== effective.sessionCapabilities.join('\0')
@@ -885,6 +975,10 @@ export class MacosRemoteDesktopWorkerHost {
 
   private handleLifecycleEvent(event: MacosRemoteDesktopLifecycleEvent): void {
     if (this.closed) return;
+    // Every one of these tears the generation down. Named, because a Mac that
+    // restarted its worker every twenty seconds logged only the cleanup that
+    // followed, never what started it.
+    this.options.onBackgroundError?.(new Error(`macos_remote_desktop_lifecycle_event:${event.type}`));
     if (event.type === 'agent_crash'
       && event.workerGeneration !== this.activeWorkerGeneration) return;
     if (event.type === 'service_generation') {

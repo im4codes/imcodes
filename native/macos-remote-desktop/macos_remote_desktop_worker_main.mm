@@ -359,10 +359,12 @@ class WorkerReadinessProbe final : public macos::NativeReadinessProbe {
     return true;
   }
 
+  /** Point-in-time console state: `locked`, `active_unlocked`, ... */
+  static const char* ProbeConsoleSessionState() noexcept;
+
  private:
   static bool DisclosureSiblingPresent() noexcept;
   static bool VirtualDisplayHelperSiblingPresent() noexcept;
-  static const char* ProbeConsoleSessionState() noexcept;
 };
 
 // Point-in-time console-session observation. CGSessionCopyCurrentDictionary is
@@ -536,37 +538,71 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
             macos::MacosTransportSessionAdapter* transport,
             class WorkerSocketEmitter* emitter) noexcept;
 
+  WorkerTransportSink();
+  ~WorkerTransportSink();
+  WorkerTransportSink(const WorkerTransportSink&) = delete;
+  WorkerTransportSink& operator=(const WorkerTransportSink&) = delete;
+
+  // libwebrtc delivers these on its signaling and network threads. They are
+  // queued, never applied in place: the worker loop may be holding the session
+  // lock while it waits synchronously on that same signaling thread (every
+  // PeerConnection proxy call does), so touching the session from the callback
+  // deadlocks both threads. The loop drains the queue on its own thread.
   void OnPeerConnectionState(const rd::common::TransportCallbackStamp& stamp,
-                             rd::common::PeerConnectionState state) override;
+                             rd::common::PeerConnectionState state) override {
+    Post([this, stamp, state] { HandlePeerConnectionState(stamp, state); });
+  }
   void OnDataChannelState(const rd::common::TransportCallbackStamp& stamp,
                           rd::common::DataChannelKind channel,
-                          rd::common::DataChannelState state) override;
+                          rd::common::DataChannelState state) override {
+    Post([this, stamp, channel, state] {
+      HandleDataChannelState(stamp, channel, state);
+    });
+  }
   void OnDataChannelMessage(const rd::common::TransportCallbackStamp& stamp,
                             rd::common::DataChannelKind channel,
-                            std::string payload) override;
-  [[nodiscard]] bool RefreshStatus() { return EmitStatus(); }
-  void DrainQualityTarget();
-  void SignalTerminal(std::string_view reason);
-  void OnSessionTerminal(const rd::common::TerminalError& error);
+                            std::string payload) override {
+    Post([this, stamp, channel, payload = std::move(payload)]() mutable {
+      HandleDataChannelMessage(stamp, channel, std::move(payload));
+    });
+  }
   void OnLocalIceCandidate(const rd::common::TransportCallbackStamp& stamp,
                            rd::common::IceCandidate candidate) override {
-    if (session_ == nullptr)
-      return;
-    session_->OnLocalIceCandidate(stamp, std::move(candidate));
+    Post([this, stamp, candidate = std::move(candidate)]() mutable {
+      if (session_ != nullptr)
+        session_->OnLocalIceCandidate(stamp, std::move(candidate));
+    });
   }
   void OnTransportPath(const rd::common::TransportCallbackStamp& stamp,
                        rd::common::TransportPath path) override {
-    if (session_ == nullptr)
-      return;
-    if (session_->OnTransportPath(stamp, path))
-      (void)EmitStatus();
+    Post([this, stamp, path] {
+      if (session_ != nullptr && session_->OnTransportPath(stamp, path))
+        (void)EmitStatus();
+    });
   }
+  [[nodiscard]] bool RefreshStatus() { return EmitStatus(); }
+  // Readable when queued transport events are waiting for DrainEvents().
+  [[nodiscard]] int wake_descriptor() const noexcept { return wake_[0]; }
+  [[nodiscard]] bool wake_ready() const noexcept { return wake_[0] >= 0; }
+  void DrainEvents();
+  void DrainQualityTarget();
+  void SignalTerminal(std::string_view reason);
+  void OnSessionTerminal(const rd::common::TerminalError& error);
   void OnQualityTarget(const rd::common::TransportCallbackStamp& stamp,
                        rd::common::QualityTarget target) override;
   void OnTerminal(rd::common::TransportTerminalReason reason) override;
   [[nodiscard]] bool terminal() const noexcept { return terminal_.load(); }
 
  private:
+  void Post(std::function<void()> event);
+  void HandlePeerConnectionState(const rd::common::TransportCallbackStamp& stamp,
+                                 rd::common::PeerConnectionState state);
+  void HandleDataChannelState(const rd::common::TransportCallbackStamp& stamp,
+                              rd::common::DataChannelKind channel,
+                              rd::common::DataChannelState state);
+  void HandleDataChannelMessage(const rd::common::TransportCallbackStamp& stamp,
+                                rd::common::DataChannelKind channel,
+                                std::string payload);
   [[nodiscard]] bool SendControl(Json::Value message);
   [[nodiscard]] bool SendTopology();
   [[nodiscard]] bool SendQuality();
@@ -592,6 +628,9 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   rd::common::TopologyRevision presented_layout_revision_ = 0;
   std::uint64_t outbound_sequence_ = 0;
   std::atomic_bool terminal_ = false;
+  std::mutex events_mutex_;
+  std::vector<std::function<void()>> events_;
+  std::array<int, 2> wake_{-1, -1};
   std::mutex quality_mutex_;
   std::optional<
       std::pair<rd::common::TransportCallbackStamp, rd::common::QualityTarget>>
@@ -1111,6 +1150,52 @@ void WorkerTransportSink::OnSessionTerminal(
   SignalTerminal(reason);
 }
 
+WorkerTransportSink::WorkerTransportSink() {
+  if (::pipe(wake_.data()) != 0) {
+    wake_ = {-1, -1};
+    return;
+  }
+  for (const int descriptor : wake_) {
+    (void)::fcntl(descriptor, F_SETFD, FD_CLOEXEC);
+    (void)::fcntl(descriptor, F_SETFL,
+                  ::fcntl(descriptor, F_GETFL) | O_NONBLOCK);
+  }
+}
+
+WorkerTransportSink::~WorkerTransportSink() {
+  for (const int descriptor : wake_) {
+    if (descriptor >= 0)
+      ::close(descriptor);
+  }
+}
+
+void WorkerTransportSink::Post(std::function<void()> event) {
+  {
+    std::lock_guard lock(events_mutex_);
+    events_.push_back(std::move(event));
+  }
+  // One byte per event at most; a full pipe already guarantees a wake-up.
+  if (wake_[1] >= 0) {
+    const char byte = 1;
+    (void)::write(wake_[1], &byte, 1);
+  }
+}
+
+void WorkerTransportSink::DrainEvents() {
+  if (wake_[0] >= 0) {
+    char buffer[256];
+    while (::read(wake_[0], buffer, sizeof(buffer)) > 0) {
+    }
+  }
+  std::vector<std::function<void()>> events;
+  {
+    std::lock_guard lock(events_mutex_);
+    events.swap(events_);
+  }
+  for (auto& event : events)
+    event();
+}
+
 void WorkerTransportSink::Bind(macos::MacosRemoteDesktopSession* session,
                                macos::MacosTransportSessionAdapter* transport,
                                WorkerSocketEmitter* emitter) noexcept {
@@ -1195,9 +1280,27 @@ bool WorkerTransportSink::SendQuality() {
   const auto authority = emitter_->SnapshotAuthority();
   const rd::common::TransportDiagnostics diagnostics =
       session_->transport_diagnostics();
-  if (!authority.has_value() || !diagnostics.quality.has_value())
+  if (!authority.has_value())
     return false;
-  const rd::common::QualitySelection& quality = *diagnostics.quality;
+  // Before congestion control has issued a target, describe what is actually
+  // being sent: the selected display at the encoder's cadence. The viewer's
+  // status bar (resolution, fps, bitrate, latency) only fills in once it has
+  // a quality report to extend with its own stats.
+  rd::common::QualitySelection fallback;
+  if (!diagnostics.quality.has_value()) {
+    const auto topology = session_->topology();
+    const rd::common::DisplayTopology* display =
+        topology ? topology->FindDisplay(session_->selected_display_id())
+                 : nullptr;
+    if (display == nullptr)
+      return false;
+    fallback.preset_id = "macos-videotoolbox";
+    fallback.encoded_pixels = display->encoded_pixels;
+    fallback.frame_rate = 30;
+    fallback.bitrate_bps = 1'500'000;
+  }
+  const rd::common::QualitySelection& quality =
+      diagnostics.quality.has_value() ? *diagnostics.quality : fallback;
   Json::Value root(Json::objectValue);
   root["type"] = imcodes::rd::kQualityType;
   root["protocolVersion"] = imcodes::rd::kProtocolVersion;
@@ -1288,6 +1391,21 @@ bool WorkerTransportSink::EmitStatus() {
       authority->mode == imcodes::rd::kControlMode && channels_ready &&
       frame_ready &&
       session_->state() == rd::common::SessionState::kControlling;
+  // The four facts the Server requires before it calls the session connected
+  // and disarms its negotiation timeout. None were sent, so every macOS session
+  // was ended as negotiation_timeout 45 s in, even with video on screen.
+  // The lock screen is part of the session now: say when the Mac is on it, so
+  // the browser can show that state. Unlocking is typing the password through
+  // ordinary input -- there is no stored-secret unlock on macOS.
+  const bool on_lock_screen =
+      std::strcmp(WorkerReadinessProbe::ProbeConsoleSessionState(),
+                  macos::kNativeSessionStateLocked) == 0;
+  root["signInScreen"] = on_lock_screen;
+  root["unlockAvailable"] = false;
+  root["peerConnected"] = connected;
+  root["dataChannelsReady"] = channels_ready;
+  root["mediaStarted"] = diagnostics.last_outbound_video_bytes > 0;
+  root["firstFramePresented"] = frame_ready;
   root["inputEnabled"] = input_enabled;
   root["atomicButtonClick"] = true;
   root["viewerCount"] = 1;
@@ -1349,7 +1467,7 @@ rd::common::InputStamp WorkerTransportSink::InputStampFor(
   };
 }
 
-void WorkerTransportSink::OnPeerConnectionState(
+void WorkerTransportSink::HandlePeerConnectionState(
     const rd::common::TransportCallbackStamp& stamp,
     rd::common::PeerConnectionState state) {
   if (session_ != nullptr &&
@@ -1358,7 +1476,7 @@ void WorkerTransportSink::OnPeerConnectionState(
   }
 }
 
-void WorkerTransportSink::OnDataChannelState(
+void WorkerTransportSink::HandleDataChannelState(
     const rd::common::TransportCallbackStamp& stamp,
     rd::common::DataChannelKind channel,
     rd::common::DataChannelState state) {
@@ -1369,6 +1487,7 @@ void WorkerTransportSink::OnDataChannelState(
   if (channel == rd::common::DataChannelKind::kControl &&
       state == rd::common::DataChannelState::kOpen) {
     (void)SendTopology();
+    (void)SendQuality();
   }
   (void)EmitStatus();
 }
@@ -1397,7 +1516,7 @@ void WorkerTransportSink::DrainQualityTarget() {
   }
 }
 
-void WorkerTransportSink::OnDataChannelMessage(
+void WorkerTransportSink::HandleDataChannelMessage(
     const rd::common::TransportCallbackStamp& stamp,
     rd::common::DataChannelKind channel,
     std::string payload) {
@@ -1513,8 +1632,12 @@ void WorkerTransportSink::OnDataChannelMessage(
                    : nullptr;
       if (display == nullptr ||
           display->display_id != session_->selected_display_id() ||
-          display->encoded_pixels.width != *message.control.frame_width ||
-          display->encoded_pixels.height != *message.control.frame_height) {
+          *message.control.frame_width == 0 || *message.control.frame_height == 0 ||
+          *message.control.frame_width > 16'384 || *message.control.frame_height > 16'384 ||
+          !rd::common::PresentedFrameCompatibleWithDisplay(
+              {static_cast<std::uint32_t>(*message.control.frame_width),
+               static_cast<std::uint32_t>(*message.control.frame_height)},
+              display->encoded_pixels)) {
         return;
       }
       presented_layout_revision_ = topology->revision;
@@ -1631,19 +1754,29 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
     return true;
   }
 
+  // OFFER, ICE and STOP carry only request, session and capability on the
+  // wire -- generations are omitted by protocol. Comparing them raw against the
+  // bound authority compared 0 and nullopt with the prepared values, so the
+  // first OFFER was refused, no ANSWER was ever sent, and every macOS session
+  // stalled on "connecting". They are bound from the prepared authority first,
+  // exactly as LEASE and MODE already were.
   bool NegotiateOffer(const imcodes::rd::Authority& authority,
                       std::string_view offer_sdp,
                       std::string* answer_sdp) override {
-    return Matches(authority) && session_ != nullptr && answer_sdp != nullptr &&
+    const imcodes::rd::Authority bound =
+        imcodes::rd::BindOmittedAuthorityFields(authority_, authority);
+    return Matches(bound) && session_ != nullptr && answer_sdp != nullptr &&
            session_->NegotiateOffer(offer_sdp, answer_sdp);
   }
 
   bool AddRemoteIce(const imcodes::rd::Authority& authority,
                     std::string_view media_id,
                     std::string_view candidate) override {
-    return Matches(authority) && session_ != nullptr &&
+    const imcodes::rd::Authority bound =
+        imcodes::rd::BindOmittedAuthorityFields(authority_, authority);
+    return Matches(bound) && session_ != nullptr &&
            session_->AddRemoteIceCandidate(
-               CommonAuthority(authority).identity,
+               CommonAuthority(bound).identity,
                rd::common::IceCandidate{std::string(media_id),
                                         std::string(candidate)});
   }
@@ -1684,7 +1817,8 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
   }
 
   bool Stop(const imcodes::rd::Authority& authority) override {
-    if (!Matches(authority) || session_ == nullptr)
+    if (!Matches(imcodes::rd::BindOmittedAuthorityFields(authority_, authority))
+        || session_ == nullptr)
       return false;
     session_->Stop();
     active_ = false;
@@ -2032,6 +2166,8 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   // to have sent them.
   auto media_binder = std::make_unique<macos::MacosMediaSenderBinder>();
   backend_view->BindMediaSender(media_binder.get());
+  // Owned by the session composition below; the loop only samples it.
+  const macos::MacosMediaSenderBinder* media_binder_view = media_binder.get();
 
   macos::DisclosureAdmission disclosure(context.worker_generation);
   DisclosureSupervisor disclosure_process;
@@ -2108,10 +2244,23 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     const macos::LoginWindowCaptureOutcome capture_outcome =
         macos::ComposeSessionCapture(
             capture_request, nullptr,
-            [](macos::LoginWindowCaptureBackend selected)
+            [locked = std::string_view(
+                          WorkerReadinessProbe::ProbeConsoleSessionState()) ==
+                      macos::kNativeSessionStateLocked,
+             aqua = session_binding.session_type == macos::kSessionTypeAqua](
+                macos::LoginWindowCaptureBackend selected)
                 -> std::unique_ptr<macos::ScreenCaptureKitBackend> {
               switch (selected) {
                 case macos::LoginWindowCaptureBackend::kScreenCaptureKit:
+                  // ScreenCaptureKit never delivers the lock screen: the
+                  // shield is excluded from every stream, so a locked Mac is
+                  // a black picture with a cursor. CGDisplayStream composites
+                  // the whole display, shield included -- the path other
+                  // remote-desktop products use to show and unlock it.
+                  if (aqua && locked) {
+                    std::cerr << "macos_remote_desktop_worker_capture_locked_cgdisplaystream\n";
+                    return macos::CreateCgDisplayStreamBackend();
+                  }
                   return macos::CreateAppleScreenCaptureKitBackend();
                 case macos::LoginWindowCaptureBackend::kCgDisplayStream:
                   return macos::CreateCgDisplayStreamBackend();
@@ -2240,11 +2389,14 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   int status = EX_OK;
   bool running = true;
 
+  std::int64_t last_media_sample_ms = 0;
+  bool media_status_sent = false;
   while (running) {
-    std::array<pollfd, 3> poll_set{};
+    std::array<pollfd, 4> poll_set{};
     poll_set[0] = {descriptor, POLLIN, 0};
     poll_set[1] = {control.descriptor(), POLLIN, 0};
     poll_set[2] = {disclosure_process.descriptor(), POLLIN, 0};
+    poll_set[3] = {sink.wake_descriptor(), POLLIN, 0};
     // A libwebrtc terminal callback can arrive on its own thread. A bounded
     // poll lets that one-way terminal wake this loop without an indefinitely
     // live worker after the peer has died.
@@ -2262,7 +2414,32 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       break;
     }
 
+    sink.DrainEvents();
+    if (sink.terminal()) {
+      std::cerr << "macos_remote_desktop_worker_transport_terminal\n";
+      status = EX_UNAVAILABLE;
+      break;
+    }
     sink.DrainQualityTarget();
+
+    // Outbound media progress, once a second -- the Windows worker's stats
+    // cadence. It arms the stall watchdog and is the only source of
+    // `mediaStarted`; without it the Server never considers a macOS route
+    // connected and fails every session at its negotiation deadline.
+    {
+      const rd::common::TransportTime now = SampleNow();
+      if (now.monotonic_ms - last_media_sample_ms >= 1'000) {
+        last_media_sample_ms = now.monotonic_ms;
+        const std::uint64_t bytes = media_binder_view->accepted_bytes();
+        (void)session->RecordMediaProgress(bytes, now);
+        if (bytes > 0 && !media_status_sent) {
+          media_status_sent = true;
+          (void)sink.RefreshStatus();
+        }
+        if (sink.terminal())
+          continue;
+      }
+    }
 
     // Disclosure first: losing it must revoke admission before any queued host
     // frame gets a chance to be acted on.

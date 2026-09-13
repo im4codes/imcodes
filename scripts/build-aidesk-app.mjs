@@ -119,6 +119,24 @@ export function aideskSigningOrder(bundlePath) {
  * Read from the pinned package rather than transcribed here, so the notice is
  * always the one that belongs to the exact version being shipped.
  */
+/**
+ * The canonical IM.codes brand mark, shipped in Resources for the on-screen
+ * remote-desktop indicator. The same source PNG generates the Windows
+ * indicator's bitmaps, so both platforms show one mark.
+ */
+export const AIDESK_BRAND_LOGO = 'imcodes-robot-avatar.png';
+
+export function copyAideskBrandLogo(bundlePath) {
+  const source = join(root, 'web', 'public', AIDESK_BRAND_LOGO);
+  if (!existsSync(source)) {
+    throw new Error(`brand logo not found at ${source}`);
+  }
+  const out = join(bundlePath, 'Contents', 'Resources', AIDESK_BRAND_LOGO);
+  mkdirSync(dirname(out), { recursive: true });
+  cpSync(source, out);
+  return out;
+}
+
 export function copyComputerUseLicense(outPath) {
   const source = join(root, 'node_modules', 'open-computer-use', 'LICENSE');
   if (!existsSync(source)) {
@@ -319,6 +337,7 @@ export function buildAideskApp(input) {
   // Into Helpers, which is where the dispatcher looks.
   extractComputerUseExecutable(computerUseArchive, join(helpers, AIDESK_COMPUTER_USE_EXECUTABLE));
   copyComputerUseLicense(join(bundlePath, 'Contents', 'Resources', AIDESK_THIRD_PARTY_LICENSE));
+  copyAideskBrandLogo(bundlePath);
   signAideskApp(bundlePath);
   return bundlePath;
 }

@@ -782,7 +782,50 @@ describe('macOS remote-desktop worker host', () => {
     });
   });
 
-  it('retires routes on Server disconnect without destroying the verified local profile', async () => {
+  it('holds an OFFER that arrives while PREPARE is still re-checking readiness', async () => {
+    // The browser sends its OFFER the moment it is authorized, while PREPARE is
+    // still inside a readiness re-check that launches a native process. With no
+    // preparing marker yet, the OFFER found no session and failed the route.
+    let slow = false;
+    const value = harness({
+      inspectReadiness: async () => {
+        if (slow) await new Promise((resolve) => { setTimeout(resolve, 50); });
+        return { screenRecording: true, encoder: true, accessibility: true, clipboard: true, disclosure: true };
+      },
+    });
+    await startAuthenticated(value);
+    slow = true;
+    const preparing = value.host.handle(prepare());
+    const offering = value.host.handle({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      requestId: REQUEST_ID, sessionId: SESSION_ID, capability: CAPABILITY,
+      sdp: 'v=0',
+    });
+    expect(await preparing).toBe(true);
+    expect(await offering).toBe(true);
+    expect(value.sent.map((command) => command.type)).toEqual([
+      REMOTE_DESKTOP_MSG.PREPARE,
+      REMOTE_DESKTOP_MSG.OFFER,
+    ]);
+  });
+
+  it('leaves an idle worker untouched when the Server link reconnects', async () => {
+    // Stop-capture sent to a worker with no session running stopped its session
+    // object for good, so the next PREPARE was refused; and every capability
+    // change reconnects the link, so every session after the first failed.
+    const releaseInput = vi.fn();
+    const stopCapture = vi.fn();
+    const value = harness({ releaseInput, stopCapture });
+    await startAuthenticated(value);
+
+    value.host.onDaemonDisconnected();
+
+    expect(value.host.available()).toBe(true);
+    expect(releaseInput).not.toHaveBeenCalled();
+    expect(stopCapture).not.toHaveBeenCalled();
+  });
+
+  it('retires open routes on Server disconnect and replaces the worker whose session was stopped', async () => {
     const releaseInput = vi.fn();
     const stopCapture = vi.fn();
     const value = harness({ releaseInput, stopCapture });
@@ -791,7 +834,6 @@ describe('macOS remote-desktop worker host', () => {
 
     value.host.onDaemonDisconnected();
 
-    expect(value.host.available()).toBe(true);
     expect(releaseInput).toHaveBeenCalledWith({
         reason: MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON.DAEMON_DISCONNECTED,
         workerGeneration: expect.any(Number),

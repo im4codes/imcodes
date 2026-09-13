@@ -13,6 +13,7 @@
  */
 
 import WebSocket, { type RawData } from 'ws';
+import { CLOCK_SYNC_FIELD } from '../../../shared/clock-sync.js';
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
 import type { Database } from '../db/client.js';
@@ -1503,6 +1504,21 @@ function toCapabilityManageJournalFrame(
     authorityRevision: request.authorityRevision,
     ...(request.targetVersionId ? { versionId: request.targetVersionId } : {}),
     ...(request.authorization ? { authorization: request.authorization } : {}),
+  };
+}
+
+/**
+ * The heartbeat ack doubles as the clock-sync round trip: echo the peer's send
+ * time and add this Server's own, so the peer can place Server-stamped
+ * deadlines on its local clock (shared/clock-sync.ts). Peers that send no
+ * timestamp get the Server time alone, which older peers ignore.
+ */
+function heartbeatAckWithClock(heartbeat: Record<string, unknown>): Record<string, unknown> {
+  const sentAt = heartbeat[CLOCK_SYNC_FIELD.SENT_AT];
+  return {
+    type: 'heartbeat_ack',
+    [CLOCK_SYNC_FIELD.SERVER_TIME]: Date.now(),
+    ...(typeof sentAt === 'number' && Number.isFinite(sentAt) ? { [CLOCK_SYNC_FIELD.SENT_AT]: sentAt } : {}),
   };
 }
 
@@ -4824,7 +4840,7 @@ export class WsBridge {
           updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
             logger.error({ err }, 'Failed to update heartbeat'),
           );
-          try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+          try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
           void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
           return;
         }
@@ -4896,7 +4912,7 @@ export class WsBridge {
           logger.error({ err }, 'Failed to update heartbeat'),
         );
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead
-        try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+        try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
         void this.refreshCapabilitySyncOnHeartbeat(db, ws, connectionGeneration).catch((error: unknown) => {
           logger.warn({ error, serverId: this.serverId }, 'Capability heartbeat sync refresh failed');
         });

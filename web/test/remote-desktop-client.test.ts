@@ -1358,6 +1358,76 @@ describe('RemoteDesktopClient', () => {
     intervalSpy.mockRestore();
   });
 
+  it('reads Server deadlines on the Server clock when the browser clock is minutes ahead', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    // The browser clock runs ten minutes ahead of the Server.
+    const skew = 10 * 60_000;
+    let now = skew + 1_000;
+    const client = new RemoteDesktopClient('controlled-mac', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-clock-skew',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_clockskew',
+      capability: 'k'.repeat(43),
+      serverTime: 1_000,
+      expiresAt: 61_000,
+      leaseExpiresAt: 16_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: [],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_clockskew',
+      sequence: 1,
+      preset: '720p30',
+      encoderClass: 'hardware',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrateBps: 3_000_000,
+      droppedFrames: 0,
+      rttMs: 1,
+    });
+    peer.stats = [{
+      type: 'inbound-rtp', kind: 'video', bytesReceived: 1_000, timestamp: 1_000,
+    }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    expect(statsTick).toBeTypeOf('function');
+    await vi.waitFor(() => expect(client.current().quality?.bitrateBps).toBe(3_000_000));
+
+    // Read raw, the 61 s deadline would already be ten minutes gone and the
+    // stall below would fail the session instead of restarting ICE.
+    now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS;
+    statsTick();
+    await vi.waitFor(() => expect(client.current().state).toBe(REMOTE_DESKTOP_STATE.RECONNECTING));
+    expect(peer.offerOptions.at(-1)).toEqual({ iceRestart: true });
+    intervalSpy.mockRestore();
+  });
+
   it('waits out a slow first frame then recovers an established stream in place', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;

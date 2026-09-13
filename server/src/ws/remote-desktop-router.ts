@@ -769,6 +769,7 @@ export class RemoteDesktopRouter {
           const capability = this.deriveCapability(route.requestId, route.sessionId);
           this.hooks.sendBrowser(route.socket, {
             type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+            serverTime: this.now(),
             requestId: route.requestId,
             sessionId: route.sessionId,
             capability,
@@ -833,6 +834,7 @@ export class RemoteDesktopRouter {
     route.browserDetached = false;
     this.hooks.sendBrowser(socket, {
       type: REMOTE_DESKTOP_MSG.RESUMED,
+      serverTime: this.now(),
       requestId: route.requestId,
       sessionId: route.sessionId,
       capability: this.deriveCapability(route.requestId, route.sessionId),
@@ -1243,7 +1245,7 @@ export class RemoteDesktopRouter {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
       return;
     }
-    this.hooks.sendBrowser(socket, { type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority });
+    this.hooks.sendBrowser(socket, { type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority, serverTime: this.now() });
     this.counters.admitted++;
     this.audit(REMOTE_DESKTOP_AUDIT_EVENT.ADMITTED, route, {
       reconnectAttempt: route.reconnectAttempt,
@@ -1382,7 +1384,7 @@ export class RemoteDesktopRouter {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
       return;
     }
-    this.hooks.sendBrowser(socket, { type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority });
+    this.hooks.sendBrowser(socket, { type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority, serverTime: this.now() });
     this.counters.admitted++;
     this.audit(REMOTE_DESKTOP_AUDIT_EVENT.ADMITTED, route);
     this.publishCollaborationCounts();

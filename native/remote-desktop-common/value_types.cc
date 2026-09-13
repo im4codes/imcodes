@@ -18,6 +18,17 @@ bool PixelSize::IsValid() const noexcept {
   return width > 0 && height > 0 && width <= 16'384 && height <= 16'384;
 }
 
+bool PresentedFrameCompatibleWithDisplay(PixelSize frame,
+                                         PixelSize display) noexcept {
+  if (!frame.IsValid() || !display.IsValid()) return false;
+  const std::int64_t first =
+      static_cast<std::int64_t>(frame.width) * display.height;
+  const std::int64_t second =
+      static_cast<std::int64_t>(frame.height) * display.width;
+  const std::int64_t difference = first > second ? first - second : second - first;
+  return difference * 100 <= (first > second ? first : second);
+}
+
 bool LogicalRect::IsValid() const noexcept {
   return Finite(x) && Finite(y) && Finite(width) && Finite(height) &&
          width > 0.0 && height > 0.0 && width <= 1'000'000.0 &&

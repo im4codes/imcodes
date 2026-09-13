@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { MACOS_REMOTE_DESKTOP_SESSION_TYPE } from '../../src/node/macos-remote-desktop-session-type.js';
 import { MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_ENVIRONMENT } from '../../src/node/macos-remote-desktop-launch-agent.js';
+import { MACOS_REMOTE_DESKTOP_BOOTSTRAP_HANDSHAKE_TIMEOUT_MS } from '../../src/node/macos-remote-desktop-global-agent-bootstrap.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native/macos-remote-desktop');
@@ -152,6 +153,37 @@ describe('macOS LoginWindow production chain', () => {
     expect(client).toContain('expected.audit_session_id');
     expect(client).toContain('expected.instance_nonce');
     expect(client).toContain('expected_socket');
+  });
+
+  it('waits for its launch grant longer than the daemon may take to produce it', () => {
+    // Between hello and grant the daemon verifies the set, reads readiness
+    // through the signed app and prepares the IPC server. The agent allowed 5 s
+    // and the daemon 15 s: on a real Mac the agent gave up, exited, was
+    // relaunched, the relaunch was read as a user switch, and no worker ever
+    // started.
+    const production = read('src/node/macos-remote-desktop-production.ts');
+    const daemonMs = Number(production.match(
+      /const DEFAULT_GRAPHICAL_AUTHORITY_TIMEOUT_MS = ([\d_]+);/u)![1]!.replaceAll('_', ''));
+    const agentMatch = agent.match(/constexpr int kGrantReadDeadlineMs = ([\d']+);/u);
+    expect(agentMatch, 'the agent grant deadline moved').not.toBeNull();
+    const agentMs = Number(agentMatch![1]!.replaceAll("'", ''));
+    // Nested, strictly: the launch fits inside the listener's handshake, and
+    // the handshake fits inside the agent's wait. The listener at 5 s hung up
+    // silently on every launch that was still being prepared.
+    expect(MACOS_REMOTE_DESKTOP_BOOTSTRAP_HANDSHAKE_TIMEOUT_MS).toBeGreaterThan(daemonMs);
+    expect(agentMs).toBeGreaterThan(MACOS_REMOTE_DESKTOP_BOOTSTRAP_HANDSHAKE_TIMEOUT_MS);
+    const bootstrap = read('src/node/macos-remote-desktop-global-agent-bootstrap.ts');
+    expect(bootstrap, 'a handshake timeout must be reported, not silent')
+      .toContain('MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.HANDSHAKE_TIMEOUT');
+
+    // One deadline for the whole exchange, measured -- never zeroed after the
+    // first read, which also rejected a grant that arrived in two segments.
+    const reader = agent.slice(
+      agent.indexOf('bool ReadOneBoundedLine'),
+      agent.indexOf('bool EnsureWorkerLaunchGrant'),
+    );
+    expect(reader).toContain('deadline - MonotonicMs()');
+    expect(reader).not.toContain('remaining_ms = 0');
   });
 
   it('orders LoginWindow advertisement after peer auth, identity, composition, and session readiness', () => {

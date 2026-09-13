@@ -309,26 +309,35 @@ public:
       return Fail(MacosPeerIdentityErrorCode::kSigningInformationUnavailable,
                   error, 0, status);
     }
-    ScopedCfRef<CFDataRef> expected_requirement_data;
-    ScopedCfRef<CFDataRef> actual_requirement_data;
-    status =
-        SecRequirementCopyData(expected_requirement.get(), kSecCSDefaultFlags,
-                               expected_requirement_data.out());
-    if (status == errSecSuccess) {
-      status =
-          SecRequirementCopyData(actual_requirement.get(), kSecCSDefaultFlags,
-                                 actual_requirement_data.out());
-    }
-    if (status != errSecSuccess || expected_requirement_data.get() == nullptr ||
-        actual_requirement_data.get() == nullptr) {
+    // Compared as CANONICAL TEXT, not as compiled bytes.
+    //
+    // SecCodeCheckValidity above already proved the peer SATISFIES the expected
+    // requirement. This second check pins that the peer's OWN designated
+    // requirement is exactly that one -- and it used to compare the two
+    // compiled blobs with CFEqual. That can never succeed: the requirement
+    // codesign embeds and the same text passed through SecRequirementCreate
+    // encode the identical boolean expression with a differently associated
+    // tree of `and` nodes. Measured on a real signed agent: the text was equal
+    // byte for byte, both blobs were 176 bytes, and CFEqual was false -- so
+    // every correctly signed LaunchAgent was refused as kCodeIdentityMismatch
+    // and remote desktop could never start. SecRequirementCopyString renders
+    // both in the same canonical form, which is what equality has to mean.
+    ScopedCfRef<CFStringRef> actual_requirement_text;
+    status = SecRequirementCopyString(actual_requirement.get(),
+                                      kSecCSDefaultFlags,
+                                      actual_requirement_text.out());
+    std::string actual_designated_requirement;
+    if (status != errSecSuccess || actual_requirement_text.get() == nullptr ||
+        !CopyBoundedCfString(actual_requirement_text.get(),
+                             kMacosPeerDesignatedRequirementMaxBytes,
+                             &actual_designated_requirement)) {
       return Fail(MacosPeerIdentityErrorCode::kSigningInformationUnavailable,
                   error, 0, status);
     }
 
     if (actual_identifier != expected.bundle_identifier ||
         actual_team_id != expected.team_id ||
-        !CFEqual(expected_requirement_data.get(),
-                 actual_requirement_data.get())) {
+        actual_designated_requirement != expected.designated_requirement) {
       return Fail(MacosPeerIdentityErrorCode::kCodeIdentityMismatch, error);
     }
 

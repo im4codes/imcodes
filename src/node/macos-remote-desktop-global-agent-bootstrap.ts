@@ -24,12 +24,23 @@ export const MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR = Object.freeze({
   REPLAY: 'macos_remote_desktop_bootstrap_replay',
   STALE_GENERATION: 'macos_remote_desktop_bootstrap_stale_generation',
   INVALID_LAUNCH: 'macos_remote_desktop_bootstrap_invalid_launch',
+  HANDSHAKE_TIMEOUT: 'macos_remote_desktop_bootstrap_handshake_timeout',
 } as const);
 
 const SECRET_RE = /^[A-Za-z0-9_-]{43}$/u;
 const MAX_TRACKED_NONCES = 4_096;
 const MAX_BOOTSTRAP_FRAME_BYTES = 16 * 1024;
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
+/**
+ * The whole hello-to-grant exchange, so it must outlast what happens inside it:
+ * the launch it waits on may take up to DEFAULT_GRAPHICAL_AUTHORITY_TIMEOUT_MS
+ * (15 s) while the component set is verified and readiness is read through the
+ * signed app. At 5 s this listener hung up -- silently -- long before the grant
+ * existed, the agent reported only "bootstrap refused" and was relaunched, and
+ * no worker ever started. It must also stay below the agent's own wait
+ * (kGrantReadDeadlineMs, 20 s), or the agent gives up on a grant still coming.
+ */
+export const MACOS_REMOTE_DESKTOP_BOOTSTRAP_HANDSHAKE_TIMEOUT_MS = 18_000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = MACOS_REMOTE_DESKTOP_BOOTSTRAP_HANDSHAKE_TIMEOUT_MS;
 
 export type MacosRemoteDesktopGraphicalSessionType = 'Aqua' | 'LoginWindow';
 
@@ -485,8 +496,9 @@ export class MacosRemoteDesktopGlobalAgentBootstrapListener {
     this.sockets.add(socket);
     let buffer = Buffer.alloc(0);
     let settled = false;
-    const timer = setTimeout(() => finish(), this.options.handshakeTimeoutMs
-      ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(
+      new Error(MACOS_REMOTE_DESKTOP_BOOTSTRAP_ERROR.HANDSHAKE_TIMEOUT),
+    ), this.options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     timer.unref?.();
     const finish = (error?: unknown) => {
       if (settled) return;

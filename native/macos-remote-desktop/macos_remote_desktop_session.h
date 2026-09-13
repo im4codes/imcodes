@@ -231,6 +231,10 @@ class MacosRemoteDesktopSession final {
                        common::TransportPath path);
   bool UpdateTransportQuality(const common::TransportCallbackStamp& stamp,
                               const common::QualityTarget& target);
+  // Periodic outbound-media sample for the live route (captured frames are
+  // counted by the session itself).
+  bool RecordMediaProgress(std::uint64_t outbound_video_bytes,
+                           common::TransportTime now);
   bool RecordTransportMediaProgress(const common::TransportCallbackStamp& stamp,
                                     std::uint64_t source_frames,
                                     std::uint64_t outbound_video_bytes,

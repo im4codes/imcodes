@@ -16,6 +16,7 @@ import {
   buildMacosRemoteDesktopGlobalLaunchAgentDefinition,
   installMacosRemoteDesktopGlobalLaunchAgent,
   loadMacosRemoteDesktopGlobalLaunchAgent,
+  retireMacosRemoteDesktopGlobalLaunchAgent,
   type MacosRemoteDesktopGlobalLaunchAgentDefinition,
   type MacosRemoteDesktopGlobalLaunchAgentLoadReceipt,
   type MacosRemoteDesktopGlobalLaunchAgentRollback,
@@ -53,12 +54,15 @@ import { randomBytes } from 'node:crypto';
 import {
   executeMacosRemoteDesktopResponsibleCommand,
   macosRemoteDesktopResponsibleCommandInvocation,
+  resolveMacosRemoteDesktopBundledLaunchAgentExecutable,
   type MacosRemoteDesktopResponsibleCommandOptions,
   type MacosRemoteDesktopResponsibleCommandResult,
 } from './macos-remote-desktop-responsible-spawn.js';
 import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
 
 const COMMAND_TIMEOUT_MS = 5_000;
+/** Repeated 申请权限 clicks inside this window reuse the prompt already up. */
+const PERMISSION_REQUEST_COALESCE_MS = 60_000;
 const COMMAND_MAX_BUFFER_BYTES = 16 * 1024;
 
 /**
@@ -132,7 +136,40 @@ export type MacosRemoteDesktopResponsibleCommandRunner = (
   options: MacosRemoteDesktopResponsibleCommandOptions,
 ) => Promise<MacosRemoteDesktopResponsibleCommandResult>;
 
+/**
+ * How the node gets a worker into the console user's session.
+ *
+ * `per_user` (default): a LaunchAgent in the user's own domain whose
+ * environment carries the launch context for exactly one worker generation.
+ * The same model RustDesk and similar tools use -- the node writes it, launchd
+ * runs it, the worker dials back. Aqua sessions only.
+ *
+ * `global_bootstrap`: one machine-wide KeepAlive agent that asks the node for a
+ * launch over a bootstrap socket, meant to also cover the login window. On a
+ * real Mac it never carried a worker to an authenticated session: the agent,
+ * the bootstrap listener, the IPC server and the display link each assumed a
+ * different party was on the other end. Kept for that later work, not used.
+ */
+export type MacosRemoteDesktopSessionModel = 'per_user' | 'global_bootstrap';
+
 export interface MacosRemoteDesktopProductionDependencies {
+  sessionModel?: MacosRemoteDesktopSessionModel;
+  /** Test seam for the per-user model's one-time removal of the global agent. */
+  retireGlobalLaunchAgent?: () => Promise<unknown>;
+  /** Test seam for choosing where the per-user agent runs from. */
+  resolveLaunchAgentExecutable?: (
+    artifact: VerifiedMacosRemoteDesktopArtifact,
+  ) => Promise<string | null>;
+  /**
+   * Start the virtual-display authority link for each session. Off unless asked
+   * for. The session does not need it -- capture and input run on the real
+   * display -- and the resident agent treats a link that drops as the daemon
+   * going away, stopping the worker with it. On a real Mac that took every
+   * session down seconds after it was granted, over an optional feature. With
+   * no listener the agent's link fails to establish, and it runs the worker
+   * without a display authority, which is the path it was built to take.
+   */
+  enableVirtualDisplay?: boolean;
   platform?: NodeJS.Platform;
   arch?: string;
   runtimeRoot?: string;
@@ -313,6 +350,17 @@ function withProductionTimeout<T>(
   });
 }
 
+function sameVerifiedArtifactSet(
+  left: VerifiedMacosRemoteDesktopArtifact,
+  right: VerifiedMacosRemoteDesktopArtifact,
+): boolean {
+  return left === right || (
+    left.setSha256 === right.setSha256
+    && left.releaseName === right.releaseName
+    && left.artifactDirectory === right.artifactDirectory
+  );
+}
+
 function sameGraphicalAuthority(
   left: MacosRemoteDesktopGraphicalSessionAuthority,
   right: MacosRemoteDesktopGraphicalSessionAuthority,
@@ -366,8 +414,28 @@ class MacosRemoteDesktopProductionBootstrapCoordinator {
     },
   };
 
+  /**
+   * The artifact the running listener and LaunchAgent were started from.
+   * Callers must use THIS object after `start`: readiness and launches compare
+   * artifacts by identity, and a freshly re-verified copy of the same set is a
+   * different object.
+   */
+  get startedArtifact(): VerifiedMacosRemoteDesktopArtifact | null {
+    return this.listener ? this.activeArtifact : null;
+  }
+
   start(artifact: VerifiedMacosRemoteDesktopArtifact): Promise<boolean> {
-    if (this.activeArtifact === artifact && this.listener) return Promise.resolve(true);
+    // Same verified SET, not the same object. Every generation re-verifies the
+    // store and gets a new object for identical bytes; comparing identity made
+    // each one reinstall the LaunchAgent and `kickstart -k` it -- killing the
+    // agent that had just been granted a launch. Its replacement connected as
+    // a "different" principal, was handled as a user switch, the teardown began
+    // a new generation, and that generation killed the next agent. No worker
+    // ever lived longer than a second.
+    if (this.listener && this.activeArtifact
+      && sameVerifiedArtifactSet(this.activeArtifact, artifact)) {
+      return Promise.resolve(true);
+    }
     if (this.startPromise) return this.startPromise;
     const start = this.startInternal(artifact).finally(() => {
       if (this.startPromise === start) this.startPromise = null;
@@ -510,9 +578,11 @@ class MacosRemoteDesktopProductionBootstrapCoordinator {
       await listener.start();
       installRollback = await (this.dependencies.installGlobalLaunchAgent
         ?? ((next) => installMacosRemoteDesktopGlobalLaunchAgent(next)))(definition);
+      const definitionChanged = installRollback.changed;
       this.loadReceipt = await (this.dependencies.loadGlobalLaunchAgent
         ?? ((next) => loadMacosRemoteDesktopGlobalLaunchAgent(next, {
           resolveAquaUser: this.dependencies.resolveUserSession,
+          ...(definitionChanged === false ? { definitionChanged } : {}),
         })))(definition);
       this.listener = listener;
       this.activeArtifact = artifact;
@@ -806,13 +876,25 @@ function verifiedReadiness(
   snapshot: MacosRemoteDesktopNativeReadinessSnapshot,
   user: MacosUserSession,
 ): NativeReadiness {
+  // Thrown, not returned: the caller reports what it catches and then answers
+  // "unavailable" exactly as before. Returning the unavailable snapshot
+  // directly was indistinguishable from a worker that saw no encoder -- a
+  // locked screen produced an all-false profile and not one log line.
   if (snapshot.activeAquaUserUids.length !== 1
-    || snapshot.activeAquaUserUids[0] !== user.uid
-    || snapshot.sessionState !== MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.ACTIVE_UNLOCKED
-    || !snapshot.lifecycleObservation
+    || snapshot.activeAquaUserUids[0] !== user.uid) {
+    throw new Error('macos_remote_desktop_readiness_user_mismatch');
+  }
+  // Locked is usable: it is still this user's console session, and reaching
+  // the lock screen is the point of remote access. Refusing it withdrew remote
+  // desktop the moment a Mac locked. Sleeping or not on the console stays out.
+  if (snapshot.sessionState !== MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.ACTIVE_UNLOCKED
+    && snapshot.sessionState !== MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.LOCKED) {
+    throw new Error(`macos_remote_desktop_readiness_session_not_active:${snapshot.sessionState}`);
+  }
+  if (!snapshot.lifecycleObservation
     || !snapshot.releaseInput
     || !snapshot.stopCapture) {
-    return UNAVAILABLE_READINESS;
+    throw new Error('macos_remote_desktop_readiness_cleanup_unavailable');
   }
   return Object.freeze({
     screenRecording: snapshot.screenRecording,
@@ -863,6 +945,7 @@ export function createMacosRemoteDesktopProductionDependencies(
     ));
   let activeArtifact: VerifiedMacosRemoteDesktopArtifact | null = null;
   let activeUser: MacosUserSession | null = null;
+  let lastPermissionRequestAt = Number.NEGATIVE_INFINITY;
 
   /**
    * Run one cleanup command against an EXACT worker generation and resolve on
@@ -908,17 +991,35 @@ export function createMacosRemoteDesktopProductionDependencies(
   let serviceGeneration = 0;
   const bootstrap = new MacosRemoteDesktopProductionBootstrapCoordinator(dependencies);
 
+  const perUser = (dependencies.sessionModel ?? 'per_user') === 'per_user';
+  let globalAgentRetired = false;
+  const graphicalBootstrapOptions = perUser ? {} : {
+    lifecycleSource: bootstrap.lifecycleSource,
+    resolveGraphicalSessionAuthority: async () => await bootstrap.nextAuthority(),
+    onGraphicalIpcLaunch: async (
+      authority: Parameters<MacosRemoteDesktopProductionBootstrapCoordinator['bindLaunch']>[0],
+      launch: Parameters<MacosRemoteDesktopProductionBootstrapCoordinator['bindLaunch']>[1],
+    ) => {
+      await bootstrap.bindLaunch(authority, launch);
+    },
+    inspectPeerGraphicalSession: async (socket: Socket) =>
+      await bootstrap.inspectWorkerGraphicalSession(socket),
+    createPeerVerificationSeams: (
+      options: Parameters<MacosRemoteDesktopProductionBootstrapCoordinator['createWorkerVerification']>[0],
+    ) => bootstrap.createWorkerVerification(options),
+  };
+
   return {
     runtime: { platform, arch },
     runtimeRoot: dependencies.runtimeRoot,
-    lifecycleSource: bootstrap.lifecycleSource,
-    resolveGraphicalSessionAuthority: async () => await bootstrap.nextAuthority(),
-    onGraphicalIpcLaunch: async (authority, launch) => {
-      await bootstrap.bindLaunch(authority, launch);
-    },
-    inspectPeerGraphicalSession: async (socket) =>
-      await bootstrap.inspectWorkerGraphicalSession(socket),
-    createPeerVerificationSeams: (options) => bootstrap.createWorkerVerification(options),
+    ...graphicalBootstrapOptions,
+    // Run the session from inside aiDesk.to by IM.codes.app whenever that app
+    // carries this exact component set, so the one grant the person gave that
+    // app is the grant capture and input run under.
+    resolveLaunchAgentExecutable: dependencies.resolveLaunchAgentExecutable
+      ?? ((artifact) => resolveMacosRemoteDesktopBundledLaunchAgentExecutable(artifact, {
+        appPath: dependencies.responsibleAppPath,
+      })),
     /**
      * The stock virtual-display authority.
      *
@@ -935,6 +1036,7 @@ export function createMacosRemoteDesktopProductionDependencies(
       // No agent verifier means nothing could check who dialled the
       // rendezvous. Refused rather than started open.
       if (!context.verification) return null;
+      if (dependencies.enableVirtualDisplay !== true) return null;
       try {
         return await startMacosVirtualDisplayAuthorityHost({
           artifact: context.artifact,
@@ -962,11 +1064,30 @@ export function createMacosRemoteDesktopProductionDependencies(
         selectArtifact,
         dependencies.onBackgroundError,
       );
+      if (perUser) {
+        if (!selected) {
+          activeArtifact = null;
+          return null;
+        }
+        if (!globalAgentRetired) {
+          globalAgentRetired = true;
+          await (dependencies.retireGlobalLaunchAgent
+            ?? (() => retireMacosRemoteDesktopGlobalLaunchAgent({
+              resolveAquaUser: dependencies.resolveUserSession,
+            })))().catch((error: unknown) => dependencies.onBackgroundError?.(error));
+        }
+        // One object per verified set, so identity checks further down keep
+        // holding across generations that re-verify the same bytes.
+        activeArtifact = activeArtifact && sameVerifiedArtifactSet(activeArtifact, selected)
+          ? activeArtifact
+          : selected;
+        return activeArtifact;
+      }
       if (!selected || !await bootstrap.start(selected)) {
         activeArtifact = null;
         return null;
       }
-      activeArtifact = selected;
+      activeArtifact = bootstrap.startedArtifact ?? selected;
       return activeArtifact;
     },
     async resolveUserSession(): Promise<MacosUserSession> {
@@ -1007,6 +1128,11 @@ export function createMacosRemoteDesktopProductionDependencies(
      * the next time readiness is read.
      */
     async requestPermissions(): Promise<boolean> {
+      // One prompt at a time. Every click used to launch another app instance,
+      // each of which stays up waiting on System Settings; five clicks left
+      // five of them running.
+      const now = Date.now();
+      if (now - lastPermissionRequestAt < PERMISSION_REQUEST_COALESCE_MS) return true;
       const artifact = await selectArtifact(storeRoot, 'current', { runtime: { platform, arch } })
         ?? await selectArtifact(storeRoot, 'lastKnownGood', { runtime: { platform, arch } });
       // Reported, not returned bare. A silent `false` is how this failed
@@ -1021,11 +1147,28 @@ export function createMacosRemoteDesktopProductionDependencies(
         await assertMacosRemoteDesktopStoreTrusted(storeRoot, artifact.releaseName, {
           runtime: { platform, arch },
         });
-        await executeNativeCommand(
-          user,
-          artifact.components.worker,
-          [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.requestPermissions],
-        );
+        if (dependencies.executeNativeCommand) {
+          await dependencies.executeNativeCommand(
+            user,
+            artifact.components.worker,
+            [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.requestPermissions],
+          );
+        } else {
+          // Detached: the request is designed to stay up while the person
+          // answers, up to its own bound. Awaiting it under the short command
+          // timeout reported a failure within seconds while the prompt was on
+          // screen, and left the process behind.
+          await (dependencies.executeResponsibleCommand ?? executeMacosRemoteDesktopResponsibleCommand)({
+            user,
+            component: artifact.components.worker,
+            args: [MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.requestPermissions],
+            ...(dependencies.responsibleAppPath ? { appPath: dependencies.responsibleAppPath } : {}),
+            timeoutMs: COMMAND_TIMEOUT_MS,
+            maxBufferBytes: COMMAND_MAX_BUFFER_BYTES,
+            detached: true,
+          });
+        }
+        lastPermissionRequestAt = now;
         return true;
       } catch (error) {
         dependencies.onBackgroundError?.(error);

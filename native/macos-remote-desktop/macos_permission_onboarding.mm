@@ -12,8 +12,14 @@
 #include <vector>
 
 #include <mach-o/dyld.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sysexits.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 
 namespace imcodes::remote_desktop::macos {
 namespace {
@@ -123,6 +129,14 @@ bool IsAiDeskProductMainExecutable() noexcept {
          executable.substr(slash + 1) == kAiDeskMainExecutableName;
 }
 
+namespace {
+volatile sig_atomic_t g_forward_signal_child = -1;
+
+void ForwardSignalToHelper(int signal_number) {
+  if (g_forward_signal_child > 0) ::kill(g_forward_signal_child, signal_number);
+}
+}  // namespace
+
 bool ExecAiDeskProductHelper(AiDeskProductHelper helper,
                              int argc,
                              const char* const argv[]) noexcept {
@@ -157,8 +171,33 @@ bool ExecAiDeskProductHelper(AiDeskProductHelper helper,
       forwarded.push_back(const_cast<char*>(argv[index]));
     }
     forwarded.push_back(nullptr);
-    ::execv(path.c_str(), forwarded.data());
-    return false;
+    // SPAWN AND WAIT, never exec. macOS checks Screen Recording and
+    // Accessibility against the RESPONSIBLE process. A child spawned from this
+    // main executable keeps this app as its responsible process, so the one
+    // grant the person gave "aiDesk.to by IM.codes.app" is the grant the helper
+    // runs under. `execv` replaced this image with the helper's, whose own
+    // signing identity then became the responsible code: on a real Mac the
+    // in-bundle worker reported screen recording and accessibility as denied
+    // while this app held both, and every helper would have needed its own
+    // grant under its own name.
+    pid_t child = -1;
+    if (::posix_spawn(&child, path.c_str(), nullptr, nullptr, forwarded.data(), environ) != 0)
+      return false;
+    g_forward_signal_child = child;
+    ::signal(SIGTERM, ForwardSignalToHelper);
+    ::signal(SIGINT, ForwardSignalToHelper);
+    ::signal(SIGHUP, ForwardSignalToHelper);
+    int status = 0;
+    for (;;) {
+      const pid_t reaped = ::waitpid(child, &status, 0);
+      if (reaped == child) break;
+      if (reaped < 0 && errno != EINTR) {
+        ::_exit(EX_OSERR);
+      }
+    }
+    // The helper's outcome IS this process's outcome: callers read the exit
+    // status (LaunchServices wait, launchd KeepAlive) exactly as before.
+    ::_exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
   }
 }
 

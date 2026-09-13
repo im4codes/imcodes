@@ -425,6 +425,46 @@ bool TestSoftwareFallbackDefaultsOnAndQualified() {
   return true;
 }
 
+bool TestLowBitrateTargetKeepsEncoderRunning() {
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend* fake = backend.get();
+  encoder::VideoToolboxH264Encoder adapter(std::move(backend));
+  if (!Check(adapter.Configure(Configuration(1920, 1080),
+                               [](common::H264AccessUnit) {}),
+             "initial quality should configure")) {
+    return false;
+  }
+  const auto initial = adapter.Configuration();
+  // Congestion control on a fresh path reports tens of kbps. That used to stop
+  // the running session and then fail validation, leaving no encoder at all.
+  if (!Check(initial.has_value() &&
+                 adapter.ReconfigureFromQualitySelection(
+                     {.id = "estimate",
+                      .width = static_cast<int>(initial->encoded_pixels.width),
+                      .height = static_cast<int>(initial->encoded_pixels.height),
+                      .fps = static_cast<int>(initial->frame_rate),
+                      .bitrate_bps = 34'167}),
+             "a bitrate-only estimate is accepted") ||
+      !Check(fake->configurations.size() == 1,
+             "a bitrate-only estimate does not rebuild the session") ||
+      !Check(adapter.Encode(Frame(1920, 1080, 7680, 22), false),
+             "the encoder still encodes after a low estimate")) {
+    return false;
+  }
+  if (!Check(adapter.ReconfigureFromQualitySelection({.id = "720p15",
+                                                      .width = 1280,
+                                                      .height = 720,
+                                                      .fps = 15,
+                                                      .bitrate_bps = 44'167}),
+             "a resize with a tiny estimate is clamped, not refused")) {
+    return false;
+  }
+  const auto resized = adapter.Configuration();
+  return Check(resized.has_value() && resized->bitrate_bps >= 100'000 &&
+                   resized->encoded_pixels.width == 1280,
+               "the clamped bitrate reaches the new configuration");
+}
+
 bool TestQualityReconfigureAndAsyncFailure() {
   auto backend = std::make_unique<FakeBackend>();
   FakeBackend* fake = backend.get();
@@ -496,6 +536,7 @@ int main() {
                    TestHardwarePreferenceKeyframesAndQueueBound() &&
                    TestSoftwareFallbackRequiresQualification() &&
                    TestSoftwareFallbackDefaultsOnAndQualified() &&
+                   TestLowBitrateTargetKeepsEncoderRunning() &&
                    TestQualityReconfigureAndAsyncFailure() &&
                    TestStopIgnoresLateOutput()
                ? 0

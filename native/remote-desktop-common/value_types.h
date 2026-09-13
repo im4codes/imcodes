@@ -22,6 +22,14 @@ struct PixelSize {
   [[nodiscard]] bool IsValid() const noexcept;
 };
 
+// Whether a frame the browser presented belongs to a display: same aspect ratio
+// within one percent. The stream is routinely encoded smaller than the display
+// (bitrate ladder, relay caps), so an exact size match rejected every scaled
+// frame and input never switched on. One rule for every worker and the web
+// client (shared/remote-desktop.ts isRemoteDesktopPresentedFrameCompatible).
+[[nodiscard]] bool PresentedFrameCompatibleWithDisplay(PixelSize frame,
+                                                       PixelSize display) noexcept;
+
 struct LogicalPoint {
   double x = 0.0;
   double y = 0.0;

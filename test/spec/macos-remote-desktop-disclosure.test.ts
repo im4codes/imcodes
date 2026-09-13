@@ -41,9 +41,12 @@ describe("macOS non-requester-controlled local disclosure", () => {
   it("renders only stable aiDesk.to by IM.codes copy plus bounded participant counts", async () => {
     expect(implementation).toContain('@"aiDesk.to by IM.codes"');
     expect(implementation).toContain('@"aiDesk.to remote desktop is active"');
-    expect(implementation).toContain('@"Viewers: %u"');
-    expect(implementation).toContain('@"Controllers: %u"');
-    expect(implementation).toContain('@"Stop"');
+    expect(implementation).toContain('@"%u VIEWING  ·  %u CONTROLLING"');
+    expect(implementation).toContain('@"STOP ALL REMOTE SESSIONS"');
+    // Windows parity: a corner indicator that folds to a badge and remembers it.
+    expect(implementation).toContain('RemoteDesktopIndicatorCollapsed');
+    expect(implementation).toContain('acceptsFirstMouse');
+    expect(implementation).toContain('@"imcodes-robot-avatar.png"');
     expect(header).toContain("kMacosDisclosureMaxViewers = 64");
     expect(header).toContain("kMacosDisclosureMaxControllers = 64");
     expect(header).not.toMatch(

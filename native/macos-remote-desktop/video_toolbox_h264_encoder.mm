@@ -1201,15 +1201,37 @@ class VideoToolboxH264Encoder::Impl {
                      "common quality selection is invalid"};
       return false;
     }
-    return Configure(
-        common::EncoderConfiguration{
-            .encoded_pixels = {static_cast<std::uint32_t>(selection.width),
-                               static_cast<std::uint32_t>(selection.height)},
-            .frame_rate = static_cast<std::uint32_t>(selection.fps),
-            .bitrate_bps = selection.bitrate_bps,
-            .profile = profile,
-        },
-        std::move(sink));
+    common::EncoderConfiguration next{
+        .encoded_pixels = {static_cast<std::uint32_t>(selection.width),
+                           static_cast<std::uint32_t>(selection.height)},
+        .frame_rate = static_cast<std::uint32_t>(selection.fps),
+        // Congestion control reports whatever it currently estimates, which
+        // on a fresh or constrained path is far below what VideoToolbox
+        // accepts. Clamp rather than refuse.
+        .bitrate_bps = std::clamp(selection.bitrate_bps, kMinimumBitrateBps,
+                                  kMaximumBitrateBps),
+        .profile = profile,
+    };
+    {
+      std::lock_guard lock(mutex_);
+      // Rebuilding the compression session costs a keyframe. A target that
+      // changes only the bitrate keeps the running session; upstream's pacer
+      // already holds the send rate to the estimate.
+      if (configuration_.has_value() &&
+          configuration_->encoded_pixels.width == next.encoded_pixels.width &&
+          configuration_->encoded_pixels.height == next.encoded_pixels.height &&
+          configuration_->frame_rate == next.frame_rate) {
+        return true;
+      }
+      // Validate before Configure(): it stops the running session first, and
+      // a refused configuration would leave the stream with no encoder at all.
+      if (!IsValidConfiguration(next, limits_)) {
+        last_error_ = {VideoToolboxEncoderErrorCode::kInvalidConfiguration,
+                       "quality selection outside encoder limits"};
+        return false;
+      }
+    }
+    return Configure(next, std::move(sink));
   }
 
   void Stop() noexcept {

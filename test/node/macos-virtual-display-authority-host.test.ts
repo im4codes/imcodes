@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import {
   grantAckAccepted,
   MACOS_VIRTUAL_DISPLAY_GRANT_ACK_FRAME,
+  MACOS_VIRTUAL_DISPLAY_GRANT_ACK_TIMEOUT_MS,
 } from '../../src/node/macos-virtual-display-authority-host.js';
 
 const ROOT = resolve(__dirname, '..', '..');
@@ -275,6 +276,32 @@ describe('macOS virtual-display grant issuance', () => {
     );
     expect(predicate).toContain('line === MACOS_VIRTUAL_DISPLAY_GRANT_ACK_FRAME');
     expect(predicate).not.toMatch(/trim\(\)|split\(|indexOf\(/u);
+  });
+
+  it('waits for the grant answer longer than the agent waits for its helper', () => {
+    // Accepting a grant means spawning the helper and waiting for "ready" --
+    // up to the supervisor's ready timeout -- before replying. Both were 5 s on
+    // a real Mac: the daemon gave up first, closed the link, the agent exited,
+    // and start-up looped forever over an optional display.
+    const header = read('native/macos-remote-desktop/macos_virtual_display_supervisor.h');
+    const match = header.match(/ready_timeout_ms\s*=\s*([\d']+)/u);
+    expect(match, 'the supervisor ready timeout moved').not.toBeNull();
+    const agentReadyMs = Number(match![1]!.replaceAll("'", ''));
+    expect(MACOS_VIRTUAL_DISPLAY_GRANT_ACK_TIMEOUT_MS).toBeGreaterThan(agentReadyMs + 5_000);
+  });
+
+  it('keeps the link after an answered refusal and ends it only on silence', () => {
+    // A refusal must not take the session down: the agent reads a lost link as
+    // the daemon gone and exits with the worker. Ungranted is enough --
+    // `lease()` stays null and every display request is refused.
+    const refusal = host.slice(
+      host.indexOf('if (!grantAckAccepted(acked))'),
+      host.indexOf('entry.granted = true;'),
+    );
+    expect(refusal).toContain("if (acked === null) endLease('grant_not_acked');");
+    expect(refusal).not.toMatch(/^\s*endLease\('grant_not_acked'\);/mu);
+    // And the refusal says what the agent answered.
+    expect(refusal).toContain('GRANT_REFUSED}:${said}');
   });
 
   it('settles a pending ACK when the lease ends underneath it', () => {

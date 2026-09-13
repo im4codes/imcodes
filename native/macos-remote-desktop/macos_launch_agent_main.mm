@@ -118,15 +118,35 @@ bool WriteAll(int descriptor, std::string_view value) {
   return true;
 }
 
+// Longer than the daemon's own bound on producing the grant
+// (DEFAULT_GRAPHICAL_AUTHORITY_TIMEOUT_MS, 15 s). Between this hello and its
+// grant the daemon verifies the component set, reads readiness through the
+// signed app and prepares the IPC server -- seconds of real work. At 5 s this
+// agent gave up first, exited, was relaunched by launchd, and the relaunch was
+// taken for a different session: a loop that never let a worker start.
+constexpr int kGrantReadDeadlineMs = 20'000;
+
+std::int64_t MonotonicMs() {
+  struct timespec now = {};
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+  return static_cast<std::int64_t>(now.tv_sec) * 1000 +
+         static_cast<std::int64_t>(now.tv_nsec) / 1'000'000;
+}
+
 bool ReadOneBoundedLine(int descriptor, std::string* line) {
   line->clear();
-  const auto deadline_ms = 5'000;
-  int remaining_ms = deadline_ms;
-  while (remaining_ms > 0 && line->size() < 16 * 1024) {
+  // One deadline for the WHOLE exchange, measured, not reset per read: a peer
+  // that drip-feeds bytes cannot extend it. It was previously enforced by
+  // zeroing the remaining time after the first read, which also rejected any
+  // grant that happened to arrive in two segments.
+  const std::int64_t deadline = MonotonicMs() + kGrantReadDeadlineMs;
+  while (line->size() < 16 * 1024) {
+    const std::int64_t remaining = deadline - MonotonicMs();
+    if (remaining <= 0) return false;
     struct pollfd poll_entry = {};
     poll_entry.fd = descriptor;
     poll_entry.events = POLLIN;
-    const int ready = ::poll(&poll_entry, 1, remaining_ms);
+    const int ready = ::poll(&poll_entry, 1, static_cast<int>(remaining));
     if (ready <= 0) return false;
     char buffer[1024];
     const ssize_t count = ::recv(descriptor, buffer, sizeof(buffer), 0);
@@ -137,9 +157,6 @@ bool ReadOneBoundedLine(int descriptor, std::string* line) {
       line->push_back(buffer[index]);
       if (line->size() >= 16 * 1024) return false;
     }
-    // poll's timeout is an upper bound for the entire exchange; a peer that
-    // drip-feeds bytes cannot reset it indefinitely.
-    remaining_ms = 0;
   }
   return false;
 }

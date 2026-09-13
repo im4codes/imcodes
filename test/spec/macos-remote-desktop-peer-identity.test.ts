@@ -144,10 +144,15 @@ describe('macOS remote-desktop native peer identity', async () => {
       'SecCodeCheckValidity',
       'SecCodeCopySigningInformation',
       'SecCodeCopyDesignatedRequirement',
-      'SecRequirementCopyData',
+      // Canonical text, not compiled bytes: the embedded requirement and the
+      // same text compiled by SecRequirementCreateWithString encode one
+      // expression with differently associated `and` nodes, so a byte
+      // comparison refused every correctly signed agent.
+      'SecRequirementCopyString',
     ]) {
       expect(source).toContain(securityBoundary);
     }
+    expect(source).not.toMatch(/CFEqual\(\s*expected_requirement_data/u);
     expect(header).toContain('kMacosPeerDesignatedRequirementMaxBytes = 1024');
     expect(header).toContain('kernel socket credentials');
     expect(source).not.toMatch(/JSON|bundleIdentifierFromPeer|teamIdFromPeer/);

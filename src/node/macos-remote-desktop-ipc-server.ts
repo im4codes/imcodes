@@ -282,6 +282,9 @@ async function ensureAbsoluteDirectoryChain(path: string, mode: number): Promise
   }
 }
 
+/** Root-owned directories between the runtime root and a session: enter, never list. */
+export const MACOS_REMOTE_DESKTOP_RUNTIME_PARENT_MODE = 0o711;
+
 async function ensureRuntimeDirectory(
   runtimeRoot: string,
   runtimeDirectory: string,
@@ -297,9 +300,31 @@ async function ensureRuntimeDirectory(
   await ensureAbsoluteDirectoryChain(canonicalRoot, 0o755);
   await assertDirectory(canonicalRoot);
   let cursor = canonicalRoot;
-  for (const component of child.split(sep)) {
+  const components = child.split(sep);
+  for (const [index, component] of components.entries()) {
     cursor = join(cursor, component);
-    await ensureDirectory(cursor, MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE);
+    if (index === components.length - 1) {
+      await ensureDirectory(cursor, MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE);
+      continue;
+    }
+    // Every directory ABOVE the session directory must be traversable by the
+    // user whose worker connects through it. They were created 0700 root, so
+    // the session directory and socket were handed to the user behind a parent
+    // the user could not enter: the worker failed to connect, exited, took the
+    // agent with it, and launchd relaunched it every ten seconds. Search
+    // permission only -- the parent stays unlistable and root-owned -- and an
+    // existing 0700 parent is repaired, not just new ones created right.
+    await ensureDirectory(cursor, MACOS_REMOTE_DESKTOP_RUNTIME_PARENT_MODE);
+    const parent = await assertDirectory(cursor);
+    // Owned by root, or by this process when it is not root (tests, dev); in
+    // either case nobody else may write it.
+    if ((parent.uid !== 0 && parent.uid !== (process.geteuid?.() ?? -1))
+      || (modeOf(parent) & 0o022) !== 0) {
+      fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.UNSAFE_RUNTIME_PATH);
+    }
+    if (modeOf(parent) !== MACOS_REMOTE_DESKTOP_RUNTIME_PARENT_MODE) {
+      await chmod(cursor, MACOS_REMOTE_DESKTOP_RUNTIME_PARENT_MODE);
+    }
   }
   await chown(canonicalRuntime, owner.uid, owner.gid ?? -1);
   await chmod(canonicalRuntime, MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE);
@@ -787,7 +812,15 @@ export class MacosRemoteDesktopIpcServer {
       sessionType: session.principal.sessionType,
       launchChallenge: session.launchNonce,
     };
-    await this.write(state.socket, `${JSON.stringify(acknowledgement)}\n`);
+    // Only a graphical-bootstrap worker reads this frame. The native client
+    // waits for the acknowledgement exclusively when its launch context came
+    // through the global bootstrap (`IsGraphicalBootstrapLaunchContext`); a
+    // per-user worker goes straight to its command loop, so an unconditional
+    // acknowledgement arrived there as its first "command", failed to parse,
+    // and the worker exited -- every generation, two seconds apart.
+    if (this.options.principal) {
+      await this.write(state.socket, `${JSON.stringify(acknowledgement)}\n`);
+    }
     state.authenticated = true;
     this.candidate = null;
     this.active = state;

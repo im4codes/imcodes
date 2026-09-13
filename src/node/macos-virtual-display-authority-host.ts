@@ -46,8 +46,19 @@ import {
   type MacosVirtualDisplayProxySeams,
 } from './macos-virtual-display-proxy.js';
 
-/** Bounded wait for the agent to acknowledge the grant. */
-export const MACOS_VIRTUAL_DISPLAY_GRANT_ACK_TIMEOUT_MS = 5_000 as const;
+/**
+ * Bounded wait for the agent to answer the grant.
+ *
+ * LONGER than the agent's own wait, by design. Accepting a grant means the
+ * agent spawns the virtual-display helper and waits for it to report ready --
+ * up to `SupervisorPolicy::ready_timeout_ms` (5 s) -- and only then replies.
+ * Both were 5 s, so on a Mac whose helper never came up the daemon gave up in
+ * the same instant the agent was about to say so, closed the link, and the
+ * agent took that as the daemon going away: it stopped the worker and exited,
+ * the exit was handled as a crash, and start-up began again. Forever, and on a
+ * feature the session does not even need.
+ */
+export const MACOS_VIRTUAL_DISPLAY_GRANT_ACK_TIMEOUT_MS = 15_000 as const;
 
 /**
  * The ONE frame that acknowledges a grant.
@@ -267,9 +278,22 @@ export async function startMacosVirtualDisplayAuthorityHost(
             });
             if (live !== entry) return;                 // ended while waiting
             if (!grantAckAccepted(acked)) {
+              // What the agent said instead, bounded and reduced to printable
+              // ASCII: the reply frame carries status fields, never the grant or
+              // its challenge, and without it a refusal is undiagnosable.
+              const said = acked === null
+                ? 'timeout'
+                : acked.replace(/[^\x20-\x7e]/gu, '?').slice(0, 120);
               options.onBackgroundError?.(new Error(
-                MACOS_VIRTUAL_DISPLAY_AUTHORITY_HOST_ERROR.GRANT_REFUSED));
-              endLease('grant_not_acked');
+                `${MACOS_VIRTUAL_DISPLAY_AUTHORITY_HOST_ERROR.GRANT_REFUSED}:${said}`));
+              // An ANSWERED refusal leaves the link up and the lease ungranted:
+              // `lease()` stays null, so every display request is refused, and
+              // nothing else changes. Closing the link here is what killed the
+              // session -- the agent reads a lost link as the daemon gone and
+              // exits, taking capture and input with it over an optional
+              // display. Only silence ends the lease: an agent that never
+              // answers cannot be trusted with the next frame either.
+              if (acked === null) endLease('grant_not_acked');
               return;
             }
             entry.granted = true;

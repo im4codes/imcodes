@@ -471,6 +471,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     let workerSocket: net.Socket | null = null;
     let client: Promise<void> | null = null;
     const options = createMacosRemoteDesktopProductionDependencies({
+      sessionModel: 'global_bootstrap',
       platform: 'darwin',
       arch: 'arm64',
       runtimeRoot,
@@ -596,6 +597,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     const socketPath = join(directory, 'bootstrap.sock');
     const rollback = vi.fn(async () => undefined);
     const options = createMacosRemoteDesktopProductionDependencies({
+      sessionModel: 'global_bootstrap',
       platform: 'darwin',
       arch: 'arm64',
       storeRoot,
@@ -741,9 +743,23 @@ describe('stock macOS remote-desktop production dependency factory', () => {
     }).mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.VIEW);
   });
 
+  it('treats a locked console as usable, so the lock screen stays reachable', async () => {
+    // Locked is still this user's session and exactly when remote access is
+    // needed: the operator sees the lock screen and types the password.
+    const locked = await readyHarness(snapshot({
+      sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.LOCKED,
+    }));
+    expect(locked.readiness).toMatchObject({ screenRecording: true, accessibility: true });
+    expect(resolveMacosRemoteDesktopRuntimeProfile({
+      artifactVerified: true,
+      activeUserQualified: true,
+      ...locked.readiness,
+    }).mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.CONTROL);
+  });
+
   it('requires native lifecycle and cleanup readiness before any profile is usable', async () => {
     for (const override of [
-      { sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.LOCKED },
+      { sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.SLEEPING },
       { lifecycleObservation: false },
       { releaseInput: false },
       { stopCapture: false },
@@ -770,7 +786,6 @@ describe('stock macOS remote-desktop production dependency factory', () => {
   it('admits a profile only when every real gate holds, cleanup capability included', async () => {
     const gates = [
       ['screen recording denied', { screenRecording: false }],
-      ['session locked', { sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.LOCKED }],
       ['session sleeping', { sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.SLEEPING }],
       ['no lifecycle observation', { lifecycleObservation: false }],
       ['no release-input capability', { releaseInput: false }],
@@ -814,6 +829,38 @@ describe('stock macOS remote-desktop production dependency factory', () => {
       activeUserQualified: true,
       ...eligible.readiness,
     }).mode).toBe(MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE);
+  });
+
+  it('says WHY readiness was refused instead of returning a silent all-false profile', async () => {
+    // A locked screen produced the same all-false answer as a worker with no
+    // encoder, and not one log line -- so a Mac that needed unlocking looked
+    // like a Mac that would never work.
+    const cases = [
+      [{ sessionState: MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.SLEEPING },
+        `macos_remote_desktop_readiness_session_not_active:${MACOS_REMOTE_DESKTOP_NATIVE_SESSION_STATE.SLEEPING}`],
+      [{ activeAquaUserUids: [501, 502] }, 'macos_remote_desktop_readiness_user_mismatch'],
+      [{ stopCapture: false }, 'macos_remote_desktop_readiness_cleanup_unavailable'],
+    ] as const;
+    for (const [override, reason] of cases) {
+      const errors: unknown[] = [];
+      const verified = artifact();
+      const storeRoot = await trustedStore(verified.releaseName!);
+      const options = stockFactory({
+        platform: 'darwin',
+        arch: 'arm64',
+        storeRoot,
+        selectArtifact: vi.fn(async (_root, selector) => selector === 'current' ? verified : null),
+        resolveUserSession: async () => USER,
+        executeNativeCommand: async () => JSON.stringify(snapshot(override)),
+        onBackgroundError: (error) => errors.push(error),
+      })!;
+      await options.resolveVerifiedArtifact();
+      await options.resolveUserSession();
+      // Still fails closed...
+      expect((await options.inspectReadiness(verified, USER)).screenRecording, reason).toBe(false);
+      // ...and now names the reason.
+      expect(errors.map((error) => (error as Error).message), reason).toContain(reason);
+    }
   });
 
   it('fails closed when the native executable lacks the readiness command', async () => {

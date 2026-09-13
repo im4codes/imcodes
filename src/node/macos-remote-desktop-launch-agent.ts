@@ -118,6 +118,11 @@ export interface MacosRemoteDesktopGlobalLaunchAgentDefinition {
 
 export interface MacosRemoteDesktopGlobalLaunchAgentRollback {
   rollback(): Promise<void>;
+  /**
+   * Whether the bytes on disk differ from what was there before. Absent means
+   * unknown, and is treated as changed.
+   */
+  readonly changed?: boolean;
 }
 
 export interface MacosRemoteDesktopGlobalLaunchAgentLoadReceipt {
@@ -164,6 +169,10 @@ export interface MacosRemoteDesktopLaunchAgentSupervisorDependencies {
     definition: MacosRemoteDesktopLaunchAgentDefinition,
   ) => Promise<void>;
   lifecycleSource?: MacosRemoteDesktopLifecycleSource;
+  /** Where the agent is run from; null or absent means the component store. */
+  resolveLauncherExecutable?: (
+    artifact: VerifiedMacosRemoteDesktopArtifact,
+  ) => Promise<string | null>;
   onBackgroundError?: (error: unknown) => void;
   now?: () => number;
   maxCrashRestarts?: number;
@@ -364,9 +373,22 @@ export function buildMacosRemoteDesktopLaunchAgentDefinition(
   user: MacosUserSession,
   artifact: VerifiedMacosRemoteDesktopArtifact,
   launch: MacosRemoteDesktopIpcLaunch,
+  options: {
+    /**
+     * Run this instead of the store's agent: aiDesk.to by IM.codes.app's main
+     * executable, already proven to carry this exact set (see
+     * resolveMacosRemoteDesktopBundledLaunchAgentExecutable).
+     */
+    launcherExecutablePath?: string | null;
+  } = {},
 ): MacosRemoteDesktopLaunchAgentDefinition {
   assertMacosUserSession(user);
-  const codeIdentity = validateArtifact(artifact);
+  const verifiedIdentity = validateArtifact(artifact);
+  const codeIdentity = options.launcherExecutablePath
+    && options.launcherExecutablePath.startsWith('/')
+    && !/[\0\r\n]/u.test(options.launcherExecutablePath)
+    ? { ...verifiedIdentity, executablePath: options.launcherExecutablePath }
+    : verifiedIdentity;
   const paths = macosRemoteDesktopUserSessionPaths(user);
   if (!isSafePositiveInteger(launch.workerGeneration)
     || !LAUNCH_CHALLENGE_RE.test(launch.challenge)
@@ -542,9 +564,11 @@ export async function installMacosRemoteDesktopGlobalLaunchAgent(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  const changed = previous === null || previous.contents.toString('utf8') !== definition.plist;
   await writeRootOwnedGlobalPlist(definition.plistPath, definition.plist);
   let rolledBack = false;
   return Object.freeze({
+    changed,
     rollback: async () => {
       if (rolledBack) return;
       rolledBack = true;
@@ -581,11 +605,45 @@ function runRootLaunchctl(args: readonly string[]): Promise<void> {
  * after a first install or update.  The listener is started before this call,
  * so a KeepAlive agent cannot race a missing rendezvous.
  */
+/**
+ * Retire the machine-wide LaunchAgent in favour of the per-user one.
+ *
+ * Both definitions share one label. Leaving the global plist in
+ * /Library/LaunchAgents means launchd loads it again at the next login, and a
+ * KeepAlive agent that dials a bootstrap socket nobody serves any more
+ * restarts forever beside the per-user agent. Best-effort and idempotent:
+ * missing is the goal state.
+ */
+export async function retireMacosRemoteDesktopGlobalLaunchAgent(
+  options: {
+    resolveAquaUser?: () => Promise<MacosUserSession>;
+    runLaunchctl?: MacosRemoteDesktopGlobalLaunchctl;
+    plistPath?: string;
+  } = {},
+): Promise<boolean> {
+  const plistPath = options.plistPath ?? MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH;
+  const exists = await lstat(plistPath).then(() => true, () => false);
+  if (!exists) return false;
+  const runLaunchctl = options.runLaunchctl ?? runRootLaunchctl;
+  try {
+    const user = await (options.resolveAquaUser ?? resolveMacosUserSession)();
+    assertMacosUserSession(user);
+    await runLaunchctl(['bootout', `gui/${user.uid}/${MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.label}`])
+      .catch(() => undefined);
+  } catch {
+    // No console user: nothing is loaded from it right now.
+  }
+  await rm(plistPath, { force: true });
+  return true;
+}
+
 export async function loadMacosRemoteDesktopGlobalLaunchAgent(
   definition: MacosRemoteDesktopGlobalLaunchAgentDefinition,
   options: {
     resolveAquaUser?: () => Promise<MacosUserSession>;
     runLaunchctl?: MacosRemoteDesktopGlobalLaunchctl;
+    /** False only when the installed definition is byte-identical to the one loaded. */
+    definitionChanged?: boolean;
   } = {},
 ): Promise<MacosRemoteDesktopGlobalLaunchAgentLoadReceipt> {
   if (definition.plistPath !== MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH) {
@@ -605,6 +663,27 @@ export async function loadMacosRemoteDesktopGlobalLaunchAgent(
   const runLaunchctl = options.runLaunchctl ?? runRootLaunchctl;
   const domainTarget = `gui/${user.uid}`;
   const serviceTarget = `${domainTarget}/${definition.label}`;
+  const receipt = (): MacosRemoteDesktopGlobalLaunchAgentLoadReceipt => {
+    let unloaded = false;
+    return Object.freeze({
+      loaded: true,
+      unload: async () => {
+        if (unloaded) return;
+        unloaded = true;
+        await runLaunchctl(['bootout', serviceTarget]);
+      },
+    });
+  };
+  // Nothing to reload: the definition launchd holds is byte-identical and the
+  // service is loaded. Reloading anyway -- bootout, bootstrap, `kickstart -k` --
+  // KILLS the resident agent, and the listener is already up by now, so the
+  // agent killed is typically the one that just connected and was being
+  // served. The node then worked on a dead agent's authority while the
+  // replacement waited, on every node start.
+  if (options.definitionChanged === false) {
+    const alreadyLoaded = await runLaunchctl(['print', serviceTarget]).then(() => true, () => false);
+    if (alreadyLoaded) return receipt();
+  }
   // A previously loaded definition may still point at old artifact bytes.
   // Bootout is best-effort; bootstrap is the fail-closed load authority.
   await runLaunchctl(['bootout', serviceTarget]).catch(() => undefined);
@@ -615,15 +694,7 @@ export async function loadMacosRemoteDesktopGlobalLaunchAgent(
     await runLaunchctl(['bootout', serviceTarget]).catch(() => undefined);
     throw error;
   }
-  let unloaded = false;
-  return Object.freeze({
-    loaded: true,
-    unload: async () => {
-      if (unloaded) return;
-      unloaded = true;
-      await runLaunchctl(['bootout', serviceTarget]);
-    },
-  });
+  return receipt();
 }
 
 export function macosRemoteDesktopLaunchctlArgs(
@@ -881,6 +952,12 @@ export class MacosRemoteDesktopLaunchAgentSupervisor {
     assertMacosUserSession(user);
     if (epoch !== this.transitionEpoch || this.closed || this.suspended || this.locked) return null;
 
+    // Resolved before the launch is minted, so a slow app verification cannot
+    // hold a challenge open, and re-checked against the transition afterwards.
+    const launcherExecutablePath = await (this.dependencies.resolveLauncherExecutable?.(
+      this.dependencies.artifact,
+    ) ?? Promise.resolve(null)).catch(() => null);
+    if (epoch !== this.transitionEpoch || this.closed || this.suspended || this.locked) return null;
     const launch = this.dependencies.beginIpcLaunch();
     if (launch.workerGeneration <= this.lastWorkerGeneration) {
       fail(MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_ERROR.STALE_GENERATION);
@@ -890,6 +967,7 @@ export class MacosRemoteDesktopLaunchAgentSupervisor {
       user,
       this.dependencies.artifact,
       launch,
+      { launcherExecutablePath },
     );
     const active: ActiveLaunch = { definition, launched: false };
     this.active = active;

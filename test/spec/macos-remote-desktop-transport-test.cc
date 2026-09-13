@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "../remote-desktop-common/quality_ladder.h"
 #include "../remote-desktop-common/data_channel_constants.h"
 #include "macos_transport_session_adapter.h"
 
@@ -351,10 +352,19 @@ void RejectsOutOfRangeQuality() {
   accepted.bitrate_bps = 2'000'000;
   Check(fixture.adapter->ApplyQuality(accepted), "in-range bitrate accepted");
   Check(fixture.backend->bitrate_calls.size() == 1, "one bitrate applied");
-  const auto& applied = fixture.backend->bitrate_calls.front();
-  Check(applied.max_bps == 2'000'000, "max matches the selection");
-  Check(applied.min_bps > 0 && applied.min_bps <= applied.max_bps,
-        "min is positive and bounded by max");
+  const auto applied = fixture.backend->bitrate_calls.front();
+  Check(applied.min_bps == imcodes::rd::kMinVideoBitrateBps &&
+            applied.start_bps == imcodes::rd::kInitialTransportBitrateBps &&
+            applied.max_bps == imcodes::rd::kPerPeerVideoBitrateBps,
+        "bounds come from the fixed policy, not the current estimate");
+
+  // A falling estimate must never become the ceiling: that ratchet starved
+  // the stream to black within seconds.
+  rd::common::QualitySelection lower;
+  lower.bitrate_bps = 90'000;
+  Check(fixture.adapter->ApplyQuality(lower), "a low estimate is accepted");
+  Check(fixture.backend->bitrate_calls.size() == 1,
+        "later estimates do not re-cap the transport");
 }
 
 void ReleaseControlRequiresExactIdentity() {

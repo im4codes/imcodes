@@ -672,13 +672,23 @@ void TestLifecycleBoundaryPerformsTerminalCleanupOnce() {
   Require(fixture.session.ApplyButton({Stamp(1, revision), "primary", true}) ==
               common::InputResult::kApplied,
           "terminal fixture should hold a pointer button");
+  // Locking is NOT the end of the session: the lock screen is what a remote
+  // operator most needs to see and type into.
   fixture.monitor.Fire(common::GraphicalSessionEvent::kLocked);
+  Require(fixture.session.state() != common::SessionState::kTerminal &&
+              fixture.lifecycle.end_count == 0,
+          "lock must keep the session so the lock screen stays reachable");
+  fixture.monitor.Fire(common::GraphicalSessionEvent::kUnlocked);
+  Require(fixture.session.state() != common::SessionState::kTerminal &&
+              fixture.lifecycle.end_count == 0,
+          "unlock must continue the same session");
+  fixture.monitor.Fire(common::GraphicalSessionEvent::kSleeping);
   Require(fixture.session.state() == common::SessionState::kTerminal &&
               fixture.session.terminal_error().code ==
                   common::TerminalErrorCode::kGraphicalSessionEnded,
-          "lock must terminate the current authority generation");
+          "sleep must terminate the current authority generation");
   Require(fixture.lifecycle.end_count == 1 &&
-              fixture.lifecycle.end_reason == macos::MacosSessionEndReason::kLocked,
+              fixture.lifecycle.end_reason == macos::MacosSessionEndReason::kSleeping,
           "lifecycle cleanup must receive the exact terminal reason");
   Require(fixture.capture.stop_count >= 1 && fixture.encoder.stop_count >= 1 &&
               fixture.sender.stop_count >= 1 && fixture.input.release_all_count >= 1 &&
@@ -691,10 +701,10 @@ void TestLifecycleBoundaryPerformsTerminalCleanupOnce() {
           "common transport cleanup must revoke authority before ordered "
           "channel/transport closure and one terminal callback");
   const std::size_t event_count = fixture.events.size();
-  fixture.monitor.Fire(common::GraphicalSessionEvent::kUnlocked);
+  fixture.monitor.Fire(common::GraphicalSessionEvent::kWoke);
   fixture.session.Stop();
   Require(fixture.lifecycle.end_count == 1 && fixture.events.size() == event_count,
-          "later wake/unlock/Stop cannot revive or duplicate cleanup");
+          "later wake/Stop cannot revive or duplicate cleanup");
 }
 
 void TestReadinessAndMediaFailuresFailClosed() {

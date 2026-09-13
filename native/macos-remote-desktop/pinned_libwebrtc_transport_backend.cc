@@ -1,6 +1,8 @@
 #include "pinned_libwebrtc_transport_backend.h"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -11,7 +13,11 @@
 #include <vector>
 
 #include "../remote-desktop-common/data_channel_constants.h"
+#include "api/audio/audio_device.h"
+#include "api/audio_codecs/builtin_audio_decoder_factory.h"
+#include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/create_modular_peer_connection_factory.h"
+#include "api/enable_media.h"
 #include "api/data_channel_interface.h"
 #include "api/environment/environment.h"
 #include "api/jsep.h"
@@ -22,11 +28,16 @@
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
+#include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
+#include "rtc_base/time_utils.h"
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_encoder.h"
+#include "api/video_codecs/video_decoder.h"
+#include "api/video_codecs/video_decoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
 #include "macos_media_sender_binder.h"
+#include "modules/audio_device/include/audio_device_default.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "pinned_libwebrtc_h264_sender.h"
 #include "rtc_base/ref_counted_object.h"
@@ -125,14 +136,36 @@ class ChannelObserver final : public webrtc::DataChannelObserver {
 // so a track (and hence an encoder) can be created at all.
 class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
  public:
+  // libwebrtc creates, initialises and keeps calling a video encoder only while
+  // its send stream receives frames. A silent source meant the passthrough
+  // encoder was never instantiated, its sender never bound, and every access
+  // unit VideoToolbox produced was dropped before the wire: the peer connected,
+  // the data channels opened, and not one video byte was sent.
+  //
+  // So this source delivers placeholder frames -- one reused black buffer at
+  // the session's encode size, a few times a second. The encoder ignores their
+  // pixels; they only drive encoder setup and the Encode cadence, while the
+  // real H.264 arrives through the binder.
+  explicit ImcodesVideoTrackSource(MacosMediaSenderBinder* binder)
+      : binder_(binder), pump_([this] { Pump(); }) {}
+
+  ~ImcodesVideoTrackSource() override {
+    stop_.store(true);
+    if (pump_.joinable()) pump_.join();
+  }
+
   void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
                        const webrtc::VideoSinkWants& wants) override {
-    (void)sink;
     (void)wants;
+    if (sink == nullptr) return;
+    std::lock_guard lock(sinks_mutex_);
+    if (std::find(sinks_.begin(), sinks_.end(), sink) == sinks_.end())
+      sinks_.push_back(sink);
   }
   void RemoveSink(
       webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink) override {
-    (void)sink;
+    std::lock_guard lock(sinks_mutex_);
+    sinks_.erase(std::remove(sinks_.begin(), sinks_.end(), sink), sinks_.end());
   }
   SourceState state() const override { return kLive; }
   bool remote() const override { return false; }
@@ -160,6 +193,47 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
       override {
     (void)sink;
   }
+
+ private:
+  static constexpr std::chrono::milliseconds kPlaceholderInterval{66};
+
+  void Pump() {
+    webrtc::scoped_refptr<webrtc::I420Buffer> buffer;
+    common::PixelSize buffer_size{};
+    while (!stop_.load()) {
+      std::this_thread::sleep_for(kPlaceholderInterval);
+      if (stop_.load()) break;
+      common::PixelSize size =
+          binder_ != nullptr ? binder_->configured_pixels() : common::PixelSize{};
+      // Before the session configures an encode size there is nothing real to
+      // match; a small even-sized frame still lets the encoder come up.
+      if (!size.IsValid()) size = common::PixelSize{640, 360};
+      // Even dimensions: I420 chroma subsampling.
+      size.width &= ~1U;
+      size.height &= ~1U;
+      if (buffer == nullptr || size.width != buffer_size.width ||
+          size.height != buffer_size.height) {
+        buffer = webrtc::I420Buffer::Create(static_cast<int>(size.width),
+                                            static_cast<int>(size.height));
+        if (buffer == nullptr) continue;
+        webrtc::I420Buffer::SetBlack(buffer.get());
+        buffer_size = size;
+      }
+      const webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                           .set_video_frame_buffer(buffer)
+                                           .set_timestamp_us(webrtc::TimeMicros())
+                                           .build();
+      std::lock_guard lock(sinks_mutex_);
+      for (auto* sink : sinks_) sink->OnFrame(frame);
+    }
+  }
+
+  MacosMediaSenderBinder* binder_;
+  std::atomic<bool> stop_{false};
+  std::mutex sinks_mutex_;
+  std::vector<webrtc::VideoSinkInterface<webrtc::VideoFrame>*> sinks_;
+  // Declared last: the thread must start after every member it reads exists.
+  std::thread pump_;
 };
 
 class PassthroughH264Encoder final : public webrtc::VideoEncoder {
@@ -260,6 +334,27 @@ class PassthroughH264Encoder final : public webrtc::VideoEncoder {
   int source_height_ = 0;
   std::uint32_t last_target_bps_ = 0;
 };
+
+// The Mac only sends video; it never decodes any. The media engine still needs
+// a decoder factory, and the builtin one is not part of this SDK.
+class NoVideoDecoderFactory final : public webrtc::VideoDecoderFactory {
+ public:
+  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+    return {};
+  }
+  std::unique_ptr<webrtc::VideoDecoder> Create(
+      const webrtc::Environment& /*env*/,
+      const webrtc::SdpVideoFormat& /*format*/) override {
+    return nullptr;
+  }
+};
+
+// Remote desktop carries no audio. Without an explicit module the media engine
+// builds the Core Audio device, which opens the microphone stack -- on macOS a
+// microphone permission prompt for a product that never records.
+class SilentAudioDeviceModule
+    : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
+          webrtc::AudioDeviceModule> {};
 
 class PassthroughH264EncoderFactory final : public webrtc::VideoEncoderFactory {
  public:
@@ -483,6 +578,19 @@ class PinnedLibwebrtcTransportBackend final
     factory_dependencies.video_encoder_factory =
         std::make_unique<PassthroughH264EncoderFactory>(media_binder_,
                                                         adapter_);
+    // WITH a media engine. Without EnableMedia the factory is signaling and
+    // data only, and libwebrtc refuses any offer carrying a video section:
+    // "Not configured for media (UNSUPPORTED_OPERATION)". Every macOS session
+    // failed at its first OFFER. The Windows worker has always enabled it.
+    factory_dependencies.video_decoder_factory =
+        std::make_unique<NoVideoDecoderFactory>();
+    factory_dependencies.adm =
+        webrtc::make_ref_counted<SilentAudioDeviceModule>();
+    factory_dependencies.audio_encoder_factory =
+        webrtc::CreateBuiltinAudioEncoderFactory();
+    factory_dependencies.audio_decoder_factory =
+        webrtc::CreateBuiltinAudioDecoderFactory();
+    webrtc::EnableMedia(factory_dependencies);
     factory_ = webrtc::CreateModularPeerConnectionFactory(
         std::move(factory_dependencies));
     if (factory_ == nullptr) {
@@ -513,7 +621,7 @@ class PinnedLibwebrtcTransportBackend final
     // The track is what makes upstream instantiate an encoder and therefore
     // produce the EncodedImageCallback. Without AddTrack the passthrough
     // encoder is never created and the binder never binds.
-    auto source = webrtc::make_ref_counted<ImcodesVideoTrackSource>();
+    auto source = webrtc::make_ref_counted<ImcodesVideoTrackSource>(media_binder_);
     video_track_ = factory_->CreateVideoTrack(source, "imcodes-screen");
     if (video_track_ == nullptr) {
       CloseLocked();
@@ -531,9 +639,14 @@ class PinnedLibwebrtcTransportBackend final
     return true;
   }
 
+  // Lock discipline: `mutex_` guards only these members. It is never held
+  // across a PeerConnection or DataChannel call. Those are proxies that block
+  // until the signaling thread runs them, and the signaling thread takes
+  // `mutex_` itself in OnDataChannel -- holding it across a proxy call
+  // deadlocks the worker.
   bool AddRemoteIceCandidate(const common::IceCandidate& candidate) override {
-    std::lock_guard lock(mutex_);
-    if (peer_ == nullptr)
+    const auto peer = CurrentPeer();
+    if (peer == nullptr)
       return false;
     webrtc::SdpParseError parse_error;
     std::unique_ptr<webrtc::IceCandidateInterface> parsed(
@@ -541,7 +654,12 @@ class PinnedLibwebrtcTransportBackend final
                                    &parse_error));
     if (parsed == nullptr)
       return false;
-    return peer_->AddIceCandidate(parsed.get());
+    // One candidate the peer cannot use (an address family it has no route
+    // for, a stale generation) is not a transport failure. Browsers skip such
+    // candidates and connect on the others; ending the session here would turn
+    // any single unusable address into a dead route.
+    (void)peer->AddIceCandidate(parsed.get());
+    return true;
   }
 
   // Local candidates are produced by upstream ICE and surfaced through
@@ -555,43 +673,55 @@ class PinnedLibwebrtcTransportBackend final
 
   bool SendDataChannel(common::DataChannelKind channel,
                        std::string_view payload) override {
-    std::lock_guard lock(mutex_);
-    if (peer_ == nullptr || payload.empty() ||
-        payload.size() > imcodes::rd::kMaxDataMessageBytes) {
+    if (payload.empty() || payload.size() > imcodes::rd::kMaxDataMessageBytes)
+      return false;
+    webrtc::scoped_refptr<webrtc::DataChannelInterface> handle;
+    {
+      std::lock_guard lock(mutex_);
+      if (peer_ == nullptr)
+        return false;
+      for (const auto& entry : channels_) {
+        if (entry.kind == channel && entry.handle != nullptr) {
+          handle = entry.handle;
+          break;
+        }
+      }
+    }
+    if (handle == nullptr ||
+        handle->state() != webrtc::DataChannelInterface::kOpen ||
+        handle->buffered_amount() > 256 * 1024) {
       return false;
     }
-    for (const auto& entry : channels_) {
-      if (entry.kind != channel || entry.handle == nullptr ||
-          entry.handle->state() != webrtc::DataChannelInterface::kOpen ||
-          entry.handle->buffered_amount() > 256 * 1024) {
-        continue;
-      }
-      return entry.handle->Send(webrtc::DataBuffer(std::string(payload)));
-    }
-    return false;
+    return handle->Send(webrtc::DataBuffer(std::string(payload)));
   }
 
   bool ApplyBitrate(std::uint32_t min_bps,
                     std::uint32_t start_bps,
                     std::uint32_t max_bps) override {
-    std::lock_guard lock(mutex_);
-    if (peer_ == nullptr)
+    const auto peer = CurrentPeer();
+    if (peer == nullptr)
       return false;
     webrtc::BitrateSettings settings;
     settings.min_bitrate_bps = static_cast<int>(min_bps);
     settings.start_bitrate_bps = static_cast<int>(start_bps);
     settings.max_bitrate_bps = static_cast<int>(max_bps);
-    return peer_->SetBitrate(settings).ok();
+    return peer->SetBitrate(settings).ok();
   }
 
   void CloseDataChannel(common::DataChannelKind channel) noexcept override {
-    std::lock_guard lock(mutex_);
-    for (auto& entry : channels_) {
-      if (entry.kind != channel || entry.handle == nullptr)
-        continue;
-      entry.handle->UnregisterObserver();
-      entry.handle->Close();
-      entry.handle = nullptr;
+    std::vector<webrtc::scoped_refptr<webrtc::DataChannelInterface>> handles;
+    {
+      std::lock_guard lock(mutex_);
+      for (auto& entry : channels_) {
+        if (entry.kind != channel || entry.handle == nullptr)
+          continue;
+        handles.push_back(std::move(entry.handle));
+        entry.handle = nullptr;
+      }
+    }
+    for (auto& handle : handles) {
+      handle->UnregisterObserver();
+      handle->Close();
     }
   }
 
@@ -648,11 +778,13 @@ class PinnedLibwebrtcTransportBackend final
 
   void Close() noexcept override {
     std::shared_ptr<NegotiationState> pending;
+    ClosedResources closed;
     {
       std::lock_guard lock(mutex_);
       pending = negotiation_;
-      CloseLocked();
+      closed = TakeResourcesLocked();
     }
+    closed.Release();
     // Released outside the backend lock: the waiter wakes, observes
     // cancellation and returns false rather than blocking until the timeout.
     if (pending != nullptr)
@@ -744,6 +876,56 @@ class PinnedLibwebrtcTransportBackend final
     webrtc::scoped_refptr<webrtc::DataChannelInterface> handle;
     std::unique_ptr<ChannelObserver> observer;
   };
+
+  // Everything Close() tears down, detached from the backend under the lock so
+  // the blocking upstream calls run without it.
+  struct ClosedResources {
+    std::vector<ChannelEntry> channels;
+    webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track;
+    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+    webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
+    std::unique_ptr<webrtc::Thread> signaling_thread;
+
+    void Release() noexcept {
+      for (auto& entry : channels) {
+        if (entry.handle == nullptr)
+          continue;
+        entry.handle->UnregisterObserver();
+        entry.handle->Close();
+        entry.handle = nullptr;
+      }
+      channels.clear();
+      video_track = nullptr;
+      if (peer != nullptr) {
+        peer->Close();
+        peer = nullptr;
+      }
+      factory = nullptr;
+      if (signaling_thread != nullptr) {
+        signaling_thread->Stop();
+        signaling_thread.reset();
+      }
+    }
+  };
+
+  ClosedResources TakeResourcesLocked() noexcept {
+    ClosedResources closed;
+    closed.channels = std::move(channels_);
+    channels_.clear();
+    closed.video_track = std::move(video_track_);
+    closed.peer = std::move(peer_);
+    closed.factory = std::move(factory_);
+    closed.signaling_thread = std::move(signaling_thread_);
+    video_track_ = nullptr;
+    peer_ = nullptr;
+    factory_ = nullptr;
+    return closed;
+  }
+
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> CurrentPeer() {
+    std::lock_guard lock(mutex_);
+    return peer_;
+  }
 
   void CloseLocked() noexcept {
     for (auto& entry : channels_) {

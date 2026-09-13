@@ -18,6 +18,7 @@ import {
 import {
   MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT,
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
+  MACOS_REMOTE_DESKTOP_WORKER_IDENTITY,
   macosRemoteDesktopGraphicalSessionPaths,
   macosRemoteDesktopUserSessionPaths,
 } from './macos-user-session.js';
@@ -61,7 +62,9 @@ const APPLE_TEAM_ID_RE = /^[A-Z0-9]{10}$/;
 const MAX_DESIGNATED_REQUIREMENT_BYTES = 1024;
 
 export interface MacosRemoteDesktopExpectedCodeIdentity {
-  bundleIdentifier: typeof MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier;
+  bundleIdentifier:
+    | typeof MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier
+    | typeof MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier;
   teamId: string;
   designatedRequirement: string;
 }
@@ -190,6 +193,14 @@ interface MacosRemoteDesktopIpcHostCommonOptions {
   expectedCodeIdentity: MacosRemoteDesktopExpectedCodeIdentity;
   runtimeRoot?: string;
   randomChallenge?: () => Buffer;
+  /**
+   * The highest worker generation any EARLIER authority for this daemon issued.
+   * Generations are the replay guard the long-lived bootstrap ledger enforces,
+   * so they must keep rising across authorities: each session generation builds
+   * a new authority, and one starting again at 1 had every grant refused as
+   * stale by a listener that correctly outlived it.
+   */
+  workerGenerationFloor?: number;
 }
 
 /**
@@ -274,7 +285,8 @@ function validateExpectedCodeIdentity(value: MacosRemoteDesktopExpectedCodeIdent
   const canonicalRequirement = appleDesignatedRequirement(
     value.bundleIdentifier, value.teamId,
   );
-  if (value.bundleIdentifier !== MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier
+  if ((value.bundleIdentifier !== MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier
+      && value.bundleIdentifier !== MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier)
     || !APPLE_TEAM_ID_RE.test(value.teamId)
     || canonicalRequirement.length > MAX_DESIGNATED_REQUIREMENT_BYTES
     || value.designatedRequirement !== canonicalRequirement) {
@@ -439,6 +451,12 @@ export class MacosRemoteDesktopIpcAuthorityHost {
       this.principalSource = options.user;
     }
     validateExpectedCodeIdentity(options.expectedCodeIdentity);
+    if (options.workerGenerationFloor !== undefined) {
+      if (!Number.isSafeInteger(options.workerGenerationFloor) || options.workerGenerationFloor < 0) {
+        fail('macos_remote_desktop_ipc_invalid_generation_floor');
+      }
+      this.workerGeneration = options.workerGenerationFloor;
+    }
     this.randomChallenge = options.randomChallenge ?? (() => randomBytes(CHALLENGE_BYTES));
   }
 
@@ -485,7 +503,15 @@ export class MacosRemoteDesktopIpcAuthorityHost {
       || (this.expectedPrincipal !== null
         && (actualPrincipal.uid !== this.expectedPrincipal.uid
           || actualPrincipal.auditSessionId !== this.expectedPrincipal.auditSessionId
-          || actualPrincipal.pidVersion !== this.expectedPrincipal.pidVersion
+          // The expected principal is the resident AGENT that was granted the
+          // launch; the peer here is the worker it spawned -- same user, same
+          // audit session, a different process. Pinning the agent's pid
+          // generation rejected every worker. What ties this worker to that
+          // grant is the one-time launch challenge checked below, which only
+          // the granted agent received and handed to its child.
+          || (this.options.expectedCodeIdentity.bundleIdentifier
+            !== MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier
+            && actualPrincipal.pidVersion !== this.expectedPrincipal.pidVersion)
           || actualPrincipal.kind !== this.expectedPrincipal.kind
           || actualPrincipal.sessionType !== this.expectedPrincipal.sessionType))
       || (this.expectedPrincipal === null
@@ -537,7 +563,8 @@ export class MacosRemoteDesktopIpcAuthorityHost {
         || command.routeGeneration !== route.routeGeneration
         || command.leaseExpiresAt <= now
         || command.leaseExpiresAt > route.expiresAt
-        || command.leaseExpiresAt - now > REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS) {
+        || command.leaseExpiresAt - now
+          > REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS) {
         fail('macos_remote_desktop_ipc_route_authority_rejected');
       }
       route.leaseExpiresAt = command.leaseExpiresAt;
@@ -629,8 +656,12 @@ export class MacosRemoteDesktopIpcAuthorityHost {
   private authorizeRoute(command: RemoteDesktopPrepare, now: number): void {
     if (command.expiresAt <= now
       || command.leaseExpiresAt <= now
-      || command.expiresAt - now > REMOTE_DESKTOP_LIMITS.ABSOLUTE_LIFETIME_MS
-      || command.leaseExpiresAt - now > REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS
+      // Server-stamped deadlines against this host's clock: allow it to trail
+      // the Server by up to CLOCK_SKEW_TOLERANCE_MS (see the limit).
+      || command.expiresAt - now
+        > REMOTE_DESKTOP_LIMITS.ABSOLUTE_LIFETIME_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS
+      || command.leaseExpiresAt - now
+        > REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS
       || command.routeGeneration === undefined
       || this.routes.has(command.sessionId)) {
       fail('macos_remote_desktop_ipc_route_authority_rejected');

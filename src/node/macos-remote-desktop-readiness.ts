@@ -2,6 +2,7 @@ import {
   REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
   REMOTE_DESKTOP_INPUT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
   type RemoteDesktopAdapterCapability,
 } from '../../shared/remote-desktop-access.js';
 import {
@@ -104,6 +105,12 @@ export function resolveMacosRemoteDesktopRuntimeProfile(
     REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
     REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
     ...(control ? [REMOTE_DESKTOP_INPUT_CAPABILITY] : []),
+    // The session survives the screen locking (the worker no longer ends it on
+    // lock, and a locked console is accepted as ready), so with control the
+    // operator can see the lock screen and type the password -- the same thing
+    // UU Remote and RustDesk offer. View-only cannot unlock anything, so the
+    // claim rides on control.
+    ...(control ? [REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY] : []),
   ]);
   if (resolveRemoteDesktopSessionProfile([
     ...sessionCapabilities,

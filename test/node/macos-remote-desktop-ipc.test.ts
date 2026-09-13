@@ -466,12 +466,35 @@ describe('macOS remote-desktop authenticated local IPC contract', () => {
     ), NOW)).toThrow('macos_remote_desktop_ipc_invalid_host_frame');
   });
 
+  it('accepts Server deadlines when this host clock trails the Server by a little', () => {
+    // The Server stamps a renewal as exactly its own now + LEASE_DURATION_MS.
+    // A Mac 400 ms behind it saw 60 400 ms and rejected every first renewal,
+    // killing each session 15 s after it connected.
+    const skew = 400;
+    const { authority, launch, session } = authenticate();
+    expect(() => authority.acceptHostFrame(session, hostCommand(launch, prepare({
+      expiresAt: NOW + REMOTE_DESKTOP_LIMITS.ABSOLUTE_LIFETIME_MS + skew,
+      leaseExpiresAt: NOW + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + skew,
+    })), NOW)).not.toThrow();
+    expect(() => authority.acceptHostFrame(session, hostCommand(launch, {
+      type: REMOTE_DESKTOP_MSG.LEASE,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      leaseExpiresAt: NOW + 15_000 + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + skew,
+      daemonGeneration: 7,
+      routeGeneration: 11,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 3,
+    }), NOW + 15_000)).not.toThrow();
+  });
+
   it('rejects expired, overlong and generation-mismatched route grants and leases', () => {
     for (const invalid of [
       prepare({ expiresAt: NOW, leaseExpiresAt: NOW }),
       prepare({ leaseExpiresAt: NOW }),
-      prepare({ expiresAt: NOW + REMOTE_DESKTOP_LIMITS.ABSOLUTE_LIFETIME_MS + 1 }),
-      prepare({ leaseExpiresAt: NOW + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + 1 }),
+      prepare({ expiresAt: NOW + REMOTE_DESKTOP_LIMITS.ABSOLUTE_LIFETIME_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS + 1 }),
+      prepare({ leaseExpiresAt: NOW + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS + 1 }),
       prepare({ routeGeneration: undefined }),
     ]) {
       const { authority, launch, session } = authenticate();

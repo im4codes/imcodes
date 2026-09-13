@@ -10,6 +10,17 @@ export const MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY = Object.freeze({
   label: 'cc.imcodes.node.remote-desktop-agent',
 } as const);
 
+/**
+ * The process that actually dials the per-session IPC socket. The resident
+ * launch agent spawns the worker and stays alive to supervise it, so the peer
+ * on that socket is the WORKER, with its own signing identity -- never the
+ * agent. Must match `components.worker.bundleIdentifier` in
+ * native/macos-remote-desktop/code-identity.json.
+ */
+export const MACOS_REMOTE_DESKTOP_WORKER_IDENTITY = Object.freeze({
+  bundleIdentifier: 'cc.imcodes.node.remote-desktop-worker',
+} as const);
+
 export const MACOS_REMOTE_DESKTOP_RUNTIME_ROOT = '/private/var/run/imcodes-node/user-sessions';
 export const MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT =
   '/private/var/run/imcodes-node/graphical-sessions';

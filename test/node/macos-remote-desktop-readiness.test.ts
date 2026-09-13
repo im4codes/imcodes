@@ -117,10 +117,13 @@ describe('macOS remote-desktop runtime readiness', () => {
     );
   });
 
-  it('never synthesizes unsupported first-release capabilities', () => {
+  it('advertises lock-screen control with control, and nothing else unsupported', () => {
     const profile = resolveMacosRemoteDesktopRuntimeProfile(READY);
     const advertised = [...profile.sessionCapabilities, ...profile.adapterCapabilities];
-    expect(advertised).not.toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
+    // The session survives the screen locking, so control reaches the lock
+    // screen; view-only is checked below and never claims it.
+    expect(advertised).toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
+    expect(resolveRemoteDesktopSessionProfile(advertised)).toMatchObject({ lockScreen: true });
     expect(advertised).not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
     expect(advertised).not.toContain(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
     expect(advertised).not.toContain(REMOTE_DESKTOP_PLATFORM_CAPABILITY.WINDOWS);
@@ -140,11 +143,11 @@ describe('macOS remote-desktop runtime readiness', () => {
       ...partialLocalEvidence.adapterCapabilities,
     ];
     expect(advertised).not.toContain(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
-    expect(advertised).not.toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
+    // Lock screen comes from control, not from this probe evidence.
     expect(resolveRemoteDesktopSessionProfile(advertised)).toMatchObject({
       platform: 'macos',
       displayControl: false,
-      lockScreen: false,
+      lockScreen: true,
     });
 
     const viewOnly = resolveMacosRemoteDesktopRuntimeProfile({

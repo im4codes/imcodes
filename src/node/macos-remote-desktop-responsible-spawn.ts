@@ -11,9 +11,13 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import type { VerifiedMacosRemoteDesktopComponent } from './macos-remote-desktop-artifact.js';
+import type {
+  VerifiedMacosRemoteDesktopArtifact,
+  VerifiedMacosRemoteDesktopComponent,
+} from './macos-remote-desktop-artifact.js';
 import {
   MACOS_AIDESK_APP_NAME,
+  MACOS_AIDESK_EXECUTABLE,
   MACOS_AIDESK_BUNDLE_ID,
   MACOS_AIDESK_TEAM_ID,
 } from './macos-computer-use.js';
@@ -49,6 +53,13 @@ export interface MacosRemoteDesktopResponsibleCommandOptions {
   appPath?: string;
   timeoutMs: number;
   maxBufferBytes: number;
+  /**
+   * Start the helper and return once LaunchServices has launched it, without
+   * waiting for it to exit. For commands that are MEANT to outlive the call --
+   * the permission request stays up while the person works in System Settings
+   * -- waiting could only end in a timeout that abandons the process anyway.
+   */
+  detached?: boolean;
 }
 
 export interface MacosRemoteDesktopResponsibleSpawnDependencies {
@@ -116,6 +127,49 @@ async function verifyResponsibleApplication(
   if (component.kind !== 'worker') {
     throw new Error('macos_remote_desktop_responsible_component_mismatch');
   }
+  return await verifyApplicationHelpers(appPath, [component], executeFile);
+}
+
+/**
+ * The executable a per-user LaunchAgent should run so that every process of the
+ * session belongs to aiDesk.to by IM.codes.app -- or null when that app cannot
+ * vouch for this exact component set.
+ *
+ * launchd starts the app's main executable; it execs the agent in
+ * Contents/Helpers, which spawns the worker and disclosure beside it. All three
+ * are therefore inside the one signed bundle the person granted Screen
+ * Recording and Accessibility to, instead of each binary in the component store
+ * asking for its own grant under its own name. Every helper that will run must
+ * be byte-identical to the verified set, and the bundle must carry aiDesk's
+ * signature; anything short of that falls back to the store, never to an
+ * unverified copy.
+ */
+export async function resolveMacosRemoteDesktopBundledLaunchAgentExecutable(
+  artifact: VerifiedMacosRemoteDesktopArtifact,
+  options: {
+    appPath?: string;
+    executeFile?: typeof execFileText;
+  } = {},
+): Promise<string | null> {
+  try {
+    const canonicalAppPath = await verifyApplicationHelpers(
+      options.appPath ?? MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH,
+      [artifact.components.launchAgent, artifact.components.worker, artifact.components.disclosure],
+      options.executeFile ?? execFileText,
+    );
+    const executable = join(canonicalAppPath, 'Contents', 'MacOS', MACOS_AIDESK_EXECUTABLE);
+    await requireUnlinkedRegularFile(executable, 'macos_remote_desktop_responsible_app_unavailable');
+    return executable;
+  } catch {
+    return null;
+  }
+}
+
+async function verifyApplicationHelpers(
+  appPath: string,
+  components: readonly VerifiedMacosRemoteDesktopComponent[],
+  executeFile: typeof execFileText,
+): Promise<string> {
   const requestedAppPath = resolve(appPath);
   await requireUnlinkedDirectory(
     requestedAppPath,
@@ -127,18 +181,22 @@ async function verifyResponsibleApplication(
   // bundle path.
   const canonicalAppPath = await realpath(requestedAppPath);
 
-  const helperPath = join(canonicalAppPath, 'Contents', 'Helpers', component.fileName);
-  await requireUnlinkedRegularFile(
-    helperPath,
-    'macos_remote_desktop_responsible_helper_unavailable',
-  );
-  const resolvedHelperPath = await realpath(helperPath);
-  if (!isInside(`${canonicalAppPath}/Contents/Helpers`, resolvedHelperPath)
-    || resolvedHelperPath !== helperPath) {
-    throw new Error('macos_remote_desktop_responsible_helper_replaced');
-  }
-  if (await sha256File(helperPath) !== component.sha256) {
-    throw new Error('macos_remote_desktop_responsible_helper_hash_mismatch');
+  const helperPaths: string[] = [];
+  for (const component of components) {
+    const helperPath = join(canonicalAppPath, 'Contents', 'Helpers', component.fileName);
+    await requireUnlinkedRegularFile(
+      helperPath,
+      'macos_remote_desktop_responsible_helper_unavailable',
+    );
+    const resolvedHelperPath = await realpath(helperPath);
+    if (!isInside(`${canonicalAppPath}/Contents/Helpers`, resolvedHelperPath)
+      || resolvedHelperPath !== helperPath) {
+      throw new Error('macos_remote_desktop_responsible_helper_replaced');
+    }
+    if (await sha256File(helperPath) !== component.sha256) {
+      throw new Error('macos_remote_desktop_responsible_helper_hash_mismatch');
+    }
+    helperPaths.push(helperPath);
   }
 
   const signatureOptions = { timeoutMs: 15_000, maxBufferBytes: 16 * 1024 };
@@ -151,14 +209,16 @@ async function verifyResponsibleApplication(
   ], signatureOptions).catch(() => {
     throw new Error('macos_remote_desktop_responsible_app_identity_mismatch');
   });
-  await executeFile(MACOS_CODESIGN_PATH, [
-    '--verify',
-    '--strict',
-    `-R=${component.designatedRequirement}`,
-    helperPath,
-  ], signatureOptions).catch(() => {
-    throw new Error('macos_remote_desktop_responsible_helper_identity_mismatch');
-  });
+  for (const [index, component] of components.entries()) {
+    await executeFile(MACOS_CODESIGN_PATH, [
+      '--verify',
+      '--strict',
+      `-R=${component.designatedRequirement}`,
+      helperPaths[index]!,
+    ], signatureOptions).catch(() => {
+      throw new Error('macos_remote_desktop_responsible_helper_identity_mismatch');
+    });
+  }
   return canonicalAppPath;
 }
 
@@ -180,6 +240,7 @@ export function macosRemoteDesktopResponsibleCommandInvocation(
   appPath: string,
   args: readonly string[],
   output: Pick<CommandOutputPaths, 'stdout' | 'stderr'>,
+  options: { detached?: boolean } = {},
 ): Readonly<{
   executable: typeof MACOS_LAUNCHCTL_PATH;
   args: readonly string[];
@@ -190,13 +251,12 @@ export function macosRemoteDesktopResponsibleCommandInvocation(
     args: Object.freeze(macosUserSessionLaunchctlArgs(user, {
       executable: MACOS_OPEN_PATH,
       args: [
-        '-W',
+        // Detached launches get no output files: the caller does not read them,
+        // and removing them while the helper still holds them open is a race.
+        ...(options.detached ? [] : ['-W']),
         '-n',
         '-g',
-        '--stdout',
-        output.stdout,
-        '--stderr',
-        output.stderr,
+        ...(options.detached ? [] : ['--stdout', output.stdout, '--stderr', output.stderr]),
         '--env',
         `HOME=${user.home}`,
         '--env',
@@ -227,12 +287,14 @@ export async function executeMacosRemoteDesktopResponsibleCommand(
       appPath,
       options.args,
       output,
+      { detached: options.detached === true },
     );
     await executeFile(invocation.executable, invocation.args, {
       env: invocation.env,
       timeoutMs: options.timeoutMs,
       maxBufferBytes: options.maxBufferBytes,
     });
+    if (options.detached) return { stdout: '', stderr: '' };
     const [stdout, stderr] = await Promise.all([
       readFile(output.stdout, 'utf8'),
       readFile(output.stderr, 'utf8'),

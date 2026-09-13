@@ -73,6 +73,49 @@ describe('macOS remote-desktop install wiring', () => {
     await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
   });
 
+  it('never reinstalls a release that is already installed, and starts it again instead', async () => {
+    // On a real Mac the components were installed and simply not running --
+    // the screen was locked when the node started. The node re-downloaded the
+    // release every retry window and flipped the store's selector back each
+    // time, while nothing ever ran start-up again once the screen was unlocked.
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    const installed = vi.fn(async () => true);
+    let now = 1_000_000;
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      now: () => now,
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopComponentsInstalled: installed,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(installed).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    // A second press 30 s later is still a start, never a download.
+    now += 31_000;
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(installed).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    expect(install).not.toHaveBeenCalled();
+  });
+
+  it('installs when the store holds no set for this release', async () => {
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopComponentsInstalled: async () => false,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
   it('refuses a request carrying caller-controlled fields', async () => {
     // The request has no parameters by design. Accepting extra keys would make
     // this a generic "fetch and run something" endpoint reachable from a

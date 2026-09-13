@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "../remote-desktop-common/quality_ladder.h"
+
 #include "../remote-desktop-common/data_channel_constants.h"
 
 namespace imcodes::remote_desktop::macos {
@@ -161,12 +163,20 @@ bool MacosTransportSessionAdapter::ApplyQuality(
       selection.bitrate_bps > common::kTransportMaximumQualityTargetBps) {
     return false;
   }
-  // Upstream congestion control owns the actual send rate. This only moves the
-  // bounds it is allowed to operate between.
-  const std::uint32_t maximum = selection.bitrate_bps;
-  const std::uint32_t start = maximum;
-  const std::uint32_t minimum = maximum / 8 == 0 ? 1 : maximum / 8;
-  return backend_->ApplyBitrate(minimum, start, maximum);
+  // Upstream congestion control owns the actual send rate; the bounds it runs
+  // between are a fixed policy, set once, exactly as on Windows. Feeding the
+  // current estimate back in as the ceiling is a ratchet: every lower estimate
+  // becomes the new maximum, the estimate can only fall further, and the
+  // stream starves to a black picture within seconds.
+  if (bitrate_policy_applied_)
+    return true;
+  if (!backend_->ApplyBitrate(imcodes::rd::kMinVideoBitrateBps,
+                              imcodes::rd::kInitialTransportBitrateBps,
+                              imcodes::rd::kPerPeerVideoBitrateBps)) {
+    return false;
+  }
+  bitrate_policy_applied_ = true;
+  return true;
 }
 
 void MacosTransportSessionAdapter::ReleaseControlAuthority(

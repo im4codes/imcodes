@@ -2,6 +2,7 @@
 
 #import <dispatch/dispatch.h>
 
+#include <atomic>
 #include <algorithm>
 #include <limits>
 #include <mutex>
@@ -733,6 +734,24 @@ class MacosRemoteDesktopSession::Impl final
     return true;
   }
 
+  // The worker's periodic sample: this session's own captured-frame count and
+  // the bytes upstream accepted, stamped with the live route.
+  bool RecordMediaProgress(std::uint64_t outbound_video_bytes,
+                           common::TransportTime now) {
+    common::TransportCallbackStamp stamp;
+    {
+      std::lock_guard lock(mutex_);
+      const common::RouteAuthority* authority = transport_core_.authority();
+      if (authority == nullptr)
+        return false;
+      stamp.daemon_generation = authority->identity.daemon_generation;
+      stamp.route_generation = authority->identity.route_generation;
+    }
+    return RecordTransportMediaProgress(
+        stamp, captured_frames_.load(std::memory_order_relaxed),
+        outbound_video_bytes, now);
+  }
+
   bool RecordTransportMediaProgress(const common::TransportCallbackStamp& stamp,
                                     std::uint64_t source_frames,
                                     std::uint64_t outbound_video_bytes,
@@ -1102,6 +1121,7 @@ class MacosRemoteDesktopSession::Impl final
         !media_started_) {
       return;
     }
+    captured_frames_.fetch_add(1, std::memory_order_relaxed);
     const common::DisplayTopology* display =
         exposed_topology_.FindDisplay(selected_display_id_);
     if (display == nullptr || !frame.IsValid() ||
@@ -1149,9 +1169,11 @@ class MacosRemoteDesktopSession::Impl final
     EmitLocked(MacosRemoteDesktopSessionEventType::kLifecycleBoundary, event);
     switch (event) {
       case GraphicalSessionEvent::kLocked:
-        TerminateLocked(Error(TerminalErrorCode::kGraphicalSessionEnded,
-                              "graphical session locked"),
-                        MacosSessionEndReason::kLocked);
+        // A locked screen is still this user's session, and it is exactly when
+        // remote access matters most: the person needs to see the lock screen
+        // and type the password. Ending the session here made a Mac unreachable
+        // the moment it locked. The boundary above is still emitted so the host
+        // knows; sleep, a user switch and the session ending stay terminal.
         break;
       case GraphicalSessionEvent::kUserChanged:
         TerminateLocked(Error(TerminalErrorCode::kGraphicalSessionEnded,
@@ -1171,7 +1193,8 @@ class MacosRemoteDesktopSession::Impl final
       case GraphicalSessionEvent::kReady:
       case GraphicalSessionEvent::kUnlocked:
       case GraphicalSessionEvent::kWoke:
-        // A terminal authority generation is never revived by a later event.
+        // Nothing to do: an unlock continues the same session, and a terminal
+        // authority generation is never revived by a later event.
         break;
     }
   }
@@ -1206,11 +1229,19 @@ class MacosRemoteDesktopSession::Impl final
   }
 
   bool ApplyQuality(const common::QualitySelection& selection) override {
-    if (dependencies_.transport == nullptr ||
-        (dependencies_.apply_quality &&
-         !dependencies_.apply_quality(selection)))
+    if (dependencies_.transport == nullptr)
       return false;
-    return dependencies_.transport->ApplyQuality(selection);
+    // A quality target is congestion-control advice. If the encoder cannot
+    // take it right now -- libwebrtc issues its first rate update before
+    // capture has started VideoToolbox -- the stream keeps its current
+    // settings and the next target tries again. Ending a working session over
+    // advice would be worse than a stale bitrate.
+    if (dependencies_.apply_quality)
+      (void)dependencies_.apply_quality(selection);
+    // Same for the send-rate bounds: congestion control keeps running on the
+    // previous ones.
+    (void)dependencies_.transport->ApplyQuality(selection);
+    return true;
   }
 
   void ReleaseControlAuthority(const common::RouteAuthorityIdentity& identity,
@@ -1350,6 +1381,7 @@ class MacosRemoteDesktopSession::Impl final
   bool generation_begun_ = false;
   bool media_started_ = false;
   bool terminating_locally_ = false;
+  std::atomic<std::uint64_t> captured_frames_{0};
   bool cleaned_ = false;
 };
 
@@ -1634,6 +1666,12 @@ bool MacosRemoteDesktopSession::UpdateTransportQuality(
     const common::TransportCallbackStamp& stamp,
     const common::QualityTarget& target) {
   return impl_->UpdateTransportQuality(stamp, target);
+}
+
+bool MacosRemoteDesktopSession::RecordMediaProgress(
+    std::uint64_t outbound_video_bytes,
+    common::TransportTime now) {
+  return impl_->RecordMediaProgress(outbound_video_bytes, now);
 }
 
 bool MacosRemoteDesktopSession::RecordTransportMediaProgress(
