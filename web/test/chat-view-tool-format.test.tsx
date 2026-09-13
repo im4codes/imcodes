@@ -682,7 +682,7 @@ describe('ChatView tool payload formatting', () => {
       expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-cn-ppt', undefined, expect.any(AbortSignal));
     });
     // A chat download now shows up in the download center like the file
-    // browser's, which is where its Open file / Show in folder buttons live.
+    // browser's, which is where its Show in folder button lives.
     // Without a save picker this browser hands the file to its own download
     // manager, so the row settles as handed off.
     await waitFor(() => {

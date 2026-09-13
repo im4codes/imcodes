@@ -2231,8 +2231,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     const fileName = resolvedPath.split(/[/\\]/).pop() || undefined;
     // The save dialog must open first, inside the click that asked for it; any
     // await in front of it lets the browser refuse the picker. Choosing where
-    // the file goes is also what lets the finished row offer "Open file" and
-    // "Show in folder" — the same path the file browser downloads through.
+    // the file goes is also what lets the finished row offer "Show in folder"
+    // — the same path the file browser downloads through.
     let destination: DirectPreviewDownloadDestination | null;
     try {
       destination = await selectPreviewDownloadDestination(fileName);

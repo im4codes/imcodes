@@ -1,6 +1,5 @@
 import {
   canRevealSavedDownload,
-  openSavedDownload,
   revealSavedDownload,
   type SavedDownloadFileHandle,
 } from './download-file-actions.js';
@@ -304,31 +303,23 @@ export function completeDownloadTransfer(id: string, handedOff = false, now = Da
 
 /**
  * Attach the file a completed download was saved to, so its row can offer
- * "Open file" and "Show in folder". Only a handle the page can read back is
- * kept; anything else leaves the row without those buttons.
+ * "Show in folder". Only a handle the page can read back is kept; anything
+ * else leaves the row without the button.
  */
 export function setDownloadTransferSavedFile(id: string, handle: SavedDownloadFileHandle | null): void {
   const runtime = runtimeById.get(id);
   const item = snapshot.find((entry) => entry.id === id);
   if (!runtime || item?.status !== DOWNLOAD_TRANSFER_STATUS.COMPLETED) return;
   runtime.savedFile = handle;
-  // Republish so an already-rendered row picks up its new buttons.
+  // Republish so an already-rendered row picks up its new button.
   publish([...snapshot]);
 }
 
-export function canOpenDownloadTransfer(id: string): boolean {
-  const item = snapshot.find((entry) => entry.id === id);
-  return !!runtimeById.get(id)?.savedFile && item?.status === DOWNLOAD_TRANSFER_STATUS.COMPLETED;
-}
-
 export function canRevealDownloadTransfer(id: string): boolean {
-  return canOpenDownloadTransfer(id) && canRevealSavedDownload();
-}
-
-/** Call synchronously from the click: the new tab needs the user's gesture. */
-export function openDownloadTransfer(id: string): boolean {
-  const handle = runtimeById.get(id)?.savedFile;
-  return canOpenDownloadTransfer(id) && !!handle && openSavedDownload(handle);
+  const item = snapshot.find((entry) => entry.id === id);
+  return !!runtimeById.get(id)?.savedFile
+    && item?.status === DOWNLOAD_TRANSFER_STATUS.COMPLETED
+    && canRevealSavedDownload();
 }
 
 /** Call synchronously from the click: the file dialog needs the user's gesture. */

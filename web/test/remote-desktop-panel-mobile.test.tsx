@@ -836,7 +836,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(fileApiMocks.downloadAttachment).not.toHaveBeenCalled();
   });
 
-  it('offers Open file and Show in folder on a finished fetch saved through the picker', async () => {
+  it('offers Show in folder, and no web-address Open file, on a finished fetch saved through the picker', async () => {
     fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'open-handle-1' });
     const savedHandle = {
       createWritable: vi.fn(),
@@ -850,11 +850,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     const picker = vi.fn(async () => []);
     (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker = picker;
-    const tab = { opener: {}, location: { href: '' }, close: vi.fn() };
-    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    const open = vi.spyOn(window, 'open');
     try {
       const ws = { targetsServer: vi.fn(() => true) };
-      const { container, getByRole, findByRole } = await renderPanel(ws, [
+      const { container, getByRole, findByRole, queryByRole } = await renderPanel(ws, [
         REMOTE_DESKTOP_CAPABILITY,
         FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
         FILE_TRANSFER_DIRECTORY_CAPABILITY,
@@ -864,12 +863,12 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       act(() => { (getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement).click(); });
       await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_done'));
 
-      act(() => { (getByRole('button', { name: 'downloads.open_file' }) as HTMLButtonElement).click(); });
-      expect(open).toHaveBeenCalledWith('', '_blank');
+      expect(queryByRole('button', { name: 'downloads.open_file' })).toBeNull();
       const folder = await findByRole('button', { name: 'downloads.open_folder' });
       expect(folder.getAttribute('title')).toBe('downloads.open_folder_hint');
       act(() => { (folder as HTMLButtonElement).click(); });
       expect(picker).toHaveBeenCalledWith({ startIn: savedHandle });
+      expect(open).not.toHaveBeenCalled();
     } finally {
       delete (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker;
       open.mockRestore();

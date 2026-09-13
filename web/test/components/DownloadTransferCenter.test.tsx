@@ -113,33 +113,32 @@ describe('DownloadTransferCenter', () => {
     expect(screen.getByText('downloads.save_share')).toBeTruthy();
   });
 
-  it('offers Open file and Show in folder on a download saved to a file the page can read', () => {
+  it('offers Show in folder, and no web-address Open file, on a download saved through the picker', () => {
     const picker = vi.fn(async () => []);
     (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker = picker;
-    const tab = { opener: {}, location: { href: '' }, close: vi.fn() };
-    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    const open = vi.spyOn(window, 'open');
     try {
-      const saved = beginDownloadTransfer('report.pdf');
+      const saved = beginDownloadTransfer('build.js');
       completeDownloadTransfer(saved.id);
-      const handle = { getFile: vi.fn(async () => new File(['x'], 'report.pdf')), createWritable: vi.fn() };
+      const handle = { getFile: vi.fn(async () => new File(['x'], 'build.js')), createWritable: vi.fn() };
       setDownloadTransferSavedFile(saved.id, handle);
 
-      // Handed to the browser's download manager: nothing the page can open.
+      // Handed to the browser's download manager: nothing the page can reach.
       const handedOff = beginDownloadTransfer('elsewhere.zip');
       completeDownloadTransfer(handedOff.id, true);
 
       render(<DownloadTransferCenter />);
 
-      const openButtons = screen.getAllByText('downloads.open_file');
+      // A page cannot open a local file in its local app, so there is no
+      // button that would only show the file at a blob: web address.
+      expect(screen.queryByText('downloads.open_file')).toBeNull();
       const folderButtons = screen.getAllByText('downloads.open_folder');
-      expect(openButtons).toHaveLength(1);
       expect(folderButtons).toHaveLength(1);
       expect(folderButtons[0]!.getAttribute('title')).toBe('downloads.open_folder_hint');
 
-      fireEvent.click(openButtons[0]!);
-      expect(open).toHaveBeenCalledWith('', '_blank');
       fireEvent.click(folderButtons[0]!);
       expect(picker).toHaveBeenCalledWith({ startIn: handle });
+      expect(open).not.toHaveBeenCalled();
     } finally {
       delete (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker;
       open.mockRestore();

@@ -2,7 +2,6 @@ import { useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   DOWNLOAD_TRANSFER_STATUS,
-  canOpenDownloadTransfer,
   canRevealDownloadTransfer,
   canSaveDownloadTransfer,
   canRetryDownloadTransfer,
@@ -10,7 +9,6 @@ import {
   clearFinishedDownloadTransfers,
   dismissDownloadTransfer,
   getDownloadTransfers,
-  openDownloadTransfer,
   retryDownloadTransfer,
   revealDownloadTransfer,
   saveDownloadTransfer,
@@ -133,11 +131,6 @@ export function DownloadTransferCenter() {
                 <div class="download-transfer-actions">
                   {isInactive ? (
                     <>
-                      {canOpenDownloadTransfer(item.id) && (
-                        <button type="button" onClick={() => { openDownloadTransfer(item.id); }}>
-                          {t('downloads.open_file')}
-                        </button>
-                      )}
                       {canRevealDownloadTransfer(item.id) && (
                         <button
                           type="button"

@@ -1665,7 +1665,6 @@
     "cancel": "キャンセル",
     "retry": "再試行",
     "save_share": "保存・共有",
-    "open_file": "ファイルを開く",
     "open_folder": "フォルダを開く",
     "open_folder_hint": "ファイルを保存したフォルダでファイル選択ダイアログを開きます",
     "dismiss": "削除",

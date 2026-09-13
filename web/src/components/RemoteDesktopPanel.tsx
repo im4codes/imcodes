@@ -25,7 +25,6 @@ import {
 import { downloadAttachment } from '../api.js';
 import {
   canRevealSavedDownload,
-  openSavedDownload,
   revealSavedDownload,
   savedDownloadFileHandle,
   type SavedDownloadFileHandle,
@@ -393,7 +392,7 @@ export function RemoteDesktopPanel({
   /**
    * The saved file behind each finished fetch that has one. Only a fetch
    * written through the save picker does; one handed to the browser's download
-   * manager is invisible to the page and gets no open/show buttons.
+   * manager is invisible to the page and gets no "Show in folder" button.
    */
   const savedFetchFilesRef = useRef(new Map<string, SavedDownloadFileHandle>());
   const displayTabLongPressRef = useRef<DisplayTabLongPress | null>(null);
@@ -2786,26 +2785,16 @@ export function RemoteDesktopPanel({
                         onClick={() => cancelTransfer(transfer.id)}
                       >{t('upload.cancel')}</button>
                     )}
-                    {transfer.direction === 'fetch' && transfer.status === 'done' && savedFetchFilesRef.current.has(transfer.id) && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const savedFile = savedFetchFilesRef.current.get(transfer.id);
-                            if (savedFile) openSavedDownload(savedFile);
-                          }}
-                        >{t('downloads.open_file')}</button>
-                        {canRevealSavedDownload() && (
-                          <button
-                            type="button"
-                            title={t('downloads.open_folder_hint')}
-                            onClick={() => {
-                              const savedFile = savedFetchFilesRef.current.get(transfer.id);
-                              if (savedFile) revealSavedDownload(savedFile);
-                            }}
-                          >{t('downloads.open_folder')}</button>
-                        )}
-                      </>
+                    {transfer.direction === 'fetch' && transfer.status === 'done'
+                      && savedFetchFilesRef.current.has(transfer.id) && canRevealSavedDownload() && (
+                      <button
+                        type="button"
+                        title={t('downloads.open_folder_hint')}
+                        onClick={() => {
+                          const savedFile = savedFetchFilesRef.current.get(transfer.id);
+                          if (savedFile) revealSavedDownload(savedFile);
+                        }}
+                      >{t('downloads.open_folder')}</button>
                     )}
                   </div>
                 ))}

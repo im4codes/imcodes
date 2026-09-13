@@ -1666,7 +1666,6 @@
     "cancel": "Cancel",
     "retry": "Retry",
     "save_share": "Save / Share",
-    "open_file": "Open file",
     "open_folder": "Show in folder",
     "open_folder_hint": "Opens the file dialog inside the folder the file was saved to",
     "dismiss": "Dismiss",
