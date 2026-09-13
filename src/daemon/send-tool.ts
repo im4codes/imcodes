@@ -4175,7 +4175,7 @@ export async function dispatchReadyIntegration(
       'Exact pathspec:',
       ...integrationArtifact.files.map((file) => `- ${file.path}`),
       '',
-      'Integrate only the verified bundle bytes already materialized in the prepared integration worktree. Record real commit/push evidence; if already present, record that fact. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
+      'Before any Git side effect, call supervision_integration_preflight with this exact task/revision/attempt/owner and destination ref; retain its preflightToken. Integrate only the verified bundle bytes already materialized in the prepared integration worktree. Record real commit/push evidence; if recovering an exact verified bundle commit that is already reachable from that ref, use already_present without repeating Git and the pre-Git token may be omitted. Otherwise call supervision_integration_finalize once with the same metadata and preflightToken. Field-level refusals are recoverable inputs, not a request for Brain to guess an extra task_finish. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
     ].join('\n'),
     idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
     internalMessageId: messageId,
